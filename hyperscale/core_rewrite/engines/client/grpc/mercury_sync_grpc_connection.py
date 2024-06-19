@@ -9,6 +9,7 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
+    Generic,
 )
 from urllib.parse import urlparse
 
@@ -24,12 +25,13 @@ from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 from .models.grpc import (
     GRPCRequest,
     GRPCResponse,
+    Protobuf
 )
 
 T = TypeVar("T")
 
 
-class MercurySyncGRPCConnection(MercurySyncHTTP2Connection):
+class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
     def __init__(
         self,
         pool_size: int = 10**3,
@@ -47,7 +49,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection):
     async def send(
         self,
         url: str,
-        protobuf: T,
+        protobuf: Protobuf[T],
         timeout: Union[Optional[int], Optional[float]] = None,
         redirects: int = 3,
     ) -> GRPCResponse:
