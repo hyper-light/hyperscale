@@ -10,5 +10,5 @@ from hyperscale.core_rewrite.hooks.optimized.models.base.base_types import (
 )
 
 
-class HeaderValidator(BaseModel):
+class ParamsValidator(BaseModel):
     value: Dict[StrictStr, HTTPEncodableValue]

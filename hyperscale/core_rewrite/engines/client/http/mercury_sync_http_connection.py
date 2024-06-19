@@ -5,6 +5,7 @@ import ssl
 import time
 from collections import defaultdict
 from typing import (
+    Any,
     Dict,
     Iterator,
     List,
@@ -89,7 +90,7 @@ class MercurySyncHTTPConnection:
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -132,7 +133,7 @@ class MercurySyncHTTPConnection:
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -175,7 +176,7 @@ class MercurySyncHTTPConnection:
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -219,8 +220,10 @@ class MercurySyncHTTPConnection:
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
+        data: Optional[
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
+        ] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -264,8 +267,10 @@ class MercurySyncHTTPConnection:
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
+        timeout: Optional[int | float] = None,
+        data: Optional[
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
+        ] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -309,8 +314,10 @@ class MercurySyncHTTPConnection:
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
+        data: Optional[
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
+        ] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -354,7 +361,7 @@ class MercurySyncHTTPConnection:
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -398,8 +405,10 @@ class MercurySyncHTTPConnection:
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        data: Optional[
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
+        ] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         timings: Dict[
@@ -480,7 +489,9 @@ class MercurySyncHTTPConnection:
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
+        data: Optional[
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
+        ] = None,
         upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
