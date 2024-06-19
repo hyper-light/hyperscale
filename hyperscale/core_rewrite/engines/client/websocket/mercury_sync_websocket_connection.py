@@ -467,7 +467,10 @@ class MercurySyncWebsocketConnection:
 
             return (
                 WebsocketResponse(
-                    url=URLMetadata(host=request_url.hostname, path=request_url.path),
+                    url=URLMetadata(
+                        host=request_url.hostname,
+                        path=request_url.path,
+                    ),
                     method=method,
                     status=400,
                     status_message=str(request_exception),
