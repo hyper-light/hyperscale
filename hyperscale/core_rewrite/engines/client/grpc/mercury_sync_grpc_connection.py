@@ -1,17 +1,20 @@
 import asyncio
+import binascii
 import ssl
 import time
 import uuid
+from random import randrange
 from typing import (
     Dict,
+    Generic,
+    List,
     Literal,
     Optional,
     Tuple,
     TypeVar,
     Union,
-    Generic,
 )
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 from hyperscale.core_rewrite.engines.client.http2 import MercurySyncHTTP2Connection
 from hyperscale.core_rewrite.engines.client.http2.pipe import HTTP2Pipe
@@ -22,11 +25,7 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 )
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 
-from .models.grpc import (
-    GRPCRequest,
-    GRPCResponse,
-    Protobuf
-)
+from .models.grpc import GRPCRequest, GRPCResponse, Protobuf
 
 T = TypeVar("T")
 
@@ -50,14 +49,20 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
         self,
         url: str,
         protobuf: Protobuf[T],
-        timeout: Union[Optional[int], Optional[float]] = None,
-        redirects: int = 3,
+        timeout: Union[
+            Optional[int],
+            Optional[float],
+        ] = None,
     ) -> GRPCResponse:
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        GRPCRequest(url=url, protobuf=protobuf, redirects=redirects),
+                        GRPCRequest(
+                            url=url,
+                            protobuf=protobuf,
+                            timeout=timeout,
+                        ),
                     ),
                     timeout=timeout,
                 )
@@ -76,7 +81,15 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     status_message="Request timed out.",
                 )
 
-    async def _request(self, request: GRPCRequest):
+    async def _request(
+        self,
+        url: str,
+        protobuf: Protobuf[T],
+        timeout: Union[
+            Optional[int],
+            Optional[float],
+        ] = None,
+    ):
         timings: Dict[
             Literal[
                 "request_start",
@@ -101,31 +114,12 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
         }
         timings["request_start"] = time.monotonic()
 
-        result, redirect, timings = await self._execute(request, timings=timings)
-
-        if redirect:
-            location = result.headers.get("location")
-
-            upgrade_ssl = False
-            if "https" in location and "https" not in request.url:
-                upgrade_ssl = True
-
-            for _ in range(request.redirects):
-                result, redirect, timings = await self._execute(
-                    request,
-                    upgrade_ssl=upgrade_ssl,
-                    redirect_url=location,
-                    timings=timings,
-                )
-
-                if redirect is False:
-                    break
-
-                location = result.headers.get("location")
-
-                upgrade_ssl = False
-                if "https" in location and "https" not in request.url:
-                    upgrade_ssl = True
+        result, _, timings = await self._execute(
+            url,
+            protobuf,
+            timeout=timeout,
+            timings=timings,
+        )
 
         timings["request_end"] = time.monotonic()
         result.timings.update(timings)
@@ -134,7 +128,12 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
     async def _execute(
         self,
-        request: GRPCRequest,
+        request_url: str,
+        protobuf: Protobuf[T],
+        timeout: Union[
+            Optional[int],
+            Optional[float],
+        ] = None,
         upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
@@ -154,16 +153,14 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
         if redirect_url:
             request_url = redirect_url
 
-        else:
-            request_url = request.url
-
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
             (error, connection, pipe, url, upgrade_ssl) = await asyncio.wait_for(
                 self._connect_to_url_location(
-                    request_url, ssl_redirect_url=request_url if upgrade_ssl else None
+                    request_url,
+                    ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
                 timeout=self.timeouts.connect_timeout,
             )
@@ -171,16 +168,21 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
             if upgrade_ssl:
                 ssl_redirect_url = request_url.replace("http://", "https://")
 
-                (error, connection, pipe, url, _) = await asyncio.wait_for(
+                (
+                    error,
+                    connection,
+                    pipe,
+                    url,
+                    _,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(
-                        request_url, ssl_redirect_url=ssl_redirect_url
+                        request_url,
+                        ssl_redirect_url=ssl_redirect_url,
                     ),
                     timeout=self.timeouts.connect_timeout,
                 )
 
                 request_url = ssl_redirect_url
-
-            headers = request.encode_headers(url)
 
             if error:
                 timings["connect_end"] = time.monotonic()
@@ -188,8 +190,8 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                 self._connections.append(
                     HTTP2Connection(
                         self._concurrency,
-                        stream_id=connection.stream.stream_id,
-                        reset_connection=connection.reset_connection,
+                        stream_id=randrange(1, 2**20 + 2, 2),
+                        reset_connections=self._reset_connections,
                     )
                 )
 
@@ -197,13 +199,13 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
                 return (
                     GRPCResponse(
-                        url=URLMetadata(host=url.hostname, path=url.path),
+                        url=URLMetadata(
+                            host=url.hostname,
+                            path=url.path,
+                        ),
                         method="POST",
                         status=400,
-                        headers={
-                            key.encode(): value.encode()
-                            for key, value in request.headers.items()
-                        },
+                        timings=timings,
                     ),
                     False,
                     timings,
@@ -215,48 +217,41 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                 timings["write_start"] = time.monotonic()
 
             connection = pipe.send_preamble(connection)
-            data = request.encode_data()
 
-            connection = pipe.send_request_headers(headers, data, connection)
+            encoded_headers = self._encode_headers(
+                url,
+                timeout=timeout,
+            )
 
-            if data:
-                connection = await asyncio.wait_for(
-                    pipe.submit_request_body(data, connection),
-                    timeout=self.timeouts.write_timeout,
-                )
+            connection = pipe.send_request_headers(
+                encoded_headers,
+                protobuf,
+                connection,
+            )
+
+            encoded_data = self._encode_data(protobuf)
+
+            connection = await asyncio.wait_for(
+                pipe.submit_request_body(
+                    encoded_data,
+                    connection,
+                ),
+                timeout=self.timeouts.write_timeout,
+            )
 
             timings["write_end"] = time.monotonic()
 
             if timings["read_start"] is None:
                 timings["read_start"] = time.monotonic()
 
-            (status, headers, body, error) = await asyncio.wait_for(
+            (
+                status,
+                headers,
+                body,
+                error,
+            ) = await asyncio.wait_for(
                 pipe.receive_response(connection), timeout=self.timeouts.read_timeout
             )
-
-            if status >= 300 and status < 400:
-                timings["read_end"] = time.monotonic()
-
-                self._connections.append(
-                    HTTP2Connection(
-                        self._concurrency,
-                        connection.stream.stream_id,
-                        reset_connection=connection.reset_connection,
-                    )
-                )
-
-                self._pipes.append(HTTP2Pipe(self._max_concurrency))
-
-                return (
-                    GRPCResponse(
-                        url=URLMetadata(host=url.hostname, path=url.path),
-                        method="POST",
-                        status=status,
-                        headers=headers,
-                    ),
-                    True,
-                    timings,
-                )
 
             if error:
                 raise error
@@ -268,11 +263,15 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
             return (
                 GRPCResponse(
-                    url=URLMetadata(host=url.hostname, path=url.path),
+                    url=URLMetadata(
+                        host=url.hostname,
+                        path=url.path,
+                    ),
                     method="POST",
                     status=status,
                     headers=headers,
                     content=body,
+                    timings=timings,
                 ),
                 False,
                 timings,
@@ -282,24 +281,28 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
             self._connections.append(
                 HTTP2Connection(
                     self._concurrency,
-                    connection.stream.stream_id,
-                    reset_connection=connection.reset_connection,
+                    stream_id=randrange(1, 2**20 + 2, 2),
+                    reset_connections=self._reset_connections,
                 )
             )
 
             self._pipes.append(HTTP2Pipe(self._max_concurrency))
 
             if isinstance(request_url, str):
-                request_url = urlparse(request_url)
+                request_url: ParseResult = urlparse(request_url)
 
             timings["read_end"] = time.monotonic()
 
             return (
                 GRPCResponse(
-                    url=URLMetadata(host=request_url.hostname, path=request_url.path),
+                    url=URLMetadata(
+                        host=request_url.hostname,
+                        path=request_url.path,
+                    ),
                     method="POST",
                     status=400,
                     status_message=str(request_exception),
+                    timings=timings,
                 ),
                 False,
                 timings,
@@ -428,4 +431,48 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
                 raise connection_error
 
-        return (connection_error, connection, pipe, parsed_url, False)
+        return (
+            connection_error,
+            connection,
+            pipe,
+            parsed_url,
+            False,
+        )
+
+    def _encode_data(
+        self,
+        data: Protobuf[T],
+    ):
+        encoded_protobuf = str(
+            binascii.b2a_hex(data.SerializeToString()),
+            encoding="raw_unicode_escape",
+        )
+        encoded_message_length = (
+            hex(int(len(encoded_protobuf) / 2)).lstrip("0x").zfill(8)
+        )
+        encoded_protobuf = f"00{encoded_message_length}{encoded_protobuf}"
+
+        return binascii.a2b_hex(encoded_protobuf)
+
+    def _encode_headers(
+        self,
+        url: URL,
+        timeout: int | float = 60,
+    ) -> List[Tuple[bytes, bytes]]:
+        encoded_headers = [
+            (b":method", b"POST"),
+            (b":authority", url.hostname.encode()),
+            (b":scheme", url.scheme.encode()),
+            (b":path", url.path.encode()),
+            (b"Content-Type", b"application/grpc"),
+            (b"Grpc-Timeout", f"{timeout}".encode()),
+            (b"TE", b"trailers"),
+        ]
+
+        encoded_headers: bytes = self._encoder.encode(encoded_headers)
+        encoded_headers: List[bytes] = [
+            encoded_headers[i : i + self._settings.max_frame_size]
+            for i in range(0, len(encoded_headers), self._settings.max_frame_size)
+        ]
+
+        return encoded_headers[0]
