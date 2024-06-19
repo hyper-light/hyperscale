@@ -10,7 +10,6 @@ from hyperscale.core.engines.types import (
     MercuryHTTP2Client,
     MercuryHTTPClient,
     MercuryPlaywrightClient,
-    MercuryTaskRunner,
     MercuryUDPClient,
     MercuryWebsocketClient,
 )
@@ -24,7 +23,6 @@ from hyperscale.core.engines.types.grpc import GRPCAction, GRPCResult
 from hyperscale.core.engines.types.http import HTTPAction, HTTPResult
 from hyperscale.core.engines.types.http2 import HTTP2Action, HTTP2Result
 from hyperscale.core.engines.types.playwright import PlaywrightCommand, PlaywrightResult
-from hyperscale.core.engines.types.task import Task, TaskResult
 from hyperscale.core.engines.types.udp import UDPAction, UDPResult
 from hyperscale.core.engines.types.websocket import WebsocketAction, WebsocketResult
 from hyperscale.core.experiments.mutations.types.base.mutation import Mutation
@@ -40,7 +38,6 @@ S = TypeVar(
     MercuryHTTPClient,
     MercuryHTTP2Client,
     MercuryPlaywrightClient,
-    MercuryTaskRunner,
     MercuryUDPClient,
     MercuryWebsocketClient
 )
@@ -52,7 +49,6 @@ A = TypeVar(
     HTTPAction,
     HTTP2Action,
     PlaywrightCommand,
-    Task,
     UDPAction,
     WebsocketAction
 )
@@ -64,7 +60,6 @@ R = TypeVar(
     HTTPResult,
     HTTP2Result,
     PlaywrightResult,
-    TaskResult,
     UDPResult,
     WebsocketResult
 )

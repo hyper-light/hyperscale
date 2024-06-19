@@ -2,9 +2,11 @@ from typing import Any, Dict, List, Union
 
 from hyperscale.core.engines.types.common.timeouts import Timeouts
 from hyperscale.core.engines.types.common.types import RequestTypes
-from hyperscale.core.engines.types.task.result import TaskResult
-from hyperscale.core.engines.types.task.runner import MercuryTaskRunner
-from hyperscale.core.engines.types.task.task import Task
+from hyperscale.core.engines.types.task.runner import (
+    MercuryTaskRunner,
+    TaskResult,
+    Task
+)
 from hyperscale.data.serializers.serializer_types.common.base_serializer import (
     BaseSerializer,
 )

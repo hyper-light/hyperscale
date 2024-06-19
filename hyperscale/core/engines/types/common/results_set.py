@@ -11,11 +11,11 @@ from hyperscale.core.engines.types.grpc import GRPCResult
 from hyperscale.core.engines.types.http import HTTPResult
 from hyperscale.core.engines.types.http2 import HTTP2Result
 from hyperscale.core.engines.types.playwright import PlaywrightResult
-from hyperscale.core.engines.types.task import TaskResult
 from hyperscale.core.engines.types.udp import UDPResult
 from hyperscale.core.engines.types.websocket import WebsocketResult
 from hyperscale.core.personas.streaming.stream_analytics import StreamAnalytics
-from hyperscale.data.serializers import Serializer
+from hyperscale.data.serializers.serializer import Serializer
+from hyperscale.core.engines.types.task.result import TaskResult
 from hyperscale.monitoring import CPUMonitor, MemoryMonitor
 
 ResultsBatch = Dict[str, Union[List[BaseResult], float]]

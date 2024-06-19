@@ -33,7 +33,7 @@ from hyperscale.core.personas.persona_registry import (
     registered_personas,
 )
 from hyperscale.core.personas.streaming.stream_analytics import StreamAnalytics
-from hyperscale.data.serializers import Serializer
+from hyperscale.data.serializers.serializer import Serializer
 from hyperscale.logging import logging_manager
 from hyperscale.monitoring import CPUMonitor, MemoryMonitor
 from hyperscale.plugins.types.extension.extension_plugin import ExtensionPlugin

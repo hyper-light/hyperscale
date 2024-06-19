@@ -40,7 +40,7 @@ from hyperscale.core.hooks.types.load.hook import LoadHook
 from hyperscale.core.hooks.types.task.hook import TaskHook
 from hyperscale.core.personas.persona_registry import registered_personas
 from hyperscale.core.personas.streaming.stream_analytics import StreamAnalytics
-from hyperscale.data.serializers import Serializer
+from hyperscale.data.serializers.serializer import Serializer
 from hyperscale.logging.hyperscale_logger import HyperscaleLogger, LoggerTypes
 from hyperscale.monitoring import CPUMonitor, MemoryMonitor
 from hyperscale.plugins.types.engine.engine_plugin import EnginePlugin

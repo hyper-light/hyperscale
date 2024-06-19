@@ -25,6 +25,7 @@ from hyperscale.core.engines.types.websocket.action import WebsocketAction
 from hyperscale.core.engines.types.websocket.result import WebsocketResult
 from hyperscale.core.hooks.types.action.hook import ActionHook
 from hyperscale.core.hooks.types.task.hook import TaskHook
+from .serializer_types.task.task_serializer import TaskSerializer
 
 from .serializer_types import (
     GraphQLHTTP2Serializer,
@@ -34,7 +35,6 @@ from .serializer_types import (
     HTTP3Serializer,
     HTTPSerializer,
     PlaywrightSerializer,
-    TaskSerializer,
     UDPSerializer,
     WebsocketSerializer,
 )
@@ -65,6 +65,7 @@ Result = Union[
     UDPResult,
     WebsocketResult
 ]
+
 
 
 class Serializer:

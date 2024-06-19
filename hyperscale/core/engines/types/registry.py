@@ -5,7 +5,7 @@ from .http import MercuryHTTPClient
 from .http2 import MercuryHTTP2Client
 from .http3 import MercuryHTTP3Client
 from .playwright import MercuryPlaywrightClient
-from .task import MercuryTaskRunner
+from .task.runner import MercuryTaskRunner
 from .udp import MercuryUDPClient
 from .websocket import MercuryWebsocketClient
 from .common.types import RequestTypes

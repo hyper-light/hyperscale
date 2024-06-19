@@ -1,8 +1,6 @@
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Any
 
 import psutil
-
-from hyperscale.core.experiments.mutations.types.base.mutation import Mutation
 
 from .time_parser import TimeParser
 from .tracing_config import TracingConfig
@@ -49,7 +47,7 @@ class Config:
         self.playwright_options = kwargs.get('playwright_options', {})
         self.experiment: Dict[str, Union[str, int, List[float]]] = kwargs.get('experiment', {})
         self.tracing: Union[TracingConfig, None] = kwargs.get('tracing')
-        self.mutations: Union[List[Mutation], None] = kwargs.get('mutations', [])
+        self.mutations: Union[List[Any], None] = kwargs.get('mutations', [])
         self.actions_filepaths: Union[Dict[str, str], None] = kwargs.get('actions_filepaths')
 
     def copy(self):

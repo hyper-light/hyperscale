@@ -2,7 +2,7 @@ import os
 import threading
 import uuid
 from asyncio import Future
-from typing import Dict, Generic, Iterable, Optional, Union
+from typing import (Dict, Generic, Iterable, Optional, Union, Unpack,)
 
 from typing_extensions import TypeVarTuple, Unpack
 
@@ -96,7 +96,7 @@ class Client(Generic[Unpack[T]]):
         return f'Graph - {self.graph_name}:{self.graph_id} - thread:{self.thread_id} - process:{self.process_id} - Stage: {self.stage_name}:{self.stage_id} - '
 
     @property
-    def plugin(self) -> Dict[str, Union[Unpack[T]]]:
+    def plugin(self) -> Dict[str, Union[tuple[*T]]]:
         self._plugin._config = self._config
         self._plugin.actions = self.actions
         self._plugin.metadata_string = self.metadata_string

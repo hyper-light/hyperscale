@@ -34,7 +34,7 @@ from hyperscale.core.hooks.types.event.decorator import event
 from hyperscale.core.hooks.types.internal.decorator import Internal
 from hyperscale.core.hooks.types.task.hook import TaskHook
 from hyperscale.core.personas.streaming.stream_analytics import StreamAnalytics
-from hyperscale.data.serializers import Serializer
+from hyperscale.data.serializers.serializer import Serializer
 from hyperscale.logging import logging_manager
 from hyperscale.monitoring import CPUMonitor, MemoryMonitor
 from hyperscale.monitoring.base.exceptions import MonitorKilledError
