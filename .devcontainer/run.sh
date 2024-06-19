@@ -1,9 +1,9 @@
 
-if [[ -d .venv ]]; then
+if [[ ! -d /workspace/.venv ]]; then
     uv venv
 fi
 
-pip uninstall playwright
+pip uninstall -y playwright
 
 source .venv/bin/activate
 
