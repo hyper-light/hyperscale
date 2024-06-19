@@ -545,7 +545,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             hostname = f"{hostname}:{port}"
 
         header_items = {
-            "user-agent": "hyperscale",
+            "user-agent": "hyperscale/client",
         }
 
         if method == "POST" and encoded_data:

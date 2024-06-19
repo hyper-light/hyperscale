@@ -802,8 +802,8 @@ class MercurySyncHTTP3Connection:
             (b":method", method.encode()),
             (b":scheme", url.scheme.encode()),
             (b":authority", url.authority.encode()),
-            (b":path", url_path),
-            (b"user-agent", "hyperscale/client".encode()),
+            (b":path", url_path.encode()),
+            (b"user-agent", b"hyperscale/client"),
         ]
 
         if headers:

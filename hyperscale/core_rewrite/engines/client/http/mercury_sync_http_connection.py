@@ -6,6 +6,7 @@ import time
 from collections import defaultdict
 from typing import (
     Dict,
+    Iterator,
     List,
     Literal,
     Optional,
@@ -538,21 +539,8 @@ class MercurySyncHTTPConnection:
 
                 request_url = ssl_redirect_url
 
-            encoded_data: Optional[bytes] = None
+            encoded_data: Optional[bytes | List[bytes]] = None
             content_type: Optional[str] = None
-
-            if data:
-                encoded_data, content_type = self.encode_data(data)
-
-            encoded_headers = self.encode_headers(
-                url,
-                method,
-                params=params,
-                headers=headers,
-                cookies=cookies,
-                data=encoded_data,
-                content_type=content_type,
-            )
 
             if connection.reader is None:
                 timings["connect_end"] = time.monotonic()
@@ -564,7 +552,10 @@ class MercurySyncHTTPConnection:
 
                 return (
                     HTTPResponse(
-                        url=URLMetadata(host=url.hostname, path=url.path),
+                        url=URLMetadata(
+                            host=url.hostname,
+                            path=url.path,
+                        ),
                         method=method,
                         status=400,
                         headers=headers,
@@ -579,9 +570,31 @@ class MercurySyncHTTPConnection:
             if timings["write_start"] is None:
                 timings["write_start"] = time.monotonic()
 
-            connection.write(encoded_headers)
+            encoded_data: Optional[bytes | List[bytes]] = None
+            content_type: Optional[str] = None
 
             if data:
+                encoded_data, content_type = self._encode_data(data)
+
+            encoded_headers = self._encode_headers(
+                url,
+                method,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                data=encoded_data,
+                content_type=content_type,
+            )
+
+            connection.write(encoded_headers)
+
+            if isinstance(encoded_data, Iterator):
+                for chunk in encoded_data:
+                    connection.write(chunk)
+
+                connection.write(("0" + NEW_LINE * 2).encode())
+
+            elif data:
                 connection.write(encoded_data)
 
             timings["write_end"] = time.monotonic()
@@ -791,35 +804,46 @@ class MercurySyncHTTPConnection:
 
         return connection, parsed_url, False
 
-    def encode_data(
+    def _encode_data(
         self,
         data: str | bytes | BaseModel | bytes,
     ):
         content_type: Optional[str] = None
-        if isinstance(data, BaseModel):
-            data = orjson.dumps(data.model_dump())
+        encoded_data: bytes | List[bytes] = None
+
+        if isinstance(data, Iterator):
+            chunks: List[bytes] = []
+            for chunk in data:
+                chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
+                encoded_chunk = chunk_size.encode() + chunk + NEW_LINE.encode()
+                chunks.append(encoded_chunk)
+
+            encoded_data = chunks
+
+        elif isinstance(data, BaseModel):
+            encoded_data = orjson.dumps(data.model_dump())
             content_type = "application/json"
 
         elif isinstance(data, (dict, list)):
-            data = orjson.dumps(data)
+            encoded_data = orjson.dumps(data)
             content_type = "application/json"
 
         elif isinstance(data, str):
-            data = data.encode()
+            encoded_data = data.encode()
 
         elif isinstance(data, (memoryview, bytearray)):
-            data = bytes(data)
+            encoded_data = bytes(data)
 
-        return data, content_type
+        return encoded_data, content_type
 
-    def encode_headers(
+    def _encode_headers(
         self,
         url: URL,
         method: str,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        data: Optional[bytes] = None,
+        data: Optional[bytes | List[bytes]] = None,
         content_type: Optional[str] = None,
     ):
         url_path = url.path
@@ -838,10 +862,13 @@ class MercurySyncHTTPConnection:
             hostname = f"{hostname}:{port}"
 
         header_items = {
-            "user-agent": "hyperscale",
+            "user-agent": "hyperscale/client",
         }
 
-        if data:
+        if data and isinstance(data, Iterator):
+            header_items["content-length"] = sum([len(chunk) for chunk in data])
+
+        elif data:
             header_items["content-length"] = len(data)
 
         if content_type:

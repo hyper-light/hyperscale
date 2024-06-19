@@ -3,15 +3,22 @@ import ssl
 import time
 from collections import defaultdict
 from typing import (
+    Any,
     Dict,
+    Iterator,
     List,
     Literal,
     Optional,
     Tuple,
     Union,
 )
-from urllib.parse import urlparse
+from urllib.parse import (
+    ParseResult,
+    urlencode,
+    urlparse,
+)
 
+import orjson
 from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.shared.models import (
@@ -21,11 +28,11 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
     HTTPEncodableValue,
     URLMetadata,
 )
+from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 
 from .connection import WebsocketConnection
 from .models.websocket import (
-    WebsocketRequest,
     WebsocketResponse,
     get_header_bits,
     get_message_buffer_size,
@@ -78,6 +85,49 @@ class MercurySyncWebsocketConnection:
 
         return ctx
 
+    async def receive(
+        self,
+        url: str,
+        auth: Optional[Tuple[str, str]] = None,
+        cookies: Optional[List[HTTPCookie]] = None,
+        headers: Dict[str, str] = {},
+        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel] = None,
+        timeout: Optional[int | float] = None,
+        redirects: int = 3,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._request(
+                        url,
+                        "GET",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        data=data,
+                        redirects=redirects,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                url_data = urlparse(url)
+
+                return WebsocketResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    headers=headers,
+                    method="PUT",
+                    status=408,
+                    status_message="Request timed out.",
+                )
+
     async def send(
         self,
         url: str,
@@ -85,30 +135,22 @@ class MercurySyncWebsocketConnection:
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
-        data: Union[
-            Optional[str], Optional[Dict[str, str]], Optional[BaseModel]
-        ] = None,
+        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
             try:
-                method = "GET"
-                if data:
-                    method = "POST"
-
                 return await asyncio.wait_for(
                     self._request(
-                        WebsocketRequest(
-                            url=url,
-                            method=method,
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            data=data,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "POST",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        data=data,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -131,7 +173,14 @@ class MercurySyncWebsocketConnection:
 
     async def _request(
         self,
-        request: WebsocketRequest,
+        url: str,
+        method: str,
+        auth: Optional[Tuple[str, str]] = None,
+        cookies: Optional[List[HTTPCookie]] = None,
+        headers: Dict[str, str] = {},
+        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel] = None,
+        redirects: int = 3,
         cert_path: Optional[str] = None,
         key_path: Optional[str] = None,
     ):
@@ -159,18 +208,33 @@ class MercurySyncWebsocketConnection:
         }
         timings["request_start"] = time.monotonic()
 
-        result, redirect, timings = await self._execute(request, timings=timings)
+        result, redirect, timings = await self._execute(
+            url,
+            method,
+            auth=auth,
+            params=params,
+            cookies=cookies,
+            headers=headers,
+            data=data,
+            timings=timings,
+        )
 
         if redirect:
             location = result.headers.get(b"location").decode()
 
             upgrade_ssl = False
-            if "https" in location and "https" not in request.url:
+            if "https" in location and "https" not in url:
                 upgrade_ssl = True
 
-            for _ in range(request.redirects):
+            for _ in range(redirects):
                 result, redirect, timings = await self._execute(
-                    request,
+                    url,
+                    method,
+                    auth=auth,
+                    params=params,
+                    cookies=cookies,
+                    headers=headers,
+                    data=data,
                     upgrade_ssl=upgrade_ssl,
                     redirect_url=location,
                     timings=timings,
@@ -182,7 +246,7 @@ class MercurySyncWebsocketConnection:
                 location = result.headers.get(b"location").decode()
 
                 upgrade_ssl = False
-                if "https" in location and "https" not in request.url:
+                if "https" in location and "https" not in url:
                     upgrade_ssl = True
 
         timings["request_end"] = time.monotonic()
@@ -192,7 +256,13 @@ class MercurySyncWebsocketConnection:
 
     async def _execute(
         self,
-        request: WebsocketRequest,
+        request_url: str,
+        method: str,
+        auth: Optional[Tuple[str, str]] = None,
+        cookies: Optional[List[HTTPCookie]] = None,
+        headers: Dict[str, str] = {},
+        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel] = None,
         upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
@@ -227,10 +297,6 @@ class MercurySyncWebsocketConnection:
     ]:
         if redirect_url:
             request_url = redirect_url
-
-        else:
-            request_url = request.url
-
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
@@ -254,17 +320,24 @@ class MercurySyncWebsocketConnection:
 
                 request_url = ssl_redirect_url
 
-            headers, data = request.prepare(url)
-
             if connection.reader is None:
                 timings["connect_end"] = time.monotonic()
+                self._connections.append(
+                    WebsocketConnection(
+                        reset_connections=self.reset_connections,
+                    )
+                )
 
                 return (
                     WebsocketResponse(
-                        url=URLMetadata(host=url.hostname, path=url.path),
-                        method=request.method,
+                        url=URLMetadata(
+                            host=url.hostname,
+                            path=url.path,
+                        ),
+                        method=method,
                         status=400,
                         headers=headers,
+                        timings=timings,
                     ),
                     False,
                     timings,
@@ -275,10 +348,32 @@ class MercurySyncWebsocketConnection:
             if timings["write_start"] is None:
                 timings["write_start"] = time.monotonic()
 
-            connection.writer.write(headers)
+            encoded_data: Optional[bytes | List[bytes]] = None
+            content_type: Optional[str] = None
 
             if data:
-                connection.writer.write(data)
+                encoded_data, content_type = self._encode_data(data)
+
+            encoded_headers = self._encode_headers(
+                url,
+                method,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                data=encoded_data,
+                content_type=content_type,
+            )
+
+            connection.write(encoded_headers)
+
+            if isinstance(encoded_data, Iterator):
+                for chunk in encoded_data:
+                    connection.write(chunk)
+
+                connection.write(("0" + NEW_LINE * 2).encode())
+
+            elif data:
+                connection.write(encoded_data)
 
             timings["write_end"] = time.monotonic()
 
@@ -294,13 +389,18 @@ class MercurySyncWebsocketConnection:
 
             if status >= 300 and status < 400:
                 timings["read_end"] = time.monotonic()
+                self._connections.append(connection)
 
                 return (
                     WebsocketResponse(
-                        url=URLMetadata(host=url.hostname, path=url.path),
-                        method=request.method,
+                        url=URLMetadata(
+                            host=url.hostname,
+                            path=url.path,
+                        ),
+                        method=method,
                         status=status,
                         headers=headers,
+                        timings=timings,
                     ),
                     True,
                     timings,
@@ -339,11 +439,15 @@ class MercurySyncWebsocketConnection:
 
             return (
                 WebsocketResponse(
-                    url=URLMetadata(host=url.hostname, path=url.path),
-                    method=request.method,
+                    url=URLMetadata(
+                        host=url.hostname,
+                        path=url.path,
+                    ),
+                    method=method,
                     status=status,
                     headers=headers,
                     content=body,
+                    timings=timings,
                 ),
                 False,
                 timings,
@@ -351,20 +455,23 @@ class MercurySyncWebsocketConnection:
 
         except Exception as request_exception:
             self._connections.append(
-                WebsocketConnection(reset_connection=self.reset_connections)
+                WebsocketConnection(
+                    reset_connection=self.reset_connections,
+                )
             )
 
             if isinstance(request_url, str):
-                request_url = urlparse(request_url)
+                request_url: ParseResult = urlparse(request_url)
 
             timings["read_end"] = time.monotonic()
 
             return (
                 WebsocketResponse(
                     url=URLMetadata(host=request_url.hostname, path=request_url.path),
-                    method=request.method,
+                    method=method,
                     status=400,
                     status_message=str(request_exception),
+                    timings=timings,
                 ),
                 False,
                 timings,
@@ -451,3 +558,95 @@ class MercurySyncWebsocketConnection:
                 raise connection_error
 
         return connection, parsed_url, False
+
+    def _encode_data(
+        self,
+        data: str | bytes | BaseModel | bytes,
+    ):
+        content_type: Optional[str] = None
+        encoded_data: bytes | List[bytes] = None
+
+        if isinstance(data, Iterator):
+            chunks: List[bytes] = []
+            for chunk in data:
+                chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
+                encoded_chunk = chunk_size.encode() + chunk + NEW_LINE.encode()
+                chunks.append(encoded_chunk)
+
+            encoded_data = chunks
+
+        elif isinstance(data, BaseModel):
+            encoded_data = orjson.dumps(data.model_dump())
+            content_type = "application/json"
+
+        elif isinstance(data, (dict, list)):
+            encoded_data = orjson.dumps(data)
+            content_type = "application/json"
+
+        elif isinstance(data, str):
+            encoded_data = data.encode()
+
+        elif isinstance(data, (memoryview, bytearray)):
+            encoded_data = bytes(data)
+
+        return encoded_data, content_type
+
+    def _encode_headers(
+        self,
+        url: URL,
+        method: str,
+        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        cookies: Optional[List[HTTPCookie]] = None,
+        data: Optional[bytes | List[bytes]] = None,
+        content_type: Optional[str] = None,
+    ):
+        url_path = url.path
+
+        if params and len(params) > 0:
+            url_params = urlencode(params)
+            url_path += f"?{url_params}"
+
+        get_base = f"{method} {url.path} HTTP/1.1{NEW_LINE}"
+
+        port = url.port or (443 if url.scheme == "https" else 80)
+
+        hostname = url.hostname.encode("idna").decode()
+
+        if port not in [80, 443]:
+            hostname = f"{hostname}:{port}"
+
+        header_items = {
+            "user-agent": "hyperscale/client",
+        }
+
+        if data and isinstance(data, Iterator):
+            header_items["content-length"] = sum([len(chunk) for chunk in data])
+
+        elif data:
+            header_items["content-length"] = len(data)
+
+        if content_type:
+            header_items["content-type"] = content_type
+
+        if headers:
+            header_items.update(headers)
+
+        for key, value in header_items.items():
+            get_base += f"{key}: {value}{NEW_LINE}"
+
+        if cookies:
+            cookies = []
+
+            for cookie_data in cookies:
+                if len(cookie_data) == 1:
+                    cookies.append(cookie_data[0])
+
+                elif len(cookie_data) == 2:
+                    cookie_name, cookie_value = cookie_data
+                    cookies.append(f"{cookie_name}={cookie_value}")
+
+            cookies = "; ".join(cookies)
+            get_base += f"cookie: {cookies}{NEW_LINE}"
+
+        return (get_base + NEW_LINE).encode(), data
