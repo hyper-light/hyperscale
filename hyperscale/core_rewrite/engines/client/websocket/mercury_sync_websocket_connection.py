@@ -181,8 +181,6 @@ class MercurySyncWebsocketConnection:
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         data: Optional[str | Dict[str, Any] | List[Any] | BaseModel] = None,
         redirects: int = 3,
-        cert_path: Optional[str] = None,
-        key_path: Optional[str] = None,
     ):
         timings: Dict[
             Literal[
