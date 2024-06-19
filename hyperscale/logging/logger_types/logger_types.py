@@ -6,7 +6,7 @@ class LoggerTypes(Enum):
     DISTRIBUTED='distributed'
     FILESYSTEM='filesystem'
     DISTRIBUTED_FILESYSTEM='distributed_filesysem'
-    HEDRA='hyperscale'
+    HYPERSCALE='hyperscale'
     SPINNER='spinner'
 
 

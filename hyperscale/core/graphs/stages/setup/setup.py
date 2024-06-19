@@ -24,7 +24,7 @@ from hyperscale.core.hooks.types.internal.decorator import Internal
 from hyperscale.core.hooks.types.task.hook import TaskHook
 from hyperscale.core.hooks.types.transform.decorator import transform
 from hyperscale.core.personas.types import PersonaTypesMap
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.monitoring import CPUMonitor, MemoryMonitor
 from hyperscale.plugins.types.engine.engine_plugin import EnginePlugin
 from hyperscale.plugins.types.persona.persona_plugin import PersonaPlugin

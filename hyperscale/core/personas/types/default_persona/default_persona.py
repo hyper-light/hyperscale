@@ -14,7 +14,7 @@ from hyperscale.core.hooks.types.task.hook import TaskHook
 from hyperscale.core.personas.batching.batch import Batch
 from hyperscale.core.personas.streaming import Stream, StreamAnalytics
 from hyperscale.core.personas.types.types import PersonaTypes
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.monitoring import CPUMonitor, MemoryMonitor
 from hyperscale.reporting.processed_result.results import results_types
 from hyperscale.reporting.reporter import Reporter, ReporterConfig

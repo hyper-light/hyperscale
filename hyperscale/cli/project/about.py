@@ -2,7 +2,7 @@ import json
 import os
 from typing import Any, Dict
 
-from hyperscale.logging import HyperscaleLogger, LoggerTypes, logging_manager
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger, LoggerTypes, logging_manager
 
 
 def about_project(

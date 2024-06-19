@@ -26,7 +26,7 @@ from hyperscale.data.connectors.common.execute_stage_summary_validator import (
     ExecuteStageSummaryValidator,
 )
 from hyperscale.data.parsers.parser import Parser
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 from .cassandra_connector_config import CassandraConnectorConfig
 from .cassandra_load_validator import CassandraLoadValidator

@@ -1,7 +1,7 @@
 import os
 
 from hyperscale.cli.exceptions.plugin.create import InvalidPluginType
-from hyperscale.logging import HyperscaleLogger, LoggerTypes, logging_manager
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger, LoggerTypes, logging_manager
 from hyperscale.projects.generation import PluginGenerator
 
 

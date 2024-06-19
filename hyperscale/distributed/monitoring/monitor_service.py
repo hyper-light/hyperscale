@@ -13,7 +13,7 @@ from hyperscale.distributed.models.raft import HealthCheck, HealthStatus
 from hyperscale.distributed.service.controller import Controller
 from hyperscale.distributed.snowflake import Snowflake
 from hyperscale.distributed.types import Call
-from hyperscale.logging import HyperscaleLogger, logging_manager
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger, logging_manager
 from hyperscale.tools.helpers import cancel
 
 

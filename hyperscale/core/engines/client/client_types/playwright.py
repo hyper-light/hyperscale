@@ -13,7 +13,7 @@ from hyperscale.core.engines.types.playwright import (
     PlaywrightCommand,
     PlaywrightResult,
 )
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 from .base_client import BaseClient
 

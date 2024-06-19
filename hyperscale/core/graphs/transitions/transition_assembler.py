@@ -20,7 +20,7 @@ from hyperscale.core.hooks.types.base.hook import Hook, HookType
 from hyperscale.core.hooks.types.base.registrar import registrar
 from hyperscale.core.hooks.types.base.simple_context import SimpleContext
 from hyperscale.core.hooks.types.load.hook import LoadHook
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.plugins.types.engine.engine_plugin import EnginePlugin
 from hyperscale.plugins.types.plugin_types import PluginType
 from hyperscale.plugins.types.reporter.reporter_plugin import ReporterPlugin

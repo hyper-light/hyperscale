@@ -13,7 +13,7 @@ from hyperscale.core.engines.types import (
     MercuryWebsocketClient,
 )
 from hyperscale.core.engines.types.common.base_action import BaseAction
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 
 class ActionsStore:

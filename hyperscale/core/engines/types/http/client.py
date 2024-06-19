@@ -8,7 +8,7 @@ from hyperscale.core.engines.types.common.concurrency import Semaphore
 from hyperscale.core.engines.types.common.ssl import get_default_ssl_context
 from hyperscale.core.engines.types.common.timeouts import Timeouts
 from hyperscale.core.engines.types.tracing.trace_session import Trace, TraceSession
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 from .action import HTTPAction
 from .connection import HTTPConnection

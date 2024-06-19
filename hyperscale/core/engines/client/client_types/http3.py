@@ -10,7 +10,7 @@ from hyperscale.core.engines.types.http3 import (
     MercuryHTTP3Client,
 )
 from hyperscale.core.engines.types.tracing.trace_session import Trace, TraceSession
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 from .base_client import BaseClient
 

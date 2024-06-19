@@ -10,7 +10,7 @@ from hyperscale.core.engines.client.config import Config
 from hyperscale.core.personas import get_persona
 from hyperscale.core.personas.batching.param_type import ParamType
 from hyperscale.core.personas.types.default_persona import DefaultPersona
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.monitoring.base.exceptions import MonitorKilledError
 from hyperscale.tools.data_structures import AsyncList
 

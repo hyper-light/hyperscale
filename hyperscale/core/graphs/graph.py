@@ -16,7 +16,7 @@ from hyperscale.core.graphs.stages.base.exceptions.process_killed_error import (
 from hyperscale.core.graphs.stages.base.stage import Stage
 from hyperscale.core.graphs.stages.types.stage_types import StageTypes
 from hyperscale.core.graphs.transitions.transition_group import TransitionGroup
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.logging.table.table_types import (
     GraphExecutionResults,
     GraphResults,

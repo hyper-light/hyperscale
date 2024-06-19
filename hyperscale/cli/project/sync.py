@@ -3,7 +3,7 @@ import os
 from urllib.parse import urlparse
 
 from hyperscale.cli.exceptions.graph.sync import NotSetError
-from hyperscale.logging import HyperscaleLogger, LoggerTypes, logging_manager
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger, LoggerTypes, logging_manager
 from hyperscale.projects.management import GraphManager
 from hyperscale.projects.management.graphs.actions import RepoConfig
 

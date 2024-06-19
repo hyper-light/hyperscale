@@ -11,7 +11,7 @@ from typing import Dict, List, TextIO, Union
 
 import psutil
 
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.reporting.experiment.experiments_collection import (
     ExperimentMetricsCollectionSet,
 )

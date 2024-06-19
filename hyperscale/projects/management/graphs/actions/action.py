@@ -7,7 +7,7 @@ from git import RemoteReference
 from git.remote import Remote
 from git.repo import Repo
 
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 from .config import RepoConfig
 

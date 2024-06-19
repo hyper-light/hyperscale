@@ -3,7 +3,7 @@ from typing import Dict, List, Union
 
 from tabulate import tabulate
 
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.reporting.experiment.experiment_metrics_set_types import (
     ExperimentSummary,
 )

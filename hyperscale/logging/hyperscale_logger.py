@@ -3,7 +3,7 @@ from typing import Dict, Type, Union
 
 from aiologger.levels import LogLevel
 
-from .config import LoggingConfig
+from .config.logging_config import LoggingConfig
 from .logger_types import (
     AsyncFilesystemLogger,
     AsyncLogger,

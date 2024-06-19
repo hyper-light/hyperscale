@@ -24,7 +24,7 @@ from hyperscale.core.engines.types.websocket import (
     MercuryWebsocketClient,
     WebsocketAction,
 )
-from hyperscale.logging import HyperscaleLogger, LoggerTypes, logging_manager
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger, LoggerTypes, logging_manager
 from hyperscale.versioning.flags.types.base.active import active_flags
 from hyperscale.versioning.flags.types.base.flag_type import FlagTypes
 

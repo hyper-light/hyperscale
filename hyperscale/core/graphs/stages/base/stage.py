@@ -15,7 +15,7 @@ from hyperscale.core.hooks.types.base.hook import Hook
 from hyperscale.core.hooks.types.base.hook_type import HookType
 from hyperscale.core.hooks.types.base.simple_context import SimpleContext
 from hyperscale.core.hooks.types.internal.decorator import Internal
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.plugins.types.common.plugin import Plugin
 from hyperscale.plugins.types.plugin_types import PluginType
 

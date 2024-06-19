@@ -39,7 +39,7 @@ from hyperscale.core.hooks.types.task.hook import TaskHook
 from hyperscale.core.personas import get_persona
 from hyperscale.core.personas.persona_registry import registered_personas
 from hyperscale.data.serializers import Serializer
-from hyperscale.logging import HyperscaleLogger, LoggerTypes, logging_manager
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger, LoggerTypes, logging_manager
 from hyperscale.plugins.types.engine.engine_plugin import EnginePlugin
 from hyperscale.plugins.types.extension.extension_plugin import ExtensionPlugin
 from hyperscale.plugins.types.persona.persona_plugin import PersonaPlugin

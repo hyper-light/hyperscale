@@ -6,7 +6,7 @@ import uuid
 from typing import Any, Dict, List, TypeVar, Union
 
 from hyperscale.core.personas.streaming.stream_analytics import StreamAnalytics
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.plugins.types.reporter.reporter_config import ReporterConfig
 
 from .experiment.experiment_metrics_set import ExperimentMetricsSet

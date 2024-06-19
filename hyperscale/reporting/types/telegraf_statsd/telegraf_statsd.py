@@ -1,7 +1,7 @@
 import uuid
 from typing import List
 
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.reporting.metric import MetricType
 from hyperscale.reporting.processed_result.types.base_processed_result import (
     BaseProcessedResult,

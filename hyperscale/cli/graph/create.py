@@ -6,7 +6,7 @@ from typing import Optional
 
 from hyperscale.cli.exceptions.graph.create import InvalidStageType
 from hyperscale.core.graphs.stages.base.stage import Stage
-from hyperscale.logging import HyperscaleLogger, LoggerTypes, logging_manager
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger, LoggerTypes, logging_manager
 from hyperscale.projects.generation import GraphGenerator
 
 

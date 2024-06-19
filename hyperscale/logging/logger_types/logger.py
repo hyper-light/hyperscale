@@ -1,6 +1,5 @@
-from typing import Dict, Generic, TypeVar
+from typing import (Dict, Generic, TypeVar, Any,)
 
-from hyperscale.logging.config import LoggingConfig
 
 from .async_filesystem_logger import AsyncFilesystemLogger
 from .async_logger import AsyncLogger
@@ -16,7 +15,7 @@ S = TypeVar('S')
 
 class Logger(Generic[A, S]):
 
-    def __init__(self, config: LoggingConfig) -> None:
+    def __init__(self, config: Any) -> None:
         self.logger_types = LoggerTypesMap()
         self.log_level = config.log_level
         self.logger_enabled = config.logger_enabled

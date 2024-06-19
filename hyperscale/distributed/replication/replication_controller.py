@@ -21,7 +21,7 @@ from hyperscale.distributed.snowflake.snowflake_generator import (
     SnowflakeGenerator,
 )
 from hyperscale.distributed.types import Call
-from hyperscale.logging import HyperscaleLogger, logging_manager
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger, logging_manager
 from hyperscale.tools.helpers import cancel
 
 from .log_queue import LogQueue

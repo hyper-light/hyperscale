@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple, Union
 import plotille
 from tabulate import tabulate
 
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 from .table_types import ExecutionResults
 

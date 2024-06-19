@@ -11,7 +11,7 @@ import uvloop
 
 from hyperscale.core.graphs.graph import Graph
 from hyperscale.core.graphs.stages.base.stage import Stage
-from hyperscale.logging import HyperscaleLogger, LoggerTypes, logging_manager
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger, LoggerTypes, logging_manager
 
 uvloop.install()
 

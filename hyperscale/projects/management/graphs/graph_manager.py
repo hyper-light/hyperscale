@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Union
 
 from hyperscale.core.graphs.stages.base.stage import Stage
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.plugins.types.common.plugin import Plugin
 
 from .actions import CreateGitignore, Fetch, Initialize, RepoConfig, Syncrhonize

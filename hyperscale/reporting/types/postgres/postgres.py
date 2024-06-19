@@ -8,7 +8,7 @@
 import uuid
 from typing import Dict, List
 
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.reporting.experiment.experiments_collection import (
     ExperimentMetricsCollectionSet,
 )

@@ -30,7 +30,7 @@ from hyperscale.core.engines.types.websocket import WebsocketAction, WebsocketRe
 from hyperscale.core.experiments.mutations.types.base.mutation import Mutation
 from hyperscale.core.hooks.types.event.event import Event
 from hyperscale.core.hooks.types.event.hook import EventHook
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 S = TypeVar(
     'S',

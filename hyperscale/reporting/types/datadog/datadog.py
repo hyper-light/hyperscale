@@ -3,7 +3,7 @@ from typing import Dict
 
 from numpy import float32, float64, int16, int32, int64
 
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.reporting.experiment.experiments_collection import (
     ExperimentMetricsCollectionSet,
 )

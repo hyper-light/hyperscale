@@ -15,7 +15,7 @@ from hyperscale.core.engines.client.config import Config
 from hyperscale.core.hooks.types.action.hook import ActionHook
 from hyperscale.data.connectors.common.connector_type import ConnectorType
 from hyperscale.data.parsers.parser import Parser
-from hyperscale.logging import HyperscaleLogger
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 from .har_connector_config import HARConnectorConfig
 

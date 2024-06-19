@@ -12,7 +12,7 @@ from hyperscale.core.graphs.stages.base.exceptions.process_killed_error import (
     ProcessKilledError,
 )
 from hyperscale.core.graphs.stages.types.stage_types import StageTypes
-from hyperscale.logging import HyperscaleLogger, LoggerTypes
+from hyperscale.logging.hyperscale_logger import HyperscaleLogger, LoggerTypes
 from hyperscale.monitoring import CPUMonitor, MemoryMonitor
 from hyperscale.reporting.processed_result.processed_results_group import (
     ProcessedResultsGroup,
