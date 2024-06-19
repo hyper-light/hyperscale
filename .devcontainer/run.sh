@@ -12,4 +12,4 @@ uv pip install -r requirements.in
 uv pip install -e .
 
 playwright install
-playwright install-de
+playwright install-deps
