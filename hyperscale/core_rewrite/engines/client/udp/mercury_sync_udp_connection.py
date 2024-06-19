@@ -2,9 +2,10 @@ import asyncio
 import ssl
 import time
 from collections import defaultdict
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
+import orjson
 from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.shared.models import (
@@ -13,7 +14,7 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 )
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 
-from .models.udp import UDPRequest, UDPResponse
+from .models.udp import UDPResponse
 from .protocols import UDPConnection
 
 
@@ -89,17 +90,15 @@ class MercurySyncUDPConnection:
         self,
         url: str,
         data: str | bytes | BaseModel,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
     ):
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        UDPRequest(
-                            url=url,
-                            method="SEND",
-                            data=data,
-                        )
+                        url,
+                        "SEND",
+                        data=data,
                     ),
                     timeout=timeout,
                 )
@@ -117,7 +116,7 @@ class MercurySyncUDPConnection:
         url: str,
         delimiter: Optional[str | bytes] = b"\n",
         response_size: Optional[int] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
     ):
         async with self._semaphore:
             try:
@@ -126,12 +125,10 @@ class MercurySyncUDPConnection:
 
                 return await asyncio.wait_for(
                     self._request(
-                        UDPRequest(
-                            url=url,
-                            method="RECEIVE",
-                            response_size=response_size,
-                            delimiter=delimiter,
-                        )
+                        url,
+                        "RECEIVE",
+                        response_size=response_size,
+                        delimiter=delimiter,
                     ),
                     timeout=timeout,
                 )
@@ -150,7 +147,7 @@ class MercurySyncUDPConnection:
         data: str | bytes | BaseModel,
         delimiter: Optional[str | bytes] = b"\n",
         response_size: Optional[int] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
     ):
         async with self._semaphore:
             try:
@@ -159,13 +156,11 @@ class MercurySyncUDPConnection:
 
                 return await asyncio.wait_for(
                     self._request(
-                        UDPRequest(
-                            url=url,
-                            method="BIDIRECTIONAL",
-                            data=data,
-                            response_size=response_size,
-                            delimiter=delimiter,
-                        )
+                        url,
+                        "BIDIRECTIONAL",
+                        data=data,
+                        response_size=response_size,
+                        delimiter=delimiter,
                     ),
                     timeout=timeout,
                 )
@@ -180,7 +175,11 @@ class MercurySyncUDPConnection:
 
     async def _request(
         self,
-        request: UDPRequest,
+        request_url: str,
+        method: Literal["BIDIRECTIONAL", "RECEIVE", "SEND"],
+        data: str | bytes | BaseModel,
+        delimiter: Optional[str | bytes] = b"\n",
+        response_size: Optional[int] = None,
         timings: Dict[
             Literal[
                 "request_start",
@@ -195,8 +194,6 @@ class MercurySyncUDPConnection:
             float | None,
         ] = {},
     ):
-        request_url = request.url
-
         if timings["connect_start"] is None:
             timings["connect_start"] = time.monotonic()
 
@@ -212,12 +209,17 @@ class MercurySyncUDPConnection:
         if connection.reader is None:
             timings["connect_end"] = time.monotonic()
             self._connections.append(
-                UDPConnection(reset_connections=self.reset_connections)
+                UDPConnection(
+                    reset_connections=self.reset_connections,
+                )
             )
 
             return (
                 UDPResponse(
-                    url=URLMetadata(host=url.hostname, path=url.path),
+                    url=URLMetadata(
+                        host=url.hostname,
+                        path=url.path,
+                    ),
                     error=str(error),
                     timings=timings,
                 ),
@@ -227,47 +229,50 @@ class MercurySyncUDPConnection:
 
         timings["connect_end"] = time.monotonic()
 
-        data = request.prepare()
         response_data = b""
 
         try:
-            match request.method:
+            match method:
                 case "BIDIRECTIONAL":
                     timings["write_start"] = time.monotonic()
 
-                    connection.writer.write(data)
+                    encoded_data = self._encode_data(data)
+                    connection.writer.write(encoded_data)
 
                     timings["write_end"] = time.monotonic()
                     timings["read_start"] = time.monotonic()
 
-                    if request.response_size:
+                    if response_size:
                         response_data = await connection.reader.readexactly(
-                            request.response_size
+                            response_size
                         )
 
                     else:
                         response_data = await connection.reader.readuntil(
-                            separator=request.delimiter
+                            separator=delimiter
                         )
 
                     timings["read_end"] = time.monotonic()
 
                 case "SEND":
                     timings["write_start"] = time.monotonic()
+
+                    encoded_data = self._encode_data(data)
                     connection.writer.write(data)
+
                     timings["write_end"] = time.monotonic()
 
                 case "RECEIVE":
                     timings["read_start"] = time.monotonic()
 
-                    if request.response_size:
+                    if response_size:
                         response_data = await connection.reader.readexactly(
-                            request.response_size
+                            response_size
                         )
 
                     else:
                         response_data = await connection.reader.readuntil(
-                            separator=request.delimiter
+                            separator=delimiter
                         )
 
                     timings["read_end"] = time.monotonic()
@@ -286,19 +291,27 @@ class MercurySyncUDPConnection:
             self._connections.append(connection)
 
             return UDPResponse(
-                url=URLMetadata(host=url.hostname, path=url.path),
+                url=URLMetadata(
+                    host=url.hostname,
+                    path=url.path,
+                ),
                 content=response_data,
                 timings=timings,
             )
 
         except Exception as err:
             self._connections.append(
-                UDPConnection(reset_connections=self.reset_connections)
+                UDPConnection(
+                    reset_connections=self.reset_connections,
+                )
             )
 
             return (
                 UDPResponse(
-                    url=URLMetadata(host=url.hostname, path=url.path),
+                    url=URLMetadata(
+                        host=url.hostname,
+                        path=url.path,
+                    ),
                     error=str(err),
                     timings=timings,
                 ),
@@ -378,3 +391,19 @@ class MercurySyncUDPConnection:
             connection,
             parsed_url,
         )
+
+    def _encode_data(self, data: str | list | dict | BaseModel | bytes):
+        if isinstance(data, BaseModel):
+            return orjson.dumps({name: value for name, value in data.model_dump()})
+
+        elif isinstance(data, (list, dict)):
+            return orjson.dumps(data)
+
+        elif isinstance(data, str):
+            return data.encode()
+
+        elif isinstance(data, (memoryview, bytearray)):
+            return bytes(data)
+
+        else:
+            return data
