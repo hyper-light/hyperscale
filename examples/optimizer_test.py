@@ -6,7 +6,7 @@ from typing import Generic, Literal, TypeVar
 
 from hyperscale.core.engines.types.http2 import HTTP2Result
 from hyperscale.core_rewrite import Graph, Workflow, step
-from hyperscale.core_rewrite.engines.client.shared.models import URL
+from hyperscale.core_rewrite.hooks.optimized.models import URL, Headers
 
 
 class Result:
@@ -66,7 +66,7 @@ class Test(Workflow):
     async def six(
         self,
         url: URL = "https://httpbin.org/get",
-        headers: dict[str, str] = {"test": "this"},
+        headers: Headers = {"test": "this"},
     ) -> HTTP2Result:
         return await self.client.graphql.query(
             url,

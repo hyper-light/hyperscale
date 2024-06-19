@@ -1,14 +1,11 @@
-from _collections_abc import (
-    dict_items,
-    dict_keys,
-    dict_values,
-)
 from typing import (
     Any,
     Dict,
     Generator,
     Generic,
+    Iterable,
     Optional,
+    Tuple,
     TypeVar,
 )
 
@@ -36,25 +33,25 @@ class Params(OptimizedArg, Generic[T]):
         self.data: FrozenDict = FrozenDict(validated_params.value)
         self.optimized: Optional[str] = None
 
-    def __getitem__(self, key: str) -> str | int | float | bool:
+    def __getitem__(self, key: str) -> HTTPEncodableValue:
         return self.data[key]
 
     def __iter__(self) -> Generator[str, Any, None]:
         for key in self.data:
             yield key
 
-    def items(self) -> dict_items[str, str | int | float | bool]:
+    def items(self) -> Iterable[Tuple[str, HTTPEncodableValue],]:
         return self.data.items()
 
-    def keys(self) -> dict_keys[str]:
+    def keys(self) -> Iterable[str]:
         return self.data.keys()
 
-    def values(self) -> dict_values[str | int | float | bool]:
+    def values(self) -> Iterable[HTTPEncodableValue]:
         return self.data.values()
 
     def get(
         self,
         key: str,
-        default: Optional[HTTPEncodableValue] = None,
-    ) -> Optional[str | int | float | bool]:
+        default: Optional[Any] = None,
+    ) -> Optional[HTTPEncodableValue]:
         return self.data.get(key, default)

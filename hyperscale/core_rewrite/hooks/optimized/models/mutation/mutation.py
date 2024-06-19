@@ -1,19 +1,19 @@
-from _collections_abc import (
-    dict_items,
-    dict_keys,
-    dict_values,
-)
 from typing import (
     Any,
     Dict,
     Generator,
     Generic,
+    Iterable,
     Literal,
     Optional,
+    Tuple,
     TypeVar,
 )
 
 from hyperscale.core_rewrite.hooks.optimized.models.base import OptimizedArg
+from hyperscale.core_rewrite.hooks.optimized.models.base.base_types import (
+    HTTPEncodableValue,
+)
 
 from .mutation_validator import MutationValidator
 
@@ -29,7 +29,7 @@ class Mutation(OptimizedArg, Generic[T]):
                 "operation_name",
                 "variables",
             ],
-            str | Dict[str, Any],
+            str | Dict[str, HTTPEncodableValue],
         ],
     ) -> None:
         super(
@@ -44,7 +44,7 @@ class Mutation(OptimizedArg, Generic[T]):
                 "operation_name",
                 "variables",
             ],
-            str | Dict[str, Any],
+            str | Dict[str, HTTPEncodableValue],
         ] = validated_mutation.model_dump()
 
         self.optimized: Optional[bytes] = None
@@ -56,7 +56,7 @@ class Mutation(OptimizedArg, Generic[T]):
             "operation_name",
             "variables",
         ],
-    ) -> str | Dict[str, Any]:
+    ) -> str | Dict[str, HTTPEncodableValue]:
         return self.data[key]
 
     def __iter__(
@@ -75,19 +75,21 @@ class Mutation(OptimizedArg, Generic[T]):
 
     def items(
         self,
-    ) -> dict_items[
-        Literal[
-            "query",
-            "operation_name",
-            "variables",
-        ],
-        str | Dict[str, Any],
+    ) -> Iterable[
+        Tuple[
+            Literal[
+                "query",
+                "operation_name",
+                "variables",
+            ],
+            str | Dict[str, HTTPEncodableValue],
+        ]
     ]:
         return self.data.items()
 
     def keys(
         self,
-    ) -> dict_keys[
+    ) -> Iterable[
         Literal[
             "query",
             "operation_name",
@@ -96,7 +98,7 @@ class Mutation(OptimizedArg, Generic[T]):
     ]:
         return self.data.keys()
 
-    def values(self) -> dict_values[str | Dict[str, Any]]:
+    def values(self) -> Iterable[str | Dict[str, HTTPEncodableValue]]:
         return self.data.values()
 
     def get(
@@ -107,5 +109,5 @@ class Mutation(OptimizedArg, Generic[T]):
             "variables",
         ],
         default: Optional[Any] = None,
-    ) -> Optional[str | Dict[str, Any] | Any]:
+    ) -> Optional[str | Dict[str, HTTPEncodableValue] | Any]:
         return self.data.get(key, default)

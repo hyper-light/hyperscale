@@ -22,6 +22,17 @@ from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 from hyperscale.core_rewrite.parser import Parser
 
 from .call_arg import CallArg
+from .optimized.models import (
+    URL,
+    Auth,
+    Cookies,
+    Data,
+    Headers,
+    Mutation,
+    Params,
+    Protobuf,
+    Query,
+)
 
 
 class Hook:
@@ -47,18 +58,60 @@ class Hook:
         self.call_id: int = 0
 
         self.params = call_signature.parameters
+
+        self._optimized_types: Dict[
+            Literal[
+                "Auth",
+                "Cookies",
+                "Data",
+                "Headers",
+                "Mutation",
+                "Params",
+                "Protobuf",
+                "Query",
+                "URL",
+            ],
+            Type[
+                Auth
+                | Cookies
+                | Data
+                | Headers
+                | Mutation
+                | Params
+                | Protobuf
+                | Query
+                | URL
+            ],
+        ] = {
+            "Auth": Auth,
+            "Cookies": Cookies,
+            "Data": Data,
+            "Headers": Headers,
+            "Mutation": Mutation,
+            "Params": Params,
+            "Protobuf": Protobuf,
+            "Query": Query,
+            "URL": URL,
+        }
+
         self.args: Dict[
             int,
             Dict[
                 Union[Literal["annotation"], Literal["default"]], Union[Type[Any], Any]
             ],
         ] = {
-            arg.name: {"annotation": arg.annotation, "default": arg.default}
+            arg.name: {
+                "annotation": arg.annotation,
+                "default": arg.default,
+                "key": self._optimized_types[arg.annotation](arg.default),
+            }
             for arg in self.params.values()
             if arg.KEYWORD_ONLY
+            and arg.name != "self"
+            and self._optimized_types.get(arg.annotation)
         }
 
-        # self.static = len([param for param in self.params if param != "self"]) == 0
+        print(self.args)
 
         self.static = True
         self.return_type = call_signature.return_annotation
