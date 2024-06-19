@@ -4,6 +4,7 @@ import time
 from collections import defaultdict, deque
 from typing import (
     Dict,
+    Iterator,
     List,
     Literal,
     Optional,
@@ -11,8 +12,13 @@ from typing import (
     TypeVar,
     Union,
 )
-from urllib.parse import urlparse
+from urllib.parse import (
+    ParseResult,
+    urlencode,
+    urlparse,
+)
 
+import orjson
 from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.http3.protocols.quic_protocol import (
@@ -28,9 +34,10 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
     HTTPEncodableValue,
     URLMetadata,
 )
+from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 
-from .models.http3 import HTTP3Request, HTTP3Response
+from .models.http3 import HTTP3Response
 from .protocols import HTTP3Connection
 
 A = TypeVar("A")
@@ -86,24 +93,22 @@ class MercurySyncHTTP3Connection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Dict[str, str] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTP3Request(
-                            url=url,
-                            method="HEAD",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "HEAD",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -129,24 +134,22 @@ class MercurySyncHTTP3Connection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Dict[str, str] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTP3Request(
-                            url=url,
-                            method="OPTIONS",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "OPTIONS",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -172,25 +175,23 @@ class MercurySyncHTTP3Connection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Dict[str, str] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTP3Request(
-                            url=url,
-                            method="GET",
-                            cookies=cookies,
-                            data=None,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            redirects=redirects,
-                        )
+                        url,
+                        "GET",
+                        cookies=cookies,
+                        data=None,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -216,26 +217,24 @@ class MercurySyncHTTP3Connection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Dict[str, str] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
+        timeout: Optional[int | float] = None,
+        data: Optional[str | BaseModel | tuple | dict | list] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTP3Request(
-                            url=url,
-                            method="POST",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            data=data,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "POST",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        data=data,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -261,26 +260,24 @@ class MercurySyncHTTP3Connection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Dict[str, str] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
+        timeout: Optional[int | float] = None,
+        data: Optional[str | BaseModel | tuple | dict | list] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTP3Request(
-                            url=url,
-                            method="PUT",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            data=data,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "PUT",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        data=data,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -306,26 +303,24 @@ class MercurySyncHTTP3Connection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Dict[str, str] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
+        timeout: Optional[int | float] = None,
+        data: Optional[str | BaseModel | tuple | dict | list] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTP3Request(
-                            url=url,
-                            method="PATCH",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            data=data,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "PATCH",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        data=data,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -351,24 +346,22 @@ class MercurySyncHTTP3Connection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Dict[str, str] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTP3Request(
-                            url=url,
-                            method="DELETE",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "DELETE",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -389,7 +382,17 @@ class MercurySyncHTTP3Connection:
                     status_message="Request timed out.",
                 )
 
-    async def _request(self, request: HTTP3Request):
+    async def _request(
+        self,
+        url: str,
+        method: str,
+        auth: Optional[Tuple[str, str]] = None,
+        cookies: Optional[List[HTTPCookie]] = None,
+        headers: Dict[str, str] = None,
+        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        data: Optional[str | BaseModel | tuple | dict | list] = None,
+        redirects: int = 3,
+    ):
         timings: Dict[
             Literal[
                 "request_start",
@@ -414,18 +417,33 @@ class MercurySyncHTTP3Connection:
         }
         timings["request_start"] = time.monotonic()
 
-        result, redirect, timings = await self._execute(request, timings=timings)
+        result, redirect, timings = await self._execute(
+            url,
+            method,
+            auth=auth,
+            cookies=cookies,
+            headers=headers,
+            params=params,
+            data=data,
+            timings=timings,
+        )
 
         if redirect:
             location = result.headers.get("location")
 
             upgrade_ssl = False
-            if "https" in location and "https" not in request.url:
+            if "https" in location and "https" not in url:
                 upgrade_ssl = True
 
-            for _ in range(request.redirects):
+            for _ in range(redirects):
                 result, redirect, timings = await self._execute(
-                    request,
+                    url,
+                    method,
+                    auth=auth,
+                    cookies=cookies,
+                    headers=headers,
+                    params=params,
+                    data=data,
                     upgrade_ssl=upgrade_ssl,
                     redirect_url=location,
                     timings=timings,
@@ -437,7 +455,7 @@ class MercurySyncHTTP3Connection:
                 location = result.headers.get("location")
 
                 upgrade_ssl = False
-                if "https" in location and "https" not in request.url:
+                if "https" in location and "https" not in url:
                     upgrade_ssl = True
 
         timings["request_end"] = time.monotonic()
@@ -447,7 +465,13 @@ class MercurySyncHTTP3Connection:
 
     async def _execute(
         self,
-        request: HTTP3Request,
+        request_url: str,
+        method: str,
+        auth: Optional[Tuple[str, str]] = None,
+        cookies: Optional[List[HTTPCookie]] = None,
+        headers: Dict[str, str] = None,
+        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        data: Optional[str | BaseModel | tuple | dict | list] = None,
         upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
@@ -483,9 +507,6 @@ class MercurySyncHTTP3Connection:
         if redirect_url:
             request_url = redirect_url
 
-        else:
-            request_url = request.url
-
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
@@ -509,8 +530,6 @@ class MercurySyncHTTP3Connection:
 
                 request_url = ssl_redirect_url
 
-            encoded_headers = request.encode_headers(url)
-
             if connection.protocol is None:
                 timings["connect_end"] = time.monotonic()
                 self._connections.append(
@@ -522,9 +541,9 @@ class MercurySyncHTTP3Connection:
                 return (
                     HTTP3Response(
                         url=URLMetadata(host=url.hostname, path=url.path),
-                        method=request.method,
+                        method=method,
                         status=400,
-                        headers=request.headers,
+                        headers=headers,
                         timings=timings,
                     ),
                     False,
@@ -535,6 +554,13 @@ class MercurySyncHTTP3Connection:
 
             if timings["write_start"] is None:
                 timings["write_start"] = time.monotonic()
+
+            encoded_headers = self._encode_headers(
+                url,
+                method,
+                params=params,
+                headers=headers,
+            )
 
             stream_id = connection.protocol.quic.get_next_available_stream_id()
 
@@ -560,18 +586,23 @@ class MercurySyncHTTP3Connection:
             connection.protocol.quic.send_stream_data(
                 stream_id,
                 encode_frame(FrameType.HEADERS, frame_data),
-                end_stream=not request.data,
+                end_stream=not data,
             )
 
-            if request.data:
-                data = request.encode_data()
+            if data:
+                encoded_data = self._encode_data()
 
                 stream = connection.protocol.get_or_create_stream(stream_id)
                 if stream.headers_send_state != HeadersState.AFTER_HEADERS:
                     raise Exception("DATA frame is not allowed in this state")
 
                 connection.protocol.quic.send_stream_data(
-                    stream_id, encode_frame(FrameType.DATA, data), True
+                    stream_id,
+                    encode_frame(
+                        FrameType.DATA,
+                        encoded_data,
+                    ),
+                    True,
                 )
 
             waiter = connection.protocol.loop.create_future()
@@ -586,7 +617,8 @@ class MercurySyncHTTP3Connection:
                 timings["read_start"] = time.monotonic()
 
             response_frames: ResponseFrameCollection = await asyncio.wait_for(
-                waiter, timeout=self.timeouts.total_timeout
+                waiter,
+                timeout=self.timeouts.request_timeout,
             )
 
             headers: Dict[str, Union[bytes, int]] = {}
@@ -607,7 +639,7 @@ class MercurySyncHTTP3Connection:
                             params=url.params,
                             query=url.query,
                         ),
-                        method=request.method,
+                        method=method,
                         status=status,
                         headers=headers,
                         timings=timings,
@@ -635,7 +667,7 @@ class MercurySyncHTTP3Connection:
                         query=url.query,
                     ),
                     cookies=cookies,
-                    method=request.method,
+                    method=method,
                     status=status,
                     headers=headers,
                     content=response_frames.body,
@@ -651,7 +683,7 @@ class MercurySyncHTTP3Connection:
             )
 
             if isinstance(request_url, str):
-                request_url = urlparse(request_url)
+                request_url: ParseResult = urlparse(request_url)
 
             timings["read_end"] = time.monotonic()
 
@@ -663,7 +695,7 @@ class MercurySyncHTTP3Connection:
                         params=request_url.params,
                         query=request_url.query,
                     ),
-                    method=request.method,
+                    method=method,
                     status=400,
                     status_message=str(request_exception),
                     timings=timings,
@@ -753,3 +785,69 @@ class MercurySyncHTTP3Connection:
                 raise connection_error
 
         return connection, parsed_url, False
+
+    def _encode_headers(
+        self,
+        url: URL,
+        method: str,
+        params: Optional[Dict[str, str]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        url_path = url.path
+        if params:
+            url_params = urlencode(params)
+            url_path += f"?{url_params}"
+
+        encoded_headers: List[Tuple[bytes, bytes]] = [
+            (b":method", method.encode()),
+            (b":scheme", url.scheme.encode()),
+            (b":authority", url.authority.encode()),
+            (b":path", url_path),
+            (b"user-agent", "hyperscale/client".encode()),
+        ]
+
+        if headers:
+            encoded_headers.extend(
+                [
+                    (
+                        k.encode(),
+                        v.encode(),
+                    )
+                    for (k, v) in headers.items()
+                ]
+            )
+
+        return encoded_headers
+
+    def _encode_data(
+        self,
+        data: str | BaseModel | tuple | dict | list,
+    ):
+        encoded_data: Optional[bytes] = None
+        size = 0
+
+        if isinstance(data, Iterator):
+            chunks = []
+            for chunk in data:
+                chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
+                encoded_chunk = chunk_size.encode() + chunk + NEW_LINE.encode()
+                size += len(encoded_chunk)
+                chunks.append(encoded_chunk)
+
+            self.is_stream = True
+            encoded_data = chunks
+
+        else:
+            if isinstance(data, (dict, list)):
+                encoded_data = orjson.dumps(data)
+
+            elif isinstance(data, BaseModel):
+                return data.model_dump_json().encode()
+
+            elif isinstance(data, tuple):
+                encoded_data = urlencode(data).encode()
+
+            elif isinstance(data, str):
+                encoded_data = data.encode()
+
+        return encoded_data

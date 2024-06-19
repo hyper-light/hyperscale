@@ -17,7 +17,6 @@ uvloop
 tdigest
 pydantic
 GitPython
-hyperframe
 tabulate
 plotille
 python3-dtls
