@@ -6,12 +6,12 @@
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/hyperscale)](https://pypi.org/project/hyperscale/)
 
 
-| Package     | Hyperscale                                                           |
+| Package     | Hyperscale                                                      |
 | ----------- | -----------                                                     |
-| Version     | 0.7.19                                                          |
-| Web         | https://hyperscale.dev                                               |
-| Download    | https://pypi.org/project/hyperscale/                                 | 
-| Source      | https://github.com/hyper-light/hyperscale                             |
+| Version     | 0.1.0                                                           |
+| Web         | https://hyperscale.dev                                          |
+| Download    | https://pypi.org/project/hyperscale/                            | 
+| Source      | https://github.com/hyper-light/hyperscale                       |
 | Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
 
 Hyperscale is a Python performance and scalable unit/integration testing framework that makes creating and running complex test workflows easy.
