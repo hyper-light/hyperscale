@@ -433,9 +433,8 @@ class MercurySyncWebsocketConnection:
                     connection.readexactly(body_size), self.timeouts.request_timeout
                 )
 
-            self._connections.append(connection)
-
             timings["read_end"] = time.monotonic()
+            self._connections.append(connection)
 
             return (
                 WebsocketResponse(
@@ -454,6 +453,8 @@ class MercurySyncWebsocketConnection:
             )
 
         except Exception as request_exception:
+            timings["read_end"] = time.monotonic()
+
             self._connections.append(
                 WebsocketConnection(
                     reset_connection=self.reset_connections,
@@ -462,8 +463,6 @@ class MercurySyncWebsocketConnection:
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
-
-            timings["read_end"] = time.monotonic()
 
             return (
                 WebsocketResponse(
