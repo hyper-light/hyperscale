@@ -17,6 +17,17 @@ from typing import (
     get_origin,
 )
 
+from hyperscale.core_rewrite.hooks.optimized.models import (
+    URL,
+    Auth,
+    Cookies,
+    Data,
+    Headers,
+    Mutation,
+    Params,
+    Protobuf,
+    Query,
+)
 from hyperscale.core_rewrite.snowflake.snowflake_generator import SnowflakeGenerator
 
 from .dynamic_placeholder import DynamicPlaceholder
@@ -104,7 +115,22 @@ class Parser:
             )
             and arg_default
             and arg_default["default"]
+            and isinstance(
+                arg_default.get("annotation"),
+                (
+                    URL,
+                    Cookies,
+                    Auth,
+                    Data,
+                    Mutation,
+                    Params,
+                    Protobuf,
+                    Query,
+                    Headers,
+                ),
+            )
         ):
+            print("HERE!")
             return arg_default["default"]
 
         return DynamicPlaceholder(node.id)

@@ -3,9 +3,10 @@ import re
 from typing import Dict, Literal, Optional, Type, TypeVar, Union
 
 import orjson
-from pydantic import BaseModel, StrictBytes, StrictFloat, StrictInt, StrictStr
+from pydantic import StrictBytes, StrictFloat, StrictInt, StrictStr
 
 from hyperscale.core_rewrite.engines.client.shared.models import (
+    CallResult,
     Cookies,
     URLMetadata,
 )
@@ -13,87 +14,83 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 space_pattern = re.compile(r"\s+")
 
 
-T = TypeVar('T', bound=BaseModel)
+T = TypeVar("T", bound=CallResult)
 
 
-class HTTP3Response(BaseModel):
-    url: URLMetadata
-    method: Optional[
-        Literal[
-            "GET", 
-            "POST",
-            "HEAD",
-            "OPTIONS", 
-            "PUT", 
-            "PATCH", 
-            "DELETE"
-        ]
-    ]=None
-    cookies: Union[
-        Optional[Cookies],
-        Optional[None]
-    ]=None
-    status: Optional[StrictInt]=None
-    status_message: Optional[StrictStr]=None
-    headers: Dict[StrictBytes, StrictBytes]={}
-    content: StrictBytes=b''
-    timings: Dict[StrictStr, StrictFloat]={}
+class HTTP3Response(CallResult):
+    __slots__ = (
+        "url",
+        "method",
+        "cookies",
+        "status",
+        "status_message",
+        "headers",
+        "content",
+        "timings",
+    )
 
-    class Config:
-        arbitrary_types_allowed=True
+    def __init__(
+        self,
+        url: URLMetadata,
+        method: Optional[
+            Literal["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+        ] = None,
+        cookies: Union[Optional[Cookies], Optional[None]] = None,
+        status: Optional[StrictInt] = None,
+        status_message: Optional[StrictStr] = None,
+        headers: Dict[StrictBytes, StrictBytes] = {},
+        content: StrictBytes = b"",
+        timings: Dict[StrictStr, StrictFloat] = {},
+    ):
+        super(
+            HTTP3Response,
+            self,
+        ).__init__()
+
+        self.url = url
+        self.method = method
+        self.cookies = cookies
+        self.status = status
+        self.status_message = status_message
+        self.headers = headers
+        self.content = content
+        self.timings = timings
 
     def check_success(self) -> bool:
-        return (
-            self.status and self.status >= 200 and self.status < 300
-        )
-    
-    def json(self):
+        return self.status and self.status >= 200 and self.status < 300
 
+    def json(self):
         if self.content:
-            return orjson.loads(
-                self.content
-            )
-    
+            return orjson.loads(self.content)
+
         return {}
-        
+
     def text(self):
         return self.content.decode()
-    
-    def to_model(
-        self,
-        model: Type[T]
-    ) -> T:
-        return model(**orjson.loads(
-            self.content
-        ))
+
+    def to_model(self, model: Type[T]) -> T:
+        return model(**orjson.loads(self.content))
 
     @property
-    def data(
-        self,
-        model: Optional[Type[T]]=None
-    ):
-
-        content_type = self.headers.get('content-type')
+    def data(self, model: Optional[Type[T]] = None):
+        content_type = self.headers.get("content-type")
 
         if model:
             return self.to_model(model)
 
         try:
             match content_type:
-
-                case 'application/json':
+                case "application/json":
                     return self.json()
-                
-                case 'text/plain':
+
+                case "text/plain":
                     return self.text()
-                
-                case 'application/gzip':
+
+                case "application/gzip":
                     return gzip.decompress(self.content)
-                
+
                 case _:
                     return self.content
 
         except Exception:
             return self.content
-            
- 

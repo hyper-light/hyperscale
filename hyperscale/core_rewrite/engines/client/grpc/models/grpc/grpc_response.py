@@ -17,18 +17,40 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 
 
 class GRPCResponse(HTTP2Response):
-    url: URLMetadata
-    method: Optional[
-        Literal["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
-    ] = FileNotFoundError
-    status: Optional[StrictInt] = None
-    status_message: Optional[StrictStr] = None
-    headers: Dict[StrictStr, StrictStr] = {}
-    content: StrictBytes = b""
-    timings: Dict[StrictStr, StrictFloat] = {}
+    __slots__ = (
+        "url",
+        "method",
+        "status",
+        "status_message",
+        "headers",
+        "content",
+        "timings",
+    )
 
-    class Config:
-        arbitrary_types_allowed = True
+    def __init__(
+        self,
+        url: URLMetadata,
+        method: Optional[
+            Literal["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+        ] = None,
+        status: Optional[StrictInt] = None,
+        status_message: Optional[StrictStr] = None,
+        headers: Dict[StrictStr, StrictStr] = {},
+        content: StrictBytes = b"",
+        timings: Dict[StrictStr, StrictFloat] = {},
+    ):
+        super(
+            GRPCResponse,
+            self,
+        ).__init__(
+            url,
+            method=method,
+            status=status,
+            status_message=status_message,
+            headers=headers,
+            content=content,
+            timings=timings,
+        )
 
     def check_success(self) -> bool:
         return self.status and self.status >= 200 and self.status < 300

@@ -14,10 +14,11 @@ from typing import (
     Type,
     Union,
     get_args,
+    get_type_hints,
 )
 
 from hyperscale.core.engines.types.common.base_action import BaseAction
-from hyperscale.core.engines.types.common.base_result import BaseResult
+from hyperscale.core_rewrite.engines.client.shared.models import CallResult
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 from hyperscale.core_rewrite.parser import Parser
 
@@ -39,7 +40,7 @@ class Hook:
     def __init__(
         self,
         call: Callable[
-            ..., Awaitable[Any] | Awaitable[BaseAction] | Awaitable[BaseResult]
+            ..., Awaitable[Any] | Awaitable[BaseAction] | Awaitable[CallResult]
         ],
         dependencies: List[str],
         timeouts: Optional[Timeouts] = None,
@@ -58,6 +59,8 @@ class Hook:
         self.call_id: int = 0
 
         self.params = call_signature.parameters
+
+        print(call_signature.return_annotation)
 
         self._optimized_types: Dict[
             Literal[
@@ -94,6 +97,8 @@ class Hook:
             "URL": URL,
         }
 
+        param_types = get_type_hints(call)
+
         self.args: Dict[
             int,
             Dict[
@@ -101,7 +106,7 @@ class Hook:
             ],
         ] = {
             arg.name: {
-                "annotation": arg.annotation,
+                "annotation": param_types.get(arg.name),
                 "default": arg.default,
                 "key": self._optimized_types[arg.annotation](arg.default),
             }
@@ -114,7 +119,7 @@ class Hook:
         print(self.args)
 
         self.static = True
-        self.return_type = call_signature.return_annotation
+        self.return_type = param_types.get("return")
         self.is_test = False
 
         annotation_subtypes = list(get_args(self.return_type))
@@ -123,7 +128,7 @@ class Hook:
             self.return_type = [return_type for return_type in annotation_subtypes]
 
         else:
-            self.is_test = self.return_type in BaseResult.__subclasses__()
+            self.is_test = self.return_type in CallResult.__subclasses__()
 
         self.cache: Dict[
             str, Dict[int, Dict[str, Union[List[Dict[str, Any]], Dict[str, Any]]]]

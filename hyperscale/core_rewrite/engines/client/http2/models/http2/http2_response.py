@@ -5,9 +5,10 @@ import zlib
 from typing import Dict, Literal, Optional, Type, TypeVar, Union
 
 import orjson
-from pydantic import BaseModel, StrictBytes, StrictFloat, StrictInt, StrictStr
+from pydantic import StrictBytes, StrictFloat, StrictInt, StrictStr
 
 from hyperscale.core_rewrite.engines.client.shared.models import (
+    CallResult,
     Cookies,
     URLMetadata,
 )
@@ -15,20 +16,44 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 T = TypeVar("T")
 
 
-class HTTP2Response(BaseModel):
-    url: URLMetadata
-    method: Optional[
-        Literal["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
-    ] = None
-    cookies: Union[Optional[Cookies], Optional[None]] = None
-    status: Optional[StrictInt] = None
-    status_message: Optional[StrictStr] = None
-    headers: Dict[StrictStr, StrictStr] = {}
-    content: StrictBytes = b""
-    timings: Dict[StrictStr, StrictFloat] = {}
+class HTTP2Response(CallResult):
+    __slots__ = (
+        "url",
+        "method",
+        "cookies",
+        "status",
+        "status_message",
+        "headers",
+        "content",
+        "timings",
+    )
 
-    class Config:
-        arbitrary_types_allowed = True
+    def __init__(
+        self,
+        url: URLMetadata,
+        method: Optional[
+            Literal["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+        ] = None,
+        cookies: Union[Optional[Cookies], Optional[None]] = None,
+        status: Optional[StrictInt] = None,
+        status_message: Optional[StrictStr] = None,
+        headers: Dict[StrictBytes, StrictBytes] = {},
+        content: StrictBytes = b"",
+        timings: Dict[StrictStr, StrictFloat] = {},
+    ):
+        super(
+            HTTP2Response,
+            self,
+        ).__init__()
+
+        self.url = url
+        self.method = method
+        self.cookies = cookies
+        self.status = status
+        self.status_message = status_message
+        self.headers = headers
+        self.content = content
+        self.timings = timings
 
     def check_success(self) -> bool:
         return self.status and self.status >= 200 and self.status < 300

@@ -4,8 +4,11 @@ import asyncio
 import os
 from typing import Generic, Literal, TypeVar
 
-from hyperscale.core.engines.types.http2 import HTTP2Result
 from hyperscale.core_rewrite import Graph, Workflow, step
+from hyperscale.core_rewrite.engines.client.graphql import GraphQLResponse
+from hyperscale.core_rewrite.engines.client.http import HTTPResponse
+from hyperscale.core_rewrite.engines.client.http2 import HTTP2Response
+from hyperscale.core_rewrite.engines.client.udp import UDPResponse
 from hyperscale.core_rewrite.hooks.optimized.models import URL, Headers
 
 
@@ -29,22 +32,22 @@ class Test(Workflow):
         return "Hello there!"
 
     @step()
-    async def one(self) -> HTTP2Result:
+    async def one(self) -> HTTPResponse:
         return await self.client.http.get("https://httpbin.org/get")
 
     @step("one")
-    async def two(self) -> HTTP2Result:
+    async def two(self) -> HTTPResponse:
         boop = self.different()
         return await self.client.http.get(
             f"https://httpbin.org/get?beep={boop}", headers={"test": (boop,)}
         )
 
     @step("one")
-    async def three(self) -> HTTP2Result:
+    async def three(self) -> HTTPResponse:
         return await self.client.http.get("https://httpbin.org/get")
 
     @step("two", "three")
-    async def four(self) -> HTTP2Result:
+    async def four(self) -> HTTP2Response:
         return await self.client.http2.post(
             "https://httpbin.org/post",
             headers={"test": "this"},
@@ -59,7 +62,7 @@ class Test(Workflow):
         )
 
     @step("two", "three")
-    async def five(self) -> HTTP2Result:
+    async def five(self) -> UDPResponse:
         return await self.client.udp.send(f"127.0.0.1:{self.udp_port}", "Test this!")
 
     @step("two", "three")
@@ -67,7 +70,7 @@ class Test(Workflow):
         self,
         url: URL = "https://httpbin.org/get",
         headers: Headers = {"test": "this"},
-    ) -> HTTP2Result:
+    ) -> GraphQLResponse:
         return await self.client.graphql.query(
             url,
             """
