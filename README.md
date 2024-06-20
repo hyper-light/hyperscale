@@ -70,7 +70,7 @@ hyperscale --help
 
 which should output
 
-![Output of the hyperscale --help command](https://github.com/hyper-light/hyperscale/blob/main/images/hedra_help_output.png?raw=true "Verifyin Install")
+![Output of the hyperscale --help command](https://github.com/hyper-light/hyperscale/blob/main/images/hedra_help_output.png?raw=true "Verifying Install")
 
 <br/>
 
