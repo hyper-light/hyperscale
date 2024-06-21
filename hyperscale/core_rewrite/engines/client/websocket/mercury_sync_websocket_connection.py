@@ -21,7 +21,9 @@ import orjson
 from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.shared.models import (
-    URL,
+    URL as HTTPUrl,
+)
+from hyperscale.core_rewrite.engines.client.shared.models import (
     Cookies,
     HTTPCookie,
     HTTPEncodableValue,
@@ -29,6 +31,7 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 )
 from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
+from hyperscale.core_rewrite.hooks.optimized.models import URL
 
 from .models.websocket import (
     WebsocketResponse,
@@ -69,11 +72,11 @@ class MercurySyncWebsocketConnection:
         self._semaphore: asyncio.Semaphore = None
         self._connection_waiters: List[asyncio.Future] = []
 
-        self._url_cache: Dict[str, URL] = {}
+        self._url_cache: Dict[str, HTTPUrl] = {}
 
     async def receive(
         self,
-        url: str,
+        url: str | URL,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
@@ -116,7 +119,7 @@ class MercurySyncWebsocketConnection:
 
     async def send(
         self,
-        url: str,
+        url: str | URL,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
         headers: Dict[str, str] = {},
@@ -157,9 +160,37 @@ class MercurySyncWebsocketConnection:
                     status_message="Request timed out.",
                 )
 
+    async def _optimize(self, url: Optional[URL] = None):
+        if isinstance(url, URL):
+            await self._optimize_url(url)
+
+    async def _optimize_url(self, url: URL):
+        try:
+            upgrade_ssl: bool = False
+            if url:
+                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            if upgrade_ssl:
+                url.data = url.data.replace("http://", "https://")
+
+                await url.optimize()
+
+                _, url, _ = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            self._url_cache[url.optimized.hostname] = url
+
+        except Exception:
+            pass
+
     async def _request(
         self,
-        url: str,
+        url: str | URL,
         method: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
@@ -240,7 +271,7 @@ class MercurySyncWebsocketConnection:
 
     async def _execute(
         self,
-        request_url: str,
+        request_url: str | URL,
         method: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
@@ -465,19 +496,25 @@ class MercurySyncWebsocketConnection:
             )
 
     async def _connect_to_url_location(
-        self, request_url: str, ssl_redirect_url: Optional[str] = None
-    ) -> Tuple[WebsocketConnection, URL, bool]:
-        if ssl_redirect_url:
-            parsed_url = URL(ssl_redirect_url)
+        self,
+        request_url: str | URL,
+        ssl_redirect_url: Optional[str] = None,
+    ) -> Tuple[WebsocketConnection, HTTPUrl, bool]:
+        has_optimized_url = isinstance(request_url, URL)
+        if has_optimized_url:
+            parsed_url = request_url.optimized
+
+        elif ssl_redirect_url:
+            parsed_url = HTTPUrl(ssl_redirect_url)
 
         else:
-            parsed_url = URL(request_url)
+            parsed_url = HTTPUrl(request_url)
 
         url = self._url_cache.get(parsed_url.hostname)
         dns_lock = self._dns_lock[parsed_url.hostname]
         dns_waiter = self._dns_waiters[parsed_url.hostname]
 
-        do_dns_lookup = url is None or ssl_redirect_url
+        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
             await dns_lock.acquire()
@@ -497,6 +534,9 @@ class MercurySyncWebsocketConnection:
         elif do_dns_lookup:
             await dns_waiter
             url = self._url_cache.get(parsed_url.hostname)
+
+        elif has_optimized_url:
+            url = request_url.optimized
 
         connection = self._connections.pop()
 
@@ -580,7 +620,7 @@ class MercurySyncWebsocketConnection:
 
     def _encode_headers(
         self,
-        url: URL,
+        url: HTTPUrl | URL,
         method: str,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         headers: Optional[Dict[str, str]] = None,
@@ -588,6 +628,9 @@ class MercurySyncWebsocketConnection:
         data: Optional[bytes | List[bytes]] = None,
         content_type: Optional[str] = None,
     ):
+        if isinstance(url, URL):
+            url = url.optimized
+
         url_path = url.path
 
         if params and len(params) > 0:

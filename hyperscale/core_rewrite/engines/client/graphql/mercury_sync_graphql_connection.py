@@ -20,7 +20,9 @@ import orjson
 from hyperscale.core_rewrite.engines.client.http import MercurySyncHTTPConnection
 from hyperscale.core_rewrite.engines.client.http.protocols import HTTPConnection
 from hyperscale.core_rewrite.engines.client.shared.models import (
-    URL,
+    URL as HTTPUrl,
+)
+from hyperscale.core_rewrite.engines.client.shared.models import (
     Cookies,
     HTTPCookie,
     HTTPEncodableValue,
@@ -29,6 +31,7 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 )
 from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
+from hyperscale.core_rewrite.hooks.optimized.models import URL
 
 from .models.graphql import (
     GraphQLResponse,
@@ -65,7 +68,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
 
     async def query(
         self,
-        url: str,
+        url: str | URL,
         query: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
@@ -109,7 +112,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
 
     async def mutate(
         self,
-        url: str,
+        url: str | URL,
         query: str,
         operation_name: str = None,
         variables: Dict[str, Any] = None,
@@ -157,9 +160,37 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     status_message="Request timed out.",
                 )
 
+    async def _optimize(self, url: Optional[URL] = None):
+        if isinstance(url, URL):
+            await self._optimize_url(url)
+
+    async def _optimize_url(self, url: URL):
+        try:
+            upgrade_ssl: bool = False
+            if url:
+                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            if upgrade_ssl:
+                url.data = url.data.replace("http://", "https://")
+
+                await url.optimize()
+
+                _, url, _ = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            self._url_cache[url.optimized.hostname] = url
+
+        except Exception:
+            pass
+
     async def _request(
         self,
-        url: str,
+        url: str | URL,
         method: Literal["GET", "POST"],
         cookies: Optional[List[HTTPCookie]] = None,
         auth: Optional[Tuple[str, str]] = None,
@@ -240,7 +271,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
 
     async def _execute(
         self,
-        request_url: str,
+        request_url: str | URL,
         method: Literal["GET", "POST"],
         cookies: Optional[List[HTTPCookie]] = None,
         auth: Optional[Tuple[str, str]] = None,
@@ -336,7 +367,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                 timings["write_start"] = time.monotonic()
 
             if method == "GET":
-                encoded_headers = self.encode_headers(
+                encoded_headers = self._encode_headers(
                     url,
                     method,
                     data,
@@ -347,9 +378,9 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                 connection.write(encoded_headers)
 
             else:
-                encoded_data = self.encode_data(data)
+                encoded_data = self._encode_data(data)
 
-                encoded_headers = self.encode_headers(
+                encoded_headers = self._encode_headers(
                     url,
                     method,
                     data,
@@ -491,7 +522,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                 timings,
             )
 
-    def encode_data(
+    def _encode_data(
         self,
         data: (
             Dict[Literal["query"], str]
@@ -515,9 +546,9 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
 
         return orjson.dumps(query)
 
-    def encode_headers(
+    def _encode_headers(
         self,
-        url: URL,
+        url: HTTPUrl | URL,
         method: Literal["GET", "POST"],
         data: (
             Dict[Literal["query"], str]
@@ -527,6 +558,9 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         cookies: Optional[List[HTTPCookie]] = None,
         encoded_data: Optional[bytes] = None,
     ):
+        if isinstance(url, URL):
+            url = url.optimized
+
         url_path = url.path
 
         if method == "GET":

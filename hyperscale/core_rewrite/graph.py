@@ -97,7 +97,10 @@ class Graph:
             for hook in hooks.values():
                 if len(hook.optimized_args) > 0:
                     await asyncio.gather(
-                        *[arg.optimize() for arg in hook.optimized_args.values()]
+                        *[
+                            arg.optimize(hook.engine_type)
+                            for arg in hook.optimized_args.values()
+                        ]
                     )
 
                     await asyncio.gather(
