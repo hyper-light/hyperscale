@@ -979,6 +979,9 @@ class MercurySyncHTTP2Connection:
             await dns_waiter
             url = self._url_cache.get(parsed_url.hostname)
 
+        elif has_optimized_url:
+            url = request_url.optimized
+
         connection = self._connections.pop()
         pipe = self._pipes.pop()
 
@@ -1001,11 +1004,19 @@ class MercurySyncHTTP2Connection:
                     url.address = address
                     url.socket_config = ip_info
 
-                except Exception as connection_error:
+                except Exception as err:
                     if "server_hostname is only meaningful with ssl" in str(
                         connection_error
                     ):
-                        return (None, None, None, parsed_url, True)
+                        return (
+                            None,
+                            None,
+                            None,
+                            parsed_url,
+                            True,
+                        )
+
+                    connection_error = err
 
         else:
             try:
@@ -1020,13 +1031,13 @@ class MercurySyncHTTP2Connection:
                     ssl_upgrade=ssl_redirect_url is not None,
                 )
 
-            except Exception as connection_error:
+            except Exception as err:
                 if "server_hostname is only meaningful with ssl" in str(
                     connection_error
                 ):
                     return (None, None, None, parsed_url, True)
 
-                raise connection_error
+                connection_error = err
 
         return (
             connection_error,

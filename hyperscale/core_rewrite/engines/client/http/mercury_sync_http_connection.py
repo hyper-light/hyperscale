@@ -897,7 +897,11 @@ class MercurySyncHTTPConnection:
 
                 raise connection_error
 
-        return connection, parsed_url, False
+        return (
+            connection,
+            parsed_url,
+            False,
+        )
 
     def _encode_data(
         self,

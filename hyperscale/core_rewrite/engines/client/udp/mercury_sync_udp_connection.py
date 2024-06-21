@@ -9,10 +9,22 @@ import orjson
 from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.shared.models import (
-    URL,
+    URL as UDPUrl,
+)
+from hyperscale.core_rewrite.engines.client.shared.models import (
+    RequestType,
     URLMetadata,
 )
+from hyperscale.core_rewrite.engines.client.shared.protocols import ProtocolMap
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
+from hyperscale.core_rewrite.hooks.optimized.models import (
+    URL,
+    Auth,
+    Cookies,
+    Data,
+    Headers,
+    Params,
+)
 
 from .models.udp import UDPResponse
 from .protocols import UDPConnection
@@ -46,17 +58,22 @@ class MercurySyncUDPConnection:
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
         self._connections_count: Dict[str, List[asyncio.Transport]] = defaultdict(list)
-        self._locks: Dict[asyncio.Transport, asyncio.Lock] = {}
 
         self._semaphore: asyncio.Semaphore = None
-        self._connection_waiters: List[asyncio.Future] = []
 
-        self._url_cache: Dict[str, URL] = {}
+        self._url_cache: Dict[str, UDPUrl] = {}
+
+        protocols = ProtocolMap()
+        address_family, protocol = protocols[RequestType.UDP]
+        self._optimized: Dict[str, URL | Params | Headers | Auth | Data | Cookies] = {}
+
+        self.address_family = address_family
+        self.address_protocol = protocol
 
     async def send(
         self,
-        url: str,
-        data: str | bytes | BaseModel,
+        url: str | URL,
+        data: str | bytes | BaseModel | Data,
         timeout: Optional[int | float] = None,
     ):
         async with self._semaphore:
@@ -71,16 +88,23 @@ class MercurySyncUDPConnection:
                 )
 
             except Exception as err:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return UDPResponse(
-                    url=URLMetadata(host=url_data.hostname, path=url_data.path),
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                    ),
                     error=str(err),
                 )
 
     async def receive(
         self,
-        url: str,
+        url: str | URL,
         delimiter: Optional[str | bytes] = b"\n",
         response_size: Optional[int] = None,
         timeout: Optional[int | float] = None,
@@ -101,7 +125,11 @@ class MercurySyncUDPConnection:
                 )
 
             except Exception as err:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return UDPResponse(
                     url=URLMetadata(host=url_data.hostname, path=url_data.path),
@@ -110,8 +138,8 @@ class MercurySyncUDPConnection:
 
     async def bidirectional(
         self,
-        url: str,
-        data: str | bytes | BaseModel,
+        url: str | URL,
+        data: str | bytes | BaseModel | Data,
         delimiter: Optional[str | bytes] = b"\n",
         response_size: Optional[int] = None,
         timeout: Optional[int | float] = None,
@@ -133,18 +161,63 @@ class MercurySyncUDPConnection:
                 )
 
             except Exception as err:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return UDPResponse(
-                    url=URLMetadata(host=url_data.hostname, path=url_data.path),
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                    ),
                     error=str(err),
                 )
 
+    async def _optimize(
+        self,
+        optimized_param: URL | Params | Headers | Cookies | Data | Auth,
+    ):
+        if isinstance(optimized_param, URL):
+            await self._optimize_url(optimized_param)
+
+        else:
+            self._optimized[optimized_param.call_name] = optimized_param
+
+    async def _optimize_url(
+        self,
+        url: URL,
+    ):
+        try:
+            upgrade_ssl: bool = False
+            if url:
+                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            if upgrade_ssl:
+                url.data = url.data.replace("http://", "https://")
+
+                await url.optimize()
+
+                _, url, _ = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            self._url_cache[url.optimized.hostname] = url
+            self._optimized[url.call_name] = url
+
+        except Exception:
+            pass
+
     async def _request(
         self,
-        request_url: str,
+        request_url: str | URL,
         method: Literal["BIDIRECTIONAL", "RECEIVE", "SEND"],
-        data: str | bytes | BaseModel,
+        data: str | bytes | BaseModel | Data,
         delimiter: Optional[str | bytes] = b"\n",
         response_size: Optional[int] = None,
         timings: Dict[
@@ -288,20 +361,30 @@ class MercurySyncUDPConnection:
 
     async def _connect_to_url_location(
         self,
-        request_url: str,
+        request_url: str | URL,
         ssl_redirect_url=None,
     ) -> Tuple[
         Optional[Exception],
         UDPConnection,
-        URL,
+        UDPUrl,
     ]:
-        parsed_url = URL(request_url)
+        has_optimized_url = isinstance(request_url, URL)
+
+        if has_optimized_url:
+            parsed_url = request_url.optimized
+
+        else:
+            parsed_url = UDPUrl(
+                request_url,
+                family=self.address_family,
+                protocol=self.address_protocol,
+            )
 
         url = self._url_cache.get(parsed_url.hostname)
         dns_lock = self._dns_lock[parsed_url.hostname]
         dns_waiter = self._dns_waiters[parsed_url.hostname]
 
-        do_dns_lookup = url is None or ssl_redirect_url
+        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
             await dns_lock.acquire()
@@ -321,6 +404,9 @@ class MercurySyncUDPConnection:
         elif do_dns_lookup:
             await dns_waiter
             url = self._url_cache.get(parsed_url.hostname)
+
+        elif has_optimized_url:
+            url = request_url.optimized
 
         connection_error: Optional[Exception] = None
         connection = self._connections.pop()
@@ -359,8 +445,14 @@ class MercurySyncUDPConnection:
             parsed_url,
         )
 
-    def _encode_data(self, data: str | list | dict | BaseModel | bytes):
-        if isinstance(data, BaseModel):
+    def _encode_data(
+        self,
+        data: str | list | dict | BaseModel | bytes | Data,
+    ):
+        if isinstance(data, Data):
+            return data.optimized
+
+        elif isinstance(data, BaseModel):
             return orjson.dumps(data.model_dump())
 
         elif isinstance(data, (list, dict)):

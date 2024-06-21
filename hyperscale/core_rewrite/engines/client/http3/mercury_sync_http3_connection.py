@@ -28,14 +28,26 @@ from hyperscale.core_rewrite.engines.client.http3.protocols.quic_protocol import
     encode_frame,
 )
 from hyperscale.core_rewrite.engines.client.shared.models import (
-    URL,
-    Cookies,
+    URL as HTTPUrl,
+)
+from hyperscale.core_rewrite.engines.client.shared.models import (
+    Cookies as HTTPCookies,
+)
+from hyperscale.core_rewrite.engines.client.shared.models import (
     HTTPCookie,
     HTTPEncodableValue,
     URLMetadata,
 )
 from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
+from hyperscale.core_rewrite.hooks.optimized.models import (
+    URL,
+    Auth,
+    Cookies,
+    Data,
+    Headers,
+    Params,
+)
 
 from .models.http3 import HTTP3Response
 from .protocols import HTTP3Connection
@@ -69,21 +81,19 @@ class MercurySyncHTTP3Connection:
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
-        self._connections_count: Dict[str, List[asyncio.Transport]] = defaultdict(list)
-        self._locks: Dict[asyncio.Transport, asyncio.Lock] = {}
-
         self._semaphore: asyncio.Semaphore = None
         self._connection_waiters: List[asyncio.Future] = []
 
-        self._url_cache: Dict[str, URL] = {}
+        self._url_cache: Dict[str, HTTPUrl] = {}
+        self._optimized: Dict[str, URL | Params | Headers | Auth | Data | Cookies] = {}
 
     async def head(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -103,7 +113,11 @@ class MercurySyncHTTP3Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP3Response(
                     url=URLMetadata(
@@ -120,11 +134,11 @@ class MercurySyncHTTP3Connection:
 
     async def options(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -144,7 +158,11 @@ class MercurySyncHTTP3Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP3Response(
                     url=URLMetadata(
@@ -161,11 +179,11 @@ class MercurySyncHTTP3Connection:
 
     async def get(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -186,7 +204,11 @@ class MercurySyncHTTP3Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP3Response(
                     url=URLMetadata(
@@ -203,13 +225,13 @@ class MercurySyncHTTP3Connection:
 
     async def post(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[str | BaseModel | tuple | dict | list | Data] = None,
         timeout: Optional[int | float] = None,
-        data: Optional[str | BaseModel | tuple | dict | list] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -229,7 +251,11 @@ class MercurySyncHTTP3Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP3Response(
                     url=URLMetadata(
@@ -246,13 +272,13 @@ class MercurySyncHTTP3Connection:
 
     async def put(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[str | BaseModel | tuple | dict | list | Data] = None,
         timeout: Optional[int | float] = None,
-        data: Optional[str | BaseModel | tuple | dict | list] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -272,7 +298,11 @@ class MercurySyncHTTP3Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP3Response(
                     url=URLMetadata(
@@ -289,13 +319,13 @@ class MercurySyncHTTP3Connection:
 
     async def patch(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
-        data: Optional[str | BaseModel | tuple | dict | list] = None,
+        data: Optional[str | BaseModel | tuple | dict | list | Data] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -315,7 +345,11 @@ class MercurySyncHTTP3Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP3Response(
                     url=URLMetadata(
@@ -332,11 +366,11 @@ class MercurySyncHTTP3Connection:
 
     async def delete(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -356,7 +390,11 @@ class MercurySyncHTTP3Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP3Response(
                     url=URLMetadata(
@@ -371,15 +409,50 @@ class MercurySyncHTTP3Connection:
                     status_message="Request timed out.",
                 )
 
+    async def _optimize(
+        self,
+        optimized_param: URL | Params | Headers | Cookies | Data | Auth,
+    ):
+        if isinstance(optimized_param, URL):
+            await self._optimize_url(optimized_param)
+
+        else:
+            self._optimized[optimized_param.call_name] = optimized_param
+
+    async def _optimize_url(self, url: URL):
+        try:
+            upgrade_ssl: bool = False
+            if url:
+                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            if upgrade_ssl:
+                url.data = url.data.replace("http://", "https://")
+
+                await url.optimize()
+
+                _, url, _ = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            self._url_cache[url.optimized.hostname] = url
+            self._optimized[url.call_name] = url
+
+        except Exception:
+            pass
+
     async def _request(
         self,
-        url: str,
+        url: str | URL,
         method: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        data: Optional[str | BaseModel | tuple | dict | list] = None,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[str | BaseModel | tuple | dict | list | Data] = None,
         redirects: int = 3,
     ):
         timings: Dict[
@@ -454,13 +527,13 @@ class MercurySyncHTTP3Connection:
 
     async def _execute(
         self,
-        request_url: str,
+        request_url: str | URL,
         method: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        data: Optional[str | BaseModel | tuple | dict | list] = None,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[str | BaseModel | tuple | dict | list | Data] = None,
         upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
@@ -544,12 +617,26 @@ class MercurySyncHTTP3Connection:
             if timings["write_start"] is None:
                 timings["write_start"] = time.monotonic()
 
-            encoded_headers = self._encode_headers(
-                url,
-                method,
-                params=params,
-                headers=headers,
-            )
+            encoded_data: Optional[bytes] = None
+            if data:
+                encoded_data, content_type = self._encode_data(data)
+                encoded_headers = self._encode_headers(
+                    url,
+                    method,
+                    params=params,
+                    headers=headers,
+                    data=data,
+                    encoded_data=encoded_data,
+                    content_type=content_type,
+                )
+
+            else:
+                encoded_headers = self._encode_headers(
+                    url,
+                    method,
+                    params=params,
+                    headers=headers,
+                )
 
             stream_id = connection.protocol.quic.get_next_available_stream_id()
 
@@ -558,12 +645,14 @@ class MercurySyncHTTP3Connection:
                 raise Exception("HEADERS frame is not allowed in this state")
 
             encoder, frame_data = connection.protocol.encoder.encode(
-                stream_id, encoded_headers
+                stream_id,
+                encoded_headers,
             )
 
             connection.protocol.encoder_bytes_sent += len(encoder)
             connection.protocol.quic.send_stream_data(
-                connection.protocol._local_encoder_stream_id, encoder
+                connection.protocol._local_encoder_stream_id,
+                encoder,
             )
 
             # update state and send headers
@@ -578,9 +667,7 @@ class MercurySyncHTTP3Connection:
                 end_stream=not data,
             )
 
-            if data:
-                encoded_data = self._encode_data()
-
+            if encoded_data:
                 stream = connection.protocol.get_or_create_stream(stream_id)
                 if stream.headers_send_state != HeadersState.AFTER_HEADERS:
                     raise Exception("DATA frame is not allowed in this state")
@@ -637,10 +724,10 @@ class MercurySyncHTTP3Connection:
                     timings,
                 )
 
-            cookies: Union[Cookies, None] = None
+            cookies: Union[HTTPCookies, None] = None
             cookies_data: Union[bytes, None] = headers.get(b"set-cookie")
             if cookies_data:
-                cookies = Cookies()
+                cookies = HTTPCookies()
                 cookies.update(cookies_data)
 
             self._connections.append(connection)
@@ -694,19 +781,26 @@ class MercurySyncHTTP3Connection:
             )
 
     async def _connect_to_url_location(
-        self, request_url: str, ssl_redirect_url: Optional[str] = None
-    ) -> Tuple[HTTP3Connection, URL, bool]:
-        if ssl_redirect_url:
-            parsed_url = URL(ssl_redirect_url)
+        self,
+        request_url: str | URL,
+        ssl_redirect_url: Optional[str] = None,
+    ) -> Tuple[HTTP3Connection, HTTPUrl, bool]:
+        has_optimized_url = isinstance(request_url, URL)
+
+        if has_optimized_url:
+            parsed_url = request_url.optimized
+
+        elif ssl_redirect_url:
+            parsed_url = HTTPUrl(ssl_redirect_url)
 
         else:
-            parsed_url = URL(request_url)
+            parsed_url = HTTPUrl(request_url)
 
         url = self._url_cache.get(parsed_url.hostname)
         dns_lock = self._dns_lock[parsed_url.hostname]
         dns_waiter = self._dns_waiters[parsed_url.hostname]
 
-        do_dns_lookup = url is None or ssl_redirect_url
+        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
             await dns_lock.acquire()
@@ -727,7 +821,11 @@ class MercurySyncHTTP3Connection:
             await dns_waiter
             url = self._url_cache.get(parsed_url.hostname)
 
+        elif has_optimized_url:
+            url = request_url.optimized
+
         connection = self._connections.pop()
+        connection_error: Optional[Exception] = None
 
         if url.address is None or ssl_redirect_url:
             for address, ip_info in url:
@@ -746,11 +844,13 @@ class MercurySyncHTTP3Connection:
                     url.address = address
                     url.socket_config = ip_info
 
-                except Exception as connection_error:
+                except Exception as err:
                     if "server_hostname is only meaningful with ssl" in str(
                         connection_error
                     ):
                         return None, parsed_url, True
+
+                    connection_error = err
 
         else:
             try:
@@ -765,49 +865,107 @@ class MercurySyncHTTP3Connection:
                     ssl_upgrade=ssl_redirect_url is not None,
                 )
 
-            except Exception as connection_error:
+            except Exception as err:
                 if "server_hostname is only meaningful with ssl" in str(
                     connection_error
                 ):
                     return None, parsed_url, True
 
-                raise connection_error
+                connection_error = err
 
-        return connection, parsed_url, False
+        return (
+            connection,
+            parsed_url,
+            False,
+        )
 
     def _encode_headers(
         self,
-        url: URL,
+        url: HTTPUrl | URL,
         method: str,
-        params: Optional[Dict[str, str]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
+        params: Optional[Dict[str, str] | Params] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        data: Optional[Data] = None,
+        encoded_data: Optional[bytes] = None,
+        content_type: Optional[str] = None,
     ):
+        if isinstance(url, URL):
+            url = url.optimized
+
         url_path = url.path
-        if params:
+
+        if isinstance(params, Params):
+            url_path += params.optimized
+
+        elif params:
             url_params = urlencode(params)
             url_path += f"?{url_params}"
 
-        encoded_headers: List[Tuple[bytes, bytes]] = [
-            (b":method", method.encode()),
-            (b":scheme", url.scheme.encode()),
-            (b":authority", url.authority.encode()),
-            (b":path", url_path.encode()),
-            (b"user-agent", b"hyperscale/client"),
-        ]
+        if isinstance(headers, Headers):
+            encoded_headers: List[Tuple[bytes, bytes]] = [
+                (b":method", method.encode()),
+                (b":authority", url.hostname.encode()),
+                (b":scheme", url.scheme.encode()),
+                (b":path", url_path.encode()),
+            ]
 
-        if headers:
+            encoded_headers.extend(headers.optimized)
+
+        elif headers:
+            encoded_headers: List[Tuple[bytes, bytes]] = [
+                (b":method", method.encode()),
+                (b":authority", url.hostname.encode()),
+                (b":scheme", url.scheme.encode()),
+                (b":path", url_path.encode()),
+                (b"user-agent", b"hyperscale/client"),
+            ]
+
             encoded_headers.extend(
                 [
-                    (
-                        k.encode(),
-                        v.encode(),
+                    (k.lower().encode(), v.encode())
+                    for k, v in headers.items()
+                    if k.lower()
+                    not in (
+                        "host",
+                        "transfer-encoding",
                     )
-                    for (k, v) in headers.items()
                 ]
             )
 
-        if cookies:
+        else:
+            encoded_headers: List[Tuple[bytes, bytes]] = [
+                (b":method", method.encode()),
+                (b":authority", url.hostname.encode()),
+                (b":scheme", url.scheme.encode()),
+                (b":path", url_path.encode()),
+                (b"user-agent", b"hyperscale/client"),
+            ]
+
+        if isinstance(data, Data):
+            encoded_headers.extend(
+                [
+                    ("Content-Length", data.content_length),
+                    ("Content-Type", data.content_type),
+                ]
+            )
+
+        elif data:
+            content_length = len(encoded_data)
+            encoded_headers.extend(
+                [
+                    ("Content-Length", f"{content_length}"),
+                    ("Content-Type", content_type),
+                ]
+            )
+
+        else:
+            encoded_headers.append(("Content-Length", "0"))
+
+        if isinstance(cookies, Cookies):
+            encoded_headers.append(cookies.optimized)
+
+        elif cookies:
             encoded_cookies: List[str] = []
 
             for cookie_data in cookies:
@@ -824,12 +982,16 @@ class MercurySyncHTTP3Connection:
 
     def _encode_data(
         self,
-        data: str | BaseModel | tuple | dict | list,
+        data: str | BaseModel | tuple | dict | list | Data,
     ):
+        content_type: Optional[str] = None
         encoded_data: Optional[bytes] = None
         size = 0
 
-        if isinstance(data, Iterator) and not isinstance(data, list):
+        if isinstance(data, Data):
+            return data.optimized
+
+        elif isinstance(data, Iterator) and not isinstance(data, list):
             chunks = []
             for chunk in data:
                 chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
@@ -841,9 +1003,11 @@ class MercurySyncHTTP3Connection:
             encoded_data = chunks
 
         elif isinstance(data, BaseModel):
-            return orjson.dumps(data.model_dump())
+            content_type = "application/json"
+            encoded_data = orjson.dumps(data.model_dump())
 
         elif isinstance(data, (dict, list)):
+            content_type = "application/json"
             encoded_data = orjson.dumps(data)
 
         elif isinstance(data, tuple):
@@ -852,4 +1016,4 @@ class MercurySyncHTTP3Connection:
         elif isinstance(data, str):
             encoded_data = data.encode()
 
-        return encoded_data
+        return encoded_data, content_type
