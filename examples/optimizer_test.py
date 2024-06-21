@@ -26,6 +26,7 @@ class Test(Workflow):
     vus = 1000
     threads = 4
     duration = "1m"
+    udp_port = 8811
 
     def different(self) -> Literal["Hello there!"]:
         return "Hello there!"
