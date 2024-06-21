@@ -420,23 +420,24 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
 
             connection = pipe.send_preamble(connection)
 
-            encoded_headers = self._encode_headers(
-                url,
-                method,
-                cookies=cookies,
-                data=data,
-                headers=headers,
-                params=params,
-            )
-
-            connection = pipe.send_request_headers(
-                encoded_headers,
-                data,
-                connection,
-            )
-
             if method == "POST":
                 encoded_data = self._encode_data(data)
+
+                encoded_headers = self._encode_headers(
+                    url,
+                    method,
+                    cookies=cookies,
+                    data=data,
+                    headers=headers,
+                    params=params,
+                    encoded_data=encoded_data,
+                )
+
+                connection = pipe.send_request_headers(
+                    encoded_headers,
+                    data,
+                    connection,
+                )
 
                 connection = await asyncio.wait_for(
                     pipe.submit_request_body(
@@ -444,6 +445,22 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                         connection,
                     ),
                     timeout=self.timeouts.write_timeout,
+                )
+
+            else:
+                encoded_headers = self._encode_headers(
+                    url,
+                    method,
+                    cookies=cookies,
+                    data=data,
+                    headers=headers,
+                    params=params,
+                )
+
+                connection = pipe.send_request_headers(
+                    encoded_headers,
+                    data,
+                    connection,
                 )
 
             timings["write_end"] = time.monotonic()
@@ -608,6 +625,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             | Mutation
         ) = None,
         headers: Optional[Dict[str, str]] = None,
+        encoded_data: Optional[bytes] = None,
     ):
         if isinstance(url, URL):
             url = url.optimized
@@ -674,6 +692,18 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                     ("Content-Type", data.content_type),
                 ]
             )
+
+        elif data and method == "POST":
+            content_length = len(encoded_data)
+            encoded_headers.extend(
+                [
+                    ("Content-Length", f"{content_length}"),
+                    ("Content-Type", "application/json"),
+                ]
+            )
+
+        else:
+            encoded_headers.append(("Content-Length", "0"))
 
         if isinstance(cookies, Cookies):
             encoded_headers.append(cookies.optimized)
