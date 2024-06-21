@@ -1,4 +1,3 @@
-import binascii
 from typing import (
     Generic,
     Iterator,
@@ -38,11 +37,11 @@ class Data(OptimizedArg, Generic[T]):
             case RequestType.HTTP | RequestType.HTTP2 | RequestType.WEBSOCKET:
                 self._optimize_http()
 
-            case RequestType.GRPC:
-                self._optimize_grpc()
-
             case RequestType.WEBSOCKET:
                 self._optimize_udp()
+
+            case _:
+                pass
 
     def _optimize_http(self):
         if isinstance(self.data, Iterator) and not isinstance(self.data, list):
@@ -91,16 +90,3 @@ class Data(OptimizedArg, Generic[T]):
 
         else:
             self.optimized = Data
-
-    def _optimize_grpc(self):
-        encoded_protobuf = str(
-            binascii.b2a_hex(self.data.SerializeToString()),
-            encoding="raw_unicode_escape",
-        )
-        encoded_message_length = (
-            hex(int(len(encoded_protobuf) / 2)).lstrip("0x").zfill(8)
-        )
-        encoded_protobuf = f"00{encoded_message_length}{encoded_protobuf}"
-
-        self.optimized = binascii.a2b_hex(encoded_protobuf)
-        self.content_length = len(self.optimized)

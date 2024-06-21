@@ -2,7 +2,6 @@ from typing import Dict, Iterator, List, TypeVar
 
 from pydantic import BaseModel, StrictBytes, StrictStr
 
-from hyperscale.core_rewrite.engines.client.grpc.models.grpc import Protobuf
 from hyperscale.core_rewrite.hooks.optimized.models.base.base_types import (
     HTTPEncodableValue,
 )
@@ -18,7 +17,6 @@ class DataValidator(BaseModel):
         | Dict[HTTPEncodableValue, HTTPEncodableValue]
         | List[HTTPEncodableValue]
         | BaseModel
-        | Protobuf[T]
     )
 
     class Config:

@@ -436,8 +436,8 @@ class MercurySyncUDPConnection:
                     tls=self._udp_ssl_context if "wss" in url.scheme else None,
                 )
 
-            except Exception as connection_error:
-                raise connection_error
+            except Exception as err:
+                connection_error = err
 
         return (
             connection_error,

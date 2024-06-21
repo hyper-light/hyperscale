@@ -65,7 +65,6 @@ def setup_client(
         client,
         (
             MercurySyncGraphQLHTTP2Connection,
-            MercurySyncGRPCConnection,
             MercurySyncGraphQLHTTP2Connection,
         ),
     ):
@@ -73,6 +72,43 @@ def setup_client(
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
 
+        ctx.options |= (
+            ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+        )
+
+        ctx.options |= ssl.OP_NO_COMPRESSION
+
+        ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+
+        try:
+            if hasattr(ctx, "_set_npn_protocols"):
+                ctx.set_npn_protocols(["h2", "http/1.1"])
+        except NotImplementedError:
+            pass
+
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        client._client_ssl_context = ctx
+
+        client._encoder = Encoder()
+        client._settings = Settings(client=False)
+        client._connections = [
+            HTTP2Connection(
+                vus,
+                stream_id=randrange(1, 2**20 + 2, 2),
+                reset_connections=reset_connections,
+            )
+            for _ in range(vus)
+        ]
+
+        client._semaphore = asyncio.Semaphore(vus)
+
+    elif isinstance(client, MercurySyncGRPCConnection):
+        client._reset_connections = reset_connections
+
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ctx.options |= (
             ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
         )

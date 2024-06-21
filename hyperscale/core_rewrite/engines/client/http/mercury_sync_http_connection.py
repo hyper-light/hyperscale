@@ -870,11 +870,15 @@ class MercurySyncHTTPConnection:
                     url.address = address
                     url.socket_config = ip_info
 
-                except Exception as connection_error:
-                    if "server_hostname is only meaningful with ssl" in str(
-                        connection_error
-                    ):
-                        return None, parsed_url, True
+                except Exception as err:
+                    if "server_hostname is only meaningful with ssl" in str(err):
+                        return (
+                            None,
+                            parsed_url,
+                            True,
+                        )
+
+                    connection_error = err
 
         else:
             try:
@@ -889,13 +893,11 @@ class MercurySyncHTTPConnection:
                     ssl_upgrade=ssl_redirect_url is not None,
                 )
 
-            except Exception as connection_error:
-                if "server_hostname is only meaningful with ssl" in str(
-                    connection_error
-                ):
+            except Exception as err:
+                if "server_hostname is only meaningful with ssl" in str(err):
                     return None, parsed_url, True
 
-                raise connection_error
+                connection_error = err
 
         return (
             connection,

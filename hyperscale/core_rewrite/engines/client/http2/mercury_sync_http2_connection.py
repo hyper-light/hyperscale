@@ -1005,9 +1005,7 @@ class MercurySyncHTTP2Connection:
                     url.socket_config = ip_info
 
                 except Exception as err:
-                    if "server_hostname is only meaningful with ssl" in str(
-                        connection_error
-                    ):
+                    if "server_hostname is only meaningful with ssl" in str(err):
                         return (
                             None,
                             None,
@@ -1032,10 +1030,14 @@ class MercurySyncHTTP2Connection:
                 )
 
             except Exception as err:
-                if "server_hostname is only meaningful with ssl" in str(
-                    connection_error
-                ):
-                    return (None, None, None, parsed_url, True)
+                if "server_hostname is only meaningful with ssl" in str(err):
+                    return (
+                        None,
+                        None,
+                        None,
+                        parsed_url,
+                        True,
+                    )
 
                 connection_error = err
 

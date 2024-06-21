@@ -1,6 +1,5 @@
 import asyncio
 import binascii
-import ssl
 import time
 import uuid
 from random import randrange
@@ -12,20 +11,22 @@ from typing import (
     Optional,
     Tuple,
     TypeVar,
-    Union,
 )
 from urllib.parse import ParseResult, urlparse
 
 from hyperscale.core_rewrite.engines.client.http2 import MercurySyncHTTP2Connection
 from hyperscale.core_rewrite.engines.client.http2.pipe import HTTP2Pipe
 from hyperscale.core_rewrite.engines.client.http2.protocols import HTTP2Connection
-from hyperscale.core_rewrite.engines.client.shared.models import (
-    URL,
-    URLMetadata,
-)
+from hyperscale.core_rewrite.engines.client.shared.models import URL as GRPCUrl
+from hyperscale.core_rewrite.engines.client.shared.models import URLMetadata
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
+from hyperscale.core_rewrite.hooks.optimized.models import (
+    URL,
+    Protobuf,
+)
 
-from .models.grpc import GRPCRequest, GRPCResponse, Protobuf
+from .models.grpc import GRPCResponse
+from .models.grpc import Protobuf as GRPCProtobuf
 
 T = TypeVar("T")
 
@@ -47,28 +48,27 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
     async def send(
         self,
-        url: str,
-        protobuf: Protobuf[T],
-        timeout: Union[
-            Optional[int],
-            Optional[float],
-        ] = None,
+        url: str | URL,
+        protobuf: GRPCProtobuf[T] | Protobuf[T],
+        timeout: Optional[int | float] = None,
     ) -> GRPCResponse:
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        GRPCRequest(
-                            url=url,
-                            protobuf=protobuf,
-                            timeout=timeout,
-                        ),
+                        url,
+                        protobuf,
+                        timeout=timeout,
                     ),
                     timeout=timeout,
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return GRPCResponse(
                     url=URLMetadata(
@@ -81,14 +81,49 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     status_message="Request timed out.",
                 )
 
+    async def _optimize(
+        self,
+        optimized_param: URL | Protobuf[T],
+    ):
+        if isinstance(optimized_param, URL):
+            await self._optimize_url(optimized_param)
+
+        else:
+            self._optimized[optimized_param.call_name] = optimized_param
+
+    async def _optimize_url(
+        self,
+        url: URL,
+    ):
+        try:
+            upgrade_ssl: bool = False
+            if url:
+                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            if upgrade_ssl:
+                url.data = url.data.replace("http://", "https://")
+
+                await url.optimize()
+
+                _, url, _ = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            self._url_cache[url.optimized.hostname] = url
+            self._optimized[url.call_name] = url
+
+        except Exception:
+            pass
+
     async def _request(
         self,
-        url: str,
-        protobuf: Protobuf[T],
-        timeout: Union[
-            Optional[int],
-            Optional[float],
-        ] = None,
+        url: str | URL,
+        protobuf: GRPCProtobuf[T] | Protobuf[T],
+        timeout: Optional[int | float] = None,
     ):
         timings: Dict[
             Literal[
@@ -128,12 +163,9 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
     async def _execute(
         self,
-        request_url: str,
-        protobuf: Protobuf[T],
-        timeout: Union[
-            Optional[int],
-            Optional[float],
-        ] = None,
+        request_url: str | URL,
+        protobuf: GRPCProtobuf[T] | Protobuf[T],
+        timeout: Optional[int | float] = None,
         upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
@@ -195,7 +227,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     )
                 )
 
-                self._pipes.append(HTTP2Pipe(self._max_concurrency))
+                self._pipes.append(HTTP2Pipe(self._concurrency))
 
                 return (
                     GRPCResponse(
@@ -286,7 +318,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                 )
             )
 
-            self._pipes.append(HTTP2Pipe(self._max_concurrency))
+            self._pipes.append(HTTP2Pipe(self._concurrency))
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
@@ -308,60 +340,33 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                 timings,
             )
 
-    def _create_http2_ssl_context(self):
-        """
-        This function creates an SSLContext object that is suitably configured for
-        HTTP/2. If you're working with Python TLS directly, you'll want to do the
-        exact same setup as this function does.
-        """
-        # Get the basic context from the standard library.
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-
-        # RFC 7540 Section 9.2: Implementations of HTTP/2 MUST use TLS version 1.2
-        # or higher. Disable TLS 1.1 and lower.
-        ctx.options |= (
-            ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
-        )
-
-        # RFC 7540 Section 9.2.1: A deployment of HTTP/2 over TLS 1.2 MUST disable
-        # compression.
-        ctx.options |= ssl.OP_NO_COMPRESSION
-
-        # RFC 7540 Section 9.2.2: "deployments of HTTP/2 that use TLS 1.2 MUST
-        # support TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256". In practice, the
-        # blocklist defined in this section allows only the AES GCM and ChaCha20
-        # cipher suites with ephemeral key negotiation.
-        ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
-
-        # We want to negotiate using NPN and ALPN. ALPN is mandatory, but NPN may
-        # be absent, so allow that. This setup allows for negotiation of HTTP/1.1.
-        ctx.set_alpn_protocols(["h2", "http/1.1"])
-
-        try:
-            if hasattr(ctx, "_set_npn_protocols"):
-                ctx.set_npn_protocols(["h2", "http/1.1"])
-        except NotImplementedError:
-            pass
-
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        return ctx
-
     async def _connect_to_url_location(
-        self, request_url: str, ssl_redirect_url: Optional[str] = None
-    ) -> Tuple[Exception, HTTP2Connection, HTTP2Pipe, URL, bool]:
-        if ssl_redirect_url:
-            parsed_url = URL(ssl_redirect_url)
+        self,
+        request_url: str | URL,
+        ssl_redirect_url: Optional[str] = None,
+    ) -> Tuple[
+        Exception,
+        HTTP2Connection,
+        HTTP2Pipe,
+        GRPCUrl,
+        bool,
+    ]:
+        has_optimized_url = isinstance(request_url, URL)
+
+        if has_optimized_url:
+            parsed_url = request_url.optimized
+
+        elif ssl_redirect_url:
+            parsed_url = GRPCUrl(ssl_redirect_url)
 
         else:
-            parsed_url = URL(request_url)
+            parsed_url = GRPCUrl(request_url)
 
         url = self._url_cache.get(parsed_url.hostname)
         dns_lock = self._dns_lock[parsed_url.hostname]
         dns_waiter = self._dns_waiters[parsed_url.hostname]
 
-        do_dns_lookup = url is None or ssl_redirect_url
+        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
             await dns_lock.acquire()
@@ -381,6 +386,9 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
         elif do_dns_lookup:
             await dns_waiter
             url = self._url_cache.get(parsed_url.hostname)
+
+        elif has_optimized_url:
+            url = request_url.optimized
 
         connection = self._connections.pop()
         pipe = self._pipes.pop()
@@ -404,11 +412,17 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     url.address = address
                     url.socket_config = ip_info
 
-                except Exception as connection_error:
-                    if "server_hostname is only meaningful with ssl" in str(
-                        connection_error
-                    ):
-                        return (None, None, None, parsed_url, True)
+                except Exception as err:
+                    if "server_hostname is only meaningful with ssl" in str(err):
+                        return (
+                            None,
+                            None,
+                            None,
+                            parsed_url,
+                            True,
+                        )
+
+                    connection_error = err
 
         else:
             try:
@@ -423,13 +437,19 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     ssl_upgrade=ssl_redirect_url is not None,
                 )
 
-            except Exception as connection_error:
+            except Exception as err:
                 if "server_hostname is only meaningful with ssl" in str(
                     connection_error
                 ):
-                    return (None, None, None, parsed_url, True)
+                    return (
+                        None,
+                        None,
+                        None,
+                        parsed_url,
+                        True,
+                    )
 
-                raise connection_error
+                connection_error = err
 
         return (
             connection_error,
@@ -441,8 +461,11 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
     def _encode_data(
         self,
-        data: Protobuf[T],
-    ):
+        data: GRPCProtobuf[T] | Protobuf[T],
+    ) -> bytes:
+        if isinstance(data, Protobuf):
+            return data.optimized
+
         encoded_protobuf = str(
             binascii.b2a_hex(data.SerializeToString()),
             encoding="raw_unicode_escape",
@@ -456,9 +479,12 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
     def _encode_headers(
         self,
-        url: URL,
+        url: GRPCUrl | URL,
         timeout: int | float = 60,
-    ) -> List[Tuple[bytes, bytes]]:
+    ):
+        if isinstance(url, URL):
+            url = url.optimized
+
         encoded_headers = [
             (b":method", b"POST"),
             (b":authority", url.hostname.encode()),

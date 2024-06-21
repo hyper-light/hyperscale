@@ -845,9 +845,7 @@ class MercurySyncHTTP3Connection:
                     url.socket_config = ip_info
 
                 except Exception as err:
-                    if "server_hostname is only meaningful with ssl" in str(
-                        connection_error
-                    ):
+                    if "server_hostname is only meaningful with ssl" in str(err):
                         return None, parsed_url, True
 
                     connection_error = err
@@ -866,9 +864,7 @@ class MercurySyncHTTP3Connection:
                 )
 
             except Exception as err:
-                if "server_hostname is only meaningful with ssl" in str(
-                    connection_error
-                ):
+                if "server_hostname is only meaningful with ssl" in str(err):
                     return None, parsed_url, True
 
                 connection_error = err
