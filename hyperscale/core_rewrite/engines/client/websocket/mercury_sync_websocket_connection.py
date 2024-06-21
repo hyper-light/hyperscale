@@ -604,17 +604,20 @@ class MercurySyncWebsocketConnection:
             hostname = f"{hostname}:{port}"
 
         header_items = {
-            "user-agent": "hyperscale/client",
+            "HOST": hostname,
+            "Keep-Alive": "timeout=60, max=100000",
+            "User-Agent": "hyperscale/client",
+            "Content-Length": 0,
         }
 
         if data and isinstance(data, Iterator):
-            header_items["content-length"] = sum([len(chunk) for chunk in data])
+            header_items["Content-Length"] = sum([len(chunk) for chunk in data])
 
         elif data:
-            header_items["content-length"] = len(data)
+            header_items["Content-Length"] = len(data)
 
         if content_type:
-            header_items["content-type"] = content_type
+            header_items["Content-Type"] = content_type
 
         if headers:
             header_items.update(headers)
@@ -636,4 +639,4 @@ class MercurySyncWebsocketConnection:
             cookies = "; ".join(cookies)
             get_base += f"cookie: {cookies}{NEW_LINE}"
 
-        return (get_base + NEW_LINE).encode(), data
+        return (get_base + NEW_LINE).encode()

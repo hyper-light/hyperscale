@@ -545,12 +545,15 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             hostname = f"{hostname}:{port}"
 
         header_items = {
-            "user-agent": "hyperscale/client",
+            "HOST": hostname,
+            "Keep-Alive": "timeout=60, max=100000",
+            "User-Agent": "hyperscale/client",
+            "Content-Length": 0,
         }
 
         if method == "POST" and encoded_data:
-            header_items["content-length"] = len(encoded_data)
-            header_items["content-type"] = "application/json"
+            header_items["Content-Length"] = len(encoded_data)
+            header_items["Content-Type"] = "application/json"
 
         if headers:
             header_items.update(headers)
@@ -572,4 +575,4 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             cookies = "; ".join(cookies)
             get_base += f"cookie: {cookies}{NEW_LINE}"
 
-        return (get_base + NEW_LINE).encode(), data
+        return (get_base + NEW_LINE).encode()

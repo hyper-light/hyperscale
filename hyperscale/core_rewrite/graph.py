@@ -58,6 +58,7 @@ class Graph:
         self._traversal_orders: Dict[str, List[List[Hook]]] = {}
 
         self._workflow_test_status: Dict[str, bool] = {}
+        self._pending: List[asyncio.Task] = []
 
     async def run(self):
         for workflow in self.workflows:
@@ -73,7 +74,8 @@ class Graph:
             hooks: Dict[str, Hook] = {
                 name: hook
                 for name, hook in inspect.getmembers(
-                    self, predicate=lambda member: isinstance(member, Hook)
+                    workflow,
+                    predicate=lambda member: isinstance(member, Hook),
                 )
             }
 
@@ -143,6 +145,12 @@ class Graph:
             config["duration"] = TimeParser(config["duration"]).time
 
             self._config = config
+            vus = self._config.get("vus")
+            threads = self._config.get("threads")
+
+            self.max_active = math.ceil(
+                vus * (psutil.cpu_count(logical=False) ** 2) / threads
+            )
 
             for client in clients:
                 setup_client(
@@ -162,37 +170,35 @@ class Graph:
         completed, pending = await asyncio.wait(
             [
                 loop.create_task(
-                    self._spawn_vu(traversal_order),
+                    self._spawn_vu(traversal_order, remaining),
                 )
-                async for _ in self._generate()
+                async for remaining in self._generate()
             ],
             timeout=1,
         )
 
         results: List[List[Any]] = await asyncio.gather(*completed)
 
-        await asyncio.gather(
-            *[asyncio.create_task(cancel_pending(pend)) for pend in pending]
-        )
-
         all_completed: List[Any] = []
         for results_set in results:
             all_completed.extend(results_set)
 
+        print(len(all_completed))
+
+        await asyncio.gather(
+            *[asyncio.create_task(cancel_pending(pend)) for pend in self._pending]
+        )
+
+        await asyncio.gather(
+            *[asyncio.create_task(cancel_pending(pend)) for pend in pending]
+        )
+
         return all_completed
 
     async def _generate(self):
-        self._active_waiter = asyncio.Future()
-
         duration = self._config.get("duration")
-        vus = self._config.get("vus")
-        threads = self._config.get("threads")
 
         elapsed = 0
-
-        self.max_active = math.ceil(
-            vus * (psutil.cpu_count(logical=False) ** 2) / threads
-        )
 
         start = time.monotonic()
         while elapsed < duration:
@@ -201,19 +207,24 @@ class Graph:
             yield remaining
 
             await asyncio.sleep(0)
-            elapsed = time.monotonic() - start
 
-            if self.active > self.max_active:
-                remaining = duration - elapsed
+            if self.active > self.max_active and self._active_waiter is None:
+                self._active_waiter = asyncio.get_event_loop().create_future()
 
                 try:
-                    await asyncio.wait_for(self._active_waiter, timeout=remaining)
+                    await asyncio.wait_for(
+                        self._active_waiter,
+                        timeout=remaining,
+                    )
                 except asyncio.TimeoutError:
                     pass
 
+            elapsed = time.monotonic() - start
+
     async def _spawn_vu(
         self,
-        traversal_order: List[Hook],
+        traversal_order: List[List[Hook]],
+        remaining: float,
     ):
         try:
             results: List[Any] = []
@@ -222,18 +233,29 @@ class Graph:
                 set_count = len(hook_set)
                 self.active += set_count
 
-                results.extend(
-                    await asyncio.gather(
-                        *[hook.call() for hook in hook_set],
-                        return_exceptions=True,
-                    )
+                completed, pending = await asyncio.wait(
+                    [
+                        asyncio.create_task(
+                            hook.call(),
+                        )
+                        for hook in hook_set
+                    ],
+                    timeout=remaining,
                 )
+
+                results.extend(completed)
+
+                self._pending.extend(pending)
 
                 self.active -= set_count
 
                 if self.active <= self.max_active and self._active_waiter:
-                    self._active_waiter.set_result(None)
-                    self._active_waiter = asyncio.Future()
+                    try:
+                        self._active_waiter.set_result(None)
+                        self._active_waiter = None
+
+                    except asyncio.InvalidStateError:
+                        self._active_waiter = None
 
         except Exception:
             pass

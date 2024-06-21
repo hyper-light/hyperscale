@@ -28,13 +28,16 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
     Cookies,
     HTTPCookie,
     HTTPEncodableValue,
+    RequestType,
     URLMetadata,
 )
-from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
+from hyperscale.core_rewrite.engines.client.shared.protocols import (
+    NEW_LINE,
+    ProtocolMap,
+)
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 
 from .models.http import (
-    HTTPRequest,
     HTTPResponse,
 )
 from .protocols import HTTPConnection
@@ -75,12 +78,18 @@ class MercurySyncHTTPConnection:
 
         self._url_cache: Dict[str, URL] = {}
 
+        protocols = ProtocolMap()
+        address_family, protocol = protocols[RequestType.HTTP]
+
+        self.address_family = address_family
+        self.address_protocol = protocol
+
     async def head(
         self,
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
@@ -89,15 +98,13 @@ class MercurySyncHTTPConnection:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTPRequest(
-                            url=url,
-                            method="HEAD",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "HEAD",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -123,7 +130,7 @@ class MercurySyncHTTPConnection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
@@ -132,15 +139,13 @@ class MercurySyncHTTPConnection:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTPRequest(
-                            url=url,
-                            method="OPTIONS",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "OPTIONS",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -166,7 +171,7 @@ class MercurySyncHTTPConnection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
@@ -175,16 +180,13 @@ class MercurySyncHTTPConnection:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTPRequest(
-                            url=url,
-                            method="GET",
-                            cookies=cookies,
-                            data=None,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            redirects=redirects,
-                        )
+                        url,
+                        "GET",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -210,7 +212,7 @@ class MercurySyncHTTPConnection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         data: Optional[
             str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
@@ -222,16 +224,14 @@ class MercurySyncHTTPConnection:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTPRequest(
-                            url=url,
-                            method="POST",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            data=data,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "POST",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        data=data,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -257,7 +257,7 @@ class MercurySyncHTTPConnection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         timeout: Optional[int | float] = None,
         data: Optional[
@@ -269,16 +269,14 @@ class MercurySyncHTTPConnection:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTPRequest(
-                            url=url,
-                            method="PUT",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            data=data,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "PUT",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        data=data,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -304,7 +302,7 @@ class MercurySyncHTTPConnection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         data: Optional[
             str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
@@ -316,16 +314,14 @@ class MercurySyncHTTPConnection:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTPRequest(
-                            url=url,
-                            method="PATCH",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            data=data,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "PATCH",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        data=data,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -351,7 +347,7 @@ class MercurySyncHTTPConnection:
         url: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
@@ -360,15 +356,13 @@ class MercurySyncHTTPConnection:
             try:
                 return await asyncio.wait_for(
                     self._request(
-                        HTTPRequest(
-                            url=url,
-                            method="DELETE",
-                            cookies=cookies,
-                            auth=auth,
-                            headers=headers,
-                            params=params,
-                            redirects=redirects,
-                        ),
+                        url,
+                        "DELETE",
+                        cookies=cookies,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        redirects=redirects,
                     ),
                     timeout=timeout,
                 )
@@ -395,12 +389,11 @@ class MercurySyncHTTPConnection:
         method: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         data: Optional[
             str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
         ] = None,
-        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         timings: Dict[
@@ -479,7 +472,7 @@ class MercurySyncHTTPConnection:
         method: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
+        headers: Optional[Dict[str, str]] = None,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         data: Optional[
             str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
@@ -525,7 +518,8 @@ class MercurySyncHTTPConnection:
 
             (connection, url, upgrade_ssl) = await asyncio.wait_for(
                 self._connect_to_url_location(
-                    request_url, ssl_redirect_url=request_url if upgrade_ssl else None
+                    request_url,
+                    ssl_redirect_url=request_url if upgrade_ssl else None,
                 ),
                 timeout=self.timeouts.connect_timeout,
             )
@@ -535,7 +529,8 @@ class MercurySyncHTTPConnection:
 
                 connection, url, _ = await asyncio.wait_for(
                     self._connect_to_url_location(
-                        request_url, ssl_redirect_url=ssl_redirect_url
+                        request_url,
+                        ssl_redirect_url=ssl_redirect_url,
                     ),
                     timeout=self.timeouts.connect_timeout,
                 )
@@ -729,10 +724,18 @@ class MercurySyncHTTPConnection:
         ssl_redirect_url: Optional[str] = None,
     ) -> Tuple[HTTPConnection, URL, bool]:
         if ssl_redirect_url:
-            parsed_url = URL(ssl_redirect_url)
+            parsed_url = URL(
+                ssl_redirect_url,
+                family=self.address_family,
+                protocol=self.address_protocol,
+            )
 
         else:
-            parsed_url = URL(request_url)
+            parsed_url = URL(
+                request_url,
+                family=self.address_family,
+                protocol=self.address_protocol,
+            )
 
         url = self._url_cache.get(parsed_url.hostname)
         dns_lock = self._dns_lock[parsed_url.hostname]
@@ -857,18 +860,27 @@ class MercurySyncHTTPConnection:
 
         get_base = f"{method} {url_path} HTTP/1.1{NEW_LINE}"
 
+        port = url.port or (443 if url.scheme == "https" else 80)
+        hostname = url.parsed.hostname.encode("idna").decode()
+
+        if port not in [80, 443]:
+            hostname = f"{hostname}:{port}"
+
         header_items = {
-            "user-agent": "hyperscale/client",
+            "HOST": hostname,
+            "Keep-Alive": "timeout=60, max=100000",
+            "User-Agent": "hyperscale/client",
+            "Content-Length": 0,
         }
 
         if data and isinstance(data, Iterator):
-            header_items["content-length"] = sum([len(chunk) for chunk in data])
+            header_items["Content-Length"] = sum([len(chunk) for chunk in data])
 
         elif data:
-            header_items["content-length"] = len(data)
+            header_items["Content-Length"] = len(data)
 
         if content_type:
-            header_items["content-type"] = content_type
+            header_items["Content-Type"] = content_type
 
         if headers:
             header_items.update(headers)
@@ -890,4 +902,4 @@ class MercurySyncHTTPConnection:
             cookies = "; ".join(cookies)
             get_base += f"cookie: {cookies}{NEW_LINE}"
 
-        return (get_base + NEW_LINE).encode(), data
+        return (get_base + NEW_LINE).encode()
