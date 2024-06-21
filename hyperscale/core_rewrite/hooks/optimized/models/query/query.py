@@ -20,7 +20,12 @@ class Query(OptimizedArg, Generic[T]):
         self.optimized: Optional[str] = None
 
     async def optimize(self):
-        query_string = "".join(self.data.replace("query", "").split())
+        query_string = "".join(
+            self.data.replace(
+                "query",
+                "",
+            ).split()
+        )
         self.optimized = f"?query={{{query_string}}}"
 
     def __str__(self) -> str:
