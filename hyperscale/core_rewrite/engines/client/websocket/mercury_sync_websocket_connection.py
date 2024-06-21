@@ -639,6 +639,7 @@ class MercurySyncWebsocketConnection:
             url = request_url.optimized
 
         connection = self._connections.pop()
+        connection_error: Optional[Exception] = None
 
         if url.address is None or ssl_redirect_url:
             for address, ip_info in url:
@@ -872,7 +873,7 @@ class MercurySyncWebsocketConnection:
 
         additional_headers: List[str] = []
 
-        if len(lowered_headers) > 0:
+        if len(headers) > 0:
             for key, value in headers.items():
                 additional_headers.append(
                     f"{key}: {value}",

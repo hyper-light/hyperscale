@@ -785,6 +785,9 @@ class MercurySyncHTTPConnection:
             )
 
         except Exception as request_exception:
+            import traceback
+
+            print(traceback.format_exc())
             self._connections.append(
                 HTTPConnection(
                     reset_connections=self.reset_connections,
@@ -872,6 +875,7 @@ class MercurySyncHTTPConnection:
             url = request_url.optimized
 
         connection = self._connections.pop()
+        connection_error: Optional[Exception] = None
 
         if url.address is None or ssl_redirect_url:
             for address, ip_info in url:

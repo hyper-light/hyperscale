@@ -119,7 +119,7 @@ class Headers(OptimizedArg, Generic[T]):
 
                 additional_headers: List[str] = []
 
-                if len(headers) > 0:
+                if len(self.data) > 0:
                     for key, value in self.data.items():
                         additional_headers.append(
                             f"{key}: {value}",
