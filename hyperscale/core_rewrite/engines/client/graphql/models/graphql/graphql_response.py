@@ -4,6 +4,7 @@ from typing import Dict, Literal, Optional
 from hyperscale.core_rewrite.engines.client.http.models.http import HTTPResponse
 from hyperscale.core_rewrite.engines.client.shared.models import (
     Cookies,
+    RequestType,
     URLMetadata,
 )
 
@@ -35,3 +36,7 @@ class GraphQLResponse(HTTPResponse):
             content=content,
             timings=timings,
         )
+
+    @classmethod
+    def response_type(cls):
+        return RequestType.GRAPHQL

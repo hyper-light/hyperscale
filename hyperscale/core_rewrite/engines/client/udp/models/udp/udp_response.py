@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.shared.models import (
     CallResult,
+    RequestType,
     URLMetadata,
 )
 
@@ -35,6 +36,10 @@ class UDPResponse(CallResult):
         self.error = error
         self.content = content
         self.timings = timings
+
+    @classmethod
+    def response_type(cls):
+        return RequestType.UDP
 
     def json(self):
         if self.content:

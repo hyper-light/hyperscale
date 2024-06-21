@@ -9,6 +9,7 @@ import orjson
 from hyperscale.core_rewrite.engines.client.shared.models import (
     CallResult,
     Cookies,
+    RequestType,
     URLMetadata,
 )
 
@@ -61,6 +62,10 @@ class HTTP2Response(CallResult):
         self.headers = headers
         self.content = content
         self.timings = timings
+
+    @classmethod
+    def response_type(cls):
+        return RequestType.HTTP2
 
     def check_success(self) -> bool:
         return self.status and self.status >= 200 and self.status < 300

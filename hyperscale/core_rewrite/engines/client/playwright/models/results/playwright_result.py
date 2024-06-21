@@ -5,7 +5,10 @@ from pydantic import BaseModel, StrictFloat, StrictStr
 from hyperscale.core_rewrite.engines.client.playwright.models.browser import (
     BrowserMetadata,
 )
-from hyperscale.core_rewrite.engines.client.shared.models import CallResult
+from hyperscale.core_rewrite.engines.client.shared.models import (
+    CallResult,
+    RequestType,
+)
 
 T = TypeVar("T")
 
@@ -52,3 +55,7 @@ class PlaywrightResult(CallResult, Generic[T]):
         self.timings = timings
         self.frame = frame
         self.source = source
+
+    @classmethod
+    def response_type(cls):
+        return RequestType.PLAYWRIGHT

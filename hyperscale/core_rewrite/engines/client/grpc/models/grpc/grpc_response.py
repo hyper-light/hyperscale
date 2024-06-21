@@ -5,6 +5,7 @@ from typing import Dict, Literal, Optional, TypeVar
 
 from hyperscale.core_rewrite.engines.client.http2.models.http2 import HTTP2Response
 from hyperscale.core_rewrite.engines.client.shared.models import (
+    RequestType,
     URLMetadata,
 )
 
@@ -40,6 +41,10 @@ class GRPCResponse(HTTP2Response):
         )
 
         self._data: Optional[bytes] = None
+
+    @classmethod
+    def response_type(cls):
+        return RequestType.GRPC
 
     def check_success(self) -> bool:
         return self.status and self.status >= 200 and self.status < 300

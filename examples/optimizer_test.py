@@ -7,6 +7,7 @@ import dill
 
 from hyperscale.core_rewrite import Graph, Workflow, step
 from hyperscale.core_rewrite.engines.client.http import HTTPResponse
+from hyperscale.core_rewrite.hooks.optimized.models import URL
 
 
 class Result:
@@ -40,8 +41,8 @@ class Test(Workflow):
         )
 
     @step("one")
-    async def three(self) -> HTTPResponse:
-        return await self.client.http.get("https://httpbin.org/get")
+    async def three(self, url=URL("https://httpbin.org/get")) -> HTTPResponse:
+        return await self.client.http.get(url)
 
 
 async def run():

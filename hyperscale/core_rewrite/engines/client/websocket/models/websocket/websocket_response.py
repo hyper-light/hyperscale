@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from hyperscale.core_rewrite.engines.client.http.models.http import HTTPResponse
 from hyperscale.core_rewrite.engines.client.shared.models import (
     Cookies,
+    RequestType,
     URLMetadata,
 )
 
@@ -50,3 +51,7 @@ class WebsocketResponse(HTTPResponse):
             content=content,
             timings=timings,
         )
+
+    @classmethod
+    def response_type(cls):
+        return RequestType.WEBSOCKET

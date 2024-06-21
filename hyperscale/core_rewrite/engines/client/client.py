@@ -10,6 +10,7 @@ from .http import MercurySyncHTTPConnection
 from .http2 import MercurySyncHTTP2Connection
 from .http3 import MercurySyncHTTP3Connection
 from .playwright import MercurySyncPlaywrightConnection
+from .shared.models import RequestType
 from .udp import MercurySyncUDPConnection
 from .websocket import MercurySyncWebsocketConnection
 
@@ -44,3 +45,38 @@ class Client(Generic[Unpack[T]]):
         self.playwright = MercurySyncPlaywrightConnection()
         self.udp = MercurySyncUDPConnection()
         self.websocket = MercurySyncWebsocketConnection()
+
+    def __getitem__(
+        self,
+        key: RequestType,
+    ):
+        match key:
+            case RequestType.GRAPHQL:
+                return self.graphql
+
+            case RequestType.GRAPHQL_HTTP2:
+                return self.graphqlh2
+
+            case RequestType.GRPC:
+                return self.grpc
+
+            case RequestType.HTTP:
+                return self.http
+
+            case RequestType.HTTP2:
+                return self.http2
+
+            case RequestType.HTTP3:
+                return self.http3
+
+            case RequestType.PLAYWRIGHT:
+                return self.playwright
+
+            case RequestType.UDP:
+                return self.udp
+
+            case RequestType.WEBSOCKET:
+                return self.websocket
+
+            case _:
+                raise Exception("Err. - invalid client type.")

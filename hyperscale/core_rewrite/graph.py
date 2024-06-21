@@ -95,6 +95,18 @@ class Graph:
             sources = []
 
             for hook in hooks.values():
+                if len(hook.optimized_args) > 0:
+                    await asyncio.gather(
+                        *[arg.optimize() for arg in hook.optimized_args.values()]
+                    )
+
+                    await asyncio.gather(
+                        *[
+                            workflow.client[hook.engine_type]._optimize(arg)
+                            for arg in hook.optimized_args.values()
+                        ]
+                    )
+
                 if len(hook.dependencies) == 0:
                     sources.append(hook.name)
 
