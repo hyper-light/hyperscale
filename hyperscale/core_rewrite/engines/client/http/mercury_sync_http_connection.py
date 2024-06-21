@@ -785,9 +785,6 @@ class MercurySyncHTTPConnection:
             )
 
         except Exception as request_exception:
-            import traceback
-
-            print(traceback.format_exc())
             self._connections.append(
                 HTTPConnection(
                     reset_connections=self.reset_connections,
