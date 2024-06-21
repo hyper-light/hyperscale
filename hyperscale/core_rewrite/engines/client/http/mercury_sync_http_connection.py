@@ -27,7 +27,9 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
     URL as HTTPUrl,
 )
 from hyperscale.core_rewrite.engines.client.shared.models import (
-    Cookies,
+    Cookies as HTTPCookies,
+)
+from hyperscale.core_rewrite.engines.client.shared.models import (
     HTTPCookie,
     HTTPEncodableValue,
     RequestType,
@@ -38,7 +40,14 @@ from hyperscale.core_rewrite.engines.client.shared.protocols import (
     ProtocolMap,
 )
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
-from hyperscale.core_rewrite.hooks.optimized.models import URL
+from hyperscale.core_rewrite.hooks.optimized.models import (
+    URL,
+    Auth,
+    Cookies,
+    Data,
+    Headers,
+    Params,
+)
 
 from .models.http import (
     HTTPResponse,
@@ -71,11 +80,6 @@ class MercurySyncHTTPConnection:
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
-        self._connections_count: Dict[str, List[asyncio.Transport]] = defaultdict(list)
-        self._locks: Dict[asyncio.Transport, asyncio.Lock] = {}
-
-        self._max_concurrency = pool_size
-
         self._semaphore: asyncio.Semaphore = None
         self._connection_waiters: List[asyncio.Future] = []
 
@@ -83,6 +87,7 @@ class MercurySyncHTTPConnection:
 
         protocols = ProtocolMap()
         address_family, protocol = protocols[RequestType.HTTP]
+        self._optimized: Dict[str, URL | Params | Headers] = {}
 
         self.address_family = address_family
         self.address_protocol = protocol
@@ -91,9 +96,9 @@ class MercurySyncHTTPConnection:
         self,
         url: str | URL,
         auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -117,7 +122,7 @@ class MercurySyncHTTPConnection:
                     url_data = urlparse(url)
 
                 else:
-                    url_data = url.parsed
+                    url_data = url.optimized.parsed
 
                 return HTTPResponse(
                     url=URLMetadata(
@@ -136,9 +141,9 @@ class MercurySyncHTTPConnection:
         self,
         url: str | URL,
         auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -162,7 +167,7 @@ class MercurySyncHTTPConnection:
                     url_data = urlparse(url)
 
                 else:
-                    url_data = url.parsed
+                    url_data = url.optimized.parsed
 
                 return HTTPResponse(
                     url=URLMetadata(
@@ -181,9 +186,9 @@ class MercurySyncHTTPConnection:
         self,
         url: str | URL,
         auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -207,7 +212,7 @@ class MercurySyncHTTPConnection:
                     url_data = urlparse(url)
 
                 else:
-                    url_data = url.parsed
+                    url_data = url.optimized.parsed
 
                 return HTTPResponse(
                     url=URLMetadata(
@@ -226,11 +231,11 @@ class MercurySyncHTTPConnection:
         self,
         url: str | URL,
         auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         data: Optional[
-            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
@@ -256,7 +261,7 @@ class MercurySyncHTTPConnection:
                     url_data = urlparse(url)
 
                 else:
-                    url_data = url.parsed
+                    url_data = url.optimized.parsed
 
                 return HTTPResponse(
                     url=URLMetadata(
@@ -275,12 +280,12 @@ class MercurySyncHTTPConnection:
         self,
         url: str | URL,
         auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         data: Optional[
-            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
         redirects: int = 3,
     ):
@@ -305,7 +310,7 @@ class MercurySyncHTTPConnection:
                     url_data = urlparse(url)
 
                 else:
-                    url_data = url.parsed
+                    url_data = url.optimized.parsed
 
                 return HTTPResponse(
                     url=URLMetadata(
@@ -324,11 +329,11 @@ class MercurySyncHTTPConnection:
         self,
         url: str | URL,
         auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         data: Optional[
-            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
@@ -354,7 +359,7 @@ class MercurySyncHTTPConnection:
                     url_data = urlparse(url)
 
                 else:
-                    url_data = url.parsed
+                    url_data = url.optimized.parsed
 
                 return HTTPResponse(
                     url=URLMetadata(
@@ -373,9 +378,9 @@ class MercurySyncHTTPConnection:
         self,
         url: str | URL,
         auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -399,7 +404,7 @@ class MercurySyncHTTPConnection:
                     url_data = urlparse(url)
 
                 else:
-                    url_data = url.parsed
+                    url_data = url.optimized.parsed
 
                 return HTTPResponse(
                     url=URLMetadata(
@@ -414,9 +419,15 @@ class MercurySyncHTTPConnection:
                     status_message="Request timed out.",
                 )
 
-    async def _optimize(self, url: Optional[URL] = None):
-        if isinstance(url, URL):
-            await self._optimize_url(url)
+    async def _optimize(
+        self,
+        optimized_param: URL | Params | Headers | Cookies | Data | Auth,
+    ):
+        if isinstance(optimized_param, URL):
+            await self._optimize_url(optimized_param)
+
+        else:
+            self._optimized[optimized_param.call_name] = optimized_param
 
     async def _optimize_url(self, url: URL):
         try:
@@ -438,6 +449,7 @@ class MercurySyncHTTPConnection:
                 )
 
             self._url_cache[url.optimized.hostname] = url
+            self._optimized[url.call_name] = url
 
         except Exception:
             pass
@@ -447,11 +459,11 @@ class MercurySyncHTTPConnection:
         url: str | URL,
         method: str,
         auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         data: Optional[
-            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
         redirects: int = 3,
     ):
@@ -530,11 +542,11 @@ class MercurySyncHTTPConnection:
         request_url: str | URL,
         method: str,
         auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         data: Optional[
-            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
         upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
@@ -639,7 +651,8 @@ class MercurySyncHTTPConnection:
                 params=params,
                 headers=headers,
                 cookies=cookies,
-                data=encoded_data,
+                data=data,
+                encoded_data=encoded_data,
                 content_type=content_type,
             )
 
@@ -692,10 +705,10 @@ class MercurySyncHTTPConnection:
             content_length = headers.get(b"content-length")
             transfer_encoding = headers.get(b"transfer-encoding")
 
-            cookies: Union[Cookies, None] = None
+            cookies: Union[HTTPCookies, None] = None
             cookies_data: Union[bytes, None] = headers.get(b"set-cookie")
             if cookies_data:
-                cookies = Cookies()
+                cookies = HTTPCookies()
                 cookies.update(cookies_data)
 
             # We require Content-Length or Transfer-Encoding headers to read a
@@ -887,10 +900,14 @@ class MercurySyncHTTPConnection:
 
     def _encode_data(
         self,
-        data: str | bytes | BaseModel | bytes,
+        data: str | bytes | BaseModel | bytes | Data,
     ):
         content_type: Optional[str] = None
         encoded_data: bytes | List[bytes] = None
+
+        if isinstance(data, Data):
+            encoded_data = data.optimized
+            content_type = data.content_type
 
         if isinstance(data, Iterator) and not isinstance(data, list):
             chunks: List[bytes] = []
@@ -921,10 +938,13 @@ class MercurySyncHTTPConnection:
         self,
         url: URL | HTTPUrl,
         method: str,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        data: Optional[bytes | List[bytes]] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        data: Optional[
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
+        ] = None,
+        encoded_data: Optional[bytes | List[bytes]] = None,
         content_type: Optional[str] = None,
     ):
         if isinstance(url, URL):
@@ -932,11 +952,12 @@ class MercurySyncHTTPConnection:
 
         url_path = url.path
 
-        if params and len(params) > 0:
+        if isinstance(params, Params):
+            url_path += params.optimized
+
+        elif params and len(params) > 0:
             url_params = urlencode(params)
             url_path += f"?{url_params}"
-
-        get_base = f"{method} {url_path} HTTP/1.1{NEW_LINE}"
 
         port = url.port or (443 if url.scheme == "https" else 80)
         hostname = url.parsed.hostname.encode("idna").decode()
@@ -944,40 +965,52 @@ class MercurySyncHTTPConnection:
         if port not in [80, 443]:
             hostname = f"{hostname}:{port}"
 
-        header_items = {
-            "HOST": hostname,
-            "Keep-Alive": "timeout=60, max=100000",
-            "User-Agent": "hyperscale/client",
-            "Content-Length": 0,
-        }
+        header_items = (
+            f"{method} {url_path} HTTP/1.1{NEW_LINE}HOST: {hostname}{NEW_LINE}"
+        )
 
-        if data and isinstance(data, Iterator):
-            header_items["Content-Length"] = sum([len(chunk) for chunk in data])
+        if isinstance(headers, Headers):
+            header_items += headers.optimized
+        elif headers:
+            header_items += f"Keep-Alive: timeout=60, max=100000{NEW_LINE}User-Agent: hyperscale/client{NEW_LINE}"
 
-        elif data:
-            header_items["Content-Length"] = len(data)
+            for key, value in headers.items():
+                header_items += f"{key}: {value}{NEW_LINE}"
+
+        else:
+            header_items += f"Keep-Alive: timeout=60, max=100000{NEW_LINE}User-Agent: hyperscale/client{NEW_LINE}"
+
+        size: int = 0
+
+        if isinstance(data, Data):
+            size = data.content_length
+
+        elif encoded_data and isinstance(encoded_data, Iterator):
+            size = sum([len(chunk) for chunk in encoded_data])
+
+        elif encoded_data:
+            size = len(encoded_data)
+
+        header_items += f"Content-Length: {size}{NEW_LINE}"
 
         if content_type:
-            header_items["Content-Type"] = content_type
+            header_items += f"Content-Type: {content_type}{NEW_LINE}"
 
-        if headers:
-            header_items.update(headers)
+        if isinstance(cookies, Cookies):
+            header_items += cookies.optimized
 
-        for key, value in header_items.items():
-            get_base += f"{key}: {value}{NEW_LINE}"
-
-        if cookies:
-            cookies = []
+        elif cookies:
+            encoded_cookies: List[str] = []
 
             for cookie_data in cookies:
                 if len(cookie_data) == 1:
-                    cookies.append(cookie_data[0])
+                    encoded_cookies.append(cookie_data[0])
 
                 elif len(cookie_data) == 2:
                     cookie_name, cookie_value = cookie_data
-                    cookies.append(f"{cookie_name}={cookie_value}")
+                    encoded_cookies.append(f"{cookie_name}={cookie_value}")
 
-            cookies = "; ".join(cookies)
-            get_base += f"cookie: {cookies}{NEW_LINE}"
+            encoded = "; ".join(encoded_cookies)
+            header_items += f"cookie: {encoded}{NEW_LINE}"
 
-        return (get_base + NEW_LINE).encode()
+        return f"{header_items}{NEW_LINE}".encode()

@@ -1,14 +1,8 @@
 from typing import Generic, Optional, TypeVar
 
-from hyperscale.core_rewrite.engines.client.shared.models import (
-    URL as OptimizedUrl,
-)
-from hyperscale.core_rewrite.engines.client.shared.models import (
-    RequestType,
-)
-from hyperscale.core_rewrite.engines.client.shared.protocols import (
-    ProtocolMap,
-)
+from hyperscale.core_rewrite.engines.client.shared.models import URL as OptimizedUrl
+from hyperscale.core_rewrite.engines.client.shared.models import RequestType
+from hyperscale.core_rewrite.engines.client.shared.protocols import ProtocolMap
 from hyperscale.core_rewrite.hooks.optimized.models.base import OptimizedArg
 
 from .url_validator import URLValidator
@@ -17,7 +11,10 @@ T = TypeVar("T")
 
 
 class URL(OptimizedArg, Generic[T]):
-    def __init__(self, url: str) -> None:
+    def __init__(
+        self,
+        url: str,
+    ) -> None:
         super(
             URL,
             self,
@@ -26,6 +23,7 @@ class URL(OptimizedArg, Generic[T]):
         URLValidator(value=url)
 
         self.data = url
+        self.optimized_params: Optional[str] = None
         self.optimized: Optional[OptimizedUrl] = None
 
     async def optimize(self, request_type: RequestType):

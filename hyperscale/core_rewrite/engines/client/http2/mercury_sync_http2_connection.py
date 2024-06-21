@@ -563,6 +563,7 @@ class MercurySyncHTTP2Connection:
                 method,
                 params=params,
                 headers=headers,
+                cookies=cookies,
             )
 
             connection = pipe.send_request_headers(
@@ -720,6 +721,7 @@ class MercurySyncHTTP2Connection:
         method: str,
         params: Optional[Dict[str, HTTPEncodableValue]] = None,
         headers: Optional[Dict[str, str]] = None,
+        cookies: Optional[List[HTTPCookie]] = None,
     ):
         url_path = url.path
         if params:
@@ -746,6 +748,19 @@ class MercurySyncHTTP2Connection:
                     )
                 ]
             )
+
+        if cookies:
+            encoded_cookies: List[str] = []
+
+            for cookie_data in cookies:
+                if len(cookie_data) == 1:
+                    encoded_cookies.append(cookie_data[0])
+
+                elif len(cookie_data) == 2:
+                    cookie_name, cookie_value = cookie_data
+                    encoded_cookies.append(f"{cookie_name}={cookie_value}")
+
+            encoded_headers.append(("cookie", "; ".join(encoded_cookies)))
 
         encoded_headers: bytes = self._encoder.encode(encoded_headers)
         encoded_headers: List[bytes] = [

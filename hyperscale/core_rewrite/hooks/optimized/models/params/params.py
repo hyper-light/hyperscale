@@ -8,7 +8,9 @@ from typing import (
     Tuple,
     TypeVar,
 )
+from urllib.parse import urlencode
 
+from hyperscale.core_rewrite.engines.client.shared.models import RequestType
 from hyperscale.core_rewrite.hooks.optimized.models.base import FrozenDict, OptimizedArg
 from hyperscale.core_rewrite.hooks.optimized.models.base.base_types import (
     HTTPEncodableValue,
@@ -32,6 +34,17 @@ class Params(OptimizedArg, Generic[T]):
         validated_params = ParamsValidator(value=params)
         self.data: FrozenDict = FrozenDict(validated_params.value)
         self.optimized: Optional[str] = None
+        self._params_types = [
+            RequestType.HTTP,
+            RequestType.HTTP2,
+            RequestType.HTTP3,
+            RequestType.WEBSOCKET,
+        ]
+
+    async def optimize(self, request_type: RequestType):
+        if request_type in self._params_types:
+            url_params = urlencode(self.data)
+            self.optimized = f"?{url_params}"
 
     def __getitem__(self, key: str) -> HTTPEncodableValue:
         return self.data[key]

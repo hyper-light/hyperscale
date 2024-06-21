@@ -11,6 +11,7 @@ class OptimizedArg:
             (uuid.uuid1().int + threading.get_native_id()) >> 64
         )
 
+        self.call_name: Optional[str] = None
         self.arg_id = self._snowflake.generate()
         self.call_id: Optional[int] = None
 

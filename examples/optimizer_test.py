@@ -7,7 +7,13 @@ import dill
 
 from hyperscale.core_rewrite import Graph, Workflow, step
 from hyperscale.core_rewrite.engines.client.http import HTTPResponse
-from hyperscale.core_rewrite.hooks.optimized.models import URL
+from hyperscale.core_rewrite.hooks.optimized.models import (
+    URL,
+    Cookies,
+    Data,
+    Headers,
+    Params,
+)
 
 
 class Result:
@@ -30,19 +36,45 @@ class Test(Workflow):
         return "Hello there!"
 
     @step()
-    async def one(self) -> HTTPResponse:
-        return await self.client.http.get("https://httpbin.org/get")
+    async def one(
+        self,
+        url=URL("https://httpbin.org/get"),
+    ) -> HTTPResponse:
+        return await self.client.http.get(url)
 
     @step("one")
-    async def two(self) -> HTTPResponse:
-        boop = self.different()
+    async def two(
+        self,
+        url=URL("https://httpbin.org/get"),
+        params=Params(
+            {"beep": "boop"},
+        ),
+    ) -> HTTPResponse:
         return await self.client.http.get(
-            f"https://httpbin.org/get?beep={boop}", headers={"test": boop}
+            url,
+            params=params,
         )
 
     @step("one")
-    async def three(self, url=URL("https://httpbin.org/get")) -> HTTPResponse:
-        return await self.client.http.get(url)
+    async def three(
+        self,
+        url=URL("https://httpbin.org/post"),
+        params=Params(
+            {"a": "b"},
+        ),
+        headers=Headers(
+            {"test": "boop"},
+        ),
+        cookies=Cookies([("a", "b")]),
+        data=Data({"bop": "blep"}),
+    ) -> HTTPResponse:
+        return await self.client.http.post(
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            data=data,
+        )
 
 
 async def run():

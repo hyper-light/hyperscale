@@ -361,7 +361,7 @@ class MercurySyncUDPConnection:
 
     def _encode_data(self, data: str | list | dict | BaseModel | bytes):
         if isinstance(data, BaseModel):
-            return orjson.dumps({name: value for name, value in data.model_dump()})
+            return orjson.dumps(data.model_dump())
 
         elif isinstance(data, (list, dict)):
             return orjson.dumps(data)

@@ -596,17 +596,17 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             get_base += f"{key}: {value}{NEW_LINE}"
 
         if cookies:
-            cookies = []
+            encoded_cookies: List[str] = []
 
             for cookie_data in cookies:
                 if len(cookie_data) == 1:
-                    cookies.append(cookie_data[0])
+                    encoded_cookies.append(cookie_data[0])
 
                 elif len(cookie_data) == 2:
                     cookie_name, cookie_value = cookie_data
-                    cookies.append(f"{cookie_name}={cookie_value}")
+                    encoded_cookies.append(f"{cookie_name}={cookie_value}")
 
-            cookies = "; ".join(cookies)
-            get_base += f"cookie: {cookies}{NEW_LINE}"
+            encoded = "; ".join(encoded_cookies)
+            get_base += f"cookie: {encoded}{NEW_LINE}"
 
         return (get_base + NEW_LINE).encode()

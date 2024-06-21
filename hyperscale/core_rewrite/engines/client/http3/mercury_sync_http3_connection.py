@@ -781,6 +781,7 @@ class MercurySyncHTTP3Connection:
         method: str,
         params: Optional[Dict[str, str]] = None,
         headers: Optional[Dict[str, str]] = None,
+        cookies: Optional[List[HTTPCookie]] = None,
     ):
         url_path = url.path
         if params:
@@ -805,6 +806,19 @@ class MercurySyncHTTP3Connection:
                     for (k, v) in headers.items()
                 ]
             )
+
+        if cookies:
+            encoded_cookies: List[str] = []
+
+            for cookie_data in cookies:
+                if len(cookie_data) == 1:
+                    encoded_cookies.append(cookie_data[0])
+
+                elif len(cookie_data) == 2:
+                    cookie_name, cookie_value = cookie_data
+                    encoded_cookies.append(f"{cookie_name}={cookie_value}")
+
+            encoded_headers.append(("cookie", "; ".join(encoded_cookies)))
 
         return encoded_headers
 

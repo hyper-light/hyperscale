@@ -20,9 +20,7 @@ from urllib.parse import (
 import orjson
 from pydantic import BaseModel
 
-from hyperscale.core_rewrite.engines.client.shared.models import (
-    URL as HTTPUrl,
-)
+from hyperscale.core_rewrite.engines.client.shared.models import URL as HTTPUrl
 from hyperscale.core_rewrite.engines.client.shared.models import (
     Cookies,
     HTTPCookie,
@@ -35,9 +33,12 @@ from hyperscale.core_rewrite.hooks.optimized.models import URL
 
 from .models.websocket import (
     WebsocketResponse,
+    create_sec_websocket_key,
     get_header_bits,
     get_message_buffer_size,
+    pack_hostname,
 )
+from .models.websocket.constants import WEBSOCKETS_VERSION
 from .protocols import WebsocketConnection
 
 
@@ -637,49 +638,97 @@ class MercurySyncWebsocketConnection:
             url_params = urlencode(params)
             url_path += f"?{url_params}"
 
-        get_base = f"{method} {url.path} HTTP/1.1{NEW_LINE}"
+        if headers is None:
+            headers: Dict[str, HTTPEncodableValue] = {}
 
-        port = url.port or (443 if url.scheme == "https" else 80)
+        for header_name, header_value in headers.items():
+            header_name_lowered = header_name.lower()
+            headers[header_name_lowered] = header_value
 
-        hostname = url.hostname.encode("idna").decode()
-
-        if port not in [80, 443]:
-            hostname = f"{hostname}:{port}"
-
-        header_items = {
-            "HOST": hostname,
-            "Keep-Alive": "timeout=60, max=100000",
-            "User-Agent": "hyperscale/client",
-            "Content-Length": 0,
-        }
-
+        size: int = 0
         if data and isinstance(data, Iterator):
-            header_items["Content-Length"] = sum([len(chunk) for chunk in data])
+            size = sum([len(chunk) for chunk in data])
 
         elif data:
-            header_items["Content-Length"] = len(data)
+            size = len(data)
 
-        if content_type:
-            header_items["Content-Type"] = content_type
+        encoded_headers = [
+            f"{method} {url.path} HTTP/1.1",
+            "Upgrade: websocket",
+            "Keep-Alive: timeout=60, max=100000",
+            "User-Agent: hyperscale/client",
+            f"Content-Length: {size}",
+            f"Content-Type: {content_type}",
+        ]
 
-        if headers:
-            header_items.update(headers)
+        if url.port == 80 or url.port == 443:
+            hostport = pack_hostname(url.hostname)
+        else:
+            hostport = "%s:%d" % (pack_hostname(url.hostname), url.port)
 
-        for key, value in header_items.items():
-            get_base += f"{key}: {value}{NEW_LINE}"
+        host = headers.get("host")
+        if host:
+            encoded_headers.append(f"Host: {host}")
+        else:
+            encoded_headers.append(f"Host: {hostport}")
+
+        if not headers.get("suppress_origin"):
+            origin = headers.get("origin")
+
+            if origin:
+                encoded_headers.append(f"Origin: {origin}")
+
+            elif url.scheme == "wss":
+                encoded_headers.append(f"Origin: https://{hostport}")
+
+            else:
+                encoded_headers.append(f"Origin: http://{hostport}")
+
+        key = create_sec_websocket_key()
+
+        header = headers.get("header")
+        if not header or "Sec-WebSocket-Key" not in header:
+            encoded_headers.append(f"Sec-WebSocket-Key: {key}")
+        else:
+            key = headers.get("header", {}).get("Sec-WebSocket-Key")
+
+        if not header or "Sec-WebSocket-Version" not in header:
+            encoded_headers.append(f"Sec-WebSocket-Version: {WEBSOCKETS_VERSION}")
+
+        connection = headers.get("connection")
+        if not connection:
+            encoded_headers.append("Connection: Upgrade")
+        else:
+            encoded_headers.append(connection)
+
+        subprotocols = headers.get("subprotocols")
+        if subprotocols:
+            encoded_headers.append(
+                "Sec-WebSocket-Protocol: %s" % ",".join(subprotocols)
+            )
+
+        if len(headers) > 0:
+            encoded_headers.extend(headers.items())
 
         if cookies:
-            cookies = []
+            encoded_cookies: List[str] = []
 
             for cookie_data in cookies:
                 if len(cookie_data) == 1:
-                    cookies.append(cookie_data[0])
+                    encoded_cookies.append(cookie_data[0])
 
                 elif len(cookie_data) == 2:
                     cookie_name, cookie_value = cookie_data
-                    cookies.append(f"{cookie_name}={cookie_value}")
+                    encoded_cookies.append(f"{cookie_name}={cookie_value}")
 
-            cookies = "; ".join(cookies)
-            get_base += f"cookie: {cookies}{NEW_LINE}"
+            encoded = "; ".join(encoded_cookies)
+            encoded_headers.append(f"cookie: {encoded}")
 
-        return (get_base + NEW_LINE).encode()
+        encoded_headers.extend(
+            [
+                "",
+                "",
+            ]
+        )
+
+        return f"{NEW_LINE}".join(encoded_headers).encode()

@@ -24,6 +24,13 @@ class Auth(OptimizedArg, Generic[T]):
         self.data = validated_auth.value
         self.optimized: Optional[str] = None
 
+    async def optimize(self):
+        if len(self.data) > 1:
+            self.data = f"{self.data[0]}:{self.data[1]}"
+
+        else:
+            self.data = self.data[0]
+
     @property
     def user(self):
         if len(self.data) > 1:

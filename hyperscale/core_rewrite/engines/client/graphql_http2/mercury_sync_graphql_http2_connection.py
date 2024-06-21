@@ -336,7 +336,8 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             encoded_headers = self._encode_headers(
                 url,
                 method,
-                data,
+                cookies=cookies,
+                data=data,
                 headers=headers,
             )
 
@@ -489,6 +490,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
         self,
         url: URL,
         method: Literal["GET", "POST"],
+        cookies: Optional[List[HTTPCookie]] = None,
         data: (
             Dict[Literal["query"], str]
             | Dict[Literal["query", "operation_name", "variables"], str]
@@ -523,6 +525,19 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                     )
                 ]
             )
+
+        if cookies:
+            encoded_cookies: List[str] = []
+
+            for cookie_data in cookies:
+                if len(cookie_data) == 1:
+                    encoded_cookies.append(cookie_data[0])
+
+                elif len(cookie_data) == 2:
+                    cookie_name, cookie_value = cookie_data
+                    encoded_cookies.append(f"{cookie_name}={cookie_value}")
+
+            encoded_headers.append(("cookie", "; ".join(encoded_cookies)))
 
         encoded_headers: bytes = self._encoder.encode(encoded_headers)
         encoded_headers: List[bytes] = [

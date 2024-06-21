@@ -74,6 +74,9 @@ class Hook:
             and isinstance(arg.default, OptimizedArg)
         }
 
+        for arg in self.optimized_args.values():
+            arg.call_name = call.__name__
+
         self.call = call
         self.full_name = call.__qualname__
         self.name = call.__name__

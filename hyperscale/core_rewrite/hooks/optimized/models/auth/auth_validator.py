@@ -7,4 +7,4 @@ from pydantic import (
 
 
 class AuthValidator(BaseModel):
-    value: Tuple[StrictStr, StrictStr]
+    value: Tuple[StrictStr,] | Tuple[StrictStr, StrictStr]
