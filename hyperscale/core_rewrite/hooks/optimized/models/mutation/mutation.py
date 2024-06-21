@@ -10,6 +10,8 @@ from typing import (
     TypeVar,
 )
 
+import orjson
+
 from hyperscale.core_rewrite.hooks.optimized.models.base import OptimizedArg
 from hyperscale.core_rewrite.hooks.optimized.models.base.base_types import (
     HTTPEncodableValue,
@@ -48,6 +50,12 @@ class Mutation(OptimizedArg, Generic[T]):
         ] = validated_mutation.model_dump()
 
         self.optimized: Optional[bytes] = None
+        self.content_length: Optional[int] = None
+        self.content_type = "application/json"
+
+    async def optimize(self):
+        self.optimized = orjson.dumps(self.data)
+        self.content_length = len(self.optimized)
 
     def __getitem__(
         self,

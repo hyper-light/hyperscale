@@ -2,8 +2,8 @@ import asyncio
 import time
 import uuid
 from typing import (
-    Any,
     Dict,
+    Iterator,
     List,
     Literal,
     Optional,
@@ -12,6 +12,7 @@ from typing import (
 )
 from urllib.parse import (
     ParseResult,
+    urlencode,
     urlparse,
 )
 
@@ -23,7 +24,9 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
     URL as HTTPUrl,
 )
 from hyperscale.core_rewrite.engines.client.shared.models import (
-    Cookies,
+    Cookies as HTTPCookies,
+)
+from hyperscale.core_rewrite.engines.client.shared.models import (
     HTTPCookie,
     HTTPEncodableValue,
     Metadata,
@@ -31,7 +34,15 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 )
 from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
-from hyperscale.core_rewrite.hooks.optimized.models import URL
+from hyperscale.core_rewrite.hooks.optimized.models import (
+    URL,
+    Auth,
+    Cookies,
+    Headers,
+    Mutation,
+    Params,
+    Query,
+)
 
 from .models.graphql import (
     GraphQLResponse,
@@ -72,8 +83,8 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         query: str,
         auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        timeout: Union[Optional[int], Optional[float]] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ) -> GraphQLResponse:
         async with self._semaphore:
@@ -94,7 +105,11 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return GraphQLResponse(
                     metadata=Metadata(),
@@ -113,14 +128,20 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
     async def mutate(
         self,
         url: str | URL,
-        query: str,
-        operation_name: str = None,
-        variables: Dict[str, Any] = None,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        mutation: Dict[
+            Literal[
+                "query",
+                "operation_name",
+                "variables",
+            ],
+            str | Dict[str, HTTPEncodableValue],
+        ]
+        | Mutation,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ) -> GraphQLResponse:
         async with self._semaphore:
@@ -133,18 +154,18 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                         auth=auth,
                         headers=headers,
                         params=params,
-                        data={
-                            "query": query,
-                            "operation_name": operation_name,
-                            "variables": variables,
-                        },
+                        data=mutation,
                         redirects=redirects,
                     ),
                     timeout=timeout,
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return GraphQLResponse(
                     metadata=Metadata(),
@@ -160,9 +181,15 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     status_message="Request timed out.",
                 )
 
-    async def _optimize(self, url: Optional[URL] = None):
-        if isinstance(url, URL):
-            await self._optimize_url(url)
+    async def _optimize(
+        self,
+        optimized_param: URL | Params | Headers | Cookies | Auth | Query | Mutation,
+    ):
+        if isinstance(optimized_param, URL):
+            await self._optimize_url(optimized_param)
+
+        else:
+            self._optimized[optimized_param.call_name] = optimized_param
 
     async def _optimize_url(self, url: URL):
         try:
@@ -192,14 +219,26 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         self,
         url: str | URL,
         method: Literal["GET", "POST"],
-        cookies: Optional[List[HTTPCookie]] = None,
-        auth: Optional[Tuple[str, str]] = None,
-        headers: Optional[Dict[str, str]] = {},
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
         data: (
-            Dict[Literal["query"], str]
-            | Dict[Literal["query", "operation_name", "variables"], str]
+            Dict[
+                Literal["query"],
+                str,
+            ]
+            | Dict[
+                Literal[
+                    "query",
+                    "operation_name",
+                    "variables",
+                ],
+                str | Dict[str, HTTPEncodableValue],
+            ]
+            | Mutation
         ) = None,
-        redirects: Optional[int] = 3,
+        redirects: int = 3,
     ):
         timings: Dict[
             Literal[
@@ -230,6 +269,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             method,
             cookies=cookies,
             auth=auth,
+            params=params,
             headers=headers,
             data=data,
             timings=timings,
@@ -248,6 +288,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     method,
                     cookies=cookies,
                     auth=auth,
+                    params=params,
                     headers=headers,
                     data=data,
                     upgrade_ssl=upgrade_ssl,
@@ -273,12 +314,24 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         self,
         request_url: str | URL,
         method: Literal["GET", "POST"],
-        cookies: Optional[List[HTTPCookie]] = None,
-        auth: Optional[Tuple[str, str]] = None,
-        headers: Optional[Dict[str, str]] = {},
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
         data: (
-            Dict[Literal["query"], str]
-            | Dict[Literal["query", "operation_name", "variables"], str]
+            Dict[
+                Literal["query"],
+                str,
+            ]
+            | Dict[
+                Literal[
+                    "query",
+                    "operation_name",
+                    "variables",
+                ],
+                str | Dict[str, HTTPEncodableValue],
+            ]
+            | Mutation
         ) = None,
         upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
@@ -373,6 +426,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     data,
                     headers=headers,
                     cookies=cookies,
+                    params=params,
                 )
 
                 connection.write(encoded_headers)
@@ -385,7 +439,9 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     method,
                     data,
                     headers=headers,
+                    params=params,
                     cookies=cookies,
+                    data=data,
                     encoded_data=encoded_data,
                 )
 
@@ -430,10 +486,10 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             content_length = headers.get(b"content-length")
             transfer_encoding = headers.get(b"transfer-encoding")
 
-            cookies: Union[Cookies, None] = None
+            cookies: Union[HTTPCookies, None] = None
             cookies_data: Union[bytes, None] = headers.get(b"set-cookie")
             if cookies_data:
-                cookies = Cookies()
+                cookies = HTTPCookies()
                 cookies.update(cookies_data)
 
             # We require Content-Length or Transfer-Encoding headers to read a
@@ -526,9 +582,20 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         self,
         data: (
             Dict[Literal["query"], str]
-            | Dict[Literal["query", "operation_name", "variables"], str]
+            | Dict[
+                Literal[
+                    "query",
+                    "operation_name",
+                    "variables",
+                ],
+                str,
+            ]
+            | Mutation
         ),
     ):
+        if isinstance(data, Mutation):
+            return data.optimized, data.content_type
+
         source = Source(data.get("query"))
         document_node = parse(source)
         query_string = print_ast(document_node)
@@ -550,52 +617,82 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         self,
         url: HTTPUrl | URL,
         method: Literal["GET", "POST"],
-        data: (
-            Dict[Literal["query"], str]
-            | Dict[Literal["query", "operation_name", "variables"], str]
-        ),
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
-        encoded_data: Optional[bytes] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[
+            Dict[Literal["query"], str]
+            | Dict[
+                Literal[
+                    "query",
+                    "operation_name",
+                    "variables",
+                ],
+                str,
+            ]
+            | Mutation
+        ] = None,
+        encoded_data: Optional[bytes | List[bytes]] = None,
     ):
         if isinstance(url, URL):
             url = url.optimized
 
         url_path = url.path
+        query_string: str | Query = data.get("query")
 
-        if method == "GET":
+        if method == "GET" and isinstance(query_string, Query):
+            url_path += query_string
+
+        elif method == "GET":
             query_string = data.get("query")
             query_string = "".join(query_string.replace("query", "").split())
 
             url_path += f"?query={{{query_string}}}"
 
-        get_base = f"{method} {url_path} HTTP/1.1{NEW_LINE}"
+        elif params:
+            url_params = urlencode(params)
+            url_path += f"?{url_params}"
 
         port = url.port or (443 if url.scheme == "https" else 80)
-
-        hostname = url.hostname.encode("idna").decode()
+        hostname = url.parsed.hostname.encode("idna").decode()
 
         if port not in [80, 443]:
             hostname = f"{hostname}:{port}"
 
-        header_items = {
-            "HOST": hostname,
-            "Keep-Alive": "timeout=60, max=100000",
-            "User-Agent": "hyperscale/client",
-            "Content-Length": 0,
-        }
+        header_items = (
+            f"{method} {url_path} HTTP/1.1{NEW_LINE}HOST: {hostname}{NEW_LINE}"
+        )
+        if isinstance(headers, Headers):
+            header_items += headers.optimized
+        elif headers:
+            header_items += f"Keep-Alive: timeout=60, max=100000{NEW_LINE}User-Agent: hyperscale/client{NEW_LINE}"
 
-        if method == "POST" and encoded_data:
-            header_items["Content-Length"] = len(encoded_data)
-            header_items["Content-Type"] = "application/json"
+            for key, value in headers.items():
+                header_items += f"{key}: {value}{NEW_LINE}"
 
-        if headers:
-            header_items.update(headers)
+        else:
+            header_items += f"Keep-Alive: timeout=60, max=100000{NEW_LINE}User-Agent: hyperscale/client{NEW_LINE}"
 
-        for key, value in header_items.items():
-            get_base += f"{key}: {value}{NEW_LINE}"
+        size: int = 0
 
-        if cookies:
+        if isinstance(data, Mutation):
+            size = data.content_length
+
+        elif encoded_data and isinstance(encoded_data, Iterator):
+            size = sum([len(chunk) for chunk in encoded_data])
+
+        elif encoded_data:
+            size = len(encoded_data)
+
+        header_items += f"Content-Length: {size}{NEW_LINE}"
+
+        if method == "POST":
+            header_items += f"Content-Type: application/json{NEW_LINE}"
+
+        if isinstance(cookies, Cookies):
+            header_items += cookies.optimized
+
+        elif cookies:
             encoded_cookies: List[str] = []
 
             for cookie_data in cookies:
@@ -607,6 +704,6 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     encoded_cookies.append(f"{cookie_name}={cookie_value}")
 
             encoded = "; ".join(encoded_cookies)
-            get_base += f"cookie: {encoded}{NEW_LINE}"
+            header_items += f"cookie: {encoded}{NEW_LINE}"
 
-        return (get_base + NEW_LINE).encode()
+        return f"{header_items}{NEW_LINE}".encode()

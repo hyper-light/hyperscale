@@ -23,15 +23,23 @@ from urllib.parse import (
 import orjson
 from pydantic import BaseModel
 
+from hyperscale.core_rewrite.engines.client.shared.models import URL as HTTPUrl
+from hyperscale.core_rewrite.engines.client.shared.models import Cookies as HTTPCookies
 from hyperscale.core_rewrite.engines.client.shared.models import (
-    URL,
-    Cookies,
     HTTPCookie,
     HTTPEncodableValue,
     URLMetadata,
 )
 from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
+from hyperscale.core_rewrite.hooks.optimized.models import (
+    URL,
+    Auth,
+    Cookies,
+    Data,
+    Headers,
+    Params,
+)
 
 from .fast_hpack import Encoder
 from .models.http2 import (
@@ -70,14 +78,9 @@ class MercurySyncHTTP2Connection:
 
         self._pipes = [HTTP2Pipe(pool_size) for _ in range(pool_size)]
 
-        self._url_cache: Dict[str, URL] = {}
+        self._url_cache: Dict[str, HTTPUrl] = {}
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
-
-        self._locks: Dict[asyncio.Transport, asyncio.Lock] = {}
-
-        self._max_concurrency = pool_size
-        self._connection_waiters: List[asyncio.Future] = []
 
         self.active = 0
         self.waiter = None
@@ -86,15 +89,16 @@ class MercurySyncHTTP2Connection:
         self._settings: Settings = None
 
         self._client_ssl_context: Optional[ssl.SSLContext] = None
+        self._optimized: Dict[str, URL | Params | Headers | Auth | Data | Cookies] = {}
 
     async def head(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
         headers: Optional[Dict[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -113,7 +117,11 @@ class MercurySyncHTTP2Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP2Response(
                     url=URLMetadata(
@@ -130,12 +138,12 @@ class MercurySyncHTTP2Connection:
 
     async def options(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -154,7 +162,11 @@ class MercurySyncHTTP2Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP2Response(
                     url=URLMetadata(
@@ -171,12 +183,12 @@ class MercurySyncHTTP2Connection:
 
     async def get(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -195,7 +207,11 @@ class MercurySyncHTTP2Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP2Response(
                     url=URLMetadata(
@@ -212,13 +228,21 @@ class MercurySyncHTTP2Connection:
 
     async def post(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[
+            str
+            | bytes
+            | Iterator
+            | Dict[str, HTTPEncodableValue]
+            | List[str]
+            | BaseModel
+            | Data
+        ] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -238,7 +262,11 @@ class MercurySyncHTTP2Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP2Response(
                     url=URLMetadata(
@@ -255,13 +283,21 @@ class MercurySyncHTTP2Connection:
 
     async def put(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[
+            str
+            | bytes
+            | Iterator
+            | Dict[str, HTTPEncodableValue]
+            | List[str]
+            | BaseModel
+            | Data
+        ] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -281,7 +317,11 @@ class MercurySyncHTTP2Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP2Response(
                     url=URLMetadata(
@@ -298,13 +338,21 @@ class MercurySyncHTTP2Connection:
 
     async def patch(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
-        data: Union[Optional[str], Optional[BaseModel]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[
+            str
+            | bytes
+            | Iterator
+            | Dict[str, HTTPEncodableValue]
+            | List[str]
+            | BaseModel
+            | Data
+        ] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -324,7 +372,11 @@ class MercurySyncHTTP2Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP2Response(
                     url=URLMetadata(
@@ -341,12 +393,12 @@ class MercurySyncHTTP2Connection:
 
     async def delete(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        timeout: Union[Optional[int], Optional[float]] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
         async with self._semaphore:
@@ -365,7 +417,11 @@ class MercurySyncHTTP2Connection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return HTTP2Response(
                     url=URLMetadata(
@@ -380,13 +436,48 @@ class MercurySyncHTTP2Connection:
                     status_message="Request timed out.",
                 )
 
+    async def _optimize(
+        self,
+        optimized_param: URL | Params | Headers | Cookies | Data | Auth,
+    ):
+        if isinstance(optimized_param, URL):
+            await self._optimize_url(optimized_param)
+
+        else:
+            self._optimized[optimized_param.call_name] = optimized_param
+
+    async def _optimize_url(self, url: URL):
+        try:
+            upgrade_ssl: bool = False
+            if url:
+                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            if upgrade_ssl:
+                url.data = url.data.replace("http://", "https://")
+
+                await url.optimize()
+
+                _, url, _ = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+            self._url_cache[url.optimized.hostname] = url
+            self._optimized[url.call_name] = url
+
+        except Exception:
+            pass
+
     async def _request(
         self,
-        url: str,
+        url: str | URL,
         method: str,
-        cookies: Optional[List[HTTPCookie]] = None,
-        auth: Optional[Tuple[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str]] = {},
         data: Union[Optional[str], Optional[bytes], Optional[BaseModel]] = None,
         redirects: Optional[int] = 3,
@@ -463,11 +554,11 @@ class MercurySyncHTTP2Connection:
 
     async def _execute(
         self,
-        request_url: str,
+        request_url: str | URL,
         method: str,
-        cookies: Optional[List[HTTPCookie]] = None,
-        auth: Optional[Tuple[str, str]] = None,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str]] = {},
         data: Union[
             Optional[str],
@@ -529,7 +620,7 @@ class MercurySyncHTTP2Connection:
                     )
                 )
 
-                self._pipes.append(HTTP2Pipe(self._max_concurrency))
+                self._pipes.append(HTTP2Pipe(self._concurrency))
 
                 return (
                     HTTP2Response(
@@ -564,6 +655,7 @@ class MercurySyncHTTP2Connection:
                 params=params,
                 headers=headers,
                 cookies=cookies,
+                data=data,
             )
 
             connection = pipe.send_request_headers(
@@ -602,7 +694,7 @@ class MercurySyncHTTP2Connection:
                         reset_connections=self._reset_connections,
                     )
                 )
-                self._pipes.append(HTTP2Pipe(self._max_concurrency))
+                self._pipes.append(HTTP2Pipe(self._concurrency))
 
                 return (
                     HTTP2Response(
@@ -621,10 +713,10 @@ class MercurySyncHTTP2Connection:
             if error:
                 raise error
 
-            cookies: Union[Cookies, None] = None
+            cookies: Union[HTTPCookies, None] = None
             cookies_data: Union[bytes, None] = headers.get("set-cookie")
             if cookies_data:
-                cookies = Cookies()
+                cookies = HTTPCookies()
                 cookies.update(cookies_data)
 
             self._connections.append(connection)
@@ -657,10 +749,13 @@ class MercurySyncHTTP2Connection:
                 )
             )
 
-            self._pipes.append(HTTP2Pipe(self._max_concurrency))
+            self._pipes.append(HTTP2Pipe(self._concurrency))
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
+
+            elif isinstance(request_url, URL):
+                request_url: ParseResult = request_url.optimized.parsed
 
             timings["read_end"] = time.monotonic()
 
@@ -682,16 +777,15 @@ class MercurySyncHTTP2Connection:
 
     def _encode_data(
         self,
-        data: Union[
-            Optional[str],
-            Optional[bytes],
-            Optional[BaseModel],
-        ] = None,
+        data: str | bytes | BaseModel | bytes | Data,
     ):
         encoded_data: Optional[bytes] = None
         size = 0
 
-        if isinstance(data, Iterator) and not isinstance(data, list):
+        if isinstance(data, Data):
+            encoded_data = data.optimized
+
+        elif isinstance(data, Iterator) and not isinstance(data, list):
             chunks = []
             for chunk in data:
                 chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
@@ -702,7 +796,7 @@ class MercurySyncHTTP2Connection:
             encoded_data = chunks
 
         elif isinstance(data, BaseModel):
-            return orjson.dumps(data.model_dump())
+            encoded_data = orjson.dumps(data.model_dump())
 
         elif isinstance(data, (dict, list)):
             encoded_data = orjson.dumps(data)
@@ -717,26 +811,44 @@ class MercurySyncHTTP2Connection:
 
     def _encode_headers(
         self,
-        url: URL,
+        url: HTTPUrl,
         method: str,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        data: Optional[str | bytes | BaseModel | bytes | Data] = None,
     ):
+        if isinstance(url, URL):
+            url = url.optimized
+
         url_path = url.path
-        if params:
+
+        if isinstance(params, Params):
+            url_path += params.optimized
+
+        elif params:
             url_params = urlencode(params)
             url_path += f"?{url_params}"
 
-        encoded_headers: List[Tuple[bytes, bytes]] = [
-            (b":method", method.encode()),
-            (b":authority", url.hostname.encode()),
-            (b":scheme", url.scheme.encode()),
-            (b":path", url_path.encode()),
-            (b"user-agent", b"hyperscale/client"),
-        ]
+        if isinstance(headers, Headers):
+            encoded_headers: List[Tuple[bytes, bytes]] = [
+                (b":method", method.encode()),
+                (b":authority", url.hostname.encode()),
+                (b":scheme", url.scheme.encode()),
+                (b":path", url_path.encode()),
+            ]
 
-        if headers:
+            encoded_headers.extend(headers.optimized)
+
+        elif headers:
+            encoded_headers: List[Tuple[bytes, bytes]] = [
+                (b":method", method.encode()),
+                (b":authority", url.hostname.encode()),
+                (b":scheme", url.scheme.encode()),
+                (b":path", url_path.encode()),
+                (b"user-agent", b"hyperscale/client"),
+            ]
+
             encoded_headers.extend(
                 [
                     (k.lower().encode(), v.encode())
@@ -749,7 +861,27 @@ class MercurySyncHTTP2Connection:
                 ]
             )
 
-        if cookies:
+        else:
+            encoded_headers: List[Tuple[bytes, bytes]] = [
+                (b":method", method.encode()),
+                (b":authority", url.hostname.encode()),
+                (b":scheme", url.scheme.encode()),
+                (b":path", url_path.encode()),
+                (b"user-agent", b"hyperscale/client"),
+            ]
+
+        if isinstance(data, Data):
+            encoded_headers.extend(
+                [
+                    ("Content-Length", data.content_length),
+                    ("Content-Type", data.content_type),
+                ]
+            )
+
+        if isinstance(cookies, Cookies):
+            encoded_headers.append(cookies.optimized)
+
+        elif cookies:
             encoded_cookies: List[str] = []
 
             for cookie_data in cookies:
@@ -771,19 +903,26 @@ class MercurySyncHTTP2Connection:
         return encoded_headers[0]
 
     async def _connect_to_url_location(
-        self, request_url: str, ssl_redirect_url: Optional[str] = None
-    ) -> Tuple[Optional[Exception], HTTP2Connection, HTTP2Pipe, URL, bool]:
-        if ssl_redirect_url:
-            parsed_url = URL(ssl_redirect_url)
+        self,
+        request_url: str | URL,
+        ssl_redirect_url: Optional[str] = None,
+    ) -> Tuple[Optional[Exception], HTTP2Connection, HTTP2Pipe, HTTPUrl, bool]:
+        has_optimized_url = isinstance(request_url, URL)
+
+        if has_optimized_url:
+            parsed_url = request_url.optimized
+
+        elif ssl_redirect_url:
+            parsed_url = HTTPUrl(ssl_redirect_url)
 
         else:
-            parsed_url = URL(request_url)
+            parsed_url = HTTPUrl(request_url)
 
         url = self._url_cache.get(parsed_url.hostname)
         dns_lock = self._dns_lock[parsed_url.hostname]
         dns_waiter = self._dns_waiters[parsed_url.hostname]
 
-        do_dns_lookup = url is None or ssl_redirect_url
+        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
             await dns_lock.acquire()

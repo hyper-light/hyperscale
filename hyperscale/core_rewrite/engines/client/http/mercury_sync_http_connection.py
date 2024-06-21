@@ -87,7 +87,7 @@ class MercurySyncHTTPConnection:
 
         protocols = ProtocolMap()
         address_family, protocol = protocols[RequestType.HTTP]
-        self._optimized: Dict[str, URL | Params | Headers] = {}
+        self._optimized: Dict[str, URL | Params | Headers | Auth | Data | Cookies] = {}
 
         self.address_family = address_family
         self.address_protocol = protocol
@@ -805,6 +805,7 @@ class MercurySyncHTTPConnection:
         ssl_redirect_url: Optional[str | URL] = None,
     ) -> Tuple[HTTPConnection, HTTPUrl, bool]:
         has_optimized_url = isinstance(request_url, URL)
+
         if has_optimized_url:
             parsed_url = request_url.optimized
 
@@ -909,7 +910,7 @@ class MercurySyncHTTPConnection:
             encoded_data = data.optimized
             content_type = data.content_type
 
-        if isinstance(data, Iterator) and not isinstance(data, list):
+        elif isinstance(data, Iterator) and not isinstance(data, list):
             chunks: List[bytes] = []
             for chunk in data:
                 chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
