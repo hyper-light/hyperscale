@@ -79,40 +79,59 @@ class Headers(OptimizedArg, Generic[T]):
                     "User-Agent: hyperscale/client",
                 ]
 
-                host = self.data.get("host")
+                headers: Dict[str, HTTPEncodableValue] = {}
+
+                for header_name, header_value in self.data.items():
+                    header_name_lowered = header_name.lower()
+                    headers[header_name_lowered] = header_value
+
+                host = headers.get("host")
                 if host:
                     encoded_headers.append(f"Host: {host}")
 
-                origin = self.data.get("origin")
-                if not self.data.get("suppress_origin") and origin:
+                origin = headers.get("origin")
+                if not headers.get("suppress_origin") and origin:
                     encoded_headers.append(f"Origin: {origin}")
 
                 key = create_sec_websocket_key()
-                header = self.data.get("header")
+                header = headers.get("header")
                 if not header or "Sec-WebSocket-Key" not in header:
                     encoded_headers.append(f"Sec-WebSocket-Key: {key}")
                 else:
-                    key = self.data.get("header", {}).get("Sec-WebSocket-Key")
+                    key = headers.get("header", {}).get("Sec-WebSocket-Key")
 
                 if not header or "Sec-WebSocket-Version" not in header:
                     encoded_headers.append(
                         f"Sec-WebSocket-Version: {WEBSOCKETS_VERSION}"
                     )
 
-                connection = self.data.get("connection")
+                connection = headers.get("connection")
                 if not connection:
                     encoded_headers.append("Connection: Upgrade")
                 else:
                     encoded_headers.append(connection)
 
-                subprotocols = self.data.get("subprotocols")
+                subprotocols = headers.get("subprotocols")
                 if subprotocols:
                     encoded_headers.append(
                         "Sec-WebSocket-Protocol: %s" % ",".join(subprotocols)
                     )
 
-                if len(self.data) > 0:
-                    encoded_headers.extend(self.data.items())
+                additional_headers: List[str] = []
+
+                if len(headers) > 0:
+                    for key, value in self.data.items():
+                        additional_headers.append(
+                            f"{key}: {value}",
+                        )
+
+                encoded_headers.extend(
+                    [
+                        header
+                        for header in additional_headers
+                        if header not in encoded_headers
+                    ]
+                )
 
                 self.optimized = encoded_headers
 

@@ -399,7 +399,7 @@ class MercurySyncWebsocketConnection:
                 timings["connect_start"] = time.monotonic()
 
             (
-                _,
+                error,
                 connection,
                 url,
                 upgrade_ssl,
@@ -414,7 +414,7 @@ class MercurySyncWebsocketConnection:
                 ssl_redirect_url = request_url.replace("http://", "https://")
 
                 (
-                    _,
+                    error,
                     connection,
                     url,
                     _,
@@ -427,7 +427,7 @@ class MercurySyncWebsocketConnection:
 
                 request_url = ssl_redirect_url
 
-            if connection.reader is None:
+            if connection.reader is None or error:
                 timings["connect_end"] = time.monotonic()
                 self._connections.append(
                     WebsocketConnection(
@@ -443,6 +443,7 @@ class MercurySyncWebsocketConnection:
                         ),
                         method=method,
                         status=400,
+                        status_message=str(error) if error else None,
                         headers=headers,
                         timings=timings,
                     ),
@@ -735,7 +736,10 @@ class MercurySyncWebsocketConnection:
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
-        data: Optional[bytes | List[bytes]] = None,
+        data: Optional[
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
+        ] = None,
+        encoded_data: Optional[bytes | List[bytes]] = None,
         content_type: Optional[str] = None,
     ):
         if isinstance(url, URL):
@@ -743,83 +747,39 @@ class MercurySyncWebsocketConnection:
 
         url_path = url.path
 
-        if params and len(params) > 0:
+        if isinstance(params, Params):
+            url_path += params.optimized
+
+        elif params and len(params) > 0:
             url_params = urlencode(params)
             url_path += f"?{url_params}"
 
-        if headers is None:
-            headers: Dict[str, HTTPEncodableValue] = {}
+        if isinstance(headers, Headers):
+            encoded_headers = headers.optimized
 
-        for header_name, header_value in headers.items():
-            header_name_lowered = header_name.lower()
-            headers[header_name_lowered] = header_value
+        else:
+            encoded_headers = self._encode_dynamic_headers(url, method, headers=headers)
 
         size: int = 0
-        if data and isinstance(data, Iterator):
-            size = sum([len(chunk) for chunk in data])
 
-        elif data:
-            size = len(data)
+        if isinstance(data, Data):
+            size = data.content_length
 
-        encoded_headers = [
-            f"{method} {url.path} HTTP/1.1",
-            "Upgrade: websocket",
-            "Keep-Alive: timeout=60, max=100000",
-            "User-Agent: hyperscale/client",
-            f"Content-Length: {size}",
-            f"Content-Type: {content_type}",
-        ]
+        elif encoded_data and isinstance(encoded_data, Iterator):
+            size = sum([len(chunk) for chunk in encoded_data])
 
-        if url.port == 80 or url.port == 443:
-            hostport = pack_hostname(url.hostname)
-        else:
-            hostport = "%s:%d" % (pack_hostname(url.hostname), url.port)
+        elif encoded_data:
+            size = len(encoded_data)
 
-        host = headers.get("host")
-        if host:
-            encoded_headers.append(f"Host: {host}")
-        else:
-            encoded_headers.append(f"Host: {hostport}")
+        encoded_headers.append(f"Content-Length: {size}")
 
-        if not headers.get("suppress_origin"):
-            origin = headers.get("origin")
+        if content_type:
+            encoded_headers.append(f"Content-Type: {content_type}")
 
-            if origin:
-                encoded_headers.append(f"Origin: {origin}")
+        if isinstance(cookies, Cookies):
+            encoded_headers.append(cookies.optimized)
 
-            elif url.scheme == "wss":
-                encoded_headers.append(f"Origin: https://{hostport}")
-
-            else:
-                encoded_headers.append(f"Origin: http://{hostport}")
-
-        key = create_sec_websocket_key()
-
-        header = headers.get("header")
-        if not header or "Sec-WebSocket-Key" not in header:
-            encoded_headers.append(f"Sec-WebSocket-Key: {key}")
-        else:
-            key = headers.get("header", {}).get("Sec-WebSocket-Key")
-
-        if not header or "Sec-WebSocket-Version" not in header:
-            encoded_headers.append(f"Sec-WebSocket-Version: {WEBSOCKETS_VERSION}")
-
-        connection = headers.get("connection")
-        if not connection:
-            encoded_headers.append("Connection: Upgrade")
-        else:
-            encoded_headers.append(connection)
-
-        subprotocols = headers.get("subprotocols")
-        if subprotocols:
-            encoded_headers.append(
-                "Sec-WebSocket-Protocol: %s" % ",".join(subprotocols)
-            )
-
-        if len(headers) > 0:
-            encoded_headers.extend(headers.items())
-
-        if cookies:
+        elif cookies:
             encoded_cookies: List[str] = []
 
             for cookie_data in cookies:
@@ -841,3 +801,85 @@ class MercurySyncWebsocketConnection:
         )
 
         return f"{NEW_LINE}".join(encoded_headers).encode()
+
+    def _encode_dynamic_headers(
+        self,
+        url: HTTPUrl,
+        method: str,
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        encoded_headers = [
+            f"{method} {url.path} HTTP/1.1",
+            "Upgrade: websocket",
+            "Keep-Alive: timeout=60, max=100000",
+            "User-Agent: hyperscale/client",
+        ]
+
+        if headers is None:
+            headers: Dict[str, HTTPEncodableValue] = {}
+
+        lowered_headers: Dict[str, HTTPEncodableValue] = {}
+
+        for header_name, header_value in headers.items():
+            header_name_lowered = header_name.lower()
+            lowered_headers[header_name_lowered] = header_value
+
+        if url.port == 80 or url.port == 443:
+            hostport = pack_hostname(url.hostname)
+        else:
+            hostport = "%s:%d" % (pack_hostname(url.hostname), url.port)
+
+        host = lowered_headers.get("host")
+        if host:
+            encoded_headers.append(f"Host: {host}")
+        else:
+            encoded_headers.append(f"Host: {hostport}")
+
+        if not lowered_headers.get("suppress_origin"):
+            origin = lowered_headers.get("origin")
+
+            if origin:
+                encoded_headers.append(f"Origin: {origin}")
+
+            elif url.scheme == "wss":
+                encoded_headers.append(f"Origin: https://{hostport}")
+
+            else:
+                encoded_headers.append(f"Origin: http://{hostport}")
+
+        key = create_sec_websocket_key()
+
+        header = lowered_headers.get("header")
+        if not header or "Sec-WebSocket-Key" not in header:
+            encoded_headers.append(f"Sec-WebSocket-Key: {key}")
+        else:
+            key = lowered_headers.get("header", {}).get("Sec-WebSocket-Key")
+
+        if not header or "Sec-WebSocket-Version" not in header:
+            encoded_headers.append(f"Sec-WebSocket-Version: {WEBSOCKETS_VERSION}")
+
+        connection = lowered_headers.get("connection")
+        if not connection:
+            encoded_headers.append("Connection: Upgrade")
+        else:
+            encoded_headers.append(connection)
+
+        subprotocols = lowered_headers.get("subprotocols")
+        if subprotocols:
+            encoded_headers.append(
+                "Sec-WebSocket-Protocol: %s" % ",".join(subprotocols)
+            )
+
+        additional_headers: List[str] = []
+
+        if len(lowered_headers) > 0:
+            for key, value in headers.items():
+                additional_headers.append(
+                    f"{key}: {value}",
+                )
+
+        encoded_headers.extend(
+            [header for header in additional_headers if header not in encoded_headers]
+        )
+
+        return encoded_headers
