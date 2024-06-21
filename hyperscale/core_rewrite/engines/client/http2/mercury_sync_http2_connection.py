@@ -450,20 +450,38 @@ class MercurySyncHTTP2Connection:
         try:
             upgrade_ssl: bool = False
             if url:
-                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                (
+                    _,
+                    connection,
+                    pipe,
+                    url,
+                    upgrade_ssl,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
                 )
+
+                self._connections.append(connection)
+                self._pipes.append(pipe)
 
             if upgrade_ssl:
                 url.data = url.data.replace("http://", "https://")
 
                 await url.optimize()
 
-                _, url, _ = await asyncio.wait_for(
+                (
+                    _,
+                    connection,
+                    pipe,
+                    url,
+                    _,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
                 )
+
+                self._connections.append(connection)
+                self._pipes.append(pipe)
 
             self._url_cache[url.optimized.hostname] = url
             self._optimized[url.call_name] = url
@@ -942,7 +960,13 @@ class MercurySyncHTTP2Connection:
         self,
         request_url: str | URL,
         ssl_redirect_url: Optional[str] = None,
-    ) -> Tuple[Optional[Exception], HTTP2Connection, HTTP2Pipe, HTTPUrl, bool]:
+    ) -> Tuple[
+        Optional[Exception],
+        HTTP2Connection,
+        HTTP2Pipe,
+        HTTPUrl,
+        bool,
+    ]:
         has_optimized_url = isinstance(request_url, URL)
 
         if has_optimized_url:
@@ -1013,8 +1037,6 @@ class MercurySyncHTTP2Connection:
                             parsed_url,
                             True,
                         )
-
-                    connection_error = err
 
         else:
             try:

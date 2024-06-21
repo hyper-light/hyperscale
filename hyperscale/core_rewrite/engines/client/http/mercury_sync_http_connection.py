@@ -433,20 +433,34 @@ class MercurySyncHTTPConnection:
         try:
             upgrade_ssl: bool = False
             if url:
-                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                (
+                    _,
+                    connection,
+                    url,
+                    upgrade_ssl,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
                 )
+
+                self._connections.append(connection)
 
             if upgrade_ssl:
                 url.data = url.data.replace("http://", "https://")
 
                 await url.optimize()
 
-                _, url, _ = await asyncio.wait_for(
+                (
+                    _,
+                    connection,
+                    url,
+                    _,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
                 )
+
+                self._connections.append(connection)
 
             self._url_cache[url.optimized.hostname] = url
             self._optimized[url.call_name] = url
@@ -587,7 +601,7 @@ class MercurySyncHTTPConnection:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
-            (connection, url, upgrade_ssl) = await asyncio.wait_for(
+            (error, connection, url, upgrade_ssl) = await asyncio.wait_for(
                 self._connect_to_url_location(
                     request_url,
                     ssl_redirect_url=request_url if upgrade_ssl else None,
@@ -598,7 +612,7 @@ class MercurySyncHTTPConnection:
             if upgrade_ssl:
                 ssl_redirect_url = request_url.replace("http://", "https://")
 
-                connection, url, _ = await asyncio.wait_for(
+                (error, connection, url, _) = await asyncio.wait_for(
                     self._connect_to_url_location(
                         request_url,
                         ssl_redirect_url=ssl_redirect_url,
@@ -611,7 +625,7 @@ class MercurySyncHTTPConnection:
             encoded_data: Optional[bytes | List[bytes]] = None
             content_type: Optional[str] = None
 
-            if connection.reader is None:
+            if connection.reader is None or error:
                 timings["connect_end"] = time.monotonic()
                 self._connections.append(
                     HTTPConnection(
@@ -627,6 +641,7 @@ class MercurySyncHTTPConnection:
                         ),
                         method=method,
                         status=400,
+                        status_message=str(error) if error else None,
                         headers=headers,
                         timings=timings,
                     ),
@@ -803,7 +818,12 @@ class MercurySyncHTTPConnection:
         self,
         request_url: str | URL,
         ssl_redirect_url: Optional[str | URL] = None,
-    ) -> Tuple[HTTPConnection, HTTPUrl, bool]:
+    ) -> Tuple[
+        Optional[Exception],
+        HTTPConnection,
+        HTTPUrl,
+        bool,
+    ]:
         has_optimized_url = isinstance(request_url, URL)
 
         if has_optimized_url:
@@ -878,8 +898,6 @@ class MercurySyncHTTPConnection:
                             True,
                         )
 
-                    connection_error = err
-
         else:
             try:
                 await connection.make_connection(
@@ -900,6 +918,7 @@ class MercurySyncHTTPConnection:
                 connection_error = err
 
         return (
+            connection_error,
             connection,
             parsed_url,
             False,

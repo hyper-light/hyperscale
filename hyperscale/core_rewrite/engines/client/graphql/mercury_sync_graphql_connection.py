@@ -195,20 +195,34 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         try:
             upgrade_ssl: bool = False
             if url:
-                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                (
+                    _,
+                    connection,
+                    url,
+                    upgrade_ssl,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
                 )
+
+                self._connections.append(connection)
 
             if upgrade_ssl:
                 url.data = url.data.replace("http://", "https://")
 
                 await url.optimize()
 
-                _, url, _ = await asyncio.wait_for(
+                (
+                    _,
+                    connection,
+                    url,
+                    _,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
                 )
+
+                self._connections.append(connection)
 
             self._url_cache[url.optimized.hostname] = url
 
@@ -372,7 +386,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
-            (connection, url, upgrade_ssl) = await asyncio.wait_for(
+            (error, connection, url, upgrade_ssl) = await asyncio.wait_for(
                 self._connect_to_url_location(
                     request_url, ssl_redirect_url=request_url if upgrade_ssl else None
                 ),
@@ -382,7 +396,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             if upgrade_ssl:
                 ssl_redirect_url = request_url.replace("http://", "https://")
 
-                connection, url, _ = await asyncio.wait_for(
+                (error, connection, url, _) = await asyncio.wait_for(
                     self._connect_to_url_location(
                         request_url, ssl_redirect_url=ssl_redirect_url
                     ),
@@ -391,7 +405,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
 
                 request_url = ssl_redirect_url
 
-            if connection.reader is None:
+            if connection.reader is None or error:
                 timings["connect_end"] = time.monotonic()
                 self._connections.append(
                     HTTPConnection(
@@ -407,6 +421,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                         ),
                         method=method,
                         status=400,
+                        status_message=str(error) if error else None,
                         headers=headers,
                         timings=timings,
                     ),
@@ -560,6 +575,9 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
 
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
+
+            elif isinstance(request_url, URL):
+                request_url: ParseResult = request_url.optimized.parsed
 
             timings["read_end"] = time.monotonic()
 

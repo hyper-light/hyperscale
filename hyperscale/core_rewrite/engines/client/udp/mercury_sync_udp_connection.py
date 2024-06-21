@@ -3,7 +3,7 @@ import ssl
 import time
 from collections import defaultdict
 from typing import Dict, List, Literal, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 import orjson
 from pydantic import BaseModel
@@ -192,20 +192,34 @@ class MercurySyncUDPConnection:
         try:
             upgrade_ssl: bool = False
             if url:
-                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                (
+                    _,
+                    connection,
+                    url,
+                    upgrade_ssl,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
                 )
+
+                self._connections.append(connection)
 
             if upgrade_ssl:
                 url.data = url.data.replace("http://", "https://")
 
                 await url.optimize()
 
-                _, url, _ = await asyncio.wait_for(
+                (
+                    _,
+                    connection,
+                    url,
+                    _,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
                 )
+
+                self._connections.append(connection)
 
             self._url_cache[url.optimized.hostname] = url
             self._optimized[url.call_name] = url
@@ -340,6 +354,12 @@ class MercurySyncUDPConnection:
             )
 
         except Exception as err:
+            if isinstance(request_url, str):
+                request_url: ParseResult = urlparse(request_url)
+
+            elif isinstance(request_url, URL):
+                request_url: ParseResult = request_url.optimized.parsed
+
             self._connections.append(
                 UDPConnection(
                     reset_connections=self.reset_connections,

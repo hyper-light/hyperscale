@@ -423,20 +423,34 @@ class MercurySyncHTTP3Connection:
         try:
             upgrade_ssl: bool = False
             if url:
-                (_, url, upgrade_ssl) = await asyncio.wait_for(
+                (
+                    _,
+                    connection,
+                    url,
+                    upgrade_ssl,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
                 )
+
+                self._connections.append(connection)
 
             if upgrade_ssl:
                 url.data = url.data.replace("http://", "https://")
 
                 await url.optimize()
 
-                _, url, _ = await asyncio.wait_for(
+                (
+                    _,
+                    connection,
+                    url,
+                    _,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
                 )
+
+                self._connections.append(connection)
 
             self._url_cache[url.optimized.hostname] = url
             self._optimized[url.call_name] = url
@@ -573,7 +587,7 @@ class MercurySyncHTTP3Connection:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
-            (connection, url, upgrade_ssl) = await asyncio.wait_for(
+            (error, connection, url, upgrade_ssl) = await asyncio.wait_for(
                 self._connect_to_url_location(
                     request_url, ssl_redirect_url=request_url if upgrade_ssl else None
                 ),
@@ -583,7 +597,7 @@ class MercurySyncHTTP3Connection:
             if upgrade_ssl:
                 ssl_redirect_url = request_url.replace("http://", "https://")
 
-                connection, url, _ = await asyncio.wait_for(
+                (error, connection, url, _) = await asyncio.wait_for(
                     self._connect_to_url_location(
                         request_url, ssl_redirect_url=ssl_redirect_url
                     ),
@@ -592,7 +606,7 @@ class MercurySyncHTTP3Connection:
 
                 request_url = ssl_redirect_url
 
-            if connection.protocol is None:
+            if connection.protocol is None or error:
                 timings["connect_end"] = time.monotonic()
                 self._connections.append(
                     HTTP3Connection(
@@ -605,6 +619,7 @@ class MercurySyncHTTP3Connection:
                         url=URLMetadata(host=url.hostname, path=url.path),
                         method=method,
                         status=400,
+                        status_message=str(error) if error else None,
                         headers=headers,
                         timings=timings,
                     ),
@@ -761,6 +776,9 @@ class MercurySyncHTTP3Connection:
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
 
+            elif isinstance(request_url, URL):
+                request_url: ParseResult = request_url.optimized.parsed
+
             timings["read_end"] = time.monotonic()
 
             return (
@@ -784,7 +802,12 @@ class MercurySyncHTTP3Connection:
         self,
         request_url: str | URL,
         ssl_redirect_url: Optional[str] = None,
-    ) -> Tuple[HTTP3Connection, HTTPUrl, bool]:
+    ) -> Tuple[
+        Optional[Exception],
+        HTTP3Connection,
+        HTTPUrl,
+        bool,
+    ]:
         has_optimized_url = isinstance(request_url, URL)
 
         if has_optimized_url:
@@ -846,9 +869,12 @@ class MercurySyncHTTP3Connection:
 
                 except Exception as err:
                     if "server_hostname is only meaningful with ssl" in str(err):
-                        return None, parsed_url, True
-
-                    connection_error = err
+                        return (
+                            None,
+                            None,
+                            parsed_url,
+                            True,
+                        )
 
         else:
             try:
@@ -870,6 +896,7 @@ class MercurySyncHTTP3Connection:
                 connection_error = err
 
         return (
+            connection_error,
             connection,
             parsed_url,
             False,
