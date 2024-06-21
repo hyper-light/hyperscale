@@ -1,5 +1,5 @@
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from .engines.client import Client
 from .hooks import Hook
@@ -20,7 +20,3 @@ class Workflow:
             self.name,
             self.id,
         )
-
-        self.is_test: bool = False
-
-        self.traversal_order: List[List[Hook]] = []

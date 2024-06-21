@@ -54,6 +54,10 @@ class Graph:
         self._active_waiter: asyncio.Future | None = None
         self._workflows_by_name: Dict[str, Workflow] = {}
         self._threads = os.cpu_count()
+        self._config: Dict[str, Any] = {}
+        self._traversal_orders: Dict[str, List[List[Hook]]] = {}
+
+        self._workflow_test_status: Dict[str, bool] = {}
 
     async def run(self):
         for workflow in self.workflows:
@@ -66,41 +70,45 @@ class Graph:
         for workflow in self.workflows:
             self._workflows_by_name[workflow.name] = workflow
 
-            workflow.hooks = {
+            hooks: Dict[str, Hook] = {
                 name: hook
                 for name, hook in inspect.getmembers(
                     self, predicate=lambda member: isinstance(member, Hook)
                 )
             }
 
-            workflow.is_test = (
-                len([hook for hook in workflow.hooks.values() if hook.is_test]) > 0
+            self._workflow_test_status[workflow.name] = (
+                len([hook for hook in hooks.values() if hook.is_test]) > 0
             )
 
             workflow_graph = networkx.DiGraph()
 
-            for hook in workflow.hooks.values():
+            for hook in hooks.values():
                 hook.call = hook.call.__get__(workflow, workflow.__class__)
                 setattr(workflow, hook.name, hook.call)
 
-            for hook_name, hook in workflow.hooks.items():
+            for hook_name, hook in hooks.items():
                 workflow_graph.add_node(hook_name, hook=hook)
 
             sources = []
 
-            for hook in workflow.hooks.values():
+            for hook in hooks.values():
                 if len(hook.dependencies) == 0:
                     sources.append(hook.name)
 
                 for dependency in hook.dependencies:
                     workflow_graph.add_edge(dependency, hook.name)
 
+            traversal_order: List[List[Hook]] = []
+
             for traversal_layer in networkx.bfs_layers(workflow_graph, sources):
-                workflow.traversal_order.append(
-                    [workflow.hooks.get(hook_name) for hook_name in traversal_layer]
+                traversal_order.append(
+                    [hooks.get(hook_name) for hook_name in traversal_layer]
                 )
 
-            for hook in workflow.hooks.values():
+            self._traversal_orders[workflow.name] = traversal_order
+
+            for hook in hooks.values():
                 hooks_by_call_id.update({hook.call_id: hook})
 
                 call_ids.append(hook.call_id)
@@ -134,6 +142,8 @@ class Graph:
 
             config["duration"] = TimeParser(config["duration"]).time
 
+            self._config = config
+
             for client in clients:
                 setup_client(
                     client,
@@ -147,10 +157,14 @@ class Graph:
     async def _run(self, workflow: Workflow):
         loop = asyncio.get_event_loop()
 
+        traversal_order = self._traversal_orders[workflow.name]
+
         completed, pending = await asyncio.wait(
             [
-                loop.create_task(self._spawn_vu(workflow))
-                async for _ in self._generate(workflow)
+                loop.create_task(
+                    self._spawn_vu(traversal_order),
+                )
+                async for _ in self._generate()
             ],
             timeout=1,
         )
@@ -167,12 +181,12 @@ class Graph:
 
         return all_completed
 
-    async def _generate(self, workflow: Workflow):
+    async def _generate(self):
         self._active_waiter = asyncio.Future()
 
-        duration = workflow.config.get("duration")
-        vus = workflow.config.get("vus")
-        threads = workflow.config.get("threads")
+        duration = self._config.get("duration")
+        vus = self._config.get("vus")
+        threads = self._config.get("threads")
 
         elapsed = 0
 
@@ -199,12 +213,12 @@ class Graph:
 
     async def _spawn_vu(
         self,
-        workflow: Workflow,
+        traversal_order: List[Hook],
     ):
         try:
             results: List[Any] = []
 
-            for hook_set in workflow.traversal_order:
+            for hook_set in traversal_order:
                 set_count = len(hook_set)
                 self.active += set_count
 
