@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Generic, Literal, TypeVar
+
+import dill
 
 from hyperscale.core_rewrite import Graph, Workflow, step
 from hyperscale.core_rewrite.engines.client.graphql import GraphQLResponse
 from hyperscale.core_rewrite.engines.client.http import HTTPResponse
 from hyperscale.core_rewrite.engines.client.http2 import HTTP2Response
 from hyperscale.core_rewrite.engines.client.udp import UDPResponse
-from hyperscale.core_rewrite.hooks.optimized.models import URL, Headers
 
 
 class Result:
@@ -26,7 +26,6 @@ class Test(Workflow):
     vus = 1000
     threads = 4
     duration = "1m"
-    udp_port = int(os.getenv("UDP_PORT", "9090"))
 
     def different(self) -> Literal["Hello there!"]:
         return "Hello there!"
@@ -66,13 +65,9 @@ class Test(Workflow):
         return await self.client.udp.send(f"127.0.0.1:{self.udp_port}", "Test this!")
 
     @step("two", "three")
-    async def six(
-        self,
-        url: URL = "https://httpbin.org/get",
-        headers: Headers = {"test": "this"},
-    ) -> GraphQLResponse:
+    async def six(self) -> GraphQLResponse:
         return await self.client.graphql.query(
-            url,
+            "https://httpbin.org/get",
             """
             query getContinents {
                 continents {
@@ -81,14 +76,17 @@ class Test(Workflow):
                 }
                 }
             """,
-            headers=headers,
+            headers={"test": "this"},
         )
 
 
 async def run():
     w = Test()
+    dill.dumps(w)
 
-    # d = dill.dumps(w.hooks)
+    # for hook_name, hook in w.hooks.items():
+    #     hook_pair = {hook_name: hook}
+    #     d = dill.dumps(hook_pair, recurse=True)
 
     g = Graph([w])
 

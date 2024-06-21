@@ -14,9 +14,9 @@ from .udp import UDPConnection as UDP
 
 do_patch()
 
-class UDPConnection:
 
-    def __init__(self, reset_connections: bool=False) -> None:
+class UDPConnection:
+    def __init__(self, reset_connections: bool = False) -> None:
         self.dns_address: str = None
         self.port: int = None
         self.ip_addr = None
@@ -31,20 +31,22 @@ class UDPConnection:
         self._connection_factory = UDP()
 
     async def make_connection(
-        self, 
+        self,
         dns_address: str,
-        port: int, 
+        port: int,
         socket_config: Tuple[int, int, int, int, Tuple[int, int]],
-        tls: Optional[ssl.SSLContext]=None
+        tls: Optional[ssl.SSLContext] = None,
     ) -> None:
-    
-        if self.connected is False or self.dns_address != dns_address or self.reset_connections:
+        if (
+            self.connected is False
+            or self.dns_address != dns_address
+            or self.reset_connections
+        ):
             try:
-                reader, writer = self._connection_factory.create_udp(
-                    socket_config,
-                    tls=tls
+                reader, writer = await self._connection_factory.create_udp(
+                    socket_config, tls=tls
                 )
-                    
+
                 self.connected = True
 
                 self.reader = reader
@@ -54,10 +56,10 @@ class UDPConnection:
                 self.port = port
 
             except asyncio.TimeoutError:
-                raise Exception('Connection timed out.')
+                raise Exception("Connection timed out.")
 
             except ConnectionResetError:
-                raise Exception('Connection reset.')
+                raise Exception("Connection reset.")
 
             except Exception as e:
                 raise e

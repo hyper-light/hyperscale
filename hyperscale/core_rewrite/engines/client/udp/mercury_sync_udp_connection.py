@@ -27,6 +27,7 @@ class MercurySyncUDPConnection:
         timeouts: Timeouts = Timeouts(),
         reset_connections: bool = False,
     ) -> None:
+        self._concurrency = pool_size
         self.timeouts = timeouts
         self.reset_connections = reset_connections
 
@@ -35,56 +36,22 @@ class MercurySyncUDPConnection:
 
         self._udp_ssl_context: Optional[ssl.SSLContext] = None
 
-        if cert_path and key_path:
-            self._udp_ssl_context = self._create_udp_ssl_context(
-                cert_path=cert_path,
-                key_path=key_path,
-            )
-
         self._dns_lock: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: Dict[str, asyncio.Future] = defaultdict(asyncio.Future)
         self._pending_queue: List[asyncio.Future] = []
 
         self._client_waiters: Dict[asyncio.Transport, asyncio.Future] = {}
-        self._connections: List[UDPConnection] = [
-            UDPConnection(reset_connections=reset_connections) for _ in range(pool_size)
-        ]
+        self._connections: List[UDPConnection] = []
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
         self._connections_count: Dict[str, List[asyncio.Transport]] = defaultdict(list)
         self._locks: Dict[asyncio.Transport, asyncio.Lock] = {}
 
-        self._max_concurrency = pool_size
-
-        self._semaphore = asyncio.Semaphore(self._max_concurrency)
+        self._semaphore: asyncio.Semaphore = None
         self._connection_waiters: List[asyncio.Future] = []
 
         self._url_cache: Dict[str, URL] = {}
-
-    def _create_udp_ssl_context(
-        self,
-        cert_path: Optional[str] = None,
-        key_path: Optional[str] = None,
-    ) -> ssl.SSLContext:
-        if cert_path is None:
-            cert_path = self._cert_path
-
-        if key_path is None:
-            key_path = self._key_path
-
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS)
-        ssl_ctx.options |= ssl.OP_NO_TLSv1
-        ssl_ctx.options |= ssl.OP_NO_TLSv1_1
-        ssl_ctx.options |= ssl.OP_SINGLE_DH_USE
-        ssl_ctx.options |= ssl.OP_SINGLE_ECDH_USE
-        ssl_ctx.load_cert_chain(cert_path, keyfile=key_path)
-        ssl_ctx.load_verify_locations(cafile=cert_path)
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.VerifyMode.CERT_REQUIRED
-        ssl_ctx.set_ciphers("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")
-
-        return ssl_ctx
 
     async def send(
         self,

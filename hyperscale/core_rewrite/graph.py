@@ -1,11 +1,16 @@
 import asyncio
+import inspect
 import math
+import os
 import time
 from typing import Any, Callable, Dict, List
 
+import networkx
 import psutil
 
-from .hooks import CallResolver, Hook
+from .engines.client import TimeParser
+from .engines.client.setup_clients import setup_client
+from .hooks import Hook
 from .workflow import Workflow
 
 
@@ -43,12 +48,12 @@ class Graph:
         self.workflows = workflows
         self.max_active = 0
         self.active = 0
-        self._call_resolver = CallResolver()
 
         self.context: Dict[str, Callable[..., Any] | object] = context
 
         self._active_waiter: asyncio.Future | None = None
         self._workflows_by_name: Dict[str, Workflow] = {}
+        self._threads = os.cpu_count()
 
     async def run(self):
         for workflow in self.workflows:
@@ -61,17 +66,83 @@ class Graph:
         for workflow in self.workflows:
             self._workflows_by_name[workflow.name] = workflow
 
-            for hook in workflow.hooks.values():
-                self._call_resolver.add_args(hook.static_args)
+            workflow.hooks = {
+                name: hook
+                for name, hook in inspect.getmembers(
+                    self, predicate=lambda member: isinstance(member, Hook)
+                )
+            }
 
+            workflow.is_test = (
+                len([hook for hook in workflow.hooks.values() if hook.is_test]) > 0
+            )
+
+            workflow_graph = networkx.DiGraph()
+
+            for hook in workflow.hooks.values():
+                hook.call = hook.call.__get__(workflow, workflow.__class__)
+                setattr(workflow, hook.name, hook.call)
+
+            for hook_name, hook in workflow.hooks.items():
+                workflow_graph.add_node(hook_name, hook=hook)
+
+            sources = []
+
+            for hook in workflow.hooks.values():
+                if len(hook.dependencies) == 0:
+                    sources.append(hook.name)
+
+                for dependency in hook.dependencies:
+                    workflow_graph.add_edge(dependency, hook.name)
+
+            for traversal_layer in networkx.bfs_layers(workflow_graph, sources):
+                workflow.traversal_order.append(
+                    [workflow.hooks.get(hook_name) for hook_name in traversal_layer]
+                )
+
+            for hook in workflow.hooks.values():
                 hooks_by_call_id.update({hook.call_id: hook})
 
                 call_ids.append(hook.call_id)
 
-        # await self._call_resolver.resolve_arg_types()
+            clients = [
+                workflow.client.graphql,
+                workflow.client.graphqlh2,
+                workflow.client.grpc,
+                workflow.client.http,
+                workflow.client.http2,
+                workflow.client.http3,
+                workflow.client.playwright,
+                workflow.client.udp,
+                workflow.client.websocket,
+            ]
 
-        # for call_id, optimized in self._call_resolver:
-        #     print(call_id, optimized)
+            config = {
+                "vus": 1000,
+                "duration": "1m",
+                "threads": self._threads,
+                "connect_retries": 3,
+            }
+
+            config.update(
+                {
+                    name: value
+                    for name, value in inspect.getmembers(workflow)
+                    if config.get(name)
+                }
+            )
+
+            config["duration"] = TimeParser(config["duration"]).time
+
+            for client in clients:
+                setup_client(
+                    client,
+                    config.get("vus"),
+                    pages=config.get("pages", 1),
+                    cert_path=config.get("cert_path"),
+                    key_path=config.get("key_path"),
+                    reset_connections=config.get("reset_connections"),
+                )
 
     async def _run(self, workflow: Workflow):
         loop = asyncio.get_event_loop()

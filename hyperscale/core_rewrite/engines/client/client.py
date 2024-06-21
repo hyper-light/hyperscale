@@ -1,9 +1,8 @@
 import uuid
-from typing import Generic, Optional
+from typing import Generic
 
 from typing_extensions import TypeVarTuple, Unpack
 
-from .config import Config
 from .graphql import MercurySyncGraphQLConnection
 from .graphql_http2 import MercurySyncGraphQLHTTP2Connection
 from .grpc import MercurySyncGRPCConnection
@@ -26,7 +25,6 @@ class Client(Generic[Unpack[T]]):
         graph_id: str,
         stage_name: str,
         stage_id: str,
-        config: Optional[Config] = None,
     ) -> None:
         self.client_id = str(uuid.uuid4())
         self.graph_name = graph_name
@@ -37,16 +35,12 @@ class Client(Generic[Unpack[T]]):
         self.next_name = None
         self.suspend = False
 
-        self._config: Config = config
-
-        self.graphql = MercurySyncGraphQLConnection(pool_size=config.vus)
-        self.graphqlh2 = MercurySyncGraphQLHTTP2Connection(pool_size=config.vus)
-        self.grpc = MercurySyncGRPCConnection(pool_size=config.vus)
-        self.http = MercurySyncHTTPConnection(pool_size=config.vus)
-        self.http2 = MercurySyncHTTP2Connection(pool_size=config.vus)
-        self.http3 = MercurySyncHTTP3Connection(pool_size=config.vus)
-        self.playwright = MercurySyncPlaywrightConnection(
-            pool_size=config.vus, pages=config.pages
-        )
-        self.udp = MercurySyncUDPConnection(pool_size=config.vus)
-        self.websocket = MercurySyncWebsocketConnection(pool_size=config.vus)
+        self.graphql = MercurySyncGraphQLConnection()
+        self.graphqlh2 = MercurySyncGraphQLHTTP2Connection()
+        self.grpc = MercurySyncGRPCConnection()
+        self.http = MercurySyncHTTPConnection()
+        self.http2 = MercurySyncHTTP2Connection()
+        self.http3 = MercurySyncHTTP3Connection()
+        self.playwright = MercurySyncPlaywrightConnection()
+        self.udp = MercurySyncUDPConnection()
+        self.websocket = MercurySyncWebsocketConnection()

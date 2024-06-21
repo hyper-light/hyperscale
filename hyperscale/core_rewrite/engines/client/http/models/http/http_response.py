@@ -1,9 +1,9 @@
 import gzip
 import re
-from typing import Dict, Literal, Optional, Type, TypeVar, Union
+from typing import Dict, Literal, Optional, Type, TypeVar
 
 import orjson
-from pydantic import BaseModel, StrictBytes, StrictFloat, StrictInt, StrictStr
+from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.shared.models import (
     CallResult,
@@ -33,14 +33,22 @@ class HTTPResponse(CallResult):
         self,
         url: URLMetadata,
         method: Optional[
-            Literal["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+            Literal[
+                "GET",
+                "POST",
+                "HEAD",
+                "OPTIONS",
+                "PUT",
+                "PATCH",
+                "DELETE",
+            ]
         ] = None,
-        cookies: Union[Optional[Cookies], Optional[None]] = None,
-        status: Optional[StrictInt] = None,
-        status_message: Optional[StrictStr] = None,
-        headers: Dict[StrictBytes, StrictBytes] = {},
-        content: StrictBytes = b"",
-        timings: Dict[StrictStr, StrictFloat] = {},
+        cookies: Optional[Cookies] = None,
+        status: Optional[int] = None,
+        status_message: Optional[str] = None,
+        headers: Dict[bytes, bytes] = {},
+        content: bytes = b"",
+        timings: Dict[str, float] = {},
     ):
         super(
             HTTPResponse,

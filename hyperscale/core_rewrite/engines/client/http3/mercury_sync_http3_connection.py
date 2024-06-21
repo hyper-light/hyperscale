@@ -54,39 +54,28 @@ class MercurySyncHTTP3Connection:
         if pool_size is None:
             pool_size = 100
 
+        self._concurrency = pool_size
         self.timeouts = timeouts
         self.reset_connections = reset_connections
 
-        self._client_ssl_context = self._create_general_client_ssl_context()
+        self._client_ssl_context: Optional[ssl.SSLContext] = None
 
         self._dns_lock: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: Dict[str, asyncio.Future] = defaultdict(asyncio.Future)
         self._pending_queue: List[asyncio.Future] = []
 
         self._client_waiters: Dict[asyncio.Transport, asyncio.Future] = {}
-        self._connections: List[HTTP3Connection] = [
-            HTTP3Connection(reset_connections=reset_connections)
-            for _ in range(pool_size)
-        ]
+        self._connections: List[HTTP3Connection] = []
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
         self._connections_count: Dict[str, List[asyncio.Transport]] = defaultdict(list)
         self._locks: Dict[asyncio.Transport, asyncio.Lock] = {}
 
-        self._max_concurrency = pool_size
-
-        self._semaphore = asyncio.Semaphore(self._max_concurrency)
+        self._semaphore: asyncio.Semaphore = None
         self._connection_waiters: List[asyncio.Future] = []
 
         self._url_cache: Dict[str, URL] = {}
-
-    def _create_general_client_ssl_context(self):
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        return ctx
 
     async def head(
         self,
@@ -826,7 +815,7 @@ class MercurySyncHTTP3Connection:
         encoded_data: Optional[bytes] = None
         size = 0
 
-        if isinstance(data, Iterator):
+        if isinstance(data, Iterator) and not isinstance(data, list):
             chunks = []
             for chunk in data:
                 chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
@@ -837,17 +826,16 @@ class MercurySyncHTTP3Connection:
             self.is_stream = True
             encoded_data = chunks
 
-        else:
-            if isinstance(data, (dict, list)):
-                encoded_data = orjson.dumps(data)
+        elif isinstance(data, BaseModel):
+            return orjson.dumps(data.model_dump())
 
-            elif isinstance(data, BaseModel):
-                return data.model_dump_json().encode()
+        elif isinstance(data, (dict, list)):
+            encoded_data = orjson.dumps(data)
 
-            elif isinstance(data, tuple):
-                encoded_data = urlencode(data).encode()
+        elif isinstance(data, tuple):
+            encoded_data = urlencode(data).encode()
 
-            elif isinstance(data, str):
-                encoded_data = data.encode()
+        elif isinstance(data, str):
+            encoded_data = data.encode()
 
         return encoded_data

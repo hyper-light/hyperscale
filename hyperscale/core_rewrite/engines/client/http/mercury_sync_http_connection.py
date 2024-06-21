@@ -50,19 +50,18 @@ class MercurySyncHTTPConnection:
         if pool_size is None:
             pool_size = 100
 
+        self._concurrency = pool_size
         self.timeouts = timeouts
         self.reset_connections = reset_connections
 
-        self._client_ssl_context = self._create_general_client_ssl_context()
+        self._client_ssl_context: Optional[ssl.SSLContext] = None
 
         self._dns_lock: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: Dict[str, asyncio.Future] = defaultdict(asyncio.Future)
         self._pending_queue: List[asyncio.Future] = []
 
         self._client_waiters: Dict[asyncio.Transport, asyncio.Future] = {}
-        self._connections: List[HTTPConnection] = [
-            HTTPConnection() for _ in range(pool_size)
-        ]
+        self._connections: List[HTTPConnection] = []
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
@@ -71,17 +70,10 @@ class MercurySyncHTTPConnection:
 
         self._max_concurrency = pool_size
 
-        self._semaphore = asyncio.Semaphore(self._max_concurrency)
+        self._semaphore: asyncio.Semaphore = None
         self._connection_waiters: List[asyncio.Future] = []
 
         self._url_cache: Dict[str, URL] = {}
-
-    def _create_general_client_ssl_context(self):
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        return ctx
 
     async def head(
         self,
@@ -822,7 +814,7 @@ class MercurySyncHTTPConnection:
         content_type: Optional[str] = None
         encoded_data: bytes | List[bytes] = None
 
-        if isinstance(data, Iterator):
+        if isinstance(data, Iterator) and not isinstance(data, list):
             chunks: List[bytes] = []
             for chunk in data:
                 chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
@@ -863,14 +855,7 @@ class MercurySyncHTTPConnection:
             url_params = urlencode(params)
             url_path += f"?{url_params}"
 
-        get_base = f"{method} {url.path} HTTP/1.1{NEW_LINE}"
-
-        port = url.port or (443 if url.scheme == "https" else 80)
-
-        hostname = url.hostname.encode("idna").decode()
-
-        if port not in [80, 443]:
-            hostname = f"{hostname}:{port}"
+        get_base = f"{method} {url_path} HTTP/1.1{NEW_LINE}"
 
         header_items = {
             "user-agent": "hyperscale/client",

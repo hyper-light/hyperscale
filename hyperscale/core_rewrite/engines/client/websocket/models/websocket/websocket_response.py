@@ -1,7 +1,7 @@
 import re
-from typing import Dict, Literal, Optional, TypeVar, Union
+from typing import Dict, Literal, Optional, TypeVar
 
-from pydantic import BaseModel, StrictBytes, StrictFloat, StrictInt, StrictStr
+from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.http.models.http import HTTPResponse
 from hyperscale.core_rewrite.engines.client.shared.models import (
@@ -16,29 +16,26 @@ T = TypeVar("T", bound=BaseModel)
 
 
 class WebsocketResponse(HTTPResponse):
-    __slots__ = (
-        "url",
-        "method",
-        "cookies",
-        "status",
-        "status_message",
-        "headers",
-        "content",
-        "timings",
-    )
-
     def __init__(
         self,
         url: URLMetadata,
         method: Optional[
-            Literal["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"]
+            Literal[
+                "GET",
+                "POST",
+                "HEAD",
+                "OPTIONS",
+                "PUT",
+                "PATCH",
+                "DELETE",
+            ]
         ] = None,
-        cookies: Union[Optional[Cookies], Optional[None]] = None,
-        status: Optional[StrictInt] = None,
-        status_message: Optional[StrictStr] = None,
-        headers: Dict[StrictBytes, StrictBytes] = {},
-        content: StrictBytes = b"",
-        timings: Dict[StrictStr, StrictFloat] = {},
+        cookies: Optional[Cookies] = None,
+        status: Optional[int] = None,
+        status_message: Optional[str] = None,
+        headers: Dict[bytes, bytes] = {},
+        content: bytes = b"",
+        timings: Dict[str, float] = {},
     ):
         super(
             WebsocketResponse,

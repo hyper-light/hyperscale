@@ -1,7 +1,7 @@
 from typing import Dict, Optional, Type, TypeVar
 
 import orjson
-from pydantic import BaseModel, StrictBytes, StrictFloat, StrictStr
+from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.shared.models import (
     CallResult,
@@ -22,9 +22,9 @@ class UDPResponse(CallResult):
     def __init__(
         self,
         url: URLMetadata,
-        error: Optional[StrictStr] = None,
-        content: StrictBytes = b"",
-        timings: Dict[StrictStr, StrictFloat] = {},
+        error: Optional[str] = None,
+        content: bytes = b"",
+        timings: Dict[str, float] = {},
     ):
         super(
             UDPResponse,

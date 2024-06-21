@@ -59,21 +59,14 @@ class MercurySyncHTTP2Connection:
         self._concurrency = pool_size
         self._reset_connections = reset_connections
 
-        self._semaphore = asyncio.Semaphore(pool_size)
+        self._semaphore: asyncio.Semaphore = None
 
         self._dns_lock: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: Dict[str, asyncio.Future] = defaultdict(asyncio.Future)
         self._pending_queue: List[asyncio.Future] = []
 
         self._client_waiters: Dict[asyncio.Transport, asyncio.Future] = {}
-        self._connections: List[HTTP2Connection] = [
-            HTTP2Connection(
-                pool_size,
-                stream_id=randrange(1, 2**20 + 2, 2),
-                reset_connections=reset_connections,
-            )
-            for _ in range(pool_size)
-        ]
+        self._connections: List[HTTP2Connection] = []
 
         self._pipes = [HTTP2Pipe(pool_size) for _ in range(pool_size)]
 
@@ -89,10 +82,10 @@ class MercurySyncHTTP2Connection:
         self.active = 0
         self.waiter = None
 
-        self._encoder = Encoder()
-        self._settings = Settings(client=False)
+        self._encoder: Encoder = None
+        self._settings: Settings = None
 
-        self._client_ssl_context = self._create_http2_ssl_context()
+        self._client_ssl_context: Optional[ssl.SSLContext] = None
 
     async def head(
         self,
@@ -697,7 +690,7 @@ class MercurySyncHTTP2Connection:
         encoded_data: Optional[bytes] = None
         size = 0
 
-        if isinstance(data, Iterator):
+        if isinstance(data, Iterator) and not isinstance(data, list):
             chunks = []
             for chunk in data:
                 chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
@@ -707,18 +700,17 @@ class MercurySyncHTTP2Connection:
 
             encoded_data = chunks
 
-        else:
-            if isinstance(data, dict):
-                encoded_data = orjson.dumps(data)
+        elif isinstance(data, BaseModel):
+            return orjson.dumps(data.model_dump())
 
-            elif isinstance(data, BaseModel):
-                return data.model_dump_json().encode()
+        elif isinstance(data, (dict, list)):
+            encoded_data = orjson.dumps(data)
 
-            elif isinstance(data, tuple):
-                encoded_data = urlencode(data).encode()
+        elif isinstance(data, tuple):
+            encoded_data = urlencode(data).encode()
 
-            elif isinstance(data, str):
-                encoded_data = data.encode()
+        elif isinstance(data, str):
+            encoded_data = data.encode()
 
         return encoded_data
 
@@ -762,46 +754,6 @@ class MercurySyncHTTP2Connection:
         ]
 
         return encoded_headers[0]
-
-    def _create_http2_ssl_context(self):
-        """
-        This function creates an SSLContext object that is suitably configured for
-        HTTP/2. If you're working with Python TLS directly, you'll want to do the
-        exact same setup as this function does.
-        """
-        # Get the basic context from the standard library.
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-
-        # RFC 7540 Section 9.2: Implementations of HTTP/2 MUST use TLS version 1.2
-        # or higher. Disable TLS 1.1 and lower.
-        ctx.options |= (
-            ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
-        )
-
-        # RFC 7540 Section 9.2.1: A deployment of HTTP/2 over TLS 1.2 MUST disable
-        # compression.
-        ctx.options |= ssl.OP_NO_COMPRESSION
-
-        # RFC 7540 Section 9.2.2: "deployments of HTTP/2 that use TLS 1.2 MUST
-        # support TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256". In practice, the
-        # blocklist defined in this section allows only the AES GCM and ChaCha20
-        # cipher suites with ephemeral key negotiation.
-        ctx.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20")
-
-        # We want to negotiate using NPN and ALPN. ALPN is mandatory, but NPN may
-        # be absent, so allow that. This setup allows for negotiation of HTTP/1.1.
-        ctx.set_alpn_protocols(["h2", "http/1.1"])
-
-        try:
-            if hasattr(ctx, "_set_npn_protocols"):
-                ctx.set_npn_protocols(["h2", "http/1.1"])
-        except NotImplementedError:
-            pass
-
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        return ctx
 
     async def _connect_to_url_location(
         self, request_url: str, ssl_redirect_url: Optional[str] = None

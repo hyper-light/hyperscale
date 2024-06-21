@@ -1,5 +1,4 @@
 import asyncio
-import ssl
 import time
 from collections import defaultdict
 from typing import (
@@ -49,41 +48,28 @@ class MercurySyncWebsocketConnection:
         if pool_size is None:
             pool_size = 100
 
+        self._concurrency = pool_size
         self.timeouts = timeouts
         self.reset_connections = reset_connections
 
-        self._client_ssl_context = self._create_general_client_ssl_context()
+        self._client_ssl_context: Optional[None] = None
 
         self._dns_lock: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: Dict[str, asyncio.Future] = defaultdict(asyncio.Future)
         self._pending_queue: List[asyncio.Future] = []
 
         self._client_waiters: Dict[asyncio.Transport, asyncio.Future] = {}
-        self._connections: List[WebsocketConnection] = [
-            WebsocketConnection(
-                reset_connections=reset_connections,
-            )
-            for _ in range(pool_size)
-        ]
+        self._connections: List[WebsocketConnection] = []
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
         self._connections_count: Dict[str, List[asyncio.Transport]] = defaultdict(list)
         self._locks: Dict[asyncio.Transport, asyncio.Lock] = {}
 
-        self._max_concurrency = pool_size
-
-        self._semaphore = asyncio.Semaphore(self._max_concurrency)
+        self._semaphore: asyncio.Semaphore = None
         self._connection_waiters: List[asyncio.Future] = []
 
         self._url_cache: Dict[str, URL] = {}
-
-    def _create_general_client_ssl_context(self):
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        return ctx
 
     async def receive(
         self,
@@ -116,7 +102,7 @@ class MercurySyncWebsocketConnection:
                 url_data = urlparse(url)
 
                 return WebsocketResponse(
-                    url=URLMetadata(
+                    URLMetadata(
                         host=url_data.hostname,
                         path=url_data.path,
                         params=url_data.params,
@@ -159,7 +145,7 @@ class MercurySyncWebsocketConnection:
                 url_data = urlparse(url)
 
                 return WebsocketResponse(
-                    url=URLMetadata(
+                    URLMetadata(
                         host=url_data.hostname,
                         path=url_data.path,
                         params=url_data.params,
@@ -295,6 +281,7 @@ class MercurySyncWebsocketConnection:
     ]:
         if redirect_url:
             request_url = redirect_url
+
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
@@ -328,7 +315,7 @@ class MercurySyncWebsocketConnection:
 
                 return (
                     WebsocketResponse(
-                        url=URLMetadata(
+                        URLMetadata(
                             host=url.hostname,
                             path=url.path,
                         ),
@@ -391,7 +378,7 @@ class MercurySyncWebsocketConnection:
 
                 return (
                     WebsocketResponse(
-                        url=URLMetadata(
+                        URLMetadata(
                             host=url.hostname,
                             path=url.path,
                         ),
@@ -436,7 +423,7 @@ class MercurySyncWebsocketConnection:
 
             return (
                 WebsocketResponse(
-                    url=URLMetadata(
+                    URLMetadata(
                         host=url.hostname,
                         path=url.path,
                     ),
@@ -464,7 +451,7 @@ class MercurySyncWebsocketConnection:
 
             return (
                 WebsocketResponse(
-                    url=URLMetadata(
+                    URLMetadata(
                         host=request_url.hostname,
                         path=request_url.path,
                     ),
