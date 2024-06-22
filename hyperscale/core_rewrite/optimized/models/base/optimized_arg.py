@@ -28,3 +28,6 @@ class OptimizedArg:
             )
             and value.arg_id == self.arg_id
         )
+
+    async def optimize(self):
+        raise NotImplementedError("Err. - Not impemented for base OptimizedArg class.")

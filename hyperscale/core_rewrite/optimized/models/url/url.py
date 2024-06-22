@@ -26,6 +26,9 @@ class URL(OptimizedArg, Generic[T]):
         self.optimized_params: Optional[str] = None
         self.optimized: Optional[OptimizedUrl] = None
 
+    def __iter__(self):
+        return self.data
+
     async def optimize(self, request_type: RequestType):
         protocols = ProtocolMap()
 

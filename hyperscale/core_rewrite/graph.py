@@ -3,7 +3,14 @@ import inspect
 import math
 import os
 import time
-from typing import Any, Callable, Dict, List
+import warnings
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Tuple,
+)
 
 import networkx
 import psutil
@@ -12,6 +19,8 @@ from .engines.client import TimeParser
 from .engines.client.setup_clients import setup_client
 from .hooks import Hook
 from .workflow import Workflow
+
+warnings.simplefilter("ignore")
 
 
 async def cancel_pending(pend: asyncio.Task):
@@ -139,7 +148,7 @@ class Graph:
             sources = []
 
             for hook in hooks.values():
-                if len(hook.optimized_args) > 0:
+                if len(hook.optimized_args) > 0 and hook.is_test:
                     await asyncio.gather(
                         *[
                             arg.optimize(hook.engine_type)
@@ -239,23 +248,46 @@ class Graph:
         remaining: float,
     ):
         try:
-            results: List[Any] = []
+            results: List[asyncio.Task] = []
+
+            context: Dict[str, Any] = {}
 
             for hook_set in traversal_order:
                 set_count = len(hook_set)
                 self.active += set_count
 
-                completed, pending = await asyncio.wait(
+                for hook in hook_set:
+                    hook.context_args.update(
+                        {
+                            key: context[key]
+                            for key in context
+                            if key in hook.kwarg_names
+                        }
+                    )
+
+                tasks: Tuple[
+                    List[asyncio.Task],
+                    List[asyncio.Task],
+                ] = await asyncio.wait(
                     [
                         asyncio.create_task(
-                            hook.call(),
+                            hook.call(**hook.context_args),
+                            name=hook.name,
                         )
                         for hook in hook_set
                     ],
                     timeout=remaining,
                 )
 
+                completed, pending = tasks
                 results.extend(completed)
+
+                for complete in completed:
+                    try:
+                        context[complete.get_name()] = complete.result()
+
+                    except Exception:
+                        context[complete.get_name()] = complete.exception()
 
                 self._pending.extend(pending)
 

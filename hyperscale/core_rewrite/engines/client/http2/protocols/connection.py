@@ -49,7 +49,9 @@ class HTTP2Connection:
     ):
         if self.connected is False or self.dns_address != dns_address or ssl_upgrade:
             reader, writer = await self._connection_factory.create_http2(
-                hostname, socket_config, ssl=ssl
+                hostname,
+                socket_config,
+                ssl=ssl,
             )
 
             self.stream.reader = reader
