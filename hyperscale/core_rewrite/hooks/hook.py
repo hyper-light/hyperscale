@@ -1,3 +1,4 @@
+import inspect
 import threading
 import uuid
 from inspect import signature
@@ -51,8 +52,31 @@ class Hook:
             and isinstance(arg.default, OptimizedArg)
         }
 
+        self.optimized_args.update(
+            {
+                arg.name: param_types.get(arg.name)(arg.default)
+                for arg in params.values()
+                if arg.KEYWORD_ONLY
+                and arg.name != "self"
+                and param_types.get(arg.name)
+                and not arg.default == inspect._empty
+            }
+        )
+
         for arg in self.optimized_args.values():
             arg.call_name = call.__name__
+
+        self.optimized_slots: Dict[str, OptimizedArg] = {
+            arg.name: arg.annotation
+            for arg in params.values()
+            if arg.POSITIONAL_OR_KEYWORD
+            and arg.name != "self"
+            and param_types.get(arg.name) in OptimizedArg.__subclasses__()
+            and arg.name not in self.optimized_args
+            and not isinstance(arg.default, inspect._empty)
+        }
+
+        print(self.optimized_slots, "SLOTS")
 
         self.call = call
         self.full_name = call.__qualname__

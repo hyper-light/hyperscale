@@ -31,34 +31,25 @@ class Test(Workflow):
         return await self.client.http.get(url)
 
     @step("one")
-    async def two(
-        self,
-        url=URL("https://httpbin.org/get"),
-        params=Params(
-            {"beep": "boop"},
-        ),
-    ) -> HTTPResponse:
-        return await self.client.http.get(
-            url,
-            params=params,
-        )
+    async def two(self, url: URL = "https://httpbin.org/get") -> HTTPResponse:
+        return await self.client.http.get(url)
 
     @step("one")
     async def three(
         self,
-        url=URL("https://httpbin.org/post"),
-        params=Params(
-            {"a": "b"},
-        ),
-        headers=Headers(
-            {"test": "boop"},
-        ),
-        cookies=Cookies(
-            [("a", "b")],
-        ),
-        data=Data(
-            {"bop": "blep"},
-        ),
+        url: URL = "https://httpbin.org/post",
+        params: Params = {
+            "a": "b",
+        },
+        headers: Headers = {
+            "test": "boop",
+        },
+        cookies: Cookies = [
+            ("a", "b"),
+        ],
+        data: Data = {
+            "bop": "blep",
+        },
     ) -> HTTPResponse:
         return await self.client.http.post(
             url,
@@ -81,7 +72,7 @@ async def run():
 
     await g.setup()
 
-    await g.run()
+    # await g.run()
 
 
 asyncio.run(run())
