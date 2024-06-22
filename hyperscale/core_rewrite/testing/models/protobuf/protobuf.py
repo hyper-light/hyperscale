@@ -3,7 +3,7 @@ from typing import Generic, Optional, TypeVar
 
 from google.protobuf.message import Message
 
-from hyperscale.core_rewrite.optimized.models.base import OptimizedArg
+from hyperscale.core_rewrite.testing.models.base import OptimizedArg
 
 from .protobuf_validator import ProtobufValidator
 

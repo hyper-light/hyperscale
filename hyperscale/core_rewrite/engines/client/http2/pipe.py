@@ -1,4 +1,3 @@
-import asyncio
 from typing import (
     Dict,
     List,
@@ -6,7 +5,6 @@ from typing import (
     Tuple,
 )
 
-from .config import H2Configuration
 from .errors import (
     ErrorCodes,
     StreamClosedError,
@@ -26,8 +24,18 @@ from .windows import WindowManager
 
 
 class HTTP2Pipe:
-    CONFIG = H2Configuration(
-        validate_inbound_headers=False,
+    __slots__ = (
+        "connected",
+        "concurrency",
+        "_encoder",
+        "_decoder",
+        "_init_sent",
+        "local_settings",
+        "remote_settings",
+        "outbound_flow_control_window",
+        "_inbound_flow_control_window_manager",
+        "local_settings_dict",
+        "remote_settings_dict",
     )
 
     def __init__(self, concurrency):
@@ -38,9 +46,6 @@ class HTTP2Pipe:
         self._decoder.header_table = HeaderTable()
         self._decoder.max_allowed_table_size = self._decoder.header_table.maxsize
         self._init_sent = False
-        self._data_to_send = b""
-        self._headers_sent = False
-        self.lock = asyncio.Lock()
 
         self.local_settings = Settings(
             client=True,
@@ -202,7 +207,6 @@ class HTTP2Pipe:
 
                     elif frame.type == 0x07:
                         # GOAWAY
-                        self._data_to_send = b""
 
                         new_event = ConnectionTerminated()
                         new_event.error_code = ErrorCodes(frame.error_code)
@@ -430,13 +434,13 @@ class HTTP2Pipe:
 
     async def submit_request_body(self, data: bytes, connection: HTTP2Connection):
         while data:
-            local_flow = self.current_outbound_window_size
+            local_flow = connection.stream.current_outbound_window_size
             max_frame_size = self.max_outbound_frame_size
             flow = min(local_flow, max_frame_size)
             while flow == 0:
                 await self.receive_response(connection)
 
-                local_flow = self.current_outbound_window_size
+                local_flow = connection.stream.current_outbound_window_size
                 max_frame_size = self.max_outbound_frame_size
                 flow = min(local_flow, max_frame_size)
 

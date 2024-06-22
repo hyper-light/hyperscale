@@ -19,8 +19,8 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
     RequestType,
 )
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
-from hyperscale.core_rewrite.optimized.models.base import OptimizedArg
 from hyperscale.core_rewrite.snowflake.snowflake_generator import SnowflakeGenerator
+from hyperscale.core_rewrite.testing.models.base import OptimizedArg
 
 
 class Hook:

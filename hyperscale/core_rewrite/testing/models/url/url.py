@@ -3,7 +3,7 @@ from typing import Generic, Optional, TypeVar
 from hyperscale.core_rewrite.engines.client.shared.models import URL as OptimizedUrl
 from hyperscale.core_rewrite.engines.client.shared.models import RequestType
 from hyperscale.core_rewrite.engines.client.shared.protocols import ProtocolMap
-from hyperscale.core_rewrite.optimized.models.base import OptimizedArg
+from hyperscale.core_rewrite.testing.models.base import OptimizedArg
 
 from .url_validator import URLValidator
 

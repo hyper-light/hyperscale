@@ -31,7 +31,7 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 )
 from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
-from hyperscale.core_rewrite.optimized.models import (
+from hyperscale.core_rewrite.testing.models import (
     URL,
     Auth,
     Cookies,

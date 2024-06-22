@@ -98,7 +98,6 @@ def setup_client(
         client._settings = Settings(client=False)
         client._connections = [
             HTTP2Connection(
-                vus,
                 stream_id=randrange(1, 2**20 + 2, 2),
                 reset_connections=reset_connections,
             )
@@ -138,7 +137,6 @@ def setup_client(
 
         client._connections = [
             HTTP2Connection(
-                vus,
                 stream_id=randrange(1, 2**20 + 2, 2),
                 reset_connections=reset_connections,
             )

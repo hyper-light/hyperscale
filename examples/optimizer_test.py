@@ -4,7 +4,7 @@ import dill
 
 from hyperscale.core_rewrite import Graph, Workflow, step
 from hyperscale.core_rewrite.engines.client.http2 import HTTP2Response
-from hyperscale.core_rewrite.optimized import URL, Headers
+from hyperscale.core_rewrite.testing import URL
 
 
 class Test(Workflow):
@@ -13,37 +13,33 @@ class Test(Workflow):
     duration = "1m"
 
     @step()
-    async def one(
-        self,
-        url: URL = "https://http2.github.io/",
-        headers: Headers = {"content-type": "application/json"},
-    ) -> HTTP2Response:
-        return await self.client.http2.get(url, headers=headers)
-
-    @step("one")
-    async def two(self, url: URL = "https://http2.github.io/") -> HTTP2Response:
+    async def login(self, url: URL = "https://http2.github.io/") -> HTTP2Response:
         return await self.client.http2.get(url)
 
-    @step("one")
-    async def three(self, url: URL = "https://http2.github.io/") -> HTTP2Response:
+    @step("login")
+    async def get_api_v1(self, url: URL = "https://http2.github.io/") -> HTTP2Response:
         return await self.client.http2.get(url)
 
-    @step("two", "three")
+    @step("login")
+    async def get_api_v2(self, url: URL = "https://http2.github.io/") -> HTTP2Response:
+        return await self.client.http2.get(url)
+
+    @step("get_api_v1", "get_api_v2")
     async def check_statuses(
         self,
-        one: HTTP2Response = None,
-        two: HTTP2Response = None,
-        three: HTTP2Response = None,
+        login: HTTP2Response = None,
+        get_api_v1: HTTP2Response = None,
+        get_api_v2: HTTP2Response = None,
     ) -> Exception | None:
         assert (
-            one.status >= 200 and one.status < 300
-        ), f"Task One failed status check, got - {one.status}"
+            login.status >= 200 and login.status < 300
+        ), f"Task One failed status check, got - {login.status}"
         assert (
-            two.status >= 200 and three.status < 300
-        ), f"Task Two failed status check, got - {two.status}"
+            get_api_v1.status >= 200 and get_api_v1.status < 300
+        ), f"Task Two failed status check, got - {get_api_v1.status}"
         assert (
-            three.status >= 200 and three.status < 300
-        ), f"Task Three failed status check, got - {three.status}"
+            get_api_v2.status >= 200 and get_api_v2.status < 300
+        ), f"Task Three failed status check, got - {get_api_v2.status}"
 
 
 async def run():

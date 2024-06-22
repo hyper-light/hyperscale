@@ -1,6 +1,6 @@
 from typing import Generic, Optional, TypeVar
 
-from hyperscale.core_rewrite.optimized.models.base import OptimizedArg
+from hyperscale.core_rewrite.testing.models.base import OptimizedArg
 
 from .query_validator import QueryValidator
 

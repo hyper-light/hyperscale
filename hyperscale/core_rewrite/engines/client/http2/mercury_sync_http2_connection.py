@@ -36,7 +36,7 @@ from hyperscale.core_rewrite.engines.client.shared.protocols import (
     ProtocolMap,
 )
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
-from hyperscale.core_rewrite.optimized.models import (
+from hyperscale.core_rewrite.testing.models import (
     URL,
     Auth,
     Cookies,
@@ -75,9 +75,7 @@ class MercurySyncHTTP2Connection:
 
         self._dns_lock: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: Dict[str, asyncio.Future] = defaultdict(asyncio.Future)
-        self._pending_queue: List[asyncio.Future] = []
 
-        self._client_waiters: Dict[asyncio.Transport, asyncio.Future] = {}
         self._connections: List[HTTP2Connection] = []
 
         self._pipes: List[HTTP2Pipe] = []
@@ -85,9 +83,6 @@ class MercurySyncHTTP2Connection:
         self._url_cache: Dict[str, HTTPUrl] = {}
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
-
-        self.active = 0
-        self.waiter = None
 
         self._encoder: Encoder = None
         self._settings: Settings = None
@@ -646,7 +641,6 @@ class MercurySyncHTTP2Connection:
 
                 self._connections.append(
                     HTTP2Connection(
-                        self._concurrency,
                         stream_id=randrange(1, 2**20 + 2, 2),
                         reset_connections=self._reset_connections,
                     )
@@ -740,7 +734,6 @@ class MercurySyncHTTP2Connection:
 
                 self._connections.append(
                     HTTP2Connection(
-                        self._concurrency,
                         stream_id=randrange(1, 2**20 + 2, 2),
                         reset_connections=self._reset_connections,
                     )
@@ -794,7 +787,6 @@ class MercurySyncHTTP2Connection:
         except Exception as request_exception:
             self._connections.append(
                 HTTP2Connection(
-                    self._concurrency,
                     stream_id=randrange(1, 2**20 + 2, 2),
                     reset_connections=self._reset_connections,
                 )

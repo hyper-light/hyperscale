@@ -142,6 +142,8 @@ class Graph:
             workflow_graph = networkx.DiGraph()
 
             for hook in hooks.values():
+                workflow_graph.add_node(hook.name)
+
                 hook.call = hook.call.__get__(workflow, workflow.__class__)
                 setattr(workflow, hook.name, hook.call)
 

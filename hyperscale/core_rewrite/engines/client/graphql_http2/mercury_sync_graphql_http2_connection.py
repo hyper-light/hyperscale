@@ -35,7 +35,7 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
     URLMetadata,
 )
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
-from hyperscale.core_rewrite.optimized.models import (
+from hyperscale.core_rewrite.testing.models import (
     URL,
     Auth,
     Cookies,
@@ -401,7 +401,6 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
 
                 self._connections.append(
                     HTTP2Connection(
-                        self._concurrency,
                         stream_id=randrange(1, 2**20 + 2, 2),
                         reset_connections=self._reset_connections,
                     )
@@ -493,7 +492,6 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
 
                 self._connections.append(
                     HTTP2Connection(
-                        self._concurrency,
                         stream_id=randrange(1, 2**20 + 2, 2),
                         reset_connections=self._reset_connections,
                     )
@@ -549,7 +547,6 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
         except Exception as request_exception:
             self._connections.append(
                 HTTP2Connection(
-                    self._concurrency,
                     stream_id=randrange(1, 2**20 + 2, 2),
                     reset_connections=self._reset_connections,
                 )

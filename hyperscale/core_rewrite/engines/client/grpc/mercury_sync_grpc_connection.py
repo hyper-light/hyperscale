@@ -20,7 +20,7 @@ from hyperscale.core_rewrite.engines.client.http2.protocols import HTTP2Connecti
 from hyperscale.core_rewrite.engines.client.shared.models import URL as GRPCUrl
 from hyperscale.core_rewrite.engines.client.shared.models import URLMetadata
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
-from hyperscale.core_rewrite.optimized.models import (
+from hyperscale.core_rewrite.testing.models import (
     URL,
     Protobuf,
 )
@@ -239,7 +239,6 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
 
                 self._connections.append(
                     HTTP2Connection(
-                        self._concurrency,
                         stream_id=randrange(1, 2**20 + 2, 2),
                         reset_connections=self._reset_connections,
                     )
@@ -330,7 +329,6 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
         except Exception as request_exception:
             self._connections.append(
                 HTTP2Connection(
-                    self._concurrency,
                     stream_id=randrange(1, 2**20 + 2, 2),
                     reset_connections=self._reset_connections,
                 )

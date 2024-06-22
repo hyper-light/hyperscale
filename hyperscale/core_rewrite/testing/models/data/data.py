@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.shared.models import RequestType
 from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
-from hyperscale.core_rewrite.optimized.models.base import OptimizedArg
+from hyperscale.core_rewrite.testing.models.base import OptimizedArg
 
 from .data_types import DataValue, OptimizedData
 from .data_validator import DataValidator
