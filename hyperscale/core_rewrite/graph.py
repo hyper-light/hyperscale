@@ -89,9 +89,6 @@ class Graph:
                 hook.call = hook.call.__get__(workflow, workflow.__class__)
                 setattr(workflow, hook.name, hook.call)
 
-            for hook_name, hook in hooks.items():
-                workflow_graph.add_node(hook_name, hook=hook)
-
             sources = []
 
             for hook in hooks.values():
