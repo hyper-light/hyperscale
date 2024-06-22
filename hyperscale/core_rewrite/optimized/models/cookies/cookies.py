@@ -8,7 +8,7 @@ from typing import (
 
 from hyperscale.core_rewrite.engines.client.shared.models import RequestType
 from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
-from hyperscale.core_rewrite.hooks.optimized.models.base import OptimizedArg
+from hyperscale.core_rewrite.optimized.models.base import OptimizedArg
 
 from .cookies_types import HTTPCookie
 from .cookies_validator import CookiesValidator

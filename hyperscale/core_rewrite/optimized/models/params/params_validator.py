@@ -5,7 +5,7 @@ from pydantic import (
     StrictStr,
 )
 
-from hyperscale.core_rewrite.hooks.optimized.models.base.base_types import (
+from hyperscale.core_rewrite.optimized.models.base.base_types import (
     HTTPEncodableValue,
 )
 

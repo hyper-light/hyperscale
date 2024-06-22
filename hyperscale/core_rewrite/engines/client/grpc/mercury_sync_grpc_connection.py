@@ -20,7 +20,7 @@ from hyperscale.core_rewrite.engines.client.http2.protocols import HTTP2Connecti
 from hyperscale.core_rewrite.engines.client.shared.models import URL as GRPCUrl
 from hyperscale.core_rewrite.engines.client.shared.models import URLMetadata
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
-from hyperscale.core_rewrite.hooks.optimized.models import (
+from hyperscale.core_rewrite.optimized.models import (
     URL,
     Protobuf,
 )

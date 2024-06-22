@@ -5,7 +5,7 @@ from typing import (
     TypeVar,
 )
 
-from hyperscale.core_rewrite.hooks.optimized.models.base import OptimizedArg
+from hyperscale.core_rewrite.optimized.models.base import OptimizedArg
 
 from .auth_validator import AuthValidator
 

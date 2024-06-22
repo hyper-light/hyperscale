@@ -11,8 +11,8 @@ from typing import (
 from urllib.parse import urlencode
 
 from hyperscale.core_rewrite.engines.client.shared.models import RequestType
-from hyperscale.core_rewrite.hooks.optimized.models.base import FrozenDict, OptimizedArg
-from hyperscale.core_rewrite.hooks.optimized.models.base.base_types import (
+from hyperscale.core_rewrite.optimized.models.base import FrozenDict, OptimizedArg
+from hyperscale.core_rewrite.optimized.models.base.base_types import (
     HTTPEncodableValue,
 )
 

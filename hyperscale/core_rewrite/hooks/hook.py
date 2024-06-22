@@ -18,20 +18,8 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
     RequestType,
 )
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
+from hyperscale.core_rewrite.optimized.models.base import OptimizedArg
 from hyperscale.core_rewrite.snowflake.snowflake_generator import SnowflakeGenerator
-
-from .optimized.models import (
-    URL,
-    Auth,
-    Cookies,
-    Data,
-    Headers,
-    Mutation,
-    Params,
-    Protobuf,
-    Query,
-)
-from .optimized.models.base import OptimizedArg
 
 
 class Hook:
@@ -55,18 +43,7 @@ class Hook:
 
         param_types = get_type_hints(call)
 
-        self.optimized_args: Dict[
-            str,
-            URL
-            | Auth
-            | Cookies
-            | Data
-            | Headers
-            | Mutation
-            | Params
-            | Protobuf
-            | Query,
-        ] = {
+        self.optimized_args: Dict[str, OptimizedArg] = {
             arg.name: arg.default
             for arg in params.values()
             if arg.KEYWORD_ONLY

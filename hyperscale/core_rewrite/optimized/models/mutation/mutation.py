@@ -12,8 +12,8 @@ from typing import (
 
 import orjson
 
-from hyperscale.core_rewrite.hooks.optimized.models.base import OptimizedArg
-from hyperscale.core_rewrite.hooks.optimized.models.base.base_types import (
+from hyperscale.core_rewrite.optimized.models.base import OptimizedArg
+from hyperscale.core_rewrite.optimized.models.base.base_types import (
     HTTPEncodableValue,
 )
 

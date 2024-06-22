@@ -1,29 +1,17 @@
-from __future__ import annotations
-
 import asyncio
-from typing import Generic, Literal, TypeVar
+from typing import Literal
 
 import dill
 
 from hyperscale.core_rewrite import Graph, Workflow, step
 from hyperscale.core_rewrite.engines.client.http import HTTPResponse
-from hyperscale.core_rewrite.hooks.optimized.models import (
+from hyperscale.core_rewrite.optimized import (
     URL,
     Cookies,
     Data,
     Headers,
     Params,
 )
-
-
-class Result:
-    pass
-
-
-T = TypeVar("T")
-K = TypeVar("K")
-
-State = Generic[T, K]
 
 
 class Test(Workflow):
@@ -65,8 +53,12 @@ class Test(Workflow):
         headers=Headers(
             {"test": "boop"},
         ),
-        cookies=Cookies([("a", "b")]),
-        data=Data({"bop": "blep"}),
+        cookies=Cookies(
+            [("a", "b")],
+        ),
+        data=Data(
+            {"bop": "blep"},
+        ),
     ) -> HTTPResponse:
         return await self.client.http.post(
             url,

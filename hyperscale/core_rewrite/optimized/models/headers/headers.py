@@ -12,8 +12,8 @@ from typing import (
 
 from hyperscale.core_rewrite.engines.client.shared.models import RequestType
 from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
-from hyperscale.core_rewrite.hooks.optimized.models.base import FrozenDict, OptimizedArg
-from hyperscale.core_rewrite.hooks.optimized.models.base.base_types import (
+from hyperscale.core_rewrite.optimized.models.base import FrozenDict, OptimizedArg
+from hyperscale.core_rewrite.optimized.models.base.base_types import (
     HTTPEncodableValue,
 )
 
