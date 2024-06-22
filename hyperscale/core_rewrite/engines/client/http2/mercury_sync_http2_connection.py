@@ -28,9 +28,13 @@ from hyperscale.core_rewrite.engines.client.shared.models import Cookies as HTTP
 from hyperscale.core_rewrite.engines.client.shared.models import (
     HTTPCookie,
     HTTPEncodableValue,
+    RequestType,
     URLMetadata,
 )
-from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
+from hyperscale.core_rewrite.engines.client.shared.protocols import (
+    NEW_LINE,
+    ProtocolMap,
+)
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 from hyperscale.core_rewrite.optimized.models import (
     URL,
@@ -76,7 +80,7 @@ class MercurySyncHTTP2Connection:
         self._client_waiters: Dict[asyncio.Transport, asyncio.Future] = {}
         self._connections: List[HTTP2Connection] = []
 
-        self._pipes = [HTTP2Pipe(pool_size) for _ in range(pool_size)]
+        self._pipes: List[HTTP2Pipe] = []
 
         self._url_cache: Dict[str, HTTPUrl] = {}
 
@@ -90,6 +94,12 @@ class MercurySyncHTTP2Connection:
 
         self._client_ssl_context: Optional[ssl.SSLContext] = None
         self._optimized: Dict[str, URL | Params | Headers | Auth | Data | Cookies] = {}
+
+        protocols = ProtocolMap()
+        address_family, protocol = protocols[RequestType.HTTP2]
+
+        self.address_family = address_family
+        self.address_protocol = protocol
 
     async def head(
         self,
@@ -454,7 +464,7 @@ class MercurySyncHTTP2Connection:
                     _,
                     connection,
                     pipe,
-                    url,
+                    optimized_url,
                     upgrade_ssl,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
@@ -463,6 +473,9 @@ class MercurySyncHTTP2Connection:
 
                 self._connections.append(connection)
                 self._pipes.append(pipe)
+
+                self._url_cache[optimized_url.hostname] = optimized_url
+                self._optimized[url.call_name] = url
 
             if upgrade_ssl:
                 url.data = url.data.replace("http://", "https://")
@@ -473,7 +486,7 @@ class MercurySyncHTTP2Connection:
                     _,
                     connection,
                     pipe,
-                    url,
+                    optimized_url,
                     _,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
@@ -483,8 +496,8 @@ class MercurySyncHTTP2Connection:
                 self._connections.append(connection)
                 self._pipes.append(pipe)
 
-            self._url_cache[url.optimized.hostname] = url
-            self._optimized[url.call_name] = url
+                self._url_cache[optimized_url.hostname] = optimized_url
+                self._optimized[url.call_name] = url
 
         except Exception:
             pass
@@ -620,7 +633,8 @@ class MercurySyncHTTP2Connection:
 
                 (error, connection, pipe, url, _) = await asyncio.wait_for(
                     self._connect_to_url_location(
-                        request_url, ssl_redirect_url=ssl_redirect_url
+                        request_url,
+                        ssl_redirect_url=ssl_redirect_url,
                     ),
                     timeout=self.timeouts.connect_timeout,
                 )
@@ -717,7 +731,8 @@ class MercurySyncHTTP2Connection:
                 timings["read_start"] = time.monotonic()
 
             (status, headers, body, error) = await asyncio.wait_for(
-                pipe.receive_response(connection), timeout=self.timeouts.read_timeout
+                pipe.receive_response(connection),
+                timeout=self.timeouts.request_timeout,
             )
 
             if status >= 300 and status < 400:
@@ -784,7 +799,6 @@ class MercurySyncHTTP2Connection:
                     reset_connections=self._reset_connections,
                 )
             )
-
             self._pipes.append(HTTP2Pipe(self._concurrency))
 
             if isinstance(request_url, str):
@@ -909,28 +923,22 @@ class MercurySyncHTTP2Connection:
                 (b":authority", url.hostname.encode()),
                 (b":scheme", url.scheme.encode()),
                 (b":path", url_path.encode()),
-                (b"user-agent", b"hyperscale/client"),
+                (b"User-Agent", b"hyperscale/client"),
             ]
 
         if isinstance(data, Data):
             encoded_headers.extend(
                 [
-                    ("Content-Length", data.content_length),
-                    ("Content-Type", data.content_type),
+                    (b"Content-Type", data.content_type.encode()),
                 ]
             )
 
         elif data:
-            content_length = len(encoded_data)
             encoded_headers.extend(
                 [
-                    ("Content-Length", f"{content_length}"),
-                    ("Content-Type", content_type),
+                    (b"Content-Type", content_type.encode()),
                 ]
             )
-
-        else:
-            encoded_headers.append(("Content-Length", "0"))
 
         if isinstance(cookies, Cookies):
             encoded_headers.append(cookies.optimized)
@@ -946,7 +954,12 @@ class MercurySyncHTTP2Connection:
                     cookie_name, cookie_value = cookie_data
                     encoded_cookies.append(f"{cookie_name}={cookie_value}")
 
-            encoded_headers.append(("cookie", "; ".join(encoded_cookies)))
+            encoded_headers.append(
+                (
+                    b"cookie",
+                    "; ".join(encoded_cookies).encode(),
+                )
+            )
 
         encoded_headers: bytes = self._encoder.encode(encoded_headers)
         encoded_headers: List[bytes] = [
@@ -973,10 +986,18 @@ class MercurySyncHTTP2Connection:
             parsed_url = request_url.optimized
 
         elif ssl_redirect_url:
-            parsed_url = HTTPUrl(ssl_redirect_url)
+            parsed_url = HTTPUrl(
+                ssl_redirect_url,
+                family=self.address_family,
+                protocol=self.address_protocol,
+            )
 
         else:
-            parsed_url = HTTPUrl(request_url)
+            parsed_url = HTTPUrl(
+                request_url,
+                family=self.address_family,
+                protocol=self.address_protocol,
+            )
 
         url = self._url_cache.get(parsed_url.hostname)
         dns_lock = self._dns_lock[parsed_url.hostname]

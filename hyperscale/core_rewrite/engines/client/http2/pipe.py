@@ -118,6 +118,8 @@ class HTTP2Pipe:
         headers_frame = Frame(connection.stream.stream_id, 0x01)
         headers_frame.flags.add("END_HEADERS")
 
+        headers_frame.data = headers
+
         if data is None:
             headers_frame.flags.add("END_STREAM")
 

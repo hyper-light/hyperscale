@@ -4,18 +4,14 @@ from typing import Literal
 import dill
 
 from hyperscale.core_rewrite import Graph, Workflow, step
-from hyperscale.core_rewrite.engines.client.http import HTTPResponse
+from hyperscale.core_rewrite.engines.client.http2 import HTTP2Response
 from hyperscale.core_rewrite.optimized import (
     URL,
-    Cookies,
-    Data,
-    Headers,
-    Params,
 )
 
 
 class Test(Workflow):
-    vus = 1000
+    vus = 200
     threads = 4
     duration = "1m"
     udp_port = 8811
@@ -24,40 +20,16 @@ class Test(Workflow):
         return "Hello there!"
 
     @step()
-    async def one(
-        self,
-        url=URL("https://httpbin.org/get"),
-    ) -> HTTPResponse:
-        return await self.client.http.get(url)
+    async def one(self, url=URL("https://http2.github.io/")) -> HTTP2Response:
+        return await self.client.http2.get(url)
 
     @step("one")
-    async def two(self, url: URL = "https://httpbin.org/get") -> HTTPResponse:
-        return await self.client.http.get(url)
+    async def two(self, url=URL("https://http2.github.io/")) -> HTTP2Response:
+        return await self.client.http2.get(url)
 
-    @step("one")
-    async def three(
-        self,
-        url: URL = "https://httpbin.org/post",
-        params: Params = {
-            "a": "b",
-        },
-        headers: Headers = {
-            "test": "boop",
-        },
-        cookies: Cookies = [
-            ("a", "b"),
-        ],
-        data: Data = {
-            "bop": "blep",
-        },
-    ) -> HTTPResponse:
-        return await self.client.http.post(
-            url,
-            params=params,
-            headers=headers,
-            cookies=cookies,
-            data=data,
-        )
+    # @step("one")
+    # async def three(self, url: URL = "https://http2.github.io/") -> HTTP2Response:
+    #     return await self.client.http2.get(url)
 
 
 async def run():
@@ -72,7 +44,7 @@ async def run():
 
     await g.setup()
 
-    # await g.run()
+    await g.run()
 
 
 asyncio.run(run())

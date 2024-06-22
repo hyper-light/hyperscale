@@ -8,7 +8,9 @@ from .graphql_http2 import MercurySyncGraphQLHTTP2Connection
 from .grpc import MercurySyncGRPCConnection
 from .http import MercurySyncHTTPConnection
 from .http.protocols import HTTPConnection
+from .http2 import MercurySyncHTTP2Connection
 from .http2.fast_hpack import Encoder
+from .http2.pipe import HTTP2Pipe
 from .http2.protocols import HTTP2Connection
 from .http2.settings import Settings
 from .http3 import MercurySyncHTTP3Connection
@@ -25,7 +27,7 @@ def setup_client(
     | MercurySyncGraphQLHTTP2Connection
     | MercurySyncGRPCConnection
     | MercurySyncHTTPConnection
-    | MercurySyncGraphQLHTTP2Connection
+    | MercurySyncHTTP2Connection
     | MercurySyncHTTP3Connection
     | MercurySyncPlaywrightConnection
     | MercurySyncUDPConnection
@@ -64,7 +66,7 @@ def setup_client(
     elif isinstance(
         client,
         (
-            MercurySyncGraphQLHTTP2Connection,
+            MercurySyncHTTP2Connection,
             MercurySyncGraphQLHTTP2Connection,
         ),
     ):
@@ -103,6 +105,8 @@ def setup_client(
             for _ in range(vus)
         ]
 
+        client._pipes = [HTTP2Pipe(vus) for _ in range(vus)]
+
         client._semaphore = asyncio.Semaphore(vus)
 
     elif isinstance(client, MercurySyncGRPCConnection):
@@ -131,6 +135,7 @@ def setup_client(
 
         client._encoder = Encoder()
         client._settings = Settings(client=False)
+
         client._connections = [
             HTTP2Connection(
                 vus,
@@ -139,6 +144,8 @@ def setup_client(
             )
             for _ in range(vus)
         ]
+
+        client._pipes = [HTTP2Pipe(vus) for _ in range(vus)]
 
         client._semaphore = asyncio.Semaphore(vus)
 

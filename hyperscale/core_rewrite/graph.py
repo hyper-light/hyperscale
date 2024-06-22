@@ -71,6 +71,53 @@ class Graph:
         for workflow in self.workflows:
             self._workflows_by_name[workflow.name] = workflow
 
+            clients = [
+                workflow.client.graphql,
+                workflow.client.graphqlh2,
+                workflow.client.grpc,
+                workflow.client.http,
+                workflow.client.http2,
+                workflow.client.http3,
+                workflow.client.playwright,
+                workflow.client.udp,
+                workflow.client.websocket,
+            ]
+
+            config = {
+                "vus": 1000,
+                "duration": "1m",
+                "threads": self._threads,
+                "connect_retries": 3,
+            }
+
+            config.update(
+                {
+                    name: value
+                    for name, value in inspect.getmembers(workflow)
+                    if config.get(name)
+                }
+            )
+
+            config["duration"] = TimeParser(config["duration"]).time
+
+            self._config = config
+            vus = self._config.get("vus")
+            threads = self._config.get("threads")
+
+            self.max_active = math.ceil(
+                vus * (psutil.cpu_count(logical=False) ** 2) / threads
+            )
+
+            for client in clients:
+                setup_client(
+                    client,
+                    config.get("vus"),
+                    pages=config.get("pages", 1),
+                    cert_path=config.get("cert_path"),
+                    key_path=config.get("key_path"),
+                    reset_connections=config.get("reset_connections"),
+                )
+
             hooks: Dict[str, Hook] = {
                 name: hook
                 for name, hook in inspect.getmembers(
@@ -126,53 +173,6 @@ class Graph:
                 hooks_by_call_id.update({hook.call_id: hook})
 
                 call_ids.append(hook.call_id)
-
-            clients = [
-                workflow.client.graphql,
-                workflow.client.graphqlh2,
-                workflow.client.grpc,
-                workflow.client.http,
-                workflow.client.http2,
-                workflow.client.http3,
-                workflow.client.playwright,
-                workflow.client.udp,
-                workflow.client.websocket,
-            ]
-
-            config = {
-                "vus": 1000,
-                "duration": "1m",
-                "threads": self._threads,
-                "connect_retries": 3,
-            }
-
-            config.update(
-                {
-                    name: value
-                    for name, value in inspect.getmembers(workflow)
-                    if config.get(name)
-                }
-            )
-
-            config["duration"] = TimeParser(config["duration"]).time
-
-            self._config = config
-            vus = self._config.get("vus")
-            threads = self._config.get("threads")
-
-            self.max_active = math.ceil(
-                vus * (psutil.cpu_count(logical=False) ** 2) / threads
-            )
-
-            for client in clients:
-                setup_client(
-                    client,
-                    config.get("vus"),
-                    pages=config.get("pages", 1),
-                    cert_path=config.get("cert_path"),
-                    key_path=config.get("key_path"),
-                    reset_connections=config.get("reset_connections"),
-                )
 
     async def _run(self, workflow: Workflow):
         loop = asyncio.get_event_loop()
