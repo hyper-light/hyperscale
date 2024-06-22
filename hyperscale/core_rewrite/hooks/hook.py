@@ -76,8 +76,6 @@ class Hook:
             and not isinstance(arg.default, inspect._empty)
         }
 
-        print(self.optimized_slots, "SLOTS")
-
         self.call = call
         self.full_name = call.__qualname__
         self.name = call.__name__
