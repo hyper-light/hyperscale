@@ -1,6 +1,6 @@
 from typing import Dict, Generic, Literal, Optional, TypeVar
 
-from pydantic import BaseModel, StrictFloat, StrictStr
+from pydantic import BaseModel
 
 from hyperscale.core_rewrite.engines.client.playwright.models.browser import (
     BrowserMetadata,
@@ -28,17 +28,17 @@ class PlaywrightResult(CallResult, Generic[T]):
 
     def __init__(
         self,
-        command: StrictStr,
+        command: str,
         command_args: BaseModel,
         metadata: BrowserMetadata,
-        url: StrictStr,
+        url: str,
         result: T,
-        error: Optional[StrictStr] = None,
-        timings: Dict[Literal["command_start", "command_end"], StrictFloat] = {
-            "command_start": 0,
-            "command_end": 0,
-        },
-        frame: Optional[StrictStr] = None,
+        error: Optional[str] = None,
+        timings: Dict[
+            Literal["command_start", "command_end"],
+            float | None,
+        ] = {},
+        frame: Optional[str] = None,
         source: Literal["page", "frame", "mouse"] = "page",
     ):
         super(
@@ -59,3 +59,9 @@ class PlaywrightResult(CallResult, Generic[T]):
     @classmethod
     def response_type(cls):
         return RequestType.PLAYWRIGHT
+
+    def check(self):
+        return self.error is None
+
+    def context(self):
+        return self.error if self.error else "OK"

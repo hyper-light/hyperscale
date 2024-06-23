@@ -17,7 +17,8 @@ import psutil
 
 from .engines.client import TimeParser
 from .engines.client.setup_clients import setup_client
-from .hooks import Hook
+from .hooks import Hook, HookType
+from .testing.models.metric import Metric
 from .workflow import Workflow
 
 warnings.simplefilter("ignore")
@@ -64,7 +65,15 @@ class Graph:
         self._workflows_by_name: Dict[str, Workflow] = {}
         self._threads = os.cpu_count()
         self._config: Dict[str, Any] = {}
-        self._traversal_orders: Dict[str, List[List[Hook]]] = {}
+        self._traversal_orders: Dict[
+            str,
+            List[
+                Dict[
+                    str,
+                    Hook,
+                ]
+            ],
+        ] = {}
 
         self._workflow_test_status: Dict[str, bool] = {}
         self._pending: List[asyncio.Task] = []
@@ -171,11 +180,11 @@ class Graph:
                 for dependency in hook.dependencies:
                     workflow_graph.add_edge(dependency, hook.name)
 
-            traversal_order: List[List[Hook]] = []
+            traversal_order: List[Dict[str, Hook]] = []
 
             for traversal_layer in networkx.bfs_layers(workflow_graph, sources):
                 traversal_order.append(
-                    [hooks.get(hook_name) for hook_name in traversal_layer]
+                    {hook_name: hooks.get(hook_name) for hook_name in traversal_layer}
                 )
 
             self._traversal_orders[workflow.name] = traversal_order
@@ -246,7 +255,7 @@ class Graph:
 
     async def _spawn_vu(
         self,
-        traversal_order: List[List[Hook]],
+        traversal_order: List[Dict[str, Hook]],
         remaining: float,
     ):
         try:
@@ -258,7 +267,7 @@ class Graph:
                 set_count = len(hook_set)
                 self.active += set_count
 
-                for hook in hook_set:
+                for hook in hook_set.values():
                     hook.context_args.update(
                         {
                             key: context[key]
@@ -274,9 +283,9 @@ class Graph:
                     [
                         asyncio.create_task(
                             hook.call(**hook.context_args),
-                            name=hook.name,
+                            name=hook_name,
                         )
-                        for hook in hook_set
+                        for hook_name, hook in hook_set.items()
                     ],
                     timeout=remaining,
                 )
@@ -285,11 +294,25 @@ class Graph:
                 results.extend(completed)
 
                 for complete in completed:
+                    hook_name = complete.get_name()
+                    hook = hook_set[hook_name]
+
                     try:
-                        context[complete.get_name()] = complete.result()
+                        result = complete.result()
 
                     except Exception:
-                        context[complete.get_name()] = complete.exception()
+                        result = complete.exception()
+
+                    if hook.hook_type == HookType.METRIC and isinstance(
+                        result, (int, float)
+                    ):
+                        context[hook_name] = Metric(
+                            result,
+                            hook.metric_type,
+                        )
+
+                    else:
+                        context[hook_name] = result
 
                 self._pending.extend(pending)
 

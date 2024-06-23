@@ -1,4 +1,10 @@
-from typing import Dict, Optional, Type, TypeVar
+from typing import (
+    Dict,
+    Literal,
+    Optional,
+    Type,
+    TypeVar,
+)
 
 import orjson
 from pydantic import BaseModel
@@ -25,7 +31,19 @@ class UDPResponse(CallResult):
         url: URLMetadata,
         error: Optional[str] = None,
         content: bytes = b"",
-        timings: Dict[str, float] = {},
+        timings: Dict[
+            Literal[
+                "request_start",
+                "connect_start",
+                "connect_end",
+                "write_start",
+                "write_end",
+                "read_start",
+                "read_end",
+                "request_end",
+            ],
+            float | None,
+        ] = {},
     ):
         super(
             UDPResponse,
@@ -56,3 +74,9 @@ class UDPResponse(CallResult):
     @property
     def data(self):
         return self.content
+
+    def check(self):
+        return self.error is None
+
+    def context(self):
+        return self.error if self.error else "OK"

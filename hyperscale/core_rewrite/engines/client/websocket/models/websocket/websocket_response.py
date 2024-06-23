@@ -36,7 +36,19 @@ class WebsocketResponse(HTTPResponse):
         status_message: Optional[str] = None,
         headers: Dict[bytes, bytes] = {},
         content: bytes = b"",
-        timings: Dict[str, float] = {},
+        timings: Dict[
+            Literal[
+                "request_start",
+                "connect_start",
+                "connect_end",
+                "write_start",
+                "write_end",
+                "read_start",
+                "read_end",
+                "request_end",
+            ],
+            float | None,
+        ] = {},
     ):
         super(
             WebsocketResponse,

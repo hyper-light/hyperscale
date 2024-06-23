@@ -21,6 +21,14 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 from hyperscale.core_rewrite.snowflake.snowflake_generator import SnowflakeGenerator
 from hyperscale.core_rewrite.testing.models.base import OptimizedArg
+from hyperscale.core_rewrite.testing.models.metric import (
+    COUNT,
+    DISTRIBUTION,
+    RATE,
+    SAMPLE,
+)
+
+from .hook_type import HookType
 
 
 class Hook:
@@ -91,13 +99,51 @@ class Hook:
         self.return_type = param_types.get("return")
         self.is_test = False
         self.engine_type: Optional[RequestType] = None
+        self.metric_type: Optional[COUNT | DISTRIBUTION | SAMPLE | RATE] = None
 
         annotation_subtypes = list(get_args(self.return_type))
 
         if len(annotation_subtypes) > 0:
-            self.return_type = [return_type for return_type in annotation_subtypes]
+            annotation_subtypes = [return_type for return_type in annotation_subtypes]
 
-        else:
-            self.is_test = self.return_type in CallResult.__subclasses__()
+        is_test = self.return_type in CallResult.__subclasses__() or (
+            len(
+                [
+                    return_type
+                    for return_type in annotation_subtypes
+                    if return_type in CallResult.__subclasses__()
+                ]
+            )
+            > 0
+        )
+
+        is_check = self.return_type is Exception or (Exception in annotation_subtypes)
+
+        metric_type = [
+            return_type
+            for return_type in annotation_subtypes
+            if return_type
+            in [
+                COUNT,
+                SAMPLE,
+                DISTRIBUTION,
+                RATE,
+            ]
+        ]
+
+        is_metric = len(metric_type) > 0
+
+        if is_test:
+            self.hook_type = HookType.TEST
             self.return_type: CallResult = self.return_type
             self.engine_type: RequestType = self.return_type.response_type()
+
+        elif is_check:
+            self.hook_type = HookType.CHECK
+
+        elif is_metric:
+            self.hook_type = HookType.METRIC
+            self.metric_type = metric_type.pop()
+
+        else:
+            self.hook_type = HookType.ACTION

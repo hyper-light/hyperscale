@@ -7,6 +7,10 @@ from .hook import Hook
 
 def step(*args: str, timeouts: Optional[Timeouts] = None):
     def wrapper(func: Callable[..., Awaitable[Any]]):
-        return Hook(func, args)
+        return Hook(
+            func,
+            args,
+            timeouts=timeouts,
+        )
 
     return wrapper

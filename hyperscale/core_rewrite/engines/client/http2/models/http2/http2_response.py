@@ -47,7 +47,19 @@ class HTTP2Response(CallResult):
         status_message: Optional[str] = None,
         headers: Dict[bytes, bytes] = {},
         content: bytes = b"",
-        timings: Dict[str, float] = {},
+        timings: Dict[
+            Literal[
+                "request_start",
+                "connect_start",
+                "connect_end",
+                "write_start",
+                "write_end",
+                "read_start",
+                "read_end",
+                "request_end",
+            ],
+            float | None,
+        ] = {},
     ):
         super(
             HTTP2Response,
@@ -132,3 +144,9 @@ class HTTP2Response(CallResult):
 
             case _:
                 return self.body
+
+    def check(self):
+        return self.status >= 200 and self.status < 300
+
+    def context(self):
+        return self.status_message
