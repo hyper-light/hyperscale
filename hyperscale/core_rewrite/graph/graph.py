@@ -190,7 +190,7 @@ class Graph:
             timeout=1,
         )
 
-        completed_results = await asyncio.gather(*completed)
+        await asyncio.gather(*completed)
 
         await asyncio.gather(
             *[

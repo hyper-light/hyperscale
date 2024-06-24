@@ -87,7 +87,7 @@ class WorkflowResults:
             str,
             List[Any],
         ],
-    ):
+    ) -> WorkflowStats:
         workflow_stats: WorkflowStats = {
             "workflow": workflow,
             "stats": {"executed": 0, "succeeded": 0, "failed": 0},
