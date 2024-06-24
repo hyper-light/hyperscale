@@ -30,36 +30,13 @@ from hyperscale.core_rewrite.testing.models.metric import (
     Metric,
 )
 
-StatTypes = Literal["max", "min", "mean", "med", "stdev", "var", "mad"]
-
-StatusCounts = Dict[int, int]
-StatsResults = Dict[StatTypes, int | float]
-CountResults = Dict[
-    Literal["succeeded", "failed", "executed"] | Optional[Literal["statuses"]],
-    int | Optional[StatusCounts],
-]
-FailedResults = Dict[Literal["failed"], int]
-ContextResults = List[Dict[Literal["context", "count"], str | int]]
-ResultSet = Dict[
-    Literal[
-        "workflow",
-        "step",
-        "timings",
-        "counts",
-        "contexts",
-    ],
-    str | StatsResults | CountResults | ContextResults,
-]
-
-ExceptionSet = Dict[
-    Literal[
-        "workflow",
-        "step",
-        "counts",
-        "contexts",
-    ],
-    str | FailedResults | ContextResults,
-]
+from .workflow_types import (
+    CheckSet,
+    MetricsSet,
+    ResultSet,
+    StatTypes,
+    WorkflowStats,
+)
 
 
 class WorkflowResults:
@@ -111,29 +88,40 @@ class WorkflowResults:
             List[Any],
         ],
     ):
-        results_sets = []
+        workflow_stats: WorkflowStats = {
+            "workflow": workflow,
+            "stats": {"executed": 0, "succeeded": 0, "failed": 0},
+            "results": [],
+            "checks": [],
+            "metrics": [],
+        }
+
         for step in results:
             step_results = results[step]
-
-            results_set = {
-                "workflow": workflow,
-                "step": step,
-            }
 
             hook = self._hooks[step]
             hook_type = hook.hook_type
 
             match hook_type:
                 case HookType.TEST:
-                    results_set.update(
-                        self._process_http_or_udp_timings_set(
-                            workflow, step, hook.engine_type, step_results
-                        )
+                    test_results = self._process_http_or_udp_timings_set(
+                        workflow, step, hook.engine_type, step_results
                     )
-                    results_sets.append(results_set)
+
+                    workflow_stats["results"].append(test_results)
+
+                    workflow_stats["stats"]["executed"] += test_results["counts"][
+                        "executed"
+                    ]
+                    workflow_stats["stats"]["succeeded"] += test_results["counts"][
+                        "succeeded"
+                    ]
+                    workflow_stats["stats"]["failed"] += test_results["counts"][
+                        "failed"
+                    ]
 
                 case HookType.METRIC:
-                    results_set.update(
+                    workflow_stats["metrics"].append(
                         self._process_metrics_set(
                             workflow,
                             step,
@@ -143,30 +131,26 @@ class WorkflowResults:
                         )
                     )
 
-                    results_sets.append(results_set)
-
                 case HookType.CHECK:
-                    results_set.update(
-                        self._process_exception_set(
+                    workflow_stats["checks"].append(
+                        self._process_check_set(
                             workflow,
                             step,
                             step_results,
                         )
                     )
 
-                    results_sets.append(results_set)
-
                 case _:
                     pass
 
-        return results_sets
+        return workflow_stats
 
-    def _process_exception_set(
+    def _process_check_set(
         self,
         workflow: str,
         step_name: str,
         exceptions: List[Exception | None],
-    ) -> ExceptionSet:
+    ) -> CheckSet:
         executed = len(exceptions)
 
         failed_contexts = Counter([str(err) for err in exceptions if err is not None])
@@ -197,7 +181,7 @@ class WorkflowResults:
         metric_type: COUNT | DISTRIBUTION | SAMPLE | RATE,
         tags: List[str],
         metrics: List[Metric],
-    ):
+    ) -> MetricsSet:
         if metric_type == COUNT:
             return {
                 "workflow": workflow,
@@ -247,13 +231,8 @@ class WorkflowResults:
             }
 
         elif metric_type == RATE:
-            rates = [
-                metric
-                for metric in metrics
-                if isinstance(metric, tuple) and len(metric) == 2
-            ]
-            values = [metric[0] for metric in rates]
-            times = [metric[1] for metric in rates]
+            values = [metric[0] for metric in metrics]
+            times = [metric[1] for metric in metrics]
 
             elapsed = max(times) - min(times)
 

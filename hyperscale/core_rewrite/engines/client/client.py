@@ -1,7 +1,11 @@
 import uuid
-from typing import Generic
-
-from typing_extensions import TypeVarTuple, Unpack
+from typing import (
+    Any,
+    Generator,
+    Generic,
+    TypeVarTuple,
+    Unpack,
+)
 
 from .graphql import MercurySyncGraphQLConnection
 from .graphql_http2 import MercurySyncGraphQLHTTP2Connection
@@ -20,18 +24,8 @@ config_registry = []
 
 
 class Client(Generic[Unpack[T]]):
-    def __init__(
-        self,
-        graph_name: str,
-        graph_id: str,
-        stage_name: str,
-        stage_id: str,
-    ) -> None:
+    def __init__(self) -> None:
         self.client_id = str(uuid.uuid4())
-        self.graph_name = graph_name
-        self.graph_id = graph_id
-        self.stage_name = stage_name
-        self.stage_id = stage_id
 
         self.next_name = None
         self.suspend = False
@@ -45,6 +39,36 @@ class Client(Generic[Unpack[T]]):
         self.playwright = MercurySyncPlaywrightConnection()
         self.udp = MercurySyncUDPConnection()
         self.websocket = MercurySyncWebsocketConnection()
+
+    def __iter__(
+        self,
+    ) -> Generator[
+        Any,
+        None,
+        MercurySyncGraphQLConnection
+        | MercurySyncGraphQLHTTP2Connection
+        | MercurySyncGRPCConnection
+        | MercurySyncHTTPConnection
+        | MercurySyncHTTP2Connection
+        | MercurySyncHTTP3Connection
+        | MercurySyncPlaywrightConnection
+        | MercurySyncUDPConnection
+        | MercurySyncWebsocketConnection,
+    ]:
+        clients = [
+            self.graphql,
+            self.graphqlh2,
+            self.grpc,
+            self.http,
+            self.http2,
+            self.http3,
+            self.playwright,
+            self.udp,
+            self.websocket,
+        ]
+
+        for client in clients:
+            yield client
 
     def __getitem__(
         self,

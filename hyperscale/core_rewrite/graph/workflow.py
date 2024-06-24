@@ -2,10 +2,9 @@ import threading
 import uuid
 from typing import Any, Dict
 
+from hyperscale.core_rewrite.engines.client import Client
+from hyperscale.core_rewrite.hooks import Hook
 from hyperscale.core_rewrite.snowflake.snowflake_generator import SnowflakeGenerator
-
-from .engines.client import Client
-from .hooks import Hook
 
 
 class Workflow:
@@ -22,9 +21,4 @@ class Workflow:
         self.context: Dict[str, Any] = {}
         self.hooks: Dict[str, Hook] = {}
 
-        self.client = Client(
-            self.graph,
-            self.id,
-            self.name,
-            self.id,
-        )
+        self.client = Client()

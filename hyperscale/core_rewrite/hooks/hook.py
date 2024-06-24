@@ -29,19 +29,8 @@ from hyperscale.core_rewrite.testing.models.metric import (
 )
 
 from .hook_type import HookType
-
-
-def wrap_check(
-    call: Callable[..., Awaitable[Any] | Awaitable[BaseAction] | Awaitable[CallResult]],
-):
-    async def wrapped_call(*args, **kwargs):
-        try:
-            return await call(*args, **kwargs)
-
-        except Exception as err:
-            return err
-
-    return wrapped_call
+from .wrap_check import wrap_check
+from .wrap_metric import wrap_metric
 
 
 class Hook:
@@ -173,7 +162,12 @@ class Hook:
         elif is_metric:
             self.hook_type = HookType.METRIC
             self.metric_type = metric_type.pop()
-            self.call = self._call
+
+            if self.metric_type == RATE:
+                self.call = wrap_metric(self._call)
+
+            else:
+                self.call = self._call
 
         else:
             self.hook_type = HookType.ACTION

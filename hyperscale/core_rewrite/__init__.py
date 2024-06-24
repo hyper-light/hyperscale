@@ -1,3 +1,3 @@
-from .graph import Graph
-from .hooks import step
-from .workflow import Workflow
+from .graph import Workflow as Workflow
+from .graph import depends as depends
+from .hooks import step as step

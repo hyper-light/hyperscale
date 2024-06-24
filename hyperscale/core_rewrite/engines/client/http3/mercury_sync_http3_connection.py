@@ -632,32 +632,18 @@ class MercurySyncHTTP3Connection:
             if timings["write_start"] is None:
                 timings["write_start"] = time.monotonic()
 
-            encoded_data: Optional[bytes] = None
-            if data:
-                encoded_data, content_type = self._encode_data(data)
-                encoded_headers = self._encode_headers(
-                    url,
-                    method,
-                    params=params,
-                    headers=headers,
-                    data=data,
-                    encoded_data=encoded_data,
-                    content_type=content_type,
-                )
-
-            else:
-                encoded_headers = self._encode_headers(
-                    url,
-                    method,
-                    params=params,
-                    headers=headers,
-                )
-
             stream_id = connection.protocol.quic.get_next_available_stream_id()
 
             stream = connection.protocol.get_or_create_stream(stream_id)
             if stream.headers_send_state == HeadersState.AFTER_TRAILERS:
                 raise Exception("HEADERS frame is not allowed in this state")
+
+            encoded_headers = self._encode_headers(
+                url,
+                method,
+                params=params,
+                headers=headers,
+            )
 
             encoder, frame_data = connection.protocol.encoder.encode(
                 stream_id,
@@ -682,10 +668,12 @@ class MercurySyncHTTP3Connection:
                 end_stream=not data,
             )
 
-            if encoded_data:
+            if data:
                 stream = connection.protocol.get_or_create_stream(stream_id)
                 if stream.headers_send_state != HeadersState.AFTER_HEADERS:
                     raise Exception("DATA frame is not allowed in this state")
+
+                encoded_data = self._encode_data(data)
 
                 connection.protocol.quic.send_stream_data(
                     stream_id,
@@ -909,9 +897,6 @@ class MercurySyncHTTP3Connection:
         params: Optional[Dict[str, str] | Params] = None,
         headers: Optional[Dict[str, str] | Headers] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
-        data: Optional[Data] = None,
-        encoded_data: Optional[bytes] = None,
-        content_type: Optional[str] = None,
     ):
         if isinstance(url, URL):
             url = url.optimized
@@ -941,7 +926,6 @@ class MercurySyncHTTP3Connection:
                 (b":authority", url.hostname.encode()),
                 (b":scheme", url.scheme.encode()),
                 (b":path", url_path.encode()),
-                (b"user-agent", b"hyperscale/client"),
             ]
 
             encoded_headers.extend(
@@ -962,28 +946,7 @@ class MercurySyncHTTP3Connection:
                 (b":authority", url.hostname.encode()),
                 (b":scheme", url.scheme.encode()),
                 (b":path", url_path.encode()),
-                (b"user-agent", b"hyperscale/client"),
             ]
-
-        if isinstance(data, Data):
-            encoded_headers.extend(
-                [
-                    ("Content-Length", data.content_length),
-                    ("Content-Type", data.content_type),
-                ]
-            )
-
-        elif data:
-            content_length = len(encoded_data)
-            encoded_headers.extend(
-                [
-                    ("Content-Length", f"{content_length}"),
-                    ("Content-Type", content_type),
-                ]
-            )
-
-        else:
-            encoded_headers.append(("Content-Length", "0"))
 
         if isinstance(cookies, Cookies):
             encoded_headers.append(cookies.optimized)
@@ -1005,11 +968,9 @@ class MercurySyncHTTP3Connection:
 
     def _encode_data(
         self,
-        data: str | BaseModel | tuple | dict | list | Data,
+        data: str | BaseModel | tuple | dict | list | Data | bytes,
     ):
-        content_type: Optional[str] = None
         encoded_data: Optional[bytes] = None
-        size = 0
 
         if isinstance(data, Data):
             return data.optimized
@@ -1019,18 +980,15 @@ class MercurySyncHTTP3Connection:
             for chunk in data:
                 chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
                 encoded_chunk = chunk_size.encode() + chunk + NEW_LINE.encode()
-                size += len(encoded_chunk)
                 chunks.append(encoded_chunk)
 
             self.is_stream = True
             encoded_data = chunks
 
         elif isinstance(data, BaseModel):
-            content_type = "application/json"
             encoded_data = orjson.dumps(data.model_dump())
 
         elif isinstance(data, (dict, list)):
-            content_type = "application/json"
             encoded_data = orjson.dumps(data)
 
         elif isinstance(data, tuple):
@@ -1039,4 +997,7 @@ class MercurySyncHTTP3Connection:
         elif isinstance(data, str):
             encoded_data = data.encode()
 
-        return encoded_data, content_type
+        else:
+            encoded_data = data
+
+        return encoded_data

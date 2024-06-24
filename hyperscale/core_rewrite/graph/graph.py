@@ -4,8 +4,10 @@ import math
 import os
 import time
 import warnings
+from collections import defaultdict
 from typing import (
     Any,
+    AsyncGenerator,
     Dict,
     List,
     Tuple,
@@ -14,10 +16,12 @@ from typing import (
 import networkx
 import psutil
 
-from .engines.client import TimeParser
-from .engines.client.setup_clients import setup_client
-from .hooks import Hook, HookType
-from .results import WorkflowResults
+from hyperscale.core_rewrite.engines.client import TimeParser
+from hyperscale.core_rewrite.engines.client.setup_clients import setup_client
+from hyperscale.core_rewrite.hooks import Hook, HookType
+from hyperscale.core_rewrite.results import WorkflowResults
+
+from .dependent_workflow import DependentWorkflow
 from .workflow import Workflow
 
 warnings.simplefilter("ignore")
@@ -58,18 +62,19 @@ def _guard_result(result: asyncio.Task):
 class Graph:
     def __init__(
         self,
-        workflows: List[Workflow],
+        workflows: List[Workflow | DependentWorkflow],
     ) -> None:
         self.graph = __file__
         self.workflows = workflows
         self.max_active = 0
         self.active = 0
 
-        self._active_waiter: asyncio.Future | None = None
+        self._active_waiters: Dict[str, asyncio.Future | None] = {}
+
         self._workflows_by_name: Dict[str, Workflow] = {}
         self._threads = os.cpu_count()
-        self._config: Dict[str, Any] = {}
-        self._traversal_orders: Dict[
+
+        self._step_traversal_orders: Dict[
             str,
             List[
                 Dict[
@@ -79,44 +84,131 @@ class Graph:
             ],
         ] = {}
 
+        self._workflow_traversal_order: List[
+            Dict[
+                str,
+                Hook,
+            ]
+        ] = []
+
+        self._workflow_configs: Dict[str, Dict[str, Any]] = {}
+
         self._workflow_test_status: Dict[str, bool] = {}
-        self._pending: List[asyncio.Task] = []
-        self._results: Dict[Tuple[str, HookType], List[Any]] = {}
+        self._pending: Dict[str, List[asyncio.Task]] = defaultdict(list)
+        self._workflows: Dict[str, Workflow] = {}
+
+    def create_workflow_graph(self):
+        workflow_graph = networkx.DiGraph()
+
+        workflow_dependencies: Dict[str, List[str]] = {}
+
+        sources = []
+
+        for workflow in self.workflows:
+            if (
+                isinstance(workflow, DependentWorkflow)
+                and len(workflow.dependencies) > 0
+            ):
+                dependent_workflow = workflow.dependent_workflow
+                workflow_dependencies[dependent_workflow.name] = workflow.dependencies
+
+                self._workflows[dependent_workflow.name] = dependent_workflow
+
+                workflow_graph.add_node(dependent_workflow.name)
+
+            else:
+                self._workflows[workflow.name] = workflow
+                sources.append(workflow.name)
+
+                workflow_graph.add_node(workflow.name)
+
+        for workflow_name, dependencies in workflow_dependencies.items():
+            for dependency in dependencies:
+                workflow_graph.add_edge(dependency, workflow_name)
+
+        for traversal_layer in networkx.bfs_layers(workflow_graph, sources):
+            self._workflow_traversal_order.append(
+                {
+                    workflow_name: self._workflows.get(workflow_name)
+                    for workflow_name in traversal_layer
+                }
+            )
 
     async def run(self):
-        for workflow in self.workflows:
-            await self._run(workflow)
+        for workflow_set in self._workflow_traversal_order:
+            await asyncio.gather(
+                *[self._run_workflow(workflow) for workflow in workflow_set.values()]
+            )
 
-    async def _run(self, workflow: Workflow):
-        loop = asyncio.get_event_loop()
-
+    async def _run_workflow(self, workflow: Workflow):
         workflow = await self._setup(workflow)
 
-        traversal_order = self._traversal_orders[workflow.name]
+        traversal_order = self._step_traversal_orders[workflow.name]
+
+        is_test_workflow = (
+            len(
+                [
+                    hook
+                    for hook in workflow.hooks.values()
+                    if hook.hook_type == HookType.TEST
+                ]
+            )
+            > 0
+        )
+
+        if is_test_workflow:
+            return await self._execute_test_workflow(workflow, traversal_order)
+
+        return await self._execute_non_test_workflow(workflow, traversal_order)
+
+    async def _execute_test_workflow(
+        self,
+        workflow: Workflow,
+        traversal_order: List[Dict[str, Hook]],
+    ):
+        loop = asyncio.get_event_loop()
+
+        workflow_name = workflow.name
+
+        config = self._workflow_configs[workflow_name]
 
         completed, pending = await asyncio.wait(
             [
                 loop.create_task(
-                    self._spawn_vu(traversal_order, remaining),
+                    self._spawn_vu(
+                        workflow_name,
+                        traversal_order,
+                        remaining,
+                    ),
                     name=workflow.name,
                 )
-                async for remaining in self._generate()
+                async for remaining in self._generate(
+                    workflow_name,
+                    config,
+                )
             ],
             timeout=1,
         )
 
-        results = await asyncio.gather(*completed)
+        completed_results = await asyncio.gather(*completed)
 
         await asyncio.gather(
-            *[asyncio.create_task(cancel_pending(pend)) for pend in self._pending]
+            *[
+                asyncio.create_task(cancel_pending(pend))
+                for pend in self._pending[workflow_name]
+            ]
         )
 
         await asyncio.gather(
             *[asyncio.create_task(cancel_pending(pend)) for pend in pending]
         )
 
+        workflow_results_set: Dict[str, List[Any]] = {
+            hook_name: [] for hook_name in workflow.hooks
+        }
+
         [
-            self._results[result.get_name()].append(
+            workflow_results_set[result.get_name()].append(
                 _guard_result(result),
             )
             for complete in completed
@@ -124,36 +216,54 @@ class Graph:
             if _guard_result(result) is not None
         ]
 
-        results = WorkflowResults(
-            workflow.hooks,
+        workflow_results = WorkflowResults(workflow.hooks)
+
+        processed_results = workflow_results.process(
+            workflow_name,
+            workflow_results_set,
         )
-
-        processed_results = results.process(workflow.name, self._results)
-
-        print(len(completed))
 
         return processed_results
 
+    async def _execute_non_test_workflow(
+        self,
+        workflow: Workflow,
+        traversal_order: List[Dict[str, Hook]],
+    ):
+        workflow_name = workflow.name
+        config = self._workflow_configs[workflow_name]
+
+        execution_results: List[asyncio.Task] = await self._spawn_vu(
+            workflow_name,
+            traversal_order,
+            config.get(
+                "workflow_timeout",
+                TimeParser("5m").time,
+            ),
+        )
+
+        await asyncio.gather(*execution_results)
+
+        await asyncio.gather(
+            *[
+                asyncio.create_task(cancel_pending(pend))
+                for pend in self._pending[workflow_name]
+            ]
+        )
+
+        return {
+            result.get_name(): _guard_result(result) for result in execution_results
+        }
+
     async def _setup(self, workflow: Workflow) -> Workflow:
         self._workflows_by_name[workflow.name] = workflow
-
-        clients = [
-            workflow.client.graphql,
-            workflow.client.graphqlh2,
-            workflow.client.grpc,
-            workflow.client.http,
-            workflow.client.http2,
-            workflow.client.http3,
-            workflow.client.playwright,
-            workflow.client.udp,
-            workflow.client.websocket,
-        ]
 
         config = {
             "vus": 1000,
             "duration": "1m",
             "threads": self._threads,
             "connect_retries": 3,
+            "workflow_timeout": "5m",
         }
 
         config.update(
@@ -164,17 +274,19 @@ class Graph:
             }
         )
 
+        config["workflow_timeout"] = TimeParser(config["workflow_timeout"]).time
         config["duration"] = TimeParser(config["duration"]).time
 
-        self._config = config
-        vus = self._config.get("vus")
-        threads = self._config.get("threads")
+        self._workflow_configs[workflow.name] = config
+
+        vus = config.get("vus")
+        threads = config.get("threads")
 
         self.max_active = math.ceil(
             vus * (psutil.cpu_count(logical=False) ** 2) / threads
         )
 
-        for client in clients:
+        for client in workflow.client:
             setup_client(
                 client,
                 config.get("vus"),
@@ -196,15 +308,13 @@ class Graph:
             len([hook for hook in hooks.values() if hook.is_test]) > 0
         )
 
-        workflow_graph = networkx.DiGraph()
+        step_graph = networkx.DiGraph()
 
         for hook in hooks.values():
-            workflow_graph.add_node(hook.name)
+            step_graph.add_node(hook.name)
 
             hook.call = hook.call.__get__(workflow, workflow.__class__)
             setattr(workflow, hook.name, hook.call)
-
-            self._results[hook.name] = []
 
         sources = []
 
@@ -228,23 +338,29 @@ class Graph:
                 sources.append(hook.name)
 
             for dependency in hook.dependencies:
-                workflow_graph.add_edge(dependency, hook.name)
+                step_graph.add_edge(dependency, hook.name)
 
         traversal_order: List[Dict[str, Hook]] = []
 
-        for traversal_layer in networkx.bfs_layers(workflow_graph, sources):
+        for traversal_layer in networkx.bfs_layers(step_graph, sources):
             traversal_order.append(
                 {hook_name: hooks.get(hook_name) for hook_name in traversal_layer}
             )
 
-        self._traversal_orders[workflow.name] = traversal_order
+        self._step_traversal_orders[workflow.name] = traversal_order
 
         workflow.hooks = hooks
 
+        self._active_waiters[workflow.name] = None
+
         return workflow
 
-    async def _generate(self):
-        duration = self._config.get("duration")
+    async def _generate(
+        self,
+        workflow_name: str,
+        config: Dict[str, Any],
+    ) -> AsyncGenerator[Any, float]:
+        duration = config.get("duration")
 
         elapsed = 0
 
@@ -256,12 +372,17 @@ class Graph:
 
             await asyncio.sleep(0)
 
-            if self.active > self.max_active and self._active_waiter is None:
-                self._active_waiter = asyncio.get_event_loop().create_future()
+            if (
+                self.active > self.max_active
+                and self._active_waiters[workflow_name] is None
+            ):
+                self._active_waiters[workflow_name] = (
+                    asyncio.get_event_loop().create_future()
+                )
 
                 try:
                     await asyncio.wait_for(
-                        self._active_waiter,
+                        self._active_waiters[workflow_name],
                         timeout=remaining,
                     )
                 except asyncio.TimeoutError:
@@ -271,6 +392,7 @@ class Graph:
 
     async def _spawn_vu(
         self,
+        workflow_name: str,
         traversal_order: List[Dict[str, Hook]],
         remaining: float,
     ):
@@ -318,17 +440,20 @@ class Graph:
 
                     context[complete.get_name()] = result
 
-                self._pending.extend(pending)
+                self._pending[workflow_name].extend(pending)
 
                 self.active -= set_count
 
-                if self.active <= self.max_active and self._active_waiter:
+                if (
+                    self.active <= self.max_active
+                    and self._active_waiters[workflow_name]
+                ):
                     try:
-                        self._active_waiter.set_result(None)
-                        self._active_waiter = None
+                        self._active_waiters[workflow_name].set_result(None)
+                        self._active_waiters[workflow_name] = None
 
                     except asyncio.InvalidStateError:
-                        self._active_waiter = None
+                        self._active_waiters[workflow_name] = None
 
         except Exception:
             pass

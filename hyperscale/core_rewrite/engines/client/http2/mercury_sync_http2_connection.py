@@ -668,25 +668,22 @@ class MercurySyncHTTP2Connection:
 
             connection = pipe.send_preamble(connection)
 
+            encoded_headers = self._encode_headers(
+                url,
+                method,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+            )
+
+            connection = pipe.send_request_headers(
+                encoded_headers,
+                data,
+                connection,
+            )
+
             if data:
-                encoded_data, content_type = self._encode_data(data)
-
-                encoded_headers = self._encode_headers(
-                    url,
-                    method,
-                    params=params,
-                    headers=headers,
-                    cookies=cookies,
-                    data=data,
-                    encoded_data=encoded_data,
-                    content_type=content_type,
-                )
-
-                connection = pipe.send_request_headers(
-                    encoded_headers,
-                    data,
-                    connection,
-                )
+                encoded_data = self._encode_data(data)
 
                 connection = await asyncio.wait_for(
                     pipe.submit_request_body(
@@ -694,22 +691,6 @@ class MercurySyncHTTP2Connection:
                         connection,
                     ),
                     timeout=self.timeouts.write_timeout,
-                )
-
-            else:
-                encoded_headers = self._encode_headers(
-                    url,
-                    method,
-                    params=params,
-                    headers=headers,
-                    cookies=cookies,
-                    data=data,
-                )
-
-                connection = pipe.send_request_headers(
-                    encoded_headers,
-                    data,
-                    connection,
                 )
 
             timings["write_end"] = time.monotonic()
@@ -814,31 +795,25 @@ class MercurySyncHTTP2Connection:
         self,
         data: str | bytes | BaseModel | bytes | Data,
     ):
-        content_type: Optional[str] = None
         encoded_data: Optional[bytes] = None
-        size = 0
 
         if isinstance(data, Data):
             encoded_data = data.optimized
-            content_type = data.content_type
 
         elif isinstance(data, Iterator) and not isinstance(data, list):
             chunks = []
             for chunk in data:
                 chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
                 encoded_chunk = chunk_size.encode() + chunk + NEW_LINE.encode()
-                size += len(encoded_chunk)
                 chunks.append(encoded_chunk)
 
             encoded_data = chunks
 
         elif isinstance(data, BaseModel):
             encoded_data = orjson.dumps(data.model_dump())
-            content_type = "application/json"
 
         elif isinstance(data, (dict, list)):
             encoded_data = orjson.dumps(data)
-            content_type = "application/json"
 
         elif isinstance(data, tuple):
             encoded_data = urlencode(data).encode()
@@ -846,7 +821,10 @@ class MercurySyncHTTP2Connection:
         elif isinstance(data, str):
             encoded_data = data.encode()
 
-        return encoded_data, content_type
+        else:
+            encoded_data = data
+
+        return encoded_data
 
     def _encode_headers(
         self,
@@ -855,9 +833,6 @@ class MercurySyncHTTP2Connection:
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
-        data: Optional[str | bytes | BaseModel | bytes | Data] = None,
-        encoded_data: Optional[bytes] = None,
-        content_type: Optional[str] = None,
     ):
         if isinstance(url, URL):
             url = url.optimized
@@ -908,20 +883,6 @@ class MercurySyncHTTP2Connection:
                 (b":scheme", url.scheme.encode()),
                 (b":path", url_path.encode()),
             ]
-
-        if isinstance(data, Data):
-            encoded_headers.extend(
-                [
-                    (b"Content-Type", data.content_type.encode()),
-                ]
-            )
-
-        elif data:
-            encoded_headers.extend(
-                [
-                    (b"Content-Type", content_type.encode()),
-                ]
-            )
 
         if isinstance(cookies, Cookies):
             encoded_headers.append(cookies.optimized)
