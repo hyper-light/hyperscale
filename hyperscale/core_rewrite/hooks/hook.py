@@ -31,6 +31,19 @@ from hyperscale.core_rewrite.testing.models.metric import (
 from .hook_type import HookType
 
 
+def wrap_check(
+    call: Callable[..., Awaitable[Any] | Awaitable[BaseAction] | Awaitable[CallResult]],
+):
+    async def wrapped_call(*args, **kwargs):
+        try:
+            return await call(*args, **kwargs)
+
+        except Exception as err:
+            return err
+
+    return wrapped_call
+
+
 class Hook:
     def __init__(
         self,
@@ -39,6 +52,7 @@ class Hook:
         ],
         dependencies: List[str],
         timeouts: Optional[Timeouts] = None,
+        tags: Optional[List[str]] = None,
     ) -> None:
         if timeouts is None:
             timeouts = Timeouts()
@@ -52,6 +66,10 @@ class Hook:
 
         param_types = get_type_hints(call)
 
+        if tags is None:
+            tags: List[str] = []
+
+        self.tags = tags
         self.kwarg_names = [arg.name for arg in params.values() if arg.KEYWORD_ONLY]
 
         self.optimized_args: Dict[str, OptimizedArg] = {
@@ -87,7 +105,7 @@ class Hook:
             and not isinstance(arg.default, inspect._empty)
         }
 
-        self.call = call
+        self._call = call
         self.full_name = call.__qualname__
         self.name = call.__name__
         self.workflow = self.full_name.split(".").pop(0)
@@ -117,7 +135,15 @@ class Hook:
             > 0
         )
 
-        is_check = self.return_type is Exception or (Exception in annotation_subtypes)
+        is_check = (
+            self.return_type is Exception
+            or (
+                Exception in annotation_subtypes
+                and type(None) in annotation_subtypes
+                and len(annotation_subtypes) == 2
+            )
+            or (Exception in annotation_subtypes and len(annotation_subtypes) == 1)
+        )
 
         metric_type = [
             return_type
@@ -138,12 +164,17 @@ class Hook:
             self.return_type: CallResult = self.return_type
             self.engine_type: RequestType = self.return_type.response_type()
 
+            self.call = self._call
+
         elif is_check:
             self.hook_type = HookType.CHECK
+            self.call = wrap_check(self._call)
 
         elif is_metric:
             self.hook_type = HookType.METRIC
             self.metric_type = metric_type.pop()
+            self.call = self._call
 
         else:
             self.hook_type = HookType.ACTION
+            self.call = self._call

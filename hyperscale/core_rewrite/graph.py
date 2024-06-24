@@ -6,7 +6,6 @@ import time
 import warnings
 from typing import (
     Any,
-    Callable,
     Dict,
     List,
     Tuple,
@@ -18,7 +17,7 @@ import psutil
 from .engines.client import TimeParser
 from .engines.client.setup_clients import setup_client
 from .hooks import Hook, HookType
-from .testing.models.metric import Metric
+from .results import WorkflowResults
 from .workflow import Workflow
 
 warnings.simplefilter("ignore")
@@ -48,18 +47,23 @@ async def cancel_pending(pend: asyncio.Task):
         return invalid_state
 
 
+def _guard_result(result: asyncio.Task):
+    try:
+        return result.result()
+
+    except Exception as err:
+        return err
+
+
 class Graph:
     def __init__(
         self,
         workflows: List[Workflow],
-        context: Dict[str, Callable[..., Any] | object] = {},
     ) -> None:
         self.graph = __file__
         self.workflows = workflows
         self.max_active = 0
         self.active = 0
-
-        self.context: Dict[str, Callable[..., Any] | object] = context
 
         self._active_waiter: asyncio.Future | None = None
         self._workflows_by_name: Dict[str, Workflow] = {}
@@ -77,6 +81,7 @@ class Graph:
 
         self._workflow_test_status: Dict[str, bool] = {}
         self._pending: List[asyncio.Task] = []
+        self._results: Dict[Tuple[str, HookType], List[Any]] = {}
 
     async def run(self):
         for workflow in self.workflows:
@@ -156,10 +161,12 @@ class Graph:
                 hook.call = hook.call.__get__(workflow, workflow.__class__)
                 setattr(workflow, hook.name, hook.call)
 
+                self._results[hook.name] = []
+
             sources = []
 
             for hook in hooks.values():
-                if len(hook.optimized_args) > 0 and hook.is_test:
+                if len(hook.optimized_args) > 0 and hook.hook_type == HookType.TEST:
                     await asyncio.gather(
                         *[
                             arg.optimize(hook.engine_type)
@@ -194,6 +201,8 @@ class Graph:
 
                 call_ids.append(hook.call_id)
 
+            workflow.hooks = hooks
+
     async def _run(self, workflow: Workflow):
         loop = asyncio.get_event_loop()
 
@@ -203,19 +212,14 @@ class Graph:
             [
                 loop.create_task(
                     self._spawn_vu(traversal_order, remaining),
+                    name=workflow.name,
                 )
                 async for remaining in self._generate()
             ],
             timeout=1,
         )
 
-        results: List[List[Any]] = await asyncio.gather(*completed)
-
-        all_completed: List[Any] = []
-        for results_set in results:
-            all_completed.extend(results_set)
-
-        print(len(all_completed))
+        await asyncio.gather(*completed)
 
         await asyncio.gather(
             *[asyncio.create_task(cancel_pending(pend)) for pend in self._pending]
@@ -225,7 +229,24 @@ class Graph:
             *[asyncio.create_task(cancel_pending(pend)) for pend in pending]
         )
 
-        return all_completed
+        [
+            self._results[result.get_name()].append(
+                _guard_result(result),
+            )
+            for complete in completed
+            for result in complete.result()
+            if _guard_result(result) is not None
+        ]
+
+        results = WorkflowResults(
+            workflow.hooks,
+        )
+
+        processed_results = results.process(workflow.name, self._results)
+
+        print(processed_results)
+
+        return processed_results
 
     async def _generate(self):
         duration = self._config.get("duration")
@@ -294,25 +315,13 @@ class Graph:
                 results.extend(completed)
 
                 for complete in completed:
-                    hook_name = complete.get_name()
-                    hook = hook_set[hook_name]
-
                     try:
                         result = complete.result()
 
-                    except Exception:
-                        result = complete.exception()
+                    except Exception as err:
+                        result = err
 
-                    if hook.hook_type == HookType.METRIC and isinstance(
-                        result, (int, float)
-                    ):
-                        context[hook_name] = Metric(
-                            result,
-                            hook.metric_type,
-                        )
-
-                    else:
-                        context[hook_name] = result
+                    context[complete.get_name()] = result
 
                 self._pending.extend(pending)
 

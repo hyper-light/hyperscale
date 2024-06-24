@@ -429,26 +429,22 @@ class MercurySyncHTTPConnection:
         else:
             self._optimized[optimized_param.call_name] = optimized_param
 
-    async def _optimize_url(self, url: URL):
+    async def _optimize_url(self, optimized_url: URL):
         try:
             upgrade_ssl: bool = False
-            if url:
-                (
-                    _,
-                    connection,
-                    url,
-                    upgrade_ssl,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                self._connections.append(connection)
-
+            (
+                _,
+                connection,
+                url,
+                upgrade_ssl,
+            ) = await asyncio.wait_for(
+                self._connect_to_url_location(optimized_url),
+                timeout=self.timeouts.connect_timeout,
+            )
             if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
+                optimized_url.data = optimized_url.data.replace("http://", "https://")
 
-                await url.optimize()
+                await optimized_url.optimize()
 
                 (
                     _,
@@ -456,14 +452,14 @@ class MercurySyncHTTPConnection:
                     url,
                     _,
                 ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
+                    self._connect_to_url_location(optimized_url),
                     timeout=self.timeouts.connect_timeout,
                 )
 
-                self._connections.append(connection)
+            self._url_cache[optimized_url.optimized.hostname] = url
+            self._optimized[optimized_url.call_name] = url
 
-            self._url_cache[url.optimized.hostname] = url
-            self._optimized[url.call_name] = url
+            self._connections.append(connection)
 
         except Exception:
             pass
@@ -641,7 +637,7 @@ class MercurySyncHTTPConnection:
                         ),
                         method=method,
                         status=400,
-                        status_message=str(error) if error else None,
+                        status_message="Connection failed.",
                         headers=headers,
                         timings=timings,
                     ),
@@ -784,7 +780,7 @@ class MercurySyncHTTPConnection:
                 timings,
             )
 
-        except Exception as request_exception:
+        except Exception:
             self._connections.append(
                 HTTPConnection(
                     reset_connections=self.reset_connections,
@@ -807,7 +803,7 @@ class MercurySyncHTTPConnection:
                     ),
                     method=method,
                     status=400,
-                    status_message=str(request_exception),
+                    status_message="Request failed or timed out.",
                     timings=timings,
                 ),
                 False,

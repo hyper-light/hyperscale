@@ -25,6 +25,7 @@ class Stream:
         "content_length",
         "expected_content_length",
         "_STRUCT_HBBBL",
+        "_STRUCT_L",
         "frame_buffer",
         "window_frame",
     )
@@ -48,6 +49,7 @@ class Stream:
         self.expected_content_length = 0
 
         self._STRUCT_HBBBL = struct.Struct(">HBBBL")
+        self._STRUCT_L = struct.Struct(">L")
         self.frame_buffer = FrameBuffer()
 
         self.window_frame = Frame(stream_id, 0x08, window_increment=65536)

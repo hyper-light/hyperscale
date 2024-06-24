@@ -454,23 +454,16 @@ class MercurySyncHTTP2Connection:
     async def _optimize_url(self, url: URL):
         try:
             upgrade_ssl: bool = False
-            if url:
-                (
-                    _,
-                    connection,
-                    pipe,
-                    optimized_url,
-                    upgrade_ssl,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                self._connections.append(connection)
-                self._pipes.append(pipe)
-
-                self._url_cache[optimized_url.hostname] = optimized_url
-                self._optimized[url.call_name] = url
+            (
+                _,
+                connection,
+                pipe,
+                optimized_url,
+                upgrade_ssl,
+            ) = await asyncio.wait_for(
+                self._connect_to_url_location(url),
+                timeout=self.timeouts.connect_timeout,
+            )
 
             if upgrade_ssl:
                 url.data = url.data.replace("http://", "https://")
@@ -488,11 +481,11 @@ class MercurySyncHTTP2Connection:
                     timeout=self.timeouts.connect_timeout,
                 )
 
-                self._connections.append(connection)
-                self._pipes.append(pipe)
+            self._connections.append(connection)
+            self._pipes.append(pipe)
 
-                self._url_cache[optimized_url.hostname] = optimized_url
-                self._optimized[url.call_name] = url
+            self._url_cache[optimized_url.hostname] = optimized_url
+            self._optimized[url.call_name] = url
 
         except Exception:
             pass
@@ -656,7 +649,7 @@ class MercurySyncHTTP2Connection:
                         ),
                         method=method,
                         status=400,
-                        status_message=str(error),
+                        status_message="Connection failed.",
                         headers={
                             key.encode(): value.encode()
                             for key, value in headers.items()
@@ -726,7 +719,7 @@ class MercurySyncHTTP2Connection:
 
             (status, headers, body, error) = await asyncio.wait_for(
                 pipe.receive_response(connection),
-                timeout=self.timeouts.request_timeout,
+                timeout=self.timeouts.read_timeout,
             )
 
             if status >= 300 and status < 400:
@@ -784,7 +777,7 @@ class MercurySyncHTTP2Connection:
                 timings,
             )
 
-        except Exception as request_exception:
+        except Exception:
             self._connections.append(
                 HTTP2Connection(
                     stream_id=randrange(1, 2**20 + 2, 2),
@@ -811,7 +804,7 @@ class MercurySyncHTTP2Connection:
                     ),
                     method=method,
                     status=400,
-                    status_message=str(request_exception),
+                    status_message="Request failed or timed out.",
                 ),
                 False,
                 timings,
@@ -894,7 +887,6 @@ class MercurySyncHTTP2Connection:
                 (b":authority", url.hostname.encode()),
                 (b":scheme", url.scheme.encode()),
                 (b":path", url_path.encode()),
-                (b"user-agent", b"hyperscale/client"),
             ]
 
             encoded_headers.extend(
@@ -915,7 +907,6 @@ class MercurySyncHTTP2Connection:
                 (b":authority", url.hostname.encode()),
                 (b":scheme", url.scheme.encode()),
                 (b":path", url_path.encode()),
-                (b"User-Agent", b"hyperscale/client"),
             ]
 
         if isinstance(data, Data):

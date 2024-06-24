@@ -54,21 +54,15 @@ class Headers(OptimizedArg, Generic[T]):
                 self.optimized = optimized
 
             case RequestType.GRAPHQL_HTTP2 | RequestType.HTTP2 | RequestType.HTTP3:
-                encoded_headers: List[Tuple[bytes, bytes]] = [
-                    (b"user-agent", b"hyperscale/client"),
+                encoded_headers = [
+                    (k.lower().encode(), v.encode())
+                    for k, v in self.data.items()
+                    if k.lower()
+                    not in (
+                        "host",
+                        "transfer-encoding",
+                    )
                 ]
-
-                encoded_headers.extend(
-                    [
-                        (k.lower().encode(), v.encode())
-                        for k, v in self.data.items()
-                        if k.lower()
-                        not in (
-                            "host",
-                            "transfer-encoding",
-                        )
-                    ]
-                )
 
                 self.optimized = encoded_headers
 

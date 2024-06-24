@@ -124,4 +124,7 @@ class HTTPResponse(CallResult):
         return self.status >= 200 and self.status < 300
 
     def context(self):
-        return self.status_message
+        if self.status_message:
+            return self.status_message
+
+        return self.data if len(self.content) > 0 else None

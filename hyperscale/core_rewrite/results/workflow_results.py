@@ -1,5 +1,6 @@
 from collections import Counter
 from typing import (
+    Any,
     Callable,
     Dict,
     List,
@@ -20,6 +21,7 @@ from hyperscale.core_rewrite.engines.client.playwright import PlaywrightResult
 from hyperscale.core_rewrite.engines.client.shared.models import RequestType
 from hyperscale.core_rewrite.engines.client.udp import UDPResponse
 from hyperscale.core_rewrite.engines.client.websocket import WebsocketResponse
+from hyperscale.core_rewrite.hooks import Hook, HookType
 from hyperscale.core_rewrite.testing.models.metric import (
     COUNT,
     DISTRIBUTION,
@@ -30,8 +32,12 @@ from hyperscale.core_rewrite.testing.models.metric import (
 
 StatTypes = Literal["max", "min", "mean", "med", "stdev", "var", "mad"]
 
+StatusCounts = Dict[int, int]
 StatsResults = Dict[StatTypes, int | float]
-CountResults = Dict[Literal["succeeded", "failed"], int]
+CountResults = Dict[
+    Literal["succeeded", "failed"] | Optional[Literal["statuses"]],
+    int | Optional[StatusCounts],
+]
 FailedResults = Dict[Literal["failed"], int]
 ContextResults = List[Dict[Literal["context", "count"], str | int]]
 ResultSet = Dict[
@@ -57,7 +63,11 @@ ExceptionSet = Dict[
 
 
 class WorkflowResults:
-    def __init__(self, precision: int = 2) -> None:
+    def __init__(
+        self,
+        hooks: Dict[str, Hook],
+        precision: int = 4,
+    ) -> None:
         self._result_type: Dict[
             Type[GraphQLResponse]
             | Type[GraphQLHTTP2Response]
@@ -89,8 +99,67 @@ class WorkflowResults:
             ],
         ] = {}
 
+        self._hooks = hooks
         self._quantiles = [10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 99]
         self._precision = precision
+
+    def process(
+        self,
+        workflow: str,
+        results: Dict[
+            str,
+            List[Any],
+        ],
+    ):
+        results_sets = []
+        for step in results:
+            step_results = results[step]
+
+            results_set = {
+                "workflow": workflow,
+                "step": step,
+            }
+
+            hook = self._hooks[step]
+            hook_type = hook.hook_type
+
+            match hook_type:
+                case HookType.TEST:
+                    results_set.update(
+                        self._process_http_or_udp_timings_set(
+                            workflow, step, hook.engine_type, step_results
+                        )
+                    )
+                    results_sets.append(results_set)
+
+                case HookType.METRIC:
+                    results_set.update(
+                        self._process_metrics_set(
+                            workflow,
+                            step,
+                            hook.metric_type,
+                            hook.tags,
+                            step_results,
+                        )
+                    )
+
+                    results_sets.append(results_set)
+
+                case HookType.CHECK:
+                    results_set.update(
+                        self._process_exception_set(
+                            workflow,
+                            step,
+                            step_results,
+                        )
+                    )
+
+                    results_sets.append(results_set)
+
+                case _:
+                    pass
+
+        return results_sets
 
     def _process_exception_set(
         self,
@@ -122,11 +191,9 @@ class WorkflowResults:
         workflow: str,
         step_name: str,
         metric_type: COUNT | DISTRIBUTION | SAMPLE | RATE,
+        tags: List[str],
         metrics: List[Metric],
     ):
-        values = [metric.value for metric in metrics]
-        tags_set = list(set(tag for metric in metrics for tag in metric.tags))
-
         if metric_type == COUNT:
             return {
                 "workflow": workflow,
@@ -134,22 +201,22 @@ class WorkflowResults:
                 "metric_type": "COUNT",
                 "stats": {
                     "count": round(
-                        sum(values),
+                        sum(metrics),
                         self._precision,
                     ),
                 },
-                "tags": tags_set,
+                "tags": tags,
             }
 
         elif metric_type == DISTRIBUTION:
-            stats = self._calculate_quantiles(values)
+            stats = self._calculate_quantiles(metrics)
             stats["max"] = round(
-                max(values),
+                max(metrics),
                 self._precision,
             )
 
             stats["min"] = round(
-                min(values),
+                min(metrics),
                 self._precision,
             )
 
@@ -158,13 +225,13 @@ class WorkflowResults:
                 "step": step_name,
                 "metric_type": "DISTRIBUTION",
                 "stats": stats,
-                "tags": tags_set,
+                "tags": tags,
             }
 
         elif metric_type == SAMPLE:
-            stats = self._calculate_stats(values)
+            stats = self._calculate_stats(metrics)
             stats.update(
-                self._calculate_quantiles(values),
+                self._calculate_quantiles(metrics),
             )
 
             return {
@@ -172,11 +239,17 @@ class WorkflowResults:
                 "step": step_name,
                 "metric_type": "SAMPLE",
                 "stats": stats,
-                "tags": tags_set,
+                "tags": tags,
             }
 
         elif metric_type == RATE:
-            times = [metric.timestamp for metric in metrics]
+            rates = [
+                metric
+                for metric in metrics
+                if isinstance(metric, tuple) and len(metric) == 2
+            ]
+            values = [metric[0] for metric in rates]
+            times = [metric[1] for metric in rates]
 
             elapsed = max(times) - min(times)
 
@@ -190,7 +263,7 @@ class WorkflowResults:
                         self._precision,
                     ),
                 },
-                "tags": tags_set,
+                "tags": tags,
             }
 
     def _calculate_quantiles(self, values: List[int | float]):
@@ -301,16 +374,19 @@ class WorkflowResults:
                 if timing_result.get(result_type) is not None
             ]
 
-            timing_stats[result_type] = self._calculate_stats(results_set)
-            timing_stats[result_type].update(
-                self._calculate_quantiles(results_set),
-            )
+            if len(results_set) > 0:
+                timing_stats[result_type] = self._calculate_stats(results_set)
+                timing_stats[result_type].update(
+                    self._calculate_quantiles(results_set),
+                )
 
         checks = Counter([result.check() for result in results])
 
         contexts = Counter(
             [result.context() for result in results if result.context() is not None]
         )
+
+        statuses = Counter([result.status for result in results])
 
         return {
             "workflow": workflow,
@@ -319,6 +395,7 @@ class WorkflowResults:
             "counts": {
                 "succeeded": checks.get(True),
                 "failed": checks.get(False),
+                "statuses": {code: count for code, count in statuses.items()},
             },
             "contexts": [
                 {

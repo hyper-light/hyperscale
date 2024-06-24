@@ -5,6 +5,7 @@ from typing import (
     Tuple,
 )
 
+from .config import H2Configuration
 from .errors import (
     ErrorCodes,
     StreamClosedError,
@@ -16,7 +17,7 @@ from .events import (
     StreamReset,
     WindowUpdated,
 )
-from .fast_hpack import Decoder, Encoder, HeaderTable
+from .fast_hpack import Decoder, Encoder
 from .frames.types.base_frame import Frame
 from .protocols import HTTP2Connection
 from .settings import SettingCodes, Settings, StreamClosedBy
@@ -38,12 +39,15 @@ class HTTP2Pipe:
         "remote_settings_dict",
     )
 
-    def __init__(self, concurrency):
+    CONFIG = H2Configuration(
+        validate_inbound_headers=False,
+    )
+
+    def __init__(self, concurrency: int):
         self.connected = False
         self.concurrency = concurrency
         self._encoder = Encoder()
         self._decoder = Decoder()
-        self._decoder.header_table = HeaderTable()
         self._decoder.max_allowed_table_size = self._decoder.header_table.maxsize
         self._init_sent = False
 
@@ -104,7 +108,7 @@ class HTTP2Pipe:
 
     def send_request_headers(
         self,
-        headers: bytes,
+        headers: List[Tuple[bytes, bytes]],
         data: Optional[bytes],
         connection: HTTP2Connection,
     ):
@@ -148,12 +152,7 @@ class HTTP2Pipe:
                 data = await connection.read()
 
             except Exception as err:
-                return (
-                    400,
-                    headers_dict,
-                    body_data,
-                    err,
-                )
+                return (400, headers_dict, body_data, err)
 
             if data == b"":
                 done = True
