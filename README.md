@@ -70,7 +70,7 @@ hyperscale --help
 
 which should output
 
-![Output of the hyperscale --help command](https://github.com/hyper-light/hyperscale/blob/main/images/hedra_help_output.png?raw=true "Verifying Install")
+![Output of the hyperscale --help command](https://github.com/hyper-light/hyperscale/blob/main/images/hyper-light_help_output.png?raw=true "Verifying Install")
 
 <br/>
 
@@ -86,7 +86,7 @@ hyperscale graph create example.py
 ```
 which will output the following:
 
-![Output of the hyperscale graph create example.py command](https://github.com/hyper-light/hyperscale/blob/main/images/hedra_graph_create.png?raw=true "Creating a Graph")
+![Output of the hyperscale graph create example.py command](https://github.com/hyper-light/hyperscale/blob/main/images/hyper-light_graph_create.png?raw=true "Creating a Graph")
 
 and generate the the test below in the specified `example.py` file:
 ```python
@@ -144,11 +144,11 @@ hyperscale graph run example.py
 
 Hyperscale will load the test graph file, parse/validate/setup the stages specified, then begin executing your test:
 
-![Output of the hyperscale graph run example.py command](https://github.com/hyper-light/hyperscale/blob/main/images/hedra_graph_run_example.png?raw=true "Running a Graph")
+![Output of the hyperscale graph run example.py command](https://github.com/hyper-light/hyperscale/blob/main/images/hyper-light_graph_run_example.png?raw=true "Running a Graph")
 
 The test will take a minute or two to run, but once complete you should see:
 
-![Output of hyperscale from a completed graph run](https://github.com/hyper-light/hyperscale/blob/main/images/hedra_graph_complete.png?raw=true "A Complete Graph Run")
+![Output of hyperscale from a completed graph run](https://github.com/hyper-light/hyperscale/blob/main/images/hyper-light_graph_complete.png?raw=true "A Complete Graph Run")
 
 You have officially created and run your first test graph!
 
