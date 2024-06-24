@@ -1,6 +1,3 @@
-import uvloop
-
-uvloop.install()
 import asyncio
 
 from hyperscale.core_rewrite import (
