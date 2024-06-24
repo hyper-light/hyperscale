@@ -1,7 +1,5 @@
 import asyncio
 
-import dill
-
 from hyperscale.core_rewrite import Graph, Workflow, step
 from hyperscale.core_rewrite.engines.client.http2 import HTTP2Response
 from hyperscale.core_rewrite.testing import COUNT, URL, Metric
@@ -51,13 +49,8 @@ class Test(Workflow):
 
 async def run():
     w = Test()
-    dill.dumps(w)
 
     g = Graph([w])
-
-    # data = list(range(0, 10001))
-
-    # print(np.percentile(data, [25, 50, 99]))
 
     await g.setup()
 

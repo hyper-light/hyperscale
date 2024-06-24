@@ -35,7 +35,7 @@ StatTypes = Literal["max", "min", "mean", "med", "stdev", "var", "mad"]
 StatusCounts = Dict[int, int]
 StatsResults = Dict[StatTypes, int | float]
 CountResults = Dict[
-    Literal["succeeded", "failed"] | Optional[Literal["statuses"]],
+    Literal["succeeded", "failed", "executed"] | Optional[Literal["statuses"]],
     int | Optional[StatusCounts],
 ]
 FailedResults = Dict[Literal["failed"], int]
@@ -165,24 +165,28 @@ class WorkflowResults:
         self,
         workflow: str,
         step_name: str,
-        exceptions: List[Exception],
+        exceptions: List[Exception | None],
     ) -> ExceptionSet:
-        exception_messages = [str(err) for err in exceptions]
+        executed = len(exceptions)
 
-        exception_contexts = Counter(exception_messages)
+        failed_contexts = Counter([str(err) for err in exceptions if err is not None])
+
+        failed = len(failed_contexts)
 
         return {
             "workflow": workflow,
             "step": step_name,
             "counts": {
-                "failed": len(exception_messages),
+                "executed": executed,
+                "succeeded": executed - failed,
+                "failed": failed,
             },
             "contexts": [
                 {
                     "context": context,
                     "count": count,
                 }
-                for context, count in exception_contexts.items()
+                for context, count in failed_contexts.items()
             ],
         }
 
@@ -393,8 +397,9 @@ class WorkflowResults:
             "step": step_name,
             "timings": timing_stats,
             "counts": {
-                "succeeded": checks.get(True),
-                "failed": checks.get(False),
+                "executed": checks.get(True, 0) + checks.get(False, 0),
+                "succeeded": checks.get(True, 0),
+                "failed": checks.get(False, 0),
                 "statuses": {code: count for code, count in statuses.items()},
             },
             "contexts": [

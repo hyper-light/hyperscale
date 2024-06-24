@@ -244,8 +244,6 @@ class Graph:
 
         processed_results = results.process(workflow.name, self._results)
 
-        print(processed_results)
-
         return processed_results
 
     async def _generate(self):
