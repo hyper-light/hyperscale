@@ -102,7 +102,35 @@ class Graph:
         self._pending: Dict[str, List[asyncio.Task]] = defaultdict(list)
         self._workflows: Dict[str, Workflow] = {}
 
-    def create_workflow_graph(self):
+    async def run(self):
+        context: Dict[str, Dict[str, Any]] = Context()
+
+        self._create_workflow_graph()
+
+        for workflow_set in self._workflow_traversal_order:
+            updated_contexts = await asyncio.gather(
+                *[
+                    self._run_workflow(
+                        workflow,
+                        context,
+                    )
+                    for workflow in workflow_set.values()
+                ]
+            )
+            await asyncio.gather(
+                *[
+                    context.update(
+                        workflow_name,
+                        key,
+                        value,
+                    )
+                    for updated in updated_contexts
+                    for workflow_name, workflow_context in updated.iter_workflow_contexts()
+                    for key, value in workflow_context.items()
+                ]
+            )
+
+    def _create_workflow_graph(self):
         workflow_graph = networkx.DiGraph()
 
         workflow_dependencies: Dict[str, List[str]] = {}
@@ -137,32 +165,6 @@ class Graph:
                     workflow_name: self._workflows.get(workflow_name)
                     for workflow_name in traversal_layer
                 }
-            )
-
-    async def run(self):
-        context: Dict[str, Dict[str, Any]] = Context()
-
-        for workflow_set in self._workflow_traversal_order:
-            updated_contexts = await asyncio.gather(
-                *[
-                    self._run_workflow(
-                        workflow,
-                        context,
-                    )
-                    for workflow in workflow_set.values()
-                ]
-            )
-            await asyncio.gather(
-                *[
-                    context.update(
-                        workflow_name,
-                        key,
-                        value,
-                    )
-                    for updated in updated_contexts
-                    for workflow_name, workflow_context in updated.iter_workflow_contexts()
-                    for key, value in workflow_context.items()
-                ]
             )
 
     async def _run_workflow(

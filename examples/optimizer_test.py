@@ -1,3 +1,6 @@
+import uvloop
+
+uvloop.install()
 import asyncio
 
 from hyperscale.core_rewrite import (
@@ -5,8 +8,8 @@ from hyperscale.core_rewrite import (
     step,
 )
 from hyperscale.core_rewrite.engines.client.http2 import HTTP2Response
-from hyperscale.core_rewrite.graph import Graph
-from hyperscale.core_rewrite.state import Use, state
+from hyperscale.core_rewrite.graph import Graph, depends
+from hyperscale.core_rewrite.state import Provide, Use, state
 from hyperscale.core_rewrite.testing import (
     COUNT,
     URL,
@@ -61,38 +64,35 @@ class Test(Workflow):
         return 1 if get_api_v2.status >= 400 else 0
 
 
-# @depends("Test")
-# class TestTwo(Workflow):
-#     @step()
-#     async def hello_world_message(
-#         self,
-#         authed_headers: Headers | None = None,
-#     ):
-#         return "Hello world!"
+@depends("Test")
+class TestTwo(Workflow):
+    @step()
+    async def hello_world_message(self):
+        return "Hello world!"
 
-#     @state("TestThree", "TestFour")
-#     async def session_headers(
-#         self,
-#         authed_headers: Headers | None = None,
-#     ) -> Provide[Headers]:
-#         if authed_headers is None:
-#             return Headers({"api_key": "123456"})
+    @state("TestThree", "TestFour")
+    async def session_headers(
+        self,
+        authed_headers: Headers | None = None,
+    ) -> Provide[Headers]:
+        if authed_headers is None:
+            return Headers({"api_key": "123456"})
 
-#         return authed_headers
+        return authed_headers
 
 
-# @depends("Test")
-# class TestThree(Workflow):
-#     @step()
-#     async def non_test_step(self):
-#         return "Hello world!"
+@depends("Test")
+class TestThree(Workflow):
+    @step()
+    async def non_test_step(self):
+        return "Hello world!"
 
 
-# @depends("TestTwo", "TestThree")
-# class TestFour(Workflow):
-#     @step()
-#     async def non_test_step(self):
-#         return "Hello world!"
+@depends("TestTwo", "TestThree")
+class TestFour(Workflow):
+    @step()
+    async def non_test_step(self):
+        return "Hello world!"
 
 
 async def run():
@@ -102,7 +102,6 @@ async def run():
         ]
     )
 
-    g.create_workflow_graph()
     await g.run()
 
 
