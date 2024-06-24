@@ -1,25 +1,21 @@
-from typing import (
-    Any,
-    Awaitable,
-    Callable,
-    List,
-    Optional,
-)
+from typing import Awaitable, Callable, List, Optional
 
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
 
-from .hook import Hook
+from .context_hook import ContextHook
+from .provide import Provide
+from .use import Use
 
 
-def step(
+def state(
     *args: str,
     timeouts: Optional[Timeouts] = None,
     tags: Optional[List[str]] = None,
 ):
-    def wrapper(func: Callable[..., Awaitable[Any]]):
-        return Hook(
+    def wrapper(func: Callable[..., Awaitable[Use | Provide]]):
+        return ContextHook(
+            list(args),
             func,
-            args,
             timeouts=timeouts,
             tags=tags,
         )

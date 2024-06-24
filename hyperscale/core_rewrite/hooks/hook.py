@@ -104,7 +104,6 @@ class Hook:
 
         self.static = True
         self.return_type = param_types.get("return")
-        self.is_test = False
         self.engine_type: Optional[RequestType] = None
         self.metric_type: Optional[COUNT | DISTRIBUTION | SAMPLE | RATE] = None
 

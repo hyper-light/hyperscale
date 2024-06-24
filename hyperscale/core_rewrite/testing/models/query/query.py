@@ -15,11 +15,16 @@ class Query(OptimizedArg, Generic[T]):
         ).__init__()
 
         validated_query = QueryValidator(value=query)
+
+        self.call_name: Optional[str] = None
         self.data = validated_query.value
 
         self.optimized: Optional[str] = None
 
     async def optimize(self):
+        if self.optimized is not None:
+            return
+
         query_string = "".join(
             self.data.replace(
                 "query",

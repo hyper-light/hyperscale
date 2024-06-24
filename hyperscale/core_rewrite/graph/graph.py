@@ -20,6 +20,12 @@ from hyperscale.core_rewrite.engines.client import TimeParser
 from hyperscale.core_rewrite.engines.client.setup_clients import setup_client
 from hyperscale.core_rewrite.hooks import Hook, HookType
 from hyperscale.core_rewrite.results import WorkflowResults
+from hyperscale.core_rewrite.state import (
+    Context,
+    ContextHook,
+    StateAction,
+)
+from hyperscale.core_rewrite.testing.models.base import OptimizedArg
 
 from .dependent_workflow import DependentWorkflow
 from .workflow import Workflow
@@ -93,7 +99,6 @@ class Graph:
 
         self._workflow_configs: Dict[str, Dict[str, Any]] = {}
 
-        self._workflow_test_status: Dict[str, bool] = {}
         self._pending: Dict[str, List[asyncio.Task]] = defaultdict(list)
         self._workflows: Dict[str, Workflow] = {}
 
@@ -135,42 +140,157 @@ class Graph:
             )
 
     async def run(self):
+        context: Dict[str, Dict[str, Any]] = Context()
+
         for workflow_set in self._workflow_traversal_order:
+            updated_contexts = await asyncio.gather(
+                *[
+                    self._run_workflow(
+                        workflow,
+                        context,
+                    )
+                    for workflow in workflow_set.values()
+                ]
+            )
             await asyncio.gather(
-                *[self._run_workflow(workflow) for workflow in workflow_set.values()]
+                *[
+                    context.update(
+                        workflow_name,
+                        key,
+                        value,
+                    )
+                    for updated in updated_contexts
+                    for workflow_name, workflow_context in updated.iter_workflow_contexts()
+                    for key, value in workflow_context.items()
+                ]
             )
 
-    async def _run_workflow(self, workflow: Workflow):
-        workflow = await self._setup(workflow)
+    async def _run_workflow(
+        self,
+        workflow: Workflow,
+        context: Context,
+    ):
+        state_actions = self._setup_state_actions(workflow)
+        context = await self._use_context(
+            workflow.name,
+            state_actions,
+            context,
+        )
+
+        workflow, hooks = await self._setup(workflow, context)
 
         traversal_order = self._step_traversal_orders[workflow.name]
 
         is_test_workflow = (
-            len(
-                [
-                    hook
-                    for hook in workflow.hooks.values()
-                    if hook.hook_type == HookType.TEST
-                ]
-            )
+            len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST])
             > 0
         )
 
         if is_test_workflow:
-            return await self._execute_test_workflow(workflow, traversal_order)
+            results = await self._execute_test_workflow(
+                workflow,
+                traversal_order,
+                hooks,
+                context,
+            )
 
-        return await self._execute_non_test_workflow(workflow, traversal_order)
+        else:
+            results = await self._execute_non_test_workflow(
+                workflow,
+                traversal_order,
+                context,
+            )
+
+        context = await self._provide_context(
+            workflow.name,
+            state_actions,
+            context,
+            results,
+        )
+
+        return context
+
+    async def _use_context(
+        self,
+        workflow: str,
+        state_actions: Dict[str, ContextHook],
+        context: Context,
+    ):
+        use_actions = [
+            action
+            for action in state_actions.values()
+            if action.action_type == StateAction.USE
+        ]
+
+        if len(use_actions) < 1:
+            return context
+
+        for hook in use_actions:
+            hook.context_args = {
+                name: value
+                for provider in hook.workflows
+                for name, value in context[provider].items()
+            }
+
+        await asyncio.gather(*[hook.call(**hook.context_args) for hook in use_actions])
+
+        await asyncio.gather(
+            *[context[workflow].set(hook.name, hook.result) for hook in use_actions]
+        )
+
+        return context
+
+    async def _provide_context(
+        self,
+        workflow: str,
+        state_actions: Dict[str, ContextHook],
+        context: Context,
+        results: Dict[str, Any],
+    ):
+        provide_actions = [
+            action
+            for action in state_actions.values()
+            if action.action_type == StateAction.PROVIDE
+        ]
+
+        if len(provide_actions) < 1:
+            return context
+
+        for hook in provide_actions:
+            hook.context_args = {
+                name: value for name, value in context[workflow].items()
+            }
+
+            hook.context_args.update(results)
+
+        await asyncio.gather(
+            *[hook.call(**hook.context_args) for hook in provide_actions]
+        )
+
+        await asyncio.gather(
+            *[
+                context[target].set(hook.name, hook.result)
+                for hook in provide_actions
+                for target in hook.workflows
+            ]
+        )
+
+        return context
 
     async def _execute_test_workflow(
         self,
         workflow: Workflow,
         traversal_order: List[Dict[str, Hook]],
+        hooks: Dict[str, Hook],
+        context: Context,
     ):
         loop = asyncio.get_event_loop()
 
         workflow_name = workflow.name
 
         config = self._workflow_configs[workflow_name]
+
+        workflow_context = context[workflow.name].dict()
 
         completed, pending = await asyncio.wait(
             [
@@ -179,6 +299,7 @@ class Graph:
                         workflow_name,
                         traversal_order,
                         remaining,
+                        workflow_context,
                     ),
                     name=workflow.name,
                 )
@@ -204,7 +325,7 @@ class Graph:
         )
 
         workflow_results_set: Dict[str, List[Any]] = {
-            hook_name: [] for hook_name in workflow.hooks
+            hook_name: [] for hook_name in hooks
         }
 
         [
@@ -216,7 +337,7 @@ class Graph:
             if _guard_result(result) is not None
         ]
 
-        workflow_results = WorkflowResults(workflow.hooks)
+        workflow_results = WorkflowResults(hooks)
 
         processed_results = workflow_results.process(
             workflow_name,
@@ -229,9 +350,12 @@ class Graph:
         self,
         workflow: Workflow,
         traversal_order: List[Dict[str, Hook]],
+        context: Context,
     ):
         workflow_name = workflow.name
         config = self._workflow_configs[workflow_name]
+
+        workflow_context = context[workflow.name].dict()
 
         execution_results: List[asyncio.Task] = await self._spawn_vu(
             workflow_name,
@@ -240,6 +364,7 @@ class Graph:
                 "workflow_timeout",
                 TimeParser("5m").time,
             ),
+            workflow_context,
         )
 
         await asyncio.gather(*execution_results)
@@ -255,7 +380,14 @@ class Graph:
             result.get_name(): _guard_result(result) for result in execution_results
         }
 
-    async def _setup(self, workflow: Workflow) -> Workflow:
+    async def _setup(
+        self,
+        workflow: Workflow,
+        context: Context,
+    ) -> Tuple[
+        Workflow,
+        Dict[str, Hook],
+    ]:
         self._workflows_by_name[workflow.name] = workflow
 
         config = {
@@ -304,10 +436,6 @@ class Graph:
             )
         }
 
-        self._workflow_test_status[workflow.name] = (
-            len([hook for hook in hooks.values() if hook.is_test]) > 0
-        )
-
         step_graph = networkx.DiGraph()
 
         for hook in hooks.values():
@@ -318,8 +446,28 @@ class Graph:
 
         sources = []
 
+        workflow_context = context[workflow.name]
+        optimized_context_args = {
+            name: value
+            for name, value in workflow_context.items()
+            if isinstance(value, OptimizedArg)
+        }
+
+        for hook in hooks.values():
+            if hook.hook_type == HookType.TEST:
+                hook.optimized_args.update(
+                    {
+                        name: value
+                        for name, value in optimized_context_args.items()
+                        if name in hook.kwarg_names
+                    }
+                )
+
         for hook in hooks.values():
             if len(hook.optimized_args) > 0 and hook.hook_type == HookType.TEST:
+                for arg in hook.optimized_args.values():
+                    arg.call_name = hook.name
+
                 await asyncio.gather(
                     *[
                         arg.optimize(hook.engine_type)
@@ -349,11 +497,27 @@ class Graph:
 
         self._step_traversal_orders[workflow.name] = traversal_order
 
-        workflow.hooks = hooks
-
         self._active_waiters[workflow.name] = None
 
-        return workflow
+        return (
+            workflow,
+            hooks,
+        )
+
+    def _setup_state_actions(self, workflow: Workflow) -> Dict[str, ContextHook]:
+        state_actions: Dict[str, ContextHook] = {
+            name: hook
+            for name, hook in inspect.getmembers(
+                workflow,
+                predicate=lambda member: isinstance(member, ContextHook),
+            )
+        }
+
+        for action in state_actions.values():
+            action._call = action._call.__get__(workflow, workflow.__class__)
+            setattr(workflow, action.name, action._call)
+
+        return state_actions
 
     async def _generate(
         self,
@@ -395,11 +559,11 @@ class Graph:
         workflow_name: str,
         traversal_order: List[Dict[str, Hook]],
         remaining: float,
+        context: Dict[str, Any],
     ):
         try:
             results: List[asyncio.Task] = []
-
-            context: Dict[str, Any] = {}
+            context: Dict[str, Any] = dict(context)
 
             for hook_set in traversal_order:
                 set_count = len(hook_set)

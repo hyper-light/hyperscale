@@ -25,10 +25,14 @@ class Cookies(OptimizedArg, Generic[T]):
 
         validated_cookies = CookiesValidator(value=cookies)
 
+        self.call_name: Optional[str] = None
         self.data = validated_cookies.value
         self.optimized: Optional[str | Tuple[str, str]] = None
 
     async def optimize(self, request_type: RequestType):
+        if self.optimized is not None:
+            return
+
         if request_type == RequestType.UDP:
             return
 

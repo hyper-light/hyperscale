@@ -22,6 +22,8 @@ class URL(OptimizedArg, Generic[T]):
 
         URLValidator(value=url)
 
+        self.call_name: Optional[str] = None
+
         self.data = url
         self.optimized_params: Optional[str] = None
         self.optimized: Optional[OptimizedUrl] = None
@@ -30,6 +32,9 @@ class URL(OptimizedArg, Generic[T]):
         return self.data
 
     async def optimize(self, request_type: RequestType):
+        if self.optimized is not None:
+            return
+
         protocols = ProtocolMap()
 
         address_family, protocol = protocols[request_type]

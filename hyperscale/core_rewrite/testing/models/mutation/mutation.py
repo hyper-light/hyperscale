@@ -40,6 +40,8 @@ class Mutation(OptimizedArg, Generic[T]):
         ).__init__()
 
         validated_mutation = MutationValidator(**mutation)
+
+        self.call_name: Optional[str] = None
         self.data: Dict[
             Literal[
                 "query",
@@ -54,6 +56,9 @@ class Mutation(OptimizedArg, Generic[T]):
         self.content_type = "application/json"
 
     async def optimize(self):
+        if self.optimized is not None:
+            return
+
         self.optimized = orjson.dumps(self.data)
         self.content_length = len(self.optimized)
 

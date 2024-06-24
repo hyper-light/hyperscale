@@ -27,12 +27,16 @@ class Data(OptimizedArg, Generic[T]):
         ).__init__()
 
         validated_data = DataValidator(value=data)
+        self.call_name: Optional[str] = None
         self.data = validated_data.value
         self.optimized: Optional[OptimizedData] = None
         self.content_length: OptimizedArg[int] = None
         self.content_type: Optional[str] = None
 
     async def optimize(self, request_type: RequestType):
+        if self.optimized is not None:
+            return
+
         match request_type:
             case RequestType.HTTP | RequestType.HTTP2 | RequestType.WEBSOCKET:
                 self._optimize_http()

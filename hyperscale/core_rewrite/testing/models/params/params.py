@@ -32,6 +32,8 @@ class Params(OptimizedArg, Generic[T]):
         ).__init__()
 
         validated_params = ParamsValidator(value=params)
+
+        self.call_name: Optional[str] = None
         self.data: FrozenDict = FrozenDict(validated_params.value)
         self.optimized: Optional[str] = None
         self._params_types = [
@@ -42,6 +44,9 @@ class Params(OptimizedArg, Generic[T]):
         ]
 
     async def optimize(self, request_type: RequestType):
+        if self.optimized is not None:
+            return
+
         if request_type in self._params_types:
             url_params = urlencode(self.data)
             self.optimized = f"?{url_params}"

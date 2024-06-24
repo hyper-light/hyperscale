@@ -2,14 +2,15 @@ import asyncio
 
 from hyperscale.core_rewrite import (
     Workflow,
-    depends,
     step,
 )
 from hyperscale.core_rewrite.engines.client.http2 import HTTP2Response
 from hyperscale.core_rewrite.graph import Graph
+from hyperscale.core_rewrite.state import Use, state
 from hyperscale.core_rewrite.testing import (
     COUNT,
     URL,
+    Headers,
     Metric,
 )
 
@@ -19,11 +20,12 @@ class Test(Workflow):
     threads = 4
     duration = "1m"
 
+    @state()
+    async def authed_headers(self) -> Use[Headers]:
+        return Headers({"api_key": "ABCDEFG"})
+
     @step()
-    async def login(
-        self,
-        url: URL = "https://http2.github.io/",
-    ) -> HTTP2Response:
+    async def login(self, url: URL = "https://http2.github.io/") -> HTTP2Response:
         return await self.client.http2.get(url)
 
     @step("login")
@@ -59,37 +61,44 @@ class Test(Workflow):
         return 1 if get_api_v2.status >= 400 else 0
 
 
-@depends("Test")
-class TestTwo(Workflow):
-    @step()
-    async def non_test_step(self):
-        print("HELLO ONCE MORE!")
-        return "Hello world!"
+# @depends("Test")
+# class TestTwo(Workflow):
+#     @step()
+#     async def hello_world_message(
+#         self,
+#         authed_headers: Headers | None = None,
+#     ):
+#         return "Hello world!"
+
+#     @state("TestThree", "TestFour")
+#     async def session_headers(
+#         self,
+#         authed_headers: Headers | None = None,
+#     ) -> Provide[Headers]:
+#         if authed_headers is None:
+#             return Headers({"api_key": "123456"})
+
+#         return authed_headers
 
 
-@depends("Test")
-class TestThree(Workflow):
-    @step()
-    async def non_test_step(self):
-        print("HI AGAIN!")
-        return "Hello world!"
+# @depends("Test")
+# class TestThree(Workflow):
+#     @step()
+#     async def non_test_step(self):
+#         return "Hello world!"
 
 
-@depends("TestTwo", "TestThree")
-class TestFour(Workflow):
-    @step()
-    async def non_test_step(self):
-        print("HI!")
-        return "Hello world!"
+# @depends("TestTwo", "TestThree")
+# class TestFour(Workflow):
+#     @step()
+#     async def non_test_step(self):
+#         return "Hello world!"
 
 
 async def run():
     g = Graph(
         [
             Test(),
-            TestTwo(),
-            TestThree(),
-            TestFour(),
         ]
     )
 

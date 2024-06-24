@@ -18,10 +18,15 @@ class Protobuf(OptimizedArg, Generic[T]):
         ).__init__()
 
         validated_protobuf = ProtobufValidator(value=protobuf)
+
+        self.call_name: Optional[str] = None
         self.data = validated_protobuf.value
         self.optimized: Optional[bytes] = None
 
     async def optimize(self):
+        if self.optimized is not None:
+            return
+
         encoded_protobuf = str(
             binascii.b2a_hex(self.data.SerializeToString()),
             encoding="raw_unicode_escape",

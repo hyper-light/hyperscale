@@ -155,7 +155,7 @@ class WorkflowResults:
 
         failed_contexts = Counter([str(err) for err in exceptions if err is not None])
 
-        failed = len(failed_contexts)
+        failed = sum(failed_contexts.values())
 
         return {
             "workflow": workflow,

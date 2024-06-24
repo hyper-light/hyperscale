@@ -24,7 +24,7 @@ from .utils import create_sec_websocket_key
 T = TypeVar("T")
 
 
-class Headers(OptimizedArg, Generic[T]):
+class Headers(Generic[T], OptimizedArg):
     def __init__(
         self,
         headers: Dict[str, HTTPEncodableValue],
@@ -35,10 +35,15 @@ class Headers(OptimizedArg, Generic[T]):
         ).__init__()
 
         validated_headers = HeaderValidator(value=headers)
+
+        self.call_name: Optional[str] = None
         self.data: Dict[str, HTTPEncodableValue] = FrozenDict(validated_headers.value)
         self.optimized: Optional[str | List[str] | List[Tuple[bytes, bytes]]] = None
 
     async def optimize(self, request_type: RequestType):
+        if self.optimized is not None:
+            return
+
         match request_type:
             case RequestType.HTTP | RequestType.GRAPHQL:
                 header_items = {

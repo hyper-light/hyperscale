@@ -21,10 +21,14 @@ class Auth(OptimizedArg, Generic[T]):
 
         validated_auth = AuthValidator(value=auth)
 
+        self.call_name: Optional[str] = None
         self.data = validated_auth.value
         self.optimized: Optional[str] = None
 
     async def optimize(self):
+        if self.optimized is not None:
+            return
+
         if len(self.data) > 1:
             self.data = f"{self.data[0]}:{self.data[1]}"
 
