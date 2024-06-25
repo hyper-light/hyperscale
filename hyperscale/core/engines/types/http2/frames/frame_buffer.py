@@ -11,7 +11,7 @@ from .types.attributes import (
     _STRUCT_HBBBL
 )
 from .types import *
-from hyperframe.exceptions import InvalidFrameError, InvalidDataError
+from .exceptions import InvalidFrameError, InvalidDataError
 from .types.base_frame import Frame
 from .types.attributes import (
     Flag,
