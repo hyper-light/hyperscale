@@ -19,14 +19,14 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
     RequestType,
 )
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
-from hyperscale.core_rewrite.snowflake.snowflake_generator import SnowflakeGenerator
-from hyperscale.core_rewrite.testing.models.base import OptimizedArg
-from hyperscale.core_rewrite.testing.models.metric import (
+from hyperscale.core_rewrite.results.models.metric import (
     COUNT,
     DISTRIBUTION,
     RATE,
     SAMPLE,
 )
+from hyperscale.core_rewrite.snowflake.snowflake_generator import SnowflakeGenerator
+from hyperscale.core_rewrite.testing.models.base import OptimizedArg
 
 from .hook_type import HookType
 from .wrap_check import wrap_check
@@ -77,6 +77,7 @@ class Hook:
             and param_types.get(arg.name)
             and param_types.get(arg.name) in OptimizedArg.__subclasses__()
             and not arg.default == inspect._empty
+            and arg.default is not None
         }
 
         self.optimized_args.update(self.context_args)
