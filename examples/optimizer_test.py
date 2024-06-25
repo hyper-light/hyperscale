@@ -1,6 +1,7 @@
 import asyncio
+from typing import Dict, List, Literal
 
-from hyperscale.core_rewrite.graph import Graph
+from hyperscale.core_rewrite.local.workers import Provisioner, StagePriority
 from hyperscale.graph import Workflow, step
 from hyperscale.testing import URL, HTTP2Response
 
@@ -16,13 +17,45 @@ class Test(Workflow):
 
 
 async def run():
-    g = Graph(
-        [
-            Test(),
-        ]
-    )
+    # g = Graph(
+    #     [
+    #         Test(),
+    #     ]
+    # )
 
-    await g.run()
+    # await g.run()
+
+    provisioner = Provisioner()
+    configs: List[
+        Dict[
+            Literal[
+                "workflow_name",
+                "priority",
+                "is_test",
+                "threads",
+            ],
+            str | int,
+        ]
+    ] = [
+        {
+            "workflow_name": "test1",
+            "priority": StagePriority.LOW,
+            "is_test": True,
+        },
+        {
+            "workflow_name": "test2",
+            "priority": StagePriority.NORMAL,
+            "is_test": True,
+        },
+        {
+            "workflow_name": "test3",
+            "priority": StagePriority.NORMAL,
+            "is_test": True,
+        },
+    ]
+    provisioner.setup()
+
+    print(provisioner.partion_by_priority(configs))
 
 
 loop = asyncio.new_event_loop()
