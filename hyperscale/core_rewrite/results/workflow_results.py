@@ -22,14 +22,14 @@ from hyperscale.core_rewrite.engines.client.shared.models import RequestType
 from hyperscale.core_rewrite.engines.client.udp import UDPResponse
 from hyperscale.core_rewrite.engines.client.websocket import WebsocketResponse
 from hyperscale.core_rewrite.hooks import Hook, HookType
-from hyperscale.core_rewrite.testing.models.metric import (
+
+from .models.metric import (
     COUNT,
     DISTRIBUTION,
     RATE,
     SAMPLE,
     Metric,
 )
-
 from .workflow_types import (
     CheckSet,
     MetricsSet,

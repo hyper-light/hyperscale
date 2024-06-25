@@ -2,11 +2,6 @@ from .auth import Auth as Auth
 from .cookies import Cookies as Cookies
 from .data import Data as Data
 from .headers import Headers as Headers
-from .metric import COUNT as COUNT
-from .metric import DISTRIBUTION as DISTRIBUTION
-from .metric import RATE as RATE
-from .metric import SAMPLE as SAMPLE
-from .metric import Metric as Metric
 from .mutation import Mutation as Mutation
 from .params import Params as Params
 from .protobuf import Protobuf as Protobuf

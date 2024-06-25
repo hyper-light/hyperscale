@@ -19,7 +19,7 @@ import psutil
 from hyperscale.core_rewrite.engines.client import TimeParser
 from hyperscale.core_rewrite.engines.client.setup_clients import setup_client
 from hyperscale.core_rewrite.hooks import Hook, HookType
-from hyperscale.core_rewrite.results import WorkflowResults
+from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
 from hyperscale.core_rewrite.state import (
     Context,
     ContextHook,
