@@ -1,4 +1,3 @@
-import asyncio
 from typing import (
     Dict,
     List,
@@ -18,7 +17,7 @@ from .events import (
     StreamReset,
     WindowUpdated,
 )
-from .fast_hpack import Decoder, Encoder, HeaderTable
+from .fast_hpack import Decoder, Encoder
 from .frames.types.base_frame import Frame
 from .protocols import HTTP2Connection
 from .settings import SettingCodes, Settings, StreamClosedBy
@@ -26,21 +25,31 @@ from .windows import WindowManager
 
 
 class HTTP2Pipe:
+    __slots__ = (
+        "connected",
+        "concurrency",
+        "_encoder",
+        "_decoder",
+        "_init_sent",
+        "local_settings",
+        "remote_settings",
+        "outbound_flow_control_window",
+        "_inbound_flow_control_window_manager",
+        "local_settings_dict",
+        "remote_settings_dict",
+    )
+
     CONFIG = H2Configuration(
         validate_inbound_headers=False,
     )
 
-    def __init__(self, concurrency):
+    def __init__(self, concurrency: int):
         self.connected = False
         self.concurrency = concurrency
         self._encoder = Encoder()
         self._decoder = Decoder()
-        self._decoder.header_table = HeaderTable()
         self._decoder.max_allowed_table_size = self._decoder.header_table.maxsize
         self._init_sent = False
-        self._data_to_send = b""
-        self._headers_sent = False
-        self.lock = asyncio.Lock()
 
         self.local_settings = Settings(
             client=True,
@@ -99,7 +108,7 @@ class HTTP2Pipe:
 
     def send_request_headers(
         self,
-        headers: bytes,
+        headers: List[Tuple[bytes, bytes]],
         data: Optional[bytes],
         connection: HTTP2Connection,
     ):
@@ -117,6 +126,8 @@ class HTTP2Pipe:
 
         headers_frame = Frame(connection.stream.stream_id, 0x01)
         headers_frame.flags.add("END_HEADERS")
+
+        headers_frame.data = headers
 
         if data is None:
             headers_frame.flags.add("END_STREAM")
@@ -141,12 +152,7 @@ class HTTP2Pipe:
                 data = await connection.read()
 
             except Exception as err:
-                return (
-                    400,
-                    headers_dict,
-                    body_data,
-                    err,
-                )
+                return (400, headers_dict, body_data, err)
 
             if data == b"":
                 done = True
@@ -200,7 +206,6 @@ class HTTP2Pipe:
 
                     elif frame.type == 0x07:
                         # GOAWAY
-                        self._data_to_send = b""
 
                         new_event = ConnectionTerminated()
                         new_event.error_code = ErrorCodes(frame.error_code)
@@ -428,13 +433,13 @@ class HTTP2Pipe:
 
     async def submit_request_body(self, data: bytes, connection: HTTP2Connection):
         while data:
-            local_flow = self.current_outbound_window_size
+            local_flow = connection.stream.current_outbound_window_size
             max_frame_size = self.max_outbound_frame_size
             flow = min(local_flow, max_frame_size)
             while flow == 0:
                 await self.receive_response(connection)
 
-                local_flow = self.current_outbound_window_size
+                local_flow = connection.stream.current_outbound_window_size
                 max_frame_size = self.max_outbound_frame_size
                 flow = min(local_flow, max_frame_size)
 

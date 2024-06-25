@@ -33,17 +33,17 @@ class MercurySyncPlaywrightConnection:
         timeouts: Timeouts = Timeouts(),
     ) -> None:
         self.pool_size = pool_size
-        self.pages = pages
+        self._max_pages = pages
         self.config = {}
         self.context: Optional[BrowserContext] = None
         self.sessions: Deque[BrowserSession] = deque()
-        self.sem = asyncio.Semaphore(self.pool_size)
+        self._semaphore: asyncio.Semaphore = None
         self.timeouts = timeouts
         self.results: List[PlaywrightResult] = []
         self._active: Deque[Tuple[BrowserSession, BrowserPage]] = deque()
 
     async def open_page(self):
-        await self.sem.acquire()
+        await self._semaphore.acquire()
 
         session = self.sessions.popleft()
         page = await session.next_page()
@@ -58,10 +58,10 @@ class MercurySyncPlaywrightConnection:
         session.return_page(page)
         self.sessions.append(session)
 
-        self.sem.release()
+        self._semaphore.release()
 
     async def __aenter__(self):
-        await self.sem.acquire()
+        await self._semaphore.acquire()
 
         session = self.sessions.popleft()
         page = await session.next_page()
@@ -76,7 +76,7 @@ class MercurySyncPlaywrightConnection:
         session.return_page(page)
         self.sessions.append(session)
 
-        self.sem.release()
+        self._semaphore.release()
 
     async def start(
         self,
@@ -92,7 +92,7 @@ class MercurySyncPlaywrightConnection:
 
         self.sessions.extend(
             [
-                BrowserSession(playwright, self.pages, self.timeouts)
+                BrowserSession(playwright, self._max_pages, self.timeouts)
                 for _ in range(self.pool_size)
             ]
         )

@@ -3,4 +3,3 @@ from .mercury_sync_http2_connection import (
 )
 from .models.http2 import HTTP2Request as HTTP2Request
 from .models.http2 import HTTP2Response as HTTP2Response
-from .models.http2 import OptimizedHTTP2Request as OptimizedHTTP2Request

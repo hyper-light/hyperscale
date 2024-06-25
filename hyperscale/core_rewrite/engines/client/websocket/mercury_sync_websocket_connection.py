@@ -1,5 +1,4 @@
 import asyncio
-import ssl
 import time
 from collections import defaultdict
 from typing import (
@@ -21,21 +20,34 @@ from urllib.parse import (
 import orjson
 from pydantic import BaseModel
 
+from hyperscale.core_rewrite.engines.client.shared.models import URL as HTTPUrl
 from hyperscale.core_rewrite.engines.client.shared.models import (
-    URL,
-    Cookies,
+    Cookies as HTTPCookies,
+)
+from hyperscale.core_rewrite.engines.client.shared.models import (
     HTTPCookie,
     HTTPEncodableValue,
     URLMetadata,
 )
 from hyperscale.core_rewrite.engines.client.shared.protocols import NEW_LINE
 from hyperscale.core_rewrite.engines.client.shared.timeouts import Timeouts
+from hyperscale.core_rewrite.testing.models import (
+    URL,
+    Auth,
+    Cookies,
+    Data,
+    Headers,
+    Params,
+)
 
 from .models.websocket import (
     WebsocketResponse,
+    create_sec_websocket_key,
     get_header_bits,
     get_message_buffer_size,
+    pack_hostname,
 )
+from .models.websocket.constants import WEBSOCKETS_VERSION
 from .protocols import WebsocketConnection
 
 
@@ -49,50 +61,38 @@ class MercurySyncWebsocketConnection:
         if pool_size is None:
             pool_size = 100
 
+        self._concurrency = pool_size
         self.timeouts = timeouts
         self.reset_connections = reset_connections
 
-        self._client_ssl_context = self._create_general_client_ssl_context()
+        self._client_ssl_context: Optional[None] = None
 
         self._dns_lock: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: Dict[str, asyncio.Future] = defaultdict(asyncio.Future)
         self._pending_queue: List[asyncio.Future] = []
 
         self._client_waiters: Dict[asyncio.Transport, asyncio.Future] = {}
-        self._connections: List[WebsocketConnection] = [
-            WebsocketConnection(
-                reset_connections=reset_connections,
-            )
-            for _ in range(pool_size)
-        ]
+        self._connections: List[WebsocketConnection] = []
 
         self._hosts: Dict[str, Tuple[str, int]] = {}
 
         self._connections_count: Dict[str, List[asyncio.Transport]] = defaultdict(list)
         self._locks: Dict[asyncio.Transport, asyncio.Lock] = {}
 
-        self._max_concurrency = pool_size
-
-        self._semaphore = asyncio.Semaphore(self._max_concurrency)
+        self._semaphore: asyncio.Semaphore = None
         self._connection_waiters: List[asyncio.Future] = []
 
-        self._url_cache: Dict[str, URL] = {}
-
-    def _create_general_client_ssl_context(self):
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        return ctx
+        self._url_cache: Dict[str, HTTPUrl] = {}
+        self._optimized: Dict[str, URL | Params | Headers | Auth | Data | Cookies] = {}
 
     async def receive(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel | Data] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -113,10 +113,14 @@ class MercurySyncWebsocketConnection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return WebsocketResponse(
-                    url=URLMetadata(
+                    URLMetadata(
                         host=url_data.hostname,
                         path=url_data.path,
                         params=url_data.params,
@@ -130,12 +134,12 @@ class MercurySyncWebsocketConnection:
 
     async def send(
         self,
-        url: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel] = None,
+        url: str | URL,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel | Data] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -156,10 +160,14 @@ class MercurySyncWebsocketConnection:
                 )
 
             except asyncio.TimeoutError:
-                url_data = urlparse(url)
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
 
                 return WebsocketResponse(
-                    url=URLMetadata(
+                    URLMetadata(
                         host=url_data.hostname,
                         path=url_data.path,
                         params=url_data.params,
@@ -171,15 +179,105 @@ class MercurySyncWebsocketConnection:
                     status_message="Request timed out.",
                 )
 
+    async def _optimize(self, url: Optional[URL] = None):
+        if isinstance(url, URL):
+            await self._optimize_url(url)
+
+    async def _optimize_url(self, url: URL):
+        try:
+            upgrade_ssl: bool = False
+            if url:
+                (
+                    _,
+                    connection,
+                    url,
+                    upgrade_ssl,
+                ) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+                self._connections.append(connection)
+
+            if upgrade_ssl:
+                url.data = url.data.replace("http://", "https://")
+
+                await url.optimize()
+
+                (
+                    _,
+                    connection,
+                    url,
+                    _,
+                ) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+                self._connections.append(connection)
+
+            self._url_cache[url.optimized.hostname] = url
+
+        except Exception:
+            pass
+
+    async def _optimize(
+        self,
+        optimized_param: URL | Params | Headers | Cookies | Data | Auth,
+    ):
+        if isinstance(optimized_param, URL):
+            await self._optimize_url(optimized_param)
+
+        else:
+            self._optimized[optimized_param.call_name] = optimized_param
+
+    async def _optimize_url(self, url: URL):
+        try:
+            upgrade_ssl: bool = False
+            if url:
+                (
+                    _,
+                    connection,
+                    url,
+                    upgrade_ssl,
+                ) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+                self._connections.append(connection)
+
+            if upgrade_ssl:
+                url.data = url.data.replace("http://", "https://")
+
+                await url.optimize()
+
+                (
+                    _,
+                    connection,
+                    url,
+                    _,
+                ) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+                self._connections.append(connection)
+
+            self._url_cache[url.optimized.hostname] = url
+            self._optimized[url.call_name] = url
+
+        except Exception:
+            pass
+
     async def _request(
         self,
-        url: str,
+        url: str | URL,
         method: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel] = None,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel | Data] = None,
         redirects: int = 3,
     ):
         timings: Dict[
@@ -254,13 +352,13 @@ class MercurySyncWebsocketConnection:
 
     async def _execute(
         self,
-        request_url: str,
+        request_url: str | URL,
         method: str,
-        auth: Optional[Tuple[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        headers: Dict[str, str] = {},
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
-        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel] = None,
+        auth: Optional[Tuple[str, str] | Auth] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        headers: Optional[Dict[str, str] | Headers] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
+        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel | Data] = None,
         upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
@@ -295,11 +393,17 @@ class MercurySyncWebsocketConnection:
     ]:
         if redirect_url:
             request_url = redirect_url
+
         try:
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
 
-            (connection, url, upgrade_ssl) = await asyncio.wait_for(
+            (
+                error,
+                connection,
+                url,
+                upgrade_ssl,
+            ) = await asyncio.wait_for(
                 self._connect_to_url_location(
                     request_url, ssl_redirect_url=request_url if upgrade_ssl else None
                 ),
@@ -309,7 +413,12 @@ class MercurySyncWebsocketConnection:
             if upgrade_ssl:
                 ssl_redirect_url = request_url.replace("http://", "https://")
 
-                connection, url, _ = await asyncio.wait_for(
+                (
+                    error,
+                    connection,
+                    url,
+                    _,
+                ) = await asyncio.wait_for(
                     self._connect_to_url_location(
                         request_url, ssl_redirect_url=ssl_redirect_url
                     ),
@@ -318,7 +427,7 @@ class MercurySyncWebsocketConnection:
 
                 request_url = ssl_redirect_url
 
-            if connection.reader is None:
+            if connection.reader is None or error:
                 timings["connect_end"] = time.monotonic()
                 self._connections.append(
                     WebsocketConnection(
@@ -328,12 +437,13 @@ class MercurySyncWebsocketConnection:
 
                 return (
                     WebsocketResponse(
-                        url=URLMetadata(
+                        URLMetadata(
                             host=url.hostname,
                             path=url.path,
                         ),
                         method=method,
                         status=400,
+                        status_message=str(error) if error else None,
                         headers=headers,
                         timings=timings,
                     ),
@@ -391,7 +501,7 @@ class MercurySyncWebsocketConnection:
 
                 return (
                     WebsocketResponse(
-                        url=URLMetadata(
+                        URLMetadata(
                             host=url.hostname,
                             path=url.path,
                         ),
@@ -413,10 +523,10 @@ class MercurySyncWebsocketConnection:
                 headers[key] = value
                 raw_headers += header_line
 
-            cookies: Union[Cookies, None] = None
+            cookies: Union[HTTPCookies, None] = None
             cookies_data: Union[bytes, None] = headers.get(b"set-cookie")
             if cookies_data:
-                cookies = Cookies()
+                cookies = HTTPCookies()
                 cookies.update(cookies_data)
 
             header_content_length = 0
@@ -436,7 +546,7 @@ class MercurySyncWebsocketConnection:
 
             return (
                 WebsocketResponse(
-                    url=URLMetadata(
+                    URLMetadata(
                         host=url.hostname,
                         path=url.path,
                     ),
@@ -462,9 +572,12 @@ class MercurySyncWebsocketConnection:
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
 
+            elif isinstance(request_url, URL):
+                request_url: ParseResult = request_url.optimized.parsed
+
             return (
                 WebsocketResponse(
-                    url=URLMetadata(
+                    URLMetadata(
                         host=request_url.hostname,
                         path=request_url.path,
                     ),
@@ -478,19 +591,30 @@ class MercurySyncWebsocketConnection:
             )
 
     async def _connect_to_url_location(
-        self, request_url: str, ssl_redirect_url: Optional[str] = None
-    ) -> Tuple[WebsocketConnection, URL, bool]:
-        if ssl_redirect_url:
-            parsed_url = URL(ssl_redirect_url)
+        self,
+        request_url: str | URL,
+        ssl_redirect_url: Optional[str] = None,
+    ) -> Tuple[
+        Optional[Exception],
+        WebsocketConnection,
+        HTTPUrl,
+        bool,
+    ]:
+        has_optimized_url = isinstance(request_url, URL)
+        if has_optimized_url:
+            parsed_url = request_url.optimized
+
+        elif ssl_redirect_url:
+            parsed_url = HTTPUrl(ssl_redirect_url)
 
         else:
-            parsed_url = URL(request_url)
+            parsed_url = HTTPUrl(request_url)
 
         url = self._url_cache.get(parsed_url.hostname)
         dns_lock = self._dns_lock[parsed_url.hostname]
         dns_waiter = self._dns_waiters[parsed_url.hostname]
 
-        do_dns_lookup = url is None or ssl_redirect_url
+        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
             await dns_lock.acquire()
@@ -511,7 +635,11 @@ class MercurySyncWebsocketConnection:
             await dns_waiter
             url = self._url_cache.get(parsed_url.hostname)
 
+        elif has_optimized_url:
+            url = request_url.optimized
+
         connection = self._connections.pop()
+        connection_error: Optional[Exception] = None
 
         if url.address is None or ssl_redirect_url:
             for address, ip_info in url:
@@ -530,11 +658,14 @@ class MercurySyncWebsocketConnection:
                     url.address = address
                     url.socket_config = ip_info
 
-                except Exception as connection_error:
-                    if "server_hostname is only meaningful with ssl" in str(
-                        connection_error
-                    ):
-                        return None, parsed_url, True
+                except Exception as err:
+                    if "server_hostname is only meaningful with ssl" in str(err):
+                        return (
+                            None,
+                            None,
+                            parsed_url,
+                            True,
+                        )
 
         else:
             try:
@@ -549,15 +680,23 @@ class MercurySyncWebsocketConnection:
                     ssl_upgrade=ssl_redirect_url is not None,
                 )
 
-            except Exception as connection_error:
-                if "server_hostname is only meaningful with ssl" in str(
-                    connection_error
-                ):
-                    return None, parsed_url, True
+            except Exception as err:
+                if "server_hostname is only meaningful with ssl" in str(err):
+                    return (
+                        None,
+                        None,
+                        parsed_url,
+                        True,
+                    )
 
-                raise connection_error
+                connection_error = err
 
-        return connection, parsed_url, False
+        return (
+            connection_error,
+            connection,
+            parsed_url,
+            False,
+        )
 
     def _encode_data(
         self,
@@ -593,60 +732,155 @@ class MercurySyncWebsocketConnection:
 
     def _encode_headers(
         self,
-        url: URL,
+        url: HTTPUrl | URL,
         method: str,
-        params: Optional[Dict[str, HTTPEncodableValue]] = None,
+        params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str]] = None,
-        cookies: Optional[List[HTTPCookie]] = None,
-        data: Optional[bytes | List[bytes]] = None,
+        cookies: Optional[List[HTTPCookie] | Cookies] = None,
+        data: Optional[
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
+        ] = None,
+        encoded_data: Optional[bytes | List[bytes]] = None,
         content_type: Optional[str] = None,
     ):
+        if isinstance(url, URL):
+            url = url.optimized
+
         url_path = url.path
 
-        if params and len(params) > 0:
+        if isinstance(params, Params):
+            url_path += params.optimized
+
+        elif params and len(params) > 0:
             url_params = urlencode(params)
             url_path += f"?{url_params}"
 
-        get_base = f"{method} {url.path} HTTP/1.1{NEW_LINE}"
+        if isinstance(headers, Headers):
+            encoded_headers = headers.optimized
 
-        port = url.port or (443 if url.scheme == "https" else 80)
+        else:
+            encoded_headers = self._encode_dynamic_headers(url, method, headers=headers)
 
-        hostname = url.hostname.encode("idna").decode()
+        size: int = 0
 
-        if port not in [80, 443]:
-            hostname = f"{hostname}:{port}"
+        if isinstance(data, Data):
+            size = data.content_length
 
-        header_items = {
-            "user-agent": "hyperscale/client",
-        }
+        elif encoded_data and isinstance(encoded_data, Iterator):
+            size = sum([len(chunk) for chunk in encoded_data])
 
-        if data and isinstance(data, Iterator):
-            header_items["content-length"] = sum([len(chunk) for chunk in data])
+        elif encoded_data:
+            size = len(encoded_data)
 
-        elif data:
-            header_items["content-length"] = len(data)
+        encoded_headers.append(f"Content-Length: {size}")
 
         if content_type:
-            header_items["content-type"] = content_type
+            encoded_headers.append(f"Content-Type: {content_type}")
 
-        if headers:
-            header_items.update(headers)
+        if isinstance(cookies, Cookies):
+            encoded_headers.append(cookies.optimized)
 
-        for key, value in header_items.items():
-            get_base += f"{key}: {value}{NEW_LINE}"
-
-        if cookies:
-            cookies = []
+        elif cookies:
+            encoded_cookies: List[str] = []
 
             for cookie_data in cookies:
                 if len(cookie_data) == 1:
-                    cookies.append(cookie_data[0])
+                    encoded_cookies.append(cookie_data[0])
 
                 elif len(cookie_data) == 2:
                     cookie_name, cookie_value = cookie_data
-                    cookies.append(f"{cookie_name}={cookie_value}")
+                    encoded_cookies.append(f"{cookie_name}={cookie_value}")
 
-            cookies = "; ".join(cookies)
-            get_base += f"cookie: {cookies}{NEW_LINE}"
+            encoded = "; ".join(encoded_cookies)
+            encoded_headers.append(f"cookie: {encoded}")
 
-        return (get_base + NEW_LINE).encode(), data
+        encoded_headers.extend(
+            [
+                "",
+                "",
+            ]
+        )
+
+        return f"{NEW_LINE}".join(encoded_headers).encode()
+
+    def _encode_dynamic_headers(
+        self,
+        url: HTTPUrl,
+        method: str,
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        encoded_headers = [
+            f"{method} {url.path} HTTP/1.1",
+            "Upgrade: websocket",
+            "Keep-Alive: timeout=60, max=100000",
+            "User-Agent: hyperscale/client",
+        ]
+
+        if headers is None:
+            headers: Dict[str, HTTPEncodableValue] = {}
+
+        lowered_headers: Dict[str, HTTPEncodableValue] = {}
+
+        for header_name, header_value in headers.items():
+            header_name_lowered = header_name.lower()
+            lowered_headers[header_name_lowered] = header_value
+
+        if url.port == 80 or url.port == 443:
+            hostport = pack_hostname(url.hostname)
+        else:
+            hostport = "%s:%d" % (pack_hostname(url.hostname), url.port)
+
+        host = lowered_headers.get("host")
+        if host:
+            encoded_headers.append(f"Host: {host}")
+        else:
+            encoded_headers.append(f"Host: {hostport}")
+
+        if not lowered_headers.get("suppress_origin"):
+            origin = lowered_headers.get("origin")
+
+            if origin:
+                encoded_headers.append(f"Origin: {origin}")
+
+            elif url.scheme == "wss":
+                encoded_headers.append(f"Origin: https://{hostport}")
+
+            else:
+                encoded_headers.append(f"Origin: http://{hostport}")
+
+        key = create_sec_websocket_key()
+
+        header = lowered_headers.get("header")
+        if not header or "Sec-WebSocket-Key" not in header:
+            encoded_headers.append(f"Sec-WebSocket-Key: {key}")
+        else:
+            key = lowered_headers.get("header", {}).get("Sec-WebSocket-Key")
+
+        if not header or "Sec-WebSocket-Version" not in header:
+            encoded_headers.append(f"Sec-WebSocket-Version: {WEBSOCKETS_VERSION}")
+
+        connection = lowered_headers.get("connection")
+        if not connection:
+            encoded_headers.append("Connection: Upgrade")
+        else:
+            encoded_headers.append(connection)
+
+        subprotocols = lowered_headers.get("subprotocols")
+        if subprotocols:
+            encoded_headers.append(
+                "Sec-WebSocket-Protocol: %s" % ",".join(subprotocols)
+            )
+
+        additional_headers: List[str] = []
+
+        if len(headers) > 0:
+            for key, value in headers.items():
+                additional_headers.append(
+                    f"{key}: {value}",
+                )
+
+        encoded_headers.extend(
+            [header for header in additional_headers if header not in encoded_headers]
+        )
+
+        return encoded_headers

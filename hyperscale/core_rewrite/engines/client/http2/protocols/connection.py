@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from ssl import SSLContext
 from typing import Optional, Tuple
 
@@ -11,9 +10,19 @@ from .tcp import TCPConnection
 
 
 class HTTP2Connection:
+    __slots__ = (
+        "dns_address",
+        "port",
+        "ssl",
+        "stream_id",
+        "stream",
+        "connected",
+        "reset_connections",
+        "_connection_factory",
+    )
+
     def __init__(
         self,
-        concurrency: int,
         stream_id: int = 1,
         reset_connections: bool = False,
     ) -> None:
@@ -24,17 +33,14 @@ class HTTP2Connection:
         self.port: int = None
         self.ssl: SSLContext = None
         self.stream_id = stream_id
-        self.lock = asyncio.Lock()
 
         self.stream = Stream(
-            concurrency,
             stream_id=stream_id,
             reset_connections=reset_connections,
         )
 
         self.connected = False
         self.reset_connections = reset_connections
-        self.pending = 0
         self._connection_factory = TCPConnection()
 
     async def make_connection(
@@ -49,7 +55,9 @@ class HTTP2Connection:
     ):
         if self.connected is False or self.dns_address != dns_address or ssl_upgrade:
             reader, writer = await self._connection_factory.create_http2(
-                hostname, socket_config, ssl=ssl
+                hostname,
+                socket_config,
+                ssl=ssl,
             )
 
             self.stream.reader = reader

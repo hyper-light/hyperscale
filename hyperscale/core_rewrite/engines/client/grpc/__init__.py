@@ -3,4 +3,3 @@ from .mercury_sync_grpc_connection import (
 )
 from .models.grpc import GRPCRequest as GRPCRequest
 from .models.grpc import GRPCResponse as GRPCResponse
-from .models.grpc import OptimizedGRPCRequest as OptimizedGRPCRequest
