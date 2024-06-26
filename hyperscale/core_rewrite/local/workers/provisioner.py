@@ -200,6 +200,7 @@ class Provisioner:
                 ).value
                 if config.get("is_test", False)
                 else 0,
+                reverse=True,
             )
         )
 
@@ -333,7 +334,13 @@ class Provisioner:
                         0,
                     )
 
-                    workflow_group = [
+                    workflow_group: List[
+                        Tuple[
+                            str,
+                            StagePriority,
+                            int,
+                        ]
+                    ] = [
                         (
                             config.get("workflow_name"),
                             config.get("priority", StagePriority.AUTO),
@@ -397,12 +404,32 @@ class Provisioner:
                     while (
                         total_workers < self.max_workers and len(completed) < group_size
                     ):
-                        for idx, group in enumerate(workflow_group):
+                        priority_sorted = list(
+                            sorted(
+                                workflow_group,
+                                key=lambda workers_config: workers_config[1].value,
+                                reverse=True,
+                            )
+                        )
+
+                        remaining = sum([count for _, _, count in priority_sorted])
+
+                        for idx, group in enumerate(priority_sorted):
                             name, priority, count = group
 
-                            max_count = max_workers_counts.get(name, 0)
+                            worker_max = max_workers_counts.get(name, 0)
 
-                            if count < max_count:
+                            max_increase = worker_max - remaining
+
+                            if max_increase > 0:
+                                while max_increase > 0:
+                                    count += 1
+                                    total_workers += 1
+                                    max_increase -= 1
+
+                                completed.append(name)
+
+                            elif count < worker_max:
                                 count += 1
                                 total_workers += 1
 

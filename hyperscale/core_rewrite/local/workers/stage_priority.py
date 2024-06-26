@@ -6,11 +6,11 @@ from typing import Dict, Tuple, Union
 
 
 class StagePriority(Enum):
+    AUTO = 0
     LOW = 1
     NORMAL = 2
     HIGH = 3
     EXCLUSIVE = 4
-    AUTO = 5
 
     @classmethod
     def map(cls, priority: Union[str, None]) -> StagePriority:

@@ -44,7 +44,7 @@ async def run():
         },
         {
             "workflow_name": "test2",
-            "priority": StagePriority.NORMAL,
+            "priority": StagePriority.AUTO,
             "is_test": True,
         },
         {
