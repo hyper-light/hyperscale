@@ -19,6 +19,8 @@ class Env(BaseModel):
     MERCURY_SYNC_REQUEST_TIMEOUT: StrictStr = "30s"
     MERCURY_SYNC_LOG_LEVEL: StrictStr = "info"
     MERCURY_SYNC_TASK_RUNNER_MAX_THREADS: StrictInt = os.cpu_count()
+    MERCURY_SYNC_MAX_RUNNING_WORKFLOWS: StrictInt = 1
+    MERCURY_SYNC_MAX_PENDING_WORKFLOWS: StrictInt = 100
 
     @classmethod
     def types_map(self) -> Dict[str, Callable[[str], PrimaryType]]:
@@ -31,4 +33,5 @@ class Env(BaseModel):
             "MERCURY_SYNC_REQUEST_TIMEOUT": str,
             "MERCURY_SYNC_LOG_LEVEL": str,
             "MERCURY_SYNC_TASK_RUNNER_MAX_THREADS": int,
+            "MERCURY_SYNC_MAX_WORKFLOWS": int,
         }

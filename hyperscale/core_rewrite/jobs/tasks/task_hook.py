@@ -143,6 +143,9 @@ class Task(Generic[T]):
 
         return run
 
+    def stop(self):
+        self._schedule_running = False
+
     def run_schedule(
         self,
         *args,

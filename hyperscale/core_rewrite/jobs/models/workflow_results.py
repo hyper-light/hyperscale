@@ -1,5 +1,6 @@
 from typing import Any, Dict
 
+from hyperscale.core_rewrite.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.state import Context
 
@@ -9,14 +10,24 @@ class WorkflowResults:
         "workflow",
         "results",
         "context",
+        "error",
+        "status",
     )
 
     def __init__(
         self,
         workflow: str,
-        results: WorkflowStats | Dict[str, Any | Exception],
-        context: Context,
+        results: WorkflowStats | Dict[str, Any | Exception] | None,
+        context: Context | Dict[str, Dict[str, Any]],
+        error: Exception | None,
+        status: WorkflowStatus,
     ) -> None:
         self.workflow = workflow
         self.results = results
-        self.context: Dict[str, Dict[str, Any]] = context.dict()
+
+        if isinstance(context, Context):
+            context = context.dict()
+
+        self.context = context
+        self.error = error if error is None else str(error)
+        self.status = status.value

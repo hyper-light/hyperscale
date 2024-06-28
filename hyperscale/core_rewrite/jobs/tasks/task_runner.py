@@ -64,6 +64,14 @@ class TaskRunner:
                 timeout=timeout,
             )
 
+    def stop(
+        self,
+        task_name: str,
+    ):
+        task = self.tasks.get(task_name)
+        if task:
+            task.stop()
+
     def get_task_status(self, task_name: str):
         if task := self.tasks.get(task_name):
             return task.status

@@ -8,6 +8,8 @@ StatusString = Literal[
     "COMPLETED",
     "PENDING",
     "FAILED",
+    "REJECTED",
+    "UNKNOWN",
 ]
 
 
@@ -18,8 +20,11 @@ class WorkflowStatus(Enum):
     COMPLETED = "COMPLETED"
     PENDING = "PENDING"
     FAILED = "FAILED"
+    REJECTED = "REJECTED"
+    UNKNOWN = "UNKNOWN"
 
-    def map_value_to_status(self, status: StatusString):
+    @classmethod
+    def map_value_to_status(cls, status: StatusString):
         status_map: Dict[StatusString, WorkflowStatus] = {
             "SUBMITTED": WorkflowStatus.SUBMITTED,
             "CREATED": WorkflowStatus.CREATED,
@@ -27,6 +32,8 @@ class WorkflowStatus(Enum):
             "COMPLETED": WorkflowStatus.COMPLETED,
             "PENDING": WorkflowStatus.PENDING,
             "FAILED": WorkflowStatus.FAILED,
+            "REJECTED": WorkflowStatus.REJECTED,
+            "UNKNOWN": WorkflowStatus.UNKNOWN,
         }
 
         return status_map[status]

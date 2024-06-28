@@ -19,7 +19,8 @@ from hyperscale.core_rewrite.engines.client import TimeParser
 from hyperscale.core_rewrite.engines.client.setup_clients import setup_client
 from hyperscale.core_rewrite.graph.workflow import Workflow
 from hyperscale.core_rewrite.hooks import Hook, HookType
-from hyperscale.core_rewrite.jobs.models import WorkflowStatus
+from hyperscale.core_rewrite.jobs.models.env import Env
+from hyperscale.core_rewrite.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
 from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.state import Context, ContextHook, StateAction
@@ -61,8 +62,8 @@ def _guard_result(result: asyncio.Task):
 
 
 class WorkflowRunner:
-    def __init__(self) -> None:
-        self.workflow_statuses: Dict[int, Dict[str, WorkflowStatus]] = defaultdict(dict)
+    def __init__(self, env: Env) -> None:
+        self.run_statuses: Dict[int, Dict[str, WorkflowStatus]] = defaultdict(dict)
 
         self._active: Dict[int, Dict[str, int]] = defaultdict(dict)
         self._active_waiters: Dict[int, Dict[str, asyncio.Future]] = defaultdict(dict)
@@ -71,6 +72,34 @@ class WorkflowRunner:
             lambda: defaultdict(list)
         )
         self._threads = psutil.cpu_count(logical=False)
+        self._workflows_sem: asyncio.Semaphore | None = None
+        self._max_running_workflows = env.MERCURY_SYNC_MAX_RUNNING_WORKFLOWS
+        self._max_pending_workflows = env.MERCURY_SYNC_MAX_PENDING_WORKFLOWS
+
+    def setup(self):
+        if self._workflows_sem is None:
+            self._workflows_sem = asyncio.Semaphore(self._max_running_workflows)
+
+    @property
+    def pending(self):
+        return len(
+            [
+                status
+                for workflow_statuses in self.run_statuses.values()
+                for status in workflow_statuses.values()
+                if status == WorkflowStatus.PENDING
+            ]
+        )
+
+    def get_workflow_status(
+        self,
+        run_id: int,
+        workflow: str,
+    ):
+        return self.run_statuses.get(
+            run_id,
+            {},
+        ).get(workflow, WorkflowStatus.UNKNOWN)
 
     async def run(
         self,
@@ -78,51 +107,84 @@ class WorkflowRunner:
         workflow: Workflow,
         workflow_context: Dict[str, Dict[str, Any]],
     ) -> Tuple[
+        int,
         WorkflowStats
         | Dict[
             str,
             Any | Exception,
-        ],
-        Context,
+        ]
+        | None,
+        Context | None,
+        Exception | None,
+        WorkflowStatus,
     ]:
-        self.workflow_statuses[run_id][workflow.name] = WorkflowStatus.CREATED
+        if self.pending >= self._max_pending_workflows:
+            return (
+                run_id,
+                None,
+                None,
+                Exception("Err. - Run rejected. Too many pending workflows."),
+                WorkflowStatus.REJECTED,
+            )
 
-        context = Context()
+        self.run_statuses[run_id][workflow.name] = WorkflowStatus.PENDING
 
-        await asyncio.gather(
-            *[
-                context.update(workflow_name, hook_name, value)
-                for workflow_name, hook_context in workflow_context.items()
-                for hook_name, value in hook_context.items()
-            ]
-        )
+        async with self._workflows_sem:
+            self.run_statuses[run_id][workflow.name] = WorkflowStatus.CREATED
 
-        (results, updated_context) = await self._run_workflow(
-            run_id,
-            workflow,
-            context,
-        )
+            context = Context()
 
-        await asyncio.gather(
-            *[
-                context.update(workflow_name, hook_name, value)
-                for workflow_name, hook_context in updated_context.iter_workflow_contexts()
-                for hook_name, value in hook_context.items()
-            ]
-        )
+            await asyncio.gather(
+                *[
+                    context.update(workflow_name, hook_name, value)
+                    for workflow_name, hook_context in workflow_context.items()
+                    for hook_name, value in hook_context.items()
+                ]
+            )
 
-        workflow_name = workflow.name
+            self.run_statuses[run_id][workflow.name] = WorkflowStatus.RUNNING
 
-        del self._active[run_id][workflow_name]
-        del self._active_waiters[run_id][workflow_name]
-        del self._max_active[run_id][workflow_name]
-        del self._pending[run_id][workflow_name]
+            try:
+                (results, updated_context) = await self._run_workflow(
+                    run_id,
+                    workflow,
+                    context,
+                )
 
-        return (
-            run_id,
-            results,
-            context,
-        )
+                await asyncio.gather(
+                    *[
+                        context.update(workflow_name, hook_name, value)
+                        for workflow_name, hook_context in updated_context.iter_workflow_contexts()
+                        for hook_name, value in hook_context.items()
+                    ]
+                )
+
+                workflow_name = workflow.name
+
+                del self._active[run_id][workflow_name]
+                del self._active_waiters[run_id][workflow_name]
+                del self._max_active[run_id][workflow_name]
+                del self._pending[run_id][workflow_name]
+
+                self.run_statuses[run_id][workflow_name] = WorkflowStatus.COMPLETED
+
+                return (
+                    run_id,
+                    results,
+                    None,
+                    None,
+                    WorkflowStatus.COMPLETED,
+                )
+
+            except Exception as err:
+                self.run_statuses[run_id][workflow.name] = WorkflowStatus.FAILED
+                return (
+                    run_id,
+                    None,
+                    context,
+                    err,
+                    WorkflowStatus.FAILED,
+                )
 
     async def _run_workflow(
         self,
