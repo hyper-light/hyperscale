@@ -73,7 +73,7 @@ class Graph:
         self.graph = __file__
         self.workflows = workflows
         self.max_active = 0
-        self.active = 0
+        self.active: Dict[str, int] = {}
 
         self._active_waiters: Dict[str, asyncio.Future | None] = {}
 
@@ -129,6 +129,28 @@ class Graph:
                     for key, value in workflow_context.items()
                 ]
             )
+
+    async def run_workflow(self, workflow: Workflow, context: Context):
+        self._create_workflow_graph()
+
+        (results, updated_context) = await self._run_workflow(
+            workflow,
+            context,
+        )
+
+        await asyncio.gather(
+            *[
+                context.update(
+                    workflow_name,
+                    key,
+                    value,
+                )
+                for workflow_name, workflow_context in updated_context.iter_workflow_contexts()
+                for key, value in workflow_context.items()
+            ]
+        )
+
+        return (results, context)
 
     def _create_workflow_graph(self):
         workflow_graph = networkx.DiGraph()
@@ -391,6 +413,7 @@ class Graph:
         Dict[str, Hook],
     ]:
         self._workflows_by_name[workflow.name] = workflow
+        self.active[workflow.name] = 0
 
         config = {
             "vus": 1000,
@@ -539,7 +562,7 @@ class Graph:
             await asyncio.sleep(0)
 
             if (
-                self.active > self.max_active
+                self.active[workflow_name] > self.max_active
                 and self._active_waiters[workflow_name] is None
             ):
                 self._active_waiters[workflow_name] = (
@@ -569,7 +592,7 @@ class Graph:
 
             for hook_set in traversal_order:
                 set_count = len(hook_set)
-                self.active += set_count
+                self.active[workflow_name] += set_count
 
                 for hook in hook_set.values():
                     hook.context_args.update(
@@ -608,10 +631,10 @@ class Graph:
 
                 self._pending[workflow_name].extend(pending)
 
-                self.active -= set_count
+                self.active[workflow_name] -= set_count
 
                 if (
-                    self.active <= self.max_active
+                    self.active[workflow_name] <= self.max_active
                     and self._active_waiters[workflow_name]
                 ):
                     try:

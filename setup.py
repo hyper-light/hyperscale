@@ -59,6 +59,7 @@ setup(
         "cryptography",
         "python-dotenv",
         "aioquic",
+        "cloudpickle",
     ],
     entry_points={
         "console_scripts": [

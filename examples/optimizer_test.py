@@ -1,61 +1,26 @@
 import asyncio
-from typing import Dict, List, Literal
 
-from hyperscale.core_rewrite.local.workers import Provisioner, StagePriority
-from hyperscale.graph import Workflow, step
-from hyperscale.testing import URL, HTTP2Response
+from hyperscale.core_rewrite.graph import Workflow
+from hyperscale.core_rewrite.jobs import Env
+from hyperscale.core_rewrite.jobs.job_server import JobServer
 
 
-class Test(Workflow):
-    vus = 400
-    threads = 4
-    duration = "1m"
-
-    @step()
-    async def login(self, url: URL = "https://http2.github.io/") -> HTTP2Response:
-        return await self.client.http2.get(url)
+async def return_response(_: int, workflow: Workflow):
+    print("HERE!", workflow.id)
+    return workflow
 
 
 async def run():
-    # g = Graph(
-    #     [
-    #         Test(),
-    #     ]
-    # )
+    server = JobServer(
+        "0.0.0.0",
+        12399,
+        Env(MERCURY_SYNC_AUTH_SECRET="testthissecret"),
+    )
 
-    # await g.run()
+    await server.start_server()
+    await server.run_forever()
 
-    provisioner = Provisioner()
-    configs: List[
-        Dict[
-            Literal[
-                "workflow_name",
-                "priority",
-                "is_test",
-                "threads",
-            ],
-            str | int,
-        ]
-    ] = [
-        {
-            "workflow_name": "test1",
-            "priority": StagePriority.LOW,
-            "is_test": True,
-        },
-        {
-            "workflow_name": "test2",
-            "priority": StagePriority.AUTO,
-            "is_test": True,
-        },
-        {
-            "workflow_name": "test3",
-            "priority": StagePriority.NORMAL,
-            "is_test": True,
-        },
-    ]
-    provisioner.setup()
-
-    print(provisioner.partion_by_priority(configs))
+    await server.close()
 
 
 loop = asyncio.new_event_loop()

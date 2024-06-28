@@ -87,6 +87,7 @@ class WorkflowResults:
             str,
             List[Any],
         ],
+        run_id: Optional[int] = None,
     ) -> WorkflowStats:
         workflow_stats: WorkflowStats = {
             "workflow": workflow,
@@ -95,6 +96,9 @@ class WorkflowResults:
             "checks": [],
             "metrics": [],
         }
+
+        if run_id:
+            workflow_stats["run"] = run_id
 
         for step in results:
             step_results = results[step]

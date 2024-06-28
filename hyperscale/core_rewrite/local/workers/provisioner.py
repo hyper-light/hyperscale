@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import math
 import multiprocessing
 import multiprocessing.context
@@ -44,6 +45,8 @@ class Provisioner:
         self.shutdown_task = None
         self.batch_by_stages = False
 
+        self._queue: asyncio.Queue[asyncio.Task] = None
+
     def setup(self):
         self.loop = asyncio.get_event_loop()
         self.context = multiprocessing.get_context(self.start_method)
@@ -52,6 +55,26 @@ class Provisioner:
             max_workers=self.max_workers,
             mp_context=self.context,
         )
+
+        self._queue = asyncio.Queue(maxsize=self.max_workers)
+
+    async def start_pool(self):
+        for _ in range(self.max_workers):
+            self._queue.put_nowait(
+                asyncio.create_task(
+                    self.loop.run_in_executor(
+                        self.pool,
+                        functools.partial(
+                            self._run_job_server,
+                            idx,
+                        ),
+                    )
+                )
+                for idx in range(self.max_workers)
+            )
+
+    async def _run_job_server(self, idx: int):
+        pass
 
     async def execute_batches(
         self,
