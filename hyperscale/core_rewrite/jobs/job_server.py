@@ -1,22 +1,22 @@
+import asyncio
 import os
-from asyncio import Server
-from socket import socket
-from typing import Any
+from collections import defaultdict
+from typing import Any, Dict, Set
 
 from hyperscale.core_rewrite.graph import Workflow
 from hyperscale.core_rewrite.jobs.models import (
     AcknowledgedCompletion,
+    Response,
     WorkflowJob,
     WorkflowResults,
 )
 from hyperscale.core_rewrite.jobs.models.env import Env
+from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.snowflake import Snowflake
 from hyperscale.core_rewrite.state import Context
 
 from .graphs import WorkflowRunner
 from .hooks import (
-    broadcast,
-    push,
     receive,
     send,
     task,
@@ -35,66 +35,95 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         super().__init__(host, port, env)
 
         self._workflows = WorkflowRunner()
+        self._results: Dict[
+            int,
+            Dict[
+                str,
+                WorkflowStats
+                | Dict[
+                    str,
+                    Any | Exception,
+                ],
+            ],
+        ] = defaultdict(dict)
+        self._contexts: Dict[int, Context] = {}
 
-    async def start_server(
-        self,
-        cert_path: str | None = None,
-        key_path: str | None = None,
-        worker_socket: socket | None = None,
-        worker_server: Server | None = None,
-    ):
-        self._workflows.initialize_context()
-        return await super().start_server(
-            cert_path,
-            key_path,
-            worker_socket,
-            worker_server,
-        )
+        self._completions: Dict[int, Set[int]] = defaultdict(set)
+        self._run_workflow_node_ids: Dict[int, Dict[str, int]] = defaultdict(dict)
 
-    @send("start_workflow")
+    @send()
     async def submit(
-        self, workflow: Workflow, context: Context
-    ) -> JobContext[Workflow]:
-        return JobContext(
-            WorkflowJob(
-                workflow,
-                context,
+        self,
+        workflow: Workflow,
+        context: Context,
+    ) -> Response[JobContext[WorkflowStatusUpdate]]:
+        return await self.send(
+            "start_workflow",
+            JobContext(
+                WorkflowJob(
+                    workflow,
+                    context,
+                ),
             ),
         )
 
-    @push("process_results")
+    @send()
+    async def send_stop(self):
+        pass
+
+    @send()
     async def push_results(
         self,
         node_id: str,
         results: WorkflowResults,
         run_id: int,
-    ) -> JobContext[WorkflowResults]:
-        return (
-            node_id,
+    ) -> Response[JobContext[AcknowledgedCompletion]]:
+        return await self.send(
+            "process_results",
             JobContext(
                 results,
                 run_id=run_id,
             ),
+            node_id=node_id,
         )
 
-    @broadcast("stop_server")
+    @receive()
     async def process_results(
         self,
         shard_id: int,
         workflow_results: JobContext[WorkflowResults],
     ) -> JobContext[AcknowledgedCompletion]:
         snowflake = Snowflake.parse(shard_id)
+        node_id = snowflake.instance
 
-        completed = self._workflows.store_results(
-            snowflake.instance,
-            workflow_results.data.results,
-            workflow_results.data.context,
+        run_id = workflow_results.run_id
+        workflow_name = workflow_results.data.workflow
+        results = workflow_results.data.results
+        workflow_context = workflow_results.data.context
+
+        context = Context()
+
+        await asyncio.gather(
+            *[
+                context.update(
+                    workflow,
+                    key,
+                    value,
+                )
+                for workflow, ctx in workflow_context.items()
+                for key, value in ctx.items()
+            ]
         )
+
+        self._contexts[run_id] = context
+
+        self._results[run_id][workflow_name] = results
+        self._completions[run_id].add(node_id)
 
         return JobContext(
             AcknowledgedCompletion(
                 workflow_results.data.workflow,
-                completed,
+                node_id,
             ),
             run_id=workflow_results.run_id,
         )
@@ -105,23 +134,9 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         _: int,
         acknowleged_completion: JobContext[AcknowledgedCompletion],
     ):
-        try:
-            print(acknowleged_completion.data.completions)
-            print(
-                self._workflows.get_expected_completions(acknowleged_completion.run_id)
-            )
-            if (
-                acknowleged_completion.data.completions
-                == self._workflows.get_expected_completions(
-                    acknowleged_completion.run_id,
-                )
-            ):
-                self.stop()
-
-        except Exception:
-            import traceback
-
-            print(traceback.format_exc())
+        self._completions[acknowleged_completion.run_id].add(
+            acknowleged_completion.data.completed_node,
+        )
 
     @receive()
     async def start_workflow(
@@ -132,9 +147,15 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         run_id = self.tasks.create_task_id()
 
         snowflake = Snowflake.parse(shard_id)
+        node_id = snowflake.instance
+
+        workflow_name = context.data.workflow.name
+
+        self._run_workflow_node_ids[run_id][workflow_name] = node_id
+
         self.tasks.run(
             "run_workflow",
-            snowflake.instance,
+            node_id,
             run_id,
             context.data,
             run_id=run_id,
@@ -143,7 +164,7 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         return JobContext(
             WorkflowStatusUpdate(
                 WorkflowStatus.SUBMITTED,
-                f"Workflow - {context.data.name} - submitted to worker - {self.node_id}",
+                f"Workflow - {context.data.workflow} - submitted to worker - {self.node_id}",
             ),
             run_id=run_id,
         )
@@ -152,6 +173,7 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         keep=int(
             os.getenv("HYPERSCALE_MAX_JOBS", 100),
         ),
+        repeat="NEVER",
     )
     async def run_workflow(
         self,
@@ -159,24 +181,23 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         run_id: int,
         job: WorkflowJob,
     ):
-        (results, context) = await self._workflows.run(
-            node_id, run_id, job.workflow, job.context
+        results = {}
+        (
+            run_id,
+            results,
+            context,
+        ) = await self._workflows.run(
+            run_id,
+            job.workflow,
+            job.context,
         )
 
-        print(context)
-
-        try:
-            await self.push_results(
-                node_id,
-                WorkflowResults(
-                    job.workflow.name,
-                    results,
-                    context,
-                ),
-                run_id,
-            )
-
-        except Exception:
-            import traceback
-
-            print(traceback.format_exc())
+        await self.push_results(
+            node_id,
+            WorkflowResults(
+                job.workflow.name,
+                results,
+                context,
+            ),
+            run_id,
+        )

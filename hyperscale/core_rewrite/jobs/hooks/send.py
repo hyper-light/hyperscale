@@ -1,23 +1,17 @@
 import functools
 
-from hyperscale.core_rewrite.jobs.protocols.tcp_protocol import TCPProtocol
-
 from .hook_type import HookType
 
 
-def send(target: str):
+def send():
     def wraps(func):
         func.hook_type = HookType.SEND
 
         @functools.wraps(func)
-        async def decorator(connection: TCPProtocol, *args, **kwargs):
-            return await connection.send(
-                target,
-                await func(
-                    connection,
-                    *args,
-                    **kwargs,
-                ),
+        async def decorator(*args, **kwargs):
+            return await func(
+                *args,
+                **kwargs,
             )
 
         return decorator

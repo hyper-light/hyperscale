@@ -14,6 +14,7 @@ from typing import (
     Deque,
     Dict,
     Generic,
+    List,
     Literal,
     Optional,
     Tuple,
@@ -97,6 +98,10 @@ class TCPProtocol(Generic[T, K]):
         self._run_future: Optional[asyncio.Future] = None
         self._node_host_map: Dict[int, Tuple[str, int]] = {}
         self._nodes: Optional[LockedSet[int]] = None
+
+    @property
+    def nodes(self):
+        return [node_id for node_id in self._node_host_map]
 
     async def start_server(
         self,
@@ -385,6 +390,22 @@ class TCPProtocol(Generic[T, K]):
                         pass
 
                     self._pending_responses.pop()
+
+    async def broadcast(
+        self,
+        target: str,
+        data: T,
+    ) -> List[Tuple[int, K]]:
+        return await asyncio.gather(
+            *[
+                self.send(
+                    target,
+                    data,
+                    node_id=node,
+                )
+                for node in self.nodes
+            ]
+        )
 
     async def send(
         self,

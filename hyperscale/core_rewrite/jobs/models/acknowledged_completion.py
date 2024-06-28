@@ -1,10 +1,10 @@
 class AcknowledgedCompletion:
-    __slots__ = "completions"
+    __slots__ = ("workflow", "completed_node")
 
     def __init__(
         self,
         workflow: str,
-        completions: int,
+        completed_node: int,
     ) -> None:
         self.workflow = workflow
-        self.completions = completions
+        self.completed_node = completed_node

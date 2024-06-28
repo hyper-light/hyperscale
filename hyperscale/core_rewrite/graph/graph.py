@@ -20,6 +20,7 @@ from hyperscale.core_rewrite.engines.client import TimeParser
 from hyperscale.core_rewrite.engines.client.setup_clients import setup_client
 from hyperscale.core_rewrite.hooks import Hook, HookType
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
+from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.state import (
     Context,
     ContextHook,
@@ -72,8 +73,8 @@ class Graph:
     ) -> None:
         self.graph = __file__
         self.workflows = workflows
-        self.max_active = 0
-        self.active: Dict[str, int] = {}
+        self._max_active: Dict[str, int] = {}
+        self._active: Dict[str, int] = {}
 
         self._active_waiters: Dict[str, asyncio.Future | None] = {}
 
@@ -124,7 +125,7 @@ class Graph:
                         key,
                         value,
                     )
-                    for updated in updated_contexts
+                    for _, updated in updated_contexts
                     for workflow_name, workflow_context in updated.iter_workflow_contexts()
                     for key, value in workflow_context.items()
                 ]
@@ -193,7 +194,14 @@ class Graph:
         self,
         workflow: Workflow,
         context: Context,
-    ):
+    ) -> Tuple[
+        WorkflowStats
+        | Dict[
+            str,
+            Any | Exception,
+        ],
+        Context,
+    ]:
         state_actions = self._setup_state_actions(workflow)
         context = await self._use_context(
             workflow.name,
@@ -232,7 +240,7 @@ class Graph:
             results,
         )
 
-        return context
+        return (results, context)
 
     async def _use_context(
         self,
@@ -375,7 +383,7 @@ class Graph:
         workflow: Workflow,
         traversal_order: List[Dict[str, Hook]],
         context: Context,
-    ):
+    ) -> Dict[str, Any]:
         workflow_name = workflow.name
         config = self._workflow_configs[workflow_name]
 
@@ -413,7 +421,7 @@ class Graph:
         Dict[str, Hook],
     ]:
         self._workflows_by_name[workflow.name] = workflow
-        self.active[workflow.name] = 0
+        self._active[workflow.name] = 0
 
         config = {
             "vus": 1000,
@@ -439,7 +447,7 @@ class Graph:
         vus = config.get("vus")
         threads = config.get("threads")
 
-        self.max_active = math.ceil(
+        self._max_active[workflow.name] = math.ceil(
             vus * (psutil.cpu_count(logical=False) ** 2) / threads
         )
 
@@ -562,7 +570,7 @@ class Graph:
             await asyncio.sleep(0)
 
             if (
-                self.active[workflow_name] > self.max_active
+                self._active[workflow_name] > self._max_active[workflow_name]
                 and self._active_waiters[workflow_name] is None
             ):
                 self._active_waiters[workflow_name] = (
@@ -592,7 +600,7 @@ class Graph:
 
             for hook_set in traversal_order:
                 set_count = len(hook_set)
-                self.active[workflow_name] += set_count
+                self._active[workflow_name] += set_count
 
                 for hook in hook_set.values():
                     hook.context_args.update(
@@ -631,10 +639,10 @@ class Graph:
 
                 self._pending[workflow_name].extend(pending)
 
-                self.active[workflow_name] -= set_count
+                self._active[workflow_name] -= set_count
 
                 if (
-                    self.active[workflow_name] <= self.max_active
+                    self._active[workflow_name] <= self._max_active[workflow_name]
                     and self._active_waiters[workflow_name]
                 ):
                     try:

@@ -1,6 +1,7 @@
 import asyncio
 
 from hyperscale.core_rewrite.jobs import Env, JobServer
+from hyperscale.core_rewrite.state import Context
 from hyperscale.graph import Workflow, step
 from hyperscale.testing import URL, HTTP2Response
 
@@ -25,7 +26,9 @@ async def run():
     await client.start_server()
     await client.connect_client(("0.0.0.0", 12399))
 
-    await client.submit(Test())
+    context = Context()
+
+    await client.submit(Test(), context)
 
     await client.run_forever()
 
