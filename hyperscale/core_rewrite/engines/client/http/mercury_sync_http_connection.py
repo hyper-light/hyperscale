@@ -135,6 +135,7 @@ class MercurySyncHTTPConnection:
                     method="HEAD",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def options(
@@ -180,6 +181,7 @@ class MercurySyncHTTPConnection:
                     method="OPTIONS",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def get(
@@ -225,6 +227,7 @@ class MercurySyncHTTPConnection:
                     method="GET",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def post(
@@ -274,6 +277,7 @@ class MercurySyncHTTPConnection:
                     method="POST",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def put(
@@ -323,6 +327,7 @@ class MercurySyncHTTPConnection:
                     method="PUT",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def patch(
@@ -372,6 +377,7 @@ class MercurySyncHTTPConnection:
                     method="PATCH",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def delete(
@@ -417,6 +423,7 @@ class MercurySyncHTTPConnection:
                     method="DELETE",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def _optimize(
@@ -572,7 +579,7 @@ class MercurySyncHTTPConnection:
                 "request_end",
             ],
             float | None,
-        ] = {},
+        ] = None,
     ) -> Tuple[
         HTTPResponse,
         bool,

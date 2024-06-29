@@ -32,7 +32,7 @@ class GraphQLHTTP2Response(HTTP2Response):
                 "request_end",
             ],
             float | None,
-        ] = {},
+        ] = None,
     ):
         super(
             GraphQLHTTP2Response,

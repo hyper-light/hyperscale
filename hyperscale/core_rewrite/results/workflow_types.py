@@ -1,23 +1,25 @@
 from typing import (
+    Any,
     Dict,
     List,
     Literal,
     Optional,
 )
 
+QuantileSet = Dict[str, int | float]
 StatTypes = Literal["max", "min", "mean", "med", "stdev", "var", "mad"]
 
 StatusCounts = Dict[int, int]
-StatsResults = Dict[StatTypes, int | float]
+StatsResults = Dict[StatTypes, int | float] | QuantileSet
 CountResults = Dict[
     Literal["succeeded", "failed", "executed"] | Optional[Literal["statuses"]],
     int | Optional[StatusCounts],
 ]
 
-QuantileSet = Dict[str, int | float]
 
 FailedResults = Dict[Literal["failed"], int]
-ContextResults = List[Dict[Literal["context", "count"], str | int]]
+ContextCount = Dict[Literal["context", "count"], str | int]
+ContextResults = List[ContextCount]
 
 ResultSet = Dict[
     Literal[
@@ -40,6 +42,22 @@ CheckSet = Dict[
     str | FailedResults | ContextResults,
 ]
 
+MetricType = Literal["COUNT", "DISTRIBUTION", "SAMPLE", "RATE"]
+
+CountMetric = Dict[Literal["count"], int]
+
+DistributionMetric = (
+    QuantileSet
+    | Dict[
+        Literal["max", "min"],
+        int | float,
+    ]
+)
+
+SampleMetric = StatsResults | QuantileSet
+RateMetric = Dict[Literal["rate"], int | float]
+MetricValue = CountMetric | DistributionMetric | SampleMetric | RateMetric
+
 MetricsSet = Dict[
     Literal[
         "workflow",
@@ -48,10 +66,7 @@ MetricsSet = Dict[
         "stats",
         "tags",
     ],
-    str
-    | Literal["COUNT", "DISTRIBUTION", "SAMPLE", "RATE"]
-    | Dict[str, int | float | StatsResults | QuantileSet]
-    | List[str],
+    str | MetricType | MetricValue | List[str],
 ]
 
 WorkflowStats = Dict[
@@ -59,3 +74,6 @@ WorkflowStats = Dict[
     | Optional[Literal["run_id"]],
     int | str | CountResults | List[ResultSet] | List[MetricsSet] | List[CheckSet],
 ]
+
+
+WorkflowContextResult = Dict[str, Any | Exception]

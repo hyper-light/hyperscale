@@ -61,7 +61,7 @@ class HTTPResponse(CallResult):
                 "request_end",
             ],
             float | None,
-        ] = {},
+        ] = None,
     ):
         super(
             HTTPResponse,

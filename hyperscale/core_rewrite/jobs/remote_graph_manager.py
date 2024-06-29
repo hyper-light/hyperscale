@@ -5,32 +5,50 @@ from typing import (
     Any,
     Dict,
     List,
+    Literal,
     Tuple,
 )
 
+import networkx
 import psutil
 
 from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
+from hyperscale.core_rewrite.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core_rewrite.graph.workflow import Workflow
 from hyperscale.core_rewrite.hooks import Hook, HookType
 from hyperscale.core_rewrite.jobs.models.env import Env
 from hyperscale.core_rewrite.jobs.workers import Provisioner, StagePriority
-from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
+from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
+from hyperscale.core_rewrite.results.workflow_types import (
+    WorkflowContextResult,
+    WorkflowStats,
+)
 from hyperscale.core_rewrite.state import (
     Context,
     ContextHook,
     StateAction,
 )
 
-from .graphs import WorkflowManager
 from .graphs.workflow_runner import cancel_pending
 from .models import InstanceRoleType
 from .remote_graph_controller import RemoteGraphController
 
-WorkflowResults = WorkflowStats | Dict[str, Any | Exception]
+WorkflowResultsSet = WorkflowStats | WorkflowContextResult
 NodeResults = Tuple[
-    WorkflowResults,
+    WorkflowResultsSet,
     Context,
+]
+
+RunResults = Dict[
+    Literal[
+        "workflow",
+        "results",
+    ],
+    str
+    | Dict[
+        str,
+        WorkflowStats | WorkflowContextResult,
+    ],
 ]
 
 
@@ -81,15 +99,12 @@ class RemoteGraphManager:
             )
 
         if self._provisioner is None:
-            self._provisioner = Provisioner(max_workers=self._threads)
-            self._provisioner.setup()
+            self._provisioner = Provisioner()
 
         await self._controller.start_server(
             cert_path=cert_path,
             key_path=key_path,
         )
-
-        self.node_id = self._controller.node_id
 
     async def connect_to_workers(
         self,
@@ -124,7 +139,7 @@ class RemoteGraphManager:
 
         await asyncio.gather(*[cancel_pending(pend) for pend in pending])
 
-        self._provisioner.max_workers = len(self._controller.nodes)
+        self._provisioner.setup(max_workers=len(self._controller.nodes))
 
         pending_count = len(pending)
         if pending_count > 0:
@@ -137,20 +152,18 @@ class RemoteGraphManager:
 
     async def execute_graph(
         self,
-        graph: str,
-        workflows: List[Workflow],
-    ):
-        manager = WorkflowManager(graph, workflows)
-
+        workflow: str,
+        workflows: List[Workflow | DependentWorkflow],
+    ) -> RunResults:
         run_id = self._controller.id_generator.generate()
 
         self._controller.create_run_contexts(run_id)
 
-        manager.create_workflow_graph()
+        workflow_traversal_order = self._create_workflow_graph(workflows)
 
-        graph_results: Dict[str, List[WorkflowResults]] = defaultdict(list)
+        workflow_results: Dict[str, List[WorkflowResultsSet]] = defaultdict(list)
 
-        for workflow_set in manager.workflow_traversal_order:
+        for workflow_set in workflow_traversal_order:
             results = await asyncio.gather(
                 *[
                     self._run_workflow(
@@ -163,38 +176,94 @@ class RemoteGraphManager:
                 ]
             )
 
-            for workflow_name, worklow_results in results:
-                graph_results[workflow_name] = [
-                    node_results for node_results, _ in worklow_results
-                ]
+            workflow_results.update(
+                {workflow_name: results for workflow_name, results in results}
+            )
 
-        return graph_results
+        return {"workflow": workflow, "results": workflow_results}
+
+    def _create_workflow_graph(self, workflows: List[Workflow | DependentWorkflow]):
+        workflow_graph = networkx.DiGraph()
+
+        workflow_dependencies: Dict[str, List[str]] = {}
+
+        sources = []
+
+        workflow_traversal_order: List[
+            Dict[
+                str,
+                Workflow,
+            ]
+        ] = []
+
+        for workflow in workflows:
+            if (
+                isinstance(workflow, DependentWorkflow)
+                and len(workflow.dependencies) > 0
+            ):
+                dependent_workflow = workflow.dependent_workflow
+                workflow_dependencies[dependent_workflow.name] = workflow.dependencies
+
+                self._workflows[dependent_workflow.name] = dependent_workflow
+
+                workflow_graph.add_node(dependent_workflow.name)
+
+            else:
+                self._workflows[workflow.name] = workflow
+                sources.append(workflow.name)
+
+                workflow_graph.add_node(workflow.name)
+
+        for workflow_name, dependencies in workflow_dependencies.items():
+            for dependency in dependencies:
+                workflow_graph.add_edge(dependency, workflow_name)
+
+        for traversal_layer in networkx.bfs_layers(workflow_graph, sources):
+            workflow_traversal_order.append(
+                {
+                    workflow_name: self._workflows.get(workflow_name)
+                    for workflow_name in traversal_layer
+                }
+            )
+
+        return workflow_traversal_order
 
     async def _run_workflow(
         self,
         run_id: int,
         workflow: Workflow,
         threads: int,
-    ) -> Tuple[str, List[NodeResults]]:
+    ) -> Tuple[str, WorkflowStats | WorkflowContextResult]:
+        hooks: Dict[str, Hook] = {
+            name: hook
+            for name, hook in inspect.getmembers(
+                workflow,
+                predicate=lambda member: isinstance(member, Hook),
+            )
+        }
+
+        is_test_workflow = (
+            len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST])
+            > 0
+        )
+
+        if is_test_workflow is False:
+            threads = len(self._controller.nodes)
+
         await self._provisioner.acquire(threads)
 
         state_actions = self._setup_state_actions(workflow)
 
-        contexts = self._controller.assign_contexts(
+        context = self._controller.assign_context(
             run_id,
             workflow.name,
             threads,
         )
 
-        loaded_contexts = await asyncio.gather(
-            *[
-                self._use_context(
-                    workflow.name,
-                    state_actions,
-                    thread_context,
-                )
-                for thread_context in contexts
-            ]
+        loaded_context = await self._use_context(
+            workflow.name,
+            state_actions,
+            context,
         )
 
         # ## Send batched requests
@@ -202,7 +271,8 @@ class RemoteGraphManager:
         await self._controller.submit_workflow_to_workers(
             run_id,
             workflow,
-            loaded_contexts,
+            loaded_context,
+            threads,
         )
 
         worker_results = await self._controller.poll_for_workflow_complete(
@@ -210,26 +280,42 @@ class RemoteGraphManager:
             workflow.name,
         )
 
-        updated_contexts = await asyncio.gather(
-            *[
-                self._provide_context(
-                    workflow.name,
-                    state_actions,
-                    thread_context,
-                    results,
+        results, run_context = worker_results
+
+        if is_test_workflow and len(results) > 1:
+            workflow_results = WorkflowResults()
+            execution_result = workflow_results.merge_results(
+                [result_set for _, result_set in results.values()],
+                run_id=run_id,
+            )
+
+        elif is_test_workflow is False and len(results) > 1:
+            _, execution_result = list(
+                sorted(
+                    results.values(),
+                    key=lambda result: result[0],
+                    reverse=True,
                 )
-                for results, thread_context in worker_results
-            ]
+            ).pop()
+
+        else:
+            _, execution_result = list(results.values()).pop()
+
+        updated_context = await self._provide_context(
+            workflow.name,
+            state_actions,
+            run_context,
+            execution_result,
         )
 
-        await self._controller.update_contexts(
+        await self._controller.update_context(
             run_id,
-            updated_contexts,
+            updated_context,
         )
 
         self._provisioner.release(threads)
 
-        return (workflow.name, worker_results)
+        return (workflow.name, execution_result)
 
     def _setup_state_actions(self, workflow: Workflow) -> Dict[str, ContextHook]:
         state_actions: Dict[str, ContextHook] = {
@@ -259,7 +345,7 @@ class RemoteGraphManager:
         ]
 
         if len(use_actions) < 1:
-            return context
+            return context[workflow]
 
         for hook in use_actions:
             hook.context_args = {
@@ -268,15 +354,15 @@ class RemoteGraphManager:
                 for name, value in context[provider].items()
             }
 
-        results = await asyncio.gather(
+        resolved = await asyncio.gather(
             *[hook.call(**hook.context_args) for hook in use_actions]
         )
 
         await asyncio.gather(
-            *[context[workflow].set(hook_name, result) for hook_name, result in results]
+            *[context[workflow].set(hook_name, value) for hook_name, value in resolved]
         )
 
-        return context
+        return context[workflow]
 
     def _provision(
         self,

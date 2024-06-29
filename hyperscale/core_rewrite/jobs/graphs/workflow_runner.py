@@ -24,6 +24,7 @@ from hyperscale.core_rewrite.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
 from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.state import Context, ContextHook, StateAction
+from hyperscale.core_rewrite.state.workflow_context import WorkflowContext
 from hyperscale.core_rewrite.testing.models.base import OptimizedArg
 
 warnings.simplefilter("ignore")
@@ -105,7 +106,7 @@ class WorkflowRunner:
         self,
         run_id: int,
         workflow: Workflow,
-        workflow_context: Dict[str, Dict[str, Any]],
+        workflow_context: Dict[str, Any],
     ) -> Tuple[
         int,
         WorkflowStats
@@ -114,7 +115,7 @@ class WorkflowRunner:
             Any | Exception,
         ]
         | None,
-        Context | None,
+        WorkflowContext | None,
         Exception | None,
         WorkflowStatus,
     ]:
@@ -130,15 +131,16 @@ class WorkflowRunner:
         self.run_statuses[run_id][workflow.name] = WorkflowStatus.PENDING
 
         async with self._workflows_sem:
-            self.run_statuses[run_id][workflow.name] = WorkflowStatus.CREATED
+            workflow_name = workflow.name
+
+            self.run_statuses[run_id][workflow_name] = WorkflowStatus.CREATED
 
             context = Context()
 
             await asyncio.gather(
                 *[
                     context.update(workflow_name, hook_name, value)
-                    for workflow_name, hook_context in workflow_context.items()
-                    for hook_name, value in hook_context.items()
+                    for hook_name, value in workflow_context.items()
                 ]
             )
 
@@ -171,7 +173,7 @@ class WorkflowRunner:
                 return (
                     run_id,
                     results,
-                    None,
+                    updated_context[workflow_name],
                     None,
                     WorkflowStatus.COMPLETED,
                 )
@@ -181,7 +183,7 @@ class WorkflowRunner:
                 return (
                     run_id,
                     None,
-                    context,
+                    context[workflow_name],
                     err,
                     WorkflowStatus.FAILED,
                 )
@@ -283,10 +285,12 @@ class WorkflowRunner:
                 for name, value in context[provider].items()
             }
 
-        await asyncio.gather(*[hook.call(**hook.context_args) for hook in use_actions])
+        resolved = await asyncio.gather(
+            *[hook.call(**hook.context_args) for hook in use_actions]
+        )
 
         await asyncio.gather(
-            *[context[workflow].set(hook.name, hook.result) for hook in use_actions]
+            *[context[workflow].set(hook_name, value) for hook_name, value in resolved]
         )
 
         return context
@@ -533,67 +537,59 @@ class WorkflowRunner:
         remaining: float,
         context: Dict[str, Any],
     ):
-        try:
-            results: List[asyncio.Task] = []
-            context: Dict[str, Any] = dict(context)
+        results: List[asyncio.Task] = []
+        context: Dict[str, Any] = dict(context)
 
-            for hook_set in traversal_order:
-                set_count = len(hook_set)
-                self._active[run_id][workflow_name] += set_count
+        for hook_set in traversal_order:
+            set_count = len(hook_set)
+            self._active[run_id][workflow_name] += set_count
 
-                for hook in hook_set.values():
-                    hook.context_args.update(
-                        {
-                            key: context[key]
-                            for key in context
-                            if key in hook.kwarg_names
-                        }
-                    )
-
-                tasks: Tuple[
-                    List[asyncio.Task],
-                    List[asyncio.Task],
-                ] = await asyncio.wait(
-                    [
-                        asyncio.create_task(
-                            hook.call(**hook.context_args),
-                            name=hook_name,
-                        )
-                        for hook_name, hook in hook_set.items()
-                    ],
-                    timeout=remaining,
+            for hook in hook_set.values():
+                hook.context_args.update(
+                    {key: context[key] for key in context if key in hook.kwarg_names}
                 )
 
-                completed, pending = tasks
-                results.extend(completed)
+            tasks: Tuple[
+                List[asyncio.Task],
+                List[asyncio.Task],
+            ] = await asyncio.wait(
+                [
+                    asyncio.create_task(
+                        hook.call(**hook.context_args),
+                        name=hook_name,
+                    )
+                    for hook_name, hook in hook_set.items()
+                ],
+                timeout=remaining,
+            )
 
-                for complete in completed:
-                    try:
-                        result = complete.result()
+            completed, pending = tasks
+            results.extend(completed)
 
-                    except Exception as err:
-                        result = err
+            for complete in completed:
+                try:
+                    result = complete.result()
 
-                    context[complete.get_name()] = result
+                except Exception as err:
+                    result = err
 
-                self._pending[run_id][workflow_name].extend(pending)
+                context[complete.get_name()] = result
 
-                self._active[run_id][workflow_name] -= set_count
+            self._pending[run_id][workflow_name].extend(pending)
 
-                if (
-                    self._active[run_id][workflow_name]
-                    <= self._max_active[run_id][workflow_name]
-                    and self._active_waiters[run_id][workflow_name]
-                ):
-                    try:
-                        self._active_waiters[run_id][workflow_name].set_result(None)
-                        self._active_waiters[run_id][workflow_name] = None
+            self._active[run_id][workflow_name] -= set_count
 
-                    except asyncio.InvalidStateError:
-                        self._active_waiters[run_id][workflow_name] = None
+            if (
+                self._active[run_id][workflow_name]
+                <= self._max_active[run_id][workflow_name]
+                and self._active_waiters[run_id][workflow_name]
+            ):
+                try:
+                    self._active_waiters[run_id][workflow_name].set_result(None)
+                    self._active_waiters[run_id][workflow_name] = None
 
-        except Exception:
-            pass
+                except asyncio.InvalidStateError:
+                    self._active_waiters[run_id][workflow_name] = None
 
         return results
 
@@ -602,7 +598,7 @@ class WorkflowRunner:
         run_id: int,
         workflow_name: str,
         config: Dict[str, Any],
-    ) -> AsyncGenerator[Any, float]:
+    ) -> AsyncGenerator[float, None]:
         duration = config.get("duration")
 
         elapsed = 0

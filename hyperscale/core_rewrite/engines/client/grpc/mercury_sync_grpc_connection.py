@@ -79,6 +79,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
                     ),
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def _optimize(

@@ -130,6 +130,7 @@ class MercurySyncWebsocketConnection:
                     method="PUT",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def send(
@@ -177,6 +178,7 @@ class MercurySyncWebsocketConnection:
                     method="PUT",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def _optimize(self, url: Optional[URL] = None):
@@ -373,7 +375,7 @@ class MercurySyncWebsocketConnection:
                 "request_end",
             ],
             float | None,
-        ] = {},
+        ] = None,
     ) -> Tuple[
         WebsocketResponse,
         bool,

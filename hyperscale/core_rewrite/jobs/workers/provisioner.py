@@ -16,21 +16,21 @@ from .stage_priority import StagePriority
 
 
 class Provisioner:
-    def __init__(
-        self,
-        max_workers: int = psutil.cpu_count(logical=False),
-    ) -> None:
+    def __init__(self) -> None:
         cpu_cores = psutil.cpu_count(logical=False)
-        if max_workers > cpu_cores:
-            max_workers = cpu_cores
-
-        self.max_workers = max_workers
+        self._cpu_cores = cpu_cores
+        self.max_workers: int = None
 
         self.loop: Optional[asyncio.AbstractEventLoop] = None
 
         self.batch_by_stages = False
 
-    def setup(self):
+    def setup(self, max_workers: int | None = None):
+        if max_workers is None:
+            max_workers = self._cpu_cores
+
+        self.max_workers = min(max_workers, self._cpu_cores)
+
         self.loop = asyncio.get_event_loop()
         self.sem = BatchedSemaphore(self.max_workers)
 
@@ -153,7 +153,7 @@ class Provisioner:
                         config.get(
                             "priority",
                             StagePriority.AUTO,
-                        ).value,
+                        ),
                         0,
                     )
                 )

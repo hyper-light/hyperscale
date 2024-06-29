@@ -108,8 +108,10 @@ class Graph:
 
         self._create_workflow_graph()
 
+        workflow_results: List[WorkflowStats | Dict[str, Any | Exception]] = []
+
         for workflow_set in self._workflow_traversal_order:
-            updated_contexts = await asyncio.gather(
+            results = await asyncio.gather(
                 *[
                     self._run_workflow(
                         workflow,
@@ -118,6 +120,11 @@ class Graph:
                     for workflow in workflow_set.values()
                 ]
             )
+
+            batch_results = [result for result, _ in results]
+
+            workflow_results.extend(batch_results)
+
             await asyncio.gather(
                 *[
                     context.update(
@@ -125,11 +132,13 @@ class Graph:
                         key,
                         value,
                     )
-                    for _, updated in updated_contexts
-                    for workflow_name, workflow_context in updated.iter_workflow_contexts()
+                    for _, updated_context in results
+                    for workflow_name, workflow_context in updated_context.iter_workflow_contexts()
                     for key, value in workflow_context.items()
                 ]
             )
+
+        return workflow_results
 
     async def run_workflow(self, workflow: Workflow, context: Context):
         self._create_workflow_graph()

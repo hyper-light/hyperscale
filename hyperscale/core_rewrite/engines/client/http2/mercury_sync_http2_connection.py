@@ -139,6 +139,7 @@ class MercurySyncHTTP2Connection:
                     method="HEAD",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def options(
@@ -184,6 +185,7 @@ class MercurySyncHTTP2Connection:
                     method="OPTIONS",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def get(
@@ -229,6 +231,7 @@ class MercurySyncHTTP2Connection:
                     method="GET",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def post(
@@ -284,6 +287,7 @@ class MercurySyncHTTP2Connection:
                     method="POST",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def put(
@@ -339,6 +343,7 @@ class MercurySyncHTTP2Connection:
                     method="PUT",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def patch(
@@ -394,6 +399,7 @@ class MercurySyncHTTP2Connection:
                     method="PATCH",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def delete(
@@ -439,6 +445,7 @@ class MercurySyncHTTP2Connection:
                     method="DELETE",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def _optimize(
@@ -523,6 +530,7 @@ class MercurySyncHTTP2Connection:
             "read_end": None,
             "request_end": None,
         }
+
         timings["request_start"] = time.monotonic()
 
         result, redirect, timings = await self._execute(
@@ -598,7 +606,7 @@ class MercurySyncHTTP2Connection:
                 "request_end",
             ],
             float | None,
-        ] = {},
+        ] = None,
     ):
         if redirect_url:
             request_url = redirect_url
@@ -656,6 +664,7 @@ class MercurySyncHTTP2Connection:
                         }
                         if headers
                         else {},
+                        timings=timings,
                     ),
                     False,
                     timings,
@@ -723,6 +732,7 @@ class MercurySyncHTTP2Connection:
                         method=method,
                         status=status,
                         headers=headers,
+                        timings=timings,
                     ),
                     True,
                     timings,
@@ -753,6 +763,7 @@ class MercurySyncHTTP2Connection:
                     status=status,
                     headers=headers,
                     content=body,
+                    timings=timings,
                 ),
                 False,
                 timings,
@@ -786,6 +797,7 @@ class MercurySyncHTTP2Connection:
                     method=method,
                     status=400,
                     status_message="Request failed or timed out.",
+                    timings=timings,
                 ),
                 False,
                 timings,

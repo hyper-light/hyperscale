@@ -5,7 +5,6 @@ from socket import socket
 from typing import (
     Any,
     Dict,
-    List,
     Set,
     Tuple,
     TypeVar,
@@ -36,10 +35,13 @@ from .protocols import TCPProtocol
 
 T = TypeVar("T")
 
-WorkflowResult = WorkflowStats | Dict[str, Any | Exception]
+WorkflowResult = Tuple[
+    int,
+    WorkflowStats | Dict[str, Any | Exception],
+]
 
 
-NodeContextSet = Dict[int, Dict[int, Context]]
+NodeContextSet = Dict[int, Context]
 
 NodeData = Dict[
     int,
@@ -64,7 +66,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         self._results: NodeData[WorkflowResult] = defaultdict(lambda: defaultdict(dict))
         self._errors: NodeData[Exception] = defaultdict(lambda: defaultdict(dict))
 
-        self._node_contexts: NodeContextSet = defaultdict(dict)
+        self._node_context: NodeContextSet = defaultdict(dict)
         self._statuses: NodeData[WorkflowStatus] = defaultdict(
             lambda: defaultdict(dict)
         )
@@ -109,41 +111,31 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         )
 
     def create_run_contexts(self, run_id: int):
-        self._node_contexts[run_id] = {
-            node: Context(node_id=node) for node in self.nodes
-        }
+        self._node_context[run_id] = Context()
 
-    def assign_contexts(
+    def assign_context(
         self,
         run_id: int,
         workflow_name: str,
         threads: int,
     ):
-        contexts = [
-            self._node_contexts[run_id][self.node_at(idx)] for idx in range(threads)
-        ]
+        self._run_workflow_expected_nodes[run_id][workflow_name] = threads
 
-        self._run_workflow_expected_nodes[run_id][workflow_name] = len(contexts)
+        return self._node_context[run_id]
 
-        return contexts
-
-    async def update_contexts(
+    async def update_context(
         self,
         run_id: int,
-        contexts: List[Context],
+        context: Context,
     ):
-        await asyncio.gather(
-            *[
-                self._node_contexts[run_id][context.node].copy(context)
-                for context in contexts
-            ]
-        )
+        await self._node_context[run_id].copy(context)
 
     async def submit_workflow_to_workers(
         self,
         run_id: int,
         workflow: Workflow,
-        contexts: List[Context],
+        context: Context,
+        threads: int,
     ):
         return await asyncio.gather(
             *[
@@ -152,7 +144,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
                     workflow,
                     context,
                 )
-                for context in contexts
+                for _ in range(threads)
             ]
         )
 
@@ -172,13 +164,10 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
             ):
                 polling = False
 
-        return [
-            (
-                self._results[run_id][workflow_name][node_id],
-                self._node_contexts[run_id][node_id],
-            )
-            for node_id in self._node_contexts[run_id]
-        ]
+        return (
+            self._results[run_id][workflow_name],
+            self._node_context[run_id],
+        )
 
     @send()
     async def submit(
@@ -244,6 +233,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
     ) -> JobContext[ReceivedReceipt]:
         snowflake = Snowflake.parse(shard_id)
         node_id = snowflake.instance
+        timestamp = snowflake.timestamp
 
         run_id = workflow_results.run_id
         workflow_name = workflow_results.data.workflow
@@ -255,17 +245,21 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         await asyncio.gather(
             *[
-                self._node_contexts[run_id][node_id].update(
-                    workflow,
+                self._node_context[run_id].update(
+                    workflow_name,
                     key,
                     value,
+                    timestamp=timestamp,
                 )
-                for workflow, ctx in workflow_context.items()
-                for key, value in ctx.items()
+                for _ in self.nodes
+                for key, value in workflow_context.items()
             ]
         )
 
-        self._results[run_id][workflow_name][node_id] = results
+        self._results[run_id][workflow_name][node_id] = (
+            timestamp,
+            results,
+        )
         self._statuses[run_id][workflow_name][node_id] = status
         self._errors[run_id][workflow_name][node_id] = Exception(error)
 

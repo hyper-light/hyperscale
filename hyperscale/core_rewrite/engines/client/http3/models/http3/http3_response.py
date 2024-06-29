@@ -60,7 +60,7 @@ class HTTP3Response(CallResult):
                 "request_end",
             ],
             float | None,
-        ] = {},
+        ] = None,
     ):
         super(
             HTTP3Response,

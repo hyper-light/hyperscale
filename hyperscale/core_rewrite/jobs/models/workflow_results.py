@@ -2,7 +2,7 @@ from typing import Any, Dict
 
 from hyperscale.core_rewrite.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
-from hyperscale.core_rewrite.state import Context
+from hyperscale.core_rewrite.state.workflow_context import WorkflowContext
 
 
 class WorkflowResults:
@@ -18,14 +18,14 @@ class WorkflowResults:
         self,
         workflow: str,
         results: WorkflowStats | Dict[str, Any | Exception] | None,
-        context: Context | Dict[str, Dict[str, Any]],
+        context: WorkflowContext | Dict[str, Any],
         error: Exception | None,
         status: WorkflowStatus,
     ) -> None:
         self.workflow = workflow
         self.results = results
 
-        if isinstance(context, Context):
+        if isinstance(context, WorkflowContext):
             context = context.dict()
 
         self.context = context

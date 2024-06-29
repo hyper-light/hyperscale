@@ -7,12 +7,8 @@ from .workflow_context import WorkflowContext
 
 
 class Context:
-    def __init__(
-        self,
-        node_id: int | None = None,
-    ) -> None:
+    def __init__(self) -> None:
         self._context: Dict[str, WorkflowContext] = {}
-        self.node = node_id
 
     def iter_workflow_contexts(self):
         for workflow, context in self._context.items():
@@ -46,8 +42,18 @@ class Context:
 
         return self
 
-    async def update(self, workflow: str, key: str, value: Any):
+    async def update(
+        self,
+        workflow: str,
+        key: str,
+        value: Any,
+        timestamp: int | None = None,
+    ):
         if self._context.get(workflow) is None:
             self._context[workflow] = WorkflowContext()
 
-        await self._context[workflow].set(key, value)
+        await self._context[workflow].set(
+            key,
+            value,
+            timestamp=timestamp,
+        )
