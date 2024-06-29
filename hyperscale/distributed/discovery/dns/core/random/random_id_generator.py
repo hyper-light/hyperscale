@@ -3,26 +3,14 @@ from typing import Union, Tuple
 
 
 class RandomIDGenerator:
-    def __init__(
-        self, 
-        start: int=0, 
-        stop: int=65535
-    ):
-        self.data = [
-            (start, stop)
-        ]
+    def __init__(self, start: int = 0, stop: int = 65535):
+        self.data = [(start, stop)]
 
     def generate(self):
-
-        index = random.randrange(
-            len(self.data)
-        )
+        index = random.randrange(len(self.data))
 
         rng = self.data[index]
-        id = random.randrange(
-            rng[0], 
-            rng[1] + 1
-        )
+        id = random.randrange(rng[0], rng[1] + 1)
 
         rngs = []
         if id > rng[0]:
@@ -31,18 +19,17 @@ class RandomIDGenerator:
         if id < rng[1]:
             rngs.append((id + 1, rng[1]))
 
-        self.data[index:index + 1] = rngs
+        self.data[index : index + 1] = rngs
 
         return id
 
     def put(self, value: int) -> None:
-
         size = len(self.data)
 
         for index, rng in enumerate(self.data):
-            if value < rng[0]: 
+            if value < rng[0]:
                 break
-        
+
         else:
             index = size
 
@@ -83,5 +70,5 @@ class RandomIDGenerator:
 
         start = max(0, index - 1)
         end = min(index + 1, size)
-        
+
         self.data[start:end] = rngs

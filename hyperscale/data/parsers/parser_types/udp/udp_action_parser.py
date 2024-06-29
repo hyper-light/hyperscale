@@ -13,33 +13,18 @@ from .udp_action_validator import UDPActionValidator
 
 
 class UDPActionParser(BaseParser):
-
-    def __init__(
-        self,
-        config: Config,
-        options: Dict[str, Any]={}
-    ) -> None:
-        super().__init__(
-            UDPActionParser.__name__,
-            config,
-            RequestTypes.UDP,
-            options
-        )
+    def __init__(self, config: Config, options: Dict[str, Any] = {}) -> None:
+        super().__init__(UDPActionParser.__name__, config, RequestTypes.UDP, options)
 
     async def parse(
-        self, 
-        action_data: Dict[str, Any],
-        stage: str
+        self, action_data: Dict[str, Any], stage: str
     ) -> Coroutine[Any, Any, Coroutine[Any, Any, ActionHook]]:
-
         parsed_data = parse_data(action_data)
         tags_data = parse_tags(action_data)
 
-        generator_action = UDPActionValidator(**{
-            **action_data,
-            'data': parsed_data,
-            'tags': tags_data
-        })
+        generator_action = UDPActionValidator(
+            **{**action_data, "data": parsed_data, "tags": tags_data}
+        )
 
         action = UDPAction(
             generator_action.name,
@@ -47,25 +32,23 @@ class UDPActionParser(BaseParser):
             wait_for_response=generator_action.wait_for_response,
             data=generator_action.data,
             user=generator_action.user,
-            tags=[
-                tag.dict() for tag in generator_action.tags
-            ]
+            tags=[tag.dict() for tag in generator_action.tags],
         )
 
         session = MercuryUDPClient(
             concurrency=self.config.batch_size,
             timeouts=self.timeouts,
             reset_connections=self.config.reset_connections,
-            tracing_session=self.config.tracing
+            tracing_session=self.config.tracing,
         )
 
         await session.prepare(action)
 
         hook = ActionHook(
-            f'{stage}.{generator_action.name}',
+            f"{stage}.{generator_action.name}",
             generator_action.name,
             None,
-            sourcefile=generator_action.sourcefile
+            sourcefile=generator_action.sourcefile,
         )
 
         hook.session = session
@@ -79,8 +62,4 @@ class UDPActionParser(BaseParser):
         hook.metadata.tags = generator_action.tags
         hook.metadata.user = generator_action.user
 
-
         return hook
-
-
-

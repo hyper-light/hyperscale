@@ -62,7 +62,7 @@ class UDPDemux(object):
     """
 
     _forwarding_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    _forwarding_socket.bind(('127.0.0.1', 0))
+    _forwarding_socket.bind(("127.0.0.1", 0))
 
     def __init__(self, datagram_socket):
         """Constructor
@@ -73,8 +73,7 @@ class UDPDemux(object):
         """
 
         if (datagram_socket.type & socket.SOCK_DGRAM) != socket.SOCK_DGRAM:
-            raise InvalidSocketError("datagram_socket is not of " +
-                                     "type SOCK_DGRAM")
+            raise InvalidSocketError("datagram_socket is not of " + "type SOCK_DGRAM")
         try:
             datagram_socket.getsockname()
         except:
@@ -104,11 +103,13 @@ class UDPDemux(object):
 
         if address in self.connections:
             return self.connections[address]
-        
+
         # We need a new datagram socket on a dynamically assigned ephemeral port
-        conn = socket.socket(self._forwarding_socket.family,
-                             self._forwarding_socket.type,
-                             self._forwarding_socket.proto)
+        conn = socket.socket(
+            self._forwarding_socket.family,
+            self._forwarding_socket.type,
+            self._forwarding_socket.proto,
+        )
         conn.bind((self._forwarding_socket.getsockname()[0], 0))
         conn.connect(self._forwarding_socket.getsockname())
         if not address:
@@ -151,10 +152,10 @@ class UDPDemux(object):
         address; otherwise None
         """
 
-        self.payload, self.payload_peer_address = \
-          self.datagram_socket.recvfrom(UDP_MAX_DGRAM_LENGTH)
-        _logger.debug("Received datagram from peer: %s",
-                      self.payload_peer_address)
+        self.payload, self.payload_peer_address = self.datagram_socket.recvfrom(
+            UDP_MAX_DGRAM_LENGTH
+        )
+        _logger.debug("Received datagram from peer: %s", self.payload_peer_address)
         if not self.payload:
             self.payload_peer_address = None
             return
@@ -182,8 +183,11 @@ class UDPDemux(object):
         else:
             conn = self.connections[None]  # propagate exception if not created
             default = True
-        _logger.debug("Forwarding datagram from peer: %s, default: %s",
-                      self.payload_peer_address, default)
+        _logger.debug(
+            "Forwarding datagram from peer: %s, default: %s",
+            self.payload_peer_address,
+            default,
+        )
         self._forwarding_socket.sendto(self.payload, conn.getsockname())
         self.payload = ""
         self.payload_peer_address = None

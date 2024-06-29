@@ -9,29 +9,19 @@ from hyperscale.distributed.discovery.dns.core.record import RecordType
 
 from .exceptions import InvalidHost, InvalidIP
 
-ip_pattern = '(?P<host>[^:/ ]+).?(?P<port>[0-9]*).*'
+ip_pattern = "(?P<host>[^:/ ]+).?(?P<port>[0-9]*).*"
 match_pattern = re.compile(ip_pattern)
 
 
-
 class URL:
-
-
-
-    def __init__(
-        self, 
-        url: str,
-        port: Optional[int]=None
-    ):
-
+    def __init__(self, url: str, port: Optional[int] = None):
         self._default_ports = {
-            'tcp': 53,
-            'udp': 53,
-            'tcps': 853,
-            'http': 80,
-            'https': 443,
+            "tcp": 53,
+            "udp": 53,
+            "tcps": 853,
+            "http": 80,
+            "https": 443,
         }
-        
 
         self.url = url
         self.parsed = urlparse(url)
@@ -44,55 +34,38 @@ class URL:
         self.port = port
 
         if self.host is None:
-            (
-                _,
-                host,
-                _
-            ) = self.parse_netloc()
+            (_, host, _) = self.parse_netloc()
 
             self.host = host
 
         self.is_ssl = False
-        if self.parsed.scheme in ['tcps', 'https', 'msyncs']:
+        if self.parsed.scheme in ["tcps", "https", "msyncs"]:
             self.is_ssl = True
 
-        self.ip_type = self.get_ip_type(
-            self.host
-        )
+        self.ip_type = self.get_ip_type(self.host)
 
         if self.ip_type is None:
-
-            matches = re.search(
-                ip_pattern,
-                self.url
-            )
-            self.host = matches.group('host')
-            self.port = matches.group('port')
+            matches = re.search(ip_pattern, self.url)
+            self.host = matches.group("host")
+            self.port = matches.group("port")
 
             if self.port:
                 self.port = int(self.port)
-        
 
-        if self.port is None or self.port == '':
-            self.port = self._default_ports.get(
-                self.parsed.scheme,
-                80
-            )
+        if self.port is None or self.port == "":
+            self.port = self._default_ports.get(self.parsed.scheme, 80)
 
         self.domain_protocol_map = {
             "tcp": "tcp",
             "udp": "udp",
             "tcps": "tcp",
             "http": "tcp",
-            "https": "tcp"
+            "https": "tcp",
         }
 
-        self.address = (
-            self.host, 
-            self.port
-        )
+        self.address = (self.host, self.port)
 
-        self.is_msync = self.parsed.scheme in ['msync', 'msyncs']
+        self.is_msync = self.parsed.scheme in ["msync", "msyncs"]
 
     def __str__(self):
         return self.url
@@ -108,54 +81,42 @@ class URL:
 
     def copy(self):
         return URL(self.url)
-    
-    def parse_netloc(self):
 
+    def parse_netloc(self):
         authentication: Union[str, None] = None
         port: Union[str, None] = None
 
         host = self.parsed.netloc
 
-        if '@' in host:
-            authentication, host = host.split('@')
+        if "@" in host:
+            authentication, host = host.split("@")
 
-        if ':' in host:
-            host, port = host.split(':')
+        if ":" in host:
+            host, port = host.split(":")
 
         if port:
             port = int(port)
 
-        return (
-            authentication,
-            host,
-            port
-        )
-            
+        return (authentication, host, port)
 
     def to_ptr(self):
         if self.ip_type is RecordType.A:
-            reversed_hostname =  '.'.join(
-                self.parsed.hostname.split('.')[::-1]
-            )
+            reversed_hostname = ".".join(self.parsed.hostname.split(".")[::-1])
 
-            return f'{reversed_hostname}.in-addr.arpa'
-        
+            return f"{reversed_hostname}.in-addr.arpa"
+
         raise InvalidIP(self.parsed.hostname)
-    
-    def get_ip_type(
-        self,
-        hostname: str
-    ):
 
-        if ':' in hostname:
+    def get_ip_type(self, hostname: str):
+        if ":" in hostname:
             # ipv6
             try:
                 socket.inet_pton(socket.AF_INET6, hostname)
             except OSError:
                 raise InvalidHost(hostname)
-            
+
             return RecordType.AAAA
-        
+
         try:
             socket.inet_pton(socket.AF_INET, hostname)
         except OSError:
@@ -164,7 +125,6 @@ class URL:
         else:
             return RecordType.A
 
-    
     @property
     def domain_protocol(self):
         return self.domain_protocol_map.get(self.parsed.scheme, "udp")

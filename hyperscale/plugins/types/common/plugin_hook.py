@@ -3,12 +3,11 @@ from .types import PluginHooks
 
 
 class PluginHook:
-
     def __init__(
-        self, 
-        name: str, 
+        self,
+        name: str,
         shortname: str,
-        call: Coroutine, 
+        call: Coroutine,
         plugin: str = None,
         hook_type=PluginHooks.CUSTOM,
     ) -> None:

@@ -53,7 +53,7 @@ async def cancel_pending(pend: asyncio.Task):
         return invalid_state
 
 
-def _guard_result(result: asyncio.Task):
+def guard_result(result: asyncio.Task):
     try:
         return result.result()
 
@@ -476,11 +476,11 @@ class WorkflowRunner:
 
         [
             workflow_results_set[result.get_name()].append(
-                _guard_result(result),
+                guard_result(result),
             )
             for complete in completed
             for result in complete.result()
-            if _guard_result(result) is not None
+            if guard_result(result) is not None
         ]
 
         workflow_results = WorkflowResults(hooks)
@@ -523,9 +523,7 @@ class WorkflowRunner:
             ]
         )
 
-        return {
-            result.get_name(): _guard_result(result) for result in execution_results
-        }
+        return {result.get_name(): guard_result(result) for result in execution_results}
 
     async def _spawn_vu(
         self,

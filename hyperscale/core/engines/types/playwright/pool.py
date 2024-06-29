@@ -3,18 +3,12 @@ from .context_config import ContextConfig
 
 
 class ContextPool:
-
-    __slots__ = (
-        'size',
-        'group_size',
-        'group_count',
-        'contexts'
-    )
+    __slots__ = ("size", "group_size", "group_count", "contexts")
 
     def __init__(self, pool_size, group_size) -> None:
         self.size = pool_size
         self.group_size = group_size
-        self.groups_count = int(pool_size/group_size)
+        self.groups_count = int(pool_size / group_size)
         self.contexts = []
 
     def __iter__(self):
@@ -27,8 +21,6 @@ class ContextPool:
 
     def create_pool(self, config: ContextConfig):
         self.contexts = [
-            ContextGroup(
-                **config.data,
-                concurrency=self.group_size
-            ) for _ in range(self.groups_count)
+            ContextGroup(**config.data, concurrency=self.group_size)
+            for _ in range(self.groups_count)
         ]

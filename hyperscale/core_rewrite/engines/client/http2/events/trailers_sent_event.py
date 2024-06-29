@@ -2,7 +2,7 @@ from .headers_sent_event import HeadersSent
 
 
 class TrailersSent(HeadersSent):
-    event_type='TRAILERS_SENT'
+    event_type = "TRAILERS_SENT"
     """
     The _TrailersSent event is fired whenever trailers are sent on a
     stream. Trailers are a set of headers sent after the body of the

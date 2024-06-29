@@ -1,10 +1,5 @@
 from typing import Optional, Tuple
-from pydantic import (
-    BaseModel, 
-    StrictStr, 
-    StrictInt,
-    StrictBool
-)
+from pydantic import BaseModel, StrictStr, StrictInt, StrictBool
 
 
 class EventHookValidator(BaseModel):

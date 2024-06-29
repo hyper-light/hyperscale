@@ -49,7 +49,7 @@ Action = Union[
     PlaywrightCommand,
     Task,
     UDPAction,
-    WebsocketAction
+    WebsocketAction,
 ]
 
 
@@ -63,13 +63,11 @@ Result = Union[
     PlaywrightResult,
     TaskResult,
     UDPResult,
-    WebsocketResult
+    WebsocketResult,
 ]
 
 
-
 class Serializer:
-
     def __init__(self) -> None:
         self._serializers: Dict[
             str,
@@ -85,9 +83,9 @@ class Serializer:
                     PlaywrightSerializer,
                     TaskSerializer,
                     UDPSerializer,
-                    WebsocketSerializer
-                ]
-            ]
+                    WebsocketSerializer,
+                ],
+            ],
         ] = {
             RequestTypes.GRAPHQL: lambda: GraphQLSerializer(),
             RequestTypes.GRAPHQL_HTTP2: lambda: GraphQLHTTP2Serializer(),
@@ -98,7 +96,7 @@ class Serializer:
             RequestTypes.PLAYWRIGHT: lambda: PlaywrightSerializer(),
             RequestTypes.TASK: lambda: TaskSerializer(),
             RequestTypes.UDP: lambda: UDPSerializer(),
-            RequestTypes.WEBSOCKET: lambda: WebsocketSerializer()
+            RequestTypes.WEBSOCKET: lambda: WebsocketSerializer(),
         }
 
         self._active_serializers: Dict[
@@ -113,14 +111,11 @@ class Serializer:
                 PlaywrightSerializer,
                 TaskSerializer,
                 UDPSerializer,
-                WebsocketSerializer
-            ] 
+                WebsocketSerializer,
+            ],
         ] = {}
 
-    def serialize_action(
-        self,
-        hook: Union[ActionHook, TaskHook]
-    ):
+    def serialize_action(self, hook: Union[ActionHook, TaskHook]):
         action: Action = hook.action
         serializer = self._active_serializers.get(action.type)
 
@@ -132,62 +127,59 @@ class Serializer:
         serializable_hook = hook.to_dict()
         serializable_client_config = hook.session.config_to_dict()
 
-        return dill.dumps({
-            'hook': serializable_hook,
-            'action': serializable_action,
-            'client_config': serializable_client_config
-        })
-    
-    def deserialize_action(
-        self,
-        serialized_hook: Union[str, bytes]
-    ):
+        return dill.dumps(
+            {
+                "hook": serializable_hook,
+                "action": serializable_action,
+                "client_config": serializable_client_config,
+            }
+        )
+
+    def deserialize_action(self, serialized_hook: Union[str, bytes]):
         deserialized_hook: Dict[str, Any] = dill.loads(serialized_hook)
 
-        deserialized_hook_config = deserialized_hook.get('hook', {})
-        deserialized_action: Dict[str, Any] = deserialized_hook.get('action', {})
-        deserialized_client_config = deserialized_hook.get('client_config', {})
+        deserialized_hook_config = deserialized_hook.get("hook", {})
+        deserialized_action: Dict[str, Any] = deserialized_hook.get("action", {})
+        deserialized_client_config = deserialized_hook.get("client_config", {})
 
-        action_type = deserialized_action.get('type', RequestTypes.HTTP)
+        action_type = deserialized_action.get("type", RequestTypes.HTTP)
 
         serializer = self._active_serializers.get(action_type)
-    
+
         if serializer is None and action_type in self._serializers:
             serializer = self._serializers.get(action_type)()
             self._active_serializers[action_type] = serializer
 
         if action_type == RequestTypes.TASK:
-
             action_hook = TaskHook(
-                deserialized_hook_config.get('name'),
-                deserialized_hook_config.get('shortname'),
+                deserialized_hook_config.get("name"),
+                deserialized_hook_config.get("shortname"),
                 None,
-                *deserialized_hook_config.get('names', []),
-                weight=deserialized_hook_config.get('weight'),
-                order=deserialized_hook_config.get('order'),
-                skip=deserialized_hook_config.get('skip'),
+                *deserialized_hook_config.get("names", []),
+                weight=deserialized_hook_config.get("weight"),
+                order=deserialized_hook_config.get("order"),
+                skip=deserialized_hook_config.get("skip"),
                 metadata={
-                    'user': deserialized_hook_config.get('user'),
-                    'tags': deserialized_hook_config.get('tags')
-                }
+                    "user": deserialized_hook_config.get("user"),
+                    "tags": deserialized_hook_config.get("tags"),
+                },
             )
 
             action = serializer.deserialize_task(deserialized_action)
-        
-        else:
 
+        else:
             action_hook = ActionHook(
-                deserialized_hook_config.get('name'),
-                deserialized_hook_config.get('shortname'),
+                deserialized_hook_config.get("name"),
+                deserialized_hook_config.get("shortname"),
                 None,
-                *deserialized_hook_config.get('names', []),
-                weight=deserialized_hook_config.get('weight'),
-                order=deserialized_hook_config.get('order'),
-                skip=deserialized_hook_config.get('skip'),
+                *deserialized_hook_config.get("names", []),
+                weight=deserialized_hook_config.get("weight"),
+                order=deserialized_hook_config.get("order"),
+                skip=deserialized_hook_config.get("skip"),
                 metadata={
-                    'user': deserialized_hook_config.get('user'),
-                    'tags': deserialized_hook_config.get('tags')
-                }
+                    "user": deserialized_hook_config.get("user"),
+                    "tags": deserialized_hook_config.get("tags"),
+                },
             )
 
             action = serializer.deserialize_action(deserialized_action)
@@ -198,11 +190,8 @@ class Serializer:
         action_hook.session = session
 
         return action_hook
-    
-    def serialize_result(
-        self,
-        result: Result
-    ):
+
+    def serialize_result(self, result: Result):
         serializer = self._active_serializers.get(result.type)
 
         if serializer is None and result.type in self._serializers:
@@ -212,17 +201,14 @@ class Serializer:
         serializable = serializer.result_to_serializable(result)
 
         return dill.dumps(serializable)
-    
-    def deserialize_result(
-        self,
-        serialized_result: Union[str, bytes]
-    ) -> Result:
+
+    def deserialize_result(self, serialized_result: Union[str, bytes]) -> Result:
         deserialized_result: Dict[str, Any] = dill.loads(serialized_result)
 
-        result_type = deserialized_result.get('type', RequestTypes.HTTP)
+        result_type = deserialized_result.get("type", RequestTypes.HTTP)
 
         serializer = self._active_serializers.get(result_type)
-    
+
         if serializer is None and result_type in self._serializers:
             serializer = self._serializers.get(result_type)()
             self._active_serializers[result_type] = serializer

@@ -2,16 +2,11 @@ import asyncio
 from typing import List
 from aiologger.levels import LogLevel
 from .spinner import ProgressText
-from .logger_types import (
-    LoggerTypes,
-    LoggerTypesMap
-)
+from .logger_types import LoggerTypes, LoggerTypesMap
 
 
 class LoggingManager:
-
     def __init__(self) -> None:
-
         self.logger_types = LoggerTypesMap()
         self.enabled_loggers = {}
 
@@ -19,17 +14,17 @@ class LoggingManager:
             self.enabled_loggers[logger_type] = True
 
         self.log_levels = {
-            'info': LogLevel.INFO,
-            'debug': LogLevel.DEBUG,
-            'error': LogLevel.ERROR,
-            'warning': LogLevel.WARNING,
-            'warn': LogLevel.WARN,
-            'critical': LogLevel.CRITICAL,
-            'fatal': LogLevel.FATAL
+            "info": LogLevel.INFO,
+            "debug": LogLevel.DEBUG,
+            "error": LogLevel.ERROR,
+            "warning": LogLevel.WARNING,
+            "warn": LogLevel.WARN,
+            "critical": LogLevel.CRITICAL,
+            "fatal": LogLevel.FATAL,
         }
 
         self.log_level = LogLevel.INFO
-        self.log_level_name = 'info'
+        self.log_level_name = "info"
         self.logfiles_directory = None
         self.progress_display = ProgressText()
 
@@ -50,12 +45,16 @@ class LoggingManager:
 
     def list_enabled(self):
         return [
-            logger_type for logger_type, logger_enabled in self.enabled_loggers.items() if logger_enabled
+            logger_type
+            for logger_type, logger_enabled in self.enabled_loggers.items()
+            if logger_enabled
         ]
 
     def list_disabled(self):
         return [
-            logger_type for logger_type, logger_enabled in self.enabled_loggers.items() if not logger_enabled
+            logger_type
+            for logger_type, logger_enabled in self.enabled_loggers.items()
+            if not logger_enabled
         ]
 
     def list_enabled_type_names(self):

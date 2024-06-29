@@ -17,35 +17,26 @@ from .http3_action_validator import HTTP3ActionValidator
 
 
 class HTTP3ActionParser(BaseParser):
-
-    def __init__(
-        self,
-        config: Config,
-        options: Dict[str, Any]={}
-    ) -> None:
+    def __init__(self, config: Config, options: Dict[str, Any] = {}) -> None:
         super().__init__(
-            HTTP3ActionParser.__name__,
-            config,
-            RequestTypes.HTTP3,
-            options
+            HTTP3ActionParser.__name__, config, RequestTypes.HTTP3, options
         )
 
     async def parse(
-        self, 
-        action_data: Dict[str, Any],
-        stage: str
+        self, action_data: Dict[str, Any], stage: str
     ) -> Coroutine[Any, Any, Coroutine[Any, Any, ActionHook]]:
-        
         normalized_headers = normalize_headers(action_data)
         parsed_data = parse_data(action_data)
         tags_data = parse_tags(action_data)
 
-        generator_action = HTTP3ActionValidator(**{
-            **action_data,
-            'headers': normalized_headers,
-            'data': parsed_data,
-            'tags': tags_data
-        })
+        generator_action = HTTP3ActionValidator(
+            **{
+                **action_data,
+                "headers": normalized_headers,
+                "data": parsed_data,
+                "tags": tags_data,
+            }
+        )
 
         action = HTTP3Action(
             generator_action.name,
@@ -54,22 +45,20 @@ class HTTP3ActionParser(BaseParser):
             headers=generator_action.headers,
             data=generator_action.data,
             user=generator_action.user,
-            tags=[
-                tag.dict() for tag in generator_action.tags
-            ]
+            tags=[tag.dict() for tag in generator_action.tags],
         )
 
         session = MercuryHTTP3Client(
             concurrency=self.config.batch_size,
             timeouts=self.timeouts,
             reset_connections=self.config.reset_connections,
-            tracing_session=self.config.tracing
+            tracing_session=self.config.tracing,
         )
 
         await session.prepare(action)
 
         hook = ActionHook(
-            f'{stage}.{generator_action.name}',
+            f"{stage}.{generator_action.name}",
             generator_action.name,
             None,
             sourcefile=generator_action.sourcefile,
@@ -87,6 +76,3 @@ class HTTP3ActionParser(BaseParser):
         hook.metadata.user = generator_action.user
 
         return hook
-
-
-

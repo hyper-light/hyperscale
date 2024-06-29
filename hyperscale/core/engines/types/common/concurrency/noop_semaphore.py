@@ -1,11 +1,11 @@
 """Synchronization primitives."""
 
-__all__ = ('Lock', 'Event', 'Condition', 'Semaphore',
-           'BoundedSemaphore', 'Barrier')
+__all__ = ("Lock", "Event", "Condition", "Semaphore", "BoundedSemaphore", "Barrier")
 
 import collections
 from asyncio import exceptions
 from asyncio import mixins
+
 
 class _ContextManagerMixin:
     async def __aenter__(self):
@@ -15,6 +15,7 @@ class _ContextManagerMixin:
 
     async def __aexit__(self, exc_type, exc, tb):
         pass
+
 
 class NoOpSemaphore(_ContextManagerMixin, mixins._LoopBoundMixin):
     """A Semaphore implementation.

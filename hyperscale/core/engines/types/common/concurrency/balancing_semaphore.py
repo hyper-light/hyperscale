@@ -1,11 +1,11 @@
 """Synchronization primitives."""
 
-__all__ = ('Lock', 'Event', 'Condition', 'Semaphore',
-           'BoundedSemaphore', 'Barrier')
+__all__ = ("Lock", "Event", "Condition", "Semaphore", "BoundedSemaphore", "Barrier")
 
 import collections
 from asyncio import exceptions
 from asyncio import mixins
+
 
 class _ContextManagerMixin:
     async def __aenter__(self):
@@ -17,15 +17,9 @@ class _ContextManagerMixin:
     async def __aexit__(self, exc_type, exc, tb):
         self.release()
 
-class BalancingSemaphore(_ContextManagerMixin, mixins._LoopBoundMixin):
 
-    __slots__ = (
-        '_value',
-        '_slots',
-        '_waiters',
-        '_busy',
-        '_wakeup_scheduled'
-    )
+class BalancingSemaphore(_ContextManagerMixin, mixins._LoopBoundMixin):
+    __slots__ = ("_value", "_slots", "_waiters", "_busy", "_wakeup_scheduled")
 
     """A Semaphore implementation.
     A semaphore manages an internal counter which is decremented by each
@@ -49,10 +43,10 @@ class BalancingSemaphore(_ContextManagerMixin, mixins._LoopBoundMixin):
 
     def __repr__(self):
         res = super().__repr__()
-        extra = 'locked' if self.locked() else f'unlocked, value:{self._value}'
+        extra = "locked" if self.locked() else f"unlocked, value:{self._value}"
         if self._waiters:
-            extra = f'{extra}, waiters:{len(self._waiters)}'
-        return f'<{res[1:-1]} [{extra}]>'
+            extra = f"{extra}, waiters:{len(self._waiters)}"
+        return f"<{res[1:-1]} [{extra}]>"
 
     def _wake_up_next(self, min_idx: int):
         while self._waiters[min_idx]:
@@ -78,7 +72,7 @@ class BalancingSemaphore(_ContextManagerMixin, mixins._LoopBoundMixin):
         # but its acquire() is not resumed yet
 
         # Find the line with the smalles number of futures waiting. Assign
-            # to that queue
+        # to that queue
         min_queue = min(self._busy)
         min_idx = self._busy.index(min_queue)
 
@@ -94,7 +88,7 @@ class BalancingSemaphore(_ContextManagerMixin, mixins._LoopBoundMixin):
             except exceptions.CancelledError:
                 self._wake_up_next(min_idx)
                 raise
-        
+
         # A line now has waiters.
         self._busy[min_idx] += 1
 

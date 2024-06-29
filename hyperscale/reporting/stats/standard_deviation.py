@@ -1,13 +1,9 @@
 import math
-from .variance import (
-    Variance
-)
+from .variance import Variance
+
 
 class StandardDeviation:
-
-    __slots__ = (
-        'variance'
-    )
+    __slots__ = "variance"
 
     def __init__(self):
         self.variance = Variance()

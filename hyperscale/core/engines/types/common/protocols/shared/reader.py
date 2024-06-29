@@ -5,18 +5,17 @@ from .constants import _DEFAULT_LIMIT
 
 
 class Reader:
-
     _source_traceback = None
     __slots__ = (
-        '_limit',
-        '_loop',
-        '_buffer',
-        '_eof',
-        '_waiter',
-        '_exception',
-        '_transport',
-        '_paused',
-        '__weakref__'
+        "_limit",
+        "_loop",
+        "_buffer",
+        "_eof",
+        "_waiter",
+        "_exception",
+        "_transport",
+        "_paused",
+        "__weakref__",
     )
 
     def __init__(self, limit=_DEFAULT_LIMIT, loop=None):
@@ -24,7 +23,7 @@ class Reader:
         # it also doubles as half the buffer limit.
 
         if limit <= 0:
-            raise ValueError('Limit cannot be <= 0')
+            raise ValueError("Limit cannot be <= 0")
 
         self._limit = limit
         if loop is None:
@@ -33,7 +32,7 @@ class Reader:
             self._loop: AbstractEventLoop = loop
 
         self._buffer = bytearray()
-        self._eof = False    # Whether we're done.
+        self._eof = False  # Whether we're done.
         self._waiter: Future = None  # A future used by _wait_for_data()
         self._exception = None
         self._transport: Transport = None
@@ -74,20 +73,24 @@ class Reader:
         return self._eof and not self._buffer
 
     def feed_data(self, data):
-        assert not self._eof, 'feed_data after feed_eof'
+        assert not self._eof, "feed_data after feed_eof"
 
         if not data:
             return
 
         self._buffer.extend(data)
-        
+
         waiter = self._waiter
         if waiter is not None:
             self._waiter = None
             if not waiter.cancelled():
                 waiter.set_result(None)
 
-        if self._transport and self._paused == False and len(self._buffer) > 2 * self._limit:
+        if (
+            self._transport
+            and self._paused == False
+            and len(self._buffer) > 2 * self._limit
+        ):
             try:
                 self._transport.pause_reading()
             except NotImplementedError:
@@ -108,11 +111,11 @@ class Reader:
         # which coroutine would get the next data.
         if self._waiter:
             raise RuntimeError(
-                f'{func_name}() called while another coroutine is '
-                f'already waiting for incoming data'
+                f"{func_name}() called while another coroutine is "
+                f"already waiting for incoming data"
             )
 
-        assert not self._eof, '_wait_for_data after EOF'
+        assert not self._eof, "_wait_for_data after EOF"
 
         # Waiting for data while paused will make deadlock, so prevent it.
         # This is essential for readexactly(n) for case when n > self._limit.
@@ -127,23 +130,21 @@ class Reader:
             self._waiter = None
 
     async def read(self, n=-1):
-
         if not self._buffer and not self._eof:
-            await self._wait_for_data('read')
+            await self._wait_for_data("read")
 
         data = bytes(self._buffer[:n])
         del self._buffer[:n]
 
         self._maybe_resume_transport()
         return data
-    
-    async def readline_fast(self, sep=b'\n'):
+
+    async def readline_fast(self, sep=b"\n"):
         seplen = len(sep)
         if self._exception is not None:
             raise self._exception
-        
-        if not self._buffer:
 
+        if not self._buffer:
             if self._paused:
                 self._paused = False
                 self._transport.resume_reading()
@@ -160,13 +161,12 @@ class Reader:
             self._buffer.clear()
             return chunk
 
-
-        chunk = self._buffer[:isep + seplen]
-        del self._buffer[:isep + seplen]
+        chunk = self._buffer[: isep + seplen]
+        del self._buffer[: isep + seplen]
         self._maybe_resume_transport()
         return bytes(chunk)
 
-    async def readuntil(self, separator=b'\n'):
+    async def readuntil(self, separator=b"\n"):
         """Read data from the stream until ``separator`` is found.
         On success, the data and separator will be removed from the
         internal buffer (consumed). Returned data will include the
@@ -227,8 +227,8 @@ class Reader:
                 offset = buflen + 1 - seplen
                 if offset > self._limit:
                     raise LimitOverrunError(
-                        'Separator is not found, and chunk exceed the limit',
-                        offset)
+                        "Separator is not found, and chunk exceed the limit", offset
+                    )
 
             # Complete message (with full separator) may be present in buffer
             # even when EOF flag is set. This may happen when the last chunk
@@ -237,22 +237,23 @@ class Reader:
             if self._eof:
                 chunk = bytes(self._buffer)
                 self._buffer.clear()
-                raise Exception('Connection closed.')
+                raise Exception("Connection closed.")
 
             # _wait_for_data() will resume reading if stream was paused.
             if not self._buffer:
-                await self._wait_for_data('readuntil')
+                await self._wait_for_data("readuntil")
 
         if isep > self._limit:
             raise LimitOverrunError(
-                'Separator is found, but chunk is longer than limit', isep)
+                "Separator is found, but chunk is longer than limit", isep
+            )
 
-        chunk = self._buffer[:isep + seplen]
-        del self._buffer[:isep + seplen]
+        chunk = self._buffer[: isep + seplen]
+        del self._buffer[: isep + seplen]
         self._maybe_resume_transport()
         return bytes(chunk)
 
-    async def read_headers(self, separator=b'\n'):
+    async def read_headers(self, separator=b"\n"):
         """Read data from the stream until ``separator`` is found.
         On success, the data and separator will be removed from the
         internal buffer (consumed). Returned data will include the
@@ -272,12 +273,10 @@ class Reader:
         seplen = len(separator)
 
         while True:
-
             if self._exception is not None:
                 raise self._exception
-            
-            if not self._buffer:
 
+            if not self._buffer:
                 if self._paused:
                     self._paused = False
                     self._transport.resume_reading()
@@ -294,21 +293,21 @@ class Reader:
                 self._buffer.clear()
 
             else:
-                chunk = bytes(self._buffer[:isep + seplen])
-                del self._buffer[:isep + seplen]
+                chunk = bytes(self._buffer[: isep + seplen])
+                del self._buffer[: isep + seplen]
                 self._maybe_resume_transport()
 
-            if b':' not in chunk:
+            if b":" not in chunk:
                 break
-            
-            decoded = chunk.strip().split(b':',1)
+
+            decoded = chunk.strip().split(b":", 1)
 
             key, value = decoded
             headers[bytes(key).lower()] = value.strip()
-            
+
         return headers
 
-    async def iter_headers(self, separator=b'\n'):
+    async def iter_headers(self, separator=b"\n"):
         """Read data from the stream until ``separator`` is found.
         On success, the data and separator will be removed from the
         internal buffer (consumed). Returned data will include the
@@ -327,12 +326,10 @@ class Reader:
         seplen = len(separator)
 
         while True:
-
             if self._exception is not None:
                 raise self._exception
-            
-            if not self._buffer:
 
+            if not self._buffer:
                 if self._paused:
                     self._paused = False
                     self._transport.resume_reading()
@@ -349,14 +346,14 @@ class Reader:
                 self._buffer.clear()
 
             else:
-                chunk = bytes(self._buffer[:isep + seplen])
-                del self._buffer[:isep + seplen]
+                chunk = bytes(self._buffer[: isep + seplen])
+                del self._buffer[: isep + seplen]
                 self._maybe_resume_transport()
 
-            if b':' not in chunk:
+            if b":" not in chunk:
                 break
-            
-            decoded = chunk.strip().split(b':',1)
+
+            decoded = chunk.strip().split(b":", 1)
 
             key, value = decoded
             yield key.lower(), value, chunk
@@ -367,6 +364,6 @@ class Reader:
 
     async def __anext__(self):
         val = await self.readuntil()
-        if val == b'':
+        if val == b"":
             raise StopAsyncIteration
         return val

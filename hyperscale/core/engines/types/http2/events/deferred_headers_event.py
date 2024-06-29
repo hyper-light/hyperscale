@@ -8,17 +8,17 @@ from .base_event import BaseEvent
 # Parsing headers mid load-test is *expensive* so we want to defer
 # this work until later.
 class DeferredHeaders(BaseEvent):
-    event_type='DEFERRED_HEADERS'
+    event_type = "DEFERRED_HEADERS"
 
     __slots__ = (
-        'stream_id',
-        'hpack_table',
-        'raw_headers',
-        'stream_ended',
-        'end_stream',
-        'priority',
-        'encoding',
-        'priority_updated'
+        "stream_id",
+        "hpack_table",
+        "raw_headers",
+        "stream_ended",
+        "end_stream",
+        "priority",
+        "encoding",
+        "priority_updated",
     )
 
     def __init__(self, encoder: Encoder, frame, encoding: Union[str, None]) -> None:
@@ -27,8 +27,8 @@ class DeferredHeaders(BaseEvent):
         self.hpack_table = encoder.header_table
         self.raw_headers = frame.data
         self.stream_ended = None
-        self.end_stream = 'END_STREAM' in frame.flags
-        self.priority = 'PRIORITY' in frame.flags
+        self.end_stream = "END_STREAM" in frame.flags
+        self.priority = "PRIORITY" in frame.flags
         self.encoding = encoding
         self.priority_updated = None
 
@@ -50,10 +50,8 @@ class DeferredHeaders(BaseEvent):
             if k == b":status":
                 status_code = int(v.decode("ascii", errors="ignore"))
             elif k.startswith(b":"):
-                headers_dict[k.strip(b':')] = v
+                headers_dict[k.strip(b":")] = v
             else:
                 headers_dict[k] = v
-        
-        return status_code, headers_dict
 
-    
+        return status_code, headers_dict

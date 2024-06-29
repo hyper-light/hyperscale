@@ -21,6 +21,7 @@ from .s3_connector_config import S3ConnectorConfig
 
 try:
     import boto3
+
     has_connector = True
 
 except Exception:
@@ -29,27 +30,24 @@ except Exception:
 
 
 def handle_loop_stop(
-    signame, 
-    executor: ThreadPoolExecutor, 
-    loop: asyncio.AbstractEventLoop
-): 
+    signame, executor: ThreadPoolExecutor, loop: asyncio.AbstractEventLoop
+):
     try:
-        executor.shutdown(wait=False, cancel_futures=True) 
+        executor.shutdown(wait=False, cancel_futures=True)
         loop.stop()
     except Exception:
         pass
 
 
 class S3Connector:
-    connector_type=ConnectorType.S3
+    connector_type = ConnectorType.S3
 
     def __init__(
-        self, 
+        self,
         config: S3ConnectorConfig,
         stage: str,
         parser_config: Config,
     ) -> None:
-        
         self.aws_access_key_id = config.aws_access_key_id
         self.aws_secret_access_key = config.aws_secret_access_key
         self.region_name = config.region_name
@@ -71,107 +69,93 @@ class S3Connector:
         self.parser = Parser()
 
     async def connect(self):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connecting to AWS S3 - Region: {self.region_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connecting to AWS S3 - Region: {self.region_name}"
+        )
 
-        for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+        for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
             self._loop.add_signal_handler(
                 getattr(signal, signame),
                 lambda signame=signame: handle_loop_stop(
-                    signame,
-                    self._executor,
-                    self._loop
-                )
+                    signame, self._executor, self._loop
+                ),
             )
 
         self.client = await self._loop.run_in_executor(
             self._executor,
             functools.partial(
                 boto3.client,
-                's3',
+                "s3",
                 aws_access_key_id=self.aws_access_key_id,
                 aws_secret_access_key=self.aws_secret_access_key,
-                region_name=self.region_name
-            )
+                region_name=self.region_name,
+            ),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connected to AWS S3 - Region: {self.region_name}')
-    
-    async def load_execute_stage_summary(
-        self,
-        options: Dict[str, Any]={}
-    ) -> Coroutine[Any, Any, ExecuteStageSummaryValidator]:
-        execute_stage_summary = await self.load_data(
-            options=options
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connected to AWS S3 - Region: {self.region_name}"
         )
-        
+
+    async def load_execute_stage_summary(
+        self, options: Dict[str, Any] = {}
+    ) -> Coroutine[Any, Any, ExecuteStageSummaryValidator]:
+        execute_stage_summary = await self.load_data(options=options)
+
         return ExecuteStageSummaryValidator(**execute_stage_summary)
 
     async def load_actions(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[ActionHook]]:
-        actions = await self.load_data(
-            options=options
-        )
+        actions = await self.load_data(options=options)
 
-        return await asyncio.gather(*[
-            self.parser.parse_action(
-                action_data,
-                self.stage,
-                self.parser_config,
-                options
-            ) for action_data in actions
-        ])
-    
-    async def load_results(
-        self,
-        options: Dict[str, Any]={}
-    ) -> Coroutine[Any, Any, ResultsSet]:
-        results = await self.load_data(
-            options=options
-        )
-
-        return ResultsSet({
-            'stage_results': await asyncio.gather(*[
-                self.parser.parse_result(
-                    results_data,
-                    self.stage,
-                    self.parser_config,
-                    options
-                ) for results_data in results
-            ])
-        })
-    
-    async def load_data(
-        self, 
-        options: Dict[str, Any]={}
-    ) -> Coroutine[Any, Any, List[Dict[str, Any]]]:
-        keys_data: Dict[str, List[Dict[str, Any]] ] = await self._loop.run_in_executor(
-            self._executor,        
-            functools.partial(
-                self.client.list_objects_v2,
-                Bucket=self.bucket_name
-            )
-        )
-
-        keys: List[str] = [
-            item.get('Key') for item in keys_data.get('Contents')
-        ]
-
-        return await asyncio.gather(*[
-            self._loop.run_in_executor(
-                self._executor,
-                functools.partial(
-                    self.client.get_object,
-                    Bucket=self.bucket_name,
-                    Key=key
-                    
+        return await asyncio.gather(
+            *[
+                self.parser.parse_action(
+                    action_data, self.stage, self.parser_config, options
                 )
-            ) for key in keys
-        ])
-    
-    async def close(self):
-        self._executor.shutdown(
-            wait=False, 
-            cancel_futures=True
+                for action_data in actions
+            ]
         )
+
+    async def load_results(
+        self, options: Dict[str, Any] = {}
+    ) -> Coroutine[Any, Any, ResultsSet]:
+        results = await self.load_data(options=options)
+
+        return ResultsSet(
+            {
+                "stage_results": await asyncio.gather(
+                    *[
+                        self.parser.parse_result(
+                            results_data, self.stage, self.parser_config, options
+                        )
+                        for results_data in results
+                    ]
+                )
+            }
+        )
+
+    async def load_data(
+        self, options: Dict[str, Any] = {}
+    ) -> Coroutine[Any, Any, List[Dict[str, Any]]]:
+        keys_data: Dict[str, List[Dict[str, Any]]] = await self._loop.run_in_executor(
+            self._executor,
+            functools.partial(self.client.list_objects_v2, Bucket=self.bucket_name),
+        )
+
+        keys: List[str] = [item.get("Key") for item in keys_data.get("Contents")]
+
+        return await asyncio.gather(
+            *[
+                self._loop.run_in_executor(
+                    self._executor,
+                    functools.partial(
+                        self.client.get_object, Bucket=self.bucket_name, Key=key
+                    ),
+                )
+                for key in keys
+            ]
+        )
+
+    async def close(self):
+        self._executor.shutdown(wait=False, cancel_futures=True)

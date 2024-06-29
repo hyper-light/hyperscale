@@ -13,17 +13,16 @@ from hyperscale.core.engines.types.websocket import (
 from .base_client import BaseClient
 
 
-class WebsocketClient(BaseClient[MercuryWebsocketClient, WebsocketAction, WebsocketResult]):
-
+class WebsocketClient(
+    BaseClient[MercuryWebsocketClient, WebsocketAction, WebsocketResult]
+):
     def __init__(self, config: Config) -> None:
         super().__init__()
 
         self.session = MercuryWebsocketClient(
             concurrency=config.batch_size,
-            timeouts=Timeouts(
-                total_timeout=config.request_timeout
-            ),
-            reset_connections=config.reset_connections
+            timeouts=Timeouts(total_timeout=config.request_timeout),
+            reset_connections=config.reset_connections,
         )
         self.request_type = RequestTypes.WEBSOCKET
         self.client_type = self.request_type.capitalize()
@@ -36,42 +35,40 @@ class WebsocketClient(BaseClient[MercuryWebsocketClient, WebsocketAction, Websoc
         return self.session.registered.get(key)
 
     async def listen(
-        self, 
-        url: str, 
-        headers: Dict[str, str] = {}, 
-        user: str = None, 
-        tags: List[Dict[str, str]] = []  
+        self,
+        url: str,
+        headers: Dict[str, str] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
     ):
-
         request = WebsocketAction(
             self.next_name,
             url,
-            method='GET',
+            method="GET",
             headers=headers,
             data=None,
             user=user,
-            tags=tags
+            tags=tags,
         )
 
         return await self._execute_action(request)
 
     async def send(
-        self, 
-        url: str, 
-        headers: Dict[str, str] = {}, 
-        data: Any = None, 
-        user: str = None, 
-        tags: List[Dict[str, str]] = []
+        self,
+        url: str,
+        headers: Dict[str, str] = {},
+        data: Any = None,
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
     ):
-
         request = WebsocketAction(
             self.next_name,
             url,
-            method='POST',
+            method="POST",
             headers=headers,
             data=data,
             user=user,
-            tags=tags
+            tags=tags,
         )
 
         return await self._execute_action(request)

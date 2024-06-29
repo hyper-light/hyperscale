@@ -9,5 +9,5 @@ from pydantic import (
 
 
 class SelectTextCommand(BaseModel):
-    force: Optional[StrictBool]=None
+    force: Optional[StrictBool] = None
     timeout: StrictInt | StrictFloat

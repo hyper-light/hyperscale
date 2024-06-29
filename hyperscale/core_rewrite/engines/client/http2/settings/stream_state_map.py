@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class StreamStateMap(Enum):
     SEND_HEADERS = 0
     SEND_PUSH_PROMISE = 1

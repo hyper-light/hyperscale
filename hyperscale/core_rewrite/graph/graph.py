@@ -94,7 +94,7 @@ class Graph:
         self._workflow_traversal_order: List[
             Dict[
                 str,
-                Hook,
+                Workflow,
             ]
         ] = []
 
@@ -264,10 +264,12 @@ class Graph:
                 for name, value in context[provider].items()
             }
 
-        await asyncio.gather(*[hook.call(**hook.context_args) for hook in use_actions])
+        results = await asyncio.gather(
+            *[hook.call(**hook.context_args) for hook in use_actions]
+        )
 
         await asyncio.gather(
-            *[context[workflow].set(hook.name, hook.result) for hook in use_actions]
+            *[context[workflow].set(hook_name, result) for hook_name, result in results]
         )
 
         return context
@@ -288,6 +290,7 @@ class Graph:
         if len(provide_actions) < 1:
             return context
 
+        hook_targets: Dict[str, Hook] = {}
         for hook in provide_actions:
             hook.context_args = {
                 name: value for name, value in context[workflow].items()
@@ -295,15 +298,17 @@ class Graph:
 
             hook.context_args.update(results)
 
-        await asyncio.gather(
+            hook_targets[hook.name] = hook.workflows
+
+        context_results = await asyncio.gather(
             *[hook.call(**hook.context_args) for hook in provide_actions]
         )
 
         await asyncio.gather(
             *[
-                context[target].set(hook.name, hook.result)
-                for hook in provide_actions
-                for target in hook.workflows
+                context[target].set(hook_name, result)
+                for hook_name, result in context_results
+                for target in hook_targets[hook_name]
             ]
         )
 

@@ -15,13 +15,13 @@ from hyperscale.core.hooks.types.task.event import TaskEvent
 from hyperscale.core.hooks.types.transform.event import TransformEvent
 
 HedraEvent = Union[
-    Event, 
-    TransformEvent, 
-    ConditionEvent, 
-    ContextEvent, 
-    SaveEvent, 
-    LoadEvent, 
-    CheckEvent
+    Event,
+    TransformEvent,
+    ConditionEvent,
+    ContextEvent,
+    SaveEvent,
+    LoadEvent,
+    CheckEvent,
 ]
 
 
@@ -37,10 +37,7 @@ def get_event(target: Hook, source: Hook) -> HedraEvent:
         HookType.METRIC: MetricEvent,
         HookType.SAVE: SaveEvent,
         HookType.TASK: TaskEvent,
-        HookType.TRANSFORM: TransformEvent
+        HookType.TRANSFORM: TransformEvent,
     }
 
-    return event_types.get(
-        source.hook_type, 
-        Event
-    )(target, source)
+    return event_types.get(source.hook_type, Event)(target, source)

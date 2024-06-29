@@ -1,9 +1,7 @@
 import asyncio
 
 
-async def cancel(
-    task: asyncio.Task
-):
+async def cancel(task: asyncio.Task):
     if task is None:
         return
 
@@ -20,8 +18,5 @@ async def cancel(
 
         return task
 
-    except (
-        asyncio.CancelledError,
-        asyncio.InvalidStateError
-    ):
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
         pass

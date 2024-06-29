@@ -1,13 +1,5 @@
 import asyncio
-import functools
 import math
-import multiprocessing
-import multiprocessing.context
-import warnings
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
-from multiprocessing import active_children
-from types import FunctionType
 from typing import (
     Any,
     Dict,
@@ -20,7 +12,6 @@ from typing import (
 import psutil
 
 from .batched_semaphore import BatchedSemaphore
-from .exceptions import ProcessKilledError
 from .stage_priority import StagePriority
 
 
@@ -28,100 +19,26 @@ class Provisioner:
     def __init__(
         self,
         max_workers: int = psutil.cpu_count(logical=False),
-        start_method: str = "spawn",
     ) -> None:
         cpu_cores = psutil.cpu_count(logical=False)
         if max_workers > cpu_cores:
             max_workers = cpu_cores
 
         self.max_workers = max_workers
-        self.start_method = start_method
 
         self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self.context: Optional[multiprocessing.context.BaseContext] = None
-        self.sem: Optional[BatchedSemaphore] = None
-        self.pool: Optional[ProcessPoolExecutor] = None
 
-        self.shutdown_task = None
         self.batch_by_stages = False
-
-        self._queue: asyncio.Queue[asyncio.Task] = None
 
     def setup(self):
         self.loop = asyncio.get_event_loop()
-        self.context = multiprocessing.get_context(self.start_method)
         self.sem = BatchedSemaphore(self.max_workers)
-        self.pool = ProcessPoolExecutor(
-            max_workers=self.max_workers,
-            mp_context=self.context,
-        )
 
-        self._queue = asyncio.Queue(maxsize=self.max_workers)
+    async def acquire(self, count: int):
+        await self.sem.acquire(count)
 
-    async def start_pool(self):
-        for _ in range(self.max_workers):
-            self._queue.put_nowait(
-                asyncio.create_task(
-                    self.loop.run_in_executor(
-                        self.pool,
-                        functools.partial(
-                            self._run_job_server,
-                            idx,
-                        ),
-                    )
-                )
-                for idx in range(self.max_workers)
-            )
-
-    async def _run_job_server(self, idx: int):
-        pass
-
-    async def execute_batches(
-        self,
-        batched_stages: List[Tuple[int, List[Any]]],
-        execution_task: FunctionType,
-    ) -> List[Tuple[str, Any]]:
-        return await asyncio.gather(
-            *[
-                asyncio.create_task(
-                    self._execute_stage(
-                        stage_name, assigned_workers_count, execution_task, configs
-                    )
-                )
-                for stage_name, assigned_workers_count, configs in batched_stages
-            ]
-        )
-
-    async def _execute_stage(
-        self,
-        stage_name: str,
-        assigned_workers_count: int,
-        execution_task: FunctionType,
-        configs: List[List[Any]],
-    ) -> Tuple[str, Any]:
-        await self.sem.acquire(assigned_workers_count)
-        stage_results = await self.execute_stage_batch(execution_task, configs)
-
-        self.sem.release(assigned_workers_count)
-
-        return (stage_name, stage_results)
-
-    async def execute_stage_batch(
-        self, execution_task: FunctionType, configs: List[Any]
-    ):
-        try:
-            return await asyncio.gather(
-                *[
-                    self.loop.run_in_executor(self.pool, execution_task, config)
-                    for config in configs
-                ]
-            )
-
-        except BrokenProcessPool:
-            raise ProcessKilledError()
-
-        except KeyboardInterrupt:
-            raise ProcessKilledError()
+    def release(self, count: int):
+        self.sem.release(count)
 
     def partition(
         self,
@@ -202,16 +119,16 @@ class Provisioner:
                     "is_test",
                     "threads",
                 ],
-                str | int,
+                str | int | StagePriority,
             ]
         ],
-    ) -> List[Tuple[str, str, int]]:
+    ) -> List[List[Tuple[str, StagePriority, int]]]:
         # How many batches do we have? For example -> 5 stages over 4
         # CPUs means 2 batches. The first batch will assign one stage to
         # each core. The second will assign all four cores to the remaing
         # one stage.
 
-        batches = []
+        batches: List[List[Tuple[str, StagePriority, int]]] = []
         seen: List[Any] = []
 
         sorted_priority_configs = list(
@@ -227,7 +144,7 @@ class Provisioner:
             )
         )
 
-        bypass_partition_batch: List[Any] = []
+        bypass_partition_batch: List[Tuple[str, StagePriority, int]] = []
         for config in sorted_priority_configs:
             if config.get("is_test", False) is False:
                 bypass_partition_batch.append(
@@ -466,21 +383,3 @@ class Provisioner:
                             )
 
         return batches
-
-    async def shutdown(self):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.pool.shutdown(cancel_futures=True)
-
-            child_processes = active_children()
-            for child in child_processes:
-                child.kill()
-
-    def close(self):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.pool.shutdown(cancel_futures=True)
-
-            child_processes = active_children()
-            for child in child_processes:
-                child.kill()

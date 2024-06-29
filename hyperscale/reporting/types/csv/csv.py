@@ -28,39 +28,36 @@ has_connector = True
 
 
 def handle_loop_stop(
-    signame, 
-    executor: ThreadPoolExecutor, 
-    loop: asyncio.AbstractEventLoop, 
-    events_file: TextIO
-): 
+    signame,
+    executor: ThreadPoolExecutor,
+    loop: asyncio.AbstractEventLoop,
+    events_file: TextIO,
+):
     try:
         events_file.close()
-        executor.shutdown(wait=False, cancel_futures=True) 
+        executor.shutdown(wait=False, cancel_futures=True)
         loop.stop()
     except Exception:
         pass
-    
+
 
 class CSV:
-
     def __init__(self, config: CSVConfig) -> None:
         self.events_filepath = config.events_filepath
         self.metrics_filepath = Path(config.metrics_filepath).absolute()
         self.experiments_filepath = config.experiments_filepath
         self._executor = ThreadPoolExecutor(max_workers=psutil.cpu_count(logical=False))
-        
+
         experiments_path = Path(self.experiments_filepath)
         experiments_directory = experiments_path.parent
         experiments_filename = experiments_path.stem
 
         self.variants_filepath = os.path.join(
-            experiments_directory,
-            f'{experiments_filename}_variants.csv'
+            experiments_directory, f"{experiments_filename}_variants.csv"
         )
 
         self.mutations_filepath = os.path.join(
-            experiments_directory,
-            f'{experiments_filename}_mutations.csv'
+            experiments_directory, f"{experiments_filename}_mutations.csv"
         )
 
         self.streams_filepath = config.streams_filepath
@@ -70,13 +67,11 @@ class CSV:
         system_metrics_filename = system_metrics_path.stem
 
         self.stage_system_metrics_filepath = os.path.join(
-            system_metrics_directory,
-            f'{system_metrics_filename}_stages.csv'
+            system_metrics_directory, f"{system_metrics_filename}_stages.csv"
         )
 
         self.session_system_metrics_filepath = os.path.join(
-            system_metrics_directory,
-            f'{system_metrics_filename}_session.csv'
+            system_metrics_directory, f"{system_metrics_filename}_session.csv"
         )
 
         self.session_uuid = str(uuid.uuid4())
@@ -98,7 +93,7 @@ class CSV:
 
         self._loop: asyncio.AbstractEventLoop = None
 
-        self.events_file: TextIO = None 
+        self.events_file: TextIO = None
         self.metrics_file: TextIO = None
         self.experiments_file: TextIO = None
         self.variants_file: TextIO = None
@@ -107,144 +102,141 @@ class CSV:
         self.stage_system_metrics_file: TextIO = None
         self.session_system_metrics_file: TextIO = None
 
-        self.write_mode = 'w' if config.overwrite else 'a'
-
+        self.write_mode = "w" if config.overwrite else "a"
 
         filepath = Path(config.metrics_filepath)
         base_filepath = filepath.parent
         base_filename = filepath.stem
 
         self.shared_metrics_filepath = os.path.join(
-            base_filepath,
-            f'{base_filename}_shared.csv'
+            base_filepath, f"{base_filename}_shared.csv"
         )
 
         self.custom_metrics_filepath = os.path.join(
-            base_filepath,
-            f'{base_filename}_custom.csv'
+            base_filepath, f"{base_filename}_custom.csv"
         )
 
         self.errors_metrics_filepath = os.path.join(
-            base_filepath,
-            f'{base_filename}_errors.csv'
+            base_filepath, f"{base_filename}_errors.csv"
         )
 
     async def connect(self):
         self._loop = asyncio._get_running_loop()
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Setting filepaths')
-        
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Setting filepaths"
+        )
+
         original_filepath = Path(self.events_filepath)
-        
+
         directory = original_filepath.parent
         filename = original_filepath.stem
 
         events_file_timestamp = time.time()
 
         self.events_filepath = os.path.join(
-            directory,
-            f'{filename}_{events_file_timestamp}.csv'
+            directory, f"{filename}_{events_file_timestamp}.csv"
         )
 
-    async def submit_session_system_metrics(self, system_metrics_sets: List[SystemMetricsSet]):
+    async def submit_session_system_metrics(
+        self, system_metrics_sets: List[SystemMetricsSet]
+    ):
         if self.session_system_metrics_file is None:
             self.session_system_metrics_file = await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
-                    open,
-                    self.session_system_metrics_filepath,
-                    self.write_mode
-                )
+                    open, self.session_system_metrics_filepath, self.write_mode
+                ),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
                         signame,
                         self._executor,
                         self._loop,
-                        self.session_system_metrics_file
-                    )
+                        self.session_system_metrics_file,
+                    ),
                 )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Session System Metrics to file - {self.session_system_metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Session System Metrics to file - {self.session_system_metrics_filepath}"
+        )
 
-        if self._session_system_metrics_writer is None or self.write_mode == 'w':
+        if self._session_system_metrics_writer is None or self.write_mode == "w":
             self._session_system_metrics_writer = csv.DictWriter(
-                self.session_system_metrics_file, 
+                self.session_system_metrics_file,
                 fieldnames=[
-                    header for header in SystemMetricsSet.metrics_header_keys if header != 'stage'
-                ]
+                    header
+                    for header in SystemMetricsSet.metrics_header_keys
+                    if header != "stage"
+                ],
             )
 
             await self._loop.run_in_executor(
-                self._executor,
-                self._session_system_metrics_writer.writeheader
+                self._executor, self._session_system_metrics_writer.writeheader
             )
 
         metrics_sets: List[Dict[str, Union[int, float, str]]] = []
 
         for metrics_set in system_metrics_sets:
-                
             for monitor_metrics in metrics_set.session_cpu_metrics.values():
                 metrics_sets.append(monitor_metrics.record)
-                
-            for  monitor_metrics in metrics_set.session_memory_metrics.values():
+
+            for monitor_metrics in metrics_set.session_memory_metrics.values():
                 metrics_sets.append(monitor_metrics.record)
 
         await self._loop.run_in_executor(
-            self._executor,
-            self._session_system_metrics_writer.writerows,
-            metrics_sets
+            self._executor, self._session_system_metrics_writer.writerows, metrics_sets
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Session System Metrics to file - {self.session_system_metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Session System Metrics to file - {self.session_system_metrics_filepath}"
+        )
 
-    async def submit_stage_system_metrics(self, system_metrics_sets: List[SystemMetricsSet]):
-
+    async def submit_stage_system_metrics(
+        self, system_metrics_sets: List[SystemMetricsSet]
+    ):
         if self.stage_system_metrics_file is None:
             self.stage_system_metrics_file = await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
-                    open,
-                    self.stage_system_metrics_filepath,
-                    self.write_mode
-                )
+                    open, self.stage_system_metrics_filepath, self.write_mode
+                ),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
                         signame,
                         self._executor,
                         self._loop,
-                        self.stage_system_metrics_file
-                    )
+                        self.stage_system_metrics_file,
+                    ),
                 )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Stage System Metrics to file - {self.stage_system_metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Stage System Metrics to file - {self.stage_system_metrics_filepath}"
+        )
 
-        if self._stage_system_metrics_writer is None or self.write_mode == 'w':
+        if self._stage_system_metrics_writer is None or self.write_mode == "w":
             self._stage_metrics_csv_writer = csv.DictWriter(
-                self.stage_system_metrics_file, 
-                fieldnames=SystemMetricsSet.metrics_header_keys
+                self.stage_system_metrics_file,
+                fieldnames=SystemMetricsSet.metrics_header_keys,
             )
 
             await self._loop.run_in_executor(
-                self._executor,
-                self._stage_metrics_csv_writer.writeheader
+                self._executor, self._stage_metrics_csv_writer.writeheader
             )
 
         metrics_sets: List[Dict[str, Union[int, float, str]]] = []
 
         for metrics_set in system_metrics_sets:
-
             cpu_metrics = metrics_set.cpu
             memory_metrics = metrics_set.memory
 
-            for stage_name, stage_cpu_metrics in  cpu_metrics.metrics.items():
-
+            for stage_name, stage_cpu_metrics in cpu_metrics.metrics.items():
                 for monitor_metrics in stage_cpu_metrics.values():
                     metrics_sets.append(monitor_metrics.record)
 
@@ -253,559 +245,492 @@ class CSV:
                     metrics_sets.append(monitor_metrics.record)
 
                 stage_mb_per_vu_metrics = metrics_set.mb_per_vu.get(stage_name)
-                
+
                 if stage_mb_per_vu_metrics:
                     metrics_sets.append(stage_mb_per_vu_metrics.record)
 
         await self._loop.run_in_executor(
-            self._executor,
-            self._stage_metrics_csv_writer.writerows,
-            metrics_sets
+            self._executor, self._stage_metrics_csv_writer.writerows, metrics_sets
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Stage System Metrics to file - {self.stage_system_metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Stage System Metrics to file - {self.stage_system_metrics_filepath}"
+        )
 
     async def submit_streams(self, stream_metrics: Dict[str, StageStreamsSet]):
         if self.streams_file is None:
             self.streams_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.streams_filepath,
-                    self.write_mode
-                )
+                functools.partial(open, self.streams_filepath, self.write_mode),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        self.streams_file
-                    )
+                        signame, self._executor, self._loop, self.streams_file
+                    ),
                 )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Streams to file - {self.streams_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Streams to file - {self.streams_filepath}"
+        )
 
         streams_data: List[Dict[str, Union[float, int]]] = []
 
         for stream_name, stream in stream_metrics.items():
-
-            streams_data.extend([{
-                    'stage': stream_name,
-                    'group': group_name,
-                    **group_metrics
-            } for group_name, group_metrics in stream.grouped.items()])
-            
+            streams_data.extend(
+                [
+                    {"stage": stream_name, "group": group_name, **group_metrics}
+                    for group_name, group_metrics in stream.grouped.items()
+                ]
+            )
 
         headers = list(streams_data[0].keys())
 
-        if self._streams_writer is None or self.write_mode == 'w':
-            self._streams_writer = csv.DictWriter(
-                self.streams_file, 
-                fieldnames=headers
-            )
+        if self._streams_writer is None or self.write_mode == "w":
+            self._streams_writer = csv.DictWriter(self.streams_file, fieldnames=headers)
 
             await self._loop.run_in_executor(
-                self._executor,
-                self._streams_writer.writeheader
+                self._executor, self._streams_writer.writeheader
             )
 
         await self._loop.run_in_executor(
-            self._executor,
-            self._streams_writer.writerows,
-            streams_data
+            self._executor, self._streams_writer.writerows, streams_data
         )
 
-    async def submit_experiments(self, experiment_metrics: ExperimentMetricsCollectionSet):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Experiments to file - {self.experiments_filepath}')
+    async def submit_experiments(
+        self, experiment_metrics: ExperimentMetricsCollectionSet
+    ):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Experiments to file - {self.experiments_filepath}"
+        )
 
         if self.experiments_file is None:
             self.experiments_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.experiments_filepath,
-                    self.write_mode
-                )
+                functools.partial(open, self.experiments_filepath, self.write_mode),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        self.experiments_file
-                    )
+                        signame, self._executor, self._loop, self.experiments_file
+                    ),
                 )
 
-        if self._experiments_writer is None or self.write_mode == 'w':
+        if self._experiments_writer is None or self.write_mode == "w":
             self._experiments_writer = csv.DictWriter(
-                self.experiments_file, 
-                fieldnames=experiment_metrics.experiments_metrics_fields
+                self.experiments_file,
+                fieldnames=experiment_metrics.experiments_metrics_fields,
             )
 
             await self._loop.run_in_executor(
-                self._executor,
-                self._experiments_writer.writeheader
+                self._executor, self._experiments_writer.writeheader
             )
 
         await self._loop.run_in_executor(
             self._executor,
             self._experiments_writer.writerows,
-            experiment_metrics.experiments
+            experiment_metrics.experiments,
         )
 
     async def submit_variants(self, experiment_metrics: ExperimentMetricsCollectionSet):
-
         if self.variants_file is None:
             self.variants_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.variants_filepath,
-                    self.write_mode
-                )
+                functools.partial(open, self.variants_filepath, self.write_mode),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        self.variants_file
-                    )
+                        signame, self._executor, self._loop, self.variants_file
+                    ),
                 )
-        
-        if self._variants_writer is None or self.write_mode == 'w':
+
+        if self._variants_writer is None or self.write_mode == "w":
             self._variants_writer = csv.DictWriter(
-                self.variants_file, 
-                fieldnames=experiment_metrics.variants_metrics_fields
+                self.variants_file,
+                fieldnames=experiment_metrics.variants_metrics_fields,
             )
 
             await self._loop.run_in_executor(
-                self._executor,
-                self._variants_writer.writeheader
+                self._executor, self._variants_writer.writeheader
             )
 
         await self._loop.run_in_executor(
-            self._executor,
-            self._variants_writer.writerows,
-            experiment_metrics.variants
+            self._executor, self._variants_writer.writerows, experiment_metrics.variants
         )
 
-    async def submit_mutations(self, experiment_metrics: ExperimentMetricsCollectionSet):
-
+    async def submit_mutations(
+        self, experiment_metrics: ExperimentMetricsCollectionSet
+    ):
         if self.mutations_file is None:
             self.mutations_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.mutations_filepath,
-                    self.write_mode
-                )
+                functools.partial(open, self.mutations_filepath, self.write_mode),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        self.mutations_file
-                    )
-                )  
+                        signame, self._executor, self._loop, self.mutations_file
+                    ),
+                )
 
-        if self._mutations_writer is None or self.write_mode == 'w':
+        if self._mutations_writer is None or self.write_mode == "w":
             self._mutations_writer = csv.DictWriter(
-                self.mutations_file, 
-                fieldnames=experiment_metrics.mutations_metrics_fields
+                self.mutations_file,
+                fieldnames=experiment_metrics.mutations_metrics_fields,
             )
 
             await self._loop.run_in_executor(
-                self._executor,
-                self._mutations_writer.writeheader
+                self._executor, self._mutations_writer.writeheader
             )
 
         await self._loop.run_in_executor(
             self._executor,
             self._mutations_writer.writerows,
-            experiment_metrics.mutations
+            experiment_metrics.mutations,
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Experiments to file - {self.experiments_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Experiments to file - {self.experiments_filepath}"
+        )
 
     async def submit_events(self, events: List[BaseProcessedResult]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Events to file - {self.events_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Events to file - {self.events_filepath}"
+        )
 
         if self.events_file is None:
             self.events_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.events_filepath,
-                    self.write_mode
-                )
+                functools.partial(open, self.events_filepath, self.write_mode),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        self.events_file
-                    )
+                        signame, self._executor, self._loop, self.events_file
+                    ),
                 )
-          
+
         for event in events:
-            if self._events_csv_writer is None or self.write_mode == 'w':
-                self._events_csv_writer = csv.DictWriter(self.events_file, fieldnames=event.fields)
-                
-                await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(event.fields)}')
+            if self._events_csv_writer is None or self.write_mode == "w":
+                self._events_csv_writer = csv.DictWriter(
+                    self.events_file, fieldnames=event.fields
+                )
+
+                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                    f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(event.fields)}'
+                )
 
                 await self._loop.run_in_executor(
-                    self._executor,
-                    self._events_csv_writer.writeheader
+                    self._executor, self._events_csv_writer.writeheader
                 )
 
-                await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(event.fields)}')
+                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                    f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(event.fields)}'
+                )
 
             await self._loop.run_in_executor(
-                self._executor,
-                self._events_csv_writer.writerow,
-                event.record
+                self._executor, self._events_csv_writer.writerow, event.record
             )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Events to file - {self.events_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Events to file - {self.events_filepath}"
+        )
 
     async def submit_common(self, metrics_sets: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Shared Metrics to file - {self.metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Shared Metrics to file - {self.metrics_filepath}"
+        )
 
         headers = [
-            'name',
-            'stage',
-            'group',
-            'total',
-            'succeeded',
-            'failed',
-            'actions_per_second'
+            "name",
+            "stage",
+            "group",
+            "total",
+            "succeeded",
+            "failed",
+            "actions_per_second",
         ]
 
         shared_metrics_file = await self._loop.run_in_executor(
-                self._executor,
-                functools.partial(
-                    open,
-                    self.shared_metrics_filepath,
-                    'w'
-                )
+            self._executor, functools.partial(open, self.shared_metrics_filepath, "w")
         )
 
-        for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+        for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
             self._loop.add_signal_handler(
                 getattr(signal, signame),
                 lambda signame=signame: handle_loop_stop(
-                    signame,
-                    self._executor,
-                    self._loop,
-                    shared_metrics_file
-                )
+                    signame, self._executor, self._loop, shared_metrics_file
+                ),
             )
 
         if self._stage_metrics_csv_writer is None:
-            self._stage_metrics_csv_writer = csv.DictWriter(shared_metrics_file, fieldnames=headers)
-
-
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(headers)}')
-
-            await self._loop.run_in_executor(
-                self._executor,
-                self._stage_metrics_csv_writer.writeheader
+            self._stage_metrics_csv_writer = csv.DictWriter(
+                shared_metrics_file, fieldnames=headers
             )
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(headers)}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+            )
+
+            await self._loop.run_in_executor(
+                self._executor, self._stage_metrics_csv_writer.writeheader
+            )
+
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+            )
 
         for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
 
             await self._loop.run_in_executor(
                 self._executor,
                 self._stage_metrics_csv_writer.writerow,
                 {
-                    'name': metrics_set.name,
-                    'stage': metrics_set.stage,
-                    'group': 'common',
-                    **metrics_set.common_stats
-                }
+                    "name": metrics_set.name,
+                    "stage": metrics_set.stage,
+                    "group": "common",
+                    **metrics_set.common_stats,
+                },
             )
 
-        await self._loop.run_in_executor(
-            self._executor,
-            shared_metrics_file.close
-        )
+        await self._loop.run_in_executor(self._executor, shared_metrics_file.close)
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Shared Metrics to file - {self.metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Shared Metrics to file - {self.metrics_filepath}"
+        )
 
     async def submit_metrics(self, metrics: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Metrics to file - {self.metrics_filepath}')
-
-        metrics_file = await self._loop.run_in_executor(
-            self._executor,
-            functools.partial(
-                open,
-                self.metrics_filepath, 
-                'w'
-            )
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Metrics to file - {self.metrics_filepath}"
         )
 
-        for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+        metrics_file = await self._loop.run_in_executor(
+            self._executor, functools.partial(open, self.metrics_filepath, "w")
+        )
+
+        for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
             self._loop.add_signal_handler(
                 getattr(signal, signame),
                 lambda signame=signame: handle_loop_stop(
-                    signame,
-                    self._executor,
-                    self._loop,
-                    metrics_file
-                )
+                    signame, self._executor, self._loop, metrics_file
+                ),
             )
 
         for metrics_set in metrics:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
 
             if self._metrics_csv_writer is None:
+                headers = [*metrics_set.fields, "group"]
 
-                headers = [
-                    *metrics_set.fields,
-                    'group'
-                ]
-
-                await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(headers)}')
-
-                self._metrics_csv_writer = csv.DictWriter(metrics_file, fieldnames=headers)
-
-                await self._loop.run_in_executor(
-                    self._executor,
-                    self._metrics_csv_writer.writeheader
+                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                    f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(headers)}'
                 )
 
-                await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(headers)}')
+                self._metrics_csv_writer = csv.DictWriter(
+                    metrics_file, fieldnames=headers
+                )
+
+                await self._loop.run_in_executor(
+                    self._executor, self._metrics_csv_writer.writeheader
+                )
+
+                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                    f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+                )
 
             for group_name, group in metrics_set.groups.items():
-                await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Metrics Group - {group_name}:{group.metrics_group_id}')
+                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                    f"{self.metadata_string} - Submitting Metrics Group - {group_name}:{group.metrics_group_id}"
+                )
 
                 await self._loop.run_in_executor(
                     self._executor,
                     self._metrics_csv_writer.writerow,
-                    {
-                        **group.record,
-                        'group': group_name
-                    }
+                    {**group.record, "group": group_name},
                 )
 
-        await self._loop.run_in_executor(
-            self._executor,
-            metrics_file.close
+        await self._loop.run_in_executor(self._executor, metrics_file.close)
+
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Metrics to file - {self.metrics_filepath}"
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Metrics to file - {self.metrics_filepath}')
-        
     async def submit_custom(self, metrics_sets: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Custom Metrics to file - {self.metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Custom Metrics to file - {self.metrics_filepath}"
+        )
 
         custom_metrics_file = None
-        
+
         headers = [
-            'name',
-            'stage',
-            'group',
+            "name",
+            "stage",
+            "group",
         ]
 
         if self._custom_metrics_csv_writer is None:
-
             custom_metrics_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.custom_metrics_filepath,
-                    'w'
-                )       
+                functools.partial(open, self.custom_metrics_filepath, "w"),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        custom_metrics_file
-                    )
+                        signame, self._executor, self._loop, custom_metrics_file
+                    ),
                 )
 
             for metrics_set in metrics_sets:
                 for custom_metric in metrics_set.custom_metrics.values():
-                    headers.append(
-                        custom_metric.metric_name
-                    )
+                    headers.append(custom_metric.metric_name)
 
-
-            self._custom_metrics_csv_writer = csv.DictWriter(custom_metrics_file, fieldnames=headers)
-            
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(headers)}')
-
-            await self._loop.run_in_executor(
-                self._executor,
-                self._custom_metrics_csv_writer.writeheader
+            self._custom_metrics_csv_writer = csv.DictWriter(
+                custom_metrics_file, fieldnames=headers
             )
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(headers)}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+            )
 
+            await self._loop.run_in_executor(
+                self._executor, self._custom_metrics_csv_writer.writeheader
+            )
+
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+            )
 
         for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Custom Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Custom Metrics Group - Custom')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Custom Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Custom Metrics Group - Custom"
+            )
 
             await self._loop.run_in_executor(
                 self._executor,
                 self._custom_metrics_csv_writer.writerow,
                 {
-                    'name': metrics_set.name,
-                    'stage': metrics_set.stage,
-                    'group': 'custom',
+                    "name": metrics_set.name,
+                    "stage": metrics_set.stage,
+                    "group": "custom",
                     **{
-                        custom_metric_name: custom_metric.metric_value for custom_metric_name, custom_metric in metrics_set.custom_metrics.items()
-                    }
-                }
+                        custom_metric_name: custom_metric.metric_value
+                        for custom_metric_name, custom_metric in metrics_set.custom_metrics.items()
+                    },
+                },
             )
 
-        await self._loop.run_in_executor(
-            self._executor,
-            custom_metrics_file.close
-        )
+        await self._loop.run_in_executor(self._executor, custom_metrics_file.close)
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Custom Metrics to file - {self.metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Custom Metrics to file - {self.metrics_filepath}"
+        )
 
     async def submit_errors(self, metrics_sets: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Error Metrics to file - {self.metrics_filepath}')
-
-        error_csv_headers = [
-            'name',
-            'stage',
-            'error_message',
-            'error_count'
-        ]
-
-        errors_file = await self._loop.run_in_executor(
-            self._executor,
-            functools.partial(
-                open,
-                self.errors_metrics_filepath,
-                'w'
-            )
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Error Metrics to file - {self.metrics_filepath}"
         )
 
-        for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+        error_csv_headers = ["name", "stage", "error_message", "error_count"]
+
+        errors_file = await self._loop.run_in_executor(
+            self._executor, functools.partial(open, self.errors_metrics_filepath, "w")
+        )
+
+        for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
             self._loop.add_signal_handler(
                 getattr(signal, signame),
                 lambda signame=signame: handle_loop_stop(
-                    signame,
-                    self._executor,
-                    self._loop,
-                    errors_file
-                )
+                    signame, self._executor, self._loop, errors_file
+                ),
             )
-            
-        if self._errors_csv_writer is None:
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(error_csv_headers)}')
+        if self._errors_csv_writer is None:
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(error_csv_headers)}'
+            )
             error_csv_writer = csv.DictWriter(errors_file, fieldnames=error_csv_headers)
 
             await self._loop.run_in_executor(
-                self._executor,
-                error_csv_writer.writeheader
+                self._executor, error_csv_writer.writeheader
             )
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(error_csv_headers)}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(error_csv_headers)}'
+            )
 
         for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Error Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Error Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
 
             for error in metrics_set.errors:
                 await self._loop.run_in_executor(
                     self._executor,
                     error_csv_writer.writerow,
                     {
-                        'name': metrics_set.name,
-                        'stage': metrics_set.stage,
-                        'error_message': error.get('message'),
-                        'error_count': error.get('count')
-                    }
+                        "name": metrics_set.name,
+                        "stage": metrics_set.stage,
+                        "error_message": error.get("message"),
+                        "error_count": error.get("count"),
+                    },
                 )
 
-        await self._loop.run_in_executor(
-            self._executor,
-            errors_file.close
+        await self._loop.run_in_executor(self._executor, errors_file.close)
+
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Error Metrics to file - {self.metrics_filepath}"
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Error Metrics to file - {self.metrics_filepath}')
-                
     async def close(self):
-        
         if self.events_file:
-            await self._loop.run_in_executor(
-                self._executor,
-                self.events_file.close
-            )
+            await self._loop.run_in_executor(self._executor, self.events_file.close)
 
         if self.experiments_file:
             await self._loop.run_in_executor(
-                self._executor,
-                self.experiments_file.close
+                self._executor, self.experiments_file.close
             )
 
         if self.variants_file:
-            await self._loop.run_in_executor(
-                self._executor,
-                self.variants_file.close
-            )
+            await self._loop.run_in_executor(self._executor, self.variants_file.close)
 
         if self.mutations_file:
-            await self._loop.run_in_executor(
-                self._executor,
-                self.mutations_file.close
-            )
+            await self._loop.run_in_executor(self._executor, self.mutations_file.close)
 
         if self.streams_file:
-            await self._loop.run_in_executor(
-                self._executor,
-                self.streams_file.close
-            )
+            await self._loop.run_in_executor(self._executor, self.streams_file.close)
 
         if self.stage_system_metrics_file:
             await self._loop.run_in_executor(
-                self._executor,
-                self.stage_system_metrics_file.close
+                self._executor, self.stage_system_metrics_file.close
             )
 
         if self.session_system_metrics_file:
             await self._loop.run_in_executor(
-                self._executor,
-                self.session_system_metrics_file.close
+                self._executor, self.session_system_metrics_file.close
             )
 
         self._executor.shutdown(wait=False, cancel_futures=True)
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Closing session - {self.session_uuid}')
-
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Closing session - {self.session_uuid}"
+        )

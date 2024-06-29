@@ -7,20 +7,10 @@ from .validator import TransformHookValidator
 
 
 @registrar(HookType.TRANSFORM)
-def transform(
-    *names, 
-    order: int=1,
-    skip: bool=False
-):
-    
-    TransformHookValidator(
-        names=names,
-        order=order,
-        skip=skip
-    )
+def transform(*names, order: int = 1, skip: bool = False):
+    TransformHookValidator(names=names, order=order, skip=skip)
 
     def wrapper(func):
-
         @functools.wraps(func)
         def decorator(*args, **kwargs):
             return func(*args, **kwargs)

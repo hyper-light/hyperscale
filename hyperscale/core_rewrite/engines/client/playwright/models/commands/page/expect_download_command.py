@@ -9,13 +9,8 @@ from pydantic import (
 
 
 class ExpectDownloadCommand(BaseModel):
-    predicate: Optional[
-        Callable[
-            [Download],
-            bool
-        ]
-    ]=None
+    predicate: Optional[Callable[[Download], bool]] = None
     timeout: StrictInt | StrictFloat
 
     class Config:
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed = True

@@ -1,11 +1,13 @@
 from enum import IntEnum
 
+
 class ErrorCodes(IntEnum):
     """
     All known HTTP/2 error codes.
 
     .. versionadded:: 2.5.0
     """
+
     #: Graceful shutdown.
     NO_ERROR = 0x0
 
@@ -37,13 +39,13 @@ class ErrorCodes(IntEnum):
     COMPRESSION_ERROR = 0x9
 
     #: TCP connection error for CONNECT method.
-    CONNECT_ERROR = 0xa
+    CONNECT_ERROR = 0xA
 
     #: Processing capacity exceeded.
-    ENHANCE_YOUR_CALM = 0xb
+    ENHANCE_YOUR_CALM = 0xB
 
     #: Negotiated TLS parameters not acceptable.
-    INADEQUATE_SECURITY = 0xc
+    INADEQUATE_SECURITY = 0xC
 
     #: Use HTTP/1.1 for the request.
-    HTTP_1_1_REQUIRED = 0xd
+    HTTP_1_1_REQUIRED = 0xD

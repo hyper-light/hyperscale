@@ -1,8 +1,4 @@
-from asyncio import (
-    Future,
-    Protocol,
-    get_event_loop
-)
+from asyncio import Future, Protocol, get_event_loop
 
 
 class FlowControlMixin(Protocol):
@@ -12,15 +8,10 @@ class FlowControlMixin(Protocol):
     these it must call the super methods.
     StreamWriter.drain() must wait for _drain_helper() coroutine.
     """
-    __slots__ = (
-        '_loop',
-        '_paused',
-        '_drain_waiter',
-        '_connection_lost'
-    )
+
+    __slots__ = ("_loop", "_paused", "_drain_waiter", "_connection_lost")
 
     def __init__(self, loop=None):
-
         if loop:
             self._loop = loop
         else:
@@ -62,7 +53,7 @@ class FlowControlMixin(Protocol):
 
     async def _drain_helper(self):
         if self._connection_lost:
-            raise ConnectionResetError('Connection lost')
+            raise ConnectionResetError("Connection lost")
         if not self._paused:
             return
         waiter = self._drain_waiter

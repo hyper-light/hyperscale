@@ -1,4 +1,3 @@
-
 import asyncio
 import sys
 
@@ -16,7 +15,7 @@ from .binary import (
     AsyncBufferedIOBase,
     AsyncBufferedReader,
     AsyncFileIO,
-    AsyncIndirectBufferedIOBase
+    AsyncIndirectBufferedIOBase,
 )
 from .text import AsyncTextIOWrapper, AsyncTextIndirectIOWrapper
 
@@ -45,9 +44,8 @@ async def open(
     opener=None,
     *,
     loop=None,
-    executor=None
+    executor=None,
 ) -> AsyncTextIOWrapper:
-
     return await _open(
         file,
         mode=mode,
@@ -73,7 +71,7 @@ async def _open(
     opener=None,
     *,
     loop=None,
-    executor=None
+    executor=None,
 ):
     """Open an asyncio file."""
     if loop is None:
@@ -121,9 +119,19 @@ def _(file, *, loop=None, executor=None):
     return AsyncFileIO(file, loop=loop, executor=executor)
 
 
-stdin = AsyncTextIndirectIOWrapper('sys.stdin', None, None, indirect=lambda: sys.stdin)
-stdout = AsyncTextIndirectIOWrapper('sys.stdout', None, None, indirect=lambda: sys.stdout)
-stderr = AsyncTextIndirectIOWrapper('sys.stderr', None, None, indirect=lambda: sys.stderr)
-stdin_bytes = AsyncIndirectBufferedIOBase('sys.stdin.buffer', None, None, indirect=lambda: sys.stdin.buffer)
-stdout_bytes = AsyncIndirectBufferedIOBase('sys.stdout.buffer', None, None, indirect=lambda: sys.stdout.buffer)
-stderr_bytes = AsyncIndirectBufferedIOBase('sys.stderr.buffer', None, None, indirect=lambda: sys.stderr.buffer)
+stdin = AsyncTextIndirectIOWrapper("sys.stdin", None, None, indirect=lambda: sys.stdin)
+stdout = AsyncTextIndirectIOWrapper(
+    "sys.stdout", None, None, indirect=lambda: sys.stdout
+)
+stderr = AsyncTextIndirectIOWrapper(
+    "sys.stderr", None, None, indirect=lambda: sys.stderr
+)
+stdin_bytes = AsyncIndirectBufferedIOBase(
+    "sys.stdin.buffer", None, None, indirect=lambda: sys.stdin.buffer
+)
+stdout_bytes = AsyncIndirectBufferedIOBase(
+    "sys.stdout.buffer", None, None, indirect=lambda: sys.stdout.buffer
+)
+stderr_bytes = AsyncIndirectBufferedIOBase(
+    "sys.stderr.buffer", None, None, indirect=lambda: sys.stderr.buffer
+)

@@ -26,24 +26,12 @@ from .memoizer import Memoizer
 
 
 class RecursiveResolver(BaseResolver):
-
     memoizer = Memoizer()
 
     def __init__(
-        self, 
-        host: str,
-        port: int,
-        instance_id: str,
-        env: Env,
-        cache: CacheNode = None
+        self, host: str, port: int, instance_id: str, env: Env, cache: CacheNode = None
     ):
-        super().__init__(
-            host,
-            port,
-            instance_id,
-            env,
-            cache=cache
-        )
+        super().__init__(host, port, instance_id, env, cache=cache)
 
         self.types_map = RecordTypesMap()
         self._nameserver_urls: List[str] = []
@@ -52,73 +40,49 @@ class RecursiveResolver(BaseResolver):
 
         self._maximum_tries = registrar_env.MERCURY_SYNC_RESOLVER_MAXIMUM_TRIES
 
-    def add_nameserver(
-        self,
-        urls: List[str]
-    ):
+    def add_nameserver(self, urls: List[str]):
         self._nameserver_urls.extend(urls)
 
         for url in urls:
-
-            self.cache.add(
-                fqdn=url,
-                record_type=RecordType.NS,
-                data=NSRecordData(url)
-            )
+            self.cache.add(fqdn=url, record_type=RecordType.NS, data=NSRecordData(url))
 
         nameserver = NameServer(urls)
 
         return nameserver.data
-        
+
     def load_nameserver_cache(
         self,
-        url: str='ftp://rs.internic.net/domain/named.cache',
-        cache_file: str=os.path.join(
-            os.getcwd(), 
-            'named.cache.txt'
-        ),
-        timeout: Optional[int]=None
+        url: str = "ftp://rs.internic.net/domain/named.cache",
+        cache_file: str = os.path.join(os.getcwd(), "named.cache.txt"),
+        timeout: Optional[int] = None,
     ):
-        
         if not os.path.isfile(cache_file):
             try:
-                res = request.urlopen(
-                    url, 
-                    timeout=timeout
-                )
+                res = request.urlopen(url, timeout=timeout)
 
-                with open(cache_file, 'wb') as f:
+                with open(cache_file, "wb") as f:
                     f.write(res.read())
 
             except Exception:
                 return
 
-        cache_data = pathlib.Path(
-            cache_file
-        ).read_text().splitlines()
+        cache_data = pathlib.Path(cache_file).read_text().splitlines()
 
         for line in cache_data:
-            if line.startswith(';'):
+            if line.startswith(";"):
                 continue
             parts = line.lower().split()
             if len(parts) < 4:
                 continue
 
-            name = parts[0].rstrip('.')
+            name = parts[0].rstrip(".")
             # parts[1] (expires) is ignored
-            record_type = self.types_map.types_by_name.get(
-                parts[2], 
-                RecordType.NONE
-            )
+            record_type = self.types_map.types_by_name.get(parts[2], RecordType.NONE)
 
-            data_str = parts[3].rstrip('.')
+            data_str = parts[3].rstrip(".")
 
+            data = Record.create_rdata(record_type, data_str)
 
-            data = Record.create_rdata(
-                record_type, 
-                data_str
-            )
-            
             record = Record(
                 name=name,
                 record_type=record_type,
@@ -129,54 +93,34 @@ class RecursiveResolver(BaseResolver):
             self.cache.add(record=record)
 
     async def _query(
-        self, 
-        fqdn: str, 
-        record_type: int,
-        skip_cache: bool=False
+        self, fqdn: str, record_type: int, skip_cache: bool = False
     ) -> DNSMessage:
-        
         current_try_count = 0
 
-        return await self._query_tick(
-            fqdn, 
-            record_type, 
-            skip_cache,
-            current_try_count
-        )
+        return await self._query_tick(fqdn, record_type, skip_cache, current_try_count)
 
     def _get_matching_nameserver(self, fqdn: str):
-        '''Return a generator of parent domains'''
+        """Return a generator of parent domains"""
 
         hosts: List[URL] = self._nameserver_urls
         empty = True
 
         while fqdn and empty:
-            if fqdn in ('in-addr.arpa', ):
+            if fqdn in ("in-addr.arpa",):
                 break
-            _, _, fqdn = fqdn.partition('.')
+            _, _, fqdn = fqdn.partition(".")
 
             for rec in self.cache.query(fqdn, RecordType.NS):
                 record_data: NSRecordData = rec.data
                 host = record_data.data
 
-                url = URL(
-                    host,
-                    port=self.client.port
-                )
+                url = URL(host, port=self.client.port)
 
                 if url.ip_type is None:
                     # host is a hostname instead of IP address
 
-                    for res in self.cache.query(
-                        host, 
-                        self.nameserver_types
-                    ):
-                        hosts.append(
-                            URL(
-                                res.data.data,
-                                port=self.client.port
-                            )
-                        )
+                    for res in self.cache.query(host, self.nameserver_types):
+                        hosts.append(URL(res.data.data, port=self.client.port))
 
                         empty = False
 
@@ -190,20 +134,11 @@ class RecursiveResolver(BaseResolver):
         lambda _, fqdn, record_type, skip_cache: (fqdn, record_type)
     )
     async def _query_tick(
-        self, 
-        fqdn: str, 
-        record_type: int,
-        skip_cache: bool,
-        current_try_count: int
+        self, fqdn: str, record_type: int, skip_cache: bool, current_try_count: int
     ):
-        
         msg = DNSMessage()
         msg.query_domains.append(
-            Record(
-                query_type=QueryType.REQUEST, 
-                name=fqdn, 
-                record_type=record_type
-            )
+            Record(query_type=QueryType.REQUEST, name=fqdn, record_type=record_type)
         )
 
         has_result = False
@@ -215,23 +150,15 @@ class RecursiveResolver(BaseResolver):
         nameserver = self._get_matching_nameserver(fqdn)
 
         while not has_result and current_try_count < self._maximum_tries:
-
             current_try_count += 1
 
             for url in nameserver.iter():
                 try:
                     has_result, fqdn, nsips = await self._query_remote(
-                        msg, 
-                        fqdn, 
-                        record_type, 
-                        url,
-                        current_try_count
+                        msg, fqdn, record_type, url, current_try_count
                     )
 
-                    nameserver = NameServer(
-                        self.client.port,
-                        nameservers=nsips
-                    )
+                    nameserver = NameServer(self.client.port, nameservers=nsips)
 
                 except Exception as err:
                     last_err = err
@@ -239,32 +166,26 @@ class RecursiveResolver(BaseResolver):
                 else:
                     break
             else:
-                raise last_err or Exception('Unknown error')
+                raise last_err or Exception("Unknown error")
 
-
-        assert has_result, 'Maximum nested query times exceeded'
+        assert has_result, "Maximum nested query times exceeded"
 
         return msg
 
     async def _query_remote(
-        self, 
-        msg: DNSMessage, 
-        fqdn: str, 
+        self,
+        msg: DNSMessage,
+        fqdn: str,
         record_type: RecordType,
         url: URL,
-        current_try_count: int
+        current_try_count: int,
     ):
-        
-        result: DNSMessage = await self.request(
-            fqdn, 
-            msg, 
-            url
-        )
+        result: DNSMessage = await self.request(fqdn, msg, url)
 
         if result.query_domains[0].name != fqdn:
-            raise DNSError(-1, 'Question section mismatch')
-        
-        assert result.query_result_code != 2, 'Remote server fail'
+            raise DNSError(-1, "Question section mismatch")
+
+        assert result.query_result_code != 2, "Remote server fail"
 
         self.cache_message(result)
 
@@ -280,16 +201,13 @@ class RecursiveResolver(BaseResolver):
                 has_cname = True
 
             if rec.record_type != RecordType.CNAME or record_type in (
-                RecordType.ANY, 
-                RecordType.CNAME
+                RecordType.ANY,
+                RecordType.CNAME,
             ):
                 has_result = True
 
         for rec in result.query_namservers:
-            if rec.record_type in (
-                RecordType.NS, 
-                RecordType.SOA
-            ):
+            if rec.record_type in (RecordType.NS, RecordType.SOA):
                 has_result = True
 
             else:
@@ -297,10 +215,7 @@ class RecursiveResolver(BaseResolver):
 
         if not has_cname and not has_ns:
             # Not found, return server fail since we are not authorative
-            msg = DNSMessage(
-                **msg.dict(),
-                query_result_code=2
-            )
+            msg = DNSMessage(**msg.dict(), query_result_code=2)
 
             has_result = True
         if has_result:
@@ -315,7 +230,6 @@ class RecursiveResolver(BaseResolver):
 
         hosts = []
         for record in result.query_namservers:
-
             if isinstance(record.data, SOARecordData):
                 hosts.append(record.data.mname)
 
@@ -334,25 +248,20 @@ class RecursiveResolver(BaseResolver):
         # Usually name server IPs will be included in res.ar.
         # In case they are not, query from remote.
         if len(namespace_ips) < 1 and len(hosts) > 0:
-
             current_try_count += 1
 
             for record_type in self.nameserver_types:
                 for host in hosts:
                     try:
-                        query_tick_result: Tuple[DNSMessage, bool] = await asyncio.shield(
+                        query_tick_result: Tuple[
+                            DNSMessage, bool
+                        ] = await asyncio.shield(
                             self._query_tick(
-                                host, 
-                                record_type, 
-                                False,
-                                current_try_count
+                                host, record_type, False, current_try_count
                             )
                         )
 
-                        (
-                            ns_res, 
-                            _
-                        ) = query_tick_result
+                        (ns_res, _) = query_tick_result
 
                     except Exception:
                         pass
@@ -367,4 +276,3 @@ class RecursiveResolver(BaseResolver):
                     break
 
         return has_result, fqdn, namespace_ips
-

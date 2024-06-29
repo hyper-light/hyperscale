@@ -34,6 +34,7 @@ wrap_socket's parameters and their semantics have been maintained.
 
 VERSION = 1, 2, 3
 
+
 def _prep_bins():
     """
     Support for running straight out of a cloned source directory instead
@@ -43,6 +44,7 @@ def _prep_bins():
     from os import path
     from sys import platform, maxsize
     from shutil import copy
+
     bit_suffix = "-x86_64" if maxsize > 2**32 else "-x86"
     package_root = path.abspath(path.dirname(__file__))
     prebuilt_path = path.join(package_root, "prebuilt", platform + bit_suffix)
@@ -57,6 +59,7 @@ def _prep_bins():
             copy(path.join(prebuilt_path, prebuilt_file), package_root)
         except IOError:
             pass
+
 
 _prep_bins()  # prepare before module imports
 

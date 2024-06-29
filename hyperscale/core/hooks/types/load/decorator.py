@@ -28,7 +28,7 @@ from .validator import LoadHookValidator
 
 @registrar(HookType.LOAD)
 def load(
-    *names: Tuple[str, ...], 
+    *names: Tuple[str, ...],
     loader: Union[
         AWSLambdaConnectorConfig,
         BigTableConnectorConfig,
@@ -46,21 +46,14 @@ def load(
         S3ConnectorConfig,
         SnowflakeConnectorConfig,
         SQLiteConnectorConfig,
-        XMLConnectorConfig
-    ]=None, 
-    order: int=1,
-    skip: bool=False
+        XMLConnectorConfig,
+    ] = None,
+    order: int = 1,
+    skip: bool = False,
 ):
-    
-    LoadHookValidator(
-        names=names,
-        loader=loader,
-        order=order,
-        skip=skip
-    )
-    
-    def wrapper(func):
+    LoadHookValidator(names=names, loader=loader, order=order, skip=skip)
 
+    def wrapper(func):
         @functools.wraps(func)
         def decorator(*args, **kwargs):
             return func(*args, **kwargs)

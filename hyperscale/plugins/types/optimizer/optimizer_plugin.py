@@ -12,24 +12,22 @@ from hyperscale.plugins.types.plugin_types import PluginType
 
 
 class OptimizerPlugin(BaseAlgorithm, Plugin):
-    type=PluginType.OPTIMIZER
-    name: str=None
+    type = PluginType.OPTIMIZER
+    name: str = None
 
     def __init__(self, config: Dict[str, Any]) -> None:
         self.hooks: Dict[PluginHooks, PluginHook] = {}
-        
-        methods = inspect.getmembers(self, predicate=inspect.ismethod) 
+
+        methods = inspect.getmembers(self, predicate=inspect.ismethod)
         for _, method in methods:
+            method_name = method.__qualname__
+            hook: PluginHook = plugin_registrar.all.get(method_name)
 
-                method_name = method.__qualname__
-                hook: PluginHook = plugin_registrar.all.get(method_name)
-                
-                if hook:
-                    hook.call = hook.call.__get__(self, self.__class__)
-                    setattr(self, hook.shortname, hook.call)
+            if hook:
+                hook.call = hook.call.__get__(self, self.__class__)
+                setattr(self, hook.shortname, hook.call)
 
-                    self.hooks[hook.hook_type] = hook
-
+                self.hooks[hook.hook_type] = hook
 
         on_get_params = self.hooks.get(PluginHooks.ON_OPTIMIZER_GET_PARAMS)
         on_update_params = self.hooks.get(PluginHooks.ON_OPTIMIZER_UPDATE_PARAMS)
@@ -45,9 +43,3 @@ class OptimizerPlugin(BaseAlgorithm, Plugin):
         self.optimize = on_optimize.call
 
         super().__init__(config)
-
-
-
-
-        
-        

@@ -8,25 +8,19 @@ from hyperscale.core.hooks.types.base.hook_type import HookType
 
 
 class TaskHook(Hook):
-
     def __init__(
-        self, 
-        name: str, 
-        shortname: str, 
-        call: Callable[..., Awaitable[Any]], 
+        self,
+        name: str,
+        shortname: str,
+        call: Callable[..., Awaitable[Any]],
         *names: Tuple[str, ...],
-        weight: int=1, 
-        order: int=1, 
-        skip: bool=False,
-        metadata: Dict[str, Union[str, int]]={}
+        weight: int = 1,
+        order: int = 1,
+        skip: bool = False,
+        metadata: Dict[str, Union[str, int]] = {},
     ) -> None:
         super().__init__(
-            name, 
-            shortname, 
-            call, 
-            order=order,
-            skip=skip,
-            hook_type=HookType.TASK
+            name, shortname, call, order=order, skip=skip, hook_type=HookType.TASK
         )
 
         self.names = list(set(names))
@@ -42,11 +36,7 @@ class TaskHook(Hook):
         self.channels: List[Any] = []
         self.notifiers: List[Any] = []
         self.listeners: List[Any] = []
-        self.metadata = HookMetadata(
-            weight=weight,
-            order=order,
-            **metadata
-        )
+        self.metadata = HookMetadata(weight=weight, order=order, **metadata)
 
     def copy(self):
         task_hook = TaskHook(
@@ -56,15 +46,13 @@ class TaskHook(Hook):
             weight=self.metadata.weight,
             order=self.order,
             skip=self.skip,
-            metadata={
-                **self.metadata.copy()
-            }
+            metadata={**self.metadata.copy()},
         )
 
         task_hook.checks = list(self.checks)
         task_hook.stage = self.stage
 
         return task_hook
-    
+
     async def call(self, *args, **kwargs):
         return await self._call(*args, **kwargs)

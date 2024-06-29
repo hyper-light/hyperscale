@@ -4,14 +4,13 @@ from .base import BaseDistribution
 
 
 class Burr12Distribution(BaseDistribution):
-
     def __init__(
-        self, 
+        self,
         size: int,
-        c_value: int=2,
-        d_value: int=1,
-        center: Union[int, float]=0.5,
-        randomness: Union[int, float]=0.4
+        c_value: int = 2,
+        d_value: int = 1,
+        center: Union[int, float] = 0.5,
+        randomness: Union[int, float] = 0.4,
     ):
         super().__init__(
             size=size,
@@ -22,5 +21,5 @@ class Burr12Distribution(BaseDistribution):
                 d_value,
                 loc=center,
                 scale=randomness,
-            )
+            ),
         )

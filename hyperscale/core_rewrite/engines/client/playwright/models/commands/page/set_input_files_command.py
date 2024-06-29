@@ -13,8 +13,13 @@ from pydantic import (
 
 class SetInputFilesCommand(BaseModel):
     selector: StrictStr
-    files: StrictStr | Path | FilePayload | Sequence[StrictStr | Path] | Sequence[FilePayload]
-    strict: Optional[StrictBool]=None
-    no_wait_after: Optional[StrictBool]=None
+    files: (
+        StrictStr
+        | Path
+        | FilePayload
+        | Sequence[StrictStr | Path]
+        | Sequence[FilePayload]
+    )
+    strict: Optional[StrictBool] = None
+    no_wait_after: Optional[StrictBool] = None
     timeout: StrictInt | StrictFloat
-    

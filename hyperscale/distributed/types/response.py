@@ -1,7 +1,7 @@
 from typing import TypeVar, Tuple
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 Response = Tuple[T, int]

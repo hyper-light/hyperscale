@@ -5,7 +5,7 @@ from pydantic import (
     StrictFloat,
     StrictBool,
     AnyHttpUrl,
-    Json
+    Json,
 )
 
 
@@ -21,9 +21,9 @@ class UDPActionValidator(BaseModel):
     engine: StrictStr
     name: StrictStr
     url: AnyHttpUrl
-    wait_for_response: StrictBool=False
+    wait_for_response: StrictBool = False
     data: Optional[Union[StrictStr, Json]]
     weight: Optional[Union[StrictInt, StrictFloat]]
     order: Optional[StrictInt]
     user: Optional[StrictStr]
-    tags: List[UDPActionTag]=[]
+    tags: List[UDPActionTag] = []

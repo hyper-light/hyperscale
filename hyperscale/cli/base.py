@@ -9,42 +9,41 @@ from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 
 class CLI(click.MultiCommand):
-
     command_files = {
-        'ping': 'ping.py',
-        'graph': 'graph.py',
-        'project': 'project.py',
-        'cloud': 'cloud.py',
-        'plugin': 'plugin.py'
+        "ping": "ping.py",
+        "graph": "graph.py",
+        "project": "project.py",
+        "cloud": "cloud.py",
+        "plugin": "plugin.py",
     }
     logger = HyperscaleLogger()
 
     def __init__(
-        self, 
-        name: Optional[str] = None, 
-        invoke_without_command: bool = False, 
-        no_args_is_help: Optional[bool] = None, 
-        subcommand_metavar: Optional[str] = None, 
-        chain: bool = False, 
-        result_callback: Optional[Callable[..., Any]] = None, 
-        **attrs: Any
+        self,
+        name: Optional[str] = None,
+        invoke_without_command: bool = False,
+        no_args_is_help: Optional[bool] = None,
+        subcommand_metavar: Optional[str] = None,
+        chain: bool = False,
+        result_callback: Optional[Callable[..., Any]] = None,
+        **attrs: Any,
     ) -> None:
         super().__init__(
-            name, 
-            invoke_without_command, 
-            no_args_is_help, 
-            subcommand_metavar, 
-            chain, 
-            result_callback, 
-            **attrs
+            name,
+            invoke_without_command,
+            no_args_is_help,
+            subcommand_metavar,
+            chain,
+            result_callback,
+            **attrs,
         )
 
         self.logger.initialize()
 
-        header_text = text2art('Hyperscale', font='alligator').strip('\n')
-        hyperscale_version = version('hyperscale')
+        header_text = text2art("Hyperscale", font="alligator").strip("\n")
+        hyperscale_version = version("hyperscale")
 
-        self.logger.console.sync.info(f'\n{header_text} {hyperscale_version}\n\n')
+        self.logger.console.sync.info(f"\n{header_text} {hyperscale_version}\n\n")
 
     def list_commands(self, ctx: click.Context) -> List[str]:
         rv = []
@@ -54,16 +53,14 @@ class CLI(click.MultiCommand):
         return rv
 
     def get_command(self, ctx: click.Context, name: str) -> Union[click.Command, None]:
-
         ns = {}
-        
+
         command_file = os.path.join(
-            os.path.dirname(__file__),
-            self.command_files.get(name, 'ping.py')
+            os.path.dirname(__file__), self.command_files.get(name, "ping.py")
         )
 
         with open(command_file) as f:
-            code = compile(f.read(), command_file, 'exec')
+            code = compile(f.read(), command_file, "exec")
             eval(code, ns, ns)
 
         return ns.get(name)

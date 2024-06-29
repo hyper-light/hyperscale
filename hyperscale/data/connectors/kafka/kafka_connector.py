@@ -16,9 +16,9 @@ from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from .kafka_connector_config import KafkaConnectorConfig
 
 try:
-
     from aiokafka import AIOKafkaConsumer
     from aiokafka.structs import ConsumerRecord
+
     has_connector = True
 
 except Exception:
@@ -28,15 +28,14 @@ except Exception:
 
 
 class KafkaConnector:
-    connector_type=ConnectorType.Kafka
+    connector_type = ConnectorType.Kafka
 
     def __init__(
-        self, 
+        self,
         config: KafkaConnectorConfig,
         stage: str,
         parser_config: Config,
     ) -> None:
-        
         self.host = config.host
         self.client_id = config.client_id
         self.stage = stage
@@ -60,18 +59,26 @@ class KafkaConnector:
         self.parser = Parser()
 
     async def connect(self):
-
         self.loop = asyncio.get_event_loop()
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connecting to Kafka at - {self.host}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connecting to Kafka at - {self.host}"
+        )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Using Kafka Options - Compression Type: {self.compression_type}')
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Using Kafka Options - Connection Timeout: {self.timeout}')
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Using Kafka Options - Idempotent: {self.enable_idempotence}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Using Kafka Options - Compression Type: {self.compression_type}"
+        )
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Using Kafka Options - Connection Timeout: {self.timeout}"
+        )
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Using Kafka Options - Idempotent: {self.enable_idempotence}"
+        )
 
         for option_name, option in self.options.items():
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Using Kafka Options - {option_name.capitalize()}: {option}')
-
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Using Kafka Options - {option_name.capitalize()}: {option}"
+            )
 
         self._consumer = AIOKafkaConsumer(
             self.topic,
@@ -81,79 +88,68 @@ class KafkaConnector:
             compression_type=self.compression_type,
             request_timeout_ms=self.timeout,
             enable_idempotence=self.enable_idempotence,
-            **self.options
+            **self.options,
         )
 
         await self._consumer.start()
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connected to Kafka at - {self.host}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connected to Kafka at - {self.host}"
+        )
 
     async def load_execute_stage_summary(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> ExecuteStageSummaryValidator:
-        execute_stage_summary = await self.load_data(
-            options=options
-        )
-        
+        execute_stage_summary = await self.load_data(options=options)
+
         return ExecuteStageSummaryValidator(**execute_stage_summary)
 
     async def load_actions(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[ActionHook]]:
-        
-        actions = await self.load_data(
-            options=options
-        )
+        actions = await self.load_data(options=options)
 
-        return await asyncio.gather(*[
-            self.parser.parse_action(
-                action_data,
-                self.stage,
-                self.parser_config,
-                options
-            ) for action_data in actions
-        ])
+        return await asyncio.gather(
+            *[
+                self.parser.parse_action(
+                    action_data, self.stage, self.parser_config, options
+                )
+                for action_data in actions
+            ]
+        )
 
     async def load_results(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ResultsSet]:
-        results = await self.load_data(
-            options=options
+        results = await self.load_data(options=options)
+
+        return ResultsSet(
+            {
+                "stage_results": await asyncio.gather(
+                    *[
+                        self.parser.parse_result(
+                            results_data, self.stage, self.parser_config, options
+                        )
+                        for results_data in results
+                    ]
+                )
+            }
         )
 
-        return ResultsSet({
-            'stage_results': await asyncio.gather(*[
-                self.parser.parse_result(
-                    results_data,
-                    self.stage,
-                    self.parser_config,
-                    options
-                ) for results_data in results
-            ])
-        })
-    
     async def load_data(
-        self, 
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[Dict[str, Any]]]:
         data: Dict[str, List[ConsumerRecord]] = await self._consumer.getmany(
-            timeout_ms=self.timeout,
-            max_records=options.get('max_records')
+            timeout_ms=self.timeout, max_records=options.get("max_records")
         )
 
         records: List[Dict[str, Any]] = []
 
         for messages in data.values():
             for message in messages:
-                records.append(
-                    json.loads(message.value)
-                )
+                records.append(json.loads(message.value))
 
         return records
-
 
     async def close(self):
         await self._consumer.stop()

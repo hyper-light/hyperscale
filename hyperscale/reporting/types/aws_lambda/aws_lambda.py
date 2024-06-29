@@ -24,26 +24,24 @@ from .aws_lambda_config import AWSLambdaConfig
 
 try:
     import boto3
-    has_connector=True
+
+    has_connector = True
 except Exception:
     boto3 = None
-    has_connector=False
+    has_connector = False
 
 
 def handle_loop_stop(
-    signame, 
-    executor: ThreadPoolExecutor, 
-    loop: asyncio.AbstractEventLoop
-): 
+    signame, executor: ThreadPoolExecutor, loop: asyncio.AbstractEventLoop
+):
     try:
-        executor.shutdown(wait=False, cancel_futures=True) 
+        executor.shutdown(wait=False, cancel_futures=True)
         loop.stop()
     except Exception:
         pass
 
 
 class AWSLambda:
-
     def __init__(self, config: AWSLambdaConfig) -> None:
         self.aws_access_key_id = config.aws_access_key_id
         self.aws_secret_access_key = config.aws_secret_access_key
@@ -51,15 +49,15 @@ class AWSLambda:
 
         self.events_lambda_name = config.events_lambda
         self.streams_lambda_name = config.streams_lambda
-        
-        self.metrics_lambda_name = config.metrics_lambda 
-        self.shared_metrics_lambda_name = f'{config.metrics_lambda}_shared'
-        self.error_metrics_lambda_name = f'{config.metrics_lambda}_error'
+
+        self.metrics_lambda_name = config.metrics_lambda
+        self.shared_metrics_lambda_name = f"{config.metrics_lambda}_shared"
+        self.error_metrics_lambda_name = f"{config.metrics_lambda}_error"
         self.system_metrics_lambda_name = config.system_metrics_lambda
 
         self.experiments_lambda_name = config.experiments_lambda
-        self.variants_lambda_name = f'{config.experiments_lambda}_variants'
-        self.mutations_lambda_name = f'{config.experiments_lambda}_mutations'
+        self.variants_lambda_name = f"{config.experiments_lambda}_variants"
+        self.mutations_lambda_name = f"{config.experiments_lambda}_mutations"
 
         self._executor = ThreadPoolExecutor(max_workers=psutil.cpu_count(logical=False))
         self._client = None
@@ -74,45 +72,50 @@ class AWSLambda:
         self.logger.initialize()
 
     async def connect(self):
-
-        for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+        for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
             self._loop.add_signal_handler(
                 getattr(signal, signame),
                 lambda signame=signame: handle_loop_stop(
-                    signame,
-                    self._executor,
-                    self._loop
-                )
+                    signame, self._executor, self._loop
+                ),
             )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Opening session - {self.session_uuid}')
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Opening amd authorizing connection to AWS - Region: {self.region_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Opening session - {self.session_uuid}"
+        )
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Opening amd authorizing connection to AWS - Region: {self.region_name}"
+        )
 
         self._client = await self._loop.run_in_executor(
             self._executor,
             functools.partial(
                 boto3.client,
-                'lambda',
+                "lambda",
                 aws_access_key_id=self.aws_access_key_id,
                 aws_secret_access_key=self.aws_secret_access_key,
-                region_name=self.region_name
-            )
+                region_name=self.region_name,
+            ),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Successfully opened connection to AWS - Region: {self.region_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Successfully opened connection to AWS - Region: {self.region_name}"
+        )
 
-    async def submit_session_system_metrics(self, system_metrics_sets: List[SystemMetricsSet]):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Session System Metrics to file - {self.experiments_lambda_name}')
-        
+    async def submit_session_system_metrics(
+        self, system_metrics_sets: List[SystemMetricsSet]
+    ):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Session System Metrics to file - {self.experiments_lambda_name}"
+        )
+
         metrics_sets: List[Dict[str, Union[int, float, str]]] = []
 
         for metrics_set in system_metrics_sets:
-
             cpu_metrics = metrics_set.cpu
             memory_metrics = metrics_set.memory
 
-            for stage_name, stage_cpu_metrics in  cpu_metrics.metrics.items():
-
+            for stage_name, stage_cpu_metrics in cpu_metrics.metrics.items():
                 for monitor_metrics in stage_cpu_metrics.values():
                     metrics_sets.append(monitor_metrics.record)
 
@@ -121,214 +124,266 @@ class AWSLambda:
                     metrics_sets.append(monitor_metrics.record)
 
                 stage_mb_per_vu_metrics = metrics_set.mb_per_vu.get(stage_name)
-                
+
                 if stage_mb_per_vu_metrics:
                     metrics_sets.append(stage_mb_per_vu_metrics.record)
-                
+
             for monitor_metrics in metrics_set.session_cpu_metrics.values():
                 metrics_sets.append(monitor_metrics.record)
-                
-            for  monitor_metrics in metrics_set.session_memory_metrics.values():
+
+            for monitor_metrics in metrics_set.session_memory_metrics.values():
                 metrics_sets.append(monitor_metrics.record)
-                
+
         await self._loop.run_in_executor(
             self._executor,
             functools.partial(
                 self._client.invoke,
                 FunctionName=self.experiments_lambda_name,
-                Payload=json.dumps(metrics_sets)
-            )
+                Payload=json.dumps(metrics_sets),
+            ),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Session System Metrics to file - {self.experiments_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Session System Metrics to file - {self.experiments_lambda_name}"
+        )
 
-    async def submit_stage_system_metrics(self, system_metrics_sets: List[SystemMetricsSet]):
+    async def submit_stage_system_metrics(
+        self, system_metrics_sets: List[SystemMetricsSet]
+    ):
         pass
 
     async def submit_streams(self, stream_metrics: Dict[str, StageStreamsSet]):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Streams to file - {self.streams_lambda_name}')
-        
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Streams to file - {self.streams_lambda_name}"
+        )
+
         await self._loop.run_in_executor(
             self._executor,
             functools.partial(
                 self._client.invoke,
                 FunctionName=self.streams_lambda_name,
-                Payload=json.dumps([
-                    {
-                        'stage': stream_name,
-                        **stream_set.grouped 
-                    } for stream_name, stream_set in stream_metrics.items()
-                ])
-            )
+                Payload=json.dumps(
+                    [
+                        {"stage": stream_name, **stream_set.grouped}
+                        for stream_name, stream_set in stream_metrics.items()
+                    ]
+                ),
+            ),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Streams to file - {self.streams_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Streams to file - {self.streams_lambda_name}"
+        )
 
+    async def submit_experiments(
+        self, experiment_metrics: ExperimentMetricsCollectionSet
+    ):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Experiments to file - {self.experiments_lambda_name}"
+        )
 
-    async def submit_experiments(self, experiment_metrics: ExperimentMetricsCollectionSet):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Experiments to file - {self.experiments_lambda_name}')
-        
         await self._loop.run_in_executor(
             self._executor,
             functools.partial(
                 self._client.invoke,
                 FunctionName=self.experiments_lambda_name,
-                Payload=json.dumps([
-                    experiment.record for experiment in experiment_metrics.experiment_summaries
-                ])
-            )
+                Payload=json.dumps(
+                    [
+                        experiment.record
+                        for experiment in experiment_metrics.experiment_summaries
+                    ]
+                ),
+            ),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Experiments to file - {self.experiments_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Experiments to file - {self.experiments_lambda_name}"
+        )
 
     async def submit_variants(self, experiment_metrics: ExperimentMetricsCollectionSet):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Variant to file - {self.variants_lambda_name}')
-        
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Variant to file - {self.variants_lambda_name}"
+        )
+
         await self._loop.run_in_executor(
             self._executor,
             functools.partial(
                 self._client.invoke,
                 FunctionName=self.variants_lambda_name,
-                Payload=json.dumps([
-                    variant.record for variant in experiment_metrics.variant_summaries
-                ])
-            )
+                Payload=json.dumps(
+                    [variant.record for variant in experiment_metrics.variant_summaries]
+                ),
+            ),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Variant to file - {self.variants_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Variant to file - {self.variants_lambda_name}"
+        )
 
-    async def submit_mutations(self, experiment_metrics: ExperimentMetricsCollectionSet):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Mutation to file - {self.mutations_lambda_name}')
-        
+    async def submit_mutations(
+        self, experiment_metrics: ExperimentMetricsCollectionSet
+    ):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Mutation to file - {self.mutations_lambda_name}"
+        )
+
         await self._loop.run_in_executor(
             self._executor,
             functools.partial(
                 self._client.invoke,
                 FunctionName=self.mutations_lambda_name,
-                Payload=json.dumps([
-                    mutation.record for mutation in experiment_metrics.mutation_summaries
-                ])
-            )
+                Payload=json.dumps(
+                    [
+                        mutation.record
+                        for mutation in experiment_metrics.mutation_summaries
+                    ]
+                ),
+            ),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Mutation to file - {self.mutations_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Mutation to file - {self.mutations_lambda_name}"
+        )
 
     async def submit_events(self, events: List[BaseProcessedResult]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Events to Lambda - {self.events_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Events to Lambda - {self.events_lambda_name}"
+        )
 
         await self._loop.run_in_executor(
             self._executor,
             functools.partial(
                 self._client.invoke,
                 FunctionName=self.events_lambda_name,
-                Payload=json.dumps([
-                    event.record for event in events
-                ])
-            )
+                Payload=json.dumps([event.record for event in events]),
+            ),
         )
 
-        
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Events to Lambda - {self.events_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Events to Lambda - {self.events_lambda_name}"
+        )
 
     async def submit_common(self, metrics_sets: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Shared Metrics to Lambda - {self.shared_metrics_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Shared Metrics to Lambda - {self.shared_metrics_lambda_name}"
+        )
 
         await self._loop.run_in_executor(
             self._executor,
             functools.partial(
                 self._client.invoke,
                 FunctionName=self.shared_metrics_lambda_name,
-                    Payload=json.dumps([
+                Payload=json.dumps(
+                    [
                         {
-                            'name': metrics_set.name,
-                            'stage': metrics_set.stage,
-                            'group': 'common',
-                            **metrics_set.common_stats
-                        } for metrics_set in metrics_sets
-                    ])
-            )
+                            "name": metrics_set.name,
+                            "stage": metrics_set.stage,
+                            "group": "common",
+                            **metrics_set.common_stats,
+                        }
+                        for metrics_set in metrics_sets
+                    ]
+                ),
+            ),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Shared Metrics to Lambda - {self.shared_metrics_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Shared Metrics to Lambda - {self.shared_metrics_lambda_name}"
+        )
 
     async def submit_metrics(self, metrics: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Metrics to Lambda - {self.metrics_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Metrics to Lambda - {self.metrics_lambda_name}"
+        )
 
         for metrics_set in metrics:
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
-            
             await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
                     self._client.invoke,
                     FunctionName=self.metrics_lambda_name,
-                    Payload=json.dumps([
-                        {
-                            'group': group_name,
-                            **group.record,
-                            **group.custom
-                        } for group_name, group in metrics_set.groups.items()
-                    ])
-                )
+                    Payload=json.dumps(
+                        [
+                            {"group": group_name, **group.record, **group.custom}
+                            for group_name, group in metrics_set.groups.items()
+                        ]
+                    ),
+                ),
             )
-            
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Metrics to Lambda - {self.metrics_lambda_name}')
 
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Metrics to Lambda - {self.metrics_lambda_name}"
+        )
 
     async def submit_custom(self, metrics_sets: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Custom Metrics to Lambda - {self.metrics_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Custom Metrics to Lambda - {self.metrics_lambda_name}"
+        )
 
         await self._loop.run_in_executor(
             self._executor,
             functools.partial(
                 self._client.invoke,
                 FunctionName=self.metrics_lambda_name,
-                Payload=json.dumps([
-                    {
-                        'name': metrics_set.name,
-                        'stage': metrics_set.stage,
-                        'group': 'custom',
-                        **{
-                            metric.metric_shortname: metric.metric_value for metric in metrics_set.custom_metrics.values()
+                Payload=json.dumps(
+                    [
+                        {
+                            "name": metrics_set.name,
+                            "stage": metrics_set.stage,
+                            "group": "custom",
+                            **{
+                                metric.metric_shortname: metric.metric_value
+                                for metric in metrics_set.custom_metrics.values()
+                            },
                         }
-                    } for metrics_set in metrics_sets
-                ])
-            )
+                        for metrics_set in metrics_sets
+                    ]
+                ),
+            ),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Custom Metrics to Lambda - {self.metrics_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Custom Metrics to Lambda - {self.metrics_lambda_name}"
+        )
 
     async def submit_errors(self, metrics: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Errors Metrics to Lambda - {self.error_metrics_lambda_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Errors Metrics to Lambda - {self.error_metrics_lambda_name}"
+        )
 
         for metrics_set in metrics:
-
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Errors Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Errors Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
 
             await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
                     self._client.invoke,
                     FunctionName=self.error_metrics_lambda_name,
-                    Payload=json.dumps([
-                        {
-                            'name': metrics_set.name,
-                            'stage': metrics_set.stage,
-                            **error
-                        } for error in metrics_set.errors
-                    ])
-                )
+                    Payload=json.dumps(
+                        [
+                            {
+                                "name": metrics_set.name,
+                                "stage": metrics_set.stage,
+                                **error,
+                            }
+                            for error in metrics_set.errors
+                        ]
+                    ),
+                ),
             )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Errors Metrics to Lambda - {self.error_metrics_lambda_name}')
-            
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Errors Metrics to Lambda - {self.error_metrics_lambda_name}"
+        )
 
     async def close(self):
         self._executor.shutdown(cancel_futures=True)
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Closing session - {self.session_uuid}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Closing session - {self.session_uuid}"
+        )

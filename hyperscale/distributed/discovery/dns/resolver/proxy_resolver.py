@@ -1,4 +1,3 @@
-
 from typing import Callable, List, Optional, Tuple, Union
 
 from hyperscale.distributed.discovery.dns.core.cache import CacheNode
@@ -15,51 +14,25 @@ from hyperscale.distributed.models.dns import DNSMessage, QueryType
 from .base_resolver import BaseResolver
 from .memoizer import Memoizer
 
-Proxy = Tuple[
-    Union[
-        Callable[
-            [str],
-            bool
-        ],
-        str,
-        None
-    ], 
-    str
-]
+Proxy = Tuple[Union[Callable[[str], bool], str, None], str]
 
-NameServerPair = Tuple[
-    Union[
-        Callable[
-            [str],
-            bool
-        ],
-        None
-    ],
-    NameServer
-]
+NameServerPair = Tuple[Union[Callable[[str], bool], None], NameServer]
 
 
 class ProxyResolver(BaseResolver):
-
-    default_nameservers = core_config['default_nameservers']
+    default_nameservers = core_config["default_nameservers"]
     memoizer = Memoizer()
 
     def __init__(
-        self, 
+        self,
         host: str,
         port: int,
         instance_id: str,
         env: Env,
         cache: CacheNode = None,
-        proxies: Optional[List[Proxy]]=None
+        proxies: Optional[List[Proxy]] = None,
     ):
-        super().__init__(
-            host,
-            port,
-            instance_id,
-            env,
-            cache=cache
-        )
+        super().__init__(host, port, instance_id, env, cache=cache)
 
         if proxies is None:
             proxies = self.default_nameservers
@@ -68,55 +41,39 @@ class ProxyResolver(BaseResolver):
         self._nameserver_pairs = self.set_proxies(proxies)
 
     def _get_matching_nameserver(self, fqdn):
-
         for nameserver_test, nameserver in self._nameserver_pairs:
             if nameserver_test is None or nameserver_test(fqdn):
                 return nameserver
 
         return NameServer([])
-    
-    def add_nameserver(
-        self,
-        urls: List[str]
-    ):
+
+    def add_nameserver(self, urls: List[str]):
         namserver = NameServer(urls)
 
-        self._nameserver_pairs.append((
-            None,
-            namserver
-        ))
+        self._nameserver_pairs.append((None, namserver))
 
         return namserver.data
 
     @staticmethod
-    def build_tester(rule) ->  Callable[
-        [str],
-        bool
-    ]:
-
+    def build_tester(rule) -> Callable[[str], bool]:
         if rule is None or callable(rule):
             return rule
-        
+
         assert isinstance(rule, str)
 
-        if rule.startswith('*.'):
+        if rule.startswith("*."):
             suffix = rule[1:]
 
             return lambda d: d.endswith(suffix)
-        
+
         return lambda d: d == rule
 
-    def set_proxies(
-        self, 
-        proxies: List[Proxy]
-    ):
-
+    def set_proxies(self, proxies: List[Proxy]):
         nameserver_pairs: List[NameServerPair] = []
         fallback: List[str] = []
 
         if proxies:
             for item in proxies:
-
                 if isinstance(item, str):
                     fallback.append(item)
                     continue
@@ -127,39 +84,21 @@ class ProxyResolver(BaseResolver):
                     continue
 
                 nameserver_pairs.append(
-                    (
-                        self.build_tester(test), 
-                        NameServer([nameserver])
-                    )
+                    (self.build_tester(test), NameServer([nameserver]))
                 )
 
         if fallback:
-            nameserver_pairs.append(
-                (
-                    None, 
-                    NameServer(fallback)
-                )
-            )
+            nameserver_pairs.append((None, NameServer(fallback)))
 
         return nameserver_pairs
 
     @memoizer.memoize_async(
-            lambda _, fqdn, record_type, skip_cache: (fqdn, record_type)
+        lambda _, fqdn, record_type, skip_cache: (fqdn, record_type)
     )
-    async def _query(
-        self, 
-        fqdn: str, 
-        record_type: RecordType,
-        skip_cache: bool
-    ):
-
+    async def _query(self, fqdn: str, record_type: RecordType, skip_cache: bool):
         msg = DNSMessage()
         msg.query_domains.append(
-            Record(
-                QueryType.REQUEST, 
-                name=fqdn, 
-                record_type=record_type
-            )
+            Record(QueryType.REQUEST, name=fqdn, record_type=record_type)
         )
 
         has_result = False
@@ -187,4 +126,3 @@ class ProxyResolver(BaseResolver):
                     break
 
         return msg
-

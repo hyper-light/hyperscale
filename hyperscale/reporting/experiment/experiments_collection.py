@@ -1,15 +1,9 @@
-from pydantic import (
-    BaseModel, 
-    StrictBool, 
-    StrictFloat, 
-    StrictInt, 
-    StrictStr
-)
+from pydantic import BaseModel, StrictBool, StrictFloat, StrictInt, StrictStr
 from typing import List, Dict, Union
 from .experiment_metrics_set_types import (
     ExperimentSummary,
     VariantSummary,
-    MutationSummary
+    MutationSummary,
 )
 
 
@@ -34,4 +28,3 @@ class ExperimentMetricsCollectionSet(BaseModel):
     experiment_summaries: List[ExperimentSummary]
     variant_summaries: List[VariantSummary]
     mutation_summaries: List[MutationSummary]
-    

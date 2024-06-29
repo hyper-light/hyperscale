@@ -7,10 +7,7 @@ from .naptr_record_data import NAPTRRecordData
 from .ns_record_data import NSRecordData
 from .ptr_record_data import PTRRecordData
 from .record_data import RecordData
-from .record_types import (
-    RecordType,
-    RecordTypesMap
-)
+from .record_types import RecordType, RecordTypesMap
 from .soa_record_data import SOARecordData
 from .srv_record_data import SRVRecordData
 from .txt_record_data import TXTRecordData

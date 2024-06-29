@@ -21,11 +21,11 @@ from hyperscale.plugins.types.plugin_types import PluginType
 
 
 class Stage:
-    stage_type=StageTypes
-    dependencies: List[Stage]=[]
-    all_dependencies: List[Stage]=[]
+    stage_type = StageTypes
+    dependencies: List[Stage] = []
+    all_dependencies: List[Stage] = []
     next_context: Any = None
-    stage_timeout=None
+    stage_timeout = None
     plugins: Dict[str, Plugin] = {}
 
     def __init__(self) -> None:
@@ -60,11 +60,11 @@ class Stage:
             time_parser = TimeParser(self.stage_timeout)
 
             self.timeout = time_parser.time
-        
+
         else:
             self.timeout = None
 
-        self.internal_hooks = ['run']
+        self.internal_hooks = ["run"]
         self.dispatcher: EventDispatcher = EventDispatcher()
         self.skip = False
 
@@ -82,27 +82,26 @@ class Stage:
 
     @property
     def metadata_string(self):
-        return f'Graph - {self.graph_name}:{self.graph_id} - thread:{self.thread_id} - process:{self.process_id} - Stage: {self.name}:{self.stage_id} - '
-    
+        return f"Graph - {self.graph_name}:{self.graph_id} - thread:{self.thread_id} - process:{self.process_id} - Stage: {self.name}:{self.stage_id} - "
+
     @Internal()
     async def setup_events(self):
-
         for event in self.dispatcher.events_by_name.values():
             event.context.update(self.context)
-            
+
             if event.source.context:
                 event.source.context.update(self.context)
 
-        await self.logger.filesystem.aio['hyperscale.core'].info(f'{self.metadata_string} - Executing events')
+        await self.logger.filesystem.aio["hyperscale.core"].info(
+            f"{self.metadata_string} - Executing events"
+        )
 
     @Internal()
     def to_copy_dict(self) -> Dict[str, Any]:
-
         copy_dict = {}
 
         for attr_name, value in self.__dict__.items():
-            if not attr_name.startswith('__'):
+            if not attr_name.startswith("__"):
                 copy_dict[attr_name] = value
 
         return copy_dict
-

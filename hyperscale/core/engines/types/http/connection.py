@@ -13,22 +13,21 @@ from hyperscale.core.engines.types.common.protocols.shared.writer import Writer
 
 
 class HTTPConnection:
-
     __slots__ = (
-        'dns_address',
-        'port',
-        'ssl',
-        'ip_addr',
-        'lock',
-        'reader',
-        'writer',
-        'connected',
-        'reset_connection',
-        'pending',
-        '_connection_factory'
+        "dns_address",
+        "port",
+        "ssl",
+        "ip_addr",
+        "lock",
+        "reader",
+        "writer",
+        "connected",
+        "reset_connection",
+        "pending",
+        "_connection_factory",
     )
 
-    def __init__(self, reset_connection: bool=False) -> None:
+    def __init__(self, reset_connection: bool = False) -> None:
         self.dns_address: str = None
         self.port: int = None
         self.ssl: SSLContext = None
@@ -44,17 +43,24 @@ class HTTPConnection:
         self._connection_factory = TCPConnection()
 
     async def make_connection(
-        self, 
-        hostname: str, 
+        self,
+        hostname: str,
         dns_address: str,
-        port: int, 
+        port: int,
         socket_config: Tuple[int, int, int, int, Tuple[int, int]],
-        ssl: Optional[SSLContext]=None,
-        timeout: Optional[float]=None
+        ssl: Optional[SSLContext] = None,
+        timeout: Optional[float] = None,
     ) -> None:
-        if self.connected is False or self.dns_address != dns_address or self.reset_connection:
+        if (
+            self.connected is False
+            or self.dns_address != dns_address
+            or self.reset_connection
+        ):
             try:
-                reader, writer = await asyncio.wait_for(self._connection_factory.create(hostname, socket_config, ssl=ssl), timeout=timeout)
+                reader, writer = await asyncio.wait_for(
+                    self._connection_factory.create(hostname, socket_config, ssl=ssl),
+                    timeout=timeout,
+                )
                 self.connected = True
 
                 self.reader = reader
@@ -65,10 +71,13 @@ class HTTPConnection:
                 self.ssl = ssl
 
             except asyncio.TimeoutError:
-                raise Exception('Connection timed out.')
+                raise Exception("Connection timed out.")
 
-            except (ConnectionResetError, OSError,):
-                raise Exception('Connection reset.')
+            except (
+                ConnectionResetError,
+                OSError,
+            ):
+                raise Exception("Connection reset.")
 
             except Exception as e:
                 raise e
@@ -83,7 +92,7 @@ class HTTPConnection:
     def readexactly(self, n_bytes: int):
         return self.reader.read(n=n_bytes)
 
-    def readuntil(self, sep=b'\n'):
+    def readuntil(self, sep=b"\n"):
         return self.reader.readuntil(separator=sep)
 
     def write(self, data):

@@ -1,4 +1,5 @@
 from .env import Env as Env
+from .instance_role_type import InstanceRoleType as InstanceRoleType
 from .job_context import JobContext as JobContext
 from .message import Message as Message
 from .received_receipt import ReceivedReceipt as ReceivedReceipt

@@ -1,5 +1,6 @@
 from enum import IntEnum
 
+
 class StreamState(IntEnum):
     IDLE = 0
     RESERVED_REMOTE = 1

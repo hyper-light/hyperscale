@@ -15,13 +15,10 @@ from pydantic import (
 
 class AddLocatorHandlerCommand(BaseModel):
     locator: Locator
-    handler: Callable[
-        [Locator],
-        Any
-    ] | Callable[[], Any]
-    no_wait_after: Optional[StrictBool]=None
-    times: Optional[StrictInt]=None
+    handler: Callable[[Locator], Any] | Callable[[], Any]
+    no_wait_after: Optional[StrictBool] = None
+    times: Optional[StrictInt] = None
     timeout: StrictInt | StrictFloat
 
     class Config:
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed = True

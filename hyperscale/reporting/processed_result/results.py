@@ -23,6 +23,5 @@ results_types = {
     RequestTypes.PLAYWRIGHT: PlaywrightProcessedResult,
     RequestTypes.TASK: TaskProcessedResult,
     RequestTypes.UDP: UDPProcessedResult,
-    RequestTypes.WEBSOCKET: WebsocketProcessedResult
+    RequestTypes.WEBSOCKET: WebsocketProcessedResult,
 }
-

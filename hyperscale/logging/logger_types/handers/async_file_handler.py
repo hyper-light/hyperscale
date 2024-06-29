@@ -22,9 +22,7 @@ from hyperscale.tools.filesystem.text import AsyncTextIOWrapper
 class AsyncFileHandler(Handler):
     terminator = "\n"
 
-    def __init__(
-        self, filename: str, mode: str = "a", encoding: str = None
-    ) -> None:
+    def __init__(self, filename: str, mode: str = "a", encoding: str = None) -> None:
         super().__init__()
         filename = os.fspath(filename)
         self.absolute_file_path = os.path.abspath(filename)
@@ -258,8 +256,7 @@ class AsyncTimedRotatingFileHandler(BaseAsyncRotatingFileHandler):
             self.suffix = "%Y-%m-%d_%H"
             ext_match = r"^\d{4}-\d{2}-\d{2}_\d{2}(\.\w+)?$"
         elif (
-            self.when == RolloverInterval.DAYS
-            or self.when == RolloverInterval.MIDNIGHT
+            self.when == RolloverInterval.DAYS or self.when == RolloverInterval.MIDNIGHT
         ):
             self.interval = ONE_DAY_IN_SECONDS  # one day
             self.suffix = "%Y-%m-%d"
@@ -322,9 +319,7 @@ class AsyncTimedRotatingFileHandler(BaseAsyncRotatingFileHandler):
                     self.at_time.hour * 60 + self.at_time.minute
                 ) * 60 + self.at_time.second
 
-            r = rotate_ts - (
-                (current_hour * 60 + current_minute) * 60 + current_second
-            )
+            r = rotate_ts - ((current_hour * 60 + current_minute) * 60 + current_second)
             if r < 0:
                 # Rotate time is before the current time (for example when
                 # self.rotateAt is 13:45 and it now 14:15), rotation is
@@ -354,9 +349,7 @@ class AsyncTimedRotatingFileHandler(BaseAsyncRotatingFileHandler):
                         days_to_wait = self.day_of_week - day
                     else:
                         days_to_wait = 6 - day + self.day_of_week + 1
-                    new_rollover_at = result + (
-                        days_to_wait * ONE_DAY_IN_SECONDS
-                    )
+                    new_rollover_at = result + (days_to_wait * ONE_DAY_IN_SECONDS)
                     if not self.utc:
                         dst_now = t[-1]
                         dst_at_rollover = time.localtime(new_rollover_at)[-1]
@@ -388,9 +381,7 @@ class AsyncTimedRotatingFileHandler(BaseAsyncRotatingFileHandler):
         """
         dir_name, base_name = os.path.split(self.absolute_file_path)
         loop = get_running_loop()
-        file_names = await loop.run_in_executor(
-            None, lambda: os.listdir(dir_name)
-        )
+        file_names = await loop.run_in_executor(None, lambda: os.listdir(dir_name))
         result = []
         prefix = base_name + "."
         plen = len(prefix)
@@ -439,17 +430,13 @@ class AsyncTimedRotatingFileHandler(BaseAsyncRotatingFileHandler):
                     addend = -ONE_HOUR_IN_SECONDS
                 time_tuple = time.localtime(t + addend)
         destination_file_path = self.rotation_filename(
-            self.absolute_file_path
-            + "."
-            + time.strftime(self.suffix, time_tuple)
+            self.absolute_file_path + "." + time.strftime(self.suffix, time_tuple)
         )
         loop = get_running_loop()
         if await loop.run_in_executor(
             None, lambda: os.path.exists(destination_file_path)
         ):
-            await loop.run_in_executor(
-                None, lambda: os.unlink(destination_file_path)
-            )
+            await loop.run_in_executor(None, lambda: os.unlink(destination_file_path))
         await self.rotate(self.absolute_file_path, destination_file_path)
         if self.backup_count > 0:
             files_to_delete = await self.get_files_to_delete()

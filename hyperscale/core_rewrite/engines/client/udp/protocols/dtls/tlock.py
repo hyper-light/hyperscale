@@ -35,6 +35,7 @@ except ImportError:
 _logger = getLogger(__name__)
 DO_DEBUG_LOG = False
 
+
 def tlock_init():
     if not globals().has_key("threading"):
         return  # nothing to configure
@@ -47,10 +48,12 @@ def tlock_init():
     _locks = tuple(threading.Lock() for _ in range(num_locks))
     CRYPTO_set_locking_callback(_locking_function)
 
+
 def _locking_function(mode, n, file, line):
     if DO_DEBUG_LOG:
-        _logger.debug("Thread lock:  mode: %d, n: %d, file: %s, line: %d",
-                      mode, n, file, line)
+        _logger.debug(
+            "Thread lock:  mode: %d, n: %d, file: %s, line: %d", mode, n, file, line
+        )
     if mode & CRYPTO_LOCK:
         _locks[n].acquire()
     else:

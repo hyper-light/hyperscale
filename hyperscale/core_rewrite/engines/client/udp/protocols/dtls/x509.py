@@ -39,6 +39,7 @@ _logger = getLogger(__name__)
 
 class _X509(_Rsrc):
     """Wrapper for the cryptographic library's X509 resource"""
+
     def __init__(self, value):
         _logger.debug("Allocating X509: %d", value.raw)
         super(_X509, self).__init__(value)
@@ -51,6 +52,7 @@ class _X509(_Rsrc):
 
 class _STACK(_Rsrc):
     """Wrapper for the cryptographic library's stacks"""
+
     def __init__(self, value):
         _logger.debug("Allocating STACK: %d", value.raw)
         super(_STACK, self).__init__(value)
@@ -59,6 +61,7 @@ class _STACK(_Rsrc):
         _logger.debug("Freeing stack: %d", self.raw)
         sk_pop_free(self._value)
         self._value = None
+
 
 def decode_cert(cert):
     """Convert an X509 certificate into a Python dictionary
@@ -80,6 +83,7 @@ def decode_cert(cert):
 
     return ret_dict
 
+
 def _test_decode_cert(cert_filename):
     """format_cert testing
 
@@ -91,10 +95,12 @@ def _test_decode_cert(cert_filename):
     cert = _X509(PEM_read_bio_X509_AUX(cert_file.value))
     return decode_cert(cert)
 
+
 def _create_tuple_for_attribute(name, value):
     name_str = OBJ_obj2txt(name, False)
     value_str = decode_ASN1_STRING(value)
     return name_str, value_str
+
 
 def _create_tuple_for_X509_NAME(xname):
     distinguished_name = []
@@ -115,28 +121,31 @@ def _create_tuple_for_X509_NAME(xname):
         distinguished_name.append(tuple(relative_distinguished_name))
     return tuple(distinguished_name)
 
+
 def _get_peer_alt_names(cert):
     ret_list = None
     ext_index = -1
     while True:
-        ext_index = X509_get_ext_by_NID(cert.value, NID_subject_alt_name,
-                                        ext_index)
+        ext_index = X509_get_ext_by_NID(cert.value, NID_subject_alt_name, ext_index)
         if ext_index < 0:
             break
         if ret_list is None:
             ret_list = []
         ext_ptr = X509_get_ext(cert.value, ext_index)
         method_ptr = X509V3_EXT_get(ext_ptr)
-        general_names = _STACK(ASN1_item_d2i(method_ptr.contents,
-                                             ext_ptr.contents.value.contents))
+        general_names = _STACK(
+            ASN1_item_d2i(method_ptr.contents, ext_ptr.contents.value.contents)
+        )
         for name_index in range(sk_num(general_names.value)):
             name_ptr = sk_value(general_names.value, name_index)
             if name_ptr.contents.type == GEN_DIRNAME:
-                name_tuple = "DirName", \
-                  _create_tuple_for_X509_NAME(name_ptr.contents.d.directoryName)
+                name_tuple = (
+                    "DirName",
+                    _create_tuple_for_X509_NAME(name_ptr.contents.d.directoryName),
+                )
             else:
                 name_str = GENERAL_NAME_print(name_ptr)
-                name_tuple = tuple(name_str.split(':', 1))
+                name_tuple = tuple(name_str.split(":", 1))
             ret_list.append(name_tuple)
 
     return tuple(ret_list) if ret_list is not None else None

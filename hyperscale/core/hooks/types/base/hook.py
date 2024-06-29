@@ -7,16 +7,15 @@ from hyperscale.core.hooks.types.base.simple_context import SimpleContext
 
 
 class Hook:
-
     def __init__(
-        self, 
-        name: str, 
+        self,
+        name: str,
         shortname: str,
-        call: Callable[..., Awaitable[Any]], 
+        call: Callable[..., Awaitable[Any]],
         stage: str = None,
-        order: int=None,
-        skip: bool=False,
-        hook_type: HookType=None
+        order: int = None,
+        skip: bool = False,
+        hook_type: HookType = None,
     ) -> None:
         self.hook_id = str(uuid.uuid4())
         self.name = name
@@ -36,11 +35,11 @@ class Hook:
         self.context: SimpleContext = SimpleContext()
         self.order: int = order
         self.skip = skip
-        
 
     async def call(self, **kwargs):
-
-        hook_args = {name: value for name, value in kwargs.items() if name in self.params}
+        hook_args = {
+            name: value for name, value in kwargs.items() if name in self.params
+        }
         execute = await self._execute_call(**hook_args)
 
         if execute:
@@ -49,19 +48,21 @@ class Hook:
             if isinstance(result, dict):
                 return result
 
-            return {
-                **kwargs,
-                self.name: result
-            }
-
+            return {**kwargs, self.name: result}
 
     async def _execute_call(self, **hook_args):
         execute = True
         for condition in self.conditions:
-            execute = await condition(**{name: value for name, value in hook_args.items() if name in self.params})
+            execute = await condition(
+                **{
+                    name: value
+                    for name, value in hook_args.items()
+                    if name in self.params
+                }
+            )
 
         return execute
-    
+
     async def _default_call(self, **kwargs):
         pass
 
@@ -73,5 +74,5 @@ class Hook:
             stage=self.stage,
             order=self.order,
             skip=self.skip,
-            hook_type=self.hook_type
+            hook_type=self.hook_type,
         )

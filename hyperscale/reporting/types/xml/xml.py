@@ -35,14 +35,14 @@ collections.Iterable = collections.abc.Iterable
 
 
 def handle_loop_stop(
-    signame, 
-    executor: ThreadPoolExecutor, 
-    loop: asyncio.AbstractEventLoop, 
-    events_file: TextIO
-): 
+    signame,
+    executor: ThreadPoolExecutor,
+    loop: asyncio.AbstractEventLoop,
+    events_file: TextIO,
+):
     try:
         events_file.close()
-        executor.shutdown(wait=False, cancel_futures=True) 
+        executor.shutdown(wait=False, cancel_futures=True)
         loop.stop()
     except Exception:
         pass
@@ -51,10 +51,9 @@ def handle_loop_stop(
 MetricRecord = Dict[str, Union[int, float, str]]
 MetricRecordGroup = Dict[str, List[MetricRecord]]
 MetricRecordCollection = Dict[str, MetricRecord]
-    
+
 
 class XML:
-    
     def __init__(self, config: XMLConfig) -> None:
         self.events_filepath = config.events_filepath
         self.metrics_filepath = Path(config.metrics_filepath).absolute()
@@ -72,13 +71,11 @@ class XML:
         experiments_filename = experiments_path.stem
 
         self.variants_filepath = os.path.join(
-            experiments_directory,
-            f'{experiments_filename}_variants.xml'
+            experiments_directory, f"{experiments_filename}_variants.xml"
         )
 
         self.mutations_filepath = os.path.join(
-            experiments_directory,
-            f'{experiments_filename}_mutations.xml'
+            experiments_directory, f"{experiments_filename}_mutations.xml"
         )
 
         filepath = Path(config.metrics_filepath)
@@ -86,18 +83,15 @@ class XML:
         base_filename = filepath.stem
 
         self.shared_metrics_filepath = os.path.join(
-            base_filepath,
-            f'{base_filename}_shared.xml'
+            base_filepath, f"{base_filename}_shared.xml"
         )
 
         self.custom_metrics_filepath = os.path.join(
-            base_filepath,
-            f'{base_filename}_custom.xml'
+            base_filepath, f"{base_filename}_custom.xml"
         )
 
         self.errors_metrics_filepath = os.path.join(
-            base_filepath,
-            f'{base_filename}_errors.xml'
+            base_filepath, f"{base_filename}_errors.xml"
         )
 
         self.streams_metrics_filepath = config.streams_filepath
@@ -107,13 +101,11 @@ class XML:
         system_metrics_filename = system_metrics_path.stem
 
         self.stage_system_metrics_filepath = os.path.join(
-            system_metrics_directory,
-            f'{system_metrics_filename}_stages.xml'
+            system_metrics_directory, f"{system_metrics_filename}_stages.xml"
         )
 
         self.session_system_metrics_filepath = os.path.join(
-            system_metrics_directory,
-            f'{system_metrics_filename}_session.xml'
+            system_metrics_directory, f"{system_metrics_filename}_session.xml"
         )
 
         self.events_file: TextIO = None
@@ -125,565 +117,483 @@ class XML:
         self.stage_system_metrics_file: TextIO = None
         self.session_system_metrics_file: TextIO = None
 
-        self.write_mode = 'w' if config.overwrite else 'a'
+        self.write_mode = "w" if config.overwrite else "a"
 
     async def connect(self):
         self._loop = asyncio._get_running_loop()
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Setting filepaths')
-        
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Setting filepaths"
+        )
+
         original_filepath = Path(self.events_filepath)
-        
+
         directory = original_filepath.parent
         filename = original_filepath.stem
 
         events_file_timestamp = time.time()
 
         self.events_filepath = os.path.join(
-            directory,
-            f'{filename}_{events_file_timestamp}.xml'
+            directory, f"{filename}_{events_file_timestamp}.xml"
         )
 
-    async def submit_session_system_metrics(self, system_metrics_sets: List[SystemMetricsSet]):
-
+    async def submit_session_system_metrics(
+        self, system_metrics_sets: List[SystemMetricsSet]
+    ):
         if self.session_system_metrics_file is None:
             self.session_system_metrics_file = await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
-                    open,
-                    self.session_system_metrics_filepath,
-                    self.write_mode
-                )
+                    open, self.session_system_metrics_filepath, self.write_mode
+                ),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
                         signame,
                         self._executor,
                         self._loop,
-                        self.session_system_metrics_file
-                    )
+                        self.session_system_metrics_file,
+                    ),
                 )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Session System Metrics to file - {self.session_system_metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Session System Metrics to file - {self.session_system_metrics_filepath}"
+        )
 
         metrics_sets: Dict[str, MetricRecord] = {}
 
         for metrics_set in system_metrics_sets:
-
-            for monitor_name, monitor_metrics in metrics_set.session_cpu_metrics.items():
-
+            for (
+                monitor_name,
+                monitor_metrics,
+            ) in metrics_set.session_cpu_metrics.items():
                 system_metrics_collection: MetricRecordCollection = {}
 
                 memory_metrics = metrics_set.session_memory_metrics.get(monitor_name)
 
-                system_metrics_collection['cpu'] = monitor_metrics.record
-                system_metrics_collection['memory'] = memory_metrics.record
-                
+                system_metrics_collection["cpu"] = monitor_metrics.record
+                system_metrics_collection["memory"] = memory_metrics.record
+
                 metrics_sets[monitor_name] = system_metrics_collection
 
-        system_metrics_xml = dicttoxml(
-            metrics_sets, 
-            custom_root='system'
-        )
+        system_metrics_xml = dicttoxml(metrics_sets, custom_root="system")
 
         system_metrics_xml = parseString(system_metrics_xml)
 
         await self._loop.run_in_executor(
             self._executor,
             self.session_system_metrics_file.write,
-            system_metrics_xml.toprettyxml()
+            system_metrics_xml.toprettyxml(),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Session System Metrics to file - {self.session_system_metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Session System Metrics to file - {self.session_system_metrics_filepath}"
+        )
 
-    async def submit_stage_system_metrics(self, system_metrics_sets: List[SystemMetricsSet]):
-
+    async def submit_stage_system_metrics(
+        self, system_metrics_sets: List[SystemMetricsSet]
+    ):
         if self.stage_system_metrics_file is None:
             self.stage_system_metrics_file = await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
-                    open,
-                    self.stage_system_metrics_filepath,
-                    self.write_mode
-                )
+                    open, self.stage_system_metrics_filepath, self.write_mode
+                ),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
                         signame,
                         self._executor,
                         self._loop,
-                        self.stage_system_metrics_file
-                    )
+                        self.stage_system_metrics_file,
+                    ),
                 )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Stage System Metrics to file - {self.stage_system_metrics_file}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Stage System Metrics to file - {self.stage_system_metrics_file}"
+        )
 
-        metrics_sets: List[MetricRecordGroup]= []
+        metrics_sets: List[MetricRecordGroup] = []
 
         for metrics_set in system_metrics_sets:
-
             cpu_metrics = metrics_set.cpu
             memory_metrics = metrics_set.memory
 
-            for stage_name, stage_cpu_metrics in  cpu_metrics.metrics.items():
-
+            for stage_name, stage_cpu_metrics in cpu_metrics.metrics.items():
                 stage_system_metrics_record: MetricRecordGroup = {
-                    'cpu': [],
-                    'memory': [],
-                    'mb_per_vu': []
+                    "cpu": [],
+                    "memory": [],
+                    "mb_per_vu": [],
                 }
 
                 for monitor_metrics in stage_cpu_metrics.values():
-                    stage_system_metrics_record['cpu'].append(monitor_metrics.record)
+                    stage_system_metrics_record["cpu"].append(monitor_metrics.record)
 
                 stage_memory_metrics = memory_metrics.metrics.get(stage_name)
                 for monitor_metrics in stage_memory_metrics.values():
-                    stage_system_metrics_record['memory'].append(monitor_metrics.record)
+                    stage_system_metrics_record["memory"].append(monitor_metrics.record)
 
                 stage_mb_per_vu_metrics = metrics_set.mb_per_vu.get(stage_name)
-                
+
                 if stage_mb_per_vu_metrics:
-                    stage_system_metrics_record['mb_per_vu'].append(stage_mb_per_vu_metrics.record)
+                    stage_system_metrics_record["mb_per_vu"].append(
+                        stage_mb_per_vu_metrics.record
+                    )
 
                 metrics_sets.append(stage_system_metrics_record)
 
-        system_metrics_xml = dicttoxml(
-            metrics_sets, 
-            custom_root='system'
-        )
+        system_metrics_xml = dicttoxml(metrics_sets, custom_root="system")
 
         system_metrics_xml = parseString(system_metrics_xml)
 
         await self._loop.run_in_executor(
             self._executor,
             self.stage_system_metrics_file.write,
-            system_metrics_xml.toprettyxml()
+            system_metrics_xml.toprettyxml(),
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Stage System Metrics to file - {self.stage_system_metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Stage System Metrics to file - {self.stage_system_metrics_filepath}"
+        )
 
     async def submit_streams(self, stream_metrics: Dict[str, StageStreamsSet]):
         if self.streams_file is None:
             self.streams_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.streams_metrics_filepath,
-                    self.write_mode
-                )
+                functools.partial(open, self.streams_metrics_filepath, self.write_mode),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        self.streams_file
-                    )
+                        signame, self._executor, self._loop, self.streams_file
+                    ),
                 )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Streams to file - {self.streams_metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Streams to file - {self.streams_metrics_filepath}"
+        )
 
         streams_data = [
-            {
-                'stage': stream_name,
-                **stream_set.grouped 
-            } for stream_name, stream_set in stream_metrics.items()
+            {"stage": stream_name, **stream_set.grouped}
+            for stream_name, stream_set in stream_metrics.items()
         ]
 
-        streams_xml = dicttoxml(
-            streams_data, 
-            custom_root='streams'
-        )
+        streams_xml = dicttoxml(streams_data, custom_root="streams")
 
         streams_xml = parseString(streams_xml)
 
         await self._loop.run_in_executor(
-            self._executor,
-            self.streams_file.write,
-            streams_xml.toprettyxml()
+            self._executor, self.streams_file.write, streams_xml.toprettyxml()
         )
-    
-    async def submit_experiments(self, experiment_metrics: ExperimentMetricsCollectionSet):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Experiments to file - {self.experiments_filepath}')
+
+    async def submit_experiments(
+        self, experiment_metrics: ExperimentMetricsCollectionSet
+    ):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Experiments to file - {self.experiments_filepath}"
+        )
 
         if self.experiments_file is None:
             self.experiments_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.experiments_filepath,
-                    self.write_mode
-                )
+                functools.partial(open, self.experiments_filepath, self.write_mode),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        self.experiments_file
-                    )
+                        signame, self._executor, self._loop, self.experiments_file
+                    ),
                 )
 
         experiments_xml = dicttoxml(
-            experiment_metrics.experiments, 
-            custom_root='experiments'
+            experiment_metrics.experiments, custom_root="experiments"
         )
 
         experiments_xml = parseString(experiments_xml)
 
         await self._loop.run_in_executor(
-            self._executor,
-            self.experiments_file.write,
-            experiments_xml.toprettyxml()
+            self._executor, self.experiments_file.write, experiments_xml.toprettyxml()
         )
 
     async def submit_variants(self, experiment_metrics: ExperimentMetricsCollectionSet):
-
         if self.variants_file is None:
             self.variants_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.variants_filepath,
-                    self.write_mode
-                )
+                functools.partial(open, self.variants_filepath, self.write_mode),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        self.variants_file
-                    )
+                        signame, self._executor, self._loop, self.variants_file
+                    ),
                 )
 
-        variants_xml = dicttoxml(
-            experiment_metrics.variants, 
-            custom_root='variants'
-        )
+        variants_xml = dicttoxml(experiment_metrics.variants, custom_root="variants")
 
         variants_xml = parseString(variants_xml)
 
         await self._loop.run_in_executor(
-            self._executor,
-            self.variants_file.write,
-            variants_xml.toprettyxml()
+            self._executor, self.variants_file.write, variants_xml.toprettyxml()
         )
 
-    async def submit_mutations(self, experiment_metrics: ExperimentMetricsCollectionSet):
-
+    async def submit_mutations(
+        self, experiment_metrics: ExperimentMetricsCollectionSet
+    ):
         if self.mutations_file is None:
             self.mutations_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.mutations_filepath,
-                    self.write_mode
-                )
+                functools.partial(open, self.mutations_filepath, self.write_mode),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        self.mutations_file
-                    )
-                ) 
+                        signame, self._executor, self._loop, self.mutations_file
+                    ),
+                )
 
-        
+        mutations_xml = dicttoxml(experiment_metrics.mutations, custom_root="mutations")
 
-        mutations_xml = dicttoxml(
-            experiment_metrics.mutations, 
-            custom_root='mutations'
-        )
-        
         mutations_xml = parseString(mutations_xml)
 
         await self._loop.run_in_executor(
-            self._executor,
-            self.mutations_file.write,
-            mutations_xml.toprettyxml()
+            self._executor, self.mutations_file.write, mutations_xml.toprettyxml()
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Events to file - {self.events_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Events to file - {self.events_filepath}"
+        )
 
     async def connect(self):
         self._loop = asyncio._get_running_loop()
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Skipping connect')
-        
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Skipping connect"
+        )
+
         original_filepath = Path(self.events_filepath)
-        
+
         directory = original_filepath.parent
         filename = original_filepath.stem
 
         events_file_timestamp = time.time()
 
         self.events_filepath = os.path.join(
-            directory,
-            f'{filename}_{events_file_timestamp}.xml'
+            directory, f"{filename}_{events_file_timestamp}.xml"
         )
 
     async def submit_events(self, events: List[BaseProcessedResult]):
-
         if self.events_file is None:
             self.events_file = await self._loop.run_in_executor(
                 self._executor,
-                functools.partial(
-                    open,
-                    self.events_filepath,
-                    self.write_mode
-                )
+                functools.partial(open, self.events_filepath, self.write_mode),
             )
 
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop,
-                        self.events_file
-                    )
+                        signame, self._executor, self._loop, self.events_file
+                    ),
                 )
 
-        events_xml = dicttoxml([
-            event.to_dict() for event in events
-        ], custom_root='events')
+        events_xml = dicttoxml(
+            [event.to_dict() for event in events], custom_root="events"
+        )
 
         events_xml = parseString(events_xml)
 
         await self._loop.run_in_executor(
-            self._executor,
-            self.events_file.write,
-            events_xml.toprettyxml()
+            self._executor, self.events_file.write, events_xml.toprettyxml()
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Events to file - {self.events_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Events to file - {self.events_filepath}"
+        )
 
     async def submit_common(self, metrics: List[MetricsSet]):
-        
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Shared Metrics to file - {self.metrics_filepath}')
-
-        shared_metrics_file = await self._loop.run_in_executor(
-                self._executor,
-                functools.partial(
-                    open,
-                    self.shared_metrics_filepath,
-                    'w'
-                )
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Shared Metrics to file - {self.metrics_filepath}"
         )
 
-        common_metrics_xml = dicttoxml([
-            {
-                'name': metric_set.name,
-                'stage': metric_set.stage,
-                'group': 'common',
-                **metric_set.common_stats
-            } for metric_set in metrics
-        ], custom_root='common_metrics')
+        shared_metrics_file = await self._loop.run_in_executor(
+            self._executor, functools.partial(open, self.shared_metrics_filepath, "w")
+        )
+
+        common_metrics_xml = dicttoxml(
+            [
+                {
+                    "name": metric_set.name,
+                    "stage": metric_set.stage,
+                    "group": "common",
+                    **metric_set.common_stats,
+                }
+                for metric_set in metrics
+            ],
+            custom_root="common_metrics",
+        )
 
         common_metrics_xml = parseString(common_metrics_xml)
 
         await self._loop.run_in_executor(
-            self._executor,
-            shared_metrics_file.write,
-            common_metrics_xml.toprettyxml()
+            self._executor, shared_metrics_file.write, common_metrics_xml.toprettyxml()
         )
 
-        await self._loop.run_in_executor(
-            self._executor,
-            shared_metrics_file.close
-        )
+        await self._loop.run_in_executor(self._executor, shared_metrics_file.close)
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Shared Metrics to file - {self.metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Shared Metrics to file - {self.metrics_filepath}"
+        )
 
     async def submit_metrics(self, metrics: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Metrics to file - {self.metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Metrics to file - {self.metrics_filepath}"
+        )
 
         metrics_file = await self._loop.run_in_executor(
-            self._executor,
-            functools.partial(
-                open,
-                self.metrics_filepath, 
-                'w'
-            )
+            self._executor, functools.partial(open, self.metrics_filepath, "w")
         )
 
         metrics_data = []
         for metrics_set in metrics:
             for group_name, group in metrics_set.groups.items():
-                metrics_data.append({
-                    **group.record,
-                    'group': group_name
-                })
+                metrics_data.append({**group.record, "group": group_name})
 
-
-        metrics_xml = dicttoxml(metrics_data, custom_root='metrics')
+        metrics_xml = dicttoxml(metrics_data, custom_root="metrics")
         metrics_xml = parseString(metrics_xml)
 
         await self._loop.run_in_executor(
-            self._executor,
-            metrics_file.write,
-            metrics_xml.toprettyxml()
+            self._executor, metrics_file.write, metrics_xml.toprettyxml()
         )
 
-        await self._loop.run_in_executor(
-            self._executor,
-            metrics_file.close
-        )
+        await self._loop.run_in_executor(self._executor, metrics_file.close)
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Metrics to file - {self.metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Metrics to file - {self.metrics_filepath}"
+        )
 
     async def submit_custom(self, metrics: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Custom Metrics to file - {self.metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Custom Metrics to file - {self.metrics_filepath}"
+        )
 
         custom_metrics_file = await self._loop.run_in_executor(
-            self._executor,
-            functools.partial(
-                open,
-                self.custom_metrics_filepath,
-                'w'
-            )       
+            self._executor, functools.partial(open, self.custom_metrics_filepath, "w")
         )
 
         metrics_data = []
         for metrics_set in metrics:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Custom Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Custom Metrics Group - Custom')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Custom Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Custom Metrics Group - Custom"
+            )
 
-            metrics_data.append({
-                **{
-                    cusom_metric_name: custom_metric.metric_value for cusom_metric_name, custom_metric in metrics_set.custom_metrics.items()
-                },
-                'group': 'custom'
-            })
+            metrics_data.append(
+                {
+                    **{
+                        cusom_metric_name: custom_metric.metric_value
+                        for cusom_metric_name, custom_metric in metrics_set.custom_metrics.items()
+                    },
+                    "group": "custom",
+                }
+            )
 
-        custom_metrics_xml = dicttoxml(metrics_data, custom_root='custom_metrics')
+        custom_metrics_xml = dicttoxml(metrics_data, custom_root="custom_metrics")
         custom_metrics_xml = parseString(custom_metrics_xml)
 
         await self._loop.run_in_executor(
-            self._executor,
-            custom_metrics_file.write,
-            custom_metrics_xml.toprettyxml()
+            self._executor, custom_metrics_file.write, custom_metrics_xml.toprettyxml()
         )
 
-        await self._loop.run_in_executor(
-            self._executor,
-            custom_metrics_file.close
+        await self._loop.run_in_executor(self._executor, custom_metrics_file.close)
+
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Custom Metrics to file - {self.metrics_filepath}"
         )
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Custom Metrics to file - {self.metrics_filepath}')
-
 
     async def submit_errors(self, metrics: List[MetricsSet]):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saving Error Metrics to file - {self.metrics_filepath}"
+        )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saving Error Metrics to file - {self.metrics_filepath}')
-        
         errors_file = await self._loop.run_in_executor(
-            self._executor,
-            functools.partial(
-                open,
-                self.errors_metrics_filepath,
-                'w'
-            )
+            self._executor, functools.partial(open, self.errors_metrics_filepath, "w")
         )
 
         errors = []
         for metrics_set in metrics:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Error Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Error Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
 
             for error in metrics_set.errors:
-                errors.append({
-                    'name': metrics_set.name,
-                    'stage': metrics_set.stage,
-                    'error_message': error.get('message'),
-                    'error_count': error.get('count')
-                })
+                errors.append(
+                    {
+                        "name": metrics_set.name,
+                        "stage": metrics_set.stage,
+                        "error_message": error.get("message"),
+                        "error_count": error.get("count"),
+                    }
+                )
 
-        errors_xml = dicttoxml(errors, custom_root='errors')
+        errors_xml = dicttoxml(errors, custom_root="errors")
         errors_xml = parseString(errors_xml)
 
         await self._loop.run_in_executor(
-            self._executor,
-            errors_file.write,
-            errors_xml.toprettyxml()
+            self._executor, errors_file.write, errors_xml.toprettyxml()
         )
 
-        await self._loop.run_in_executor(
-            self._executor,
-            errors_file.close
-        )
+        await self._loop.run_in_executor(self._executor, errors_file.close)
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Saved Error Metrics to file - {self.metrics_filepath}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Saved Error Metrics to file - {self.metrics_filepath}"
+        )
 
     async def close(self):
-
         if self.events_file:
-            await self._loop.run_in_executor(
-                self._executor,
-                self.events_file.close
-            )
+            await self._loop.run_in_executor(self._executor, self.events_file.close)
 
         if self.metrics_file:
-            await self._loop.run_in_executor(
-                self._executor,
-                self.metrics_file.close
-            )
+            await self._loop.run_in_executor(self._executor, self.metrics_file.close)
 
         if self.experiments_file:
             await self._loop.run_in_executor(
-                self._executor,
-                self.experiments_file.close
+                self._executor, self.experiments_file.close
             )
 
         if self.variants_file:
-            await self._loop.run_in_executor(
-                self._executor,
-                self.variants_file.close
-            )
+            await self._loop.run_in_executor(self._executor, self.variants_file.close)
 
         if self.mutations_file:
-            await self._loop.run_in_executor(
-                self._executor,
-                self.mutations_file.close
-            )
-        
+            await self._loop.run_in_executor(self._executor, self.mutations_file.close)
+
         if self.streams_file:
-            await self._loop.run_in_executor(
-                self._executor,
-                self.streams_file.close
-            )
+            await self._loop.run_in_executor(self._executor, self.streams_file.close)
 
         if self.stage_system_metrics_file:
             await self._loop.run_in_executor(
-                self._executor,
-                self.stage_system_metrics_file.close
+                self._executor, self.stage_system_metrics_file.close
             )
 
         if self.session_system_metrics_file:
             await self._loop.run_in_executor(
-                self._executor,
-                self.session_system_metrics_file.close
+                self._executor, self.session_system_metrics_file.close
             )
 
         self._executor.shutdown(cancel_futures=True)
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Closing session - {self.session_uuid}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Closing session - {self.session_uuid}"
+        )

@@ -13,37 +13,29 @@ try:
 except ImportError:
     HeadersReceived = object
     DataReceived = object
-    
+
 
 class HTTP3Result(HTTPResult):
-
     __slots__ = (
-        'action_id',
-        'url',
-        'ip_addr',
-        'method',
-        'path',
-        'params',
-        'query',
-        'hostname',
-        'headers',
-        'headers_frame',
-        'body',
-        'response_code',
-        '_version',
-        '_reason',
-        '_status'
+        "action_id",
+        "url",
+        "ip_addr",
+        "method",
+        "path",
+        "params",
+        "query",
+        "hostname",
+        "headers",
+        "headers_frame",
+        "body",
+        "response_code",
+        "_version",
+        "_reason",
+        "_status",
     )
 
-    def __init__(
-            self, 
-            action: HTTP3Action, 
-            error: Exception = None
-        ) -> None:
-        super().__init__(
-            action, 
-            error
-        )
+    def __init__(self, action: HTTP3Action, error: Exception = None) -> None:
+        super().__init__(action, error)
 
         self.body = bytearray()
         self.headers_frame: HeadersReceived = None
@@ -53,7 +45,7 @@ class HTTP3Result(HTTPResult):
     @property
     def status(self) -> Union[int, None]:
         try:
-            response_status = self.headers.get(b':status')
+            response_status = self.headers.get(b":status")
             if self._status is None and isinstance(response_status, (bytes, bytearray)):
                 self._status = int(response_status)
 
@@ -61,5 +53,3 @@ class HTTP3Result(HTTPResult):
             pass
 
         return self._status
- 
-        

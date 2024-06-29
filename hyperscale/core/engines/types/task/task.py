@@ -7,43 +7,37 @@ from hyperscale.core.engines.types.common.types import RequestTypes
 
 
 class Task(BaseAction):
-
     __slots__ = (
-        'action_id',
-        'protocols', 
-        'name', 
-        'is_setup', 
-        'metadata', 
-        'hooks',
-        'type',
-        'source',
-        'execute',
-        'event',
-        'args',
-        'params',
-        'task_args',
-        'mutations'
+        "action_id",
+        "protocols",
+        "name",
+        "is_setup",
+        "metadata",
+        "hooks",
+        "type",
+        "source",
+        "execute",
+        "event",
+        "args",
+        "params",
+        "task_args",
+        "mutations",
     )
 
     def __init__(
-        self, 
+        self,
         name: str,
         task_action: Coroutine,
-        source: str=None,
-        user: str=None, 
-        tags: List[Dict[str, str]] = []
+        source: str = None,
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
     ):
-        super(Task, self).__init__(
-            name,
-            user,
-            tags
-        )
+        super(Task, self).__init__(name, user, tags)
 
         self.type = RequestTypes.TASK
         self.source = source
         self.execute = task_action
         self.hooks: Hooks[Task] = Hooks()
-
 
         self.args = inspect.signature(task_action)
         self.params = self.args.parameters

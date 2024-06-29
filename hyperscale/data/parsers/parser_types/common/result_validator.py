@@ -1,10 +1,4 @@
-from pydantic import (
-    BaseModel,
-    StrictStr,
-    StrictInt,
-    StrictFloat,
-    StrictBytes
-)
+from pydantic import BaseModel, StrictStr, StrictInt, StrictFloat, StrictBytes
 
 from typing import List, Optional
 

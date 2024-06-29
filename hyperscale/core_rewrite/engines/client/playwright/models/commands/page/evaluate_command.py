@@ -10,5 +10,5 @@ from pydantic import (
 
 class EvaluateCommand(BaseModel):
     expression: StrictStr
-    arg: Optional[Any]=None
-    timeout: Optional[StrictInt | StrictFloat]=None
+    arg: Optional[Any] = None
+    timeout: Optional[StrictInt | StrictFloat] = None

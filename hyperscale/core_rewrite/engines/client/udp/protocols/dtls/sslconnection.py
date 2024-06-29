@@ -75,7 +75,7 @@ CERT_REQUIRED = 2
 # One-time global OpenSSL library initialization
 #
 OPENSSL_init_ssl(0, None)
-#SSL_load_error_strings()
+# SSL_load_error_strings()
 
 DTLS_OPENSSL_VERSION_NUMBER = OpenSSL_version_num()
 DTLS_OPENSSL_VERSION = OpenSSL_version(OPENSSL_VERSION).decode()
@@ -83,8 +83,9 @@ DTLS_OPENSSL_VERSION_INFO = (
     DTLS_OPENSSL_VERSION_NUMBER >> 28 & 0xFF,  # major
     DTLS_OPENSSL_VERSION_NUMBER >> 20 & 0xFF,  # minor
     DTLS_OPENSSL_VERSION_NUMBER >> 12 & 0xFF,  # fix
-    DTLS_OPENSSL_VERSION_NUMBER >> 4  & 0xFF,  # patch
-    DTLS_OPENSSL_VERSION_NUMBER       & 0xF)   # status
+    DTLS_OPENSSL_VERSION_NUMBER >> 4 & 0xFF,  # patch
+    DTLS_OPENSSL_VERSION_NUMBER & 0xF,
+)  # status
 
 
 def _ssl_logging_cb(conn, where, return_code):
@@ -106,41 +107,43 @@ def _ssl_logging_cb(conn, where, return_code):
             state += "_handshake_done"
 
     if where & SSL_CB_LOOP:
-        state += '_loop'
-        _logger.debug("%s:%s:%d" % (state,
-                                    SSL_state_string_long(conn),
-                                    return_code))
+        state += "_loop"
+        _logger.debug("%s:%s:%d" % (state, SSL_state_string_long(conn), return_code))
 
     elif where & SSL_CB_ALERT:
-        state += '_alert'
+        state += "_alert"
         state += "_read" if where & SSL_CB_READ else "_write"
-        _logger.debug("%s:%s:%s" % (state,
-                                    SSL_alert_type_string_long(return_code),
-                                    SSL_alert_desc_string_long(return_code)))
+        _logger.debug(
+            "%s:%s:%s"
+            % (
+                state,
+                SSL_alert_type_string_long(return_code),
+                SSL_alert_desc_string_long(return_code),
+            )
+        )
 
     elif where & SSL_CB_EXIT:
-        state += '_exit'
+        state += "_exit"
         if return_code == 0:
-            _logger.debug("%s:%s:%d(failed)" % (state,
-                                                SSL_state_string_long(conn),
-                                                return_code))
+            _logger.debug(
+                "%s:%s:%d(failed)" % (state, SSL_state_string_long(conn), return_code)
+            )
         elif return_code < 0:
-            _logger.debug("%s:%s:%d(error)" % (state,
-                                               SSL_state_string_long(conn),
-                                               return_code))
+            _logger.debug(
+                "%s:%s:%d(error)" % (state, SSL_state_string_long(conn), return_code)
+            )
         else:
-            _logger.debug("%s:%s:%d" % (state,
-                                        SSL_state_string_long(conn),
-                                        return_code))
+            _logger.debug(
+                "%s:%s:%d" % (state, SSL_state_string_long(conn), return_code)
+            )
 
     else:
-        _logger.debug("%s:%s:%d" % (state,
-                                    SSL_state_string_long(conn),
-                                    return_code))
+        _logger.debug("%s:%s:%d" % (state, SSL_state_string_long(conn), return_code))
 
 
 class _CTX(_Rsrc):
     """SSL_CTX wrapper"""
+
     def __init__(self, value):
         _logger.debug("Allocating SSL CTX: %d", value.raw)
         super(_CTX, self).__init__(value)
@@ -153,6 +156,7 @@ class _CTX(_Rsrc):
 
 class _SSL(_Rsrc):
     """SSL structure wrapper"""
+
     def __init__(self, value):
         _logger.debug("Allocating SSL: %d", value.raw)
         super(_SSL, self).__init__(value)
@@ -181,41 +185,42 @@ class _CallbackProxy(object):
 
 
 class SSLContext(object):
-
     def __init__(self, ctx):
         self._ctx = ctx
 
     def set_ciphers(self, ciphers):
-        u'''
+        """
         s.a. https://www.openssl.org/docs/man1.1.0/apps/ciphers.html
 
         :param str ciphers: Example "AES256-SHA:ECDHE-ECDSA-AES256-SHA", ...
         :return: 1 for success and 0 for failure
-        '''
-        retVal = SSL_CTX_set_cipher_list(self._ctx, ciphers.encode('ascii'))
+        """
+        retVal = SSL_CTX_set_cipher_list(self._ctx, ciphers.encode("ascii"))
         return retVal
 
     def set_sigalgs(self, sigalgs):
-        u'''
+        """
         s.a. https://www.openssl.org/docs/man1.1.0/ssl/SSL_CTX_set1_sigalgs_list.html
 
         :param str sigalgs: Example "RSA+SHA256", "ECDSA+SHA256", ...
         :return: 1 for success and 0 for failure
-        '''
-        retVal = SSL_CTX_set1_sigalgs_list(self._ctx, sigalgs.encode('ascii'))
+        """
+        retVal = SSL_CTX_set1_sigalgs_list(self._ctx, sigalgs.encode("ascii"))
         return retVal
 
     def set_curves(self, curves):
-        u''' Set supported curves by name, nid or nist.
+        """Set supported curves by name, nid or nist.
 
         :param str | tuple(int) curves: Example "secp384r1:secp256k1", (715, 714), "P-384", "K-409:B-409:K-571", ...
         :return: 1 for success and 0 for failure
-        '''
+        """
         retVal = None
         if isinstance(curves, str):
-            retVal = SSL_CTX_set1_curves_list(self._ctx, curves.encode('ascii'))
+            retVal = SSL_CTX_set1_curves_list(self._ctx, curves.encode("ascii"))
         elif isinstance(curves, tuple):
-            retVal = SSL_CTX_set1_curves(self._ctx, curves.encode('ascii'), len(curves.encode('ascii')))
+            retVal = SSL_CTX_set1_curves(
+                self._ctx, curves.encode("ascii"), len(curves.encode("ascii"))
+            )
         return retVal
 
     @staticmethod
@@ -228,7 +233,7 @@ class SSLContext(object):
     @staticmethod
     def get_ec_nid2nist(nid):
         if not isinstance(nid, tuple):
-            nid = (nid, )
+            nid = (nid,)
         nist = ":".join([EC_curve_nid2nist(x) for x in nid])
         return nist
 
@@ -238,7 +243,7 @@ class SSLContext(object):
         return sorted([x.name for x in curves] if bAsName else [x.nid for x in curves])
 
     def set_ecdh_curve(self, curve_name=None):
-        u''' Select a curve to use for ECDH(E) key exchange or set it to auto mode
+        """Select a curve to use for ECDH(E) key exchange or set it to auto mode
 
         Used for server only!
 
@@ -246,32 +251,34 @@ class SSLContext(object):
 
         :param None | str curve_name: None = Auto-mode, "secp256k1", "secp384r1", ...
         :return: 1 for success and 0 for failure
-        '''
+        """
         if curve_name:
             retVal = SSL_CTX_set_ecdh_auto(self._ctx, 0)
             avail_curves = get_elliptic_curves()
-            key = [curve for curve in avail_curves if curve.name == curve_name][0].to_EC_KEY()
+            key = [curve for curve in avail_curves if curve.name == curve_name][
+                0
+            ].to_EC_KEY()
             retVal &= SSL_CTX_set_tmp_ecdh(self._ctx, key)
         else:
             retVal = SSL_CTX_set_ecdh_auto(self._ctx, 1)
         return retVal
 
     def build_cert_chain(self, flags=SSL_BUILD_CHAIN_FLAG_NONE):
-        u'''
+        """
         Used for server side only!
 
         :param flags:
         :return: 1 for success and 0 for failure
-        '''
+        """
         retVal = SSL_CTX_build_cert_chain(self._ctx, flags)
         return retVal
 
     def set_ssl_logging(self, enable=False, func=_ssl_logging_cb):
-        u''' Enable or disable SSL logging
+        """Enable or disable SSL logging
 
         :param True | False enable: Enable or disable SSL logging
         :param func: Callback function for logging
-        '''
+        """
         if enable:
             SSL_CTX_set_info_callback(self._ctx, func)
         else:
@@ -279,7 +286,6 @@ class SSLContext(object):
 
 
 class SSL(object):
-
     def __init__(self, ssl):
         self._ssl = ssl
 
@@ -322,18 +328,24 @@ class SSLConnection(object):
         # corruption when packet loss occurs
         SSL_CTX_set_options(self._ctx.value, SSL_OP_NO_COMPRESSION)
         if self._certfile:
-            SSL_CTX_use_certificate_chain_file(self._ctx.value, fsencode(self._certfile))
+            SSL_CTX_use_certificate_chain_file(
+                self._ctx.value, fsencode(self._certfile)
+            )
         if self._keyfile:
-            SSL_CTX_use_PrivateKey_file(self._ctx.value, fsencode(self._keyfile), SSL_FILE_TYPE_PEM)
+            SSL_CTX_use_PrivateKey_file(
+                self._ctx.value, fsencode(self._keyfile), SSL_FILE_TYPE_PEM
+            )
         if self._ca_certs:
-            SSL_CTX_load_verify_locations(self._ctx.value, fsencode(self._ca_certs), None)
+            SSL_CTX_load_verify_locations(
+                self._ctx.value, fsencode(self._ca_certs), None
+            )
             # if self._server_side:
             #     cert_names = SSL_load_client_CA_file(fsencode(self._ca_certs))
             #     if cert_names:
             #         SSL_CTX_set_client_CA_list(self._ctx.value, cert_names)
         if self._ciphers:
             try:
-                SSL_CTX_set_cipher_list(self._ctx.value, self._ciphers.encode('ascii'))
+                SSL_CTX_set_cipher_list(self._ctx.value, self._ciphers.encode("ascii"))
             except openssl_error() as err:
                 raise_ssl_error(ERR_NO_CIPHER, err)
         if self._user_config_ssl_ctx:
@@ -351,6 +363,7 @@ class SSLConnection(object):
         else:
             # We are starting an UDP listening socket
             from .demux import UDPDemux
+
             self._udp_demux = UDPDemux(self._sock)
             rsock = self._udp_demux.get_connection(None)
         if rsock is self._sock:
@@ -372,8 +385,11 @@ class SSLConnection(object):
         elif self._cert_reqs == CERT_OPTIONAL:
             verify_mode = SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE
         else:
-            verify_mode = SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE | \
-              SSL_VERIFY_FAIL_IF_NO_PEER_CERT
+            verify_mode = (
+                SSL_VERIFY_PEER
+                | SSL_VERIFY_CLIENT_ONCE
+                | SSL_VERIFY_FAIL_IF_NO_PEER_CERT
+            )
         self._config_ssl_ctx(verify_mode)
         if not peer_address:
             # Configure UDP listening socket
@@ -383,7 +399,8 @@ class SSLConnection(object):
             self._cb_keepalive = SSL_CTX_set_cookie_cb(
                 self._ctx.value,
                 _CallbackProxy(self._generate_cookie_cb),
-                _CallbackProxy(self._verify_cookie_cb))
+                _CallbackProxy(self._verify_cookie_cb),
+            )
         self._ssl = _SSL(SSL_new(self._ctx.value))
         self._intf_ssl = SSL(self._ssl.value)
         SSL_set_accept_state(self._ssl.value)
@@ -445,7 +462,9 @@ class SSLConnection(object):
         source._intf_ssl = SSL(source._ssl.value)
         SSL_set_accept_state(source._ssl.value)
         if self._user_config_ssl:
-            self._user_config_ssl(self._intf_ssl)  # Why is this not source._intf_ssl? If it is, then the mtu size is not set correctly!?
+            self._user_config_ssl(
+                self._intf_ssl
+            )  # Why is this not source._intf_ssl? If it is, then the mtu size is not set correctly!?
         source._rbio = new_source_rbio
         source._wbio = new_source_wbio
         SSL_set_bio(source._ssl.value, new_source_rbio.value, new_source_wbio.value)
@@ -494,8 +513,10 @@ class SSLConnection(object):
             if need_select:
                 if not select([read_sock], [], [], timeout_sec)[0]:
                     break
-                timeout_sec = timeout_sec_start - \
-                  (datetime.datetime.now() - start_time).total_seconds()
+                timeout_sec = (
+                    timeout_sec_start
+                    - (datetime.datetime.now() - start_time).total_seconds()
+                )
             try:
                 return call()
             except openssl_error() as err:
@@ -519,13 +540,21 @@ class SSLConnection(object):
         if self._get_cookie(ssl) != cookie:
             raise Exception("DTLS cookie mismatch")
 
-    def __init__(self, sock, keyfile=None, certfile=None,
-                 server_side=False, cert_reqs=CERT_NONE,
-                 ssl_version=PROTOCOL_DTLS, ca_certs=None,
-                 do_handshake_on_connect=True,
-                 suppress_ragged_eofs=True, ciphers=None,
-                 cb_user_config_ssl_ctx=None,
-                 cb_user_config_ssl=None):
+    def __init__(
+        self,
+        sock,
+        keyfile=None,
+        certfile=None,
+        server_side=False,
+        cert_reqs=CERT_NONE,
+        ssl_version=PROTOCOL_DTLS,
+        ca_certs=None,
+        do_handshake_on_connect=True,
+        suppress_ragged_eofs=True,
+        ciphers=None,
+        cb_user_config_ssl_ctx=None,
+        cb_user_config_ssl=None,
+    ):
         """Constructor
 
         Arguments:
@@ -591,10 +620,10 @@ class SSLConnection(object):
         del self._sock
         remove_from_timer_callbacks(self._ssl.value)
         remove_from_info_callback(self._ctx.value)
-        if hasattr(self, '_ssl'):
+        if hasattr(self, "_ssl"):
             del self._intf_ssl
             del self._ssl
-        if hasattr(self, '_ctx'):
+        if hasattr(self, "_ctx"):
             del self._intf_ssl_ctx
             del self._ctx
 
@@ -688,7 +717,8 @@ class SSLConnection(object):
         self._listening_peer_address = None
         _logger.debug(
             "peer_address from demux: %s and dtls_peer_address from DTLSv1_listen: %s",
-            repr(peer_address), repr(dtls_peer_address)
+            repr(peer_address),
+            repr(dtls_peer_address),
         )
         if type(peer_address) is tuple:
             self._pending_peer_address = peer_address
@@ -712,12 +742,20 @@ class SSLConnection(object):
             if not self.listen():
                 _logger.debug("Accept returning without connection")
                 return
-        new_conn = SSLConnection(self, self._keyfile, self._certfile, True,
-                                 self._cert_reqs, self._ssl_version,
-                                 self._ca_certs, self._do_handshake_on_connect,
-                                 self._suppress_ragged_eofs, self._ciphers,
-                                 cb_user_config_ssl_ctx=self._user_config_ssl_ctx,
-                                 cb_user_config_ssl=self._user_config_ssl)
+        new_conn = SSLConnection(
+            self,
+            self._keyfile,
+            self._certfile,
+            True,
+            self._cert_reqs,
+            self._ssl_version,
+            self._ca_certs,
+            self._do_handshake_on_connect,
+            self._suppress_ragged_eofs,
+            self._ciphers,
+            cb_user_config_ssl_ctx=self._user_config_ssl_ctx,
+            cb_user_config_ssl=self._user_config_ssl,
+        )
         new_peer = self._pending_peer_address
         self._pending_peer_address = None
         if self._do_handshake_on_connect:
@@ -758,8 +796,8 @@ class SSLConnection(object):
         _logger.debug("Initiating handshake...")
         try:
             self._wrap_socket_library_call(
-                lambda: SSL_do_handshake(self._ssl.value),
-                ERR_HANDSHAKE_TIMEOUT)
+                lambda: SSL_do_handshake(self._ssl.value), ERR_HANDSHAKE_TIMEOUT
+            )
         except openssl_error() as err:
             if err.ssl_error == SSL_ERROR_SYSCALL and err.result == -1:
                 raise_ssl_error(ERR_PORT_UNREACHABLE, err)
@@ -780,7 +818,8 @@ class SSLConnection(object):
 
         try:
             return self._wrap_socket_library_call(
-                lambda: SSL_read(self._ssl.value, len, buffer), ERR_READ_TIMEOUT)
+                lambda: SSL_read(self._ssl.value, len, buffer), ERR_READ_TIMEOUT
+            )
         except openssl_error() as err:
             if err.ssl_error == SSL_ERROR_SYSCALL and err.result == -1:
                 raise_ssl_error(ERR_PORT_UNREACHABLE, err)
@@ -800,7 +839,8 @@ class SSLConnection(object):
 
         try:
             ret = self._wrap_socket_library_call(
-                lambda: SSL_write(self._ssl.value, data), ERR_WRITE_TIMEOUT)
+                lambda: SSL_write(self._ssl.value, data), ERR_WRITE_TIMEOUT
+            )
         except openssl_error() as err:
             if err.ssl_error == SSL_ERROR_SYSCALL and err.result == -1:
                 raise_ssl_error(ERR_PORT_UNREACHABLE, err)
@@ -824,10 +864,17 @@ class SSLConnection(object):
             return
 
         try:
-            _logger.debug("Starting shutdown %s", "server-side" if self._server_side else "client-side")
+            _logger.debug(
+                "Starting shutdown %s",
+                "server-side" if self._server_side else "client-side",
+            )
             self._wrap_socket_library_call(
-                lambda: SSL_shutdown(self._ssl.value), ERR_READ_TIMEOUT)
-            _logger.debug("...completed shutdown %s", "server-side" if self._server_side else "client-side")
+                lambda: SSL_shutdown(self._ssl.value), ERR_READ_TIMEOUT
+            )
+            _logger.debug(
+                "...completed shutdown %s",
+                "server-side" if self._server_side else "client-side",
+            )
         except openssl_error() as err:
             if err.result == 0:
                 # close-notify alert was just sent; wait for same from peer
@@ -835,10 +882,17 @@ class SSLConnection(object):
                 # with SSL_set_read_ahead here, doing so causes a shutdown
                 # failure (ret: -1, SSL_ERROR_SYSCALL) on the DTLS shutdown
                 # initiator side. And test_starttls does pass.
-                _logger.debug("Initiated shutdown %s...", "server-side" if self._server_side else "client-side")
+                _logger.debug(
+                    "Initiated shutdown %s...",
+                    "server-side" if self._server_side else "client-side",
+                )
                 self._wrap_socket_library_call(
-                    lambda: SSL_shutdown(self._ssl.value), ERR_READ_TIMEOUT)
-                _logger.debug("...completed shutdown %s", "server-side" if self._server_side else "client-side")
+                    lambda: SSL_shutdown(self._ssl.value), ERR_READ_TIMEOUT
+                )
+                _logger.debug(
+                    "...completed shutdown %s",
+                    "server-side" if self._server_side else "client-side",
+                )
             else:
                 raise
         if self._server_side:
@@ -847,9 +901,13 @@ class SSLConnection(object):
             SSL_set_connect_state(self._ssl.value)
         if hasattr(self, "_rsock"):
             # Return wrapped connected server socket (non-listening)
-            return _UnwrappedSocket(self._sock, self._rsock, self._udp_demux,
-                                    self._ctx,
-                                    BIO_dgram_get_peer(self._wbio.value))
+            return _UnwrappedSocket(
+                self._sock,
+                self._rsock,
+                self._udp_demux,
+                self._ctx,
+                BIO_dgram_get_peer(self._wbio.value),
+            )
         # Return unwrapped client-side socket or unwrapped server-side socket
         # for single-socket servers
         return self._sock
@@ -998,7 +1056,7 @@ class _UnwrappedSocket(socket.socket):
         __doc__ = self._wsock.sendall.__doc__
         amount = len(data)
         count = 0
-        while (count < amount):
+        while count < amount:
             v = self.send(data[count:], flags)
             count += v
         return amount

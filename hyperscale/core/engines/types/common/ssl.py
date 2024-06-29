@@ -31,16 +31,16 @@ def get_http2_ssl_context():
     ctx.set_alpn_protocols(["h2", "http/1.1"])
 
     try:
-        if hasattr(ctx, '_set_npn_protocols'):
+        if hasattr(ctx, "_set_npn_protocols"):
             ctx.set_npn_protocols(["h2", "http/1.1"])
     except NotImplementedError:
         pass
-
 
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
     return ctx
+
 
 def get_graphql_ssl_context():
     # Get the basic context from the standard library.
@@ -67,7 +67,7 @@ def get_graphql_ssl_context():
     ctx.set_alpn_protocols(["h2", "http/1.1"])
 
     try:
-        if hasattr(ctx, '_set_npn_protocols'):
+        if hasattr(ctx, "_set_npn_protocols"):
             ctx.set_npn_protocols(["h2", "http/1.1"])
     except NotImplementedError:
         pass
@@ -76,7 +76,6 @@ def get_graphql_ssl_context():
     ctx.verify_mode = ssl.CERT_NONE
 
     return ctx
-
 
 
 def get_default_ssl_context():

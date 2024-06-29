@@ -11,6 +11,6 @@ from pydantic import (
 class ExpectNavigationCommand(BaseModel):
     url: StrictStr
     wait_until: Optional[
-        Literal['commit', 'domcontentloaded', 'load', 'networkidle']
-    ]=None
+        Literal["commit", "domcontentloaded", "load", "networkidle"]
+    ] = None
     timeout: StrictInt | StrictFloat

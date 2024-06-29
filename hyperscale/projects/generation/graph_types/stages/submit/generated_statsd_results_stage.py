@@ -3,7 +3,4 @@ from hyperscale.reporting.types import StatsDConfig
 
 
 class SubmitStatsDResultsStage(Submit):
-    config=StatsDConfig(
-        host='localhost',
-        port=8125
-    )
+    config = StatsDConfig(host="localhost", port=8125)

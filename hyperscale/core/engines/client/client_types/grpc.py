@@ -12,7 +12,6 @@ from .base_client import BaseClient
 
 
 class GRPCClient(BaseClient[MercuryGRPCClient, GRPCAction, GRPCResult]):
-    
     def __init__(self, config: Config) -> None:
         super().__init__()
 
@@ -26,11 +25,9 @@ class GRPCClient(BaseClient[MercuryGRPCClient, GRPCAction, GRPCResult]):
 
         self.session = MercuryGRPCClient(
             concurrency=config.batch_size,
-            timeouts=Timeouts(
-                total_timeout=config.request_timeout
-            ),
+            timeouts=Timeouts(total_timeout=config.request_timeout),
             reset_connections=config.reset_connections,
-            tracing_session=tracing_session
+            tracing_session=tracing_session,
         )
         self.request_type = RequestTypes.GRPC
         self.client_type = self.request_type.capitalize()
@@ -46,27 +43,25 @@ class GRPCClient(BaseClient[MercuryGRPCClient, GRPCAction, GRPCResult]):
         return self.session.registered.get(key)
 
     async def request(
-        self, 
-        url: str, 
-        headers: Dict[str, str] = {}, 
-        protobuf: Any = None, 
-        user: str = None, 
+        self,
+        url: str,
+        headers: Dict[str, str] = {},
+        protobuf: Any = None,
+        user: str = None,
         tags: List[Dict[str, str]] = [],
-        trace: Trace=None
+        trace: Trace = None,
     ):
         if trace and self.session.tracing_session is None:
-            self.session.tracing_session = TraceSession(
-                **trace.to_dict()
-            )
+            self.session.tracing_session = TraceSession(**trace.to_dict())
 
         request = GRPCAction(
             self.next_name,
             url,
-            method='POST',
+            method="POST",
             headers=headers,
             data=protobuf,
             user=user,
-            tags=tags
+            tags=tags,
         )
 
         return await self._execute_action(request)

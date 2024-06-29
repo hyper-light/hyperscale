@@ -7,23 +7,13 @@ from hyperscale.core.hooks.types.save.hook import SaveHook
 
 
 class SaveEvent(BaseEvent[SaveHook]):
-
     def __init__(self, target: Hook, source: SaveHook) -> None:
-        super(
-            SaveEvent,
-            self
-        ).__init__(
-            target,
-            source
-        )
+        super(SaveEvent, self).__init__(target, source)
 
         self.event_type = EventType.SAVE
 
     def copy(self):
-        save_event = SaveEvent(
-            self.target.copy(),
-            self.source.copy()
-        )
+        save_event = SaveEvent(self.target.copy(), self.source.copy())
 
         save_event.execution_path = list(self.execution_path)
         save_event.previous_map = list(self.previous_map)

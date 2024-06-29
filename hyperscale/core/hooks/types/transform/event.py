@@ -7,23 +7,13 @@ from hyperscale.core.hooks.types.transform.hook import TransformHook
 
 
 class TransformEvent(BaseEvent[TransformHook]):
-
     def __init__(self, target: Hook, source: TransformHook) -> None:
-        super(
-            TransformEvent,
-            self
-        ).__init__(
-            target,
-            source
-        )
-        
+        super(TransformEvent, self).__init__(target, source)
+
         self.event_type = EventType.TRANSFORM
 
     def copy(self):
-        transform_event = TransformEvent(
-            self.target.copy(),
-            self.source.copy()
-        )
+        transform_event = TransformEvent(self.target.copy(), self.source.copy())
 
         transform_event.execution_path = list(self.execution_path)
         transform_event.previous_map = list(self.previous_map)

@@ -67,8 +67,7 @@ class UDPDemux(object):
         """
 
         if (datagram_socket.type & socket.SOCK_DGRAM) != socket.SOCK_DGRAM:
-            raise InvalidSocketError("datagram_socket is not of " +
-                                     "type SOCK_DGRAM")
+            raise InvalidSocketError("datagram_socket is not of " + "type SOCK_DGRAM")
         try:
             datagram_socket.getsockname()
         except:
@@ -100,9 +99,11 @@ class UDPDemux(object):
 
         # Create a new datagram socket bound to the same interface and port as
         # the root socket, but connected to the given peer
-        conn = socket.socket(self._datagram_socket.family,
-                             self._datagram_socket.type,
-                             self._datagram_socket.proto)
+        conn = socket.socket(
+            self._datagram_socket.family,
+            self._datagram_socket.type,
+            self._datagram_socket.proto,
+        )
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         conn.bind(self._datagram_socket.getsockname())
         conn.connect(address)

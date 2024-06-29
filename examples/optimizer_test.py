@@ -1,8 +1,7 @@
 import asyncio
 
 from hyperscale.core_rewrite.graph import Workflow
-from hyperscale.core_rewrite.jobs import Env
-from hyperscale.core_rewrite.jobs.job_server import JobServer
+from hyperscale.core_rewrite.jobs import Env, RemoteGraphManager
 
 
 async def return_response(_: int, workflow: Workflow):
@@ -11,13 +10,14 @@ async def return_response(_: int, workflow: Workflow):
 
 
 async def run():
-    server = JobServer(
+    server = RemoteGraphManager()
+
+    await server.start(
         "0.0.0.0",
         12399,
         Env(MERCURY_SYNC_AUTH_SECRET="testthissecret"),
     )
 
-    await server.start_server()
     await server.run_forever()
 
     await server.close()

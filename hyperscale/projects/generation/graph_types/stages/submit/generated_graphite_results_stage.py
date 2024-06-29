@@ -3,7 +3,4 @@ from hyperscale.reporting.types import GraphiteConfig
 
 
 class SubmitGraphiteResultsStage(Submit):
-    config=GraphiteConfig(
-        host='localhost',
-        port=2003
-    )
+    config = GraphiteConfig(host="localhost", port=2003)

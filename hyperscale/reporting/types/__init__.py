@@ -1,156 +1,63 @@
 from .common import ReporterTypes
 
-from .aws_lambda import (
-    AWSLambda,
-    AWSLambdaConfig
-)
+from .aws_lambda import AWSLambda, AWSLambdaConfig
 
-from .aws_timestream import (
-    AWSTimestream,
-    AWSTimestreamConfig
-)
+from .aws_timestream import AWSTimestream, AWSTimestreamConfig
 
-from .bigquery import (
-    BigQuery,
-    BigQueryConfig
-)
+from .bigquery import BigQuery, BigQueryConfig
 
-from .bigtable import (
-    BigTable,
-    BigTableConfig
-)
+from .bigtable import BigTable, BigTableConfig
 
-from .cassandra import (
-    Cassandra,
-    CassandraConfig
-)
+from .cassandra import Cassandra, CassandraConfig
 
-from .cloudwatch import (
-    Cloudwatch,
-    CloudwatchConfig
-)
+from .cloudwatch import Cloudwatch, CloudwatchConfig
 
-from .cosmosdb import (
-    CosmosDB,
-    CosmosDBConfig
-)
+from .cosmosdb import CosmosDB, CosmosDBConfig
 
-from .csv import (
-    CSV,
-    CSVConfig
-)
+from .csv import CSV, CSVConfig
 
-from .datadog import (
-    Datadog,
-    DatadogConfig
-)
+from .datadog import Datadog, DatadogConfig
 
-from .dogstatsd import (
-    DogStatsD,
-    DogStatsDConfig
-)
+from .dogstatsd import DogStatsD, DogStatsDConfig
 
-from .google_cloud_storage import (
-    GoogleCloudStorage,
-    GoogleCloudStorageConfig
-)
+from .google_cloud_storage import GoogleCloudStorage, GoogleCloudStorageConfig
 
-from .graphite import (
-    Graphite,
-    GraphiteConfig
-)
+from .graphite import Graphite, GraphiteConfig
 
-from .honeycomb import (
-    Honeycomb,
-    HoneycombConfig
-)
+from .honeycomb import Honeycomb, HoneycombConfig
 
-from .influxdb import (
-    InfluxDB,
-    InfluxDBConfig
-)
+from .influxdb import InfluxDB, InfluxDBConfig
 
-from .json import (
-    JSON,
-    JSONConfig
-)
+from .json import JSON, JSONConfig
 
-from .kafka import (
-    Kafka,
-    KafkaConfig
-)
+from .kafka import Kafka, KafkaConfig
 
-from .mongodb import (
-    MongoDB,
-    MongoDBConfig
-)
+from .mongodb import MongoDB, MongoDBConfig
 
-from .mysql import (
-    MySQL,
-    MySQLConfig
-)
+from .mysql import MySQL, MySQLConfig
 
-from .netdata import (
-    Netdata,
-    NetdataConfig
-)
+from .netdata import Netdata, NetdataConfig
 
-from .newrelic import (
-    NewRelic,
-    NewRelicConfig
-)
+from .newrelic import NewRelic, NewRelicConfig
 
-from .postgres import (
-    Postgres,
-    PostgresConfig
-)
+from .postgres import Postgres, PostgresConfig
 
-from .prometheus import (
-    Prometheus,
-    PrometheusConfig
-)
+from .prometheus import Prometheus, PrometheusConfig
 
-from .redis import (
-    Redis,
-    RedisConfig
-)
+from .redis import Redis, RedisConfig
 
-from .s3 import (
-    S3,
-    S3Config
-)
+from .s3 import S3, S3Config
 
-from .snowflake import (
-    Snowflake,
-    SnowflakeConfig
-)
+from .snowflake import Snowflake, SnowflakeConfig
 
-from .sqlite import (
-    SQLite,
-    SQLiteConfig
-)
+from .sqlite import SQLite, SQLiteConfig
 
-from .statsd import (
-    StatsD,
-    StatsDConfig
-)
+from .statsd import StatsD, StatsDConfig
 
-from .telegraf import (
-    Telegraf,
-    TelegrafConfig
-)
+from .telegraf import Telegraf, TelegrafConfig
 
-from .telegraf_statsd import (
-    TelegrafStatsD,
-    TelegrafStatsDConfig
-)
+from .telegraf_statsd import TelegrafStatsD, TelegrafStatsDConfig
 
-from .timescaledb import (
-    TimescaleDB,
-    TimescaleDBConfig
-)
+from .timescaledb import TimescaleDB, TimescaleDBConfig
 
-from .xml import (
-    XML,
-    XMLConfig
-)
+from .xml import XML, XMLConfig

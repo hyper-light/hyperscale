@@ -22,8 +22,9 @@ HistoryUpdate = Dict[Tuple[str, str], Any]
 
 
 class Transition:
-
-    def __init__(self, metadata: TransitionMetadata, from_stage: Stage, to_stage: Stage) -> None:
+    def __init__(
+        self, metadata: TransitionMetadata, from_stage: Stage, to_stage: Stage
+    ) -> None:
         self.transition_id = str(uuid.uuid4())
         self.metadata = metadata
         self.from_stage = from_stage
@@ -49,17 +50,15 @@ class Transition:
         }
 
         self.edge: BaseEdge = edge_types.get(from_stage.stage_type)(
-            from_stage,
-            to_stage
+            from_stage, to_stage
         )
 
     async def execute(self):
-
         self.edge.setup()
 
         if self.edge.source.context is None:
             self.edge.source.context = SimpleContext()
-        
+
         result: Union[None, Tuple[None, StageTypes]] = None
         if self.retries > 0:
             for _ in range(self.retries):
@@ -67,15 +66,13 @@ class Transition:
 
                 if self.edge.exception is None:
                     break
-            
+
         else:
             result = await self.edge.transition()
 
         self.edge.descendants = {
-            descendant: self.edges_by_name.get((
-                self.edge.source.name,
-                descendant
-            )) for descendant in self.descendants
+            descendant: self.edges_by_name.get((self.edge.source.name, descendant))
+            for descendant in self.descendants
         }
 
         skip_next_stages = [
@@ -97,22 +94,17 @@ class Transition:
             selected_edge = self.edge
 
             if self.edge.skip_stage:
-                selected_edge_idx = min([
-                    edge.transition_idx for edge in self.edges
-                ])
+                selected_edge_idx = min([edge.transition_idx for edge in self.edges])
 
                 selected_edge = self.edges[selected_edge_idx]
                 source_name = self.edges[selected_edge_idx].source.name
 
             destination_name = self.edge.destination.name
 
-            neighbors: List[Tuple[str, str]]  = []
+            neighbors: List[Tuple[str, str]] = []
             transition_source_histories: Dict[str, HistoryUpdate] = {}
 
-            source_edge_name = (
-                source_name, 
-                destination_name
-            )
+            source_edge_name = (source_name, destination_name)
 
             transition_source_history: HistoryUpdate = selected_edge.next_history.get(
                 source_edge_name, {}
@@ -120,49 +112,59 @@ class Transition:
 
             for destination in self.destinations:
                 for transition in self.adjacency_list[destination]:
-
                     destination_edge_name = (
-                        destination, 
-                        transition.edge.destination.name
+                        destination,
+                        transition.edge.destination.name,
                     )
 
-                    neighbors.extend([
-                        (
-                            destination, 
-                            transition.edge.destination.name
-                        ) for transition in self.adjacency_list[destination]
-                    ])
+                    neighbors.extend(
+                        [
+                            (destination, transition.edge.destination.name)
+                            for transition in self.adjacency_list[destination]
+                        ]
+                    )
 
-                    transition_source_histories[destination_edge_name] = transition_source_history
+                    transition_source_histories[destination_edge_name] = (
+                        transition_source_history
+                    )
 
             for neighbor in neighbors:
                 required_keys = self.edges_by_name[neighbor].requires
 
                 if source_name not in self.edges_by_name[neighbor].from_stage_names:
                     self.edges_by_name[neighbor].from_stage_names.append(source_name)
-                    
 
                 for edge_name in self.edge.next_history:
                     source_history: HistoryUpdate = self.edge.next_history[edge_name]
 
-                    self.edges_by_name[neighbor].history.update({
-                        edge_name: {
-                            key: value for key, value in source_history.items() if key in required_keys
+                    self.edges_by_name[neighbor].history.update(
+                        {
+                            edge_name: {
+                                key: value
+                                for key, value in source_history.items()
+                                if key in required_keys
+                            }
                         }
-                    })
+                    )
 
                 neighbor_edge_source = self.edges_by_name[neighbor].source.name
 
                 previous_edge = (source_name, neighbor_edge_source)
 
                 for history in transition_source_histories.values():
-                    if self.edges_by_name[neighbor].history.get(previous_edge) is None and len(history) > 0:
-                        self.edges_by_name[neighbor].history.update({
+                    if (
+                        self.edges_by_name[neighbor].history.get(previous_edge) is None
+                        and len(history) > 0
+                    ):
+                        self.edges_by_name[neighbor].history.update(
+                            {
                                 previous_edge: {
-                                    key: value for key, value in history.items() if key in required_keys
+                                    key: value
+                                    for key, value in history.items()
+                                    if key in required_keys
                                 }
-                            })
-
+                            }
+                        )
 
         self.edge.edge_data = {}
 

@@ -13,7 +13,7 @@ from hyperscale.core.hooks.types.internal.decorator import Internal
 
 
 class Error(Stage):
-    stage_type=StageTypes.ERROR
+    stage_type = StageTypes.ERROR
 
     def __init__(self) -> None:
         super().__init__()
@@ -21,16 +21,15 @@ class Error(Stage):
         self.retries: int = 0
 
         self.priority = None
-        self.priority_level: StagePriority = StagePriority.map(
-            self.priority
-        )
+        self.priority_level: StagePriority = StagePriority.map(self.priority)
 
         base_stage_name = self.__class__.__name__
-        self.logger.filesystem.sync['hyperscale.core'].info(f'{self.metadata_string} - Checking internal Hooks for stage - {base_stage_name}')
-        
+        self.logger.filesystem.sync["hyperscale.core"].info(
+            f"{self.metadata_string} - Checking internal Hooks for stage - {base_stage_name}"
+        )
+
         for reserved_hook_name in self.internal_hooks:
             try:
-
                 hook = registrar.reserved[base_stage_name].get(reserved_hook_name)
 
                 assert hasattr(self, reserved_hook_name) is True
@@ -45,13 +44,16 @@ class Error(Stage):
 
             hook._call = hook._call.__get__(self, self.__class__)
             setattr(self, reserved_hook_name, hook._call)
-            
-            self.logger.filesystem.sync['hyperscale.core'].info(f'{self.metadata_string} - Loading internal Hook - {hook.name} - for stage - {base_stage_name}')
+
+            self.logger.filesystem.sync["hyperscale.core"].info(
+                f"{self.metadata_string} - Loading internal Hook - {hook.name} - for stage - {base_stage_name}"
+            )
 
     @Internal()
     async def run(self):
-        await self.logger.spinner.system.error(f'{self.metadata_string} - Encountered error - {self.error}')
-        await self.logger.filesystem.aio['hyperscale.core'].error(f'{self.metadata_string} - Encountered error - {self.error}')
-        
-
-
+        await self.logger.spinner.system.error(
+            f"{self.metadata_string} - Encountered error - {self.error}"
+        )
+        await self.logger.filesystem.aio["hyperscale.core"].error(
+            f"{self.metadata_string} - Encountered error - {self.error}"
+        )

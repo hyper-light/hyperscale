@@ -7,19 +7,10 @@ from .validator import ConditionHookValidator
 
 
 @registrar(HookType.CONDITION)
-def condition(
-    *names,
-    order: int=1,
-    skip: bool=False
-):
-    ConditionHookValidator(
-        names=names,
-        order=order,
-        skip=skip
-    )
+def condition(*names, order: int = 1, skip: bool = False):
+    ConditionHookValidator(names=names, order=order, skip=skip)
 
     def wrapper(func):
-
         @functools.wraps(func)
         def decorator(*args, **kwargs):
             return func(*args, **kwargs)

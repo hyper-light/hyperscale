@@ -10,5 +10,5 @@ from pydantic import (
 
 class TypeCommand(BaseModel):
     text: StrictStr
-    delay: Optional[StrictInt | StrictFloat]=None
+    delay: Optional[StrictInt | StrictFloat] = None
     timeout: StrictInt | StrictFloat

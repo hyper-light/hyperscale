@@ -7,4 +7,3 @@ from pydantic import (
 
 class HighlightCommand(BaseModel):
     timeout: StrictInt | StrictFloat
-    

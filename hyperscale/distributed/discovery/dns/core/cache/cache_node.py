@@ -15,12 +15,12 @@ class CacheNode:
 
     def get(self, fqdn: str, touch: bool = False):
         current = self
-        keys = reversed(fqdn.split('.'))
+        keys = reversed(fqdn.split("."))
         for key in keys:
             child = current.children.get(key)
 
             if child is None:
-                child = current.children.get('*')
+                child = current.children.get("*")
 
             if child is None and touch is False:
                 return None
@@ -28,15 +28,11 @@ class CacheNode:
             elif child is None and touch:
                 child = CacheNode()
                 current.children[key] = child
-                
+
             current = child
         return current.data
 
-    def query(
-        self, 
-        fqdn: str, 
-        record_type: Union[RecordType, Iterable[RecordType]]
-    ):
+    def query(self, fqdn: str, record_type: Union[RecordType, Iterable[RecordType]]):
         if isinstance(record_type, RecordType):
             value = self.get(fqdn)
             if value is not None:
@@ -51,10 +47,9 @@ class CacheNode:
         record_type: RecordType = None,
         data: Union[RecordData, bytes, Iterable] = None,
         ttl=-1,
-        record: Record = None
+        record: Record = None,
     ):
         if record is None:
-
             if isinstance(data, bytes):
                 _, rdata = Record.load_rdata(record_type, data, 0, len(data))
 
@@ -64,18 +59,12 @@ class CacheNode:
             else:
                 rdata = Record.create_rdata(record_type, *data)
 
-            record = Record(
-                name=fqdn, 
-                data=rdata, 
-                record_type=record_type, 
-                ttl=ttl
-            )
+            record = Record(name=fqdn, data=rdata, record_type=record_type, ttl=ttl)
 
         value = self.get(record.name, True)
         value.add(record)
 
     def iter_values(self) -> Iterable[Record]:
-
         yield from self.data.get(RecordType.ANY)
 
         for child in self.children.values():

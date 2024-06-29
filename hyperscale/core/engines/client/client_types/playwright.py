@@ -18,17 +18,16 @@ from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from .base_client import BaseClient
 
 
-class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, PlaywrightResult]):
-
+class PlaywrightClient(
+    BaseClient[MercuryPlaywrightClient, PlaywrightCommand, PlaywrightResult]
+):
     def __init__(self, config: Config) -> None:
         super().__init__()
-        
+
         self.session = MercuryPlaywrightClient(
             concurrency=config.batch_size,
             group_size=config.group_size,
-            timeouts=Timeouts(
-                total_timeout=config.request_timeout
-            )
+            timeouts=Timeouts(total_timeout=config.request_timeout),
         )
 
         self.request_type = RequestTypes.PLAYWRIGHT
@@ -45,41 +44,41 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
         return self.session.registered.get(key)
 
     async def goto(
-        self, 
-        url: str, 
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        self,
+        url: str,
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'goto',
+            "goto",
             url=URL(location=url),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
 
     async def fill(
-        self, 
-        selector: str, 
+        self,
+        selector: str,
         text: str,
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'fill',
+            "fill",
             page=Page(selector=selector),
             input=Input(text=text),
             user=user,
             tags=tags,
-            checks=checks     
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -87,19 +86,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def check(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'check',
+            "check",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -107,19 +106,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def click(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'click',
+            "click",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -127,19 +126,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def double_click(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'double_click',
+            "double_click",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -148,22 +147,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
         self,
         selector: str,
         event: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'double_click',
+            "double_click",
             page=Page(selector=selector),
-            options=Options(
-                event=event, 
-                **extra
-            ),
+            options=Options(event=event, **extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -172,38 +168,31 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
         self,
         x_coordinate: int,
         y_coordinate: int,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'drag_and_drop',
-            page=Page(
-                x_coordinate=x_coordinate,
-                y_coordinate=y_coordinate
-            ),
+            "drag_and_drop",
+            page=Page(x_coordinate=x_coordinate, y_coordinate=y_coordinate),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
 
     async def switch_active_tab(
         self,
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
-            self.next_name,
-            'switch_active_tab',
-            user=user,
-            tags=tags,
-            checks=checks
+            self.next_name, "switch_active_tab", user=user, tags=tags, checks=checks
         )
 
         return await self._execute_action(command)
@@ -212,24 +201,21 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
         self,
         selector: str,
         expression: str,
-        args: List[Union[int, str, float, bool, None]]=[],
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        args: List[Union[int, str, float, bool, None]] = [],
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'evaluate_selector',
+            "evaluate_selector",
             page=Page(selector=selector),
-            input=Input(
-                expression=expression,
-                args=args
-            ),
+            input=Input(expression=expression, args=args),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -238,24 +224,21 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
         self,
         selector: str,
         expression: str,
-        args: List[Union[int, str, float, bool, None]]=[],
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        args: List[Union[int, str, float, bool, None]] = [],
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'evaluate_all_selectors',
+            "evaluate_all_selectors",
             page=Page(selector=selector),
-            input=Input(
-                expression=expression,
-                args=args
-            ),
+            input=Input(expression=expression, args=args),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -263,23 +246,20 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def evaluate_expression(
         self,
         expression: str,
-        args: List[Union[int, str, float, bool, None]]=[],
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        args: List[Union[int, str, float, bool, None]] = [],
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'evaluate_expression',
-            input=Input(
-                expression=expression,
-                args=args
-            ),
+            "evaluate_expression",
+            input=Input(expression=expression, args=args),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -287,23 +267,20 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def evaluate_handle(
         self,
         expression: str,
-        args: List[Union[int, str, float, bool, None]]=[],
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        args: List[Union[int, str, float, bool, None]] = [],
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'evaluate_handle',
-            input=Input(
-                expression=expression,
-                args=args
-            ),
+            "evaluate_handle",
+            input=Input(expression=expression, args=args),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -311,19 +288,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def exepect_console_message(
         self,
         expression: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'exepect_console_message',
+            "exepect_console_message",
             input=Input(expression=expression),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -331,19 +308,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def expect_download(
         self,
         expression: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'expect_download',
+            "expect_download",
             input=Input(expression=expression),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -351,21 +328,18 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def expect_event(
         self,
         event: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'expect_event',
-            options=Options(
-                event=event, 
-                **extra
-            ),
+            "expect_event",
+            options=Options(event=event, **extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -373,19 +347,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def expect_location(
         self,
         url: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'expect_location',
+            "expect_location",
             url=URL(location=url),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -393,19 +367,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def expect_popup(
         self,
         expression: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'expect_popup',
+            "expect_popup",
             input=Input(expression=expression),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -413,19 +387,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def expect_request(
         self,
         url: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'expect_request',
+            "expect_request",
             url=URL(location=url),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -433,19 +407,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def expect_request_finished(
         self,
         url: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'expect_request_finished',
+            "expect_request_finished",
             url=URL(location=url),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -453,19 +427,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def expect_response(
         self,
         url: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'expect_response',
+            "expect_response",
             url=URL(location=url),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -473,19 +447,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def focus(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'focus',
+            "focus",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -493,19 +467,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def hover(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'hover',
+            "hover",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -513,19 +487,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def get_inner_html(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'get_inner_html',
+            "get_inner_html",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -533,19 +507,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def get_text(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'get_text',
+            "get_text",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -553,19 +527,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def get_input_value(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'get_input_value',
+            "get_input_value",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -574,20 +548,20 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
         self,
         selector: str,
         key: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'press_key',
+            "press_key",
             page=Page(selector=selector),
             input=Input(key=key),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -595,19 +569,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def verify_is_enabled(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'verify_is_enabled',
+            "verify_is_enabled",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -615,19 +589,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def verify_is_hidden(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'verify_is_hidden',
+            "verify_is_hidden",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -635,19 +609,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def verify_is_visible(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'verify_is_visible',
+            "verify_is_visible",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -655,35 +629,31 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def verify_is_checked(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'verify_is_checked',
+            "verify_is_checked",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
 
     async def get_content(
         self,
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
-            self.next_name,
-            'get_content',
-            user=user,
-            tags=tags,
-            checks=checks
+            self.next_name, "get_content", user=user, tags=tags, checks=checks
         )
 
         return await self._execute_action(command)
@@ -691,19 +661,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def get_element(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'get_element',
+            "get_element",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -711,37 +681,37 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def get_all_elements(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'get_all_elements',
+            "get_all_elements",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
 
     async def reload_page(
         self,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'reload_page',
+            "reload_page",
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -749,19 +719,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def take_screenshot(
         self,
         screenshot_filepath: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'take_screenshot',
+            "take_screenshot",
             input=Input(path=screenshot_filepath),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -770,26 +740,22 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
         self,
         selector: str,
         option: Union[str, int, bool, float, None],
-        by_label: bool=False,
-        by_value: bool=False,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        by_label: bool = False,
+        by_value: bool = False,
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'select_option',
+            "select_option",
             page=Page(selector=selector),
-            input=Input(
-                option=option,
-                by_label=by_label,
-                by_value=by_value
-            ),
+            input=Input(option=option, by_label=by_label, by_value=by_value),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -798,22 +764,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
         self,
         selector: str,
         checked: bool,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'set_checked',
+            "set_checked",
             page=Page(selector=selector),
-            options=Options(
-                is_checked=checked,
-                **extra
-            ),
+            options=Options(is_checked=checked, **extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -821,21 +784,18 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def set_default_timeout(
         self,
         timeout: float,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'set_default_timeout',
-            options=Options(
-                timeout=timeout,
-                **extra
-            ),
+            "set_default_timeout",
+            options=Options(timeout=timeout, **extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -843,21 +803,18 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def set_navigation_timeout(
         self,
         timeout: float,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'set_navigation_timeout',
-            options=Options(
-                timeout=timeout,
-                **extra
-            ),
+            "set_navigation_timeout",
+            options=Options(timeout=timeout, **extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -865,19 +822,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def set_http_headers(
         self,
         headers: Dict[str, str],
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'set_http_headers',
+            "set_http_headers",
             url=URL(headers=headers),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -885,19 +842,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def tap(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'tap',
+            "tap",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -905,35 +862,31 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def get_text_content(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'get_text_content',
+            "get_text_content",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
 
     async def get_page_title(
         self,
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
-            self.next_name,
-            'get_page_title',
-            user=user,
-            tags=tags,
-            checks=checks
+            self.next_name, "get_page_title", user=user, tags=tags, checks=checks
         )
 
         return await self._execute_action(command)
@@ -942,20 +895,20 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
         self,
         selector: str,
         text: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'input_text',
+            "input_text",
             page=Page(selector=selector),
             input=Input(text=text),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -963,19 +916,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def uncheck(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'uncheck',
+            "uncheck",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -983,21 +936,18 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def wait_for_event(
         self,
         event: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'wait_for_event',
-            options=Options(
-                event=event,
-                **extra
-            ),
+            "wait_for_event",
+            options=Options(event=event, **extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -1005,41 +955,38 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def wait_for_function(
         self,
         expression: str,
-        args: List[Union[int, str, float, bool, None]]=[],
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        args: List[Union[int, str, float, bool, None]] = [],
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'wait_for_function',
-            input=Input(
-                expression=expression,
-                args=args
-            ),
+            "wait_for_function",
+            input=Input(expression=expression, args=args),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
 
     async def wait_for_page_load_state(
         self,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'wait_for_page_load_state',
+            "wait_for_page_load_state",
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -1047,19 +994,19 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def wait_for_selector(
         self,
         selector: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'wait_for_selector',
+            "wait_for_selector",
             page=Page(selector=selector),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
@@ -1067,79 +1014,72 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
     async def wait_for_timeout(
         self,
         timeout: float,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'wait_for_timeout',
-            options=Options(
-                timeout=timeout,
-                **extra
-            ),
+            "wait_for_timeout",
+            options=Options(timeout=timeout, **extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
-    
+
     async def wait_for_url(
         self,
         url: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'wait_for_url',
+            "wait_for_url",
             url=URL(location=url),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
 
     async def switch_frame(
         self,
-        url: str=None,
-        frame: int=None,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        url: str = None,
+        frame: int = None,
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'switch_frame',
+            "switch_frame",
             url=URL(location=url),
             page=Page(frame=frame),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
 
     async def get_frames(
         self,
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
-            self.next_name,
-            'get_frames',
-            user=user,
-            tags=tags,
-            checks=checks
+            self.next_name, "get_frames", user=user, tags=tags, checks=checks
         )
 
         return await self._execute_action(command)
@@ -1148,58 +1088,55 @@ class PlaywrightClient(BaseClient[MercuryPlaywrightClient, PlaywrightCommand, Pl
         self,
         selector: str,
         attribute: str,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'get_attribute',
-            page=Page(
-                selector=selector,
-                attribute=attribute
-            ),
+            "get_attribute",
+            page=Page(selector=selector, attribute=attribute),
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
 
     async def go_back_page(
         self,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'go_back_page',
+            "go_back_page",
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)
 
     async def go_forward_page(
         self,
-        extra: Dict[str, Any]={}, 
-        user: str=None,
-        tags: List[Dict[str, str]]=[],
-        checks: List[Callable]=[]
+        extra: Dict[str, Any] = {},
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
+        checks: List[Callable] = [],
     ):
         command = PlaywrightCommand(
             self.next_name,
-            'go_forward_page',
+            "go_forward_page",
             options=Options(**extra),
             user=user,
             tags=tags,
-            checks=checks
+            checks=checks,
         )
 
         return await self._execute_action(command)

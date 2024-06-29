@@ -1,7 +1,7 @@
 import datetime
 
-class Timer:
 
+class Timer:
     def __init__(self, name: str) -> None:
         self.name = name
         self.elapsed = 0
@@ -9,7 +9,7 @@ class Timer:
         self.minutes = 0
         self.hours = 0
         self.start = datetime.datetime.now()
-        self.default_message = 'Pending...'
+        self.default_message = "Pending..."
         self.elapsed_message = self.default_message
 
     def __str__(self) -> str:
@@ -19,23 +19,22 @@ class Timer:
         current = datetime.datetime.now()
         self.elapsed = round((current - self.start).total_seconds())
 
-        self.seconds = self.elapsed%60
-        time_elapsed_string = f'{self.seconds}s'
+        self.seconds = self.elapsed % 60
+        time_elapsed_string = f"{self.seconds}s"
 
-        self.minutes = int(self.elapsed/60)%60
+        self.minutes = int(self.elapsed / 60) % 60
         if self.minutes > 0:
-            time_elapsed_string = f'{self.minutes}m.{self.seconds}s'
+            time_elapsed_string = f"{self.minutes}m.{self.seconds}s"
 
-        self.hours = int(self.elapsed/3600)
+        self.hours = int(self.elapsed / 3600)
         if self.hours > 0:
-            time_elapsed_string = f'{self.hours}h.{self.minutes}m.{self.seconds}s'
+            time_elapsed_string = f"{self.hours}h.{self.minutes}m.{self.seconds}s"
 
-
-        self.elapsed_message = f'{self.name} Time Elapsed: {time_elapsed_string}'
+        self.elapsed_message = f"{self.name} Time Elapsed: {time_elapsed_string}"
 
     def finalize(self, message: str):
         self.update()
-        return f'{message} - {self.elapsed_message}'
+        return f"{message} - {self.elapsed_message}"
 
     def reset(self):
         self.start = datetime.datetime.now()

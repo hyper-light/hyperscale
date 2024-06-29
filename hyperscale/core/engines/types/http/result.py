@@ -12,37 +12,32 @@ from .action import HTTPAction
 
 
 class HTTPResult(BaseResult):
-
     __slots__ = (
-        'action_id',
-        'url',
-        'ip_addr',
-        'method',
-        'path',
-        'params',
-        'query',
-        'hostname',
-        'headers',
-        'body',
-        'response_code',
-        '_version',
-        '_reason',
-        '_status'
+        "action_id",
+        "url",
+        "ip_addr",
+        "method",
+        "path",
+        "params",
+        "query",
+        "hostname",
+        "headers",
+        "body",
+        "response_code",
+        "_version",
+        "_reason",
+        "_status",
     )
 
-    def __init__(self, action: HTTPAction, error: Exception=None) -> None:
-
-        super(
-            HTTPResult,
-            self
-        ).__init__(
+    def __init__(self, action: HTTPAction, error: Exception = None) -> None:
+        super(HTTPResult, self).__init__(
             action.action_id,
             action.name,
             action.url.hostname,
             action.metadata.user,
             action.metadata.tags,
             RequestTypes.HTTP,
-            error
+            error,
         )
 
         self.url = action.url.full
@@ -63,7 +58,7 @@ class HTTPResult(BaseResult):
 
     @property
     def content_type(self):
-        return self.headers.get(b'content-type')
+        return self.headers.get(b"content-type")
 
     @property
     def compression(self):
@@ -71,12 +66,12 @@ class HTTPResult(BaseResult):
 
     @property
     def size(self):
-        if self.headers.get(b'content-length'):
-            return int(self.headers.get(b'content-length'))
-        
+        if self.headers.get(b"content-length"):
+            return int(self.headers.get(b"content-length"))
+
         elif self.body:
             return len(self.body)
-        
+
         else:
             return 0
 
@@ -91,7 +86,7 @@ class HTTPResult(BaseResult):
 
             if self.content_type == b"application/json":
                 data = json.loads(self.body)
-            
+
             elif isinstance(self.body, (bytes, bytearray)):
                 data = str(data.decode())
 
@@ -107,12 +102,14 @@ class HTTPResult(BaseResult):
     @property
     def version(self) -> Union[str, None]:
         try:
-            if self._version is None and isinstance(self.response_code, (bytes, bytearray)):
+            if self._version is None and isinstance(
+                self.response_code, (bytes, bytearray)
+            ):
                 status_string: List[bytes] = self.response_code.split()
                 self._version = status_string[0].decode()
         except Exception:
             pass
-            
+
         return self._version
 
     @version.setter
@@ -122,8 +119,9 @@ class HTTPResult(BaseResult):
     @property
     def status(self) -> Union[int, None]:
         try:
-
-            if self._status is None and isinstance(self.response_code, (bytes, bytearray)):
+            if self._status is None and isinstance(
+                self.response_code, (bytes, bytearray)
+            ):
                 status_string: List[bytes] = self.response_code.split()
                 self._status = int(status_string[1])
 
@@ -138,16 +136,16 @@ class HTTPResult(BaseResult):
 
     @property
     def reason(self) -> Union[str, None]:
-
         try:
-
-            if self._reason is None and isinstance(self.response_code, (bytes, bytearray)):
+            if self._reason is None and isinstance(
+                self.response_code, (bytes, bytearray)
+            ):
                 status_string: List[bytes] = self.response_code.split()
                 self._reason = status_string[2].decode()
 
         except Exception:
             pass
-        
+
         return self._reason
 
     @reason.setter

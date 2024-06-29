@@ -47,7 +47,8 @@ class TCPProtocol(Generic[T, K]):
         port: int,
         env: Env,
     ) -> None:
-        self.node_id: Optional[int] = None
+        self._node_id_base = uuid.uuid4().int >> 64
+        self.node_id: int | None = None
 
         self.id_generator: Optional[SnowflakeGenerator] = None
 
@@ -103,6 +104,9 @@ class TCPProtocol(Generic[T, K]):
     def nodes(self):
         return [node_id for node_id in self._node_host_map]
 
+    def node_at(self, idx: int):
+        return self.nodes[idx]
+
     async def start_server(
         self,
         cert_path: Optional[str] = None,
@@ -148,11 +152,14 @@ class TCPProtocol(Generic[T, K]):
         if self._nodes is None:
             self._nodes: LockedSet[int] = LockedSet()
 
-        if self.node_id is None:
-            self.node_id = uuid.uuid4().int >> 64
-
         if self.id_generator is None:
-            self.id_generator = SnowflakeGenerator(self.node_id)
+            self.id_generator = SnowflakeGenerator(self._node_id_base)
+
+        if self.node_id is None:
+            snowflake_id = self.id_generator.generate()
+            snowflake = Snowflake.parse(snowflake_id)
+
+            self.node_id = snowflake.instance
 
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._max_concurrency)
@@ -269,7 +276,7 @@ class TCPProtocol(Generic[T, K]):
         cert_path: Optional[str] = None,
         key_path: Optional[str] = None,
         worker_socket: Optional[socket.socket] = None,
-    ) -> None:
+    ) -> int | None:
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._max_concurrency)
 
@@ -334,7 +341,7 @@ class TCPProtocol(Generic[T, K]):
                 self._node_host_map[instance] = address
                 self._nodes.put_no_wait(instance)
 
-                return client_transport
+                return instance
 
             except ConnectionRefusedError as connection_error:
                 last_error = connection_error
@@ -431,7 +438,7 @@ class TCPProtocol(Generic[T, K]):
                     request_type = "request"
 
                 client_transport = self._client_transports.get(address)
-                if client_transport is None:
+                if client_transport is None or client_transport.is_closing():
                     await self.connect_client(
                         address,
                         cert_path=self._client_cert_path,
@@ -457,16 +464,6 @@ class TCPProtocol(Generic[T, K]):
 
                 encrypted_message = self._encryptor.encrypt(item)
                 compressed = self._compressor.compress(encrypted_message)
-
-                if client_transport.is_closing():
-                    return (
-                        self.id_generator.generate(),
-                        Message(
-                            self.node_id,
-                            target,
-                            error="Transport closed.",
-                        ),
-                    )
 
                 client_transport.write(compressed)
 
@@ -711,7 +708,10 @@ class TCPProtocol(Generic[T, K]):
         instance = snowflake.instance
         if (await self._nodes.exists(instance)) is False:
             self._nodes.put_no_wait(instance)
-            self._node_host_map[instance] = (message.service_host, message.service_port)
+            self._node_host_map[instance] = (
+                message.service_host,
+                message.service_port,
+            )
 
         if message_type == "connect":
             item = cloudpickle.dumps(

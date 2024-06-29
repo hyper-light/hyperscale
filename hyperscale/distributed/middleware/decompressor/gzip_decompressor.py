@@ -8,103 +8,60 @@ from hyperscale.distributed.models.http import Request, Response
 
 
 class GZipDecompressor(Middleware):
-
     def __init__(
-        self, 
-        compression_level: int=9,
+        self,
+        compression_level: int = 9,
         serializers: Dict[
-            str,
-            Callable[
-                [
-                    Union[
-                        Response,
-                        BaseModel,
-                        str,
-                        None
-                    ]
-                ],
-                Union[
-                    str,
-                    None
-                ]
-            ]
-        ]={}
+            str, Callable[[Union[Response, BaseModel, str, None]], Union[str, None]]
+        ] = {},
     ) -> None:
         super().__init__(
-            self.__class__.__name__,
-            middleware_type=MiddlewareType.UNIDIRECTIONAL_AFTER
+            self.__class__.__name__, middleware_type=MiddlewareType.UNIDIRECTIONAL_AFTER
         )
 
         self.compression_level = compression_level
         self.serializers = serializers
 
     async def __run__(
-        self, 
+        self,
         request: Request,
-        response: Union[
-            Response,
-            BaseModel,
-            str,
-            None
-        ],
-        status: int
-    ) -> Tuple[
-        Tuple[Response, int], 
-        bool
-    ]:
+        response: Union[Response, BaseModel, str, None],
+        status: int,
+    ) -> Tuple[Tuple[Response, int], bool]:
         try:
-            
             if response is None:
                 return (
                     request,
-                    Response(
-                        request.path,
-                        request.method,
-                        data=response
-                    ),
-                    status
+                    Response(request.path, request.method, data=response),
+                    status,
                 ), True
-            
-            elif isinstance(response, str):
 
-                decompressed_data = decompress(
-                    response.encode()
-                )
+            elif isinstance(response, str):
+                decompressed_data = decompress(response.encode())
 
                 return (
                     request,
                     Response(
                         request.path,
                         request.method,
-                        headers={
-                            'content-type': 'text/plain'
-                        },
-                        data=decompressed_data.decode()
+                        headers={"content-type": "text/plain"},
+                        data=decompressed_data.decode(),
                     ),
-                    status
+                    status,
                 ), True
-            
-            else:
 
+            else:
                 headers = response.headers
                 content_encoding = headers.get(
-                    'content-encoding',
-                    headers.get('x-compression-encoding')
+                    "content-encoding", headers.get("x-compression-encoding")
                 )
-                
-                if content_encoding == 'gzip':
 
+                if content_encoding == "gzip":
                     serialized = self.serializers[request.path](response)
-                    decompressed_data = decompress(
-                        serialized
-                    )
+                    decompressed_data = decompress(serialized)
 
                     headers.pop(
-                        'content-encoding',
-                        headers.pop(
-                            'x-compression-encoding',
-                            None
-                        )
+                        "content-encoding", headers.pop("x-compression-encoding", None)
                     )
 
                     return (
@@ -113,34 +70,27 @@ class GZipDecompressor(Middleware):
                             request.path,
                             request.method,
                             headers=headers,
-                            data=decompressed_data.decode()
+                            data=decompressed_data.decode(),
                         ),
-                        status
+                        status,
                     ), True
-       
-                return (
-                    response,
-                    status
-                ), True
-            
+
+                return (response, status), True
+
         except KeyError:
             return (
                 request,
                 Response(
                     request.path,
                     request.method,
-                    data=f'No serializer for {request.path} found.'
+                    data=f"No serializer for {request.path} found.",
                 ),
-                500
+                500,
             ), False
 
         except Exception as e:
             return (
                 request,
-                Response(
-                    request.path,
-                    request.method,
-                    data=str(e)
-                ),
-                500
+                Response(request.path, request.method, data=str(e)),
+                500,
             ), False

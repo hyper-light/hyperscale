@@ -8,7 +8,7 @@ class SettingCodes(IntEnum):
     .. versionadded:: 2.6.0
     """
 
-     #: The byte that signals the SETTINGS_HEADER_TABLE_SIZE setting.
+    #: The byte that signals the SETTINGS_HEADER_TABLE_SIZE setting.
     HEADER_TABLE_SIZE = 0x01
     #: The byte that signals the SETTINGS_ENABLE_PUSH setting.
     ENABLE_PUSH = 0x02

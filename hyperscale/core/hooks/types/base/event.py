@@ -8,29 +8,27 @@ from hyperscale.core.hooks.types.base.simple_context import SimpleContext
 
 from .event_types import EventType
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class BaseEvent(Generic[T]):
-
     __slots__ = (
-        'target',
-        'event_type',
-        'source',
-        'as_hook',
-        'event_name',
-        'event_order',
-        'target_is_event',
-        'context',
-        'events',
-        'execution_path',
-        'next_args',
-        'previous_map',
-        'next_map'
+        "target",
+        "event_type",
+        "source",
+        "as_hook",
+        "event_name",
+        "event_order",
+        "target_is_event",
+        "context",
+        "events",
+        "execution_path",
+        "next_args",
+        "previous_map",
+        "next_map",
     )
 
     def __init__(self, target: Hook, source: Hook) -> None:
-        
         self.target = target
         self.target_is_event = False
 
@@ -54,58 +52,55 @@ class BaseEvent(Generic[T]):
         self.execution_path: List[List[str]] = []
         self.previous_map: List[str] = []
         self.next_map: List[str] = []
-        self.next_args: Dict[str, Dict[str,Any]] = defaultdict(dict)
+        self.next_args: Dict[str, Dict[str, Any]] = defaultdict(dict)
 
     def __getattribute__(self, name: str) -> Any:
-        
         source = None
         event_attrs = [
-            'call', 
-            'event_type',
-            'target', 
-            'source',
-            'as_hook',
-            'event_name',
-            'event_order',
-            'target_is_event',
-            'context',
-            'events',
-            'execution_path',
-            'next_args',
-            'previous_map',
-            'next_map',
-            'copy'
+            "call",
+            "event_type",
+            "target",
+            "source",
+            "as_hook",
+            "event_name",
+            "event_order",
+            "target_is_event",
+            "context",
+            "events",
+            "execution_path",
+            "next_args",
+            "previous_map",
+            "next_map",
+            "copy",
         ]
-      
-        source = object.__getattribute__(self, 'source')
-        
+
+        source = object.__getattribute__(self, "source")
+
         if source and hasattr(source, name) and name not in event_attrs:
             return getattr(source, name)
-        
+
         return object.__getattribute__(self, name)
 
     def __setattr__(self, name: str, value: Any) -> None:
-
         try:
-
-            source = object.__getattribute__(self, 'source')
+            source = object.__getattribute__(self, "source")
 
             event_attrs = [
-                'call', 
-                'event_type',
-                'target', 
-                'source',
-                'as_hook',
-                'event_name',
-                'event_order',
-                'target_is_event',
-                'context',
-                'events',
-                'execution_path',
-                'next_args',
-                'previous_map',
-                'next_map',
-                'copy'
+                "call",
+                "event_type",
+                "target",
+                "source",
+                "as_hook",
+                "event_name",
+                "event_order",
+                "target_is_event",
+                "context",
+                "events",
+                "execution_path",
+                "next_args",
+                "previous_map",
+                "next_map",
+                "copy",
             ]
 
             if source and hasattr(source, name) and name not in event_attrs:
@@ -116,8 +111,7 @@ class BaseEvent(Generic[T]):
 
         return super().__setattr__(name, value)
 
-    async def call(self, **kwargs) -> Dict[str, Any]: 
-   
+    async def call(self, **kwargs) -> Dict[str, Any]:
         if len(self.next_args[self.event_name]) == 0:
             self.next_args[self.event_name] = kwargs
 
@@ -125,7 +119,6 @@ class BaseEvent(Generic[T]):
             self.source.context = self.context
 
         results = await self.source.call(**self.next_args[self.event_name])
-        
 
         self.context.update(results)
         self.source.stage_instance.context.update(results)
@@ -134,7 +127,9 @@ class BaseEvent(Generic[T]):
             self.source.context.update(results)
 
         next_events = [
-            self.events.get(event_name) for event_name in  self.next_map if self.events.get(event_name) is not None
+            self.events.get(event_name)
+            for event_name in self.next_map
+            if self.events.get(event_name) is not None
         ]
 
         for event in next_events:
@@ -142,9 +137,7 @@ class BaseEvent(Generic[T]):
 
             self.next_args[event.event_name].update(results)
 
-        return {
-            self.event_name: results
-        }
+        return {self.event_name: results}
 
     async def execute_pre(self, *hook_args: List[Any]):
         results = None
@@ -165,10 +158,7 @@ class BaseEvent(Generic[T]):
         return results
 
     def copy(self) -> BaseEvent[Hook]:
-        base_event = BaseEvent(
-            self.target.copy(),
-            self.source.copy()
-        )
+        base_event = BaseEvent(self.target.copy(), self.source.copy())
 
         base_event.execution_path = self.execution_path
         base_event.previous_map = self.previous_map

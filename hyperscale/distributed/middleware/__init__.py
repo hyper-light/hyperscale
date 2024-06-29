@@ -7,12 +7,12 @@ from .compressor import (
     BidirectionalGZipCompressor,
     BidirectionalZStandardCompressor,
     GZipCompressor,
-    ZStandardCompressor
+    ZStandardCompressor,
 )
 
 from .decompressor import (
     BidirectionalGZipDecompressor,
     BidirectionalZStandardDecompressor,
     GZipDecompressor,
-    ZStandardDecompressor
+    ZStandardDecompressor,
 )

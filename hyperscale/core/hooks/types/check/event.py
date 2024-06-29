@@ -7,23 +7,13 @@ from hyperscale.core.hooks.types.check.hook import CheckHook
 
 
 class CheckEvent(BaseEvent[CheckHook]):
-
     def __init__(self, target: Hook, source: CheckHook) -> None:
-        super(
-            CheckEvent,
-            self
-        ).__init__(
-            target,
-            source
-        )
+        super(CheckEvent, self).__init__(target, source)
 
         self.event_type = EventType.CHECK
 
     def copy(self):
-        check_event = CheckEvent(
-            self.target.copy(),
-            self.source.copy()
-        )
+        check_event = CheckEvent(self.target.copy(), self.source.copy())
 
         check_event.execution_path = list(self.execution_path)
         check_event.previous_map = list(self.previous_map)

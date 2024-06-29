@@ -19,8 +19,8 @@ class CustomReporterConfig(ReporterConfig):
     pass
 
 
-class  CustomReporter(ReporterPlugin):
-    config=CustomReporterConfig
+class CustomReporter(ReporterPlugin):
+    config = CustomReporterConfig
 
     def __init__(self, config: CustomReporterConfig) -> None:
         super().__init__(config)

@@ -42,6 +42,7 @@ class Settings(MutableMapping):
         set, rather than RFC 7540's defaults.
     :type initial_vales: ``MutableMapping``
     """
+
     def __init__(self, client=True, initial_values=None):
         # Backing object for the settings. This is a dictionary of
         # (setting: [list of values]), where the first value in the list is the
@@ -62,7 +63,7 @@ class Settings(MutableMapping):
                 if invalid:
                     raise Exception(
                         "Setting %d has invalid value %d" % (key, value),
-                        error_code=invalid
+                        error_code=invalid,
                     )
                 self._settings[key] = deque([value])
 
@@ -81,9 +82,7 @@ class Settings(MutableMapping):
             if len(v) > 1:
                 old_setting = v.popleft()
                 new_setting = v[0]
-                changed_settings[k] = ChangedSetting(
-                    k, old_setting, new_setting
-                )
+                changed_settings[k] = ChangedSetting(k, old_setting, new_setting)
 
         return changed_settings
 
@@ -142,7 +141,7 @@ class Settings(MutableMapping):
         The current value of the :data:`MAX_CONCURRENT_STREAMS
         <h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS>` setting.
         """
-        return self.get(SettingCodes.MAX_CONCURRENT_STREAMS, 2**32+1)
+        return self.get(SettingCodes.MAX_CONCURRENT_STREAMS, 2**32 + 1)
 
     @max_concurrent_streams.setter
     def max_concurrent_streams(self, value):
@@ -190,8 +189,7 @@ class Settings(MutableMapping):
         invalid = _validate_setting(key, value)
         if invalid:
             raise Exception(
-                "Setting %d has invalid value %d" % (key, value),
-                error_code=invalid
+                "Setting %d has invalid value %d" % (key, value), error_code=invalid
             )
 
         try:

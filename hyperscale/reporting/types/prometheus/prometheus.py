@@ -28,6 +28,7 @@ try:
 
     from .prometheus_config import PrometheusConfig
     from .prometheus_metric import PrometheusMetric
+
     has_connector = True
 
 except Exception:
@@ -37,7 +38,6 @@ except Exception:
 
 
 class Prometheus:
-
     def __init__(self, config: PrometheusConfig) -> None:
         self.pushgateway_address = config.pushgateway_address
         self.auth_request_method = config.auth_request_method
@@ -52,18 +52,18 @@ class Prometheus:
         self._auth_handler = None
         self._has_auth = False
         self._loop = asyncio.get_event_loop()
-        
+
         self.types_map = {
-            'total': 'count',
-            'succeeded': 'count',
-            'failed': 'count',
-            'actions_per_second': 'gauge',
-            'median': 'gauge',
-            'mean': 'gauge',
-            'variance': 'gauge',
-            'stdev': 'gauge',
-            'minimum': 'gauge',
-            'maximum': 'gauge'
+            "total": "count",
+            "succeeded": "count",
+            "failed": "count",
+            "actions_per_second": "gauge",
+            "median": "gauge",
+            "mean": "gauge",
+            "variance": "gauge",
+            "stdev": "gauge",
+            "minimum": "gauge",
+            "maximum": "gauge",
         }
 
         self._events: Dict[str, PrometheusMetric] = {}
@@ -76,25 +76,26 @@ class Prometheus:
         self._variants: Dict[str, Dict[str, PrometheusMetric]] = {}
         self._mutations: Dict[str, Dict[str, PrometheusMetric]] = {}
 
-        self._shared_metrics: Dict[str, Dict[str, PrometheusMetric]]  = {}
+        self._shared_metrics: Dict[str, Dict[str, PrometheusMetric]] = {}
         self._custom_metrics: Dict[str, PrometheusMetric] = {}
         self._errors: Dict[str, PrometheusMetric] = {}
 
         self.metric_types_map = {
-            MetricType.COUNT: 'count',
-            MetricType.RATE: 'gauge',
-            MetricType.DISTRIBUTION: 'histogram',
-            MetricType.SAMPLE: 'gauge'
+            MetricType.COUNT: "count",
+            MetricType.RATE: "gauge",
+            MetricType.DISTRIBUTION: "histogram",
+            MetricType.SAMPLE: "gauge",
         }
 
         self.session_uuid = str(uuid.uuid4())
         self.metadata_string: str = None
         self.logger = HyperscaleLogger()
         self.logger.initialize()
-        
-    async def connect(self) -> None:
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connecting to Prometheus Pushgateway at: {self.pushgateway_address}')
+    async def connect(self) -> None:
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connecting to Prometheus Pushgateway at: {self.pushgateway_address}"
+        )
 
         self.registry = CollectorRegistry()
         REGISTRY.register(self.registry)
@@ -102,25 +103,26 @@ class Prometheus:
         if self.username and self.password:
             self._has_auth = True
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connected to Prometheus Pushgateway at: {self.pushgateway_address}')
-            
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connected to Prometheus Pushgateway at: {self.pushgateway_address}"
+        )
 
     def _generate_auth(self) -> basic_auth_handler:
         return basic_auth_handler(
             self.pushgateway_address,
             self.auth_request_method,
             self.auth_request_timeout,
-            {
-                'Content-Type': 'application/json'
-            },
+            {"Content-Type": "application/json"},
             self.auth_request_data,
             username=self.username,
-            password=self.password
+            password=self.password,
         )
-    
+
     async def _submit_to_pushgateway(self):
         if self._has_auth:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Pushing to secure Prometheus Pushgateway via HTTPS')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Pushing to secure Prometheus Pushgateway via HTTPS"
+            )
             await self._loop.run_in_executor(
                 None,
                 functools.partial(
@@ -128,101 +130,122 @@ class Prometheus:
                     self.pushgateway_address,
                     job=self.job_name,
                     registry=self.registry,
-                    handler=self._generate_auth
-                )
+                    handler=self._generate_auth,
+                ),
             )
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Pushed to secure Prometheus Pushgateway via HTTPS')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Pushed to secure Prometheus Pushgateway via HTTPS"
+            )
 
         else:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Pushing to Prometheus Pushgateway via HTTP')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Pushing to Prometheus Pushgateway via HTTP"
+            )
             await self._loop.run_in_executor(
                 None,
                 functools.partial(
                     push_to_gateway,
                     self.pushgateway_address,
                     job=self.job_name,
-                    registry=self.registry
-                )
+                    registry=self.registry,
+                ),
             )
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Pushed to Prometheus Pushgateway via HTTP')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Pushed to Prometheus Pushgateway via HTTP"
+            )
 
-    async def submit_session_system_metrics(self, system_metrics_sets: List[SystemMetricsSet]):
-
+    async def submit_session_system_metrics(
+        self, system_metrics_sets: List[SystemMetricsSet]
+    ):
         for quantile in SystemMetricsSet.quantiles:
-            quantile_key = f'quantile_{quantile}th'
-            self.types_map[quantile_key] = 'gauge'
+            quantile_key = f"quantile_{quantile}th"
+            self.types_map[quantile_key] = "gauge"
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Session System Metrics to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Session System Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
         metrics_sets: List[SessionMetricsCollection] = []
-        
+
         for metrics_set in system_metrics_sets:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Session System Metrics - {metrics_set.system_metrics_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Session System Metrics - {metrics_set.system_metrics_set_id}"
+            )
             for monitor_metrics in metrics_set.session_cpu_metrics.values():
                 metrics_sets.append(monitor_metrics)
-                
-            for  monitor_metrics in metrics_set.session_memory_metrics.values():
+
+            for monitor_metrics in metrics_set.session_memory_metrics.values():
                 metrics_sets.append(monitor_metrics)
 
         for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Session System Metrics - {metrics_set.name}:{metrics_set.group}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Session System Metrics - {metrics_set.name}:{metrics_set.group}"
+            )
 
-            session_system_metric_set = self._session_system_metrics.get(metrics_set.name)
+            session_system_metric_set = self._session_system_metrics.get(
+                metrics_set.name
+            )
             if session_system_metric_set is None:
-                tags = [
-                    f'name:{metrics_set.name}',
-                    f'group:{metrics_set.group}'
-                ]
-
+                tags = [f"name:{metrics_set.name}", f"group:{metrics_set.group}"]
 
                 fields = {}
 
                 for metric_field in metrics_set.record.keys():
-                    await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Session System Metrics Group - {metrics_set.name}:{metrics_set.group}:{metric_field}')
+                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                        f"{self.metadata_string} - Submitting Session System Metrics Group - {metrics_set.name}:{metrics_set.group}:{metric_field}"
+                    )
                     metric_type = self.types_map.get(metric_field)
-                    metric_name = f'{metrics_set.name}_{metrics_set.group}_{metric_field}'.replace('.', '_')
+                    metric_name = f"{metrics_set.name}_{metrics_set.group}_{metric_field}".replace(
+                        ".", "_"
+                    )
 
                     prometheus_metric = PrometheusMetric(
                         metric_name,
                         metric_type,
-                        metric_description=f'{metrics_set.name} {metrics_set.group} {metric_field}',
+                        metric_description=f"{metrics_set.name} {metrics_set.group} {metric_field}",
                         metric_labels=tags,
                         metric_namespace=self.namespace,
-                        registry=self.registry
+                        registry=self.registry,
                     )
                     prometheus_metric.create_metric()
 
                     fields[metric_field] = prometheus_metric
 
                 self._session_system_metrics[metrics_set.name] = fields
-            
+
             for field, prometheus_metric in session_system_metric_set.items():
                 metric_value = metrics_set.record.get(field)
                 prometheus_metric.update(metric_value)
 
         await self._submit_to_pushgateway()
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Session System Metrics to Prometheus - Namespace: {self.namespace}')
-    
-    async def submit_stage_system_metrics(self, system_metrics_sets: List[SystemMetricsSet]):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Session System Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
+    async def submit_stage_system_metrics(
+        self, system_metrics_sets: List[SystemMetricsSet]
+    ):
         for quantile in SystemMetricsSet.quantiles:
-            quantile_key = f'quantile_{quantile}th'
-            self.types_map[quantile_key] = 'gauge'
+            quantile_key = f"quantile_{quantile}th"
+            self.types_map[quantile_key] = "gauge"
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Stage System Metrics to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Stage System Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
         metrics_sets: List[SystemMetricsCollection] = []
-        
+
         for metrics_set in system_metrics_sets:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Stage System Metrics - {metrics_set.system_metrics_set_id}')
-            
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Stage System Metrics - {metrics_set.system_metrics_set_id}"
+            )
+
             cpu_metrics = metrics_set.cpu
             memory_metrics = metrics_set.memory
 
-            for stage_name, stage_cpu_metrics in  cpu_metrics.metrics.items():
-
+            for stage_name, stage_cpu_metrics in cpu_metrics.metrics.items():
                 for monitor_metrics in stage_cpu_metrics.values():
                     metrics_sets.append(monitor_metrics)
 
@@ -231,57 +254,64 @@ class Prometheus:
                     metrics_sets.append(monitor_metrics)
 
                 stage_mb_per_vu_metrics = metrics_set.mb_per_vu.get(stage_name)
-                
+
                 if stage_mb_per_vu_metrics:
                     metrics_sets.append(stage_mb_per_vu_metrics)
 
         for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Stage System Metrics - {metrics_set.name}:{metrics_set.group}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Stage System Metrics - {metrics_set.name}:{metrics_set.group}"
+            )
 
             stage_system_metric_set = self._stage_system_metrics.get(metrics_set.name)
             if stage_system_metric_set is None:
-                tags = [
-                    f'name:{metrics_set.name}',
-                    f'group:{metrics_set.group}'
-                ]
-
+                tags = [f"name:{metrics_set.name}", f"group:{metrics_set.group}"]
 
                 fields = {}
 
                 for metric_field in metrics_set.record.keys():
-                    await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Stage System Metrics Group - {metrics_set.name}:{metrics_set.group}:{metric_field}')
+                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                        f"{self.metadata_string} - Submitting Stage System Metrics Group - {metrics_set.name}:{metrics_set.group}:{metric_field}"
+                    )
                     metric_type = self.types_map.get(metric_field)
-                    metric_name = f'{metrics_set.name}_{metrics_set.group}_{metric_field}'.replace('.', '_')
+                    metric_name = f"{metrics_set.name}_{metrics_set.group}_{metric_field}".replace(
+                        ".", "_"
+                    )
 
                     prometheus_metric = PrometheusMetric(
                         metric_name,
                         metric_type,
-                        metric_description=f'{metrics_set.name} {metrics_set.group} {metric_field}',
+                        metric_description=f"{metrics_set.name} {metrics_set.group} {metric_field}",
                         metric_labels=tags,
                         metric_namespace=self.namespace,
-                        registry=self.registry
+                        registry=self.registry,
                     )
                     prometheus_metric.create_metric()
 
                     fields[metric_field] = prometheus_metric
 
                 self._stage_system_metrics[metrics_set.name] = fields
-            
+
             for field, prometheus_metric in stage_system_metric_set.items():
                 metric_value = metrics_set.record.get(field)
                 prometheus_metric.update(metric_value)
 
         await self._submit_to_pushgateway()
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Stage System Metrics to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Stage System Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
     async def submit_streams(self, stream_metrics: Dict[str, StageStreamsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Streams to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Streams to Prometheus - Namespace: {self.namespace}"
+        )
 
         for stage_name, stream in stream_metrics.items():
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Stream - {stage_name}:{stream.stream_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Stream - {stage_name}:{stream.stream_set_id}"
+            )
 
-            stream_metric_name = f'{stage_name}_streams'
+            stream_metric_name = f"{stage_name}_streams"
 
             stream_metric_set = self._streams.get(stage_name)
             if stream_metric_set is None:
@@ -291,32 +321,40 @@ class Prometheus:
                     group_metrics = stream_metric_set.get(group_name)
 
                     tags = [
-                        f'name:{stage_name}_streams',
-                        f'stage:{stage_name}',
-                        f'group:{group_name}'
+                        f"name:{stage_name}_streams",
+                        f"stage:{stage_name}",
+                        f"group:{group_name}",
                     ]
 
                     if group_metrics is None:
                         group_metrics = {}
 
                         for quantile in stream.quantiles:
-                            quantile_key = f'quantile_{quantile}th'
-                            self.types_map[quantile_key] = 'gauge'
+                            quantile_key = f"quantile_{quantile}th"
+                            self.types_map[quantile_key] = "gauge"
 
                         fields = {}
 
                         for metric_field in group.keys():
-                            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Stream Group - {stage_name}:{group_name}:{metric_field}')
+                            await self.logger.filesystem.aio[
+                                "hyperscale.reporting"
+                            ].debug(
+                                f"{self.metadata_string} - Submitting Stream Group - {stage_name}:{group_name}:{metric_field}"
+                            )
                             metric_type = self.types_map.get(metric_field)
-                            metric_name = f'{stage_name}_{group_name}_{metric_field}'.replace('.', '_')
+                            metric_name = (
+                                f"{stage_name}_{group_name}_{metric_field}".replace(
+                                    ".", "_"
+                                )
+                            )
 
                             prometheus_metric = PrometheusMetric(
                                 metric_name,
                                 metric_type,
-                                metric_description=f'{stream_metric_name} {metric_field}',
+                                metric_description=f"{stream_metric_name} {metric_field}",
                                 metric_labels=tags,
                                 metric_namespace=self.namespace,
-                                registry=self.registry
+                                registry=self.registry,
                             )
                             prometheus_metric.create_metric()
 
@@ -336,46 +374,52 @@ class Prometheus:
                     group_metrics.update(metric_value)
 
         await self._submit_to_pushgateway()
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Streams to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Streams to Prometheus - Namespace: {self.namespace}"
+        )
 
-    async def submit_experiments(self, experiment_metrics: ExperimentMetricsCollectionSet):
+    async def submit_experiments(
+        self, experiment_metrics: ExperimentMetricsCollectionSet
+    ):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Experiments to Prometheus - Namespace: {self.namespace}"
+        )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Experiments to Prometheus - Namespace: {self.namespace}')
-        
         for experiment in experiment_metrics.experiment_summaries:
-            
             experiment_id = uuid.uuid4()
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Experiments Set - {experiment.experiment_name}:{experiment_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Experiments Set - {experiment.experiment_name}:{experiment_id}"
+            )
 
-            tags = [
-                f'{tag.name}:{tag.value}' for tag in experiment.tags
-            ]
-            
+            tags = [f"{tag.name}:{tag.value}" for tag in experiment.tags]
+
             experiment_stats = self._experiments.get(experiment.experiment_name)
             if experiment_stats is None:
                 experiment_stats = {}
 
                 for field in experiment.stats.keys():
-                    await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Experiment- {experiment.experiment_name}:{field}')
+                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                        f"{self.metadata_string} - Submitting Experiment- {experiment.experiment_name}:{field}"
+                    )
 
-                    metric_name = f'{experiment.experiment_name}_{field}'.replace('.', '_')
+                    metric_name = f"{experiment.experiment_name}_{field}".replace(
+                        ".", "_"
+                    )
                     metric_type = self.types_map.get(field)
 
                     prometheus_metric = PrometheusMetric(
                         metric_name,
                         metric_type,
-                        metric_description=f'{experiment.experiment_name} {field}',
-                        metric_labels=[
-                            *tags
-                        ],
+                        metric_description=f"{experiment.experiment_name} {field}",
+                        metric_labels=[*tags],
                         metric_namespace=self.namespace,
-                        registry=self.registry
+                        registry=self.registry,
                     )
                     prometheus_metric.create_metric()
-                    
+
                     experiment_stats[field] = prometheus_metric
-                
+
                 self._experiments[experiment.experiment_name] = experiment_stats
 
             self._experiments[experiment.experiment_name] = experiment_stats
@@ -384,46 +428,48 @@ class Prometheus:
                 metric.update(value)
 
         await self._submit_to_pushgateway()
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Experiments to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Experiments to Prometheus - Namespace: {self.namespace}"
+        )
 
     async def submit_variants(self, experiment_metrics: ExperimentMetricsCollectionSet):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Variants to Prometheus - Namespace: {self.namespace}"
+        )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Variants to Prometheus - Namespace: {self.namespace}')
-        
         for variant in experiment_metrics.variant_summaries:
-            
             variant_id = uuid.uuid4()
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Variants Set - {variant.variant_name}:{variant_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Variants Set - {variant.variant_name}:{variant_id}"
+            )
 
-            tags = [
-                f'{tag.name}:{tag.value}' for tag in variant.tags
-            ]
-            
+            tags = [f"{tag.name}:{tag.value}" for tag in variant.tags]
+
             variant_stats = self._variants.get(variant.variant_name)
             if variant_stats is None:
                 variant_stats = {}
 
                 for field in variant.stats.keys():
-                    await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Variants- {variant.variant_name}:{field}')
+                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                        f"{self.metadata_string} - Submitting Variants- {variant.variant_name}:{field}"
+                    )
 
-                    metric_name = f'{variant.variant_name}_{field}'.replace('.', '_')
+                    metric_name = f"{variant.variant_name}_{field}".replace(".", "_")
                     metric_type = self.types_map.get(field)
 
                     prometheus_metric = PrometheusMetric(
                         metric_name,
                         metric_type,
-                        metric_description=f'{variant.variant_name} {field}',
-                        metric_labels=[
-                            *tags
-                        ],
+                        metric_description=f"{variant.variant_name} {field}",
+                        metric_labels=[*tags],
                         metric_namespace=self.namespace,
-                        registry=self.registry
+                        registry=self.registry,
                     )
                     prometheus_metric.create_metric()
-                    
+
                     variant_stats[field] = prometheus_metric
-                
+
                 self._variants[variant.variant_name] = variant_stats
 
             self._variants[variant.variant_name] = variant_stats
@@ -432,46 +478,50 @@ class Prometheus:
                 metric.update(value)
 
         await self._submit_to_pushgateway()
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Variants to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Variants to Prometheus - Namespace: {self.namespace}"
+        )
 
-    async def submit_mutations(self, experiment_metrics: ExperimentMetricsCollectionSet):
+    async def submit_mutations(
+        self, experiment_metrics: ExperimentMetricsCollectionSet
+    ):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Mutations to Prometheus - Namespace: {self.namespace}"
+        )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Mutations to Prometheus - Namespace: {self.namespace}')
-        
         for mutation in experiment_metrics.mutation_summaries:
-            
             mutation_id = uuid.uuid4()
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Mutations Set - {mutation.mutation_name}:{mutation_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Mutations Set - {mutation.mutation_name}:{mutation_id}"
+            )
 
-            tags = [
-                f'{tag.name}:{tag.value}' for tag in mutation.tags
-            ]
-            
+            tags = [f"{tag.name}:{tag.value}" for tag in mutation.tags]
+
             mutation_stats = self._mutations.get(mutation.mutation_name)
             if mutation_stats is None:
                 mutation_stats = {}
 
                 for field in mutation.stats.keys():
-                    await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Mutations- {mutation.mutation_name}:{field}')
+                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                        f"{self.metadata_string} - Submitting Mutations- {mutation.mutation_name}:{field}"
+                    )
 
-                    metric_name = f'{mutation.mutation_name}_{field}'.replace('.', '_')
+                    metric_name = f"{mutation.mutation_name}_{field}".replace(".", "_")
                     metric_type = self.types_map.get(field)
 
                     prometheus_metric = PrometheusMetric(
                         metric_name,
                         metric_type,
-                        metric_description=f'{mutation.mutation_name} {field}',
-                        metric_labels=[
-                            *tags
-                        ],
+                        metric_description=f"{mutation.mutation_name} {field}",
+                        metric_labels=[*tags],
                         metric_namespace=self.namespace,
-                        registry=self.registry
+                        registry=self.registry,
                     )
                     prometheus_metric.create_metric()
-                    
+
                     mutation_stats[field] = prometheus_metric
-                
+
                 self._mutations[mutation.mutation_name] = mutation_stats
 
             self._mutations[mutation.mutation_name] = mutation_stats
@@ -480,34 +530,35 @@ class Prometheus:
                 metric.update(value)
 
         await self._submit_to_pushgateway()
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Mutations to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Mutations to Prometheus - Namespace: {self.namespace}"
+        )
 
     async def submit_events(self, events: List[BaseProcessedResult]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Events to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Events to Prometheus - Namespace: {self.namespace}"
+        )
 
         for event in events:
-            
             record = {
-                f'{event.name}_time': event.time,
-                f'{event.name}_success': 1 if event.success else 0,
-                f'{event.name}_failed': 1 if event.success is False else 0
+                f"{event.name}_time": event.time,
+                f"{event.name}_success": 1 if event.success else 0,
+                f"{event.name}_failed": 1 if event.success is False else 0,
             }
 
             if self._events.get(event.name) is None:
-
                 fields = {}
 
                 for event_field in record.keys():
                     metric_type = self.types_map.get(event_field)
-                
+
                     metric = PrometheusMetric(
-                        f'{event.name}_{event_field}',
+                        f"{event.name}_{event_field}",
                         metric_type,
-                        metric_description=f'{event.name} {event_field}',
+                        metric_description=f"{event.name} {event_field}",
                         metric_labels=[],
                         metric_namespace=self.namespace,
-                        registry=self.registry
+                        registry=self.registry,
                     )
 
                     metric.create_metric()
@@ -515,50 +566,55 @@ class Prometheus:
                     fields[event_field] = metric
 
                 self._events[event.name] = fields
-                
+
             for event_field, event_value in record.items():
                 if event_value and event_field in self.types_map:
                     self._events[event.name][event_field].update(event_value)
 
             await self._submit_to_pushgateway()
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Events to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Events to Prometheus - Namespace: {self.namespace}"
+        )
 
     async def submit_common(self, metrics_sets: List[MetricsSet]):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Shared Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Shared Metrics to Prometheus - Namespace: {self.namespace}')
-        
         for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
 
-            tags = [
-                f'{tag.name}:{tag.value}' for tag in metrics_set.tags
-            ]
-            
+            tags = [f"{tag.name}:{tag.value}" for tag in metrics_set.tags]
+
             shared_metrics = self._shared_metrics.get(metrics_set.name)
             if shared_metrics is None:
                 shared_metrics = {}
 
                 for field in metrics_set.common_stats.keys():
-                    await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Shared Metric - {metrics_set.name}:common:{field}')
+                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                        f"{self.metadata_string} - Submitting Shared Metric - {metrics_set.name}:common:{field}"
+                    )
 
-                    metric_name = f'{metrics_set.name}_{field}'.replace('.', '_')
+                    metric_name = f"{metrics_set.name}_{field}".replace(".", "_")
                     metric_type = self.types_map.get(field)
 
                     prometheus_metric = PrometheusMetric(
                         metric_name,
                         metric_type,
-                        metric_description=f'{metrics_set.name} {field}',
+                        metric_description=f"{metrics_set.name} {field}",
                         metric_labels=[
                             *tags,
-                            f'stage:{metrics_set.stage}',
-                            'group:common'
+                            f"stage:{metrics_set.stage}",
+                            "group:common",
                         ],
                         metric_namespace=self.namespace,
-                        registry=self.registry
+                        registry=self.registry,
                     )
                     prometheus_metric.create_metric()
-                    
+
                     shared_metrics[field] = prometheus_metric
 
             self._shared_metrics[metrics_set.name] = shared_metrics
@@ -567,18 +623,21 @@ class Prometheus:
                 metric.update(value)
 
         await self._submit_to_pushgateway()
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Shared Metrics to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Shared Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
     async def submit_metrics(self, metrics: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Metrics to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
         for metrics_set in metrics:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
 
-            tags = [
-                f'{tag.name}:{tag.value}' for tag in metrics_set.tags
-            ]
+            tags = [f"{tag.name}:{tag.value}" for tag in metrics_set.tags]
 
             stage_metrics = self._metrics.get(metrics_set.name)
             if stage_metrics is None:
@@ -591,26 +650,32 @@ class Prometheus:
                         group_metrics = {}
 
                         for quantile_name in metrics_set.quantiles:
-                            self.types_map[quantile_name] = 'gauge'
+                            self.types_map[quantile_name] = "gauge"
 
                         fields = {}
 
                         for metric_field in metrics_set.stats_fields:
-                            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Metric - {metrics_set.name}:{group_name}:{metric_field}')
+                            await self.logger.filesystem.aio[
+                                "hyperscale.reporting"
+                            ].debug(
+                                f"{self.metadata_string} - Submitting Metric - {metrics_set.name}:{group_name}:{metric_field}"
+                            )
                             metric_type = self.types_map.get(metric_field)
-                            metric_name = f'{metrics_set.name}_{group_name}_{metric_field}'.replace('.', '_')
+                            metric_name = f"{metrics_set.name}_{group_name}_{metric_field}".replace(
+                                ".", "_"
+                            )
 
                             prometheus_metric = PrometheusMetric(
                                 metric_name,
                                 metric_type,
-                                metric_description=f'{metrics_set.name} {metric_field}',
+                                metric_description=f"{metrics_set.name} {metric_field}",
                                 metric_labels=[
                                     *tags,
-                                    f'stage:{metrics_set.stage}',
-                                    f'group:{group_name}'
+                                    f"stage:{metrics_set.stage}",
+                                    f"group:{group_name}",
                                 ],
                                 metric_namespace=self.namespace,
-                                registry=self.registry
+                                registry=self.registry,
                             )
                             prometheus_metric.create_metric()
 
@@ -631,92 +696,107 @@ class Prometheus:
                     field_metric.update(metric_value)
 
         await self._submit_to_pushgateway()
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Metrics to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
     async def submit_custom(self, metrics_sets: List[MetricsSet]):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Custom Metrics to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Custom Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
         for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
 
             custom_metrics = self._custom_metrics.get(metrics_set.name)
             if custom_metrics is None:
                 custom_metrics = {}
 
-                for custom_metric_name, custom_metric in metrics_set.custom_metrics.items():
+                for (
+                    custom_metric_name,
+                    custom_metric,
+                ) in metrics_set.custom_metrics.items():
                     # group_metrics = custom_metrics.get(custom_group_name)
 
                     metric_type = self.metric_types_map.get(
-                        custom_metric.metric_type,
-                        'gauge'
+                        custom_metric.metric_type, "gauge"
                     )
 
-                    await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Metric - {metrics_set.name}:custom:{custom_metric_name}')
+                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                        f"{self.metadata_string} - Submitting Metric - {metrics_set.name}:custom:{custom_metric_name}"
+                    )
 
-                    metric_name = f'{metrics_set.name}_{custom_metric_name}'.replace('.', '_')
+                    metric_name = f"{metrics_set.name}_{custom_metric_name}".replace(
+                        ".", "_"
+                    )
 
-                    tags = [
-                        f'{tag.name}:{tag.value}' for tag in metrics_set.tags
-                    ]
+                    tags = [f"{tag.name}:{tag.value}" for tag in metrics_set.tags]
 
                     prometheus_metric = PrometheusMetric(
                         metric_name,
                         metric_type,
-                        metric_description=f'{metrics_set.name} {custom_metric_name}',
+                        metric_description=f"{metrics_set.name} {custom_metric_name}",
                         metric_labels=[
                             *tags,
-                            f'stage:{metrics_set.stage}',
-                            'group:custom',
-                            f'type:{custom_metric.metric_type}'
+                            f"stage:{metrics_set.stage}",
+                            "group:custom",
+                            f"type:{custom_metric.metric_type}",
                         ],
                         metric_namespace=self.namespace,
-                        registry=self.registry
+                        registry=self.registry,
                     )
                     prometheus_metric.create_metric()
 
                     custom_metrics[custom_metric_name] = prometheus_metric
 
-
             self._custom_metrics[metrics_set.name] = custom_metrics
             for custom_metric_name, custom_metric in metrics_set.custom_metrics.items():
-                custom_metric_prometheus_value: PrometheusMetric = custom_metrics.get(custom_metric_name)
+                custom_metric_prometheus_value: PrometheusMetric = custom_metrics.get(
+                    custom_metric_name
+                )
                 custom_metric_prometheus_value.update(custom_metric.metric_value)
 
         await self._submit_to_pushgateway()
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Custom Metrics to Prometheus - Namespace: {self.namespace}')
-                    
-    async def submit_errors(self, metrics_sets: List[MetricsSet]):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Custom Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitting Error Metrics to Prometheus - Namespace: {self.namespace}')
+    async def submit_errors(self, metrics_sets: List[MetricsSet]):
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitting Error Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
         for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Submitting Error Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+                f"{self.metadata_string} - Submitting Error Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            )
 
             if self._errors.get(metrics_set.name) is None:
                 errors_metric = PrometheusMetric(
-                    f'{metrics_set.name}_errors',
-                    'count',
-                    metric_description=f'Errors for action - {metrics_set.name}.',
+                    f"{metrics_set.name}_errors",
+                    "count",
+                    metric_description=f"Errors for action - {metrics_set.name}.",
                     metric_labels=[],
                     metric_namespace=self.namespace,
-                    registry=self.registry
+                    registry=self.registry,
                 )
 
                 errors_metric.create_metric()
                 self._errors[metrics_set.name] = errors_metric
 
-            for error in metrics_set.errors:              
+            for error in metrics_set.errors:
                 errors_metric.update(
-                    error.get('count'),
-                    labels={
-                        'message': error.get('message')
-                    }
+                    error.get("count"), labels={"message": error.get("message")}
                 )
-                
+
         await self._submit_to_pushgateway()
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Submitted Error Metrics to Prometheus - Namespace: {self.namespace}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Submitted Error Metrics to Prometheus - Namespace: {self.namespace}"
+        )
 
     async def close(self):
-        await self.logger.filesystem.aio['hyperscale.reporting'].debug(f'{self.metadata_string} - Closing session - {self.session_uuid}')
-                
+        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
+            f"{self.metadata_string} - Closing session - {self.session_uuid}"
+        )

@@ -11,5 +11,5 @@ from pydantic import (
 
 class FocusCommand(BaseModel):
     selector: StrictStr
-    strict: Optional[StrictBool]=None
+    strict: Optional[StrictBool] = None
     timeout: StrictInt | StrictFloat

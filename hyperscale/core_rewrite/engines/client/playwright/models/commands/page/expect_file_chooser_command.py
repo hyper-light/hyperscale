@@ -9,13 +9,8 @@ from pydantic import (
 
 
 class ExpectFileChooserCommand(BaseModel):
-    predicate: Optional[
-        Callable[
-            [FileChooser],
-            bool
-        ]
-    ]=None
+    predicate: Optional[Callable[[FileChooser], bool]] = None
     timeout: StrictInt | StrictFloat
 
     class Config:
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed = True

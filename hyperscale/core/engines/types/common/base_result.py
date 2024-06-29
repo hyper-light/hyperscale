@@ -3,33 +3,32 @@ from .types import RequestTypes
 
 
 class BaseResult:
-
     __slots__ = (
-        'action_id',
-        'name',
-        'checks',
-        'error',
-        'source',
-        'user',
-        'tags',
-        'type',
-        'time',
-        'wait_start',
-        'start',
-        'connect_end',
-        'write_end',
-        'complete'
+        "action_id",
+        "name",
+        "checks",
+        "error",
+        "source",
+        "user",
+        "tags",
+        "type",
+        "time",
+        "wait_start",
+        "start",
+        "connect_end",
+        "write_end",
+        "complete",
     )
 
     def __init__(
-        self, 
+        self,
         action_id: str,
-        name: str, 
+        name: str,
         source: str,
         user: str,
         tags: List[Dict[str, str]],
         type: Union[RequestTypes, str],
-        error: Exception
+        error: Exception,
     ) -> None:
         self.action_id = action_id
         self.name = name

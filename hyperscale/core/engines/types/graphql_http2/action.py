@@ -9,35 +9,24 @@ try:
     from graphql import Source, parse, print_ast
 
 except ImportError:
-    Source=None
-    parse=lambda: None
-    print_ast=lambda: None
+    Source = None
+    parse = lambda: None
+    print_ast = lambda: None
 
 
 class GraphQLHTTP2Action(HTTP2Action):
-
     def __init__(
         self,
-        name: str, 
-        url: str, 
-        method: str = 'GET', 
-        headers: Dict[str, str] = {}, 
-        data: Union[str, dict, Iterator, bytes, None] = None, 
-        user: str=None, 
-        tags: List[Dict[str, str]] = []
+        name: str,
+        url: str,
+        method: str = "GET",
+        headers: Dict[str, str] = {},
+        data: Union[str, dict, Iterator, bytes, None] = None,
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
     ) -> None:
-
-        super(
-            GraphQLHTTP2Action,
-            self
-        ).__init__(
-            name, 
-            url, 
-            method, 
-            headers, 
-            data, 
-            user, 
-            tags
+        super(GraphQLHTTP2Action, self).__init__(
+            name, url, method, headers, data, user, tags
         )
 
         self.type = RequestTypes.GRAPHQL_HTTP2
@@ -47,19 +36,17 @@ class GraphQLHTTP2Action(HTTP2Action):
         source = Source(self._data.get("query"))
         document_node = parse(source)
         query_string = print_ast(document_node)
-        
+
         self.size = len(query_string)
-        
-        query = {
-            "query": query_string
-        }
+
+        query = {"query": query_string}
 
         operation_name = self._data.get("operation_name")
         variables = self._data.get("variables")
-        
+
         if operation_name:
             query["operationName"] = operation_name
-        
+
         if variables:
             query["variables"] = variables
 

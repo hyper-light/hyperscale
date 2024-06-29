@@ -8,11 +8,5 @@ from pydantic import (
 
 
 class WaitForLoadStateCommand(BaseModel):
-    state: Optional[
-        Literal[
-            'domcontentloaded', 
-            'load', 
-            'networkidle'
-        ]
-    ]=None
+    state: Optional[Literal["domcontentloaded", "load", "networkidle"]] = None
     timeout: StrictInt | StrictFloat

@@ -16,27 +16,26 @@ from hyperscale.core.personas.types.default_persona.default_persona import (
 
 
 class BaseAlgorithm:
-
     def __init__(
-        self, 
+        self,
         config: Dict[str, Union[List[Tuple[Union[int, float]]], int, Config]],
-        distribution_idx: int=None
+        distribution_idx: int = None,
     ) -> None:
-        self.stage_config: Config = config.get('stage_config')
-        self.max_iter = config.get('iterations', 10)
+        self.stage_config: Config = config.get("stage_config")
+        self.max_iter = config.get("iterations", 10)
         self.distribution: Optional[List[int]] = None
 
         if self.stage_config.experiment:
-            self.distribution = self.stage_config.experiment.get('distribution')
+            self.distribution = self.stage_config.experiment.get("distribution")
 
-        parameters: List[Parameter] = config.get('params', [])
+        parameters: List[Parameter] = config.get("params", [])
         algorithm_parameters: Dict[str, Parameter] = {}
 
         for parameter in parameters:
             algorithm_parameters[parameter.parameter_name] = parameter
 
         self.params: Dict[str, Parameter] = algorithm_parameters
-        self.time_limit = config.get('time_limit', 60)
+        self.time_limit = config.get("time_limit", 60)
         self.persona_total_time = self.stage_config.total_time
         self.batch = Batch(self.stage_config)
         self.current_params = {}
@@ -50,7 +49,7 @@ class BaseAlgorithm:
         if self.time_limit is None or self.time_limit <= 0:
             self.time_limit = 60
 
-        self.batch_time = self.time_limit/self.max_iter
+        self.batch_time = self.time_limit / self.max_iter
 
         self.param_names = []
         self.bounds = []
@@ -59,26 +58,26 @@ class BaseAlgorithm:
         self.current_params = {}
 
         self.optimize_params = [
-            param_name for param_name in self.params.keys() if param_name in self.param_values
+            param_name
+            for param_name in self.params.keys()
+            if param_name in self.param_values
         ]
 
         if len(self.optimize_params) < 1:
-            self.optimize_params = [
-                'batch_size'
-            ]
+            self.optimize_params = ["batch_size"]
 
         for param_name in self.optimize_params:
             parameter = self.params.get(param_name)
-                    
+
             param = self.param_values.get(param_name, {})
-            value = param.get('value')
-            params_type = param.get('type')
+            value = param.get("value")
+            params_type = param.get("type")
 
             if self.distribution_idx is not None:
                 parameter.minimum = 0.01
                 parameter.maximum = 10
                 value = self.distribution[self.distribution_idx]
-                param['value'] = value
+                param["value"] = value
 
             min_range = parameter.minimum
             max_range = parameter.maximum
@@ -99,7 +98,7 @@ class BaseAlgorithm:
             self._boundaries_by_param_name[param_name] = boundaries
 
             self.current_params[param_name] = value
-            
+
         self.fixed_iters = False
         self.iters = 0
 
@@ -107,26 +106,19 @@ class BaseAlgorithm:
         return self.batch.to_params()
 
     def update_params(self, persona: DefaultPersona) -> DefaultPersona:
-
         persona.total_time = self.batch_time
 
-        batch_size = int(self.current_params.get(
-            'batch_size',
-            persona.batch.size
-        ))
+        batch_size = int(self.current_params.get("batch_size", persona.batch.size))
 
-        batch_interval = float(self.current_params.get(
-            'batch_interval',
-            persona.batch.interval
-        ))
+        batch_interval = float(
+            self.current_params.get("batch_interval", persona.batch.interval)
+        )
 
-        batch_gradient = float(self.current_params.get(
-            'batch_gradient',
-            persona.batch.gradient
-        ))
+        batch_gradient = float(
+            self.current_params.get("batch_gradient", persona.batch.gradient)
+        )
 
         for hook in persona._hooks:
-
             if batch_size <= psutil.cpu_count():
                 batch_size = 1000
 
@@ -143,5 +135,5 @@ class BaseAlgorithm:
 
     def optimize(self, func):
         raise NotImplementedError(
-            'Err. - Base Algorithm is an abstract class and its optimize method should be overridden.'
+            "Err. - Base Algorithm is an abstract class and its optimize method should be overridden."
         )

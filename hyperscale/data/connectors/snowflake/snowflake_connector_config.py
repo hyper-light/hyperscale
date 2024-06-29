@@ -13,10 +13,10 @@ class SnowflakeConnectorConfig(BaseModel):
     private_key: Optional[StrictStr]
     warehouse: StrictStr
     database: StrictStr
-    database_schema: StrictStr='PUBLIC'
+    database_schema: StrictStr = "PUBLIC"
     table_name: StrictStr
-    connect_timeout: StrictInt=30
-    connector_type: ConnectorType=ConnectorType.Snowflake
+    connect_timeout: StrictInt = 30
+    connector_type: ConnectorType = ConnectorType.Snowflake
 
     class Config:
         arbitrary_types_allowed = True

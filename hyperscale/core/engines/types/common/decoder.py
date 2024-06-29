@@ -5,29 +5,33 @@ hpack/hpack
 
 Implements the HPACK header compression algorithm as detailed by the IETF.
 """
+
 from functools import lru_cache
 from .hpack.table import HeaderTable, table_entry_size
 from .hpack.exceptions import (
-    HPACKDecodingError, OversizedHeaderListError, InvalidTableSizeError
+    HPACKDecodingError,
+    OversizedHeaderListError,
+    InvalidTableSizeError,
 )
 
 from .hpack.huffman_table import decode_huffman
 
-INDEX_NONE = b'\x00'
-INDEX_NEVER = b'\x10'
-INDEX_INCREMENTAL = b'\x40'
+INDEX_NONE = b"\x00"
+INDEX_NEVER = b"\x10"
+INDEX_INCREMENTAL = b"\x40"
 
 # Precompute 2^i for 1-8 for use in prefix calcs.
 # Zero index is not used but there to save a subtraction
 # as prefix numbers are not zero indexed.
-_PREFIX_BIT_MAX_NUMBERS = [(2 ** i) - 1 for i in range(9)]
+_PREFIX_BIT_MAX_NUMBERS = [(2**i) - 1 for i in range(9)]
 
 basestring = (str, bytes)
 
 
 # We default the maximum header list we're willing to accept to 64kB. That's a
 # lot of headers, but if applications want to raise it they can do.
-DEFAULT_MAX_HEADER_LIST_SIZE = 2 ** 16
+DEFAULT_MAX_HEADER_LIST_SIZE = 2**16
+
 
 @lru_cache(maxsize=4096)
 def decode_integer(data, prefix_bits):
@@ -41,7 +45,7 @@ def decode_integer(data, prefix_bits):
     max_number = _PREFIX_BIT_MAX_NUMBERS[prefix_bits]
     index = 1
     shift = 0
-    mask = (0xFF >> (8 - prefix_bits))
+    mask = 0xFF >> (8 - prefix_bits)
 
     try:
         number = data[0] & mask
@@ -87,11 +91,7 @@ class Decoder:
     :type max_header_list_size: ``int``
     """
 
-    __slots__ = (
-        'header_table', 
-        'max_header_list_size',
-        'max_allowed_table_size'
-    )
+    __slots__ = ("header_table", "max_header_list_size", "max_allowed_table_size")
 
     def __init__(self, max_header_list_size=DEFAULT_MAX_HEADER_LIST_SIZE):
         self.header_table: HeaderTable = None
@@ -170,29 +170,19 @@ class Decoder:
             if indexed:
                 index, consumed = decode_integer(data_mem[current_index:], 7)
                 header = self.header_table.get_by_index(index)
-   
+
             elif literal_index:
                 # It's a literal header that does affect the header table.
-                header, consumed = self._decode_literal(
-                    data_mem[current_index:],
-                    True
-                )
+                header, consumed = self._decode_literal(data_mem[current_index:], True)
             elif encoding_update:
-                
-                new_size, consumed = decode_integer(
-                    data_mem[current_index:], 
-                    5
-                )
+                new_size, consumed = decode_integer(data_mem[current_index:], 5)
 
                 self.header_table_size = new_size
 
                 header = None
             else:
                 # It's a literal header that does not affect the header table.
-                header, consumed = self._decode_literal(
-                    data_mem[current_index:],
-                    False
-                )
+                header, consumed = self._decode_literal(data_mem[current_index:], False)
 
             if header:
                 headers.append(header)
@@ -214,7 +204,7 @@ class Decoder:
         if should_index:
             indexed_name = data[0] & 0x3F
             name_len = 6
-            
+
         else:
             high_byte = data[0]
             indexed_name = high_byte & 0x0F
@@ -233,17 +223,17 @@ class Decoder:
             data = data[1:]
 
             length, consumed = decode_integer(data, 7)
-            name = data[consumed:consumed + length]
+            name = data[consumed : consumed + length]
 
             if data[0] & 0x80:
                 name = decode_huffman(name)
             total_consumed = consumed + length + 1  # Since we moved forward 1.
 
-        data = data[consumed + length:]
+        data = data[consumed + length :]
 
         # The header value is definitely length-based.
         length, consumed = decode_integer(data, 7)
-        value = data[consumed:consumed + length]
+        value = data[consumed : consumed + length]
 
         if data[0] & 0x80:
             value = decode_huffman(value)

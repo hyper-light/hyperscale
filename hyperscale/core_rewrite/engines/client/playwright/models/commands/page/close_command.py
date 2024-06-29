@@ -10,6 +10,6 @@ from pydantic import (
 
 
 class CloseCommand(BaseModel):
-    run_before_unload: Optional[StrictBool]=None
+    run_before_unload: Optional[StrictBool] = None
     reason: Optional[StrictStr]
     timeout: StrictInt | StrictFloat

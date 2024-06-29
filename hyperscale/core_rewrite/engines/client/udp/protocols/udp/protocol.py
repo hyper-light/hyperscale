@@ -10,7 +10,6 @@ from hyperscale.core_rewrite.engines.client.shared.protocols import (
 
 
 class UDPProtocol(FlowControlMixin, Protocol):
-
     _source_traceback = None
 
     def __init__(self, stream_reader, client_connected_cb=None, loop=None):
@@ -30,7 +29,7 @@ class UDPProtocol(FlowControlMixin, Protocol):
         self._stream_writer: Writer = None
         self._transport: Transport = None
         self._client_connected_cb = client_connected_cb
-        
+
         self._closed = self._loop.create_future()
 
     @property
@@ -47,12 +46,14 @@ class UDPProtocol(FlowControlMixin, Protocol):
     def connection_made(self, transport: Transport):
         if self._reject_connection:
             context = {
-                'message': ('An open stream was garbage collected prior to '
-                            'establishing network connection; '
-                            'call "stream.close()" explicitly.')
+                "message": (
+                    "An open stream was garbage collected prior to "
+                    "establishing network connection; "
+                    'call "stream.close()" explicitly.'
+                )
             }
             if self._source_traceback:
-                context['source_traceback'] = self._source_traceback
+                context["source_traceback"] = self._source_traceback
             self._loop.call_exception_handler(context)
             transport.abort()
             return
@@ -62,11 +63,8 @@ class UDPProtocol(FlowControlMixin, Protocol):
             reader.set_transport(transport)
 
         if self._client_connected_cb is not None:
-            self._stream_writer = Reader(transport, self,
-                                               reader,
-                                               self._loop)
-            res = self._client_connected_cb(reader,
-                                            self._stream_writer)
+            self._stream_writer = Reader(transport, self, reader, self._loop)
+            res = self._client_connected_cb(reader, self._stream_writer)
             if iscoroutine(res):
                 self._loop.create_task(res)
             self._strong_reader = None

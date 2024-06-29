@@ -10,5 +10,5 @@ from pydantic import (
 
 class DispatchEventCommand(BaseModel):
     event_type: StrictStr
-    event_init: Optional[Dict[StrictStr, Any]]=None
-    timeout: StrictInt | StrictFloat=None
+    event_init: Optional[Dict[StrictStr, Any]] = None
+    timeout: StrictInt | StrictFloat = None

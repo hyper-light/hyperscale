@@ -13,7 +13,9 @@ from .types.sequenced_persona import SequencedPersona
 from .types.weighted_selection_persona import WeightedSelectionPersona
 
 registered_personas = {
-    PersonaTypes.APPROXIMATE_DISTRIBUTION: lambda config: ApproximateDistributionPersona(config),
+    PersonaTypes.APPROXIMATE_DISTRIBUTION: lambda config: ApproximateDistributionPersona(
+        config
+    ),
     PersonaTypes.DEFAULT: lambda config: DefaultPersona(config),
     PersonaTypes.BATCHED: lambda config: BatchedPersona(config),
     PersonaTypes.RAMPED: lambda config: RampedPersona(config),
@@ -22,11 +24,9 @@ registered_personas = {
     PersonaTypes.CONSTANT_SPAWN: lambda config: ConstantSpawnPersona(config),
     PersonaTypes.SEQUENCE: lambda config: SequencedPersona(config),
     PersonaTypes.WEIGHTED: lambda config: WeightedSelectionPersona(config),
-    PersonaTypes.NO_WAIT: lambda config: CyclicNoWaitPersona(config)
+    PersonaTypes.NO_WAIT: lambda config: CyclicNoWaitPersona(config),
 }
 
+
 def get_persona(config: Config):
-    return registered_personas.get(
-        config.persona_type, 
-        DefaultPersona
-    )(config)
+    return registered_personas.get(config.persona_type, DefaultPersona)(config)

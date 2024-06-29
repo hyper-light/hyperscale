@@ -1,4 +1,3 @@
-
 from pydantic import (
     BaseModel,
     StrictFloat,
@@ -10,4 +9,3 @@ class WheelCommand(BaseModel):
     delta_x: StrictInt | StrictFloat
     delta_y: StrictInt | StrictFloat
     timeout: StrictInt | StrictFloat
-    

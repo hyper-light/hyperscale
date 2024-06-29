@@ -9,13 +9,8 @@ from pydantic import (
 
 
 class ExpectPopupCommand(BaseModel):
-    predicate: Optional[
-        Callable[
-            [Page],
-            bool
-        ]
-    ]=None
+    predicate: Optional[Callable[[Page], bool]] = None
     timeout: StrictInt | StrictFloat
 
     class Config:
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed = True

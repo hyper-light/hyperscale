@@ -1,6 +1,6 @@
-
 from typing import Coroutine
 from typing import Any
+
 
 class AsyncBase:
     def __init__(self, file, loop, executor):

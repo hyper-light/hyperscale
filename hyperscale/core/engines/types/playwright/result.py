@@ -7,40 +7,36 @@ from .command import PlaywrightCommand
 
 
 class PlaywrightResult(BaseResult):
-
     __slots__ = (
-        'action_id',
-        'url',
-        'headers',
-        'command',
-        'selector',
-        'attribute',
-        'x_coord',
-        'y_coord',
-        'frame',
-        'key',
-        'text',
-        'expression',
-        'args',
-        'filepath',
-        'file',
-        'option',
-        'event',
-        'is_checked'
+        "action_id",
+        "url",
+        "headers",
+        "command",
+        "selector",
+        "attribute",
+        "x_coord",
+        "y_coord",
+        "frame",
+        "key",
+        "text",
+        "expression",
+        "args",
+        "filepath",
+        "file",
+        "option",
+        "event",
+        "is_checked",
     )
 
-    def __init__(self, command: PlaywrightCommand, error: Exception=None) -> None:
-        super(
-            PlaywrightResult,
-            self
-        ).__init__(
+    def __init__(self, command: PlaywrightCommand, error: Exception = None) -> None:
+        super(PlaywrightResult, self).__init__(
             command.action_id,
             command.name,
             command.url.location,
             command.metadata.user,
             command.metadata.tags,
             RequestTypes.PLAYWRIGHT,
-            error
+            error,
         )
 
         self.url = command.url.location

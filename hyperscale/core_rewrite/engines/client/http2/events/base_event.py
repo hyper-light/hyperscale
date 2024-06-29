@@ -1,2 +1,2 @@
 class BaseEvent:
-    error_code=None
+    error_code = None

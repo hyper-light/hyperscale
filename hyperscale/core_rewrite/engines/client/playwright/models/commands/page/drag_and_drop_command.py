@@ -13,10 +13,10 @@ from pydantic import (
 class DragAndDropCommand(BaseModel):
     source: StrictStr
     target: StrictStr
-    source_position: Optional[Position]=None
-    target_position: Optional[Position]=None
+    source_position: Optional[Position] = None
+    target_position: Optional[Position] = None
     timeout: StrictInt | StrictFloat
-    force: Optional[StrictBool]=None
-    no_wait_after: Optional[StrictBool]=None
-    strict: Optional[StrictBool]=None
-    trial: Optional[StrictBool]=None
+    force: Optional[StrictBool] = None
+    no_wait_after: Optional[StrictBool] = None
+    strict: Optional[StrictBool] = None
+    trial: Optional[StrictBool] = None

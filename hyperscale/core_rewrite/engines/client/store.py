@@ -16,7 +16,6 @@ from hyperscale.core.engines.types.common.base_action import BaseAction
 
 
 class ActionsStore:
-
     def __init__(self, metadata_string: str) -> None:
         self.metadata_string = metadata_string
         self.actions = defaultdict(dict)
@@ -30,7 +29,6 @@ class ActionsStore:
         # self.logger.initialize()
 
     def set_waiter(self, stage: str):
-
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
 
@@ -45,7 +43,6 @@ class ActionsStore:
         # await self.logger.filesystem.aio['hyperscale.core'].debug(f'{self.metadata_string} - Action Store was notified and is exiting suspension')
 
     def store(self, request: str, action: Any, session: Any):
-
         self.actions[self.current_stage][request] = action
         self.sessions[self.current_stage][request] = session
 
@@ -57,13 +54,23 @@ class ActionsStore:
         except asyncio.exceptions.InvalidStateError:
             pass
 
-    def get(self, stage: str, action_name: str) -> Tuple[BaseAction, Union[MercuryGraphQLClient, MercuryGraphQLHTTP2Client, MercuryGRPCClient, MercuryHTTP2Client, MercuryHTTPClient, MercuryPlaywrightClient, MercuryWebsocketClient, MercuryUDPClient]]:
-        action = self.actions.get(
-            stage
-        ).get(action_name)
+    def get(
+        self, stage: str, action_name: str
+    ) -> Tuple[
+        BaseAction,
+        Union[
+            MercuryGraphQLClient,
+            MercuryGraphQLHTTP2Client,
+            MercuryGRPCClient,
+            MercuryHTTP2Client,
+            MercuryHTTPClient,
+            MercuryPlaywrightClient,
+            MercuryWebsocketClient,
+            MercuryUDPClient,
+        ],
+    ]:
+        action = self.actions.get(stage).get(action_name)
 
-        session = self.sessions.get(
-            stage
-        ).get(action_name)
+        session = self.sessions.get(stage).get(action_name)
 
         return action, session

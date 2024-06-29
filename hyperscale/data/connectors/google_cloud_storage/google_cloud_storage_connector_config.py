@@ -7,4 +7,4 @@ class GoogleCloudStorageConnectorConfig(BaseModel):
     service_account_json_path: str
     bucket_namespace: str
     bucket_name: str
-    connector_type: ConnectorType=ConnectorType.GCS
+    connector_type: ConnectorType = ConnectorType.GCS

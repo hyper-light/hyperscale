@@ -1,11 +1,18 @@
+from __future__ import annotations
+
+import asyncio
 from typing import Any, Dict
 
 from .workflow_context import WorkflowContext
 
 
 class Context:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        node_id: int | None = None,
+    ) -> None:
         self._context: Dict[str, WorkflowContext] = {}
+        self.node = node_id
 
     def iter_workflow_contexts(self):
         for workflow, context in self._context.items():
@@ -28,5 +35,19 @@ class Context:
     def dict(self):
         return {key: value.dict() for key, value in self._context.items()}
 
+    async def copy(self, context: Context):
+        await asyncio.gather(
+            *[
+                self._context[workflow].set(key, value)
+                for workflow, ctx in context.iter_workflow_contexts()
+                for key, value in ctx.items()
+            ]
+        )
+
+        return self
+
     async def update(self, workflow: str, key: str, value: Any):
+        if self._context.get(workflow) is None:
+            self._context[workflow] = WorkflowContext()
+
         await self._context[workflow].set(key, value)

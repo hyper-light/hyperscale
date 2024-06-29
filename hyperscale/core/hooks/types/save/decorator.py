@@ -9,20 +9,11 @@ from .validator import SaveHookValidator
 
 @registrar(HookType.SAVE)
 def save(
-    *names: Tuple[str, ...], 
-    save_path: str=None,
-    order: int=1,
-    skip: bool=False
+    *names: Tuple[str, ...], save_path: str = None, order: int = 1, skip: bool = False
 ):
-    SaveHookValidator(
-        names=names,
-        save_path=save_path,
-        order=order,
-        skip=skip
-    )
-    
-    def wrapper(func):
+    SaveHookValidator(names=names, save_path=save_path, order=order, skip=skip)
 
+    def wrapper(func):
         @functools.wraps(func)
         def decorator(*args, **kwargs):
             return func(*args, **kwargs)

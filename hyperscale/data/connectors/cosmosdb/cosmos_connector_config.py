@@ -9,5 +9,5 @@ class CosmosDBConnectorConfig(BaseModel):
     database: str
     container_name: str
     partition_key: str
-    analytics_ttl: int=0
-    connector_type: ConnectorType=ConnectorType.CosmosDB
+    analytics_ttl: int = 0
+    connector_type: ConnectorType = ConnectorType.CosmosDB

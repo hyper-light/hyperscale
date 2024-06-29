@@ -7,15 +7,8 @@ from .exceptions import NoNameServer
 
 
 class NameServer:
-
-    def __init__(
-        self, 
-        urls: List[Union[str, URL]]
-    ):
-        self.data = [
-            URL(url) if isinstance(url, str) else url for url in urls
-        ]
-        
+    def __init__(self, urls: List[Union[str, URL]]):
+        self.data = [URL(url) if isinstance(url, str) else url for url in urls]
 
         self._failures = [0] * len(self.data)
         self.timestamp = 0
@@ -28,21 +21,18 @@ class NameServer:
         return iter(self.data)
 
     def iter(self) -> Iterable[URL]:
-        if not self.data: 
+        if not self.data:
             raise NoNameServer()
-        
+
         return iter(self.data)
 
     def _update(self):
-
         if time.time() > self.timestamp + 60:
             self.timestamp = time.time()
 
             self._sorted = list(
-                self.data[i] for i in sorted(
-                    range(len(self.data)), 
-                    key=lambda i: self._failures[i]
-                )
+                self.data[i]
+                for i in sorted(range(len(self.data)), key=lambda i: self._failures[i])
             )
 
             self._failures = [0] * len(self.data)

@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -22,35 +21,30 @@ class MercurySyncUDPMulticastConnection(MercurySyncUDPConnection):
     """Implementation of Zeroconf Multicast DNS Service Discovery
     Supports registration, unregistration, queries and browsing.
     """
+
     def __init__(
-        self, 
+        self,
         host: str,
         port: int,
         instance_id: int,
         env: Env,
     ):
-        super().__init__(
-            host,
-            port,
-            instance_id,
-            env
-        )
+        super().__init__(host, port, instance_id, env)
 
         self._mcast_group = env.MERCURY_SYNC_MULTICAST_GROUP
 
         if self._mcast_group is None:
-            self.group = ('', self.port)
+            self.group = ("", self.port)
 
         else:
             self.group = (self._mcast_group, self.port)
 
     async def connect_async(
-        self, 
-        cert_path: Optional[str]=None,
-        key_path: Optional[str]=None,
-        worker_socket: Optional[socket.socket]=None
+        self,
+        cert_path: Optional[str] = None,
+        key_path: Optional[str] = None,
+        worker_socket: Optional[socket.socket] = None,
     ) -> None:
-        
         self._loop = asyncio.get_event_loop()
         self._running = True
 
@@ -60,7 +54,9 @@ class MercurySyncUDPMulticastConnection(MercurySyncUDPConnection):
         self._decompressor = zstandard.ZstdDecompressor()
 
         if worker_socket is None:
-            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            self.udp_socket = socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
+            )
             self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
             try:
@@ -79,25 +75,24 @@ class MercurySyncUDPMulticastConnection(MercurySyncUDPConnection):
 
             except OSError:
                 pass
-            
+
             self.udp_socket.setsockopt(
-                socket.SOL_IP, 
-                socket.IP_MULTICAST_IF, 
-                socket.inet_aton(self.host) + socket.inet_aton('0.0.0.0')
+                socket.SOL_IP,
+                socket.IP_MULTICAST_IF,
+                socket.inet_aton(self.host) + socket.inet_aton("0.0.0.0"),
             )
 
             if self._mcast_group is not None:
                 self.udp_socket.setsockopt(
-                    socket.SOL_IP, 
-                    socket.IP_ADD_MEMBERSHIP, 
-                    socket.inet_aton(self.udp_socket) + socket.inet_aton('0.0.0.0')
+                    socket.SOL_IP,
+                    socket.IP_ADD_MEMBERSHIP,
+                    socket.inet_aton(self.udp_socket) + socket.inet_aton("0.0.0.0"),
                 )
 
             self.udp_socket.setblocking(False)
 
         else:
             self.udp_socket = worker_socket
-
 
         if cert_path and key_path:
             self._udp_ssl_context = self._create_udp_ssl_context(
@@ -108,10 +103,7 @@ class MercurySyncUDPMulticastConnection(MercurySyncUDPConnection):
             self.udp_socket = self._udp_ssl_context.wrap_socket(self.udp_socket)
 
         server = self._loop.create_datagram_endpoint(
-            lambda: MercurySyncUDPProtocol(
-                self.read
-            ),
-            sock=self.udp_socket
+            lambda: MercurySyncUDPProtocol(self.read), sock=self.udp_socket
         )
 
         transport, _ = await server

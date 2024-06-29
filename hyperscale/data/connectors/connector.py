@@ -64,17 +64,13 @@ ConnectorConfig = Union[
     S3ConnectorConfig,
     SnowflakeConnectorConfig,
     SQLiteConnectorConfig,
-    XMLConnectorConfig
+    XMLConnectorConfig,
 ]
 
 
 class Connector:
-
     def __init__(
-        self, 
-        stage: str,
-        connector_config: ConnectorConfig,
-        parser_config: Config
+        self, stage: str, connector_config: ConnectorConfig, parser_config: Config
     ) -> None:
         self._connectors: Dict[
             ConnectorType,
@@ -97,110 +93,69 @@ class Connector:
                         S3ConnectorConfig,
                         SnowflakeConnectorConfig,
                         SQLiteConnectorConfig,
-                        XMLConnectorConfig
+                        XMLConnectorConfig,
                     ],
                     str,
-                    Config
+                    Config,
                 ],
-                Union[
-                    AWSLambdaConnector,
-                    BigTableConnector
-                ]
-            ]
+                Union[AWSLambdaConnector, BigTableConnector],
+            ],
         ] = {
-            ConnectorType.AWSLambda: lambda config, stage, parser_config: AWSLambdaConnector(
-                config,
-                stage,
-                parser_config
-            ),
-            ConnectorType.BigTable: lambda config, stage, parser_config: BigTableConnector(
-                config,
-                stage,
-                parser_config
-            ),
-            ConnectorType.Cassandra: lambda config, stage, parser_config: CassandraConnector(
-                config,
-                stage,
-                parser_config
-            ),
-            ConnectorType.CosmosDB: lambda config, stage, parser_config: CosmosDBConnector(
-                config,
-                stage,
-                parser_config
-            ),
+            ConnectorType.AWSLambda: lambda config,
+            stage,
+            parser_config: AWSLambdaConnector(config, stage, parser_config),
+            ConnectorType.BigTable: lambda config,
+            stage,
+            parser_config: BigTableConnector(config, stage, parser_config),
+            ConnectorType.Cassandra: lambda config,
+            stage,
+            parser_config: CassandraConnector(config, stage, parser_config),
+            ConnectorType.CosmosDB: lambda config,
+            stage,
+            parser_config: CosmosDBConnector(config, stage, parser_config),
             ConnectorType.CSV: lambda config, stage, parser_config: CSVConnector(
-                config,
-                stage,
-                parser_config
+                config, stage, parser_config
             ),
-            ConnectorType.GCS: lambda config, stage, parser_config: GoogleCloudStorageConnector(
-                config,
-                stage,
-                parser_config
-            ),
+            ConnectorType.GCS: lambda config,
+            stage,
+            parser_config: GoogleCloudStorageConnector(config, stage, parser_config),
             ConnectorType.HAR: lambda config, stage, parser_config: HARConnector(
-                config,
-                stage,
-                parser_config
+                config, stage, parser_config
             ),
             ConnectorType.JSON: lambda config, stage, parser_config: JSONConnector(
-                config,
-                stage,
-                parser_config
+                config, stage, parser_config
             ),
             ConnectorType.Kafka: lambda config, stage, parser_config: KafkaConnector(
-                config,
-                stage,
-                parser_config
+                config, stage, parser_config
             ),
-            ConnectorType.MongoDB: lambda config, stage, parser_config: MongoDBConnector(
-                config,
-                stage,
-                parser_config
-            ),
+            ConnectorType.MongoDB: lambda config,
+            stage,
+            parser_config: MongoDBConnector(config, stage, parser_config),
             ConnectorType.MySQL: lambda config, stage, parser_config: MySQLConnector(
-                config,
-                stage,
-                parser_config
+                config, stage, parser_config
             ),
-            ConnectorType.Postgres: lambda config, stage, parser_config: PostgresConnection(
-                config,
-                stage,
-                parser_config
-            ),
+            ConnectorType.Postgres: lambda config,
+            stage,
+            parser_config: PostgresConnection(config, stage, parser_config),
             ConnectorType.Redis: lambda config, stage, parser_config: RedisConnector(
-                config,
-                stage,
-                parser_config
+                config, stage, parser_config
             ),
             ConnectorType.S3: lambda config, stage, parser_config: S3Connector(
-                config,
-                stage,
-                parser_config
+                config, stage, parser_config
             ),
-            ConnectorType.Snowflake: lambda config, stage, parser_config: SnowflakeConnector(
-                config,
-                stage,
-                parser_config
-            ),
+            ConnectorType.Snowflake: lambda config,
+            stage,
+            parser_config: SnowflakeConnector(config, stage, parser_config),
             ConnectorType.SQLite: lambda config, stage, parser_config: SQLiteConnector(
-                config,
-                stage,
-                parser_config
+                config, stage, parser_config
             ),
             ConnectorType.XML: lambda config, stage, parser_config: XMLConnector(
-                config,
-                stage,
-                parser_config
-            )
-        }   
+                config, stage, parser_config
+            ),
+        }
 
-        self.selected = self._connectors.get(
-            connector_config.connector_type
-        )(
-            connector_config,
-            stage,
-            parser_config
+        self.selected = self._connectors.get(connector_config.connector_type)(
+            connector_config, stage, parser_config
         )
 
         self.stage = stage
@@ -212,37 +167,23 @@ class Connector:
         self.connected = True
 
     async def load_execute_stage_summary(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ExecuteStageSummaryValidator]:
-        return await self.selected.load_execute_stage_summary(
-            options=options
-        )
+        return await self.selected.load_execute_stage_summary(options=options)
 
     async def load_actions(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[ActionHook]]:
-        return await self.selected.load_actions(
-            options=options
-        )
-    
+        return await self.selected.load_actions(options=options)
+
     async def load_results(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ResultsSet]:
-        return await self.selected.load_results(
-            options=options
-        )
-    
-    async def load_data(
-        self,
-        options: Dict[str, Any]={}
-    ) -> Coroutine[Any, Any, Any]:
-        return await self.load_data(
-            options=options
-        )
-    
+        return await self.selected.load_results(options=options)
+
+    async def load_data(self, options: Dict[str, Any] = {}) -> Coroutine[Any, Any, Any]:
+        return await self.load_data(options=options)
+
     async def close(self):
         self.connected = False
         return await self.selected.close()

@@ -2,8 +2,16 @@ import asyncio
 import os
 from collections import defaultdict
 from socket import socket
-from typing import Any, Dict, Set, Tuple
+from typing import (
+    Any,
+    Dict,
+    List,
+    Set,
+    Tuple,
+    TypeVar,
+)
 
+from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.core_rewrite.graph import Workflow
 from hyperscale.core_rewrite.jobs.models import (
     ReceivedReceipt,
@@ -26,8 +34,23 @@ from .models import JobContext, WorkflowStatusUpdate
 from .models.workflow_status import WorkflowStatus
 from .protocols import TCPProtocol
 
+T = TypeVar("T")
 
-class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
+WorkflowResult = WorkflowStats | Dict[str, Any | Exception]
+
+
+NodeContextSet = Dict[int, Dict[int, Context]]
+
+NodeData = Dict[
+    int,
+    Dict[
+        str,
+        Dict[int, T],
+    ],
+]
+
+
+class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
     def __init__(
         self,
         host: str,
@@ -37,32 +60,22 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         super().__init__(host, port, env)
 
         self._workflows = WorkflowRunner(env)
-        self._results: Dict[
-            int,
-            Dict[
-                str,
-                WorkflowStats
-                | Dict[
-                    str,
-                    Any | Exception,
-                ],
-            ],
-        ] = defaultdict(dict)
 
-        self._errors: Dict[
-            int,
-            Dict[
-                str,
-                Exception,
-            ],
-        ] = defaultdict(dict)
-        self._contexts: Dict[int, Context] = {}
-        self._statuses: Dict[int, Dict[str, Dict[int, WorkflowStatus]]] = defaultdict(
+        self._results: NodeData[WorkflowResult] = defaultdict(lambda: defaultdict(dict))
+        self._errors: NodeData[Exception] = defaultdict(lambda: defaultdict(dict))
+
+        self._node_contexts: NodeContextSet = defaultdict(dict)
+        self._statuses: NodeData[WorkflowStatus] = defaultdict(
             lambda: defaultdict(dict)
         )
 
-        self._completions: Dict[int, Set[int]] = defaultdict(set)
-        self._run_workflow_node_ids: Dict[int, Dict[str, int]] = defaultdict(dict)
+        self._run_workflow_expected_nodes: Dict[int, Dict[str, int]] = defaultdict(dict)
+
+        self._completions: Dict[int, Dict[str, Set[int]]] = defaultdict(
+            lambda: defaultdict(set),
+        )
+
+        self._context_poll_rate = TimeParser(env.MERCURY_SYNC_CONTEXT_POLL_RATE).time
 
     async def start_server(
         self,
@@ -87,16 +100,90 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         worker_socket: socket | None = None,
     ) -> None:
         self._workflows.setup()
-        return await super().connect_client(
+
+        await super().connect_client(
             address,
             cert_path,
             key_path,
             worker_socket,
         )
 
+    def create_run_contexts(self, run_id: int):
+        self._node_contexts[run_id] = {
+            node: Context(node_id=node) for node in self.nodes
+        }
+
+    def assign_contexts(
+        self,
+        run_id: int,
+        workflow_name: str,
+        threads: int,
+    ):
+        contexts = [
+            self._node_contexts[run_id][self.node_at(idx)] for idx in range(threads)
+        ]
+
+        self._run_workflow_expected_nodes[run_id][workflow_name] = len(contexts)
+
+        return contexts
+
+    async def update_contexts(
+        self,
+        run_id: int,
+        contexts: List[Context],
+    ):
+        await asyncio.gather(
+            *[
+                self._node_contexts[run_id][context.node].copy(context)
+                for context in contexts
+            ]
+        )
+
+    async def submit_workflow_to_workers(
+        self,
+        run_id: int,
+        workflow: Workflow,
+        contexts: List[Context],
+    ):
+        return await asyncio.gather(
+            *[
+                self.submit(
+                    run_id,
+                    workflow,
+                    context,
+                )
+                for context in contexts
+            ]
+        )
+
+    async def poll_for_workflow_complete(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        polling = True
+
+        while polling:
+            await asyncio.sleep(self._context_poll_rate)
+
+            if (
+                len(self._completions[run_id][workflow_name])
+                >= self._run_workflow_expected_nodes[run_id][workflow_name]
+            ):
+                polling = False
+
+        return [
+            (
+                self._results[run_id][workflow_name][node_id],
+                self._node_contexts[run_id][node_id],
+            )
+            for node_id in self._node_contexts[run_id]
+        ]
+
     @send()
     async def submit(
         self,
+        run_id: int,
         workflow: Workflow,
         context: Context,
     ) -> Response[JobContext[WorkflowStatusUpdate]]:
@@ -107,6 +194,7 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
                     workflow,
                     context,
                 ),
+                run_id=run_id,
             ),
         )
 
@@ -126,8 +214,11 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         return response
 
     @send()
-    async def send_stop(self):
-        pass
+    async def submit_stop_request(self):
+        return await self.broadcast(
+            "process_stop_request",
+            JobContext(None),
+        )
 
     @send()
     async def push_results(
@@ -162,11 +253,9 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         error = workflow_results.data.error
         status = workflow_results.data.status
 
-        context = Context()
-
         await asyncio.gather(
             *[
-                context.update(
+                self._node_contexts[run_id][node_id].update(
                     workflow,
                     key,
                     value,
@@ -176,12 +265,11 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
             ]
         )
 
-        self._contexts[run_id] = context
-        self._results[run_id][workflow_name] = results
-        self._statuses[run_id][workflow_name] = status
-        self._errors[run_id][workflow_name] = Exception(error)
+        self._results[run_id][workflow_name][node_id] = results
+        self._statuses[run_id][workflow_name][node_id] = status
+        self._errors[run_id][workflow_name][node_id] = Exception(error)
 
-        self._completions[run_id].add(node_id)
+        self._completions[run_id][workflow_name].add(node_id)
 
         return JobContext(
             ReceivedReceipt(
@@ -192,14 +280,12 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         )
 
     @receive()
-    async def stop_server(
+    async def process_stop_request(
         self,
         _: int,
-        receipt: JobContext[ReceivedReceipt],
+        stop_request: JobContext[None],
     ):
-        self._completions[receipt.run_id].add(
-            receipt.data.node_id,
-        )
+        self.stop()
 
     @receive()
     async def start_workflow(
@@ -207,29 +293,27 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         shard_id: int,
         context: JobContext[WorkflowJob],
     ) -> JobContext[WorkflowStatusUpdate]:
-        run_id = self.tasks.create_task_id()
+        task_id = self.tasks.create_task_id()
 
         snowflake = Snowflake.parse(shard_id)
         node_id = snowflake.instance
 
         workflow_name = context.data.workflow.name
 
-        self._run_workflow_node_ids[run_id][workflow_name] = node_id
-
         self.tasks.run(
             "run_workflow",
             node_id,
-            run_id,
+            context.run_id,
             context.data,
-            run_id=run_id,
+            run_id=task_id,
         )
 
         self.tasks.run(
             "push_workflow_status_update",
             node_id,
-            run_id,
+            context.run_id,
             context.data,
-            run_id=run_id,
+            run_id=task_id,
         )
 
         return JobContext(
@@ -238,7 +322,7 @@ class JobServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
                 node_id,
                 WorkflowStatus.SUBMITTED,
             ),
-            run_id=run_id,
+            run_id=context.run_id,
         )
 
     @receive()

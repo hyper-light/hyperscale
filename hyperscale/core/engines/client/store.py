@@ -17,7 +17,6 @@ from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 
 class ActionsStore:
-
     def __init__(self, metadata_string: str) -> None:
         self.metadata_string = metadata_string
         self.actions = defaultdict(dict)
@@ -31,7 +30,6 @@ class ActionsStore:
         self.logger.initialize()
 
     def set_waiter(self, stage: str):
-
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
 
@@ -39,14 +37,17 @@ class ActionsStore:
         self.current_stage = stage
 
     async def wait_for_ready(self, setup_call):
-        await self.logger.filesystem.aio['hyperscale.core'].debug(f'{self.metadata_string} - Action Store waiting for Action or Task to notify store it is ready')
+        await self.logger.filesystem.aio["hyperscale.core"].debug(
+            f"{self.metadata_string} - Action Store waiting for Action or Task to notify store it is ready"
+        )
         self.setup_call = setup_call
         await self.waiter
 
-        await self.logger.filesystem.aio['hyperscale.core'].debug(f'{self.metadata_string} - Action Store was notified and is exiting suspension')
+        await self.logger.filesystem.aio["hyperscale.core"].debug(
+            f"{self.metadata_string} - Action Store was notified and is exiting suspension"
+        )
 
     def store(self, request: str, action: Any, session: Any):
-
         self.actions[self.current_stage][request] = action
         self.sessions[self.current_stage][request] = session
 
@@ -58,13 +59,23 @@ class ActionsStore:
         except asyncio.exceptions.InvalidStateError:
             pass
 
-    def get(self, stage: str, action_name: str) -> Tuple[BaseAction, Union[MercuryGraphQLClient, MercuryGraphQLHTTP2Client, MercuryGRPCClient, MercuryHTTP2Client, MercuryHTTPClient, MercuryPlaywrightClient, MercuryWebsocketClient, MercuryUDPClient]]:
-        action = self.actions.get(
-            stage
-        ).get(action_name)
+    def get(
+        self, stage: str, action_name: str
+    ) -> Tuple[
+        BaseAction,
+        Union[
+            MercuryGraphQLClient,
+            MercuryGraphQLHTTP2Client,
+            MercuryGRPCClient,
+            MercuryHTTP2Client,
+            MercuryHTTPClient,
+            MercuryPlaywrightClient,
+            MercuryWebsocketClient,
+            MercuryUDPClient,
+        ],
+    ]:
+        action = self.actions.get(stage).get(action_name)
 
-        session = self.sessions.get(
-            stage
-        ).get(action_name)
+        session = self.sessions.get(stage).get(action_name)
 
         return action, session

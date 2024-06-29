@@ -4,7 +4,7 @@ from pydantic import (
     StrictInt,
     StrictFloat,
     StrictBool,
-    AnyHttpUrl
+    AnyHttpUrl,
 )
 from typing import List, Dict, Optional, Union, Any
 
@@ -27,8 +27,8 @@ class PlaywrightInputValidator(BaseModel):
     file: Optional[StrictStr]
     path: Optional[StrictStr]
     option: Optional[Union[StrictStr, StrictBool, StrictInt, StrictFloat]]
-    by_label: StrictBool=False
-    by_value: StrictBool=False
+    by_label: StrictBool = False
+    by_value: StrictBool = False
 
 
 class PlaywrightURLValidator(BaseModel):
@@ -60,5 +60,4 @@ class PlaywrightActionValidator(BaseModel):
     weight: Optional[Union[StrictInt, StrictFloat]]
     order: Optional[StrictInt]
     user: Optional[StrictStr]
-    tags: List[PlaywrightActionTag]=[]
-
+    tags: List[PlaywrightActionTag] = []
