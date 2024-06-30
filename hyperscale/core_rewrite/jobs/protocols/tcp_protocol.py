@@ -3,6 +3,7 @@ import inspect
 import pickle
 import socket
 import ssl
+import signal
 import uuid
 from collections import defaultdict, deque
 from typing import (
@@ -38,6 +39,7 @@ from .server_protocol import MercurySyncTCPServerProtocol
 
 T = TypeVar("T")
 K = TypeVar("K")
+
 
 
 class TCPProtocol(Generic[T, K]):
@@ -101,6 +103,7 @@ class TCPProtocol(Generic[T, K]):
         self._run_future: Optional[asyncio.Future] = None
         self._node_host_map: Dict[int, Tuple[str, int]] = {}
         self._nodes: Optional[LockedSet[int]] = None
+        self._abort_handle_created: bool = None
 
     @property
     def nodes(self):
@@ -242,12 +245,24 @@ class TCPProtocol(Generic[T, K]):
 
         self._start_tasks()
 
+        if not self._abort_handle_created:
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
+                self._loop.add_signal_handler(
+                    getattr(
+                        signal,
+                        signame,
+                    ),
+                    self.abort,
+                )
+
+
     def __iter__(self):
         for node_id in self._node_host_map:
             yield node_id
 
     async def run_forever(self):
         self._run_future = self._loop.create_future()
+
         await self._run_future
 
     def _create_server_ssl_context(
@@ -354,6 +369,17 @@ class TCPProtocol(Generic[T, K]):
 
         if last_error and tries >= self._tcp_connect_retries:
             raise last_error
+        
+        if not self._abort_handle_created:
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
+                self._loop.add_signal_handler(
+                    getattr(
+                        signal,
+                        signame,
+                    ),
+                    self.abort,
+                )
+
 
     def _create_client_ssl_context(
         self, cert_path: Optional[str] = None, key_path: Optional[str] = None
@@ -925,7 +951,16 @@ class TCPProtocol(Generic[T, K]):
             except Exception:
                 pass
 
-        self._run_future.set_result(None)
+        if self._run_future:
+            self._run_future.set_result(None)
+
+        self.tasks.abort()
+        for task in asyncio.all_tasks():
+            try:
+                task.cancel()
+
+            except Exception:
+                pass
 
 
     def abort(self):
@@ -951,7 +986,19 @@ class TCPProtocol(Generic[T, K]):
             except Exception:
                 pass
 
-        
-        self._run_future.set_result(None)
+        self.tasks.abort()
+
+        if self._run_future:
+            self._run_future.set_result(None)
+
+        for task in asyncio.all_tasks():
+            try:
+                task.cancel()
+
+            except Exception:
+                pass
+
+            except asyncio.CancelledError:
+                pass
 
      

@@ -48,7 +48,6 @@ def run_thread(
     cert_path: str | None = None,
     key_path: str | None = None,
 ):
-    import asyncio
 
     try:
         import uvloop
@@ -57,6 +56,8 @@ def run_thread(
 
     except ImportError:
         pass
+
+    import asyncio
 
     try:
         loop = asyncio.get_event_loop()
@@ -91,8 +92,6 @@ def run_thread(
 
 
     except Exception:
-        import traceback
-        print(traceback.format_exc())
         server.abort()
 
 
@@ -105,6 +104,7 @@ class LocalServerPool:
         self._context: SpawnContext | None = None
         self._executor: ProcessPoolExecutor | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._pool_task: asyncio.Task | None = None
         self._run_future: asyncio.Future | None = None
 
     def setup(self):
@@ -125,7 +125,7 @@ class LocalServerPool:
                 self.abort,
             )
 
-    async def run_pool(
+    def run_pool(
         self,
         ip_range: List[Tuple[str, int]],
         env: Env,
@@ -133,7 +133,7 @@ class LocalServerPool:
         key_path: str | None = None,
     ):
 
-        await asyncio.gather(
+        self._pool_task = asyncio.gather(
             *[
                 self._loop.run_in_executor(
                     self._executor,
@@ -153,25 +153,29 @@ class LocalServerPool:
         )
 
     async def shutdown(self):
+        
+        try:
+            self._pool_task.set_result(None)
+
+        except Exception:
+            pass
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self._executor.shutdown(cancel_futures=True, wait=False)
-
-            child_processes = active_children()
-            for child in child_processes:
-                child.kill()
 
 
     def abort(self):
+        try:
+
+            self._pool_task.set_result(None)
+
+        except Exception:
+            pass
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self._executor.shutdown(cancel_futures=True, wait=False)
 
-            child_processes = active_children()
-            for child in child_processes:
-                child.kill()
-
-    def cleanup(self):
-        self._executor.shutdown(wait=False)
 
 

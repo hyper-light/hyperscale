@@ -14,16 +14,16 @@ from .local_server_pool import LocalServerPool
 def abort(
     manager: RemoteGraphManager,
     server: LocalServerPool,
-    task: asyncio.Task
 ):
+
     try:
-        task.cancel()
-    
+        manager.abort()
+        server.abort()
+
     except Exception:
         pass
 
-    manager.abort()
-    server.abort()
+    
 
 
 class LocalRunner:
@@ -68,7 +68,6 @@ class LocalRunner:
                 lambda signame=signame: abort(
                     self._remote_manger,
                     self._server_pool,
-                    self._pool_task,
                 ),
             )
             
@@ -99,13 +98,11 @@ class LocalRunner:
 
                 worker_ips = [(self.host, port) for port in worker_port_range]
 
-                self._pool_task = asyncio.create_task(
-                    self._server_pool.run_pool(
-                        worker_ips,
-                        self._env,
-                        cert_path=cert_path,
-                        key_path=key_path,
-                    )
+                self._server_pool.run_pool(
+                    worker_ips,
+                    self._env,
+                    cert_path=cert_path,
+                    key_path=key_path,
                 )
 
                 await self._remote_manger.connect_to_workers(
@@ -123,19 +120,15 @@ class LocalRunner:
                 await self._remote_manger.close()
                 await self._server_pool.shutdown()
 
-                await self._pool_task
-
                 return results
         except Exception:
-            self._server_pool.abort()
-
             try:
 
-                self._pool_task.cancel()
+                self._server_pool.abort()
+                self._remote_manger.abort()
 
-                await self._pool_task
-            
             except Exception:
                 pass
 
-            self._remote_manger.abort()
+        except asyncio.CancelledError:
+            pass

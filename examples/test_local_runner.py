@@ -18,7 +18,7 @@ class Test(Workflow):
 async def run():
     runner = LocalRunner(
         "0.0.0.0",
-        12223,
+        12443,
     )
 
     results = await runner.run(
