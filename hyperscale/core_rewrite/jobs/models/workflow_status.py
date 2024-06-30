@@ -10,11 +10,13 @@ StatusString = Literal[
     "FAILED",
     "REJECTED",
     "UNKNOWN",
+    "QUEUED",
 ]
 
 
 class WorkflowStatus(Enum):
     SUBMITTED = "SUBMITTED"
+    QUEUED = "QUEUED"
     CREATED = "CREATED"
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
@@ -34,6 +36,7 @@ class WorkflowStatus(Enum):
             "FAILED": WorkflowStatus.FAILED,
             "REJECTED": WorkflowStatus.REJECTED,
             "UNKNOWN": WorkflowStatus.UNKNOWN,
+            "QUEUED": WorkflowStatus.QUEUED,
         }
 
         return status_map[status]

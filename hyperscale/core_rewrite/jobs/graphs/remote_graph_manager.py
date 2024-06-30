@@ -16,6 +16,7 @@ from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.core_rewrite.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core_rewrite.graph.workflow import Workflow
 from hyperscale.core_rewrite.hooks import Hook, HookType
+from hyperscale.core_rewrite.jobs.models import InstanceRoleType
 from hyperscale.core_rewrite.jobs.models.env import Env
 from hyperscale.core_rewrite.jobs.workers import Provisioner, StagePriority
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
@@ -29,9 +30,8 @@ from hyperscale.core_rewrite.state import (
     StateAction,
 )
 
-from .graphs.workflow_runner import cancel_pending
-from .models import InstanceRoleType
 from .remote_graph_controller import RemoteGraphController
+from .workflow_runner import cancel_pending
 
 WorkflowResultsSet = WorkflowStats | WorkflowContextResult
 NodeResults = Tuple[
@@ -53,11 +53,8 @@ RunResults = Dict[
 
 
 class RemoteGraphManager:
-    def __init__(
-        self,
-        workers: List[Tuple[str, int]] | None = None,
-    ) -> None:
-        self._workers = workers
+    def __init__(self) -> None:
+        self._workers: List[Tuple[str, int]] | None = None
         self._workflows: Dict[str, Workflow] = {}
         self._threads = psutil.cpu_count(logical=False)
         self._controller: RemoteGraphController | None = None
@@ -108,6 +105,7 @@ class RemoteGraphManager:
 
     async def connect_to_workers(
         self,
+        workers: List[Tuple[str, int]],
         cert_path: str | None = None,
         key_path: str | None = None,
         timeout: int | float | str | None = None,
@@ -117,6 +115,8 @@ class RemoteGraphManager:
 
         elif timeout is None:
             timeout = self._controller._request_timeout
+
+        self._workers = workers
 
         completed, pending = await asyncio.wait(
             [
@@ -152,7 +152,7 @@ class RemoteGraphManager:
 
     async def execute_graph(
         self,
-        workflow: str,
+        test_name: str,
         workflows: List[Workflow | DependentWorkflow],
     ) -> RunResults:
         run_id = self._controller.id_generator.generate()
@@ -180,7 +180,7 @@ class RemoteGraphManager:
                 {workflow_name: results for workflow_name, results in results}
             )
 
-        return {"workflow": workflow, "results": workflow_results}
+        return {"test": test_name, "results": workflow_results}
 
     def _create_workflow_graph(self, workflows: List[Workflow | DependentWorkflow]):
         workflow_graph = networkx.DiGraph()
@@ -475,4 +475,5 @@ class RemoteGraphManager:
         return context
 
     async def close(self):
+        await self._controller.submit_stop_request()
         await self._controller.close()

@@ -76,10 +76,14 @@ class WorkflowRunner:
         self._workflows_sem: asyncio.Semaphore | None = None
         self._max_running_workflows = env.MERCURY_SYNC_MAX_RUNNING_WORKFLOWS
         self._max_pending_workflows = env.MERCURY_SYNC_MAX_PENDING_WORKFLOWS
+        self._run_check_lock: asyncio.Lock | None = None
 
     def setup(self):
         if self._workflows_sem is None:
             self._workflows_sem = asyncio.Semaphore(self._max_running_workflows)
+
+        if self._run_check_lock is None:
+            self._run_check_lock = asyncio.Lock()
 
     @property
     def pending(self):
@@ -119,6 +123,11 @@ class WorkflowRunner:
         Exception | None,
         WorkflowStatus,
     ]:
+        await self._run_check_lock.acquire()
+        already_running = (
+            self.run_statuses[run_id].get(workflow.name) == WorkflowStatus.RUNNING
+        )
+
         if self.pending >= self._max_pending_workflows:
             return (
                 run_id,
@@ -127,6 +136,17 @@ class WorkflowRunner:
                 Exception("Err. - Run rejected. Too many pending workflows."),
                 WorkflowStatus.REJECTED,
             )
+
+        elif already_running:
+            return (
+                run_id,
+                None,
+                None,
+                Exception("Err. - Run rejected. Already running."),
+                WorkflowStatus.REJECTED,
+            )
+
+        self._run_check_lock.release()
 
         self.run_statuses[run_id][workflow.name] = WorkflowStatus.PENDING
 
@@ -440,6 +460,8 @@ class WorkflowRunner:
 
         workflow_context = context[workflow_name].dict()
 
+        start = time.monotonic()
+
         completed, pending = await asyncio.wait(
             [
                 loop.create_task(
@@ -460,6 +482,8 @@ class WorkflowRunner:
             ],
             timeout=1,
         )
+
+        elapsed = time.monotonic() - start
 
         await asyncio.gather(*completed)
 
@@ -492,6 +516,7 @@ class WorkflowRunner:
         processed_results = workflow_results.process(
             workflow_name,
             workflow_results_set,
+            elapsed,
         )
 
         return processed_results

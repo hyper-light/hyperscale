@@ -95,7 +95,9 @@ class TCPProtocol(Generic[T, K]):
         self._request_timeout = TimeParser(env.MERCURY_SYNC_REQUEST_TIMEOUT).time
 
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
-        self._tcp_connect_retries = env.MERCURY_SYNC_TCP_CONNECT_RETRIES
+        self._tcp_connect_retries = int(
+            TimeParser(env.MERCURY_SYNC_TCP_CONNECT_SECONDS).time
+        )
         self._run_future: Optional[asyncio.Future] = None
         self._node_host_map: Dict[int, Tuple[str, int]] = {}
         self._nodes: Optional[LockedSet[int]] = None
@@ -303,20 +305,20 @@ class TCPProtocol(Generic[T, K]):
                 cert_path=cert_path, key_path=key_path
             )
 
-        if worker_socket is None:
-            tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            await self._loop.run_in_executor(None, tcp_socket.connect, address)
-
-            tcp_socket.setblocking(False)
-
-        else:
-            tcp_socket = worker_socket
-
         last_error: Optional[Exception] = None
 
         for _ in range(self._tcp_connect_retries):
             try:
+                if worker_socket is None:
+                    tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    await self._loop.run_in_executor(None, tcp_socket.connect, address)
+
+                    tcp_socket.setblocking(False)
+
+                else:
+                    tcp_socket = worker_socket
+
                 client_transport, _ = await self._loop.create_connection(
                     lambda: MercurySyncTCPClientProtocol(self.read),
                     sock=tcp_socket,

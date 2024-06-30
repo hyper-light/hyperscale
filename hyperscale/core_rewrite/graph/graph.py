@@ -69,9 +69,10 @@ def _guard_result(result: asyncio.Task):
 class Graph:
     def __init__(
         self,
+        test_name: str,
         workflows: List[Workflow | DependentWorkflow],
     ) -> None:
-        self.graph = __file__
+        self.test = test_name
         self.workflows = workflows
         self._max_active: Dict[str, int] = {}
         self._active: Dict[str, int] = {}
@@ -138,7 +139,7 @@ class Graph:
                 ]
             )
 
-        return workflow_results
+        return {"test": self.test, "results": workflow_results}
 
     async def run_workflow(self, workflow: Workflow, context: Context):
         self._create_workflow_graph()
@@ -338,6 +339,8 @@ class Graph:
 
         workflow_context = context[workflow.name].dict()
 
+        start = time.monotonic()
+
         completed, pending = await asyncio.wait(
             [
                 loop.create_task(
@@ -356,6 +359,8 @@ class Graph:
             ],
             timeout=1,
         )
+
+        elapsed = time.monotonic() - start
 
         await asyncio.gather(*completed)
 
@@ -388,6 +393,7 @@ class Graph:
         processed_results = workflow_results.process(
             workflow_name,
             workflow_results_set,
+            elapsed,
         )
 
         return processed_results

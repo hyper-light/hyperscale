@@ -70,9 +70,15 @@ MetricsSet = Dict[
 ]
 
 WorkflowStats = Dict[
-    Literal["workflow", "stats", "results", "metrics", "checks"]
+    Literal["workflow", "stats", "results", "metrics", "checks", "elapsed", "rps"]
     | Optional[Literal["run_id"]],
-    int | str | CountResults | List[ResultSet] | List[MetricsSet] | List[CheckSet],
+    int
+    | str
+    | float
+    | CountResults
+    | List[ResultSet]
+    | List[MetricsSet]
+    | List[CheckSet],
 ]
 
 

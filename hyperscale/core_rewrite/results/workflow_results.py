@@ -94,10 +94,12 @@ class WorkflowResults:
             str,
             List[Any],
         ],
+        elapsed: float,
         run_id: Optional[int] = None,
     ) -> WorkflowStats:
         workflow_stats: WorkflowStats = {
             "workflow": workflow,
+            "elapsed": elapsed,
             "stats": {"executed": 0, "succeeded": 0, "failed": 0},
             "results": [],
             "checks": [],
@@ -113,6 +115,8 @@ class WorkflowResults:
             hook = self._hooks[step]
             hook_type = hook.hook_type
 
+            executed: int = 0
+
             match hook_type:
                 case HookType.TEST:
                     test_results = self._process_timings_set(
@@ -121,9 +125,9 @@ class WorkflowResults:
 
                     workflow_stats["results"].append(test_results)
 
-                    workflow_stats["stats"]["executed"] += test_results["counts"][
-                        "executed"
-                    ]
+                    executed += test_results["counts"]["executed"]
+
+                    workflow_stats["stats"]["executed"] = executed
                     workflow_stats["stats"]["succeeded"] += test_results["counts"][
                         "succeeded"
                     ]
@@ -153,6 +157,8 @@ class WorkflowResults:
 
                 case _:
                     pass
+
+        workflow_stats["rps"] = executed / elapsed
 
         return workflow_stats
 
@@ -363,7 +369,9 @@ class WorkflowResults:
         }
 
     def merge_results(
-        self, workflow_stats_set: List[WorkflowStats], run_id: int | None = None
+        self,
+        workflow_stats_set: List[WorkflowStats],
+        run_id: int | None = None,
     ) -> WorkflowStats:
         timing_results = [
             result_set
@@ -410,6 +418,16 @@ class WorkflowResults:
 
         if run_id:
             merged["run_id"] = run_id
+
+        median_elapsed: float = statistics.median(
+            [workflow_set["elapsed"] for workflow_set in workflow_stats_set]
+        )
+        total_executed: int = sum(
+            [workflow_set["stats"]["executed"] for workflow_set in workflow_stats_set]
+        )
+
+        merged["rps"] = total_executed / median_elapsed
+        merged["elapsed"] = median_elapsed
 
         return merged
 
