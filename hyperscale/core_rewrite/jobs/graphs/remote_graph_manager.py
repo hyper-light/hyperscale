@@ -51,6 +51,21 @@ RunResults = Dict[
     ],
 ]
 
+ProvisionedBatch = List[
+    List[
+        Tuple[
+            str,
+            StagePriority,
+            int,
+        ]
+    ]
+]
+
+WorkflowVUs = Dict[
+    str,
+    List[int]
+]
+
 
 class RemoteGraphManager:
     def __init__(self) -> None:
@@ -164,14 +179,18 @@ class RemoteGraphManager:
         workflow_results: Dict[str, List[WorkflowResultsSet]] = defaultdict(list)
 
         for workflow_set in workflow_traversal_order:
+
+            provisioned_batch, workflow_vus = self._provision(workflow_set)
+
             results = await asyncio.gather(
                 *[
                     self._run_workflow(
                         run_id,
                         workflow_set[workflow_name],
                         threads,
+                        workflow_vus[workflow_name]
                     )
-                    for group in self._provision(workflow_set)
+                    for group in provisioned_batch
                     for workflow_name, _, threads in group
                 ]
             )
@@ -233,6 +252,7 @@ class RemoteGraphManager:
         run_id: int,
         workflow: Workflow,
         threads: int,
+        workflow_vus: List[int],
     ) -> Tuple[str, WorkflowStats | WorkflowContextResult]:
         hooks: Dict[str, Hook] = {
             name: hook
@@ -273,6 +293,7 @@ class RemoteGraphManager:
             workflow,
             loaded_context,
             threads,
+            workflow_vus,
         )
 
         worker_results = await self._controller.poll_for_workflow_complete(
@@ -367,18 +388,11 @@ class RemoteGraphManager:
     def _provision(
         self,
         workflows: Dict[str, Workflow],
-    ) -> List[
-        List[
-            Tuple[
-                str,
-                StagePriority,
-                int,
-            ]
-        ]
-    ]:
+    ) -> Tuple[ProvisionedBatch, WorkflowVUs]:
         configs = {
             workflow_name: {
                 "threads": self._threads,
+                "vus": 1000,
             }
             for workflow_name in workflows
         }
@@ -393,8 +407,9 @@ class RemoteGraphManager:
                     if config.get(name)
                 }
             )
+            
+            config["threads"] = min(config["threads"], len(self._controller.nodes))
 
-        config["threads"] = min(config["threads"], len(self._controller.nodes))
 
         workflow_hooks: Dict[str, Dict[str, Hook]] = {
             workflow_name: {
@@ -432,7 +447,25 @@ class RemoteGraphManager:
             ]
         )
 
-        return provisioned_workers
+        workflow_vus: Dict[
+            str,
+            List[int]
+        ] = defaultdict(list)
+
+        for batch in provisioned_workers:
+            for workflow_name, _, threads in batch:
+                workflow_config = configs[workflow_name]
+
+                vus = int(workflow_config['vus']/threads)
+                remainder_vus = workflow_config['vus']%threads
+
+                workflow_vus[workflow_name].extend([
+                    vus for _ in range(threads)
+                ])
+
+                workflow_vus[workflow_name][-1] += remainder_vus
+
+        return (provisioned_workers, workflow_vus)
 
     async def _provide_context(
         self,

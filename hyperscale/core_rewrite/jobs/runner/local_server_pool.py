@@ -33,6 +33,9 @@ async def run_server(
     except KeyboardInterrupt:
         server.abort()
 
+    except Exception:
+        server.abort()
+
 
 
 def abort(server: RemoteGraphController, run_task: asyncio.Future):

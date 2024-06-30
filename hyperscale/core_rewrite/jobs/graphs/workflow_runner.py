@@ -111,6 +111,7 @@ class WorkflowRunner:
         run_id: int,
         workflow: Workflow,
         workflow_context: Dict[str, Any],
+        vus: int,
     ) -> Tuple[
         int,
         WorkflowStats
@@ -171,6 +172,7 @@ class WorkflowRunner:
                     run_id,
                     workflow,
                     context,
+                    vus,
                 )
 
                 await asyncio.gather(
@@ -213,6 +215,7 @@ class WorkflowRunner:
         run_id: int,
         workflow: Workflow,
         context: Context,
+        vus: int,
     ) -> Tuple[
         WorkflowStats
         | Dict[
@@ -233,7 +236,12 @@ class WorkflowRunner:
             hooks,
             traversal_order,
             config,
-        ) = await self._setup(run_id, workflow, context)
+        ) = await self._setup(
+            run_id, 
+            workflow, 
+            context, 
+            vus,
+        )
 
         is_test_workflow = (
             len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST])
@@ -320,6 +328,7 @@ class WorkflowRunner:
         run_id: int,
         workflow: Workflow,
         context: Context,
+        vus: int,
     ) -> Tuple[
         Workflow,
         Dict[str, Hook],
@@ -349,6 +358,7 @@ class WorkflowRunner:
             }
         )
 
+        config["vus"] = vus
         config["workflow_timeout"] = TimeParser(config["workflow_timeout"]).time
         config["duration"] = TimeParser(config["duration"]).time
 

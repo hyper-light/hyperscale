@@ -8,6 +8,7 @@ from typing import (
     Set,
     Tuple,
     TypeVar,
+    List,
 )
 
 from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
@@ -137,15 +138,17 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         workflow: Workflow,
         context: Context,
         threads: int,
+        workflow_vus: List[int]
     ):
         return await asyncio.gather(
             *[
                 self.submit(
                     run_id,
                     workflow,
+                    workflow_vus[idx],
                     context,
                 )
-                for _ in range(threads)
+                for idx in range(threads)
             ]
         )
 
@@ -175,6 +178,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         self,
         run_id: int,
         workflow: Workflow,
+        vus: int,
         context: Context,
     ) -> Response[JobContext[WorkflowStatusUpdate]]:
         response: Response[JobContext[WorkflowStatusUpdate]] = await self.send(
@@ -183,6 +187,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
                 WorkflowJob(
                     workflow,
                     context,
+                    vus,
                 ),
                 run_id=run_id,
             ),
@@ -367,6 +372,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
             run_id,
             job.workflow,
             job.context,
+            job.vus,
         )
 
         if context is None:
