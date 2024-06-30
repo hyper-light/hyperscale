@@ -37,7 +37,7 @@ async def run_server(
 
 def abort(server: RemoteGraphController, run_task: asyncio.Future):
     server.abort()
-    run_task.set_result(None)
+  
 
 
 def run_thread(
@@ -89,12 +89,10 @@ def run_thread(
             )
         )
 
-    except KeyboardInterrupt:
-        server.abort()
 
-    except BrokenPipeError:
-        server.abort()
     except Exception:
+        import traceback
+        print(traceback.format_exc())
         server.abort()
 
 

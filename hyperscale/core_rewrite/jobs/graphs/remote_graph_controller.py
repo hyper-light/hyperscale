@@ -385,11 +385,14 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         )
 
     @task(
+        keep=int(
+            os.getenv("HYPERSCALE_MAX_JOBS", 10),
+        ),
         trigger="MANUAL",
         repeat="ALWAYS",
         schedule="1s",
         max_age="1m",
-        keep_policy="AGE",
+        keep_policy="COUNT_AND_AGE",
     )
     async def push_workflow_status_update(
         self,

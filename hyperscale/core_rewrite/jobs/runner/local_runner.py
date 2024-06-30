@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 import psutil
 from typing import List
 
@@ -8,6 +9,21 @@ from hyperscale.core_rewrite.jobs.graphs.remote_graph_manager import RemoteGraph
 from hyperscale.core_rewrite.jobs.models import Env
 
 from .local_server_pool import LocalServerPool
+
+
+def abort(
+    manager: RemoteGraphManager,
+    server: LocalServerPool,
+    task: asyncio.Task
+):
+    try:
+        task.cancel()
+    
+    except Exception:
+        pass
+
+    manager.abort()
+    server.abort()
 
 
 class LocalRunner:
@@ -42,6 +58,20 @@ class LocalRunner:
         key_path: str | None = None,
         timeout: int | float | str | None = None,
     ):
+        loop = asyncio.get_event_loop()
+        for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
+            loop.add_signal_handler(
+                getattr(
+                    signal,
+                    signame,
+                ),
+                lambda signame=signame: abort(
+                    self._remote_manger,
+                    self._server_pool,
+                    self._pool_task,
+                ),
+            )
+            
         try:
             if self._workers <= 1:
                 graph = Graph(test_name, workflows)

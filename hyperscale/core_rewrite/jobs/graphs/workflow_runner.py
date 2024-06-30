@@ -356,7 +356,7 @@ class WorkflowRunner:
         threads = config.get("threads")
 
         self._max_active[run_id][workflow.name] = math.ceil(
-            vus * (psutil.cpu_count(logical=False) ** 2) / threads
+            (vus * (psutil.cpu_count(logical=False) ** 2) )/ threads
         )
 
         for client in workflow.client:

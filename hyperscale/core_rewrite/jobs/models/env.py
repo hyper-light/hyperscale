@@ -13,7 +13,7 @@ PrimaryType = Union[str, int, float, bytes, bool]
 
 class Env(BaseModel):
     MERCURY_SYNC_TCP_CONNECT_SECONDS: StrictStr = "10s"
-    MERCURY_SYNC_CLEANUP_INTERVAL: StrictStr = "0.5s"
+    MERCURY_SYNC_CLEANUP_INTERVAL: StrictStr = "1m"
     MERCURY_SYNC_MAX_CONCURRENCY: StrictInt = 2048
     MERCURY_SYNC_AUTH_SECRET: StrictStr
     MERCURY_SYNC_LOGS_DIRECTORY: StrictStr = os.getcwd()
