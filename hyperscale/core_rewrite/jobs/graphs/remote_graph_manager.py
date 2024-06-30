@@ -463,6 +463,11 @@ class RemoteGraphManager:
                     vus for _ in range(threads)
                 ])
 
+                workflow = workflows.get(workflow_name)
+                
+                if hasattr(workflow, 'threads'):
+                    setattr(workflow, 'threads', threads)
+
                 workflow_vus[workflow_name][-1] += remainder_vus
 
         return (provisioned_workers, workflow_vus)

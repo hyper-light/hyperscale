@@ -362,7 +362,6 @@ class WorkflowRunner:
         config["workflow_timeout"] = TimeParser(config["workflow_timeout"]).time
         config["duration"] = TimeParser(config["duration"]).time
 
-        vus = config.get("vus")
         threads = config.get("threads")
 
         self._max_active[run_id][workflow.name] = math.ceil(
