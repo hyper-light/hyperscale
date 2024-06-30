@@ -34,13 +34,11 @@ async def run_server(
         server.abort()
 
     except Exception:
-        server.abort()
-
-
+        import traceback
+        print(traceback.format_exc())
 
 def abort(server: RemoteGraphController, run_task: asyncio.Future):
     server.abort()
-  
 
 
 def run_thread(
@@ -51,7 +49,6 @@ def run_thread(
     cert_path: str | None = None,
     key_path: str | None = None,
 ):
-
     try:
         import uvloop
 
@@ -93,7 +90,6 @@ def run_thread(
             )
         )
 
-
     except Exception:
         try:
             server.abort()
@@ -108,7 +104,6 @@ def run_thread(
             pass
 
     except asyncio.CancelledError:
-        
         try:
             server.abort()
 
@@ -159,7 +154,6 @@ class LocalServerPool:
         cert_path: str | None = None,
         key_path: str | None = None,
     ):
-
         self._pool_task = asyncio.gather(
             *[
                 self._loop.run_in_executor(
@@ -176,11 +170,10 @@ class LocalServerPool:
                 )
                 for worker_idx, address in enumerate(ip_range)
             ],
-            return_exceptions=True
+            return_exceptions=True,
         )
 
     async def shutdown(self):
-        
         try:
             self._pool_task.set_result(None)
 
@@ -196,11 +189,9 @@ class LocalServerPool:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self._executor.shutdown(cancel_futures=True, wait=False)
-
 
     def abort(self):
         try:
-
             self._pool_task.set_result(None)
 
         except Exception:
@@ -215,6 +206,3 @@ class LocalServerPool:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self._executor.shutdown(cancel_futures=True, wait=False)
-
-
-

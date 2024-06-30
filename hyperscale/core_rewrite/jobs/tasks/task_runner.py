@@ -111,12 +111,10 @@ class TaskRunner:
         self._run_cleanup = False
 
         try:
-
             self._cleanup_task.cancel()
 
         except Exception:
             pass
-
 
     async def _cleanup(self):
         while self._run_cleanup:

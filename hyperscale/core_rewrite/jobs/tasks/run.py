@@ -107,13 +107,12 @@ class Run:
 
     def abort(self):
         if self.running and self.task_running:
-
             try:
                 self._task.cancel()
 
             except Exception:
                 pass
-            
+
             self.status = RunStatus.CANCELLED
 
     def execute(self, *args, **kwargs):

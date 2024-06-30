@@ -41,7 +41,6 @@ T = TypeVar("T")
 K = TypeVar("K")
 
 
-
 class TCPProtocol(Generic[T, K]):
     def __init__(
         self,
@@ -255,7 +254,6 @@ class TCPProtocol(Generic[T, K]):
                     self.abort,
                 )
 
-
     def __iter__(self):
         for node_id in self._node_host_map:
             yield node_id
@@ -369,7 +367,7 @@ class TCPProtocol(Generic[T, K]):
 
         if last_error and tries >= self._tcp_connect_retries:
             raise last_error
-        
+
         if not self._abort_handle_created:
             for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
@@ -379,7 +377,6 @@ class TCPProtocol(Generic[T, K]):
                     ),
                     self.abort,
                 )
-
 
     def _create_client_ssl_context(
         self, cert_path: Optional[str] = None, key_path: Optional[str] = None
@@ -909,12 +906,10 @@ class TCPProtocol(Generic[T, K]):
 
         close_task = asyncio.current_task()
 
-    
         for client in self._client_transports.values():
             client.abort()
 
         if self._sleep_task:
-
             try:
                 self._sleep_task.cancel()
 
@@ -925,9 +920,7 @@ class TCPProtocol(Generic[T, K]):
                 pass
 
         if self._cleanup_task:
-
             try:
-
                 self._cleanup_task.cancel()
 
             except Exception:
@@ -938,7 +931,6 @@ class TCPProtocol(Generic[T, K]):
 
         if self.tasks:
             await self.tasks.shutdown()
-
 
         for task in asyncio.all_tasks():
             try:
@@ -954,7 +946,6 @@ class TCPProtocol(Generic[T, K]):
     def stop(self):
         if self._run_future:
             try:
-
                 self._run_future.set_result(None)
 
             except asyncio.InvalidStateError:
@@ -963,17 +954,14 @@ class TCPProtocol(Generic[T, K]):
             except asyncio.CancelledError:
                 pass
 
-
     def abort(self):
         self._running = False
-        
 
         for client in self._client_transports.values():
             client.abort()
 
         if self._sleep_task:
             try:
-
                 self._sleep_task.cancel()
 
             except Exception:
@@ -984,7 +972,6 @@ class TCPProtocol(Generic[T, K]):
 
         if self._cleanup_task:
             try:
-
                 self._cleanup_task.cancel()
 
             except Exception:
@@ -997,7 +984,6 @@ class TCPProtocol(Generic[T, K]):
 
         if self._run_future:
             try:
-
                 self._run_future.set_result(None)
 
             except asyncio.InvalidStateError:
@@ -1015,5 +1001,3 @@ class TCPProtocol(Generic[T, K]):
 
             except asyncio.CancelledError:
                 pass
-
-     

@@ -61,10 +61,7 @@ ProvisionedBatch = List[
     ]
 ]
 
-WorkflowVUs = Dict[
-    str,
-    List[int]
-]
+WorkflowVUs = Dict[str, List[int]]
 
 
 class RemoteGraphManager:
@@ -179,7 +176,6 @@ class RemoteGraphManager:
         workflow_results: Dict[str, List[WorkflowResultsSet]] = defaultdict(list)
 
         for workflow_set in workflow_traversal_order:
-
             provisioned_batch, workflow_vus = self._provision(workflow_set)
 
             results = await asyncio.gather(
@@ -188,7 +184,7 @@ class RemoteGraphManager:
                         run_id,
                         workflow_set[workflow_name],
                         threads,
-                        workflow_vus[workflow_name]
+                        workflow_vus[workflow_name],
                     )
                     for group in provisioned_batch
                     for workflow_name, _, threads in group
@@ -407,9 +403,8 @@ class RemoteGraphManager:
                     if config.get(name)
                 }
             )
-            
-            config["threads"] = min(config["threads"], len(self._controller.nodes))
 
+            config["threads"] = min(config["threads"], len(self._controller.nodes))
 
         workflow_hooks: Dict[str, Dict[str, Hook]] = {
             workflow_name: {
@@ -447,26 +442,21 @@ class RemoteGraphManager:
             ]
         )
 
-        workflow_vus: Dict[
-            str,
-            List[int]
-        ] = defaultdict(list)
+        workflow_vus: Dict[str, List[int]] = defaultdict(list)
 
         for batch in provisioned_workers:
             for workflow_name, _, threads in batch:
                 workflow_config = configs[workflow_name]
 
-                vus = int(workflow_config['vus']/threads)
-                remainder_vus = workflow_config['vus']%threads
+                vus = int(workflow_config["vus"] / threads)
+                remainder_vus = workflow_config["vus"] % threads
 
-                workflow_vus[workflow_name].extend([
-                    vus for _ in range(threads)
-                ])
+                workflow_vus[workflow_name].extend([vus for _ in range(threads)])
 
                 workflow = workflows.get(workflow_name)
-                
-                if hasattr(workflow, 'threads'):
-                    setattr(workflow, 'threads', threads)
+
+                if hasattr(workflow, "threads"):
+                    setattr(workflow, "threads", threads)
 
                 workflow_vus[workflow_name][-1] += remainder_vus
 
@@ -511,7 +501,7 @@ class RemoteGraphManager:
         )
 
         return context
-    
+
     async def shutdown_workers(self):
         await self._controller.submit_stop_request()
 
@@ -519,9 +509,7 @@ class RemoteGraphManager:
         await self._controller.close()
 
     def abort(self):
-
         try:
-
             self._controller.abort()
 
         except Exception:

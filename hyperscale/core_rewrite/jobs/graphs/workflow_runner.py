@@ -14,7 +14,6 @@ from typing import (
 
 import networkx
 import psutil
-
 from hyperscale.core_rewrite.engines.client import TimeParser
 from hyperscale.core_rewrite.engines.client.setup_clients import setup_client
 from hyperscale.core_rewrite.graph.workflow import Workflow
@@ -26,6 +25,7 @@ from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.state import Context, ContextHook, StateAction
 from hyperscale.core_rewrite.state.workflow_context import WorkflowContext
 from hyperscale.core_rewrite.testing.models.base import OptimizedArg
+from .completion_counter import CompletionCounter
 
 warnings.simplefilter("ignore")
 
@@ -77,6 +77,9 @@ class WorkflowRunner:
         self._max_running_workflows = env.MERCURY_SYNC_MAX_RUNNING_WORKFLOWS
         self._max_pending_workflows = env.MERCURY_SYNC_MAX_PENDING_WORKFLOWS
         self._run_check_lock: asyncio.Lock | None = None
+        self._completed_counts: Dict[int, Dict[str, CompletionCounter]] = defaultdict(
+            dict
+        )
 
     def setup(self):
         if self._workflows_sem is None:
@@ -96,15 +99,23 @@ class WorkflowRunner:
             ]
         )
 
-    def get_workflow_status(
+    def get_running_workflow_stats(
         self,
         run_id: int,
         workflow: str,
-    ):
-        return self.run_statuses.get(
+    ) -> Tuple[WorkflowStatus, int]:
+        status = self.run_statuses.get(
             run_id,
             {},
         ).get(workflow, WorkflowStatus.UNKNOWN)
+
+        counter = self._completed_counts.get(run_id, {}).get(
+            workflow, CompletionCounter()
+        )
+
+        completed_count = counter.value()
+
+        return (status, completed_count)
 
     async def run(
         self,
@@ -237,9 +248,9 @@ class WorkflowRunner:
             traversal_order,
             config,
         ) = await self._setup(
-            run_id, 
-            workflow, 
-            context, 
+            run_id,
+            workflow,
+            context,
             vus,
         )
 
@@ -341,6 +352,7 @@ class WorkflowRunner:
         Dict[str, Any],
     ]:
         self._active[run_id][workflow.name] = 0
+        self._completed_counts[run_id][workflow.name] = CompletionCounter()
 
         config = {
             "vus": 1000,
@@ -365,7 +377,7 @@ class WorkflowRunner:
         threads = config.get("threads")
 
         self._max_active[run_id][workflow.name] = math.ceil(
-            (vus * (psutil.cpu_count(logical=False) ** 2) )/ threads
+            (vus * (psutil.cpu_count(logical=False) ** 2)) / threads
         )
 
         for client in workflow.client:
@@ -624,6 +636,8 @@ class WorkflowRunner:
 
                 except asyncio.InvalidStateError:
                     self._active_waiters[run_id][workflow_name] = None
+
+        self._completed_counts[run_id][workflow_name].increment()
 
         return results
 

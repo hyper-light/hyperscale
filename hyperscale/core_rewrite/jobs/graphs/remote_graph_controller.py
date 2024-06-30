@@ -10,7 +10,6 @@ from typing import (
     TypeVar,
     List,
 )
-
 from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.core_rewrite.graph import Workflow
 from hyperscale.core_rewrite.jobs.hooks import (
@@ -32,6 +31,7 @@ from hyperscale.core_rewrite.jobs.protocols import TCPProtocol
 from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.snowflake import Snowflake
 from hyperscale.core_rewrite.state import Context
+from .completion_counter import CompletionCounter
 
 from .workflow_runner import WorkflowRunner
 
@@ -77,6 +77,14 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         self._completions: Dict[int, Dict[str, Set[int]]] = defaultdict(
             lambda: defaultdict(set),
+        )
+
+        self._completed_counts: Dict[int, Dict[str, Dict[int, int]]] = defaultdict(
+            lambda: defaultdict(
+                defaultdict(
+                    defaultdict(lambda: 0),
+                )
+            )
         )
 
         self._context_poll_rate = TimeParser(env.MERCURY_SYNC_CONTEXT_POLL_RATE).time
@@ -138,7 +146,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         workflow: Workflow,
         context: Context,
         threads: int,
-        workflow_vus: List[int]
+        workflow_vus: List[int],
     ):
         return await asyncio.gather(
             *[
@@ -337,10 +345,17 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         run_id = update.run_id
         workflow = update.data.workflow
         status = update.data.status
+        completed_count = update.data.completed_count
 
         self._statuses[run_id][workflow][node_id] = WorkflowStatus.map_value_to_status(
             status
         )
+
+
+        self._completed_counts[run_id][workflow][node_id] = completed_count
+        current_completed_count = sum(self._completed_counts[run_id][workflow].values())
+
+        print(current_completed_count)
 
         return JobContext(
             ReceivedReceipt(
@@ -408,7 +423,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
     ):
         workflow_name = job.workflow.name
 
-        status = self._workflows.get_workflow_status(
+        status, completed_count = self._workflows.get_running_workflow_stats(
             run_id,
             workflow_name,
         )
@@ -427,6 +442,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
                     workflow_name,
                     node_id,
                     status,
+                    completed_count,
                 ),
                 run_id=run_id,
             ),

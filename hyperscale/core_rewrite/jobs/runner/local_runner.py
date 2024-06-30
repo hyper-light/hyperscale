@@ -15,7 +15,6 @@ def abort(
     manager: RemoteGraphManager,
     server: LocalServerPool,
 ):
-
     try:
         manager.abort()
         server.abort()
@@ -25,8 +24,6 @@ def abort(
 
     except asyncio.CancelledError:
         pass
-
-    
 
 
 class LocalRunner:
@@ -73,7 +70,7 @@ class LocalRunner:
                     self._server_pool,
                 ),
             )
-            
+
         try:
             if self._workers <= 1:
                 graph = Graph(test_name, workflows)
@@ -127,7 +124,6 @@ class LocalRunner:
                 return results
         except Exception:
             try:
-
                 self._server_pool.abort()
                 self._remote_manger.abort()
 

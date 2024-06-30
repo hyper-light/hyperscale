@@ -92,12 +92,10 @@ class Task(Generic[T]):
         self._schedule_running = False
 
         try:
-
             self._schedule.cancel()
 
         except Exception:
             pass
-
 
     async def cleanup(self):
         match self.keep_policy:
