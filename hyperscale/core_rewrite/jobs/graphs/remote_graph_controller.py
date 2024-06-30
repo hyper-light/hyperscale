@@ -279,7 +279,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         self,
         _: int,
         stop_request: JobContext[None],
-    ):
+    ) -> JobContext[None]:
         self.stop()
 
     @receive()

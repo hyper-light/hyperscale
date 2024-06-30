@@ -23,6 +23,9 @@ def abort(
     except Exception:
         pass
 
+    except asyncio.CancelledError:
+        pass
+
     
 
 
@@ -117,6 +120,7 @@ class LocalRunner:
                     workflows,
                 )
 
+                await self._remote_manger.shutdown_workers()
                 await self._remote_manger.close()
                 await self._server_pool.shutdown()
 
@@ -128,6 +132,9 @@ class LocalRunner:
                 self._remote_manger.abort()
 
             except Exception:
+                pass
+
+            except asyncio.CancelledError:
                 pass
 
         except asyncio.CancelledError:

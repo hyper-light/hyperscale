@@ -474,7 +474,7 @@ class RemoteGraphManager:
 
         return context
     
-    async def shutdown_worker(self):
+    async def shutdown_workers(self):
         await self._controller.submit_stop_request()
 
     async def close(self):

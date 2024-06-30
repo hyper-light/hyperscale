@@ -28,10 +28,10 @@ async def run_server(
         await server.close()
 
     except asyncio.CancelledError:
-        await server.close()
+        server.abort()
 
     except KeyboardInterrupt:
-        await server.close()
+        server.abort()
 
 
 
@@ -92,7 +92,31 @@ def run_thread(
 
 
     except Exception:
-        server.abort()
+        try:
+            server.abort()
+
+        except Exception:
+            pass
+
+        except asyncio.InvalidStateError:
+            pass
+
+        except asyncio.CancelledError:
+            pass
+
+    except asyncio.CancelledError:
+        
+        try:
+            server.abort()
+
+        except Exception:
+            pass
+
+        except asyncio.InvalidStateError:
+            pass
+
+        except asyncio.CancelledError:
+            pass
 
 
 class LocalServerPool:
@@ -160,6 +184,12 @@ class LocalServerPool:
         except Exception:
             pass
 
+        except asyncio.CancelledError:
+            pass
+
+        except asyncio.InvalidStateError:
+            pass
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self._executor.shutdown(cancel_futures=True, wait=False)
@@ -171,6 +201,12 @@ class LocalServerPool:
             self._pool_task.set_result(None)
 
         except Exception:
+            pass
+
+        except asyncio.CancelledError:
+            pass
+
+        except asyncio.InvalidStateError:
             pass
 
         with warnings.catch_warnings():

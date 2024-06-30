@@ -907,6 +907,9 @@ class TCPProtocol(Generic[T, K]):
         self._stream = False
         self._running = False
 
+        close_task = asyncio.current_task()
+
+    
         for client in self._client_transports.values():
             client.abort()
 
@@ -918,6 +921,9 @@ class TCPProtocol(Generic[T, K]):
             except Exception:
                 pass
 
+            except asyncio.CancelledError:
+                pass
+
         if self._cleanup_task:
 
             try:
@@ -925,41 +931,36 @@ class TCPProtocol(Generic[T, K]):
                 self._cleanup_task.cancel()
 
             except Exception:
+                pass
+
+            except asyncio.CancelledError:
                 pass
 
         if self.tasks:
             await self.tasks.shutdown()
 
-    def stop(self):
-        self._running = False
-        for client in self._client_transports.values():
-            client.abort()
 
-        if self._sleep_task:
-            try:
-
-                self._sleep_task.cancel()
-
-            except Exception:
-                pass
-
-        if self._cleanup_task:
-            try:
-
-                self._cleanup_task.cancel()
-
-            except Exception:
-                pass
-
-        if self._run_future:
-            self._run_future.set_result(None)
-
-        self.tasks.abort()
         for task in asyncio.all_tasks():
             try:
-                task.cancel()
+                if task != close_task and task.cancelled() is False:
+                    task.cancel()
 
             except Exception:
+                pass
+
+            except asyncio.CancelledError:
+                pass
+
+    def stop(self):
+        if self._run_future:
+            try:
+
+                self._run_future.set_result(None)
+
+            except asyncio.InvalidStateError:
+                pass
+
+            except asyncio.CancelledError:
                 pass
 
 
@@ -978,6 +979,9 @@ class TCPProtocol(Generic[T, K]):
             except Exception:
                 pass
 
+            except asyncio.CancelledError:
+                pass
+
         if self._cleanup_task:
             try:
 
@@ -986,10 +990,21 @@ class TCPProtocol(Generic[T, K]):
             except Exception:
                 pass
 
+            except asyncio.CancelledError:
+                pass
+
         self.tasks.abort()
 
         if self._run_future:
-            self._run_future.set_result(None)
+            try:
+
+                self._run_future.set_result(None)
+
+            except asyncio.InvalidStateError:
+                pass
+
+            except asyncio.CancelledError:
+                pass
 
         for task in asyncio.all_tasks():
             try:
