@@ -7,11 +7,10 @@ from hyperscale.tools.helpers import awaitable, wrap
 
 
 class AsyncList:
-
     def __init__(self, data=[]):
         self.data = data
 
-    def __getitem__(self, start: int, stop: int=None) -> Union[AsyncList, Any]:
+    def __getitem__(self, start: int, stop: int = None) -> Union[AsyncList, Any]:
         if stop:
             subset_list = self.data[start:stop]
             return AsyncList(subset_list)
@@ -53,16 +52,10 @@ class AsyncList:
         return list_size == 0
 
     async def append(self, value) -> None:
-        self.data = [
-            *self.data,
-            value
-        ]
+        self.data = [*self.data, value]
 
     async def prepend(self, value) -> None:
-        self.data = [
-            value,
-            self.data
-        ]
+        self.data = [value, self.data]
 
     async def insert(self, idx, value) -> None:
         size = await self.size(self.data)
@@ -73,17 +66,13 @@ class AsyncList:
             await self.prepend(value)
 
         else:
-            self.data = [
-                self.data[:idx-1],
-                value,
-                self.data[idx:]
-            ]
+            self.data = [self.data[: idx - 1], value, self.data[idx:]]
 
     async def at(self, idx) -> Any:
         size = await self.size(self.data)
         if idx >= size:
             return None
-        
+
         return self.data[idx]
 
     async def find(self, value) -> Any:
@@ -106,10 +95,7 @@ class AsyncList:
         for item in self.data:
             meets_condition = await awaitable(condition, item)
             if meets_condition:
-                filtered = [
-                    *filtered,
-                    item
-                ]
+                filtered = [*filtered, item]
 
         return AsyncList(filtered)
 
@@ -124,10 +110,7 @@ class AsyncList:
     async def subscribe(self, hook, *args, **kwargs) -> None:
         async_hook = await wrap(hook, args, kwargs)
         async for item in async_hook():
-            self.data = [
-                *self.data,
-                item
-            ]
+            self.data = [*self.data, item]
 
     async def publish(self, hook) -> None:
         for item in self.data:
@@ -136,7 +119,9 @@ class AsyncList:
     async def join(self, join_character) -> str:
         return await awaitable(self.data.join, join_character)
 
-    async def replace(self, match_value: Any, replacement: Any, occurences: int=-1, in_place=True) -> Union[AsyncList, None]:
+    async def replace(
+        self, match_value: Any, replacement: Any, occurences: int = -1, in_place=True
+    ) -> Union[AsyncList, None]:
         if occurences == -1:
             occurences = await self.size()
 
@@ -144,40 +129,38 @@ class AsyncList:
             await self._replace_in_place(match_value, replacement, occurences)
         else:
             return await self._replace(match_value, replacement, occurences)
-            
-    async def _replace_in_place(self, match_value: Any, replacement: Any, occurences: int):    
+
+    async def _replace_in_place(
+        self, match_value: Any, replacement: Any, occurences: int
+    ):
         found = 0
         for idx, item in enumerate(self.data):
-                if item == match_value and found < occurences:
-                    self.data[idx] = replacement
-                    found += 1
+            if item == match_value and found < occurences:
+                self.data[idx] = replacement
+                found += 1
 
     async def _replace(self, match_value: Any, replacement: Any, occurences: int):
         replaced_list = AsyncList(list(self.data))
-            
+
         found = 0
         for idx, item in enumerate(self.data):
-                if item == match_value and found < occurences:
-                    replaced_list[idx] = replacement
-                    found += 1
+            if item == match_value and found < occurences:
+                replaced_list[idx] = replacement
+                found += 1
 
         return replaced_list
 
-    async def index(self, match_item: Any, offset: int=0, end: int=None):
+    async def index(self, match_item: Any, offset: int = 0, end: int = None):
         try:
             return await awaitable(self.data.index, match_item, offset, end)
         except ValueError:
             return -1
 
     async def indexes(self, match_item: Any) -> List[int]:
-
         occurences = []
         for idx in range(self.data):
             if self.data[idx] == match_item:
-                occurences = [
-                    *occurences,
-                    idx
-                ]
+                occurences = [*occurences, idx]
 
         return occurences
 
@@ -194,10 +177,10 @@ class AsyncList:
         await awaitable(self.data.remove, value)
 
     async def remove_index(self, index: int) -> AsyncList:
-        removed = self.data[index:index+1]
+        removed = self.data[index : index + 1]
         return AsyncList(removed)
 
-    async def remove_range(self, start: int=0, stop: int=None) -> AsyncList:
+    async def remove_range(self, start: int = 0, stop: int = None) -> AsyncList:
         if stop is None:
             stop = await self.size()
             return AsyncList(self.data[start:])
@@ -213,25 +196,18 @@ class AsyncList:
     async def extend(self, value: List[Any]) -> None:
         await awaitable(self.data.extend, value)
 
-    async def splice(self, start: int=0, stop: int=None, step=1) -> AsyncList:
+    async def splice(self, start: int = 0, stop: int = None, step=1) -> AsyncList:
         spliced = []
         for idx in range(start, stop, step):
-            spliced = [
-                *spliced,
-                self.data[idx]
-            ]
+            spliced = [*spliced, self.data[idx]]
 
         return AsyncList(spliced)
 
     async def subset(self, values: List[Any]) -> AsyncList:
-
         found = []
         for value in values:
             found_item = await self.find(value)
-            found = [
-                *found,
-                found_item
-            ]
+            found = [*found, found_item]
 
         return AsyncList(found)
 

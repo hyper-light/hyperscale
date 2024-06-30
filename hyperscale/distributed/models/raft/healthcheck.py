@@ -4,13 +4,8 @@ from pydantic import StrictInt, StrictStr
 
 from hyperscale.distributed.models.base.message import Message
 
-HealthStatus = Literal[
-    "initializing",
-    "waiting",
-    "healthy", 
-    "suspect", 
-    "failed"
-]
+HealthStatus = Literal["initializing", "waiting", "healthy", "suspect", "failed"]
+
 
 class HealthCheck(Message):
     target_host: Optional[StrictStr]

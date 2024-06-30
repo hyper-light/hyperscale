@@ -10,13 +10,14 @@ from pydantic import (
 
 
 class HoverCommand(BaseModel):
-    modifiers: Optional[Sequence[Literal['Alt', 'Control', 'ControlOrMeta', 'Meta', 'Shift']]]=None
-    postion: Optional[Position]=None
+    modifiers: Optional[
+        Sequence[Literal["Alt", "Control", "ControlOrMeta", "Meta", "Shift"]]
+    ] = None
+    postion: Optional[Position] = None
     timeout: StrictInt | StrictFloat
-    force: Optional[StrictBool]=None
-    no_wait_after: Optional[StrictBool]=None
-    trial: Optional[StrictBool]=None
-    
+    force: Optional[StrictBool] = None
+    no_wait_after: Optional[StrictBool] = None
+    trial: Optional[StrictBool] = None
+
     class Config:
-        arbitrary_types_allowed=True
-        
+        arbitrary_types_allowed = True

@@ -8,7 +8,6 @@ from .base_limiter import BaseLimiter
 
 
 class TokenBucketLimiter(BaseLimiter):
-
     __slots__ = (
         "max_rate",
         "time_period",
@@ -16,24 +15,18 @@ class TokenBucketLimiter(BaseLimiter):
         "_level",
         "_waiters",
         "_loop",
-        "_last_check"
+        "_last_check",
     )
 
-    def __init__(
-        self, 
-        limit: Limit
-    ) -> None:
+    def __init__(self, limit: Limit) -> None:
         super().__init__(
-            limit.max_requests,
-            limit.period,
-            reject_requests=limit.reject_requests
+            limit.max_requests, limit.period, reject_requests=limit.reject_requests
         )
 
         self._level = limit.max_requests
         self._last_check = self._loop.time()
 
     def has_capacity(self, amount: float = 1) -> bool:
-
         if self._level < self.max_rate:
             current_time = self._loop.time()
             delta = self._rate_per_sec * (current_time - self._last_check)
@@ -47,21 +40,13 @@ class TokenBucketLimiter(BaseLimiter):
                     fut.set_result(True)
                     break
 
-
         return amount < self._level
-    
-    async def acquire(
-        self, 
-        amount: float = 1
-    ):
-        
+
+    async def acquire(self, amount: float = 1):
         if amount > self.max_rate:
             raise ValueError("Can't acquire more than the maximum capacity")
 
-
-        task = asyncio.current_task(
-            loop=self._loop
-        )
+        task = asyncio.current_task(loop=self._loop)
 
         assert task is not None
 
@@ -71,15 +56,12 @@ class TokenBucketLimiter(BaseLimiter):
             return True
 
         while not self.has_capacity(amount):
-
             fut = self._loop.create_future()
 
             try:
-
                 self._waiters[task] = fut
                 await asyncio.wait_for(
-                    asyncio.shield(fut), 
-                    timeout=(1 / self._rate_per_sec * amount)
+                    asyncio.shield(fut), timeout=(1 / self._rate_per_sec * amount)
                 )
 
             except asyncio.TimeoutError:
@@ -94,22 +76,16 @@ class TokenBucketLimiter(BaseLimiter):
 
         return rejected
 
-    async def reject(
-        self,
-        request: Request,
-        transport: asyncio.Transport
-    ):
+    async def reject(self, request: Request, transport: asyncio.Transport):
         if transport.is_closing() is False:
-
             server_error_respnse = HTTPMessage(
                 path=request.path,
                 status=429,
-                error='Too Many Requests',
-                method=request.method
+                error="Too Many Requests",
+                method=request.method,
             )
 
             transport.write(server_error_respnse.prepare_response())
-
 
     async def __aenter__(self) -> None:
         await self.acquire()

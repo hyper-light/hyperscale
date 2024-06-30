@@ -12,8 +12,8 @@ the user has already used. It then implements a basic algorithm that attempts
 to manage the flow control window without user input, trying to ensure that it
 does not emit too many WINDOW_UPDATE frames.
 """
-from __future__ import division
 
+from __future__ import division
 
 
 # The largest acceptable value for a HTTP/2 flow control window.
@@ -21,12 +21,7 @@ LARGEST_FLOW_CONTROL_WINDOW = 2**31 - 1
 
 
 class WindowManager:
-
-    __slots__ = (
-        'max_window_size',
-        'current_window_size',
-        '_bytes_processed'
-    )
+    __slots__ = ("max_window_size", "current_window_size", "_bytes_processed")
 
     """
     A basic HTTP/2 window manager.
@@ -34,6 +29,7 @@ class WindowManager:
     :param max_window_size: The maximum size of the flow control window.
     :type max_window_size: ``int``
     """
+
     def __init__(self, max_window_size):
         self.max_window_size = max_window_size
         self.current_window_size = max_window_size
@@ -89,15 +85,17 @@ class WindowManager:
 
         if size is None:
             size = 0
-        
+
         self._bytes_processed += size
         if not self._bytes_processed:
             return None
 
-        max_increment = (self.max_window_size - self.current_window_size)
+        max_increment = self.max_window_size - self.current_window_size
         increment = 0
 
-        min_threshold =  (self.current_window_size == 0) and (self._bytes_processed > min(1024, self.max_window_size // 4))
+        min_threshold = (self.current_window_size == 0) and (
+            self._bytes_processed > min(1024, self.max_window_size // 4)
+        )
         max_threshold = self._bytes_processed >= (self.max_window_size // 2)
 
         # Note that, even though we may increment less than _bytes_processed,

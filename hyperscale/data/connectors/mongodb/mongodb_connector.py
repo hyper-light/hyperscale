@@ -16,6 +16,7 @@ from .mongodb_connector_config import MongoDBConnectorConfig
 
 try:
     from motor.motor_asyncio import AsyncIOMotorClient
+
     has_connector = True
 
 except Exception:
@@ -24,10 +25,10 @@ except Exception:
 
 
 class MongoDBConnector:
-    connector_type=ConnectorType.MongoDB
+    connector_type = ConnectorType.MongoDB
 
     def __init__(
-        self, 
+        self,
         config: MongoDBConnectorConfig,
         stage: str,
         parser_config: Config,
@@ -50,75 +51,66 @@ class MongoDBConnector:
         self.parser = Parser()
 
     async def connect(self):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connecting to MongoDB instance at - {self.host} - Database: {self.database_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connecting to MongoDB instance at - {self.host} - Database: {self.database_name}"
+        )
 
         if self.username and self.password:
-            connection_string = f'mongodb://{self.username}:{self.password}@{self.host}/{self.database_name}'
-        
+            connection_string = f"mongodb://{self.username}:{self.password}@{self.host}/{self.database_name}"
+
         else:
-            connection_string = f'mongodb://{self.host}/{self.database_name}'
+            connection_string = f"mongodb://{self.host}/{self.database_name}"
 
         self.connection = AsyncIOMotorClient(connection_string)
         self.database = self.connection[self.database_name]
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connected to MongoDB instance at - {self.host} - Database: {self.database_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connected to MongoDB instance at - {self.host} - Database: {self.database_name}"
+        )
 
     async def load_execute_stage_summary(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ExecuteStageSummaryValidator]:
-        execute_stage_summary = await self.load_data(
-            options=options
-        )
-        
+        execute_stage_summary = await self.load_data(options=options)
+
         return ExecuteStageSummaryValidator(**execute_stage_summary)
 
     async def load_actions(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[ActionHook]]:
-        
-        actions: List[Dict[str, Any]] = await self.load_data(
-            options=options
-        )
+        actions: List[Dict[str, Any]] = await self.load_data(options=options)
 
-        return await asyncio.gather(*[
-            self.parser.parse_action(
-                action_data,
-                self.stage,
-                self.parser_config,
-                options
-            ) for action_data in actions
-        ])
+        return await asyncio.gather(
+            *[
+                self.parser.parse_action(
+                    action_data, self.stage, self.parser_config, options
+                )
+                for action_data in actions
+            ]
+        )
 
     async def load_results(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ResultsSet]:
-        results = await self.load_data(
-            options=options
-        )
+        results = await self.load_data(options=options)
 
-        return ResultsSet({
-            'stage_results': await asyncio.gather(*[
-                self.parser.parse_result(
-                    results_data,
-                    self.stage,
-                    self.parser_config,
-                    options
-                ) for results_data in results
-            ])
-        })
+        return ResultsSet(
+            {
+                "stage_results": await asyncio.gather(
+                    *[
+                        self.parser.parse_result(
+                            results_data, self.stage, self.parser_config, options
+                        )
+                        for results_data in results
+                    ]
+                )
+            }
+        )
 
     async def load_data(
-        self, 
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[Dict[str, Any]]]:
-        return await self.database[self.collection].find(
-            limit=options.get('limit')
-        )
-    
+        return await self.database[self.collection].find(limit=options.get("limit"))
+
     async def close(self):
         await self.connection.close()
-

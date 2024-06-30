@@ -15,48 +15,34 @@ from .websocket_action_validator import WebsocketActionValidator
 
 
 class WebsocketResultParser(BaseParser):
-
-    def __init__(
-        self,
-        config: Config,
-        options: Dict[str, Any]={}
-    ) -> None:
+    def __init__(self, config: Config, options: Dict[str, Any] = {}) -> None:
         super().__init__(
-            WebsocketResultParser.__name__,
-            config,
-            RequestTypes.GRPC,
-            options
+            WebsocketResultParser.__name__, config, RequestTypes.GRPC, options
         )
 
     async def parse(
-        self, 
-        result_data: Dict[str, Any]
+        self, result_data: Dict[str, Any]
     ) -> Coroutine[Any, Any, Coroutine[Any, Any, WebsocketAction]]:
-        
         normalized_headers = normalize_headers(result_data)
-        content_type = normalized_headers.get('content-type')
+        content_type = normalized_headers.get("content-type")
 
-        parsed_data = parse_data(
-            result_data,
-            content_type
-        )
+        parsed_data = parse_data(result_data, content_type)
 
         tags_data = parse_tags(result_data)
 
         generator_action = WebsocketActionValidator(
-            engine=result_data.get('engine'),
-            name=result_data.get('name'),
-            url=result_data.get('url'),
-            method=result_data.get('method'),
+            engine=result_data.get("engine"),
+            name=result_data.get("name"),
+            url=result_data.get("url"),
+            method=result_data.get("method"),
             headers=normalized_headers,
-            params=result_data.get('params'),
+            params=result_data.get("params"),
             data=parsed_data,
-            weight=result_data.get('weight'),
-            order=result_data.get('order'),
-            user=result_data.get('user'),
-            tag=tags_data
+            weight=result_data.get("weight"),
+            order=result_data.get("order"),
+            user=result_data.get("user"),
+            tag=tags_data,
         )
-
 
         action = WebsocketAction(
             generator_action.name,
@@ -65,28 +51,25 @@ class WebsocketResultParser(BaseParser):
             headers=generator_action.headers,
             data=generator_action.data,
             user=generator_action.user,
-            tags=[
-                tag.dict() for tag in generator_action.tags
-            ]
+            tags=[tag.dict() for tag in generator_action.tags],
         )
 
-
         result_validator = ResultValidator(
-            error=result_data.get('error'),       
-            status=result_data.get('status'),
-            reason=result_data.get('reason'),
-            params=result_data.get('params'),
-            wait_start=result_data.get('wait_start'),
-            start=result_data.get('start'),
-            connect_end=result_data.get('connect_end'),
-            write_end=result_data.get('write_end'),
-            complete=result_data.get('complete'),
-            checks=result_data.get('checks')
+            error=result_data.get("error"),
+            status=result_data.get("status"),
+            reason=result_data.get("reason"),
+            params=result_data.get("params"),
+            wait_start=result_data.get("wait_start"),
+            start=result_data.get("start"),
+            connect_end=result_data.get("connect_end"),
+            write_end=result_data.get("write_end"),
+            complete=result_data.get("complete"),
+            checks=result_data.get("checks"),
         )
 
         result = WebsocketResult(
             action,
-            error=Exception(result_validator.error) if result_validator.error else None
+            error=Exception(result_validator.error) if result_validator.error else None,
         )
 
         result.query = result_validator.query
@@ -101,6 +84,3 @@ class WebsocketResultParser(BaseParser):
         result.checks = result_validator.checks
 
         return result
-
-
-

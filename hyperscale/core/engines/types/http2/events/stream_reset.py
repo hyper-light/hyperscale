@@ -1,8 +1,9 @@
 from .base_event import BaseEvent
 
+
 class StreamReset(BaseEvent):
-    event_type='STREAM_RESET'
-    __slots__ = ('stream_id', 'error_code', 'remote_reset')
+    event_type = "STREAM_RESET"
+    __slots__ = ("stream_id", "error_code", "remote_reset")
     """
     The StreamReset event is fired in two situations. The first is when the
     remote party forcefully resets the stream. The second is when the remote
@@ -12,6 +13,7 @@ class StreamReset(BaseEvent):
     .. versionchanged:: 2.0.0
        This event is now fired when h2 automatically resets a stream.
     """
+
     def __init__(self):
         #: The Stream ID of the stream that was reset.
         self.stream_id = None
@@ -25,5 +27,7 @@ class StreamReset(BaseEvent):
 
     def __repr__(self):
         return "<StreamReset stream_id:%s, error_code:%s, remote_reset:%s>" % (
-            self.stream_id, self.error_code, self.remote_reset
+            self.stream_id,
+            self.error_code,
+            self.remote_reset,
         )

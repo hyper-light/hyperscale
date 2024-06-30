@@ -7,28 +7,17 @@ from .task import Task
 
 
 class TaskResult(BaseResult):
+    __slots__ = ("action_id", "wait_start", "start", "complete", "data", "error")
 
-    __slots__ = (
-        'action_id',
-        'wait_start',
-        'start',
-        'complete',
-        'data',
-        'error'
-    )
-
-    def __init__(self, task: Task, error: Exception=None):
-        super(
-            TaskResult,
-            self
-        ).__init__(
+    def __init__(self, task: Task, error: Exception = None):
+        super(TaskResult, self).__init__(
             task.action_id,
             task.name,
             task.source,
             task.metadata.user,
             task.metadata.tags,
             RequestTypes.TASK,
-            error
+            error,
         )
 
         self.wait_start = 0

@@ -5,7 +5,7 @@ from .condition.decorator import condition
 from .context.decorator import context
 from .depends.decorator import depends
 from .event.decorator import event
-from .internal.decorator import Internal  
+from .internal.decorator import Internal
 from .metric.decorator import metric
 from .load.decorator import load
 from .save.decorator import save

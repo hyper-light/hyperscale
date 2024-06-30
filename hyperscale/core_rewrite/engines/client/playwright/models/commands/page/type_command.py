@@ -12,8 +12,7 @@ from pydantic import (
 class TypeCommand(BaseModel):
     selector: StrictStr
     text: StrictStr
-    delay: Optional[StrictInt | StrictFloat]=None
-    no_wait_after: Optional[StrictInt | StrictFloat]=None
-    strict: Optional[StrictBool]=None
+    delay: Optional[StrictInt | StrictFloat] = None
+    no_wait_after: Optional[StrictInt | StrictFloat] = None
+    strict: Optional[StrictBool] = None
     timeout: StrictInt | StrictFloat
-    

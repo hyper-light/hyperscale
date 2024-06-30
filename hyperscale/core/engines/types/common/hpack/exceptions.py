@@ -11,6 +11,7 @@ class HPACKError(Exception):
     """
     The base class for all ``hpack`` exceptions.
     """
+
     pass
 
 
@@ -18,6 +19,7 @@ class HPACKDecodingError(HPACKError):
     """
     An error has been encountered while performing HPACK decoding.
     """
+
     pass
 
 
@@ -25,6 +27,7 @@ class InvalidTableIndex(HPACKDecodingError):
     """
     An invalid table index was received.
     """
+
     pass
 
 
@@ -35,6 +38,7 @@ class OversizedHeaderListError(HPACKDecodingError):
 
     .. versionadded:: 2.3.0
     """
+
     pass
 
 
@@ -46,4 +50,5 @@ class InvalidTableSizeError(HPACKDecodingError):
 
     .. versionadded:: 3.0.0
     """
+
     pass

@@ -7,5 +7,4 @@ class BigTableConnectorConfig(BaseModel):
     service_account_json_path: StrictStr
     instance_id: StrictStr
     table_name: StrictStr
-    connector_type: ConnectorType=ConnectorType.BigTable
-
+    connector_type: ConnectorType = ConnectorType.BigTable

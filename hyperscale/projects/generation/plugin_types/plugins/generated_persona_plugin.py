@@ -9,7 +9,6 @@ from hyperscale.plugins.types.persona import PersonaPlugin, generate, setup, shu
 
 
 class CustomPersona(PersonaPlugin):
-
     @setup()
     async def setup(self, hooks: Dict[HookType, List[Union[ActionHook, TaskHook]]]):
         return super().setup(hooks)
@@ -23,11 +22,10 @@ class CustomPersona(PersonaPlugin):
         start = time.time()
 
         while elapsed < total_time:
-            yield idx%self.actions_count
+            yield idx % self.actions_count
             await asyncio.sleep(0)
-            
+
             idx += 1
-            
 
         elapsed = time.time() - start
 

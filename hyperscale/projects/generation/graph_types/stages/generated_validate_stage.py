@@ -6,8 +6,7 @@ from hyperscale.core.hooks import validate
 
 
 class ValidateStage(Validate):
-
-    @validate('<action_name_here>')
+    @validate("<action_name_here>")
     async def validate_action(self, action_or_task: Awaitable[BaseResult]):
         result: BaseResult = await action_or_task()
         assert result is not None

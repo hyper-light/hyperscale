@@ -8,9 +8,9 @@ class S3Config(BaseModel):
     aws_secret_access_key: str
     region_name: str
     buckets_namespace: str
-    events_bucket: str='events'
-    metrics_bucket: str='metrics'
-    experiments_bucket: str='experiments'
-    streams_bucket: str='streams'
-    system_metrics_bucket: str='system_metrics'
-    reporter_type: ReporterTypes=ReporterTypes.S3
+    events_bucket: str = "events"
+    metrics_bucket: str = "metrics"
+    experiments_bucket: str = "experiments"
+    streams_bucket: str = "streams"
+    system_metrics_bucket: str = "system_metrics"
+    reporter_type: ReporterTypes = ReporterTypes.S3

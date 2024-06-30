@@ -33,7 +33,7 @@ async def cancel_pending(pend: Task):
             await pend
 
         return pend
-    
+
     except asyncio.CancelledError as cancelled_error:
         return cancelled_error
 
@@ -45,48 +45,47 @@ async def cancel_pending(pend: Task):
 
 
 class DefaultPersona:
-
     __slots__ = (
-        'metadata_string',
-        'persona_id',
-        'logger',
-        'type',
-        'workers',
-        'actions',
-        '_hooks',
-        'batch',
-        '_stream',
-        'total_time',
-        'duration',
-        'total_actions',
-        'total_elapsed',
-        'start',
-        'end',
-        'completed_actions',
-        'pending_actions',
-        'completed_time',
-        'run_timer',
-        'actions_count',
-        'graceful_stop',
-        'is_timed',
-        '_stream_thread',
-        '_loop',
-        'current_action_idx',
-        'optimized_params',
-        '_executor',
-        'stream',
-        'streamed_analytics',
-        'stream_reporter_configs',
-        'stream_reporters',
-        'stage_name',
-        'optimization_active',
-        'pending',
-        'collect_analytics',
-        'collection_interval',
-        'bypass_cleanup',
-        'cpu_monitor',
-        'memory_monitor'
-    )    
+        "metadata_string",
+        "persona_id",
+        "logger",
+        "type",
+        "workers",
+        "actions",
+        "_hooks",
+        "batch",
+        "_stream",
+        "total_time",
+        "duration",
+        "total_actions",
+        "total_elapsed",
+        "start",
+        "end",
+        "completed_actions",
+        "pending_actions",
+        "completed_time",
+        "run_timer",
+        "actions_count",
+        "graceful_stop",
+        "is_timed",
+        "_stream_thread",
+        "_loop",
+        "current_action_idx",
+        "optimized_params",
+        "_executor",
+        "stream",
+        "streamed_analytics",
+        "stream_reporter_configs",
+        "stream_reporters",
+        "stage_name",
+        "optimization_active",
+        "pending",
+        "collect_analytics",
+        "collection_interval",
+        "bypass_cleanup",
+        "cpu_monitor",
+        "memory_monitor",
+    )
 
     def __init__(self, config: Config):
         self.persona_id = str(uuid.uuid4())
@@ -117,7 +116,7 @@ class DefaultPersona:
         self.run_timer = False
         self.actions_count = 0
         self.graceful_stop = config.graceful_stop
-        self.stream: Stream = None 
+        self.stream: Stream = None
 
         self.is_timed = True
         self._stream_thread = None
@@ -136,44 +135,39 @@ class DefaultPersona:
         self.memory_monitor = MemoryMonitor()
 
     def setup(
-            self, 
-            hooks: Dict[HookType, List[Union[ActionHook, TaskHook]]], 
-            metadata_string: str
-        ):
-
-        self._setup(
-            hooks, 
-            metadata_string
-        )
+        self,
+        hooks: Dict[HookType, List[Union[ActionHook, TaskHook]]],
+        metadata_string: str,
+    ):
+        self._setup(hooks, metadata_string)
 
         self.actions_count = len(self._hooks)
 
     def _setup(
-            self, 
-            hooks: Dict[HookType, List[Union[ActionHook, TaskHook]]], 
-            metadata_string: str
-        ):
-        self.metadata_string = f'{metadata_string} Persona: {self.type.capitalize()}:{self.persona_id} - '
+        self,
+        hooks: Dict[HookType, List[Union[ActionHook, TaskHook]]],
+        metadata_string: str,
+    ):
+        self.metadata_string = (
+            f"{metadata_string} Persona: {self.type.capitalize()}:{self.persona_id} - "
+        )
 
-        actions_and_tasks = list([
-            *hooks.get(HookType.ACTION),
-            *hooks.get(HookType.TASK, [])
-        ])
+        actions_and_tasks = list(
+            [*hooks.get(HookType.ACTION), *hooks.get(HookType.TASK, [])]
+        )
 
-        self._hooks = [
-            hook for hook in actions_and_tasks if not hook.skip
-        ]
+        self._hooks = [hook for hook in actions_and_tasks if not hook.skip]
 
         for hook in self._hooks:
             if self.stage_name is None:
                 self.stage_name = hook.stage
-        
-        for reporter_config in self.stream_reporter_configs:
-            self.stream_reporters.append(
-                Reporter(reporter_config)
-            )
 
-        self._stream = len(self.stream_reporters) > 0 and self.optimization_active is False
+        for reporter_config in self.stream_reporter_configs:
+            self.stream_reporters.append(Reporter(reporter_config))
+
+        self._stream = (
+            len(self.stream_reporters) > 0 and self.optimization_active is False
+        )
 
         if self._stream or self.collect_analytics:
             self.stream = Stream()
@@ -184,39 +178,43 @@ class DefaultPersona:
 
     async def execute(self):
         hooks = self._hooks
-        hook_names = ', '.join([
-            hook.name for hook in hooks
-        ])
+        hook_names = ", ".join([hook.name for hook in hooks])
 
-        await self.logger.filesystem.aio['hyperscale.core'].info(f'{self.metadata_string} - Executing {self.actions_count} Hooks: {hook_names}')
+        await self.logger.filesystem.aio["hyperscale.core"].info(
+            f"{self.metadata_string} - Executing {self.actions_count} Hooks: {hook_names}"
+        )
 
         total_time = self.total_time
-        
-        monitor_name = f'{self.stage_name}.persona'
 
-        await self.logger.filesystem.aio['hyperscale.core'].debug(f'{self.metadata_string} - Executing for a total of - {total_time} - seconds')
+        monitor_name = f"{self.stage_name}.persona"
+
+        await self.logger.filesystem.aio["hyperscale.core"].debug(
+            f"{self.metadata_string} - Executing for a total of - {total_time} - seconds"
+        )
         loop = asyncio.get_running_loop()
         if self._stream or self.collect_analytics:
-
             for reporter in self.stream_reporters:
-                reporter.logger.filesystem.aio['hyperscale.reporting'].logger_enabled = False
-                reporter.selected_reporter.logger.filesystem.aio['hyperscale.reporting'].logger_enabled = False
+                reporter.logger.filesystem.aio[
+                    "hyperscale.reporting"
+                ].logger_enabled = False
+                reporter.selected_reporter.logger.filesystem.aio[
+                    "hyperscale.reporting"
+                ].logger_enabled = False
                 await reporter.connect()
 
-            
             await self.cpu_monitor.start_background_monitor(monitor_name)
             await self.memory_monitor.start_background_monitor(monitor_name)
 
             await self.start_stream()
 
             self.start = time.monotonic()
-            completed, pending = await asyncio.wait([
-                loop.create_task(
-                    self.stream.execute_action(
-                        hooks[action_idx]
-                    )
-                ) async for action_idx in self.generator(total_time)
-            ], timeout=self.graceful_stop)
+            completed, pending = await asyncio.wait(
+                [
+                    loop.create_task(self.stream.execute_action(hooks[action_idx]))
+                    async for action_idx in self.generator(total_time)
+                ],
+                timeout=self.graceful_stop,
+            )
 
             self.end = time.monotonic()
 
@@ -229,18 +227,21 @@ class DefaultPersona:
                 await reporter.close()
 
         else:
-
             await self.cpu_monitor.start_background_monitor(monitor_name)
             await self.memory_monitor.start_background_monitor(monitor_name)
 
             self.start = time.monotonic()
-            completed, pending = await asyncio.wait([
-                loop.create_task(
-                    hooks[action_idx].session.execute_prepared_request(
-                        hooks[action_idx].action
+            completed, pending = await asyncio.wait(
+                [
+                    loop.create_task(
+                        hooks[action_idx].session.execute_prepared_request(
+                            hooks[action_idx].action
+                        )
                     )
-                ) async for action_idx in self.generator(total_time)
-            ], timeout=self.graceful_stop)
+                    async for action_idx in self.generator(total_time)
+                ],
+                timeout=self.graceful_stop,
+            )
 
             self.end = time.monotonic()
 
@@ -248,62 +249,61 @@ class DefaultPersona:
             await self.memory_monitor.stop_background_monitor(monitor_name)
 
         self.cpu_monitor.close()
-        self.memory_monitor.close() 
+        self.memory_monitor.close()
 
         execution_elapsed = int(self.end - self.start)
 
-        self.cpu_monitor.trim_monitor_samples(
-            monitor_name,
-            execution_elapsed
-        )
+        self.cpu_monitor.trim_monitor_samples(monitor_name, execution_elapsed)
 
-        self.memory_monitor.trim_monitor_samples(
-            monitor_name,
-            execution_elapsed
-        )
+        self.memory_monitor.trim_monitor_samples(monitor_name, execution_elapsed)
 
         self.pending_actions = len(pending)
-        await self.logger.filesystem.aio['hyperscale.core'].debug(
-            f'{self.metadata_string} - Execution completed with - {self.pending_actions} - actions left pending'
+        await self.logger.filesystem.aio["hyperscale.core"].debug(
+            f"{self.metadata_string} - Execution completed with - {self.pending_actions} - actions left pending"
         )
 
         results = await asyncio.gather(*completed)
 
         cleanup_start = time.monotonic()
 
-        await asyncio.gather(*[
-            asyncio.create_task(
-                cancel_pending(pend)
-            ) for pend in pending
-        ])
+        await asyncio.gather(
+            *[asyncio.create_task(cancel_pending(pend)) for pend in pending]
+        )
 
         cleanup_elapsed = time.monotonic() - cleanup_start
-        await self.logger.filesystem.aio['hyperscale.core'].info(
-            f'{self.metadata_string} - Cleanup completed - Resolved {self.pending_actions} pending actions in {round(cleanup_elapsed, 2)} seconds'
+        await self.logger.filesystem.aio["hyperscale.core"].info(
+            f"{self.metadata_string} - Cleanup completed - Resolved {self.pending_actions} pending actions in {round(cleanup_elapsed, 2)} seconds"
         )
 
         for hook in hooks:
-
             session_closed_start = time.monotonic()
 
-            await self.logger.filesystem.aio['hyperscale.core'].info(f'{self.metadata_string} - Closing session - {hook.session.session_id} - for Hook - {hook.name}:{hook.hook_id}')
+            await self.logger.filesystem.aio["hyperscale.core"].info(
+                f"{self.metadata_string} - Closing session - {hook.session.session_id} - for Hook - {hook.name}:{hook.hook_id}"
+            )
             await hook.session.close()
 
             session_closed_elapsed = time.monotonic() - session_closed_start
 
-            await self.logger.filesystem.aio['hyperscale.core'].info(f'{self.metadata_string} - Closed session - {hook.session.session_id} - for Hook - {hook.name}:{hook.hook_id}. Took: {round(session_closed_elapsed, 2)} seconds')
-        
+            await self.logger.filesystem.aio["hyperscale.core"].info(
+                f"{self.metadata_string} - Closed session - {hook.session.session_id} - for Hook - {hook.name}:{hook.hook_id}. Took: {round(session_closed_elapsed, 2)} seconds"
+            )
+
         self.total_actions = len(set(results))
         self.total_elapsed = self.end - self.start
         self.optimized_params = None
 
-        await self.logger.filesystem.aio['hyperscale.core'].info(f'{self.metadata_string} - Completed execution')
+        await self.logger.filesystem.aio["hyperscale.core"].info(
+            f"{self.metadata_string} - Completed execution"
+        )
 
         return results
 
     async def generator(self, total_time):
         elapsed = 0
-        max_pool_size = math.ceil(self.batch.size * (psutil.cpu_count(logical=False)**2)/self.workers)
+        max_pool_size = math.ceil(
+            self.batch.size * (psutil.cpu_count(logical=False) ** 2) / self.workers
+        )
         action_idx = 0
 
         start = time.monotonic()
@@ -317,22 +317,24 @@ class DefaultPersona:
                     max_wait = total_time - elapsed
                     await asyncio.wait_for(
                         self._hooks[action_idx].session.wait_for_active_threshold(),
-                        timeout=max_wait
+                        timeout=max_wait,
                     )
                 except asyncio.TimeoutError:
                     pass
-            
-            action_idx = (action_idx+1)%self.actions_count
+
+            action_idx = (action_idx + 1) % self.actions_count
 
     async def start_stream(self):
         self._loop = asyncio.get_event_loop()
-        await self.logger.filesystem.aio['hyperscale.core'].info(f'{self.metadata_string} - Live Updates enabled')
-        self._stream_thread = asyncio.create_task(
-            self._run_stream()
+        await self.logger.filesystem.aio["hyperscale.core"].info(
+            f"{self.metadata_string} - Live Updates enabled"
         )
+        self._stream_thread = asyncio.create_task(self._run_stream())
 
     async def stop_stream(self) -> StreamAnalytics:
-        await self.logger.filesystem.aio['hyperscale.core'].info(f'{self.metadata_string} - Live Updates stopped')
+        await self.logger.filesystem.aio["hyperscale.core"].info(
+            f"{self.metadata_string} - Live Updates stopped"
+        )
         self.run_timer = False
         return await self._stream_thread
 
@@ -340,7 +342,7 @@ class DefaultPersona:
         self.run_timer = True
 
         stream_analytics = StreamAnalytics()
-        
+
         stream_submission_tasks = []
         collection_stop_time = self.total_time - 1
 
@@ -353,26 +355,17 @@ class DefaultPersona:
 
             batch_elapsed = time.time() - batch_start
 
-            stream_analytics.add(
-                self.stream,
-                batch_elapsed
-            )
+            stream_analytics.add(self.stream, batch_elapsed)
 
             if self._stream:
                 processed_results = [
-                    results_types.get(
-                        result.type
-                    )(
-                        self.stage_name,
-                        result
-                    ) for result in self.stream.completed
+                    results_types.get(result.type)(self.stage_name, result)
+                    for result in self.stream.completed
                 ]
 
                 for reporter in self.stream_reporters:
                     stream_submission_tasks.append(
-                        asyncio.create_task(
-                            reporter.submit_events(processed_results)
-                        )
+                        asyncio.create_task(reporter.submit_events(processed_results))
                     )
 
             batch_start = time.time()
@@ -382,8 +375,7 @@ class DefaultPersona:
 
         if self._stream:
             await asyncio.gather(*stream_submission_tasks)
-   
+
         self.completed_time = time.time() - start
 
         return stream_analytics
-        

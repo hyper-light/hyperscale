@@ -5,15 +5,15 @@ from .timer import Timer
 
 class ProgressText:
     def __init__(self):
-        self.total_timer = Timer('Total')
-        self.group_timer = Timer('Group')
+        self.total_timer = Timer("Total")
+        self.group_timer = Timer("Group")
 
         self.selected_timer_name = self.group_timer.name
         self.selected_timer = self.group_timer
 
         self.run_cli_task = False
         self.run_timer_task = False
-        self.cli_message = ''
+        self.cli_message = ""
         self.cli_messages = []
         self.next_cli_message = 0
         self._cli_task = None
@@ -23,17 +23,16 @@ class ProgressText:
         self.group_finalized = False
 
     def __str__(self):
-
         self.total_timer.update()
         self.group_timer.update()
 
         if self.finalized:
-            return f'{self.cli_message} - {self.total_timer.elapsed_message}'
+            return f"{self.cli_message} - {self.total_timer.elapsed_message}"
 
         elif self.group_finalized:
-            return f'{self.cli_message} - {self.group_timer.elapsed_message}'
+            return f"{self.cli_message} - {self.group_timer.elapsed_message}"
 
-        return f'> {self.cli_message} - {self.selected_timer.elapsed_message}'
+        return f"> {self.cli_message} - {self.selected_timer.elapsed_message}"
 
     async def append_cli_message(self, text: str):
         self.cli_message = text
@@ -52,7 +51,6 @@ class ProgressText:
 
         while self.run_cli_task:
             for cli_task in self.cli_messages:
-
                 if self.run_cli_task is False:
                     return
 
@@ -77,7 +75,6 @@ class ProgressText:
             if self.run_timer_task is False:
                 return
 
-
     async def stop_cli_tasks(self):
         self.run_cli_task = False
         self.run_timer_task = False
@@ -94,7 +91,6 @@ class ProgressText:
             await self._cli_task
 
     async def clear_and_replace(self, message: str):
-
         await self.pause_cli_tasks()
         self.cli_message = message
         self.cli_messages = [message]

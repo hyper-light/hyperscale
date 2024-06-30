@@ -1,25 +1,19 @@
 import asyncio
-from typing import (
-    Coroutine, 
-    List, 
-    Generic, 
-    TypeVar
-)
+from typing import Coroutine, List, Generic, TypeVar
 
 
-A = TypeVar('A')
+A = TypeVar("A")
 
 
 class Hooks(Generic[A]):
-
     __slots__ = (
-        'before',
-        'after',
-        'checks',
-        'notify',
-        'listen',
-        'listeners',
-        'channels'
+        "before",
+        "after",
+        "checks",
+        "notify",
+        "listen",
+        "listeners",
+        "channels",
     )
 
     def __init__(self) -> None:
@@ -33,29 +27,26 @@ class Hooks(Generic[A]):
         self.channels: List[Coroutine] = []
 
     def to_names(self):
-
         names = {}
 
         if self.before:
-            names['before'] = self.before.name
+            names["before"] = self.before.name
 
         if self.after:
-            names['after'] = self.after.name
+            names["after"] = self.after.name
 
         check_names = []
         for check in self.checks:
             check_names.append(check.name)
 
-        names['checks'] = check_names
+        names["checks"] = check_names
 
         return names
 
     def action_to_serializable(self):
         return {
-            'notify': self.notify,
-            'listen': self.listen,
-            'listeners': [
-                listener.name for listener in self.listeners
-            ],
-            'names': self.to_names()
+            "notify": self.notify,
+            "listen": self.listen,
+            "listeners": [listener.name for listener in self.listeners],
+            "names": self.to_names(),
         }

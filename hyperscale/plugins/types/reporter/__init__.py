@@ -8,5 +8,5 @@ from .hooks.types import (
     process_custom,
     process_errors,
     reporter_connect,
-    reporter_close
+    reporter_close,
 )

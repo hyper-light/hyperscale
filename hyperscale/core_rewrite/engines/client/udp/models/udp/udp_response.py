@@ -43,7 +43,7 @@ class UDPResponse(CallResult):
                 "request_end",
             ],
             float | None,
-        ] = {},
+        ] = None,
     ):
         super(
             UDPResponse,

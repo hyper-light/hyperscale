@@ -9,36 +9,30 @@ from .action import UDPAction
 
 
 class UDPResult(BaseResult):
-
     __slots__ = (
-        'action_id',
-        'url',
-        'ip_addr',
-        'has_response',
-        'path',
-        'params',
-        'query',
-        'hostname',
-        'body',
-        'response_code',
-        '_version',
-        '_reason'
-        '_status'
+        "action_id",
+        "url",
+        "ip_addr",
+        "has_response",
+        "path",
+        "params",
+        "query",
+        "hostname",
+        "body",
+        "response_code",
+        "_version",
+        "_reason" "_status",
     )
 
-    def __init__(self, action: UDPAction, error: Exception=None) -> None:
-
-        super(
-            UDPResult,
-            self
-        ).__init__(
+    def __init__(self, action: UDPAction, error: Exception = None) -> None:
+        super(UDPResult, self).__init__(
             action.action_id,
             action.name,
             action.url.hostname,
             action.metadata.user,
             action.metadata.tags,
             RequestTypes.UDP,
-            error
+            error,
         )
 
         self.url = action.url.full
@@ -57,10 +51,9 @@ class UDPResult(BaseResult):
 
     @property
     def size(self):
-        
         if self.body:
             return len(self.body)
-        
+
         else:
             return 0
 

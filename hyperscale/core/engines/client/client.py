@@ -2,7 +2,14 @@ import os
 import threading
 import uuid
 from asyncio import Future
-from typing import (Dict, Generic, Iterable, Optional, Union, Unpack,)
+from typing import (
+    Dict,
+    Generic,
+    Iterable,
+    Optional,
+    Union,
+    Unpack,
+)
 
 from typing_extensions import TypeVarTuple, Unpack
 
@@ -24,22 +31,20 @@ from .config import Config
 from .plugins_store import PluginsStore
 from .store import ActionsStore
 
-T = TypeVarTuple('T')
+T = TypeVarTuple("T")
 
 config_registry = []
 
 
 class Client(Generic[Unpack[T]]):
-
     def __init__(
         self,
         graph_name: str,
         graph_id: str,
         stage_name: str,
         stage_id: str,
-        config: Optional[Config]=None
+        config: Optional[Config] = None,
     ) -> None:
-
         self.client_id = str(uuid.uuid4())
         self.graph_name = graph_name
         self.graph_id = graph_id
@@ -82,7 +87,7 @@ class Client(Generic[Unpack[T]]):
             for mutation in self._config.mutations:
                 for target in mutation.targets:
                     self.mutations[target] = mutation
-                    
+
     @property
     def thread_id(self) -> int:
         return threading.current_thread().ident
@@ -93,7 +98,7 @@ class Client(Generic[Unpack[T]]):
 
     @property
     def metadata_string(self):
-        return f'Graph - {self.graph_name}:{self.graph_id} - thread:{self.thread_id} - process:{self.process_id} - Stage: {self.stage_name}:{self.stage_id} - '
+        return f"Graph - {self.graph_name}:{self.graph_id} - thread:{self.thread_id} - process:{self.process_id} - Stage: {self.stage_name}:{self.stage_id} - "
 
     @property
     def plugin(self) -> Dict[str, Union[tuple[*T]]]:
@@ -150,7 +155,7 @@ class Client(Generic[Unpack[T]]):
 
             self._http3.mutations.update(self.mutations)
             self.mutations.update(self._http3.mutations)
-       
+
         self._http3.next_name = self.next_name
         self._http3.intercept = self.intercept
         return self._http3
@@ -187,7 +192,6 @@ class Client(Generic[Unpack[T]]):
 
     @property
     def graphqlh2(self):
-
         if self._config is None:
             self._config = config_registry.pop()
 
@@ -248,10 +252,3 @@ class Client(Generic[Unpack[T]]):
         self._udp.next_name = self.next_name
         self._udp.intercept = self.intercept
         return self._udp
-
-
-        
-
-
-        
-        

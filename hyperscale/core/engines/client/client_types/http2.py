@@ -16,7 +16,6 @@ from .base_client import BaseClient
 
 
 class HTTP2Client(BaseClient[MercuryHTTP2Client, HTTP2Action, HTTP2Result]):
-    
     def __init__(self, config: Config) -> None:
         super().__init__()
 
@@ -32,10 +31,10 @@ class HTTP2Client(BaseClient[MercuryHTTP2Client, HTTP2Action, HTTP2Result]):
             concurrency=config.batch_size,
             timeouts=Timeouts(
                 connect_timeout=config.connect_timeout,
-                total_timeout=config.request_timeout
+                total_timeout=config.request_timeout,
             ),
             reset_connections=config.reset_connections,
-            tracing_session=tracing_session
+            tracing_session=tracing_session,
         )
         self.request_type = RequestTypes.HTTP2
         self.client_type = self.request_type.capitalize()
@@ -51,132 +50,119 @@ class HTTP2Client(BaseClient[MercuryHTTP2Client, HTTP2Action, HTTP2Result]):
         return self.session.registered.get(key)
 
     async def get(
-        self, 
-        url: str, 
-        headers: Dict[str, str] = {}, 
+        self,
+        url: str,
+        headers: Dict[str, str] = {},
         user: str = None,
         tags: List[Dict[str, str]] = [],
-        trace: Trace=None
+        trace: Trace = None,
     ):
         if trace and self.session.tracing_session is None:
-            self.session.tracing_session = TraceSession(
-                **trace.to_dict()
-            )
+            self.session.tracing_session = TraceSession(**trace.to_dict())
 
         request = HTTP2Action(
             self.next_name,
             url,
-            method='GET',
+            method="GET",
             headers=headers,
             data=None,
             user=user,
-            tags=tags
+            tags=tags,
         )
-        
+
         return await self._execute_action(request)
 
     async def post(
         self,
-        url: str, 
-        headers: Dict[str, str] = {}, 
+        url: str,
+        headers: Dict[str, str] = {},
         data: Union[dict, str, bytes, Iterator] = None,
         user: str = None,
         tags: List[Dict[str, str]] = [],
-        trace: Trace=None
+        trace: Trace = None,
     ):
         if trace and self.session.tracing_session is None:
-            self.session.tracing_session = TraceSession(
-                **trace.to_dict()
-            )
+            self.session.tracing_session = TraceSession(**trace.to_dict())
 
         request = HTTP2Action(
             self.next_name,
             url,
-            method='POST',
+            method="POST",
             headers=headers,
             data=data,
             user=user,
-            tags=tags
+            tags=tags,
         )
-    
-        return await self._execute_action(request)
 
+        return await self._execute_action(request)
 
     async def put(
         self,
-        url: str, 
-        headers: Dict[str, str] = {}, 
+        url: str,
+        headers: Dict[str, str] = {},
         data: Union[dict, str, bytes, Iterator] = None,
         user: str = None,
         tags: List[Dict[str, str]] = [],
-        trace: Trace=None
+        trace: Trace = None,
     ):
         if trace and self.session.tracing_session is None:
-            self.session.tracing_session = TraceSession(
-                **trace.to_dict()
-            )
+            self.session.tracing_session = TraceSession(**trace.to_dict())
 
         request = HTTP2Action(
             self.next_name,
             url,
-            method='PUT',
+            method="PUT",
             headers=headers,
             data=data,
             user=user,
-            tags=tags
+            tags=tags,
         )
 
         return await self._execute_action(request)
-
 
     async def patch(
         self,
-        url: str, 
-        headers: Dict[str, str] = {}, 
+        url: str,
+        headers: Dict[str, str] = {},
         data: Union[dict, str, bytes, Iterator] = None,
         user: str = None,
         tags: List[Dict[str, str]] = [],
-        trace: Trace=None
+        trace: Trace = None,
     ):
         if trace and self.session.tracing_session is None:
-            self.session.tracing_session = TraceSession(
-                **trace.to_dict()
-            )
+            self.session.tracing_session = TraceSession(**trace.to_dict())
 
         request = HTTP2Action(
             self.next_name,
             url,
-            method='PATCH',
+            method="PATCH",
             headers=headers,
             data=data,
             user=user,
-            tags=tags
+            tags=tags,
         )
 
         return await self._execute_action(request)
 
-
     async def delete(
-        self, 
-        url: str, 
-        headers: Dict[str, str] = {}, 
+        self,
+        url: str,
+        headers: Dict[str, str] = {},
         user: str = None,
         tags: List[Dict[str, str]] = [],
-        trace: Trace=None
+        trace: Trace = None,
     ):
         if trace and self.session.tracing_session is None:
-            self.session.tracing_session = TraceSession(
-                **trace.to_dict()
-            )
+            self.session.tracing_session = TraceSession(**trace.to_dict())
 
         request = HTTP2Action(
             self.next_name,
             url,
-            method='DELETE',
+            method="DELETE",
             headers=headers,
             data=None,
             user=user,
-            tags=tags
+            tags=tags,
         )
 
         return await self._execute_action(request)

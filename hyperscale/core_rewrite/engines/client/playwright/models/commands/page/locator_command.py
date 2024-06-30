@@ -11,11 +11,11 @@ from pydantic import (
 
 class LocatorCommand(BaseModel):
     selector: StrictStr
-    has_text: Optional[StrictStr | Pattern[str]]=None
-    has_not_text: Optional[StrictStr | Pattern[str]]=None
-    has: Optional[Locator]=None
-    has_not: Optional[Locator]=None
+    has_text: Optional[StrictStr | Pattern[str]] = None
+    has_not_text: Optional[StrictStr | Pattern[str]] = None
+    has: Optional[Locator] = None
+    has_not: Optional[Locator] = None
     timeout: StrictInt | StrictFloat
 
     class Config:
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed = True

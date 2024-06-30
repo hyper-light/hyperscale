@@ -166,6 +166,7 @@ class ProtocolError(Exception):
     def __init__(self, reason_phrase: str = ""):
         self.reason_phrase = reason_phrase
 
+
 class QpackDecompressionFailed(ProtocolError):
     error_code = ErrorCode.QPACK_DECOMPRESSION_FAILED
 
@@ -201,6 +202,7 @@ class SettingsError(ProtocolError):
 class StreamCreationError(ProtocolError):
     error_code = ErrorCode.H3_STREAM_CREATION_ERROR
 
+
 class FrameType(IntEnum):
     DATA = 0x0
     HEADERS = 0x1
@@ -213,6 +215,7 @@ class FrameType(IntEnum):
     DUPLICATE_PUSH = 0xE
     WEBTRANSPORT_STREAM = 0x41
 
+
 class StreamType(IntEnum):
     CONTROL = 0
     PUSH = 1
@@ -220,26 +223,27 @@ class StreamType(IntEnum):
     QPACK_DECODER = 3
     WEBTRANSPORT = 0x54
 
+
 class HeadersState(Enum):
     INITIAL = 0
     AFTER_HEADERS = 1
     AFTER_TRAILERS = 2
 
-class H3Stream:
 
-    __slots__ =(
-        'blocked',
-        'blocked_frame_size',
-        'buffer',
-        'ended',
-        'frame_size',
-        'frame_type',
-        'headers_recv_state',
-        'headers_send_state',
-        'push_id',
-        'session_id',
-        'stream_id',
-        'stream_type'
+class H3Stream:
+    __slots__ = (
+        "blocked",
+        "blocked_frame_size",
+        "buffer",
+        "ended",
+        "frame_size",
+        "frame_type",
+        "headers_recv_state",
+        "headers_send_state",
+        "push_id",
+        "session_id",
+        "stream_id",
+        "stream_type",
     )
 
     def __init__(self, stream_id: int) -> None:
@@ -258,11 +262,7 @@ class H3Stream:
 
 
 class ResponseFrameCollection:
-
-    __slots__ = (
-        'headers_frame',
-        'body'
-    )
+    __slots__ = ("headers_frame", "body")
 
     def __init__(self) -> None:
         self.headers_frame: HeadersReceived = None
@@ -270,11 +270,7 @@ class ResponseFrameCollection:
 
 
 class QuicStreamAdapter(asyncio.Transport):
-
-    __slots__ = (
-        'protocol',
-        'stream_id'
-    )
+    __slots__ = ("protocol", "stream_id")
 
     def __init__(self, protocol: QuicProtocol, stream_id: int):
         self.protocol = protocol
@@ -300,59 +296,58 @@ class QuicStreamAdapter(asyncio.Transport):
 
 
 class QuicProtocol(asyncio.DatagramProtocol):
-
     __slots__ = (
-        'loop',
-        '_request_waiter',
-        '_closed',
-        '_connected',
-        '_connected_waiter',
-        '_ping_waiters',
-        'quic',
-        '_stream_readers',
-        '_timer',
-        '_timer_at',
-        '_transmit_task',
-        '_transport',
-        '_connection_id_issued_handler',
-        '_connection_id_retired_handler',
-        '_connection_terminated_handler',
-        '_stream_handler',
-        'pushes',
-        'request_events',
-        '_request_waiter',
-        '_stream',
-        '_is_done',
-        '_max_table_capacity',
-        '_blocked_streams',
-        '_decoder',
-        '_decoder_bytes_received',
-        '_decoder_bytes_sent',
-        'encoder',
-        'encoder_bytes_received',
-        'encoder_bytes_sent',
-        '_settings_received',
-        '_stream',
-        '_max_push_id',
-        '_next_push_id',
-        '_local_control_stream_id',
-        '_local_decoder_stream_id',
-        '_local_encoder_stream_id',
-        '_peer_control_stream_id',
-        '_peer_decoder_stream_id',
-        '_peer_encoder_stream_id',
-        '_received_settings',
-        '_sent_settings',
-        'responses',
-        '_is_closed'
+        "loop",
+        "_request_waiter",
+        "_closed",
+        "_connected",
+        "_connected_waiter",
+        "_ping_waiters",
+        "quic",
+        "_stream_readers",
+        "_timer",
+        "_timer_at",
+        "_transmit_task",
+        "_transport",
+        "_connection_id_issued_handler",
+        "_connection_id_retired_handler",
+        "_connection_terminated_handler",
+        "_stream_handler",
+        "pushes",
+        "request_events",
+        "_request_waiter",
+        "_stream",
+        "_is_done",
+        "_max_table_capacity",
+        "_blocked_streams",
+        "_decoder",
+        "_decoder_bytes_received",
+        "_decoder_bytes_sent",
+        "encoder",
+        "encoder_bytes_received",
+        "encoder_bytes_sent",
+        "_settings_received",
+        "_stream",
+        "_max_push_id",
+        "_next_push_id",
+        "_local_control_stream_id",
+        "_local_decoder_stream_id",
+        "_local_encoder_stream_id",
+        "_peer_control_stream_id",
+        "_peer_decoder_stream_id",
+        "_peer_encoder_stream_id",
+        "_received_settings",
+        "_sent_settings",
+        "responses",
+        "_is_closed",
     )
 
     def __init__(
-        self, quic: QuicConnection, 
+        self,
+        quic: QuicConnection,
         stream_handler: Optional[QuicStreamHandler] = None,
-        loop: asyncio.AbstractEventLoop = None
+        loop: asyncio.AbstractEventLoop = None,
     ):
-        
         self.loop = loop
 
         self._request_waiter: Dict[int, asyncio.Future[Deque[H3Event]]] = {}
@@ -407,9 +402,8 @@ class QuicProtocol(asyncio.DatagramProtocol):
         self._peer_encoder_stream_id: Optional[int] = None
         self._received_settings: Optional[Dict[int, int]] = None
         self._sent_settings: Optional[Dict[int, int]] = None
-        self.responses: Dict[int, ResponseFrameCollection] = {} 
+        self.responses: Dict[int, ResponseFrameCollection] = {}
         self._is_closed = False
-        
 
     def init_connection(self) -> None:
         # send our settings
@@ -481,12 +475,10 @@ class QuicProtocol(asyncio.DatagramProtocol):
         self.quic.connect(addr, now=self.loop.time())
         self.transmit()
 
-    
     def get_or_create_stream(self, stream_id: int) -> H3Stream:
         if stream_id not in self._stream:
             self._stream[stream_id] = H3Stream(stream_id)
         return self._stream[stream_id]
-    
 
     async def create_stream(
         self, is_unidirectional: bool = False
@@ -574,7 +566,6 @@ class QuicProtocol(asyncio.DatagramProtocol):
                     stream_id = event.stream_id
                     stream = self.get_or_create_stream(stream_id)
                     if stream_is_unidirectional(stream_id):
-
                         http_events: List[H3Event] = []
 
                         stream.buffer += event.data
@@ -587,7 +578,11 @@ class QuicProtocol(asyncio.DatagramProtocol):
 
                         while (
                             stream.stream_type
-                            in (StreamType.PUSH, StreamType.CONTROL, StreamType.WEBTRANSPORT)
+                            in (
+                                StreamType.PUSH,
+                                StreamType.CONTROL,
+                                StreamType.WEBTRANSPORT,
+                            )
                             or not buf.eof()
                         ):
                             # fetch stream type for unidirectional streams
@@ -601,7 +596,9 @@ class QuicProtocol(asyncio.DatagramProtocol):
                                 # check unicity
                                 if stream.stream_type == StreamType.CONTROL:
                                     if self._peer_control_stream_id is not None:
-                                        raise StreamCreationError("Only one control stream is allowed")
+                                        raise StreamCreationError(
+                                            "Only one control stream is allowed"
+                                        )
                                     self._peer_control_stream_id = stream.stream_id
                                 elif stream.stream_type == StreamType.QPACK_DECODER:
                                     if self._peer_decoder_stream_id is not None:
@@ -616,11 +613,11 @@ class QuicProtocol(asyncio.DatagramProtocol):
                                         )
                                     self._peer_encoder_stream_id = stream.stream_id
 
-
-
                             if stream.stream_type == StreamType.CONTROL:
                                 if event.end_stream:
-                                    raise ClosedCriticalStream("Closing control stream is not allowed")
+                                    raise ClosedCriticalStream(
+                                        "Closing control stream is not allowed"
+                                    )
 
                                 # fetch next frame
                                 try:
@@ -631,35 +628,51 @@ class QuicProtocol(asyncio.DatagramProtocol):
                                     break
                                 consumed = buf.tell()
 
-                                if frame_type != FrameType.SETTINGS and not self._settings_received:
+                                if (
+                                    frame_type != FrameType.SETTINGS
+                                    and not self._settings_received
+                                ):
                                     raise MissingSettingsError
 
                                 if frame_type == FrameType.SETTINGS:
                                     if self._settings_received:
-                                        raise FrameUnexpected("SETTINGS have already been received")
-                            
+                                        raise FrameUnexpected(
+                                            "SETTINGS have already been received"
+                                        )
+
                                     buf = Buffer(data=frame_data)
                                     settings: Dict[int, int] = {}
                                     while not buf.eof():
                                         setting = buf.pull_uint_var()
                                         value = buf.pull_uint_var()
                                         if setting in RESERVED_SETTINGS:
-                                            raise SettingsError("Setting identifier 0x%x is reserved" % setting)
+                                            raise SettingsError(
+                                                "Setting identifier 0x%x is reserved"
+                                                % setting
+                                            )
                                         if setting in settings:
-                                            raise SettingsError("Setting identifier 0x%x is included twice" % setting)
-                                        settings[setting] = value   
+                                            raise SettingsError(
+                                                "Setting identifier 0x%x is included twice"
+                                                % setting
+                                            )
+                                        settings[setting] = value
 
                                     for setting in [
                                         Setting.ENABLE_CONNECT_PROTOCOL,
                                         Setting.ENABLE_WEBTRANSPORT,
                                         Setting.H3_DATAGRAM,
                                     ]:
-                                        if setting in settings and settings[setting] not in (0, 1):
-                                            raise SettingsError(f"{setting.name} setting must be 0 or 1")
+                                        if setting in settings and settings[
+                                            setting
+                                        ] not in (0, 1):
+                                            raise SettingsError(
+                                                f"{setting.name} setting must be 0 or 1"
+                                            )
 
                                     if (
                                         settings.get(Setting.H3_DATAGRAM) == 1
-                                        and self.quic._remote_max_datagram_frame_size is None
+                                        and self.quic._remote_max_datagram_frame_size
+                                        is None
                                     ):
                                         raise SettingsError(
                                             "H3_DATAGRAM requires max_datagram_frame_size transport parameter"
@@ -669,14 +682,22 @@ class QuicProtocol(asyncio.DatagramProtocol):
                                         settings.get(Setting.ENABLE_WEBTRANSPORT) == 1
                                         and settings.get(Setting.H3_DATAGRAM) != 1
                                     ):
-                                        raise SettingsError("ENABLE_WEBTRANSPORT requires H3_DATAGRAM")
+                                        raise SettingsError(
+                                            "ENABLE_WEBTRANSPORT requires H3_DATAGRAM"
+                                        )
 
                                     self._received_settings = settings
                                     encoder = self.encoder.apply_settings(
-                                        max_table_capacity=settings.get(Setting.QPACK_MAX_TABLE_CAPACITY, 0),
-                                        blocked_streams=settings.get(Setting.QPACK_BLOCKED_STREAMS, 0),
+                                        max_table_capacity=settings.get(
+                                            Setting.QPACK_MAX_TABLE_CAPACITY, 0
+                                        ),
+                                        blocked_streams=settings.get(
+                                            Setting.QPACK_BLOCKED_STREAMS, 0
+                                        ),
                                     )
-                                    self.quic.send_stream_data(self._local_encoder_stream_id, encoder)
+                                    self.quic.send_stream_data(
+                                        self._local_encoder_stream_id, encoder
+                                    )
                                     self._settings_received = True
 
                                 elif frame_type in (
@@ -685,7 +706,9 @@ class QuicProtocol(asyncio.DatagramProtocol):
                                     FrameType.PUSH_PROMISE,
                                     FrameType.DUPLICATE_PUSH,
                                 ):
-                                    raise FrameUnexpected("Invalid frame type on control stream")
+                                    raise FrameUnexpected(
+                                        "Invalid frame type on control stream"
+                                    )
 
                             elif stream.stream_type == StreamType.PUSH:
                                 # fetch push id
@@ -699,7 +722,9 @@ class QuicProtocol(asyncio.DatagramProtocol):
                                 # remove processed data from buffer
                                 stream.buffer = stream.buffer[consumed:]
 
-                                return self._receive_request_or_push_data(stream, b"", event.end_stream)
+                                return self._receive_request_or_push_data(
+                                    stream, b"", event.end_stream
+                                )
                             elif stream.stream_type == StreamType.WEBTRANSPORT:
                                 # fetch session id
                                 if stream.session_id is None:
@@ -736,7 +761,9 @@ class QuicProtocol(asyncio.DatagramProtocol):
                                 data = buf.pull_bytes(buf.capacity - buf.tell())
                                 consumed = buf.tell()
                                 try:
-                                    unblocked_streams.update(self._decoder.feed_encoder(data))
+                                    unblocked_streams.update(
+                                        self._decoder.feed_encoder(data)
+                                    )
                                 except pylsqpack.EncoderStreamError as exc:
                                     raise QpackEncoderStreamError() from exc
                                 self.encoder_bytes_received += len(data)
@@ -767,7 +794,9 @@ class QuicProtocol(asyncio.DatagramProtocol):
                             # resume processing
                             if stream.buffer:
                                 http_events.extend(
-                                    self._receive_request_or_push_data(stream, b"", stream.ended)
+                                    self._receive_request_or_push_data(
+                                        stream, b"", stream.ended
+                                    )
                                 )
 
                         events = http_events
@@ -782,11 +811,10 @@ class QuicProtocol(asyncio.DatagramProtocol):
                         flow_id = buf.pull_uint_var()
                     except BufferReadError:
                         raise ProtocolError("Could not parse flow ID")
-                    
-                    events = [DatagramReceived(
-                        data=event.data[buf.tell() :], 
-                        flow_id=flow_id
-                    )]
+
+                    events = [
+                        DatagramReceived(data=event.data[buf.tell() :], flow_id=flow_id)
+                    ]
 
             except ProtocolError as exc:
                 self._is_done = True
@@ -795,9 +823,7 @@ class QuicProtocol(asyncio.DatagramProtocol):
                 )
 
         for http_event in events:
-
             if isinstance(http_event, HeadersReceived):
-
                 if self.responses.get(http_event.stream_id) is None:
                     self.responses[http_event.stream_id] = ResponseFrameCollection()
 
@@ -807,9 +833,7 @@ class QuicProtocol(asyncio.DatagramProtocol):
                     # push
                     self.pushes[http_event.push_id].append(http_event)
 
-
             elif isinstance(http_event, DataReceived):
-
                 if self.responses.get(http_event.stream_id) is None:
                     self.responses[http_event.stream_id] = ResponseFrameCollection()
 
@@ -817,11 +841,11 @@ class QuicProtocol(asyncio.DatagramProtocol):
                 request_waiter = self._request_waiter.get(http_event.stream_id)
 
                 if http_event.stream_ended and request_waiter is None:
-                    raise Exception('Err. - Stream failed')
-                
+                    raise Exception("Err. - Stream failed")
+
                 elif http_event.stream_ended and request_waiter.done() is False:
                     request_waiter.set_result(self.responses.pop(http_event.stream_id))
-                
+
                 if http_event.push_id in self.pushes:
                     # push
                     self.pushes[http_event.push_id].append(http_event)
@@ -829,7 +853,7 @@ class QuicProtocol(asyncio.DatagramProtocol):
             elif isinstance(event, PushPromiseReceived):
                 self.pushes[event.push_id] = deque()
                 self.pushes[event.push_id].append(event)
-    
+
     def _receive_request_or_push_data(
         self, stream: H3Stream, data: bytes, stream_ended: bool
     ) -> List[H3Event]:
@@ -1062,7 +1086,6 @@ class QuicProtocol(asyncio.DatagramProtocol):
                     required_pseudo_headers=frozenset(),
                 )
 
-
             # update state and emit headers
             if stream.headers_recv_state == HeadersState.INITIAL:
                 stream.headers_recv_state = HeadersState.AFTER_HEADERS
@@ -1077,7 +1100,6 @@ class QuicProtocol(asyncio.DatagramProtocol):
                 )
             )
         elif frame_type == FrameType.PUSH_PROMISE and stream.push_id is None:
-            
             frame_buf = Buffer(data=frame_data)
             push_id = frame_buf.pull_uint_var()
             headers = self._decode_headers(
@@ -1117,7 +1139,7 @@ class QuicProtocol(asyncio.DatagramProtocol):
             )
 
         return http_events
-    
+
     def _decode_headers(self, stream_id: int, frame_data: Optional[bytes]) -> Headers:
         """
         Decode a HEADERS block and send decoder updates on the decoder stream.

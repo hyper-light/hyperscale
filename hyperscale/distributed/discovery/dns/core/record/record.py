@@ -30,13 +30,8 @@ from .record_data_types import (
 MAXAGE = 3600000
 
 
-
 class Record:
-
-    record_types: Dict[
-        RecordType,
-        RecordData
-    ] = {
+    record_types: Dict[RecordType, RecordData] = {
         RecordType.A: ARecordData,
         RecordType.AAAA: AAAARecordData,
         RecordType.CNAME: CNAMERecordData,
@@ -46,17 +41,17 @@ class Record:
         RecordType.PTR: PTRRecordData,
         RecordType.SOA: SOARecordData,
         RecordType.SRV: SRVRecordData,
-        RecordType.TXT: TXTRecordData
+        RecordType.TXT: TXTRecordData,
     }
 
     def __init__(
         self,
         query_type: QueryType = QueryType.REQUEST,
-        name: str = '',
+        name: str = "",
         record_type: RecordType = RecordType.ANY,
         qclass: int = 1,
         ttl: int = 0,
-        data: Tuple[int, RecordData] = None
+        data: Tuple[int, RecordData] = None,
     ):
         self.query_type = query_type
         self.name = name
@@ -70,126 +65,69 @@ class Record:
         self.types_map = RecordTypesMap()
 
     @classmethod
-    def create_rdata(
-        cls,
-        record_type: RecordType, 
-        *args
-    ) -> RecordData:
-        
+    def create_rdata(cls, record_type: RecordType, *args) -> RecordData:
         record_data = cls.record_types.get(record_type)
 
         if record_data is None:
-            return UnsupportedRecordData(
-                record_type,
-                *args
-            )
+            return UnsupportedRecordData(record_type, *args)
 
-        return record_data(
-            *args
-        )
+        return record_data(*args)
 
     @classmethod
     def load_rdata(
-        cls,
-        record_type: RecordType, 
-        data: bytes, 
-        cursor_position: int,
-        size: int
+        cls, record_type: RecordType, data: bytes, cursor_position: int, size: int
     ) -> Tuple[int, RecordData]:
-        '''Load RData from a byte sequence.'''
+        """Load RData from a byte sequence."""
         record_data = cls.record_types.get(record_type)
         if record_data is None:
-            return UnsupportedRecordData.load(
-                data, 
-                cursor_position, 
-                size, 
-                record_type
-            )
-        
-        return record_data.load(
-            data, 
-            cursor_position, 
-            size
-        )
+            return UnsupportedRecordData.load(data, cursor_position, size, record_type)
 
-    def copy(
-        self, 
-        **kwargs
-    ):
+        return record_data.load(data, cursor_position, size)
+
+    def copy(self, **kwargs):
         return Record(
-            query_type=kwargs.get('query_type', self.query_type),
-            name=kwargs.get('name', self.name),
-            record_type=kwargs.get('record_type', self.record_type),
-            qclass=kwargs.get('qclass', self.qclass),
-            ttl=kwargs.get('ttl', self.ttl),
-            data=kwargs.get('data', self.data)
+            query_type=kwargs.get("query_type", self.query_type),
+            name=kwargs.get("name", self.name),
+            record_type=kwargs.get("record_type", self.record_type),
+            qclass=kwargs.get("qclass", self.qclass),
+            ttl=kwargs.get("ttl", self.ttl),
+            data=kwargs.get("data", self.data),
         )
 
-    def parse(
-        self, 
-        data: bytes, 
-        cursor_position: int
-    ):
-        cursor_position, self.name = load_domain_name(
-            data, 
-            cursor_position
-        )
+    def parse(self, data: bytes, cursor_position: int):
+        cursor_position, self.name = load_domain_name(data, cursor_position)
 
         record_type, self.qclass = struct.unpack(
-            '!HH', 
-            data[cursor_position:cursor_position + 4]
+            "!HH", data[cursor_position : cursor_position + 4]
         )
 
-        self.record_type = self.types_map.types_by_code.get(
-            record_type
-        )
+        self.record_type = self.types_map.types_by_code.get(record_type)
 
         cursor_position += 4
         if self.query_type == QueryType.RESPONSE:
             self.timestamp = int(time.time())
             self.ttl, size = struct.unpack(
-                '!LH', 
-                data[cursor_position:cursor_position + 6]
+                "!LH", data[cursor_position : cursor_position + 6]
             )
 
             cursor_position += 6
 
             _, self.data = Record.load_rdata(
-                self.record_type, 
-                data, 
-                cursor_position, 
-                size
+                self.record_type, data, cursor_position, size
             )
 
             cursor_position += size
 
         return cursor_position
 
-    def pack(
-        self, 
-        names, 
-        offset=0
-    ):
+    def pack(self, names, offset=0):
         buf = io.BytesIO()
 
-        buf.write(
-            pack_domain_name(
-                self.name, 
-                names, 
-                offset
-            )
-        )
+        buf.write(pack_domain_name(self.name, names, offset))
 
-        buf.write(
-            struct.pack(
-                '!HH', 
-                self.record_type.value, 
-                self.qclass
-            )
-        )
+        buf.write(struct.pack("!HH", self.record_type.value, self.qclass))
 
         if self.query_type == QueryType.RESPONSE:
-
             if self.ttl < 0:
                 ttl = MAXAGE
 
@@ -203,25 +141,10 @@ class Record:
                 self.timestamp = now
                 ttl = self.ttl
 
-            buf.write(
-                struct.pack(
-                    '!L', 
-                    ttl
-                )
-            )
+            buf.write(struct.pack("!L", ttl))
 
-            data_str = b''.join(
-                self.data.dump(
-                    names, 
-                    offset + buf.tell()
-                )
-            )
+            data_str = b"".join(self.data.dump(names, offset + buf.tell()))
 
-            buf.write(
-                pack_string(
-                    data_str, 
-                    '!H'
-                )
-            )
+            buf.write(pack_string(data_str, "!H"))
 
         return buf.getvalue()

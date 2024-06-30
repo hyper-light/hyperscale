@@ -20,6 +20,7 @@ from hyperscale.core_rewrite.engines.client import TimeParser
 from hyperscale.core_rewrite.engines.client.setup_clients import setup_client
 from hyperscale.core_rewrite.hooks import Hook, HookType
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
+from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.state import (
     Context,
     ContextHook,
@@ -68,12 +69,13 @@ def _guard_result(result: asyncio.Task):
 class Graph:
     def __init__(
         self,
+        test_name: str,
         workflows: List[Workflow | DependentWorkflow],
     ) -> None:
-        self.graph = __file__
+        self.test = test_name
         self.workflows = workflows
-        self.max_active = 0
-        self.active = 0
+        self._max_active: Dict[str, int] = {}
+        self._active: Dict[str, int] = {}
 
         self._active_waiters: Dict[str, asyncio.Future | None] = {}
 
@@ -93,7 +95,7 @@ class Graph:
         self._workflow_traversal_order: List[
             Dict[
                 str,
-                Hook,
+                Workflow,
             ]
         ] = []
 
@@ -107,8 +109,10 @@ class Graph:
 
         self._create_workflow_graph()
 
+        workflow_results: List[WorkflowStats | Dict[str, Any | Exception]] = []
+
         for workflow_set in self._workflow_traversal_order:
-            updated_contexts = await asyncio.gather(
+            results = await asyncio.gather(
                 *[
                     self._run_workflow(
                         workflow,
@@ -117,6 +121,11 @@ class Graph:
                     for workflow in workflow_set.values()
                 ]
             )
+
+            batch_results = [result for result, _ in results]
+
+            workflow_results.extend(batch_results)
+
             await asyncio.gather(
                 *[
                     context.update(
@@ -124,11 +133,35 @@ class Graph:
                         key,
                         value,
                     )
-                    for updated in updated_contexts
-                    for workflow_name, workflow_context in updated.iter_workflow_contexts()
+                    for _, updated_context in results
+                    for workflow_name, workflow_context in updated_context.iter_workflow_contexts()
                     for key, value in workflow_context.items()
                 ]
             )
+
+        return {"test": self.test, "results": workflow_results}
+
+    async def run_workflow(self, workflow: Workflow, context: Context):
+        self._create_workflow_graph()
+
+        (results, updated_context) = await self._run_workflow(
+            workflow,
+            context,
+        )
+
+        await asyncio.gather(
+            *[
+                context.update(
+                    workflow_name,
+                    key,
+                    value,
+                )
+                for workflow_name, workflow_context in updated_context.iter_workflow_contexts()
+                for key, value in workflow_context.items()
+            ]
+        )
+
+        return (results, context)
 
     def _create_workflow_graph(self):
         workflow_graph = networkx.DiGraph()
@@ -171,7 +204,14 @@ class Graph:
         self,
         workflow: Workflow,
         context: Context,
-    ):
+    ) -> Tuple[
+        WorkflowStats
+        | Dict[
+            str,
+            Any | Exception,
+        ],
+        Context,
+    ]:
         state_actions = self._setup_state_actions(workflow)
         context = await self._use_context(
             workflow.name,
@@ -210,7 +250,7 @@ class Graph:
             results,
         )
 
-        return context
+        return (results, context)
 
     async def _use_context(
         self,
@@ -234,10 +274,12 @@ class Graph:
                 for name, value in context[provider].items()
             }
 
-        await asyncio.gather(*[hook.call(**hook.context_args) for hook in use_actions])
+        results = await asyncio.gather(
+            *[hook.call(**hook.context_args) for hook in use_actions]
+        )
 
         await asyncio.gather(
-            *[context[workflow].set(hook.name, hook.result) for hook in use_actions]
+            *[context[workflow].set(hook_name, result) for hook_name, result in results]
         )
 
         return context
@@ -258,6 +300,7 @@ class Graph:
         if len(provide_actions) < 1:
             return context
 
+        hook_targets: Dict[str, Hook] = {}
         for hook in provide_actions:
             hook.context_args = {
                 name: value for name, value in context[workflow].items()
@@ -265,15 +308,17 @@ class Graph:
 
             hook.context_args.update(results)
 
-        await asyncio.gather(
+            hook_targets[hook.name] = hook.workflows
+
+        context_results = await asyncio.gather(
             *[hook.call(**hook.context_args) for hook in provide_actions]
         )
 
         await asyncio.gather(
             *[
-                context[target].set(hook.name, hook.result)
-                for hook in provide_actions
-                for target in hook.workflows
+                context[target].set(hook_name, result)
+                for hook_name, result in context_results
+                for target in hook_targets[hook_name]
             ]
         )
 
@@ -294,6 +339,8 @@ class Graph:
 
         workflow_context = context[workflow.name].dict()
 
+        start = time.monotonic()
+
         completed, pending = await asyncio.wait(
             [
                 loop.create_task(
@@ -312,6 +359,8 @@ class Graph:
             ],
             timeout=1,
         )
+
+        elapsed = time.monotonic() - start
 
         await asyncio.gather(*completed)
 
@@ -344,6 +393,7 @@ class Graph:
         processed_results = workflow_results.process(
             workflow_name,
             workflow_results_set,
+            elapsed,
         )
 
         return processed_results
@@ -353,7 +403,7 @@ class Graph:
         workflow: Workflow,
         traversal_order: List[Dict[str, Hook]],
         context: Context,
-    ):
+    ) -> Dict[str, Any]:
         workflow_name = workflow.name
         config = self._workflow_configs[workflow_name]
 
@@ -391,6 +441,7 @@ class Graph:
         Dict[str, Hook],
     ]:
         self._workflows_by_name[workflow.name] = workflow
+        self._active[workflow.name] = 0
 
         config = {
             "vus": 1000,
@@ -416,7 +467,7 @@ class Graph:
         vus = config.get("vus")
         threads = config.get("threads")
 
-        self.max_active = math.ceil(
+        self._max_active[workflow.name] = math.ceil(
             vus * (psutil.cpu_count(logical=False) ** 2) / threads
         )
 
@@ -539,7 +590,7 @@ class Graph:
             await asyncio.sleep(0)
 
             if (
-                self.active > self.max_active
+                self._active[workflow_name] > self._max_active[workflow_name]
                 and self._active_waiters[workflow_name] is None
             ):
                 self._active_waiters[workflow_name] = (
@@ -569,7 +620,7 @@ class Graph:
 
             for hook_set in traversal_order:
                 set_count = len(hook_set)
-                self.active += set_count
+                self._active[workflow_name] += set_count
 
                 for hook in hook_set.values():
                     hook.context_args.update(
@@ -608,10 +659,10 @@ class Graph:
 
                 self._pending[workflow_name].extend(pending)
 
-                self.active -= set_count
+                self._active[workflow_name] -= set_count
 
                 if (
-                    self.active <= self.max_active
+                    self._active[workflow_name] <= self._max_active[workflow_name]
                     and self._active_waiters[workflow_name]
                 ):
                     try:

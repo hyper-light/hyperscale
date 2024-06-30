@@ -10,7 +10,6 @@ from .validator import MutationValidator
 
 
 class Mutation:
-
     def __init__(
         self,
         name: str,
@@ -19,29 +18,24 @@ class Mutation:
         *targets: Tuple[str],
     ) -> None:
         validated_mutation = MutationValidator(
-            name=name,
-            chance=chance,
-            targets=targets,
-            mutation_type=mutation_type
+            name=name, chance=chance, targets=targets, mutation_type=mutation_type
         )
 
         self.name = validated_mutation.name
         self.chance = validated_mutation.chance
         self.targets = list(validated_mutation.targets)
-        self.stage: Any = SimpleNamespace(
-            context=SimpleContext()
-        )
+        self.stage: Any = SimpleNamespace(context=SimpleContext())
 
         self.mutation_type = validated_mutation.mutation_type
 
         unstable_threadsafe(Mutation)
 
-    async def mutate(self, action: BaseAction=None):
+    async def mutate(self, action: BaseAction = None):
         raise NotImplementedError(
-            'Err. - mutate() is an abstract method in the base Mutation class.'
+            "Err. - mutate() is an abstract method in the base Mutation class."
         )
-    
+
     def copy(self):
         raise NotImplementedError(
-            'Err. - copy() is an abstract method in the base Mutation class.'
+            "Err. - copy() is an abstract method in the base Mutation class."
         )

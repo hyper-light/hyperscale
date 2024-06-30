@@ -6,13 +6,7 @@ from .param_type import ParamType
 
 
 class Batch:
-
-    __slots__ = (
-        'gradient',
-        'size',
-        'interval',
-        'deferred'
-    )
+    __slots__ = ("gradient", "size", "interval", "deferred")
 
     def __init__(self, config: Config) -> None:
         self.gradient = config.batch_gradient
@@ -25,30 +19,21 @@ class Batch:
 
     def to_params(self):
         return {
-            'batch_gradient': {
-                'value': self.gradient,
-                'type': ParamType.FLOAT
-            },
-            'batch_size': {
-                'value': self.size,
-                'type': ParamType.INTEGER
-            },
-            'batch_interval': {
-                'value': self.size,
-                'type': ParamType.FLOAT
-            }
+            "batch_gradient": {"value": self.gradient, "type": ParamType.FLOAT},
+            "batch_size": {"value": self.size, "type": ParamType.INTEGER},
+            "batch_interval": {"value": self.size, "type": ParamType.FLOAT},
         }
 
     def update(self, values: Dict[str, Union[int, float]]):
-        gradient = values.get('batch_gradient')
+        gradient = values.get("batch_gradient")
         if gradient is None:
             gradient = self.gradient
 
-        size = values.get('batch_size')
+        size = values.get("batch_size")
         if size is None:
             size = self.size
 
-        interval = values.get('batch_interval')
+        interval = values.get("batch_interval")
         if interval is None:
             interval = self.interval
 

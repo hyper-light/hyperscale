@@ -20,35 +20,26 @@ from .websocket_action_validator import WebsocketActionValidator
 
 
 class WebsocketActionParser(BaseParser):
-
-    def __init__(
-        self,
-        config: Config,
-        options: Dict[str, Any]={}
-    ) -> None:
+    def __init__(self, config: Config, options: Dict[str, Any] = {}) -> None:
         super().__init__(
-            WebsocketActionParser.__name__,
-            config,
-            RequestTypes.WEBSOCKET,
-            options
+            WebsocketActionParser.__name__, config, RequestTypes.WEBSOCKET, options
         )
 
     async def parse(
-        self, 
-        action_data: Dict[str, Any],
-        stage: str
+        self, action_data: Dict[str, Any], stage: str
     ) -> Coroutine[Any, Any, Coroutine[Any, Any, ActionHook]]:
-        
         normalized_headers = normalize_headers(action_data)
         parsed_data = parse_data(action_data)
         tags_data = parse_tags(action_data)
 
-        generator_action = WebsocketActionValidator(**{
-            **action_data,
-            'headers': normalized_headers,
-            'data': parsed_data,
-            'tags': tags_data
-        })
+        generator_action = WebsocketActionValidator(
+            **{
+                **action_data,
+                "headers": normalized_headers,
+                "data": parsed_data,
+                "tags": tags_data,
+            }
+        )
 
         action = WebsocketAction(
             generator_action.name,
@@ -57,24 +48,20 @@ class WebsocketActionParser(BaseParser):
             headers=generator_action.headers,
             data=generator_action.data,
             user=generator_action.user,
-            tags=[
-                tag.dict() for tag in generator_action.tags
-            ]
+            tags=[tag.dict() for tag in generator_action.tags],
         )
 
         session = MercuryWebsocketClient(
             concurrency=self.config.batch_size,
             timeouts=self.timeouts,
             reset_connections=self.config.reset_connections,
-            tracing_session=self.config.tracing
+            tracing_session=self.config.tracing,
         )
 
         await session.prepare(action)
 
         hook = ActionHook(
-            f'{stage}.{generator_action.name}',
-            generator_action.name,
-            None
+            f"{stage}.{generator_action.name}", generator_action.name, None
         )
 
         hook.session = session
@@ -88,8 +75,4 @@ class WebsocketActionParser(BaseParser):
         hook.metadata.tags = generator_action.tags
         hook.metadata.user = generator_action.user
 
-
         return hook
-
-
-

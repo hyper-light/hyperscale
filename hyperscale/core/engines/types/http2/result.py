@@ -12,40 +12,36 @@ from .action import HTTP2Action
 
 
 class HTTP2Result(BaseResult):
-
     __slots__ = (
-        'action_id',
-        'url',
-        'ip_addr',
-        'method',
-        'path',
-        'params',
-        'query',
-        'hostname',
-        'body',
-        'response_code',
-        'deferred_headers',
-        '_headers',
-        '_compression',
-        '_content_type',
-        '_size',
-        '_version',
-        '_reason',
-        '_status'
+        "action_id",
+        "url",
+        "ip_addr",
+        "method",
+        "path",
+        "params",
+        "query",
+        "hostname",
+        "body",
+        "response_code",
+        "deferred_headers",
+        "_headers",
+        "_compression",
+        "_content_type",
+        "_size",
+        "_version",
+        "_reason",
+        "_status",
     )
 
     def __init__(self, action: HTTP2Action, error: Exception = None) -> None:
-        super(
-            HTTP2Result,
-            self
-        ).__init__(
+        super(HTTP2Result, self).__init__(
             action.action_id,
             action.name,
             action.url.hostname,
             action.metadata.user,
             action.metadata.tags,
             RequestTypes.HTTP2,
-            error
+            error,
         )
 
         self.url = action.url.full
@@ -58,7 +54,7 @@ class HTTP2Result(BaseResult):
         self.headers: Dict[bytes, bytes] = {}
         self.status: int = None
         self.body = bytearray()
-        
+
         self.response_code: str = None
         self._compression = None
         self._content_type = None
@@ -71,8 +67,8 @@ class HTTP2Result(BaseResult):
     def content_type(self):
         if len(self.headers) == 0 and self.deferred_headers:
             self.headers = self._parse_headers()
-            self._content_type = self.headers.get(b'content-type')
-        
+            self._content_type = self.headers.get(b"content-type")
+
         return self._content_type
 
     @content_type.setter
@@ -83,7 +79,7 @@ class HTTP2Result(BaseResult):
     def compression(self):
         if len(self.headers) == 0 and self.deferred_headers:
             self.headers = self._parse_headers()
-            self._compression = self.headers.get(b'content-encoding')
+            self._compression = self.headers.get(b"content-encoding")
 
         return self._compression
 
@@ -95,7 +91,7 @@ class HTTP2Result(BaseResult):
     def version(self) -> Union[str, None]:
         if len(self.headers) == 0 and self.deferred_headers:
             self.headers = self._parse_headers()
-            self._version = self.headers.get(b'version')
+            self._version = self.headers.get(b"version")
 
         return self._version
 
@@ -107,7 +103,7 @@ class HTTP2Result(BaseResult):
     def reason(self) -> Union[str, None]:
         if len(self.headers) == 0 and self.deferred_headers:
             self.headers = self._parse_headers()
-            self._reason = self.headers.get(b'reason')
+            self._reason = self.headers.get(b"reason")
 
         return self._reason
 
@@ -117,16 +113,15 @@ class HTTP2Result(BaseResult):
 
     @property
     def size(self):
-        
         if len(self.headers) == 0 and self.deferred_headers:
             self.headers = self._parse_headers()
-            content_length = self.headers.get(b'content-length')
+            content_length = self.headers.get(b"content-length")
             if content_length:
                 self._size = int(content_length)
 
             elif len(self.body) > 0:
                 self._size = len(self.body)
-            
+
             else:
                 self._size = 0
 
@@ -135,23 +130,22 @@ class HTTP2Result(BaseResult):
     @size.setter
     def size(self, value: int):
         self._size = value
-        
+
     @property
     def data(self) -> Union[str, dict, None]:
-
         if len(self.headers) == 0 and self.deferred_headers:
             self._headers = self._parse_headers()
 
         data = self.body
         try:
-            if self.headers.get(b'content-encoding') == b"gzip":
+            if self.headers.get(b"content-encoding") == b"gzip":
                 data = gzip_decompress(self.body)
-            elif self.headers.get(b'content-encoding') == b"deflate":
+            elif self.headers.get(b"content-encoding") == b"deflate":
                 data = zlib_decompress(self.body)
 
-            if self.headers.get(b'content-type') == b"application/json":
+            if self.headers.get(b"content-type") == b"application/json":
                 data = json.loads(self.body)
-            
+
             elif isinstance(self.body, (bytes, bytearray)):
                 data = str(self.body.decode())
 
@@ -167,7 +161,7 @@ class HTTP2Result(BaseResult):
     def _parse_headers(self):
         try:
             status, decoded_headers = self.deferred_headers.parse()
-            decoded_headers['status'] = status
+            decoded_headers["status"] = status
             return decoded_headers
 
         except Exception:

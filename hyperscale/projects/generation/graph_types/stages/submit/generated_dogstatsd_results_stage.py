@@ -3,7 +3,4 @@ from hyperscale.reporting.types import DogStatsDConfig
 
 
 class SubmitDogStatsDResultsStage(Submit):
-    config=DogStatsDConfig(
-        host='localhost',
-        port=8125
-    )
+    config = DogStatsDConfig(host="localhost", port=8125)

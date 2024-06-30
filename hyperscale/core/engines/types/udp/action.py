@@ -10,36 +10,31 @@ from hyperscale.core.engines.types.common.types import RequestTypes
 
 
 class UDPAction(BaseAction):
-
     __slots__ = (
-        'action_id',
-        'protocols',
-        'wait_for_response',
-        'type',
-        'url',
-        '_data',
-        'encoded_data',
-        'is_stream',
-        'ssl_context',
-        'event',
-        'action_args',
-        'mutations'
+        "action_id",
+        "protocols",
+        "wait_for_response",
+        "type",
+        "url",
+        "_data",
+        "encoded_data",
+        "is_stream",
+        "ssl_context",
+        "event",
+        "action_args",
+        "mutations",
     )
-    
+
     def __init__(
         self,
-        name: str, 
-        url: str, 
-        wait_for_response: bool = False, 
-        data: Union[str, dict, Iterator, bytes, None] = None, 
-        user: str=None, 
-        tags: List[Dict[str, str]] = []
+        name: str,
+        url: str,
+        wait_for_response: bool = False,
+        data: Union[str, dict, Iterator, bytes, None] = None,
+        user: str = None,
+        tags: List[Dict[str, str]] = [],
     ) -> None:
-        super(UDPAction, self).__init__(
-            name,
-            user,
-            tags
-        )
+        super(UDPAction, self).__init__(name, user, tags)
 
         self.wait_for_response = wait_for_response
         self.type = RequestTypes.UDP
@@ -78,27 +73,20 @@ class UDPAction(BaseAction):
 
     def _setup_data(self):
         if self._data:
-            
             if isinstance(self._data, Iterator):
                 chunks = bytearray()
                 for chunk in self._data:
-                    chunks.extend(
-                        chunk.encode()
-                    )
+                    chunks.extend(chunk.encode())
 
                 self.is_stream = True
                 self.encoded_data = bytes(chunks)
 
             else:
                 if isinstance(self._data, dict):
-                    self.encoded_data = json.dumps(
-                        self._data
-                    ).encode()
+                    self.encoded_data = json.dumps(self._data).encode()
 
                 elif isinstance(self._data, tuple):
-                    self.encoded_data = urlencode(
-                        self._data
-                    ).encode()
+                    self.encoded_data = urlencode(self._data).encode()
 
                 elif isinstance(self._data, str):
                     self.encoded_data = self._data.encode()

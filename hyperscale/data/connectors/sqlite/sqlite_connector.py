@@ -27,7 +27,7 @@ try:
         AsyncEngine,
         create_async_engine,
     )
-        
+
     has_connector = True
 
 except Exception:
@@ -39,17 +39,16 @@ except Exception:
     has_connector = False
 
 
-
 class SQLiteConnector:
-    connector_type=ConnectorType.SQLite
+    connector_type = ConnectorType.SQLite
 
     def __init__(
-        self, 
+        self,
         config: SQLiteConnectorConfig,
         stage: str,
         parser_config: Config,
     ) -> None:
-        self.path = f'sqlite+aiosqlite:///{config.path}'
+        self.path = f"sqlite+aiosqlite:///{config.path}"
         self.table_name = config.table_name
         self.stage = stage
         self.parser_config = parser_config
@@ -70,67 +69,60 @@ class SQLiteConnector:
         self.parser = Parser()
 
     async def connect(self):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connecting to SQLite at - {self.path} - Database: {self.database}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connecting to SQLite at - {self.path} - Database: {self.database}"
+        )
         self._engine = create_async_engine(self.path)
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connected to SQLite at - {self.path} - Database: {self.database}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connected to SQLite at - {self.path} - Database: {self.database}"
+        )
 
     async def load_execute_stage_summary(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ExecuteStageSummaryValidator]:
-        execute_stage_summary = await self.load_data(
-            options=options
-        )
-        
+        execute_stage_summary = await self.load_data(options=options)
+
         return ExecuteStageSummaryValidator(**execute_stage_summary)
 
     async def load_actions(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[ActionHook]]:
-        actions = await self.load_data(
-            options=options
+        actions = await self.load_data(options=options)
+
+        return await asyncio.gather(
+            *[
+                self.parser.parse_action(
+                    action_data, self.stage, self.parser_config, options
+                )
+                for action_data in actions
+            ]
         )
 
-        return await asyncio.gather(*[
-            self.parser.parse_action(
-                action_data,
-                self.stage,
-                self.parser_config,
-                options
-            ) for action_data in actions
-        ])
-    
     async def load_results(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ResultsSet]:
-        results = await self.load_data(
-            options=options
+        results = await self.load_data(options=options)
+
+        return ResultsSet(
+            {
+                "stage_results": await asyncio.gather(
+                    *[
+                        self.parser.parse_result(
+                            results_data, self.stage, self.parser_config, options
+                        )
+                        for results_data in results
+                    ]
+                )
+            }
         )
 
-        return ResultsSet({
-            'stage_results': await asyncio.gather(*[
-                self.parser.parse_result(
-                    results_data,
-                    self.stage,
-                    self.parser_config,
-                    options
-                ) for results_data in results
-            ])
-        })
-    
     async def load_data(
-        self, 
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[Dict[str, Any]]]:
-        
         if self._table is None:
             self._table = sqlalchemy.Table(
-                self.table_name,
-                self.metadata,
-                autoload_with=self._engine
+                self.table_name, self.metadata, autoload_with=self._engine
             )
 
         async with self._engine.connect() as connection:
@@ -138,12 +130,11 @@ class SQLiteConnector:
             results: SQLResult = await self._connection.execute(
                 self._table.select(**options)
             )
-            
+
             return [
-                {
-                    column: value  for column, value in result._mapping.items()
-                } for result in results.fetchall()
+                {column: value for column, value in result._mapping.items()}
+                for result in results.fetchall()
             ]
-    
+
     async def close(self):
         await self._connection.close()

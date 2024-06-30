@@ -2,7 +2,7 @@ from .base_event import BaseEvent
 
 
 class HeadersSent(BaseEvent):
-    event_type='HEADERS_SENT'
+    event_type = "HEADERS_SENT"
     """
     The _HeadersSent event is fired whenever headers are sent.
 
@@ -10,4 +10,3 @@ class HeadersSent(BaseEvent):
     outgoing header blocks.
     """
     pass
-

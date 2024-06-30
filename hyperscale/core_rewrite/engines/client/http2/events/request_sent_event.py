@@ -2,7 +2,7 @@ from .headers_sent_event import HeadersSent
 
 
 class RequestSent(HeadersSent):
-    event_type='REQUEST_SENT'
+    event_type = "REQUEST_SENT"
     """
     The _RequestSent event is fired whenever request headers are sent
     on a stream.

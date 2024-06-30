@@ -5,23 +5,17 @@ from hyperscale.core.hooks.types.base.hook_type import HookType
 
 
 class ConditionHook(Hook):
-
     def __init__(
-        self, 
-        name: str, 
-        shortname: str, 
-        call: Callable[..., Awaitable[Any]], 
+        self,
+        name: str,
+        shortname: str,
+        call: Callable[..., Awaitable[Any]],
         *names: Tuple[str, ...],
-        order: int=1,
-        skip: bool=False
+        order: int = 1,
+        skip: bool = False,
     ) -> None:
         super().__init__(
-            name, 
-            shortname, 
-            call, 
-            order=order,
-            skip=skip,
-            hook_type=HookType.CONDITION
+            name, shortname, call, order=order, skip=skip, hook_type=HookType.CONDITION
         )
 
         self.names = list(set(names))
@@ -30,23 +24,18 @@ class ConditionHook(Hook):
         self.events: Dict[str, Coroutine] = {}
 
     async def call(self, **kwargs):
-
         if self.skip:
             return kwargs
 
-        execute = await super().call(**{name: value for name, value in kwargs.items() if name in self.params})
+        execute = await super().call(
+            **{name: value for name, value in kwargs.items() if name in self.params}
+        )
 
         if isinstance(execute, dict):
-            return {
-                **kwargs,
-                **execute
-            }
+            return {**kwargs, **execute}
 
-        return {
-            **kwargs,
-            self.shortname: execute
-        }
-    
+        return {**kwargs, self.shortname: execute}
+
     def copy(self):
         condition_hook = ConditionHook(
             self.name,

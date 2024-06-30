@@ -1,11 +1,9 @@
-
 from types import FunctionType
 from typing import Any, Dict
 from .plugin_hook import PluginHook
 
 
 class PluginRegistrar:
-
     all: Dict[str, PluginHook] = {}
     module_paths: Dict[str, str] = {}
 
@@ -19,26 +17,21 @@ class PluginRegistrar:
     def add_hook(self, hook_type: str):
         def wrap_hook():
             def wrapped_method(func):
-
                 hook_name = func.__qualname__
                 hook_shortname = func.__name__
 
                 self.all[hook_name] = PluginHook(
-                    hook_name,
-                    hook_shortname,
-                    func,
-                    hook_type=hook_type
+                    hook_name, hook_shortname, func, hook_type=hook_type
                 )
 
                 return func
-            
+
             return wrapped_method
 
         return wrap_hook
 
 
 def makePluginRegistrar():
-
     return PluginRegistrar
 
 

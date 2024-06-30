@@ -12,6 +12,6 @@ from pydantic import (
 class EvaluateOnSelectorCommand(BaseModel):
     selector: StrictStr
     expression: StrictStr
-    arg: Optional[Any]=None
-    strict: Optional[StrictBool]=None
-    timeout: Optional[StrictInt | StrictFloat]=None
+    arg: Optional[Any] = None
+    strict: Optional[StrictBool] = None
+    timeout: Optional[StrictInt | StrictFloat] = None

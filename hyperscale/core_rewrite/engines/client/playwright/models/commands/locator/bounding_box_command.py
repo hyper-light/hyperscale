@@ -7,4 +7,3 @@ from pydantic import (
 
 class BoundingBoxCommand(BaseModel):
     timeout: StrictInt | StrictFloat
-    

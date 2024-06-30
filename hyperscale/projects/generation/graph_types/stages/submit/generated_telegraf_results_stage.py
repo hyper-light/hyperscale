@@ -3,7 +3,4 @@ from hyperscale.reporting.types import TelegrafConfig
 
 
 class SubmitTelegrafResultsStage(Submit):
-    config=TelegrafConfig(
-        host='localhost',
-        port=8094
-    )
+    config = TelegrafConfig(host="localhost", port=8094)

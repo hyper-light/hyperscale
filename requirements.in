@@ -27,3 +27,4 @@ aioquic
 playwright
 protobuf
 graphql-core
+cloudpickle

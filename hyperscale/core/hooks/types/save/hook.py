@@ -43,12 +43,11 @@ from hyperscale.data.connectors.xml.xml_connector_config import XMLConnectorConf
 
 
 class SaveHook(Hook):
-
     def __init__(
-        self, 
-        name: str, 
-        shortname: str, 
-        call: Callable[..., Awaitable[Any]], 
+        self,
+        name: str,
+        shortname: str,
+        call: Callable[..., Awaitable[Any]],
         *names: Tuple[str, ...],
         loader: Union[
             AWSLambdaConnectorConfig,
@@ -67,34 +66,25 @@ class SaveHook(Hook):
             S3ConnectorConfig,
             SnowflakeConnectorConfig,
             SQLiteConnectorConfig,
-            XMLConnectorConfig
-
-        ]=None, 
-        order: int=1,
-        skip: bool=False
+            XMLConnectorConfig,
+        ] = None,
+        order: int = 1,
+        skip: bool = False,
     ) -> None:
         super().__init__(
-            name, 
-            shortname, 
-            call, 
-            order=order,
-            skip=skip,
-            hook_type=HookType.SAVE
+            name, shortname, call, order=order, skip=skip, hook_type=HookType.SAVE
         )
 
         self.names = list(set(names))
         self.loader_config = loader
         self.parser_config: Union[Config, None] = None
         self.connector: Union[Connector, None] = Connector(
-            self.stage,
-            self.loader_config,
-            self.parser_config
+            self.stage, self.loader_config, self.parser_config
         )
 
         self.saved = False
 
     async def call(self, **kwargs) -> None:
-
         condition_result = await self._execute_call(**kwargs)
 
         if self.skip or self.saved or condition_result is False:
@@ -109,28 +99,23 @@ class SaveHook(Hook):
         hook_args = {
             name: value for name, value in kwargs.items() if name in self.params
         }
-        
-        load_result: Union[Dict[str, Any], Any] = await self._call(**{
-            **hook_args,
-            'actions': actions_registry.actions(),
-            'connector': self.connector
-        })
-        
-        await self.connector.close()
 
+        load_result: Union[Dict[str, Any], Any] = await self._call(
+            **{
+                **hook_args,
+                "actions": actions_registry.actions(),
+                "connector": self.connector,
+            }
+        )
+
+        await self.connector.close()
 
         self.saved = True
 
         if isinstance(load_result, dict):
-            return {
-                **kwargs,
-                **load_result
-            }
+            return {**kwargs, **load_result}
 
-        return {
-            **kwargs,
-            self.shortname: load_result
-        }
+        return {**kwargs, self.shortname: load_result}
 
     def copy(self):
         save_hook = SaveHook(

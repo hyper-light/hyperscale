@@ -37,7 +37,7 @@ class PlaywrightResult(CallResult, Generic[T]):
         timings: Dict[
             Literal["command_start", "command_end"],
             float | None,
-        ] = {},
+        ] = None,
         frame: Optional[str] = None,
         source: Literal["page", "frame", "mouse"] = "page",
     ):

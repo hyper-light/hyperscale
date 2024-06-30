@@ -12,5 +12,5 @@ from pydantic import (
 class GetAttributeCommand(BaseModel):
     selector: StrictStr
     name: StrictStr
-    strict: Optional[StrictBool]=None
+    strict: Optional[StrictBool] = None
     timeout: StrictInt | StrictFloat

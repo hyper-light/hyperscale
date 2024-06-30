@@ -61,7 +61,7 @@ class HTTPResponse(CallResult):
                 "request_end",
             ],
             float | None,
-        ] = {},
+        ] = None,
     ):
         super(
             HTTPResponse,
@@ -124,7 +124,4 @@ class HTTPResponse(CallResult):
         return self.status >= 200 and self.status < 300
 
     def context(self):
-        if self.status_message:
-            return self.status_message
-
-        return self.data if len(self.content) > 0 else None
+        return self.status_message

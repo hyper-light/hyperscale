@@ -33,7 +33,7 @@ class GraphQLResponse(HTTPResponse):
                 "request_end",
             ],
             float | None,
-        ] = {},
+        ] = None,
     ):
         super(
             GraphQLResponse,

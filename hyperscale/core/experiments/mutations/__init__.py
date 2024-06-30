@@ -3,5 +3,5 @@ from .types import (
     InjectHeader,
     InjectJunkData,
     InjectPing,
-    SmuggleRequest
+    SmuggleRequest,
 )

@@ -1,5 +1,2 @@
 from .url import URL
-from .exceptions import (
-    InvalidHost,
-    InvalidIP
-)
+from .exceptions import InvalidHost, InvalidIP

@@ -8,7 +8,6 @@ from hyperscale.core.personas.types.types import PersonaTypes
 
 
 class CyclicNoWaitPersona(DefaultPersona):
-
     def __init__(self, config: Config):
         super().__init__(config)
 
@@ -21,8 +20,8 @@ class CyclicNoWaitPersona(DefaultPersona):
 
         start = time.monotonic()
         while elapsed < total_time:
-            yield idx%self.actions_count
-            
+            yield idx % self.actions_count
+
             await asyncio.sleep(0)
             elapsed = time.monotonic() - start
             idx += 1

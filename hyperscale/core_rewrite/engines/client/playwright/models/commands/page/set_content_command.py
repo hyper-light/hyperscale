@@ -11,11 +11,6 @@ from pydantic import (
 class SetContentCommand(BaseModel):
     html: StrictStr
     wait_until: Optional[
-        Literal[
-            'commit', 
-            'domcontentloaded', 
-            'load', 
-            'networkidle'
-        ]
-    ]=None
+        Literal["commit", "domcontentloaded", "load", "networkidle"]
+    ] = None
     timeout: StrictInt | StrictFloat

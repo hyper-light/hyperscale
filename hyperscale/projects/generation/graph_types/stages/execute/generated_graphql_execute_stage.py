@@ -5,7 +5,6 @@ from hyperscale.core.hooks import action
 
 
 class ExecuteGraphQLStage(Execute):
-
     @action()
     async def http_query(self):
         return await self.client.graphql.query(

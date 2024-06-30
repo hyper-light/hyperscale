@@ -13,7 +13,3 @@ async def awaitable(func, *args, **kwargs):
     ctx = contextvars.copy_context()
     func_call = functools.partial(ctx.run, func, *args, **kwargs)
     return await loop.run_in_executor(None, func_call)
-
-
-
-

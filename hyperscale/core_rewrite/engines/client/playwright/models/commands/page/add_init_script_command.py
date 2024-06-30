@@ -10,10 +10,9 @@ from pydantic import (
 
 
 class AddInitScriptCommand(BaseModel):
-    script: Optional[StrictStr]=None
-    path: Optional[StrictStr | Path]=None
+    script: Optional[StrictStr] = None
+    path: Optional[StrictStr | Path] = None
     timeout: StrictInt | StrictFloat
 
     class Config:
-        arbitrary_types_allowed=True
-    
+        arbitrary_types_allowed = True

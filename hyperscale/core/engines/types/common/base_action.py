@@ -1,37 +1,26 @@
 import uuid
-from typing import (
-    Any, 
-    Dict, 
-    List, 
-    TypeVar, 
-    Generic
-)
+from typing import Any, Dict, List, TypeVar, Generic
 from .metadata import Metadata
 from .hooks import Hooks
 from .types import ProtocolMap
 
 
-A = TypeVar('A')
+A = TypeVar("A")
 
 
 class BaseAction(Generic[A]):
-
-    __slots__ = ( 
-        'action_id'
-        'protocols', 
-        'is_setup', 
-        'metadata', 
-        'hooks',
-        'event',
-        'action_args',
-        'mutations'
+    __slots__ = (
+        "action_id" "protocols",
+        "is_setup",
+        "metadata",
+        "hooks",
+        "event",
+        "action_args",
+        "mutations",
     )
 
     def __init__(
-        self,
-        name: str=None, 
-        user: str=None, 
-        tags: List[Dict[str, str]] = []
+        self, name: str = None, user: str = None, tags: List[Dict[str, str]] = []
     ) -> None:
         self.name = name
         self.action_id = str(uuid.uuid4())

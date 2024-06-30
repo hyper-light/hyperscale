@@ -1,12 +1,5 @@
 class Mean:
-
-    __slots__ = (
-        'size',
-        'previous_size',
-        'mean',
-        'delta',
-        'delta_n'
-    )
+    __slots__ = ("size", "previous_size", "mean", "delta", "delta_n")
 
     def __init__(self):
         self.size = 0

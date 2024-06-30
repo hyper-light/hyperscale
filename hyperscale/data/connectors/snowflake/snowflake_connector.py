@@ -29,35 +29,33 @@ try:
     from snowflake.sqlalchemy import URL
     from sqlalchemy import create_engine
     from sqlalchemy.engine import Connection, Engine
-    
+
     has_connector = True
 
 except Exception:
     sqlalchemy = object
     URL = object
-    create_engine=noop_create_engine
+    create_engine = noop_create_engine
     Engine = object
     Connection = object
     has_connector = False
 
 
 def handle_loop_stop(
-    signame, 
-    executor: ThreadPoolExecutor, 
-    loop: asyncio.AbstractEventLoop
-): 
+    signame, executor: ThreadPoolExecutor, loop: asyncio.AbstractEventLoop
+):
     try:
-        executor.shutdown(wait=False, cancel_futures=True) 
+        executor.shutdown(wait=False, cancel_futures=True)
         loop.stop()
     except Exception:
         pass
 
 
 class SnowflakeConnector:
-    connector_type=ConnectorType.Snowflake
+    connector_type = ConnectorType.Snowflake
 
     def __init__(
-        self, 
+        self,
         config: SnowflakeConnectorConfig,
         stage: str,
         parser_config: Config,
@@ -76,7 +74,7 @@ class SnowflakeConnector:
         self.table_name = config.table_name
 
         self.connect_timeout = config.connect_timeout
-        
+
         self.metadata = sqlalchemy.MetaData()
         self._executor = ThreadPoolExecutor(max_workers=psutil.cpu_count(logical=False))
 
@@ -91,24 +89,22 @@ class SnowflakeConnector:
         self.metadata_string: str = None
         self.logger = HyperscaleLogger()
         self.logger.initialize()
-        
+
         self.parser = Parser()
 
     async def connect(self):
-
         try:
-
-            for signame in ('SIGINT', 'SIGTERM', 'SIG_IGN'):
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
                     getattr(signal, signame),
                     lambda signame=signame: handle_loop_stop(
-                        signame,
-                        self._executor,
-                        self._loop
-                    )
+                        signame, self._executor, self._loop
+                    ),
                 )
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connecting to Snowflake instance at - Warehouse: {self.warehouse} - Database: {self.database} - Schema: {self.schema}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].info(
+                f"{self.metadata_string} - Connecting to Snowflake instance at - Warehouse: {self.warehouse} - Database: {self.database} - Schema: {self.schema}"
+            )
             self._engine = await self._loop.run_in_executor(
                 self._executor,
                 create_engine,
@@ -118,107 +114,84 @@ class SnowflakeConnector:
                     account=self.account_id,
                     warehouse=self.warehouse,
                     database=self.database,
-                    schema=self.schema
-                )
-            
+                    schema=self.schema,
+                ),
             )
 
             self._connection = await asyncio.wait_for(
-                self._loop.run_in_executor(
-                    self._executor,
-                    self._engine.connect
-                ),
-                timeout=self.connect_timeout
+                self._loop.run_in_executor(self._executor, self._engine.connect),
+                timeout=self.connect_timeout,
             )
 
-            await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connected to Snowflake instance at - Warehouse: {self.warehouse} - Database: {self.database} - Schema: {self.schema}')
+            await self.logger.filesystem.aio["hyperscale.reporting"].info(
+                f"{self.metadata_string} - Connected to Snowflake instance at - Warehouse: {self.warehouse} - Database: {self.database} - Schema: {self.schema}"
+            )
 
         except asyncio.TimeoutError:
-            raise Exception('Err. - Connection to Snowflake timed out - check your account id, username, and password.')
+            raise Exception(
+                "Err. - Connection to Snowflake timed out - check your account id, username, and password."
+            )
 
     async def load_execute_stage_summary(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ExecuteStageSummaryValidator]:
-        execute_stage_summary = await self.load_data(
-            options=options
-        )
-        
+        execute_stage_summary = await self.load_data(options=options)
+
         return ExecuteStageSummaryValidator(**execute_stage_summary)
 
     async def load_actions(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[ActionHook]]:
-        
-        actions: List[Dict[str, Any]] = await self.load_data(
-            options=options
+        actions: List[Dict[str, Any]] = await self.load_data(options=options)
+
+        return await asyncio.gather(
+            *[
+                self.parser.parse_action(
+                    action_data, self.stage, self.parser_config, options
+                )
+                for action_data in actions
+            ]
         )
 
-        return await asyncio.gather(*[
-            self.parser.parse_action(
-                action_data,
-                self.stage,
-                self.parser_config,
-                options
-            ) for action_data in actions
-        ])
-    
     async def load_results(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ResultsSet]:
-        results = await self.load_data(
-            options=options
-        )
+        results = await self.load_data(options=options)
 
-        return ResultsSet({
-            'stage_results': await asyncio.gather(*[
-                self.parser.parse_result(
-                    results_data,
-                    self.stage,
-                    self.parser_config,
-                    options
-                ) for results_data in results
-            ])
-        })
+        return ResultsSet(
+            {
+                "stage_results": await asyncio.gather(
+                    *[
+                        self.parser.parse_result(
+                            results_data, self.stage, self.parser_config, options
+                        )
+                        for results_data in results
+                    ]
+                )
+            }
+        )
 
     async def load_data(
-        self, 
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[Dict[str, Any]]]:
-        
         if self._table is None:
-            
             self._table = sqlalchemy.Table(
-                self.table_name,
-                self.metadata,
-                autoload_with=self._engine
+                self.table_name, self.metadata, autoload_with=self._engine
             )
-            
+
         results = await self._loop.run_in_executor(
             self._executor,
-            functools.partial(
-                self._connection.execute,
-                self._table.select(**options)
-            )
-        )
-        
-        all_results = await self._loop.run_in_executor(
-            self._executor,
-            results.fetchall
+            functools.partial(self._connection.execute, self._table.select(**options)),
         )
 
+        all_results = await self._loop.run_in_executor(self._executor, results.fetchall)
+
         return [
-            {
-              column: value  for column, value in result._mapping.items()
-            } for result in all_results
+            {column: value for column, value in result._mapping.items()}
+            for result in all_results
         ]
-    
+
     async def close(self):
-        await self._loop.run_in_executor(
-            self._executor,
-            self._connection.close
-        )
+        await self._loop.run_in_executor(self._executor, self._connection.close)
 
         self._executor.shutdown()

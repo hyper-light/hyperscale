@@ -9,15 +9,8 @@ from pydantic import (
 
 
 class ExpectResponseCommand(BaseModel):
-    url_or_predicate: Optional[
-        str | 
-        Pattern[str] | 
-        Callable[
-            [Response],
-            bool
-        ]
-    ]=None
+    url_or_predicate: Optional[str | Pattern[str] | Callable[[Response], bool]] = None
     timeout: StrictInt | StrictFloat
 
     class Config:
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed = True

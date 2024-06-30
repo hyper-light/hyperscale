@@ -13,36 +13,35 @@ from hyperscale.plugins.types.engine.result import Result
 from .connection import CustomConnection
 from .pool import CustomPool
 
-A = TypeVar('A')
-R = TypeVar('R')
+A = TypeVar("A")
+R = TypeVar("R")
+
 
 class MercuryCustomClient(BaseEngine[A, R]):
-
     __slots__ = (
-        'session_id',
-        'timeouts',
-        'registered',
-        '_hosts',
-        'closed',
-        'sem',
-        'active',
-        'waiter',
-        'plugin',
-        '_on_connect',
-        '_on_execute',
-        '_on_close',
-        'custom_connection',
-        'pool'
+        "session_id",
+        "timeouts",
+        "registered",
+        "_hosts",
+        "closed",
+        "sem",
+        "active",
+        "waiter",
+        "plugin",
+        "_on_connect",
+        "_on_execute",
+        "_on_close",
+        "custom_connection",
+        "pool",
     )
 
     def __init__(
-        self, 
+        self,
         plugin: Any,
-        concurrency: int=10**3, 
-        timeouts: Timeouts = Timeouts(), 
-        reset_connections: bool=False
+        concurrency: int = 10**3,
+        timeouts: Timeouts = Timeouts(),
+        reset_connections: bool = False,
     ) -> None:
-
         self.session_id = str(uuid.uuid4())
         self.timeouts = timeouts
 
@@ -51,7 +50,7 @@ class MercuryCustomClient(BaseEngine[A, R]):
         self.closed = False
 
         self.sem = asyncio.Semaphore(value=concurrency)
-        
+
         self.active = 0
         self.waiter: asyncio.Future = None
         self.plugin: Any = plugin
@@ -60,18 +59,18 @@ class MercuryCustomClient(BaseEngine[A, R]):
         self._on_execute = self.plugin.hooks.get(PluginHooks.ON_ENGINE_EXECUTE)
         self._on_close = self.plugin.hooks.get(PluginHooks.ON_ENGINE_CLOSE)
 
-        self.custom_connection: CustomConnection = lambda reset_connection: CustomConnection(
-            security_context=self.plugin.security_context,
-            reset_connection=reset_connection,
-            on_connect=self._on_connect.call,
-            on_execute=self._on_execute.call,
-            on_close=self._on_close.call
+        self.custom_connection: CustomConnection = (
+            lambda reset_connection: CustomConnection(
+                security_context=self.plugin.security_context,
+                reset_connection=reset_connection,
+                on_connect=self._on_connect.call,
+                on_execute=self._on_execute.call,
+                on_close=self._on_close.call,
+            )
         )
 
         self.pool = CustomPool(
-            self.custom_connection,
-            concurrency, 
-            reset_connections=reset_connections
+            self.custom_connection, concurrency, reset_connections=reset_connections
         )
 
         self.pool.create_pool()
@@ -80,8 +79,8 @@ class MercuryCustomClient(BaseEngine[A, R]):
         self.sem = asyncio.Semaphore(value=concurrency)
         self.pool = CustomPool(
             self.custom_connection,
-            concurrency, 
-            reset_connections=self.pool.reset_connections
+            concurrency,
+            reset_connections=self.pool.reset_connections,
         )
         self.pool.create_pool()
 
@@ -91,24 +90,26 @@ class MercuryCustomClient(BaseEngine[A, R]):
             self.pool.connections.append(
                 self.custom_connection(self.pool.reset_connections)
             )
-        
+
         self.sem = Semaphore(self.pool.size)
 
     def shrink_pool(self, decrease_capacity: int):
         self.pool.size -= decrease_capacity
-        self.pool.connections = self.pool.connections[:self.pool.size]
+        self.pool.connections = self.pool.connections[: self.pool.size]
         self.sem = Semaphore(self.pool.size)
 
     async def prepare(self, action: Action[A]) -> Coroutine[Any, Any, None]:
         try:
-            connection: CustomConnection = self.custom_connection(self.pool.reset_connections)
+            connection: CustomConnection = self.custom_connection(
+                self.pool.reset_connections
+            )
 
             if action.use_security_context:
                 action.security_context = connection.security_context
 
             await asyncio.wait_for(
                 connection.make_connection(action),
-                timeout=self.timeouts.connect_timeout
+                timeout=self.timeouts.connect_timeout,
             )
 
             if action.is_setup is False:
@@ -116,21 +117,21 @@ class MercuryCustomClient(BaseEngine[A, R]):
 
             self.registered[action.name] = action
 
-        except Exception as e:       
+        except Exception as e:
             raise e
 
-    async def execute_prepared_request(self, action: Action[A]) -> Coroutine[Any, Any, Result[R]]:
- 
+    async def execute_prepared_request(
+        self, action: Action[A]
+    ) -> Coroutine[Any, Any, Result[R]]:
         result: Result[R] = self.plugin.result(action)
-        
-        result.times['wait_start'] = time.monotonic()
+
+        result.times["wait_start"] = time.monotonic()
         self.active += 1
- 
+
         async with self.sem:
             connection = self.pool.connections.pop()
-            
-            try:
 
+            try:
                 if action.hooks.listen:
                     event = asyncio.Event()
                     action.hooks.channel_events.append(event)
@@ -140,15 +141,15 @@ class MercuryCustomClient(BaseEngine[A, R]):
                     action: Action[A] = await self.execute_before(action)
                     action.setup()
 
-                result.times['start'] = time.monotonic()
+                result.times["start"] = time.monotonic()
 
                 result = await asyncio.wait_for(
                     connection.execute(action, result),
-                    timeout=self.timeouts.total_timeout
+                    timeout=self.timeouts.total_timeout,
                 )
 
-                result.times['complete'] = time.monotonic()
-       
+                result.times["complete"] = time.monotonic()
+
                 self.pool.connections.append(connection)
 
                 if action.hooks.after:
@@ -156,21 +157,22 @@ class MercuryCustomClient(BaseEngine[A, R]):
                     action.setup()
 
                 if action.hooks.notify:
-                    await asyncio.gather(*[
-                        asyncio.create_task(
-                            channel(result, action.hooks.listeners)
-                        ) for channel in action.hooks.channels
-                    ])
+                    await asyncio.gather(
+                        *[
+                            asyncio.create_task(channel(result, action.hooks.listeners))
+                            for channel in action.hooks.channels
+                        ]
+                    )
 
-                    for listener in action.hooks.listeners: 
+                    for listener in action.hooks.listeners:
                         if len(listener.hooks.channel_events) > 0:
                             listener.setup()
                             event = listener.hooks.channel_events.pop()
                             if not event.is_set():
-                                event.set()    
+                                event.set()
 
             except Exception as e:
-                result.times['complete'] = time.monotonic()
+                result.times["complete"] = time.monotonic()
                 result.error = str(e)
 
                 self.pool.connections.append(
@@ -179,7 +181,6 @@ class MercuryCustomClient(BaseEngine[A, R]):
 
             self.active -= 1
             if self.waiter and self.active <= self.pool.size:
-
                 try:
                     self.waiter.set_result(None)
                     self.waiter = None

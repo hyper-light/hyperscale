@@ -3,12 +3,11 @@ from typing import Callable, Coroutine, Dict, Optional
 from hyperscale.core.engines.types.common.url import URL
 
 try:
-
     from opentelemetry.trace import Span
 
 except ImportError:
     Span = object
-    
+
 
 class Request:
     url: URL
@@ -24,15 +23,7 @@ class Response:
     error: Exception
 
 
-RequestHook = Optional[
-    Callable[
-        [
-            Span, 
-            Request
-        ], 
-        None
-    ]
-]
+RequestHook = Optional[Callable[[Span, Request], None]]
 
 
 ResponseHook = Optional[
@@ -46,24 +37,7 @@ ResponseHook = Optional[
 ]
 
 
-TraceSignal = Callable[
-    [   
-        Span,
-        Request,
-        Response
-
-    ], 
-    Coroutine[
-        None, 
-        None, 
-        None
-    ]
-]
+TraceSignal = Callable[[Span, Request, Response], Coroutine[None, None, None]]
 
 
-UrlFilter = Callable[
-    [
-        str
-    ], 
-    str
-]
+UrlFilter = Callable[[str], str]

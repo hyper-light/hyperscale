@@ -7,24 +7,13 @@ from hyperscale.core.hooks.types.context.hook import ContextHook
 
 
 class ContextEvent(BaseEvent[ContextHook]):
-
     def __init__(self, target: Hook, source: ContextHook) -> None:
-
-        super(
-            ContextEvent,
-            self
-        ).__init__(
-            target,
-            source
-        )
+        super(ContextEvent, self).__init__(target, source)
 
         self.event_type = EventType.CONTEXT
 
     def copy(self):
-        context_event = ContextEvent(
-            self.target.copy(),
-            self.source.copy()
-        )
+        context_event = ContextEvent(self.target.copy(), self.source.copy())
 
         context_event.execution_path = list(self.execution_path)
         context_event.previous_map = list(self.previous_map)

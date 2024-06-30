@@ -11,7 +11,7 @@ class DependsValidator(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-    @validator('stages')
+    @validator("stages")
     def validate_stages(cls, vals):
         assert len(vals) > 0
         assert len(vals) == len(set(vals))

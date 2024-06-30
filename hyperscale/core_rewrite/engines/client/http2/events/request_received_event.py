@@ -2,14 +2,9 @@ from .base_event import BaseEvent
 
 
 class RequestReceived(BaseEvent):
-    event_type='REQUEST_RECEIVED'
-    __slots__ = (
-        'stream_id',
-        'headers',
-        'stream_ended',
-        'priority_updated'
-    )
-    
+    event_type = "REQUEST_RECEIVED"
+    __slots__ = ("stream_id", "headers", "stream_ended", "priority_updated")
+
     """
     The RequestReceived event is fired whenever request headers are received.
     This event carries the HTTP headers for the given request and the stream ID
@@ -22,6 +17,7 @@ class RequestReceived(BaseEvent):
     .. versionchanged:: 2.4.0
        Added ``stream_ended`` and ``priority_updated`` properties.
     """
+
     def __init__(self):
         #: The Stream ID for the stream this request was made on.
         self.stream_id = None
@@ -45,5 +41,6 @@ class RequestReceived(BaseEvent):
 
     def __repr__(self):
         return "<RequestReceived stream_id:%s, headers:%s>" % (
-            self.stream_id, self.headers
+            self.stream_id,
+            self.headers,
         )

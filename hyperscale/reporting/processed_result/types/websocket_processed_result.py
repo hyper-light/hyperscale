@@ -4,16 +4,5 @@ from .http_processed_result import HTTPProcessedResult
 
 
 class WebsocketProcessedResult(HTTPProcessedResult):
-
-    def __init__(
-        self, 
-        stage: str, 
-        result: WebsocketResult
-    ) -> None:
-        super(
-            WebsocketProcessedResult,
-            self
-        ).__init__(
-            stage,
-            result
-        )
+    def __init__(self, stage: str, result: WebsocketResult) -> None:
+        super(WebsocketProcessedResult, self).__init__(stage, result)

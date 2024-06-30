@@ -17,9 +17,8 @@ from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from .redis_connector_config import RedisConnectorConfig
 
 try:
-
     import aioredis
-    
+
     has_connector = True
 
 except Exception:
@@ -28,16 +27,16 @@ except Exception:
 
 
 class RedisConnector:
-    connector_type=ConnectorType.Redis
+    connector_type = ConnectorType.Redis
 
     def __init__(
-        self, 
+        self,
         config: RedisConnectorConfig,
         stage: str,
         parser_config: Config,
     ) -> None:
         self.host = config.host
-        self.base = 'rediss' if config.secure else 'redis'
+        self.base = "rediss" if config.secure else "redis"
         self.username = config.username
         self.password = config.password
         self.database = config.database
@@ -56,96 +55,91 @@ class RedisConnector:
         self.parser = Parser()
 
     async def connect(self):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connecting to Redis instance at - {self.base}://{self.host} - Database: {self.database}')
-        
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connecting to Redis instance at - {self.base}://{self.host} - Database: {self.database}"
+        )
+
         self.connection = await aioredis.from_url(
-            f'{self.base}://{self.host}',
+            f"{self.base}://{self.host}",
             username=self.username,
             password=self.password,
-            db=self.database
+            db=self.database,
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connected to Redis instance at - {self.base}://{self.host} - Database: {self.database}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connected to Redis instance at - {self.base}://{self.host} - Database: {self.database}"
+        )
 
     async def load_execute_stage_summary(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ExecuteStageSummaryValidator]:
-        execute_stage_summary = await self.load_data(
-            options=options
-        )
-        
+        execute_stage_summary = await self.load_data(options=options)
+
         return ExecuteStageSummaryValidator(**execute_stage_summary)
 
     async def load_actions(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[ActionHook]]:
-        actions = await self.load_data(
-            options=options
+        actions = await self.load_data(options=options)
+
+        return await asyncio.gather(
+            *[
+                self.parser.parse_action(
+                    action_data, self.stage, self.parser_config, options
+                )
+                for action_data in actions
+            ]
         )
 
-        return await asyncio.gather(*[
-            self.parser.parse_action(
-                action_data,
-                self.stage,
-                self.parser_config,
-                options
-            ) for action_data in actions
-        ])
-    
     async def load_results(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ResultsSet]:
-        results = await self.load_data(
-            options=options
+        results = await self.load_data(options=options)
+
+        return ResultsSet(
+            {
+                "stage_results": await asyncio.gather(
+                    *[
+                        self.parser.parse_result(
+                            results_data, self.stage, self.parser_config, options
+                        )
+                        for results_data in results
+                    ]
+                )
+            }
         )
 
-        return ResultsSet({
-            'stage_results': await asyncio.gather(*[
-                self.parser.parse_result(
-                    results_data,
-                    self.stage,
-                    self.parser_config,
-                    options
-                ) for results_data in results
-            ])
-        })
-    
     async def load_data(
-        self, 
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[Dict[str, Any]]]:
-        
         if self.channel:
             async with self.connection.client() as connection:
                 keys = await connection.keys()
-                return await asyncio.gather(*[
-                    asyncio.create_task(
-                        connection.get(key) for key in keys
-                    )
-                ])
-            
+                return await asyncio.gather(
+                    *[asyncio.create_task(connection.get(key) for key in keys)]
+                )
+
         else:
             subscriber = self.connection.pubsub()
             await subscriber.subscribe(self.channel)
 
-            limit = options.get('limit')
-            timeout = options.get('timeout', 1)
+            limit = options.get("limit")
+            timeout = options.get("timeout", 1)
 
             if limit is None and timeout is None:
-                raise Exception('A limit or timeout must be provided.')
-            
-            if limit:
+                raise Exception("A limit or timeout must be provided.")
 
+            if limit:
                 async with subscriber as subscription:
-                    results: List[bytes] = await asyncio.gather(*[
-                        asyncio.create_task(subscription.get_message(
-                            ignore_subscribe_messages=True
-                        )) for _ in range(limit)
-                    ])
-                
+                    results: List[bytes] = await asyncio.gather(
+                        *[
+                            asyncio.create_task(
+                                subscription.get_message(ignore_subscribe_messages=True)
+                            )
+                            for _ in range(limit)
+                        ]
+                    )
+
             else:
                 async with subscriber as subscription:
                     elapsed = 0
@@ -162,9 +156,7 @@ class RedisConnector:
 
                         elapsed = time.time() - start
 
-            return [
-                json.loads(result) for result in results
-            ]  
-    
+            return [json.loads(result) for result in results]
+
     async def close(self):
         await self.connection.close()

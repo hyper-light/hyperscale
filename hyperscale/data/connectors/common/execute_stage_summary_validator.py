@@ -1,10 +1,4 @@
-from pydantic import (
-    BaseModel,
-    StrictStr,
-    StrictBool,
-    StrictInt,
-    StrictFloat
-)
+from pydantic import BaseModel, StrictStr, StrictBool, StrictInt, StrictFloat
 
 from typing import Union
 

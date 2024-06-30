@@ -5,13 +5,9 @@ hyperframe/flags
 
 Defines basic Flag and Flags data structures.
 """
+
 from collections.abc import MutableSet
-from typing import (
-    NamedTuple, 
-    Iterable, 
-    Set, 
-    Iterator
-)
+from typing import NamedTuple, Iterable, Set, Iterator
 
 
 class Flag(NamedTuple):
@@ -20,10 +16,7 @@ class Flag(NamedTuple):
 
 
 class Flags(MutableSet):  # type: ignore
-    __slots__ = (
-        '_valid_flags', 
-        '_flags'
-    )
+    __slots__ = ("_valid_flags", "_flags")
 
     """
     A simple MutableSet implementation that will only accept known flags as
@@ -32,6 +25,7 @@ class Flags(MutableSet):  # type: ignore
     Will behave like a regular set(), except that a ValueError will be thrown
     when .add()ing unexpected flags.
     """
+
     def __init__(self, defined_flags: Iterable[Flag]):
         self._valid_flags = set(flag.name for flag in defined_flags)
         self._flags: Set[str] = set()

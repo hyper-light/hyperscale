@@ -7,10 +7,8 @@ from .base_event import BaseEvent
 
 
 class RemoteSettingsChanged(BaseEvent):
-    event_type='REMOTE_SETTINGS_CHANGED'
-    __slots__ = (
-        'changed_settings'
-    )
+    event_type = "REMOTE_SETTINGS_CHANGED"
+    __slots__ = "changed_settings"
     """
     The RemoteSettingsChanged event is fired whenever the remote peer changes
     its settings. It contains a complete inventory of changed settings,
@@ -30,6 +28,7 @@ class RemoteSettingsChanged(BaseEvent):
        This is no longer the case: h2 now automatically acknowledges
        them.
     """
+
     def __init__(self):
         #: A dictionary of setting byte to
         #: :class:`ChangedSetting <h2.settings.ChangedSetting>`, representing
@@ -48,7 +47,6 @@ class RemoteSettingsChanged(BaseEvent):
         """
         e = cls()
         for setting, new_value in new_settings.items():
-
             try:
                 setting = SettingCodes(setting)
             except ValueError:

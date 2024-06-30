@@ -1,7 +1,7 @@
-
 import functools
 import asyncio
 from types import coroutine
+
 
 def delegate_to_executor(*attrs):
     def cls_builder(cls):

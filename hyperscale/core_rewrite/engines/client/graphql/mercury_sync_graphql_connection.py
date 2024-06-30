@@ -123,6 +123,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     method="GET",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def mutate(
@@ -179,6 +180,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     method="POST",
                     status=408,
                     status_message="Request timed out.",
+                    timings={},
                 )
 
     async def _optimize(

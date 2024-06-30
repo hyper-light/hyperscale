@@ -7,4 +7,3 @@ from pydantic import (
 
 class AllTextsCommand(BaseModel):
     timeout: StrictInt | StrictFloat
-    

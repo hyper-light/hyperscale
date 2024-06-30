@@ -4,21 +4,16 @@ from .base import BaseDistribution
 
 
 class GeneralizedNormalDistribution(BaseDistribution):
-
     def __init__(
         self,
         size: int,
-        a_value: float=1,
-        center: Union[int, float]=0.5,
-        randomness: Union[int, float]=0.5
+        a_value: float = 1,
+        center: Union[int, float] = 0.5,
+        randomness: Union[int, float] = 0.5,
     ):
         super().__init__(
             size=size,
             center=center,
             randomness=randomness,
-            frozen_distribution=gennorm(
-                a_value,
-                loc=center,
-                scale=randomness
-            )
+            frozen_distribution=gennorm(a_value, loc=center, scale=randomness),
         )

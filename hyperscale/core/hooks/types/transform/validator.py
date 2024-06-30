@@ -1,11 +1,5 @@
 from typing import Tuple, Optional
-from pydantic import (
-    BaseModel, 
-    validator, 
-    StrictStr, 
-    StrictInt,
-    StrictBool
-)
+from pydantic import BaseModel, validator, StrictStr, StrictInt, StrictBool
 
 
 class TransformHookValidator(BaseModel):
@@ -13,7 +7,7 @@ class TransformHookValidator(BaseModel):
     order: Optional[StrictInt]
     skip: StrictBool
 
-    @validator('names')
+    @validator("names")
     def validate_names(cls, vals):
         assert len(vals) == len(set(vals))
 

@@ -11,6 +11,12 @@ from pydantic import (
 
 
 class SetFilesCommand(BaseModel):
-    files: StrictStr | Path | FilePayload | Sequence[StrictStr | Path] | Sequence[FilePayload]
-    no_wait_after: Optional[bool]=None
-    timeout: Optional[StrictInt | StrictFloat]=None
+    files: (
+        StrictStr
+        | Path
+        | FilePayload
+        | Sequence[StrictStr | Path]
+        | Sequence[FilePayload]
+    )
+    no_wait_after: Optional[bool] = None
+    timeout: Optional[StrictInt | StrictFloat] = None

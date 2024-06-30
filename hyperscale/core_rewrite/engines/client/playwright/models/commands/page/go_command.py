@@ -8,12 +8,7 @@ from pydantic import (
 
 
 class GoCommand(BaseModel):
-    wait_until:  Optional[
-        Literal[
-            'commit', 
-            'domcontentloaded', 
-            'load', 
-            'networkidle'
-        ]
+    wait_until: Optional[
+        Literal["commit", "domcontentloaded", "load", "networkidle"]
     ] = None
     timeout: StrictInt | StrictFloat

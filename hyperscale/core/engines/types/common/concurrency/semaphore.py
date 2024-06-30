@@ -29,11 +29,7 @@ class Semaphore(_ContextManagerMixin, mixins._LoopBoundMixin):
     ValueError is raised.
     """
 
-    __slots__ = (
-        '_value',
-        '_waiters',
-        '_wakeup_scheduled'
-    )
+    __slots__ = ("_value", "_waiters", "_wakeup_scheduled")
 
     def __init__(self, value=1, *, loop=None):
         super().__init__()
@@ -45,10 +41,10 @@ class Semaphore(_ContextManagerMixin, mixins._LoopBoundMixin):
 
     def __repr__(self):
         res = super().__repr__()
-        extra = 'locked' if self.locked() else f'unlocked, value:{self._value}'
+        extra = "locked" if self.locked() else f"unlocked, value:{self._value}"
         if self._waiters:
-            extra = f'{extra}, waiters:{len(self._waiters)}'
-        return f'<{res[1:-1]} [{extra}]>'
+            extra = f"{extra}, waiters:{len(self._waiters)}"
+        return f"<{res[1:-1]} [{extra}]>"
 
     def _wake_up_next(self):
         while self._waiters:

@@ -1,4 +1,5 @@
-from collections import Counter
+import statistics
+from collections import Counter, defaultdict
 from typing import (
     Any,
     Callable,
@@ -32,8 +33,14 @@ from .models.metric import (
 )
 from .workflow_types import (
     CheckSet,
+    ContextCount,
+    CountResults,
     MetricsSet,
+    MetricType,
+    MetricValue,
+    QuantileSet,
     ResultSet,
+    StatsResults,
     StatTypes,
     WorkflowStats,
 )
@@ -42,8 +49,8 @@ from .workflow_types import (
 class WorkflowResults:
     def __init__(
         self,
-        hooks: Dict[str, Hook],
-        precision: int = 4,
+        hooks: Dict[str, Hook] | None = None,
+        precision: int = 8,
     ) -> None:
         self._result_type: Dict[
             Type[GraphQLResponse]
@@ -87,14 +94,20 @@ class WorkflowResults:
             str,
             List[Any],
         ],
+        elapsed: float,
+        run_id: Optional[int] = None,
     ) -> WorkflowStats:
         workflow_stats: WorkflowStats = {
             "workflow": workflow,
+            "elapsed": elapsed,
             "stats": {"executed": 0, "succeeded": 0, "failed": 0},
             "results": [],
             "checks": [],
             "metrics": [],
         }
+
+        if run_id:
+            workflow_stats["run"] = run_id
 
         for step in results:
             step_results = results[step]
@@ -102,17 +115,19 @@ class WorkflowResults:
             hook = self._hooks[step]
             hook_type = hook.hook_type
 
+            executed: int = 0
+
             match hook_type:
                 case HookType.TEST:
-                    test_results = self._process_http_or_udp_timings_set(
+                    test_results = self._process_timings_set(
                         workflow, step, hook.engine_type, step_results
                     )
 
                     workflow_stats["results"].append(test_results)
 
-                    workflow_stats["stats"]["executed"] += test_results["counts"][
-                        "executed"
-                    ]
+                    executed += test_results["counts"]["executed"]
+
+                    workflow_stats["stats"]["executed"] = executed
                     workflow_stats["stats"]["succeeded"] += test_results["counts"][
                         "succeeded"
                     ]
@@ -142,6 +157,8 @@ class WorkflowResults:
 
                 case _:
                     pass
+
+        workflow_stats["rps"] = executed / elapsed
 
         return workflow_stats
 
@@ -188,25 +205,16 @@ class WorkflowResults:
                 "step": step_name,
                 "metric_type": "COUNT",
                 "stats": {
-                    "count": round(
-                        sum(metrics),
-                        self._precision,
-                    ),
+                    "count": sum(metrics),
                 },
                 "tags": tags,
             }
 
         elif metric_type == DISTRIBUTION:
             stats = self._calculate_quantiles(metrics)
-            stats["max"] = round(
-                max(metrics),
-                self._precision,
-            )
+            stats["max"] = max(metrics)
 
-            stats["min"] = round(
-                min(metrics),
-                self._precision,
-            )
+            stats["min"] = min(metrics)
 
             return {
                 "workflow": workflow,
@@ -241,23 +249,14 @@ class WorkflowResults:
                 "step": step_name,
                 "metric_type": "RATE",
                 "stats": {
-                    "rate": round(
-                        sum(values) / elapsed,
-                        self._precision,
-                    ),
+                    "rate": sum(values) / elapsed,
                 },
                 "tags": tags,
             }
 
     def _calculate_quantiles(self, values: List[int | float]):
         return {
-            f"{quantile}th_quantile": round(
-                round(
-                    float(value),
-                    self._precision,
-                ),
-                self._precision,
-            )
+            f"{quantile}th_quantile": float(value)
             for quantile, value in zip(
                 self._quantiles,
                 np.percentile(
@@ -271,37 +270,16 @@ class WorkflowResults:
         mean = float(np.mean(values))
 
         return {
-            "mean": round(
-                mean,
-                self._precision,
-            ),
-            "max": round(
-                max(values),
-                self._precision,
-            ),
-            "min": round(
-                min(values),
-                self._precision,
-            ),
-            "med": round(
-                float(np.median(values)),
-                self._precision,
-            ),
-            "stdev": round(
-                float(np.std(values)),
-                self._precision,
-            ),
-            "var": round(
-                float(np.var(values)),
-                self._precision,
-            ),
-            "mad": round(
-                float(np.mean([abs(el - mean) for el in values])),
-                self._precision,
-            ),
+            "mean": mean,
+            "max": max(values),
+            "min": min(values),
+            "med": float(np.median(values)),
+            "stdev": float(np.std(values)),
+            "var": float(np.var(values)),
+            "mad": float(np.mean([abs(el - mean) for el in values])),
         }
 
-    def _process_http_or_udp_timings_set(
+    def _process_timings_set(
         self,
         workflow: str,
         step_name: str,
@@ -389,6 +367,252 @@ class WorkflowResults:
                 for context, count in contexts.items()
             ],
         }
+
+    def merge_results(
+        self,
+        workflow_stats_set: List[WorkflowStats],
+        run_id: int | None = None,
+    ) -> WorkflowStats:
+        timing_results = [
+            result_set
+            for workflow_stats in workflow_stats_set
+            for result_set in workflow_stats["results"]
+        ]
+
+        checks = [
+            check_set
+            for workflow_stats in workflow_stats_set
+            for check_set in workflow_stats["checks"]
+        ]
+
+        metrics = [
+            metric_set
+            for workflow_stats in workflow_stats_set
+            for metric_set in workflow_stats["metrics"]
+        ]
+
+        aggregate_workflow_stats = self._aggregate_counts(
+            [
+                {
+                    "counts": workflow_stats["stats"],
+                }
+                for workflow_stats in workflow_stats_set
+            ]
+        )
+
+        merged_timing_results = self._merge_timing_results(timing_results)
+
+        merged: WorkflowStats = {
+            "workflow": merged_timing_results[0].get("workflow"),
+            "stats": aggregate_workflow_stats,
+            "results": merged_timing_results,
+            "checks": [],
+            "metrics": [],
+        }
+
+        if len(checks) > 0:
+            merged["checks"].extend(self._merge_check_results(checks))
+
+        if len(metrics) > 0:
+            merged["metrics"].extend(self._merge_metric_results(metrics))
+
+        if run_id:
+            merged["run_id"] = run_id
+
+        median_elapsed: float = statistics.median(
+            [workflow_set["elapsed"] for workflow_set in workflow_stats_set]
+        )
+        total_executed: int = sum(
+            [workflow_set["stats"]["executed"] for workflow_set in workflow_stats_set]
+        )
+
+        merged["rps"] = total_executed / median_elapsed
+        merged["elapsed"] = median_elapsed
+
+        return merged
+
+    def _merge_timing_results(self, results: List[ResultSet]):
+        workflow = results[0].get("workflow")
+
+        binned_timings: Dict[str, List[CheckSet]] = defaultdict(list)
+
+        for result in results:
+            binned_timings[result["step"]].append(result)
+
+        merged_timings: List[ResultSet] = []
+
+        for step_name, timings_result in binned_timings.items():
+            aggregate_timings = self._aggregate_timings(timings_result)
+            aggregate_counts = self._aggregate_counts(timings_result)
+            aggregate_contexts = self._aggregate_contexts(timings_result)
+
+            merged_timings.append(
+                {
+                    "workflow": workflow,
+                    "step": step_name,
+                    "timings": aggregate_timings,
+                    "counts": aggregate_counts,
+                    "contexts": aggregate_contexts,
+                }
+            )
+
+        return merged_timings
+
+    def _merge_check_results(self, results: List[CheckSet]):
+        workflow = results[0].get("workflow")
+
+        binned_checks: Dict[str, List[CheckSet]] = defaultdict(list)
+
+        for result in results:
+            binned_checks[result["step"]].append(result)
+
+        merged_checks: List[CheckSet] = []
+
+        for step_name, check_results in binned_checks.items():
+            aggregate_counts = self._aggregate_counts(check_results)
+            aggregate_contexts = self._aggregate_contexts(check_results)
+
+            merged_checks.append(
+                {
+                    "workflow": workflow,
+                    "step": step_name,
+                    "counts": aggregate_counts,
+                    "contexts": aggregate_contexts,
+                }
+            )
+
+        return merged_checks
+
+    def _merge_metric_results(self, results: List[MetricsSet]):
+        workflow = results[0].get("workflow")
+        binned_metrics: Dict[str, List[MetricsSet]] = defaultdict(list)
+
+        for result in results:
+            binned_metrics[result["step"]].append(result)
+
+        merged_metrics: List[MetricsSet] = []
+        for step_name, metric_results in binned_metrics.items():
+            metric_type = metric_results[0].get("metric_type")
+            tags = metric_results[0].get("tags")
+
+            merged_metrics.append(
+                {
+                    "workflow": workflow,
+                    "step": step_name,
+                    "metric_type": metric_type,
+                    "stats": self._aggregate_metrics(metric_results),
+                    "tags": tags,
+                }
+            )
+
+    def _aggregate_metrics(self, metrics: List[MetricsSet]) -> MetricValue:
+        metric_type: MetricType = metrics[0].get("metric_type")
+
+        if metric_type == COUNT:
+            return {"count": sum([metric["stats"]["count"] for metric in metrics])}
+
+        elif metric_type == DISTRIBUTION or metric_type == SAMPLE:
+            return self._aggregate_stats(
+                [metric["stats"] for metric in metrics],
+            )
+
+        elif metric_type == RATE:
+            return {
+                "rate": sum([metric["stats"]["rate"] for metric in metrics]),
+            }
+
+        else:
+            raise Exception(f"Err. - Invalid metric type - {metric_type}")
+
+    def _aggregate_timings(
+        self, results: List[ResultSet]
+    ) -> Dict[str, StatsResults | QuantileSet]:
+        stats_by_name: Dict[str, List[StatsResults | QuantileSet]] = defaultdict(list)
+
+        [
+            stats_by_name[stat_name].append(stats)
+            for results_set in results
+            for stat_name, stats in results_set["timings"].items()
+        ]
+
+        aggregate_timings: Dict[str, StatsResults | QuantileSet] = {}
+        for stat_name, timing_stats in stats_by_name.items():
+            aggregate_timings[stat_name] = self._aggregate_stats(timing_stats)
+
+        return aggregate_timings
+
+    def _aggregate_stats(self, stats: List[StatsResults | QuantileSet]):
+        aggregate_stat = {
+            "max": max([stat["max"] for stat in stats]),
+            "min": min([stat["min"] for stat in stats]),
+        }
+
+        grouped_stats: Dict[str, List[float]] = defaultdict(list)
+
+        [
+            grouped_stats[stat_type].append(value)
+            for stat in stats
+            for stat_type, value in stat.items()
+            if stat_type not in aggregate_stat
+        ]
+
+        aggregate_stat.update(
+            {
+                stat_type: statistics.median(value)
+                for stat_type, value in grouped_stats.items()
+            }
+        )
+
+        return aggregate_stat
+
+    def _aggregate_counts(self, results: List[ResultSet]) -> StatsResults:
+        counts: List[CountResults] = [result["counts"] for result in results]
+
+        aggregate_counts: CountResults = {
+            "succeeded": sum([count_set["succeeded"] for count_set in counts]),
+            "failed": sum([count_set["failed"] for count_set in counts]),
+            "executed": sum([count_set["executed"] for count_set in counts]),
+        }
+
+        status_counts_data: Dict[str, List[int]] = defaultdict(list)
+
+        [
+            status_counts_data[status_type].append(count)
+            for count_results in counts
+            for status_type, count in count_results.get(
+                "statuses",
+                {},
+            ).items()
+        ]
+
+        if len(status_counts_data) > 0:
+            status_counts = {
+                status_name: sum(counts)
+                for status_name, counts in status_counts_data.items()
+            }
+
+            aggregate_counts["statuses"] = status_counts
+
+        return aggregate_counts
+
+    def _aggregate_contexts(self, results: List[ResultSet]) -> List[ContextCount]:
+        context_counts_results: Dict[str, List[int]] = defaultdict(list)
+
+        [
+            context_counts_results[context_count["context"]].append(
+                context_count["count"]
+            )
+            for result_set in results
+            for context_count in result_set["contexts"]
+        ]
+
+        return [
+            {
+                "context": context_name,
+                "count": sum(counts),
+            }
+            for context_name, counts in context_counts_results.items()
+        ]
 
     def _process_playwright_timings(self, result: PlaywrightResult):
         timings = result.timings

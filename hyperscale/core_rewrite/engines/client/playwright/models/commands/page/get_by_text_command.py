@@ -11,5 +11,5 @@ from pydantic import (
 
 class GetByTextCommand(BaseModel):
     text: StrictStr
-    exact: Optional[StrictBool]=None
+    exact: Optional[StrictBool] = None
     timeout: StrictInt | StrictFloat

@@ -11,6 +11,6 @@ from pydantic import (
 
 class FillCommand(BaseModel):
     value: StrictStr
-    no_wait_after: Optional[StrictBool]=None
-    force: Optional[StrictBool]=None
+    no_wait_after: Optional[StrictBool] = None
+    force: Optional[StrictBool] = None
     timeout: StrictInt | StrictFloat

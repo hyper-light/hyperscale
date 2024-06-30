@@ -11,4 +11,4 @@ class OrMatchingCommand(BaseModel):
     timeout: StrictInt | StrictFloat
 
     class Config:
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed = True

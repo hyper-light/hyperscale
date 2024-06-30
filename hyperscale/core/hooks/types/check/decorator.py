@@ -8,21 +8,11 @@ from .validator import CheckHookValidator
 
 @registrar(HookType.CHECK)
 def check(
-    *names, 
-    message: str='Did not return True.', 
-    order: int=1,
-    skip: bool=False
+    *names, message: str = "Did not return True.", order: int = 1, skip: bool = False
 ):
-    
-    CheckHookValidator(
-        names=names,
-        message=message,
-        order=order,
-        skip=skip
-    )
-    
-    def wrapper(func):
+    CheckHookValidator(names=names, message=message, order=order, skip=skip)
 
+    def wrapper(func):
         @functools.wraps(func)
         def decorator(*args, **kwargs):
             return func(*args, **kwargs)

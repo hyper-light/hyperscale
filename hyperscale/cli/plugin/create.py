@@ -1,17 +1,20 @@
 import os
 
 from hyperscale.cli.exceptions.plugin.create import InvalidPluginType
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger, LoggerTypes, logging_manager
+from hyperscale.logging.hyperscale_logger import (
+    HyperscaleLogger,
+    LoggerTypes,
+    logging_manager,
+)
 from hyperscale.projects.generation import PluginGenerator
 
 
 def create_plugin(plugin_type: str, path: str, log_level: str):
-
     logging_manager.disable(
-        LoggerTypes.HYPERSCALE, 
+        LoggerTypes.HYPERSCALE,
         LoggerTypes.DISTRIBUTED,
         LoggerTypes.FILESYSTEM,
-        LoggerTypes.DISTRIBUTED_FILESYSTEM
+        LoggerTypes.DISTRIBUTED_FILESYSTEM,
     )
 
     logging_manager.update_log_level(log_level)
@@ -20,7 +23,7 @@ def create_plugin(plugin_type: str, path: str, log_level: str):
     logger.initialize()
     logging_manager.logfiles_directory = os.getcwd()
 
-    logger['console'].sync.info(f'Creating new - {plugin_type} - plugin at - {path}.')
+    logger["console"].sync.info(f"Creating new - {plugin_type} - plugin at - {path}.")
 
     generator = PluginGenerator()
     generated_plugin_data = None
@@ -29,15 +32,11 @@ def create_plugin(plugin_type: str, path: str, log_level: str):
         generated_plugin_data = generator.generate_plugin(plugin_type)
 
     else:
-        raise InvalidPluginType(
-            plugin_type,
-            list(generator.generator_types.keys())
-        )
+        raise InvalidPluginType(plugin_type, list(generator.generator_types.keys()))
 
-    logger['console'].sync.info('Saving template.')
+    logger["console"].sync.info("Saving template.")
 
-    with open(path, 'w') as generated_plugin:
-        generated_plugin.write(f'{generated_plugin_data}\n')
+    with open(path, "w") as generated_plugin:
+        generated_plugin.write(f"{generated_plugin_data}\n")
 
-    logger['console'].sync.info('\nPlugin generated!\n')
-    
+    logger["console"].sync.info("\nPlugin generated!\n")

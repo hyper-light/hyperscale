@@ -4,5 +4,5 @@ from pydantic import BaseModel, StrictFloat, StrictInt
 
 
 class WaitForCommand(BaseModel):
-    state: Literal['attached', 'detached', 'visible', 'hidden']='visible'
+    state: Literal["attached", "detached", "visible", "hidden"] = "visible"
     timeout: StrictInt | StrictFloat

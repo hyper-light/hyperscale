@@ -39,15 +39,14 @@ except Exception:
 
 
 class PostgresConnection:
-    connection_type=ConnectorType.Postgres
+    connection_type = ConnectorType.Postgres
 
     def __init__(
-        self, 
+        self,
         config: PostgresConnectorConfig,
         stage: str,
         parser_config: Config,
     ) -> None:
-        
         self.host = config.host
         self.database = config.database
         self.username = config.username
@@ -56,7 +55,7 @@ class PostgresConnection:
         self.parser_config = parser_config
 
         self.table_name = config.table_name
-        
+
         self._engine: Union[AsyncEngine, None] = None
         self.metadata = sqlalchemy.MetaData()
 
@@ -66,95 +65,83 @@ class PostgresConnection:
         self.metadata_string: str = None
         self.logger = HyperscaleLogger()
         self.logger.initialize()
-        
+
         self.parser = Parser()
-        self.sql_type = 'Postgresql'
+        self.sql_type = "Postgresql"
 
     async def connect(self):
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connecting to {self.sql_type} instance at - {self.host} - Database: {self.database}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connecting to {self.sql_type} instance at - {self.host} - Database: {self.database}"
+        )
 
-        connection_uri = 'postgresql+asyncpg://'
+        connection_uri = "postgresql+asyncpg://"
 
         if self.username and self.password:
-            connection_uri = f'{connection_uri}{self.username}:{self.password}@'
+            connection_uri = f"{connection_uri}{self.username}:{self.password}@"
 
         self._engine: AsyncEngine = await create_async_engine(
-            f'{connection_uri}{self.host}/{self.database}',
-            echo=False
+            f"{connection_uri}{self.host}/{self.database}", echo=False
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connected to {self.sql_type} instance at - {self.host} - Database: {self.database}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connected to {self.sql_type} instance at - {self.host} - Database: {self.database}"
+        )
 
     async def load_execute_stage_summary(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> ExecuteStageSummaryValidator:
-        execute_stage_summary = await self.load_data(
-            options=options
-        )
-        
+        execute_stage_summary = await self.load_data(options=options)
+
         return ExecuteStageSummaryValidator(**execute_stage_summary)
 
     async def load_actions(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[ActionHook]]:
-        actions = await self.load_data(
-            options=options
+        actions = await self.load_data(options=options)
+
+        return await asyncio.gather(
+            *[
+                self.parser.parse_action(
+                    action_data, self.stage, self.parser_config, options
+                )
+                for action_data in actions
+            ]
         )
 
-        return await asyncio.gather(*[
-            self.parser.parse_action(
-                action_data,
-                self.stage,
-                self.parser_config,
-                options
-            ) for action_data in actions
-        ])
-    
     async def load_results(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ResultsSet]:
-        results = await self.load_data(
-            options=options
+        results = await self.load_data(options=options)
+
+        return ResultsSet(
+            {
+                "stage_results": await asyncio.gather(
+                    *[
+                        self.parser.parse_result(
+                            results_data, self.stage, self.parser_config, options
+                        )
+                        for results_data in results
+                    ]
+                )
+            }
         )
 
-        return ResultsSet({
-            'stage_results': await asyncio.gather(*[
-                self.parser.parse_result(
-                    results_data,
-                    self.stage,
-                    self.parser_config,
-                    options
-                ) for results_data in results
-            ])
-        })
-    
     async def load_data(
-        self, 
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[Dict[str, Any]]]:
-        
         if self._table is None:
-            
             self._table = sqlalchemy.Table(
-                self.table_name,
-                self.metadata,
-                autoload_with=self._engine
+                self.table_name, self.metadata, autoload_with=self._engine
             )
-            
+
         async with self._engine.connect() as connection:
             connection: AsyncConnection = connection
-            
-            results: SQLResult = await connection.execute(
-                self._table.select(**options)
-            )
+
+            results: SQLResult = await connection.execute(self._table.select(**options))
 
             return [
-                {
-                    column: value for column, value in row._mapping.items()
-                } for row in results.fetchall()
+                {column: value for column, value in row._mapping.items()}
+                for row in results.fetchall()
             ]
 
     async def close(self):

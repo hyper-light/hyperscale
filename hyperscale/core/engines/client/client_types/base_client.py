@@ -31,7 +31,7 @@ from hyperscale.core.hooks.types.event.hook import EventHook
 from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 S = TypeVar(
-    'S',
+    "S",
     MercuryGraphQLClient,
     MercuryGraphQLHTTP2Client,
     MercuryGRPCClient,
@@ -39,10 +39,10 @@ S = TypeVar(
     MercuryHTTP2Client,
     MercuryPlaywrightClient,
     MercuryUDPClient,
-    MercuryWebsocketClient
+    MercuryWebsocketClient,
 )
 A = TypeVar(
-    'A',
+    "A",
     GraphQLAction,
     GraphQLHTTP2Action,
     GRPCAction,
@@ -50,10 +50,10 @@ A = TypeVar(
     HTTP2Action,
     PlaywrightCommand,
     UDPAction,
-    WebsocketAction
+    WebsocketAction,
 )
 R = TypeVar(
-    'R',
+    "R",
     GraphQLResult,
     GraphQLHTTP2Result,
     GRPCResult,
@@ -61,20 +61,20 @@ R = TypeVar(
     HTTP2Result,
     PlaywrightResult,
     UDPResult,
-    WebsocketResult
+    WebsocketResult,
 )
 
 
 class BaseClient(Generic[S, A, R]):
-    initialized=False
-    setup=False
+    initialized = False
+    setup = False
 
     def __init__(self) -> None:
         self.initialized = True
         self.metadata_string: str = None
         self.client_id = str(uuid.uuid4())
-        self.session: S =  None
-        self.request_type :RequestTypes = None
+        self.session: S = None
+        self.request_type: RequestTypes = None
         self.client_type: str = None
 
         self.actions: ActionsStore = None
@@ -87,7 +87,6 @@ class BaseClient(Generic[S, A, R]):
         self.mutations: Dict[str, Mutation] = {}
 
     async def _execute_action(self, action: A) -> R:
-        
         if self.mutations.get(action.name):
             mutation = self.mutations[action.name]
 
@@ -96,32 +95,27 @@ class BaseClient(Generic[S, A, R]):
 
             mutation_event = Event(
                 None,
-                EventHook(
-                    mutation.name,
-                    mutation.name,
-                    mutation.mutate,
-                    action.name
-                )
+                EventHook(mutation.name, mutation.name, mutation.mutate, action.name),
             )
 
             mutation_event.source.stage_instance = mutation.stage
             action.hooks.before.append([mutation_event])
 
-        await self.logger.filesystem.aio['hyperscale.core'].debug(
-            f'{self.metadata_string} - {self.client_type} Client {self.client_id} - Preparing Action - {action.name}:{action.action_id}'
+        await self.logger.filesystem.aio["hyperscale.core"].debug(
+            f"{self.metadata_string} - {self.client_type} Client {self.client_id} - Preparing Action - {action.name}:{action.action_id}"
         )
         await self.session.prepare(action)
 
-        await self.logger.filesystem.aio['hyperscale.core'].debug(
-            f'{self.metadata_string} - {self.client_type} Client {self.client_id} - Prepared Action - {action.name}:{action.action_id}'
+        await self.logger.filesystem.aio["hyperscale.core"].debug(
+            f"{self.metadata_string} - {self.client_type} Client {self.client_id} - Prepared Action - {action.name}:{action.action_id}"
         )
 
         if self.intercept:
-            await self.logger.filesystem.aio['hyperscale.core'].debug(
-                f'{self.metadata_string} - {self.client_type} Client {self.client_id} - Initiating suspense for Action - {action.name}:{action.action_id} - and storing'
+            await self.logger.filesystem.aio["hyperscale.core"].debug(
+                f"{self.metadata_string} - {self.client_type} Client {self.client_id} - Initiating suspense for Action - {action.name}:{action.action_id} - and storing"
             )
             self.actions.store(self.next_name, action, self.session)
-            
+
             loop = asyncio.get_event_loop()
             self.waiter = loop.create_future()
             await self.waiter

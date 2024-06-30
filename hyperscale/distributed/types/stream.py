@@ -4,7 +4,7 @@ from hyperscale.distributed.models.base.message import Message
 
 from .call import Call
 
-T = TypeVar('T', bound=Message)
+T = TypeVar("T", bound=Message)
 
 
 Stream = AsyncIterable[Call[T]]

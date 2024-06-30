@@ -1,8 +1,9 @@
-from.types import ErrorCodes
+from .types import ErrorCodes
 
 
 class StreamError(Exception):
     error_code = None
+
 
 class StreamResetException(Exception):
     pass
@@ -16,6 +17,7 @@ class NoSuchStreamError(Exception):
        Became a subclass of :class:`ProtocolError
        <h2.exceptions.ProtocolError>`
     """
+
     def __init__(self, stream_id):
         #: The stream ID corresponds to the non-existent stream.
         self.stream_id = stream_id
@@ -29,11 +31,7 @@ class StreamClosedError(Exception):
     stream has been removed.
     """
 
-    __slots__ = (
-        'stream_id',
-        'error_code',
-        'events'
-    )
+    __slots__ = ("stream_id", "error_code", "events")
 
     def __init__(self, stream_id):
         #: The stream ID corresponds to the nonexistent stream.

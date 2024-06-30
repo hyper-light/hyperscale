@@ -4,7 +4,7 @@ from pydantic import (
     StrictInt,
     StrictFloat,
     StrictBool,
-    AnyHttpUrl
+    AnyHttpUrl,
 )
 
 
@@ -20,12 +20,12 @@ class GraphQLActionValidator(BaseModel):
     engine: StrictStr
     name: StrictStr
     url: AnyHttpUrl
-    method: StrictStr='GET'
-    headers: Dict[StrictStr, StrictStr]={}
+    method: StrictStr = "GET"
+    headers: Dict[StrictStr, StrictStr] = {}
     query: StrictStr
     operation_name: StrictStr
     variables: Dict[str, Union[StrictStr, StrictInt, StrictFloat, StrictBool, None]]
     weight: Optional[Union[StrictInt, StrictFloat]]
     order: Optional[StrictInt]
     user: Optional[StrictStr]
-    tags: List[GraphQLActionTag]=[]
+    tags: List[GraphQLActionTag] = []

@@ -17,38 +17,36 @@ from .graphql_action_validator import GraphQLActionValidator
 
 
 class GraphQLActionParser(BaseParser):
-
-    def __init__(
-        self,
-        config: Config,
-        options: Dict[str, Any]={}
-    ) -> None:
+    def __init__(self, config: Config, options: Dict[str, Any] = {}) -> None:
         super().__init__(
-            GraphQLActionParser.__name__,
-            config,
-            RequestTypes.GRAPHQL,
-            options
+            GraphQLActionParser.__name__, config, RequestTypes.GRAPHQL, options
         )
 
     async def parse(
-        self, 
-        action_data: Dict[str, Any],
-        stage: str
+        self, action_data: Dict[str, Any], stage: str
     ) -> Coroutine[Any, Any, Coroutine[Any, Any, ActionHook]]:
-        
-        graphql_variables_data = action_data.get('variables')
-        if isinstance(graphql_variables_data, (str, bytes, bytearray,)):
+        graphql_variables_data = action_data.get("variables")
+        if isinstance(
+            graphql_variables_data,
+            (
+                str,
+                bytes,
+                bytearray,
+            ),
+        ):
             graphql_variables_data = json.loads(graphql_variables_data)
 
         normalized_headers = normalize_headers(action_data)
         tags_data = parse_tags(action_data)
 
-        generator_action = GraphQLActionValidator(**{
-            **action_data,
-            'headers': normalized_headers,
-            'variables': graphql_variables_data,
-            'tags': tags_data
-        })
+        generator_action = GraphQLActionValidator(
+            **{
+                **action_data,
+                "headers": normalized_headers,
+                "variables": graphql_variables_data,
+                "tags": tags_data,
+            }
+        )
 
         action = GraphQLAction(
             generator_action.name,
@@ -56,30 +54,28 @@ class GraphQLActionParser(BaseParser):
             method=generator_action.method,
             headers=generator_action.headers,
             data={
-                'query': generator_action.query,
-                'operation_name': generator_action.operation_name,
-                'variables': generator_action.variables
+                "query": generator_action.query,
+                "operation_name": generator_action.operation_name,
+                "variables": generator_action.variables,
             },
             user=generator_action.user,
-            tags=[
-                tag.dict() for tag in generator_action.tags
-            ]
+            tags=[tag.dict() for tag in generator_action.tags],
         )
 
         session = MercuryGraphQLClient(
             concurrency=self.config.batch_size,
             timeouts=self.timeouts,
             reset_connections=self.config.reset_connections,
-            tracing_session=self.config.tracing
+            tracing_session=self.config.tracing,
         )
 
         await session.prepare(action)
 
         hook = ActionHook(
-            f'{stage}.{generator_action.name}',
+            f"{stage}.{generator_action.name}",
             generator_action.name,
             None,
-            sourcefile=generator_action.sourcefile
+            sourcefile=generator_action.sourcefile,
         )
 
         hook.session = session
@@ -87,13 +83,10 @@ class GraphQLActionParser(BaseParser):
         hook.stage = stage
         hook.context = SimpleContext()
         hook.hook_id = uuid.uuid4()
-      
+
         hook.metadata.order = generator_action.order
         hook.metadata.weight = generator_action.weight
         hook.metadata.tags = generator_action.tags
         hook.metadata.user = generator_action.user
 
         return hook
-
-
-

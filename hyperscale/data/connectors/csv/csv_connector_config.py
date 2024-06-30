@@ -7,6 +7,6 @@ from hyperscale.data.connectors.common.connector_type import ConnectorType
 
 class CSVConnectorConfig(BaseModel):
     filepath: StrictStr
-    file_mode: StrictStr='r'
-    reporter_type: ConnectorType=ConnectorType.CSV
+    file_mode: StrictStr = "r"
+    reporter_type: ConnectorType = ConnectorType.CSV
     headers: Optional[List[StrictStr]]

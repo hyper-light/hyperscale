@@ -9,13 +9,8 @@ from pydantic import (
 
 
 class ExpectConsoleMessageCommand(BaseModel):
-    predicate: Optional[
-        Callable[
-            [ConsoleMessage],
-            bool
-        ]
-    ]=None
+    predicate: Optional[Callable[[ConsoleMessage], bool]] = None
     timeout: StrictInt | StrictFloat
 
     class Config:
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed = True

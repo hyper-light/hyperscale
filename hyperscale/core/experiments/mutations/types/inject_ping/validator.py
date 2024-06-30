@@ -7,10 +7,9 @@ class InjectPingValidator(BaseModel):
     ping_type: StrictStr
     timeout: StrictInt
 
-    @validator('ping_type')
+    @validator("ping_type")
     def validate_ping_type(cls, val):
         types_map = PingTypesMap()
         assert types_map.get(val) is not None
-        
-        return val
 
+        return val

@@ -6,31 +6,18 @@ from .record_types import RecordType
 
 
 class ARecordData(RecordData):
-    '''A record'''
+    """A record"""
 
     def __init__(self, data: str):
-        super().__init__(
-            RecordType.A,
-            data=data
-        )
+        super().__init__(RecordType.A, data=data)
 
     @classmethod
     def load(
-        cls, 
-        data: bytes, 
-        cursor_position: int, 
-        size: int
+        cls, data: bytes, cursor_position: int, size: int
     ) -> Tuple[int, ARecordData]:
-        
-        ip = socket.inet_ntoa(
-            data[cursor_position:cursor_position + size]
-        )
-        
+        ip = socket.inet_ntoa(data[cursor_position : cursor_position + size])
+
         return cursor_position + size, ARecordData(ip)
 
-    def dump(
-        self, 
-        names: Dict[str, int], 
-        offset: int
-    ) -> Iterable[bytes]:
+    def dump(self, names: Dict[str, int], offset: int) -> Iterable[bytes]:
         yield socket.inet_aton(self.data)

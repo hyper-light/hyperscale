@@ -100,6 +100,7 @@ class MercurySyncUDPConnection:
                         path=url_data.path,
                     ),
                     error=str(err),
+                    timings={},
                 )
 
     async def receive(
@@ -132,8 +133,12 @@ class MercurySyncUDPConnection:
                     url_data = url.optimized.parsed
 
                 return UDPResponse(
-                    url=URLMetadata(host=url_data.hostname, path=url_data.path),
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                    ),
                     error=str(err),
+                    timings={},
                 )
 
     async def bidirectional(
@@ -173,6 +178,7 @@ class MercurySyncUDPConnection:
                         path=url_data.path,
                     ),
                     error=str(err),
+                    timings={},
                 )
 
     async def _optimize(
@@ -246,7 +252,7 @@ class MercurySyncUDPConnection:
                 "request_end",
             ],
             float | None,
-        ] = {},
+        ] = None,
     ):
         if timings["connect_start"] is None:
             timings["connect_start"] = time.monotonic()

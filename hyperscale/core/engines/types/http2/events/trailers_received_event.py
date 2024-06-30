@@ -2,8 +2,8 @@ from .base_event import BaseEvent
 
 
 class TrailersReceived(BaseEvent):
-    event_type='TRAILERS_RECEIVED'
-    __slots__ = ('stream_id', 'headers', 'stream_ended', 'priority_updated')
+    event_type = "TRAILERS_RECEIVED"
+    __slots__ = ("stream_id", "headers", "stream_ended", "priority_updated")
     """
     The TrailersReceived event is fired whenever trailers are received on a
     stream. Trailers are a set of headers sent after the body of the
@@ -19,6 +19,7 @@ class TrailersReceived(BaseEvent):
     .. versionchanged:: 2.4.0
        Added ``stream_ended`` and ``priority_updated`` properties.
     """
+
     def __init__(self):
         #: The Stream ID for the stream on which these trailers were received.
         self.stream_id = None
@@ -41,5 +42,6 @@ class TrailersReceived(BaseEvent):
 
     def __repr__(self):
         return "<TrailersReceived stream_id:%s, headers:%s>" % (
-            self.stream_id, self.headers
+            self.stream_id,
+            self.headers,
         )

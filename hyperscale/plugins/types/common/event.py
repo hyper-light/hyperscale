@@ -3,31 +3,28 @@ from typing import Generic, TypeVar
 
 from hyperscale.reporting.processed_result.types.base_processed_result import BaseEvent
 
-T = TypeVar('T')
+T = TypeVar("T")
+
 
 class Event(BaseEvent, Generic[T]):
-
-    __slots__ = (
-        'fields',
-        'type'
-    )
+    __slots__ = ("fields", "type")
 
     def __init__(self, result: T) -> None:
         super().__init__(result)
 
         self.timings = result.as_timings()
-        self.time = result.times['complete'] - result.times['start']
+        self.time = result.times["complete"] - result.times["start"]
 
     def to_dict(self):
         return {
-            'name': self.name,
-            'stage': self.stage,
-            'shortname': self.shortname,
-            'checks': [check.__name__ for check in self.checks],
-            'error': str(self.error),
-            'time': self.time,
-            'type': self.type,
-            'source': self.source,
+            "name": self.name,
+            "stage": self.stage,
+            "shortname": self.shortname,
+            "checks": [check.__name__ for check in self.checks],
+            "error": str(self.error),
+            "time": self.time,
+            "type": self.type,
+            "source": self.source,
         }
 
     def serialize(self):

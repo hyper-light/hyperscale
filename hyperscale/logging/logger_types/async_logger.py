@@ -11,13 +11,12 @@ from .logger_types import LoggerTypes
 
 
 class AsyncLogger(aiologger.Logger):
-
     def __init__(
-        self, 
-        logger_name: str=None, 
-        logger_type: LoggerTypes=LoggerTypes.CONSOLE,
-        log_level: LogLevel = LogLevel.INFO, 
-        logger_enabled: bool=True
+        self,
+        logger_name: str = None,
+        logger_type: LoggerTypes = LoggerTypes.CONSOLE,
+        log_level: LogLevel = LogLevel.INFO,
+        logger_enabled: bool = True,
     ) -> None:
         super().__init__(name=logger_name, level=log_level)
 
@@ -28,23 +27,19 @@ class AsyncLogger(aiologger.Logger):
         self.pattern = None
         self.datefmt_pattern = None
 
-    def initialize(self, pattern: str, datefmt_pattern: str=None):
-
+    def initialize(self, pattern: str, datefmt_pattern: str = None):
         self.pattern = pattern
         self.datefmt_pattern = datefmt_pattern
 
         self.add_handler(
             AsyncStreamHandler(
-                stream=os.fdopen(
-                    os.dup(sys.__stdout__.fileno())
-                ),
+                stream=os.fdopen(os.dup(sys.__stdout__.fileno())),
                 level=self.level,
                 formatter=Formatter(pattern, datefmt=datefmt_pattern),
             )
         )
 
     def _make_log_task(self, level, msg, *args, **kwargs) -> Task:
-
         if self.logger_enabled:
             return super()._make_log_task(level, msg, *args, **kwargs)
 
@@ -53,5 +48,3 @@ class AsyncLogger(aiologger.Logger):
 
     async def _skip_task(self):
         return
-
-

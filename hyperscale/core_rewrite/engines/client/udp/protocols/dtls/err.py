@@ -40,15 +40,15 @@ SSL_ERROR_WANT_CONNECT = 7
 SSL_ERROR_WANT_ACCEPT = 8
 
 SSL_ERROR_TEXT = {
-    0: 'SSL_ERROR_NONE',
-    1: 'SSL_ERROR_SSL',
-    2: 'SSL_ERROR_WANT_READ',
-    3: 'SSL_ERROR_WANT_WRITE',
-    4: 'SSL_ERROR_WANT_X509_LOOKUP',
-    5: 'SSL_ERROR_SYSCALL',
-    6: 'SSL_ERROR_ZERO_RETURN',
-    7: 'SSL_ERROR_WANT_CONNECT',
-    8: 'SSL_ERROR_WANT_ACCEPT',
+    0: "SSL_ERROR_NONE",
+    1: "SSL_ERROR_SSL",
+    2: "SSL_ERROR_WANT_READ",
+    3: "SSL_ERROR_WANT_WRITE",
+    4: "SSL_ERROR_WANT_X509_LOOKUP",
+    5: "SSL_ERROR_SYSCALL",
+    6: "SSL_ERROR_ZERO_RETURN",
+    7: "SSL_ERROR_WANT_CONNECT",
+    8: "SSL_ERROR_WANT_ACCEPT",
 }
 
 ERR_BOTH_KEY_CERT_FILES = 500
@@ -72,52 +72,66 @@ ERR_BAD_SIGNATURE = 0x1417B07B
 
 def patch_ssl_errors():
     import ssl
-    errors = [i for i in globals().items() if type(i[1]) == int and str(i[0]).startswith('ERR_')]
+
+    errors = [
+        i
+        for i in globals().items()
+        if type(i[1]) == int and str(i[0]).startswith("ERR_")
+    ]
     for k, v in errors:
         if not hasattr(ssl, k):
             setattr(ssl, k, v)
 
+
 class SSLError(socket_error):
     """This exception is raised by modules in the dtls package."""
+
     def __init__(self, *args):
         super(SSLError, self).__init__(*args)
 
 
 class InvalidSocketError(Exception):
     """There is a problem with a socket passed to the dtls package."""
+
     def __init__(self, *args):
         super(InvalidSocketError, self).__init__(*args)
 
 
 def _make_opensslerror_class():
     global _OpenSSLError
+
     class __OpenSSLError(SSLError):
         """
         This exception is raised when an error occurs in the OpenSSL library
         """
+
         def __init__(self, ssl_error, errqueue, result, func, args):
             self.ssl_error = ssl_error
             self.errqueue = errqueue
             self.result = result
             self.func = func
             self.args = args
-            SSLError.__init__(self, ssl_error, errqueue,
-                              result, func, args)
+            SSLError.__init__(self, ssl_error, errqueue, result, func, args)
 
     _OpenSSLError = __OpenSSLError
 
+
 _make_opensslerror_class()
+
 
 def openssl_error():
     """Return the OpenSSL error type for use in exception clauses"""
     return _OpenSSLError
 
+
 def raise_as_ssl_module_error():
     """Exceptions raised from this module are instances of ssl.SSLError"""
     import ssl
+
     global SSLError
     SSLError = ssl.SSLError
     _make_opensslerror_class()
+
 
 def raise_ssl_error(code, nested=None):
     """Raise an SSL error with the given error code"""
@@ -126,16 +140,16 @@ def raise_ssl_error(code, nested=None):
         raise SSLError(code, err_string + str(nested))
     raise SSLError(code, err_string)
 
+
 _ssl_errors = {
-    ERR_NO_CERTS: "No root certificates specified for verification " + \
-                  "of other-side certificates",
-    ERR_BOTH_KEY_CERT_FILES: "Both the key & certificate files " + \
-                             "must be specified",
-    ERR_BOTH_KEY_CERT_FILES_SVR: "Both the key & certificate files must be " + \
-                                 "specified for server-side operation",
+    ERR_NO_CERTS: "No root certificates specified for verification "
+    + "of other-side certificates",
+    ERR_BOTH_KEY_CERT_FILES: "Both the key & certificate files " + "must be specified",
+    ERR_BOTH_KEY_CERT_FILES_SVR: "Both the key & certificate files must be "
+    + "specified for server-side operation",
     ERR_NO_CIPHER: "No cipher can be selected.",
     ERR_READ_TIMEOUT: "The read operation timed out",
     ERR_WRITE_TIMEOUT: "The write operation timed out",
     ERR_HANDSHAKE_TIMEOUT: "The handshake operation timed out",
     ERR_PORT_UNREACHABLE: "The peer address is not reachable",
-    }
+}

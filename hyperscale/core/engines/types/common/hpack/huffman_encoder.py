@@ -13,6 +13,7 @@ class HuffmanEncoder:
     Encodes a string according to the Huffman encoding table defined in the
     HPACK specification.
     """
+
     def __init__(self, huffman_code_list, huffman_code_list_lengths):
         self.huffman_code_list = huffman_code_list
         self.huffman_code_list_lengths = huffman_code_list_lengths
@@ -24,7 +25,7 @@ class HuffmanEncoder:
         """
         # If handed the empty string, just immediately return.
         if not bytes_to_encode:
-            return b''
+            return b""
 
         final_num = 0
         final_int_len = 0
@@ -34,9 +35,7 @@ class HuffmanEncoder:
         # handle this cleanly, just use a single giant integer.
         for byte in bytes_to_encode:
             bin_int_len = self.huffman_code_list_lengths[byte]
-            bin_int = self.huffman_code_list[byte] & (
-                2 ** (bin_int_len + 1) - 1
-            )
+            bin_int = self.huffman_code_list[byte] & (2 ** (bin_int_len + 1) - 1)
             final_num <<= bin_int_len
             final_num |= bin_int
             final_int_len += bin_int_len
@@ -48,10 +47,10 @@ class HuffmanEncoder:
 
         # Convert the number to hex and strip off the leading '0x' and the
         # trailing 'L', if present.
-        final_num = hex(final_num)[2:].rstrip('L')
+        final_num = hex(final_num)[2:].rstrip("L")
 
         # If this is odd, prepend a zero.
-        final_num = '0' + final_num if len(final_num) % 2 != 0 else final_num
+        final_num = "0" + final_num if len(final_num) % 2 != 0 else final_num
 
         # This number should have twice as many digits as bytes. If not, we're
         # missing some leading zeroes. Work out how many bytes we want and how
@@ -61,6 +60,6 @@ class HuffmanEncoder:
 
         if len(final_num) != expected_digits:
             missing_digits = expected_digits - len(final_num)
-            final_num = ('0' * missing_digits) + final_num
+            final_num = ("0" * missing_digits) + final_num
 
         return bytes.fromhex(final_num)

@@ -5,11 +5,10 @@ from hyperscale.core.hooks import action
 
 
 class ExecuteUDPStage(Execute):
-
     @action()
     async def udp_send(self):
-        return await self.client.udp.send('https://<url_here>', data="PING")
+        return await self.client.udp.send("https://<url_here>", data="PING")
 
     @action()
     async def udp_receive(self):
-        return await self.client.udp.receive('https://<url_here>')
+        return await self.client.udp.receive("https://<url_here>")

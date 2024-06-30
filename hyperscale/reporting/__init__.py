@@ -30,11 +30,7 @@ from .types import (
     TelegrafStatsDConfig,
     TimescaleDBConfig,
     XML,
-    XMLConfig
-    
+    XMLConfig,
 )
 
-from .reporter import (
-    Reporter,
-    ReporterType
-)
+from .reporter import Reporter, ReporterType

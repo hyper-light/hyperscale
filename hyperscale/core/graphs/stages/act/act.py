@@ -10,27 +10,24 @@ from hyperscale.core.hooks.types.base.hook_type import HookType
 from hyperscale.core.hooks.types.internal.decorator import Internal
 from hyperscale.monitoring import CPUMonitor, MemoryMonitor
 
-T = TypeVarTuple('T')
+T = TypeVarTuple("T")
 
 
 class Act(Stage, Generic[Unpack[T]]):
-    stage_type=StageTypes.ACT
-    priority: Optional[str]=None
-    retries=0
+    stage_type = StageTypes.ACT
+    priority: Optional[str] = None
+    retries = 0
 
     def __init__(self) -> None:
         super().__init__()
         self.persona = None
         self.client: Client[Unpack[T]] = Client(
-            self.graph_name,
-            self.graph_id,
-            self.name,
-            self.stage_id
+            self.graph_name, self.graph_id, self.name, self.stage_id
         )
-        
-        self.accepted_hook_types = [ 
+
+        self.accepted_hook_types = [
             HookType.ACTION,
-            HookType.CHANNEL, 
+            HookType.CHANNEL,
             HookType.CHECK,
             HookType.CONDITION,
             HookType.CONTEXT,
@@ -38,16 +35,14 @@ class Act(Stage, Generic[Unpack[T]]):
             HookType.LOAD,
             HookType.SAVE,
             HookType.TASK,
-            HookType.TRANSFORM
+            HookType.TRANSFORM,
         ]
 
         self.priority = self.priority
         if self.priority is None:
-            self.priority = 'auto'
+            self.priority = "auto"
 
-        self.priority_level: StagePriority = StagePriority.map(
-            self.priority
-        )
+        self.priority_level: StagePriority = StagePriority.map(self.priority)
 
         self.stage_retries = self.retries
 
@@ -59,7 +54,7 @@ class Act(Stage, Generic[Unpack[T]]):
         cpu_monitor = CPUMonitor()
         memory_monitor = MemoryMonitor()
 
-        main_monitor_name = f'{self.name}.main'
+        main_monitor_name = f"{self.name}.main"
 
         await cpu_monitor.start_background_monitor(main_monitor_name)
         await memory_monitor.start_background_monitor(main_monitor_name)
@@ -72,17 +67,17 @@ class Act(Stage, Generic[Unpack[T]]):
         cpu_monitor.close()
         memory_monitor.close()
 
-        cpu_monitor.stage_metrics[main_monitor_name] = cpu_monitor.collected[main_monitor_name]
-        memory_monitor.stage_metrics[main_monitor_name] = memory_monitor.collected[main_monitor_name]
+        cpu_monitor.stage_metrics[main_monitor_name] = cpu_monitor.collected[
+            main_monitor_name
+        ]
+        memory_monitor.stage_metrics[main_monitor_name] = memory_monitor.collected[
+            main_monitor_name
+        ]
 
-        self.context.update({
-            'act_stage_monitors': {
-                self.name: {
-                    'cpu': cpu_monitor,
-                    'memory': memory_monitor
+        self.context.update(
+            {
+                "act_stage_monitors": {
+                    self.name: {"cpu": cpu_monitor, "memory": memory_monitor}
                 }
             }
-        })
-
-
-
+        )

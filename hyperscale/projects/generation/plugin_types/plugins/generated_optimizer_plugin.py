@@ -6,7 +6,6 @@ from hyperscale.plugins.types.optimizer import OptimizerPlugin, get, optimize, u
 
 
 class CustomOptimizer(OptimizerPlugin):
-
     def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__(config)
 

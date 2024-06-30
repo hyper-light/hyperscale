@@ -14,18 +14,17 @@ from .sync_logger import SyncLogger
 
 
 class SyncFilesystemLogger:
-
     def __init__(
-        self, 
-        logger_name: str=None,
-        logger_type: LoggerTypes=LoggerTypes.FILESYSTEM,
-        log_level: LogLevel=LogLevel.NOTSET, 
-        logfiles_directory: str=None,
+        self,
+        logger_name: str = None,
+        logger_type: LoggerTypes = LoggerTypes.FILESYSTEM,
+        log_level: LogLevel = LogLevel.NOTSET,
+        logfiles_directory: str = None,
         logger_enabled: bool = True,
-        rotation_interval_type: RolloverInterval=RolloverInterval.DAYS,
-        rotation_interval: int=1,
-        backup_count: int=1,
-        rotation_time: datetime.time=None
+        rotation_interval_type: RolloverInterval = RolloverInterval.DAYS,
+        rotation_interval: int = 1,
+        backup_count: int = 1,
+        rotation_time: datetime.time = None,
     ) -> None:
         self.logger_name = logger_name
         self.logger_type = logger_type
@@ -40,17 +39,12 @@ class SyncFilesystemLogger:
         self.files: Dict[str, SyncLogger] = {}
         self.filepaths: Dict[str, str] = {}
 
-    def __getitem__(self, logger_name: str=None):
-
+    def __getitem__(self, logger_name: str = None):
         file_logger = self.files.get(logger_name)
 
         if file_logger is None:
             file_logger = self._create_file_logger(
-                logger_name,
-                os.path.join(
-                    self.logfiles_directory,
-                    f'{logger_name}.log'
-                ) 
+                logger_name, os.path.join(self.logfiles_directory, f"{logger_name}.log")
             )
 
             self.files[logger_name] = file_logger
@@ -62,7 +56,7 @@ class SyncFilesystemLogger:
             logger_name=logger_name,
             logger_type=self.logger_type,
             log_level=self.log_level,
-            logger_enabled=self.logger_enabled
+            logger_enabled=self.logger_enabled,
         )
 
         sync_file_handler = TimedRotatingFileHandler(
@@ -70,12 +64,12 @@ class SyncFilesystemLogger:
             when=self.rotation_interval_type,
             interval=self.rotation_interval,
             backupCount=self.backups,
-            atTime=self.rotation_time
+            atTime=self.rotation_time,
         )
 
         sync_file_handler.formatter = Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(funcName)s:%(lineno)d - %(message)s',
-            '%Y-%m-%dT%H:%M:%S.%Z'
+            "%(asctime)s - %(name)s - %(levelname)s - %(module)s:%(funcName)s:%(lineno)d - %(message)s",
+            "%Y-%m-%dT%H:%M:%S.%Z",
         )
 
         sync_logger.addHandler(sync_file_handler)
@@ -83,11 +77,10 @@ class SyncFilesystemLogger:
         return sync_logger
 
     def create_logfile(self, log_filename: str):
-
         filepath = os.path.join(self.logfiles_directory, log_filename)
 
-        if os.path.exists(filepath) is False:      
-            log_file = open(filepath, 'w')
+        if os.path.exists(filepath) is False:
+            log_file = open(filepath, "w")
             log_file.close()
 
             self.update_files(filepath)
@@ -101,4 +94,3 @@ class SyncFilesystemLogger:
         if self.files.get(logger_name) is None:
             self.files[logger_name] = self._create_file_logger(logger_name, filepath)
             self.filepaths[logger_name] = filepath
-            

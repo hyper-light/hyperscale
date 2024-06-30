@@ -8,37 +8,30 @@ from hyperscale.data.serializers.serializer_types.common.metadata_serializer imp
 
 
 class BaseSerializer:
-
     def __init__(self) -> None:
         self.metadata_serializer = MetadataSerializer()
 
     def action_to_serializable(
-        self, 
-        action: BaseAction
+        self, action: BaseAction
     ) -> Dict[str, Union[str, List[str]]]:
         return {
-            'action_id': action.action_id,
-            'name': action.name,
-            'metadata': self.metadata_serializer.serialize_metadata(
-                action.metadata
-            ),
+            "action_id": action.action_id,
+            "name": action.name,
+            "metadata": self.metadata_serializer.serialize_metadata(action.metadata),
         }
-    
-    def result_to_serializable(
-        self,
-        result: BaseResult
-    ) -> Dict[str, Any]:
+
+    def result_to_serializable(self, result: BaseResult) -> Dict[str, Any]:
         return {
-            'name': result.name,
-            'error': str(result.error),
-            'source': result.source,
-            'user': result.user,
-            'tags': result.tags,
-            'type': result.type,
-            'wait_start': float(result.wait_start),
-            'start': float(result.start),
-            'connect_end': float(result.connect_end),
-            'write_end': float(result.write_end),
-            'complete': float(result.complete),
-            'checks': result.checks
+            "name": result.name,
+            "error": str(result.error),
+            "source": result.source,
+            "user": result.user,
+            "tags": result.tags,
+            "type": result.type,
+            "wait_start": float(result.wait_start),
+            "start": float(result.start),
+            "connect_end": float(result.connect_end),
+            "write_end": float(result.write_end),
+            "complete": float(result.complete),
+            "checks": result.checks,
         }

@@ -10,6 +10,6 @@ from pydantic import (
 
 class WaitForFunctionCommand(BaseModel):
     expression: StrictStr
-    arg: Optional[Any]=None
-    polling: Optional[StrictFloat | Literal['raf']]=None
+    arg: Optional[Any] = None
+    polling: Optional[StrictFloat | Literal["raf"]] = None
     timeout: StrictInt | StrictFloat

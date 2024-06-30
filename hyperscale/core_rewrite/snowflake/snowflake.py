@@ -1,14 +1,7 @@
 from dataclasses import dataclass
-from datetime import (
-    datetime,
-    tzinfo,
-    timedelta
-)
+from datetime import datetime, tzinfo, timedelta
 from typing import Optional
-from .constants import (
-    MAX_INSTANCE,
-    MAX_SEQ
-)
+from .constants import MAX_INSTANCE, MAX_SEQ
 
 
 @dataclass(frozen=True)
@@ -18,14 +11,13 @@ class Snowflake:
     epoch: int = 0
     seq: int = 0
 
-
     @classmethod
-    def parse(cls, snowflake: int, epoch: int = 0) -> 'Snowflake':
+    def parse(cls, snowflake: int, epoch: int = 0) -> "Snowflake":
         return cls(
             epoch=epoch,
             timestamp=snowflake >> 22,
             instance=snowflake >> 12 & MAX_INSTANCE,
-            seq=snowflake & MAX_SEQ
+            seq=snowflake & MAX_SEQ,
         )
 
     @property

@@ -7,11 +7,10 @@ from hyperscale.core.experiments.mutations.types.base.mutation import Mutation
 
 from .store import ActionsStore
 
-T = TypeVarTuple('T')
+T = TypeVarTuple("T")
 
 
 class PluginsStore(Generic[Unpack[T]]):
-
     def __init__(self, metadata_string: str):
         self._plugins: Dict[str, Union[Unpack[T]]] = {}
         self._config: Config = None
@@ -23,7 +22,6 @@ class PluginsStore(Generic[Unpack[T]]):
         self.mutations: Dict[str, Mutation] = {}
 
     def __getitem__(self, plugin_name: str) -> Union[Unpack[T]]:
-
         custom_plugin: Union[Unpack[T]] = self._plugins.get(plugin_name)
 
         if custom_plugin.initialized is False:

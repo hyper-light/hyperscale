@@ -68,28 +68,23 @@ class H2Configuration:
 
     :type logger: ``logging.Logger``
     """
-    client_side = BooleanConfigOption('client_side')
-    validate_outbound_headers = BooleanConfigOption(
-        'validate_outbound_headers'
-    )
-    normalize_outbound_headers = BooleanConfigOption(
-        'normalize_outbound_headers'
-    )
-    validate_inbound_headers = BooleanConfigOption(
-        'validate_inbound_headers'
-    )
-    normalize_inbound_headers = BooleanConfigOption(
-        'normalize_inbound_headers'
-    )
 
-    def __init__(self,
-                 client_side=True,
-                 header_encoding=None,
-                 validate_outbound_headers=True,
-                 normalize_outbound_headers=True,
-                 validate_inbound_headers=True,
-                 normalize_inbound_headers=True,
-                 logger=None):
+    client_side = BooleanConfigOption("client_side")
+    validate_outbound_headers = BooleanConfigOption("validate_outbound_headers")
+    normalize_outbound_headers = BooleanConfigOption("normalize_outbound_headers")
+    validate_inbound_headers = BooleanConfigOption("validate_inbound_headers")
+    normalize_inbound_headers = BooleanConfigOption("normalize_inbound_headers")
+
+    def __init__(
+        self,
+        client_side=True,
+        header_encoding=None,
+        validate_outbound_headers=True,
+        normalize_outbound_headers=True,
+        validate_inbound_headers=True,
+        normalize_inbound_headers=True,
+        logger=None,
+    ):
         self.client_side = client_side
         self.header_encoding = header_encoding
         self.validate_outbound_headers = validate_outbound_headers

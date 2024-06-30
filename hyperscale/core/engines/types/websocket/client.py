@@ -15,23 +15,25 @@ from .utils import get_header_bits, get_message_buffer_size
 
 
 class MercuryWebsocketClient(BaseEngine[WebsocketAction, WebsocketResult]):
-
     __slots__ = (
-        'session_id',
-        'timeouts',
-        'registered',
-        '_hosts',
-        'closed',
-        'sem',
-        'pool',
-        'active',
-        'waiter',
-        'ssl_context'
+        "session_id",
+        "timeouts",
+        "registered",
+        "_hosts",
+        "closed",
+        "sem",
+        "pool",
+        "active",
+        "waiter",
+        "ssl_context",
     )
 
-
-    def __init__(self, concurrency: int = 10 ** 3, timeouts: Timeouts = Timeouts(), reset_connections: bool=False) -> None:
-        
+    def __init__(
+        self,
+        concurrency: int = 10**3,
+        timeouts: Timeouts = Timeouts(),
+        reset_connections: bool = False,
+    ) -> None:
         self.session_id = str(uuid.uuid4())
         self.timeouts = timeouts
 
@@ -49,78 +51,76 @@ class MercuryWebsocketClient(BaseEngine[WebsocketAction, WebsocketResult]):
 
     def config_to_dict(self):
         return {
-            'concurrency': self.pool.size,
-            'timeouts': {
-                'connect_timeout': self.timeouts.connect_timeout,
-                'socket_read_timeout': self.timeouts.socket_read_timeout,
-                'total_timeout': self.timeouts.total_timeout
+            "concurrency": self.pool.size,
+            "timeouts": {
+                "connect_timeout": self.timeouts.connect_timeout,
+                "socket_read_timeout": self.timeouts.socket_read_timeout,
+                "total_timeout": self.timeouts.total_timeout,
             },
-            'reset_connections': self.pool.reset_connections
+            "reset_connections": self.pool.reset_connections,
         }
-    
+
     async def set_pool(self, concurrency: int):
         self.sem = asyncio.Semaphore(value=concurrency)
         self.pool = Pool(concurrency, reset_connections=self.pool.reset_connections)
         self.pool.create_pool()
 
-    
     def extend_pool(self, increased_capacity: int):
         self.pool.size += increased_capacity
         for _ in range(increased_capacity):
             self.pool.connections.append(
                 WebsocketConnection(self.pool.reset_connections)
             )
-        
+
         self.sem = asyncio.Semaphore(self.pool.size)
 
     def shrink_pool(self, decrease_capacity: int):
         self.pool.size -= decrease_capacity
-        self.pool.connections = self.pool.connections[:self.pool.size]
+        self.pool.connections = self.pool.connections[: self.pool.size]
         self.sem = asyncio.Semaphore(self.pool.size)
-        
+
     async def prepare(self, action: WebsocketAction) -> Coroutine[Any, Any, None]:
         try:
             if action.url.is_ssl:
                 action.ssl_context = self.ssl_context
 
             if self._hosts.get(action.url.hostname) is None:
+                socket_configs = await action.url.lookup()
+                for ip_addr, configs in socket_configs.items():
+                    for config in configs:
+                        try:
+                            connection = WebsocketConnection()
+                            await connection.make_connection(
+                                action.url.hostname,
+                                ip_addr,
+                                action.url.port,
+                                config,
+                                ssl=action.ssl_context,
+                            )
 
-                    socket_configs = await action.url.lookup()
-                    for ip_addr, configs in socket_configs.items():
-                        for config in configs:
-                            try:
-                                connection = WebsocketConnection()
-                                await connection.make_connection(
-                                    action.url.hostname,
-                                    ip_addr,
-                                    action.url.port,
-                                    config,
-                                    ssl=action.ssl_context
-                                )
-
-                                action.url.socket_config = config
-                                action.url.ip_addr = ip_addr
-                                action.url.has_ip_addr = True
-                                break
-
-                            except Exception:
-                                pass
-
-                        if action.url.socket_config:
+                            action.url.socket_config = config
+                            action.url.ip_addr = ip_addr
+                            action.url.has_ip_addr = True
                             break
 
-                    if action.url.socket_config is None:
-                        raise Exception('Err. - No socket found.')
-                    
-                    self._hosts[action.url.hostname] = {
-                        'ip_addr': action.url.ip_addr,
-                        'socket_config': action.url.socket_config
-                    }
+                        except Exception:
+                            pass
+
+                    if action.url.socket_config:
+                        break
+
+                if action.url.socket_config is None:
+                    raise Exception("Err. - No socket found.")
+
+                self._hosts[action.url.hostname] = {
+                    "ip_addr": action.url.ip_addr,
+                    "socket_config": action.url.socket_config,
+                }
 
             else:
                 host_config = self._hosts[action.url.hostname]
-                action.url.ip_addr = host_config.get('ip_addr')
-                action.url.socket_config = host_config.get('socket_config')
+                action.url.ip_addr = host_config.get("ip_addr")
+                action.url.socket_config = host_config.get("socket_config")
 
             if action.is_setup is False:
                 action.setup()
@@ -128,22 +128,21 @@ class MercuryWebsocketClient(BaseEngine[WebsocketAction, WebsocketResult]):
             self.registered[action.name] = action
 
             return action
-        
+
         except Exception as e:
             raise e
 
-    async def execute_prepared_request(self, action: WebsocketAction) -> Coroutine[Any, Any, WebsocketResult]:
-
+    async def execute_prepared_request(
+        self, action: WebsocketAction
+    ) -> Coroutine[Any, Any, WebsocketResult]:
         response = WebsocketResult(action)
         response.wait_start = time.monotonic()
         self.active += 1
 
         async with self.sem:
-
             connection = self.pool.connections.pop()
 
             try:
-
                 if action.hooks.listen:
                     event = asyncio.Event()
                     action.hooks.channel_events.append(event)
@@ -160,13 +159,13 @@ class MercuryWebsocketClient(BaseEngine[WebsocketAction, WebsocketResult]):
                     action.url.ip_addr,
                     action.url.port,
                     ssl=action.ssl_context,
-                    timeout=self.timeouts.connect_timeout
+                    timeout=self.timeouts.connect_timeout,
                 )
 
                 response.connect_end = time.monotonic()
 
                 connection.write(action.encoded_headers)
-                
+
                 if action.encoded_data is not None:
                     if action.is_stream:
                         action.write_chunks(connection)
@@ -176,21 +175,28 @@ class MercuryWebsocketClient(BaseEngine[WebsocketAction, WebsocketResult]):
 
                 response.write_end = time.monotonic()
 
-                line = await asyncio.wait_for(connection.readuntil(), self.timeouts.socket_read_timeout)
+                line = await asyncio.wait_for(
+                    connection.readuntil(), self.timeouts.socket_read_timeout
+                )
 
                 response.response_code = line
-                raw_headers = b''
-                async for key, value, header_line in connection.iter_headers(connection):
+                raw_headers = b""
+                async for key, value, header_line in connection.iter_headers(
+                    connection
+                ):
                     response.headers[key] = value
                     raw_headers += header_line
 
                 if action.encoded_data is not None:
                     header_bits = get_header_bits(raw_headers)
                     header_content_length = get_message_buffer_size(header_bits)
-                    
-                if action.method == 'GET':
-                    response.body = await asyncio.wait_for(connection.readexactly(min(16384, header_content_length)), self.timeouts.total_timeout)
-                
+
+                if action.method == "GET":
+                    response.body = await asyncio.wait_for(
+                        connection.readexactly(min(16384, header_content_length)),
+                        self.timeouts.total_timeout,
+                    )
+
                 response.complete = time.monotonic()
 
                 if action.hooks.after:
@@ -198,18 +204,21 @@ class MercuryWebsocketClient(BaseEngine[WebsocketAction, WebsocketResult]):
                     action.setup()
 
                 if action.hooks.notify:
-                    await asyncio.gather(*[
-                        asyncio.create_task(
-                            channel.call(response, action.hooks.listeners)
-                        ) for channel in action.hooks.channels
-                    ])
+                    await asyncio.gather(
+                        *[
+                            asyncio.create_task(
+                                channel.call(response, action.hooks.listeners)
+                            )
+                            for channel in action.hooks.channels
+                        ]
+                    )
 
-                    for listener in action.hooks.listeners: 
+                    for listener in action.hooks.listeners:
                         if len(listener.hooks.channel_events) > 0:
                             listener.setup()
                             event = listener.hooks.channel_events.pop()
                             if not event.is_set():
-                                event.set()   
+                                event.set()
 
                 self.pool.connections.append(connection)
 
@@ -218,18 +227,17 @@ class MercuryWebsocketClient(BaseEngine[WebsocketAction, WebsocketResult]):
                 response.error = str(e)
 
                 self.pool.connections.append(
-                    WebsocketConnection(reset_connection=self.pool.reset_connections) 
+                    WebsocketConnection(reset_connection=self.pool.reset_connections)
                 )
 
             self.active -= 1
             if self.waiter and self.active <= self.pool.size:
-
                 try:
                     self.waiter.set_result(None)
                     self.waiter = None
 
                 except asyncio.InvalidStateError:
-                    self.waiter = None 
+                    self.waiter = None
 
             return response
 
@@ -237,4 +245,3 @@ class MercuryWebsocketClient(BaseEngine[WebsocketAction, WebsocketResult]):
         if self.closed is False:
             await self.pool.close()
             self.closed = True
-

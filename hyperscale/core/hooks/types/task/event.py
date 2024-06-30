@@ -7,23 +7,13 @@ from hyperscale.core.hooks.types.task.hook import TaskHook
 
 
 class TaskEvent(BaseEvent[TaskHook]):
-
     def __init__(self, target: Hook, source: TaskHook) -> None:
-        super(
-            TaskEvent,
-            self
-        ).__init__(
-            target,
-            source
-        )
+        super(TaskEvent, self).__init__(target, source)
 
         self.event_type = EventType.TASK
 
     def copy(self):
-        task_event = TaskEvent(
-            self.target.copy(),
-            self.source.copy()
-        )
+        task_event = TaskEvent(self.target.copy(), self.source.copy())
 
         task_event.execution_path = list(self.execution_path)
         task_event.previous_map = list(self.previous_map)

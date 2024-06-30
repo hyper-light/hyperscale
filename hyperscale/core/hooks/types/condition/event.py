@@ -7,23 +7,13 @@ from hyperscale.core.hooks.types.condition.hook import ConditionHook
 
 
 class ConditionEvent(BaseEvent[ConditionHook]):
-
     def __init__(self, target: Hook, source: ConditionHook) -> None:
-        super(
-            ConditionEvent,
-            self
-        ).__init__(
-            target,
-            source
-        )
+        super(ConditionEvent, self).__init__(target, source)
 
         self.event_type = EventType.CONDITION
 
     def copy(self):
-        condtion_event = ConditionEvent(
-            self.target.copy(),
-            self.source.copy()
-        )
+        condtion_event = ConditionEvent(self.target.copy(), self.source.copy())
 
         condtion_event.execution_path = list(self.execution_path)
         condtion_event.previous_map = list(self.previous_map)

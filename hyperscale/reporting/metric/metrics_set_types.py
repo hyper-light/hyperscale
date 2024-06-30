@@ -112,44 +112,29 @@ class ReadingMetrics(WritingMetrics):
 
 
 class GroupMetricsSet(ReadingMetrics):
-
     def get_group(self, group: str) -> Dict[str, Union[int, float]]:
-        return {
-            key: value for key, value in self.dict().items() if group in key
-        }
-
+        return {key: value for key, value in self.dict().items() if group in key}
 
     @property
     def total(self) -> Dict[str, Union[int, float]]:
-        return {
-            key: value for key, value in self.dict().items() if 'total' in key
-        }
-
+        return {key: value for key, value in self.dict().items() if "total" in key}
 
     @property
     def waiting(self) -> Dict[str, Union[int, float]]:
-        return {
-            key: value for key, value in self.dict().items() if 'waiting' in key
-        }
+        return {key: value for key, value in self.dict().items() if "waiting" in key}
 
     @property
     def connecting(self) -> Dict[str, Union[int, float]]:
-        return {
-            key: value for key, value in self.dict().items() if 'connecting' in key
-        }
-    
+        return {key: value for key, value in self.dict().items() if "connecting" in key}
+
     @property
     def reading(self) -> Dict[str, Union[int, float]]:
-        return {
-            key: value for key, value in self.dict().items() if 'reading' in key
-        }
-    
+        return {key: value for key, value in self.dict().items() if "reading" in key}
+
     @property
     def writing(self) -> Dict[str, Union[int, float]]:
-        return {
-            key: value for key, value in self.dict().items() if 'writing' in key
-        }
-        
+        return {key: value for key, value in self.dict().items() if "writing" in key}
+
 
 class StageMetrics(BaseModel):
     name: StrictStr

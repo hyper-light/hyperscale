@@ -3,14 +3,9 @@ from .base_event import BaseEvent
 
 
 class DataReceived(BaseEvent):
-    event_type='DATA_RECEIVED'
+    event_type = "DATA_RECEIVED"
 
-    __slots__ = (
-        'stream_id',
-        'data',
-        'flow_controlled_length',
-        'stream_ended'
-    )
+    __slots__ = ("stream_id", "data", "flow_controlled_length", "stream_ended")
 
     def __init__(self):
         #: The Stream ID for the stream this data was received on.
@@ -33,15 +28,15 @@ class DataReceived(BaseEvent):
         self.stream_ended = None
 
     def __repr__(self):
-        
         decoded_data = None
         if self.data:
-            decoded_data = binascii.hexlify(self.data[:20]).decode('ascii')
+            decoded_data = binascii.hexlify(self.data[:20]).decode("ascii")
 
         return (
             "<DataReceived stream_id:%s, "
             "flow_controlled_length:%s, "
-            "data:%s>" % (
+            "data:%s>"
+            % (
                 self.stream_id,
                 self.flow_controlled_length,
                 decoded_data,

@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import asyncio
 from typing import Any, Dict
 
 from .workflow_context import WorkflowContext
@@ -28,5 +31,29 @@ class Context:
     def dict(self):
         return {key: value.dict() for key, value in self._context.items()}
 
-    async def update(self, workflow: str, key: str, value: Any):
-        await self._context[workflow].set(key, value)
+    async def copy(self, context: Context):
+        await asyncio.gather(
+            *[
+                self._context[workflow].set(key, value)
+                for workflow, ctx in context.iter_workflow_contexts()
+                for key, value in ctx.items()
+            ]
+        )
+
+        return self
+
+    async def update(
+        self,
+        workflow: str,
+        key: str,
+        value: Any,
+        timestamp: int | None = None,
+    ):
+        if self._context.get(workflow) is None:
+            self._context[workflow] = WorkflowContext()
+
+        await self._context[workflow].set(
+            key,
+            value,
+            timestamp=timestamp,
+        )

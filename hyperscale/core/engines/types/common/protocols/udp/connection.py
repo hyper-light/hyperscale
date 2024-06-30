@@ -27,7 +27,6 @@ QuicStreamHandler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], None]
 
 
 class UDPConnection:
-
     def __init__(self, factory_type: RequestTypes = RequestTypes.HTTP) -> None:
         self.loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
         self.transport: asyncio.DatagramTransport = None
@@ -37,13 +36,12 @@ class UDPConnection:
         self._writer = None
 
     async def create_udp(self, socket_config=None, *, limit=_DEFAULT_LIMIT, tls=None):
-        
         self.loop = asyncio.get_event_loop()
 
         family, type_, _, _, address = socket_config
 
         self.socket = socket.socket(family=family, type=type_)
-        
+
         await self.loop.run_in_executor(None, self.socket.connect, address)
 
         self.socket.setblocking(False)
@@ -52,26 +50,24 @@ class UDPConnection:
         reader_protocol = UDPProtocol(reader, loop=self.loop)
 
         self.transport, _ = await self.loop.create_datagram_endpoint(
-            lambda: reader_protocol, 
-            sock=self.socket
+            lambda: reader_protocol, sock=self.socket
         )
 
         # TODO: Enable DTLS - This appears to be a *significant* amount of work
         # but would allow for VOIP testing, etc.
 
         self._writer = Writer(self.transport, reader_protocol, reader, self.loop)
-        
+
         return reader, self._writer
-    
+
     async def create_http3(
-        self, 
+        self,
         socket_config=None,
-        server_name: str=None, 
+        server_name: str = None,
         configuration: Optional[QuicConfiguration] = None,
         stream_handler: Optional[QuicStreamHandler] = None,
         local_port: int = 0,
     ):
-        
         _, _, _, _, address = socket_config
         if len(address) == 2:
             address = ("::ffff:" + address[0], address[1], 0, 0)
@@ -82,17 +78,14 @@ class UDPConnection:
         if not hasattr(socket, "IPPROTO_IPV6"):
             socket.IPPROTO_IPV6 = 41
 
-        configuration = QuicConfiguration(
-            is_client=True, alpn_protocols=H3_ALPN
-        )
+        configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
 
         # prepare QUIC connection
         if configuration.server_name is None:
             configuration.server_name = server_name
-            
+
         connection = QuicConnection(
-            configuration=configuration, 
-            session_ticket_handler=lambda handler: None
+            configuration=configuration, session_ticket_handler=lambda handler: None
         )
 
         # explicitly enable IPv4/IPv6 dual stack
@@ -110,13 +103,10 @@ class UDPConnection:
         self.loop = asyncio.get_event_loop()
         _, protocol = await self.loop.create_datagram_endpoint(
             lambda: QuicProtocol(
-                connection, 
-                stream_handler=stream_handler,
-                loop=self.loop
+                connection, stream_handler=stream_handler, loop=self.loop
             ),
             sock=self.socket,
         )
-
 
         protocol.init_connection()
 
@@ -124,12 +114,10 @@ class UDPConnection:
         await protocol.wait_connected()
 
         return protocol
-    
-    async def close(self):
 
+    async def close(self):
         try:
             self.transport.close()
 
         except Exception:
             pass
-

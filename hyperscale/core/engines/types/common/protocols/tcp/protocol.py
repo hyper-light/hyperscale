@@ -18,14 +18,14 @@ class TCPProtocol(FlowControlMixin, Protocol):
     """
 
     __slots__ = (
-        '_source_traceback',
-        '_reject_connection',
-        '_stream_writer',
-        '_transport',
-        '_client_connected_cb',
-        '_over_ssl',
-        '_closed',
-        '_stream_reader_wr'
+        "_source_traceback",
+        "_reject_connection",
+        "_stream_writer",
+        "_transport",
+        "_client_connected_cb",
+        "_over_ssl",
+        "_closed",
+        "_stream_reader_wr",
     )
 
     def __init__(self, stream_reader: Reader, client_connected_cb=None, loop=None):
@@ -59,17 +59,19 @@ class TCPProtocol(FlowControlMixin, Protocol):
         transport = writer.transport
         self._stream_writer = writer
         self._transport = transport
-        self._over_ssl = transport.get_extra_info('sslcontext') is not None
+        self._over_ssl = transport.get_extra_info("sslcontext") is not None
 
     def connection_made(self, transport: Transport):
         if self._reject_connection:
             context = {
-                'message': ('An open stream was garbage collected prior to '
-                            'establishing network connection; '
-                            'call "stream.close()" explicitly.')
+                "message": (
+                    "An open stream was garbage collected prior to "
+                    "establishing network connection; "
+                    'call "stream.close()" explicitly.'
+                )
             }
             if self._source_traceback:
-                context['source_traceback'] = self._source_traceback
+                context["source_traceback"] = self._source_traceback
             self._loop.call_exception_handler(context)
             transport.abort()
             return
@@ -77,13 +79,10 @@ class TCPProtocol(FlowControlMixin, Protocol):
         reader: Reader = self._stream_reader
         if reader is not None:
             reader.set_transport(transport)
-        self._over_ssl = transport.get_extra_info('sslcontext') is not None
+        self._over_ssl = transport.get_extra_info("sslcontext") is not None
         if self._client_connected_cb is not None:
-            self._stream_writer = Reader(transport, self,
-                                               reader,
-                                               self._loop)
-            res = self._client_connected_cb(reader,
-                                            self._stream_writer)
+            self._stream_writer = Reader(transport, self, reader, self._loop)
+            res = self._client_connected_cb(reader, self._stream_writer)
             if iscoroutine(res):
                 self._loop.create_task(res)
             self._strong_reader = None
@@ -134,4 +133,3 @@ class TCPProtocol(FlowControlMixin, Protocol):
         else:
             if closed.done() and not closed.cancelled():
                 closed.exception()
-

@@ -7,23 +7,13 @@ from hyperscale.core.hooks.types.channel.hook import ChannelHook
 
 
 class ChannelEvent(BaseEvent[ChannelHook]):
-
     def __init__(self, target: Hook, source: ChannelHook) -> None:
-        super(
-            ChannelEvent,
-            self
-        ).__init__(
-            target,
-            source
-        )
+        super(ChannelEvent, self).__init__(target, source)
 
         self.event_type = EventType.CHANNEL
 
     def copy(self):
-        channel_event = ChannelEvent(
-            self.target.copy(),
-            self.source.copy()
-        )
+        channel_event = ChannelEvent(self.target.copy(), self.source.copy())
 
         channel_event.execution_path = list(self.execution_path)
         channel_event.previous_map = list(self.previous_map)

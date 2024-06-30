@@ -29,6 +29,7 @@ _logger = getLogger(__name__)
 
 class _Rsrc(object):
     """Wrapper base for library-owned resources"""
+
     def __init__(self, value):
         self._value = value
 
@@ -43,6 +44,7 @@ class _Rsrc(object):
 
 class _BIO(_Rsrc):
     """BIO wrapper"""
+
     def __init__(self, value):
         _logger.debug("Allocating BIO: %d", value.raw)
         super(_BIO, self).__init__(value)
@@ -55,6 +57,7 @@ class _BIO(_Rsrc):
         if self.owned:
             _logger.debug("Freeing BIO: %d", self.raw)
             from .openssl import BIO_free
+
             BIO_free(self._value)
             self.owned = False
         self._value = None
@@ -62,6 +65,7 @@ class _BIO(_Rsrc):
 
 class _EC_KEY(_Rsrc):
     """EC KEY wrapper"""
+
     def __init__(self, value):
         _logger.debug("Allocating EC_KEY: %d", value.raw)
         super(_EC_KEY, self).__init__(value)
@@ -69,5 +73,6 @@ class _EC_KEY(_Rsrc):
     def __del__(self):
         _logger.debug("Freeing EC_KEY: %d", self.raw)
         from .openssl import EC_KEY_free
+
         EC_KEY_free(self._value)
         self._value = None

@@ -14,6 +14,7 @@ class HeaderTable:
 
     See RFC7541 Section 2.3
     """
+
     #: Default maximum size of the dynamic table. See
     #:  RFC7540 Section 6.5.2.
     DEFAULT_SIZE = 4096
@@ -21,71 +22,71 @@ class HeaderTable:
     #: Constant list of static headers. See RFC7541 Section
     #:  2.3.1 and Appendix A
     STATIC_TABLE = (
-        (b':authority'                  , b''             ),  # noqa
-        (b':method'                     , b'GET'          ),  # noqa
-        (b':method'                     , b'POST'         ),  # noqa
-        (b':path'                       , b'/'            ),  # noqa
-        (b':path'                       , b'/index.html'  ),  # noqa
-        (b':scheme'                     , b'http'         ),  # noqa
-        (b':scheme'                     , b'https'        ),  # noqa
-        (b':status'                     , b'200'          ),  # noqa
-        (b':status'                     , b'204'          ),  # noqa
-        (b':status'                     , b'206'          ),  # noqa
-        (b':status'                     , b'304'          ),  # noqa
-        (b':status'                     , b'400'          ),  # noqa
-        (b':status'                     , b'404'          ),  # noqa
-        (b':status'                     , b'500'          ),  # noqa
-        (b'accept-charset'              , b''             ),  # noqa
-        (b'accept-encoding'             , b'gzip, deflate'),  # noqa
-        (b'accept-language'             , b''             ),  # noqa
-        (b'accept-ranges'               , b''             ),  # noqa
-        (b'accept'                      , b''             ),  # noqa
-        (b'access-control-allow-origin' , b''             ),  # noqa
-        (b'age'                         , b''             ),  # noqa
-        (b'allow'                       , b''             ),  # noqa
-        (b'authorization'               , b''             ),  # noqa
-        (b'cache-control'               , b''             ),  # noqa
-        (b'content-disposition'         , b''             ),  # noqa
-        (b'content-encoding'            , b''             ),  # noqa
-        (b'content-language'            , b''             ),  # noqa
-        (b'content-length'              , b''             ),  # noqa
-        (b'content-location'            , b''             ),  # noqa
-        (b'content-range'               , b''             ),  # noqa
-        (b'content-type'                , b''             ),  # noqa
-        (b'cookie'                      , b''             ),  # noqa
-        (b'date'                        , b''             ),  # noqa
-        (b'etag'                        , b''             ),  # noqa
-        (b'expect'                      , b''             ),  # noqa
-        (b'expires'                     , b''             ),  # noqa
-        (b'from'                        , b''             ),  # noqa
-        (b'host'                        , b''             ),  # noqa
-        (b'if-match'                    , b''             ),  # noqa
-        (b'if-modified-since'           , b''             ),  # noqa
-        (b'if-none-match'               , b''             ),  # noqa
-        (b'if-range'                    , b''             ),  # noqa
-        (b'if-unmodified-since'         , b''             ),  # noqa
-        (b'last-modified'               , b''             ),  # noqa
-        (b'link'                        , b''             ),  # noqa
-        (b'location'                    , b''             ),  # noqa
-        (b'max-forwards'                , b''             ),  # noqa
-        (b'proxy-authenticate'          , b''             ),  # noqa
-        (b'proxy-authorization'         , b''             ),  # noqa
-        (b'range'                       , b''             ),  # noqa
-        (b'referer'                     , b''             ),  # noqa
-        (b'refresh'                     , b''             ),  # noqa
-        (b'retry-after'                 , b''             ),  # noqa
-        (b'server'                      , b''             ),  # noqa
-        (b'set-cookie'                  , b''             ),  # noqa
-        (b'strict-transport-security'   , b''             ),  # noqa
-        (b'transfer-encoding'           , b''             ),  # noqa
-        (b'user-agent'                  , b''             ),  # noqa
-        (b'vary'                        , b''             ),  # noqa
-        (b'via'                         , b''             ),  # noqa
-        (b'www-authenticate'            , b''             ),  # noqa
+        (b":authority", b""),  # noqa
+        (b":method", b"GET"),  # noqa
+        (b":method", b"POST"),  # noqa
+        (b":path", b"/"),  # noqa
+        (b":path", b"/index.html"),  # noqa
+        (b":scheme", b"http"),  # noqa
+        (b":scheme", b"https"),  # noqa
+        (b":status", b"200"),  # noqa
+        (b":status", b"204"),  # noqa
+        (b":status", b"206"),  # noqa
+        (b":status", b"304"),  # noqa
+        (b":status", b"400"),  # noqa
+        (b":status", b"404"),  # noqa
+        (b":status", b"500"),  # noqa
+        (b"accept-charset", b""),  # noqa
+        (b"accept-encoding", b"gzip, deflate"),  # noqa
+        (b"accept-language", b""),  # noqa
+        (b"accept-ranges", b""),  # noqa
+        (b"accept", b""),  # noqa
+        (b"access-control-allow-origin", b""),  # noqa
+        (b"age", b""),  # noqa
+        (b"allow", b""),  # noqa
+        (b"authorization", b""),  # noqa
+        (b"cache-control", b""),  # noqa
+        (b"content-disposition", b""),  # noqa
+        (b"content-encoding", b""),  # noqa
+        (b"content-language", b""),  # noqa
+        (b"content-length", b""),  # noqa
+        (b"content-location", b""),  # noqa
+        (b"content-range", b""),  # noqa
+        (b"content-type", b""),  # noqa
+        (b"cookie", b""),  # noqa
+        (b"date", b""),  # noqa
+        (b"etag", b""),  # noqa
+        (b"expect", b""),  # noqa
+        (b"expires", b""),  # noqa
+        (b"from", b""),  # noqa
+        (b"host", b""),  # noqa
+        (b"if-match", b""),  # noqa
+        (b"if-modified-since", b""),  # noqa
+        (b"if-none-match", b""),  # noqa
+        (b"if-range", b""),  # noqa
+        (b"if-unmodified-since", b""),  # noqa
+        (b"last-modified", b""),  # noqa
+        (b"link", b""),  # noqa
+        (b"location", b""),  # noqa
+        (b"max-forwards", b""),  # noqa
+        (b"proxy-authenticate", b""),  # noqa
+        (b"proxy-authorization", b""),  # noqa
+        (b"range", b""),  # noqa
+        (b"referer", b""),  # noqa
+        (b"refresh", b""),  # noqa
+        (b"retry-after", b""),  # noqa
+        (b"server", b""),  # noqa
+        (b"set-cookie", b""),  # noqa
+        (b"strict-transport-security", b""),  # noqa
+        (b"transfer-encoding", b""),  # noqa
+        (b"user-agent", b""),  # noqa
+        (b"vary", b""),  # noqa
+        (b"via", b""),  # noqa
+        (b"www-authenticate", b""),  # noqa
     )  # noqa
 
     STATIC_TABLE_LENGTH = len(STATIC_TABLE)
-    STATIC_TABLE_MAPPING: Dict[bytes, Tuple[int, Dict[bytes, int]]]={}
+    STATIC_TABLE_MAPPING: Dict[bytes, Tuple[int, Dict[bytes, int]]] = {}
 
     def __init__(self):
         self._maxsize = HeaderTable.DEFAULT_SIZE
@@ -122,7 +123,7 @@ class HeaderTable:
         return "HeaderTable(%d, %s, %r)" % (
             self._maxsize,
             self.resized,
-            self.dynamic_entries
+            self.dynamic_entries,
         )
 
     def add(self, name, value):
@@ -141,7 +142,7 @@ class HeaderTable:
             # Add new entry
             self.dynamic_entries.appendleft((name, value))
             self._current_size += size
-            
+
             # Remove entries until the size is within the limit
             while self._current_size > self._maxsize:
                 name, value = self.dynamic_entries.pop()
@@ -158,12 +159,8 @@ class HeaderTable:
             - ``(index, name, value)`` for perfect matches.
         """
 
-        if (
-            header_name_search_result := HeaderTable.STATIC_TABLE_MAPPING.get(name)
-        ):
-            if (
-                index := header_name_search_result[1].get(value)
-            ):
+        if header_name_search_result := HeaderTable.STATIC_TABLE_MAPPING.get(name):
+            if index := header_name_search_result[1].get(value):
                 return index, name, value
             else:
                 partial = (header_name_search_result[0], name, None)
@@ -172,15 +169,14 @@ class HeaderTable:
             partial = None
 
         offset = HeaderTable.STATIC_TABLE_LENGTH + 1
-        
-        for (i, (n, v)) in enumerate(self.dynamic_entries):
 
+        for i, (n, v) in enumerate(self.dynamic_entries):
             if n == name:
                 if v == value:
                     return i + offset, n, v
                 elif partial is None:
                     partial = (i + offset, n, None)
-                    
+
         return partial
 
     @property
@@ -192,7 +188,7 @@ class HeaderTable:
         newmax = int(newmax)
         oldmax = self._maxsize
         self._maxsize = newmax
-        self.resized = (newmax != oldmax)
+        self.resized = newmax != oldmax
         if newmax <= 0:
             self.dynamic_entries.clear()
             self._current_size = 0
@@ -201,10 +197,9 @@ class HeaderTable:
             cursize = self._current_size
             while cursize > self._maxsize:
                 name, value = self.dynamic_entries.pop()
-                cursize -= (
-                    32 + len(name) + len(value)
-                )
+                cursize -= 32 + len(name) + len(value)
             self._current_size = cursize
+
 
 def _build_static_table_mapping():
     """

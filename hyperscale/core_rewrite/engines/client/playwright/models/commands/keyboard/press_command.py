@@ -10,5 +10,5 @@ from pydantic import (
 
 class PressCommand(BaseModel):
     key: StrictStr
-    delay: Optional[StrictInt | StrictFloat]=None
+    delay: Optional[StrictInt | StrictFloat] = None
     timeout: StrictInt | StrictFloat

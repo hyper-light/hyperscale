@@ -12,21 +12,20 @@ from hyperscale.core.engines.types.common.protocols.shared.writer import Writer
 
 
 class UDPConnection:
-
     __slots__ = (
-        'dns_address',
-        'port',
-        'ip_addr',
-        'lock',
-        'reader',
-        'writer',
-        'connected',
-        'reset_connection',
-        'pending',
-        '_connection_factory'
+        "dns_address",
+        "port",
+        "ip_addr",
+        "lock",
+        "reader",
+        "writer",
+        "connected",
+        "reset_connection",
+        "pending",
+        "_connection_factory",
     )
 
-    def __init__(self, reset_connection: bool=False) -> None:
+    def __init__(self, reset_connection: bool = False) -> None:
         self.dns_address: str = None
         self.port: int = None
         self.ip_addr = None
@@ -41,20 +40,22 @@ class UDPConnection:
         self._connection_factory = UDP()
 
     async def make_connection(
-        self, 
+        self,
         dns_address: str,
-        port: int, 
+        port: int,
         socket_config: Tuple[int, int, int, int, Tuple[int, int]],
-        timeout: Optional[float]=None
+        timeout: Optional[float] = None,
     ) -> None:
-    
-        if self.connected is False or self.dns_address != dns_address or self.reset_connection:
+        if (
+            self.connected is False
+            or self.dns_address != dns_address
+            or self.reset_connection
+        ):
             try:
                 reader, writer = await asyncio.wait_for(
-                    self._connection_factory.create_udp(socket_config), 
-                    timeout=timeout
+                    self._connection_factory.create_udp(socket_config), timeout=timeout
                 )
-                    
+
                 self.connected = True
 
                 self.reader = reader
@@ -64,10 +65,10 @@ class UDPConnection:
                 self.port = port
 
             except asyncio.TimeoutError:
-                raise Exception('Connection timed out.')
+                raise Exception("Connection timed out.")
 
             except ConnectionResetError:
-                raise Exception('Connection reset.')
+                raise Exception("Connection reset.")
 
             except Exception as e:
                 raise e
@@ -82,7 +83,7 @@ class UDPConnection:
     def readexactly(self, n_bytes: int):
         return self.reader.read(n=n_bytes)
 
-    def readuntil(self, sep=b'\n'):
+    def readuntil(self, sep=b"\n"):
         return self.reader.readuntil(separator=sep)
 
     def write(self, data):

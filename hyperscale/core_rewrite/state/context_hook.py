@@ -73,10 +73,12 @@ class ContextHook(Generic[T, K]):
                 name: value for name, value in kwargs.items() if name in self._hook_args
             }
 
-            self.result = await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._call(*args, **context_args),
                 timeout=self.timeouts.request_timeout,
             )
 
+            return (self.name, result)
+
         except Exception as err:
-            self.result = err
+            return (self.name, err)

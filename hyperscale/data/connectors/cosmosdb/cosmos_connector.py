@@ -17,6 +17,7 @@ from .cosmos_connector_config import CosmosDBConnectorConfig
 try:
     from azure.cosmos import DatabaseProxy
     from azure.cosmos.aio import CosmosClient
+
     has_connector = True
 except Exception:
     CosmosClient = None
@@ -25,10 +26,11 @@ except Exception:
 
 
 class CosmosDBConnector:
-    connector_type=ConnectorType.CosmosDB
+    connector_type = ConnectorType.CosmosDB
 
     def __init__(
-        self, config: CosmosDBConnectorConfig,
+        self,
+        config: CosmosDBConnectorConfig,
         stage: str,
         parser_config: Config,
     ) -> None:
@@ -50,81 +52,81 @@ class CosmosDBConnector:
         self.logger.initialize()
 
         self.container = None
-        
+
         self.client = None
         self.database: Union[DatabaseProxy, None] = None
         self.parser = Parser()
 
     async def connect(self):
-
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connecting to CosmosDB')
-
-        self.client = CosmosClient(
-            self.account_uri,
-            credential=self.account_key
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connecting to CosmosDB"
         )
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Connected to CosmosDB')
-        
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Creating Database - {self.database_name} - if not exists')
+        self.client = CosmosClient(self.account_uri, credential=self.account_key)
+
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Connected to CosmosDB"
+        )
+
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Creating Database - {self.database_name} - if not exists"
+        )
         self.database = self.client.get_database_client(self.database_name)
 
-        await self.logger.filesystem.aio['hyperscale.reporting'].info(f'{self.metadata_string} - Created or set Database - {self.database_name}')
+        await self.logger.filesystem.aio["hyperscale.reporting"].info(
+            f"{self.metadata_string} - Created or set Database - {self.database_name}"
+        )
 
         self.container = self.database.get_container_client(self.container_name)
-    
+
     async def load_execute_stage_summary(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ExecuteStageSummaryValidator]:
-        execute_stage_summary = await self.load_data(
-            options=options
-        )
-        
+        execute_stage_summary = await self.load_data(options=options)
+
         return ExecuteStageSummaryValidator(**execute_stage_summary)
-    
+
     async def load_actions(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[ActionHook]]:
         actions = await self.load_data()
 
-        return await asyncio.gather(*[
-            self.parser.parse_action(
-                action_data,
-                self.stage,
-                self.parser_config,
-                options
-            ) for action_data in actions
-        ])
-    
+        return await asyncio.gather(
+            *[
+                self.parser.parse_action(
+                    action_data, self.stage, self.parser_config, options
+                )
+                for action_data in actions
+            ]
+        )
+
     async def load_results(
-        self,
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, ResultsSet]:
         results = await self.load_data()
 
-        return ResultsSet({
-            'stage_results': await asyncio.gather(*[
-                self.parser.parse_result(
-                    results_data,
-                    self.stage,
-                    self.parser_config,
-                    options
-                ) for results_data in results
-            ])
-        })
-    
+        return ResultsSet(
+            {
+                "stage_results": await asyncio.gather(
+                    *[
+                        self.parser.parse_result(
+                            results_data, self.stage, self.parser_config, options
+                        )
+                        for results_data in results
+                    ]
+                )
+            }
+        )
+
     async def load_data(
-        self, 
-        options: Dict[str, Any]={}
+        self, options: Dict[str, Any] = {}
     ) -> Coroutine[Any, Any, List[Dict[str, Any]]]:
         return [
-            record async for record in self.container.read_all_items(
-                max_item_count=options.get('max_item_count'),
+            record
+            async for record in self.container.read_all_items(
+                max_item_count=options.get("max_item_count"),
             )
         ]
-            
-    
+
     async def close(self):
         await self.client.close()

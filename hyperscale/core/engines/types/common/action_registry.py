@@ -21,12 +21,11 @@ Action = Union[
     PlaywrightCommand,
     Task,
     UDPAction,
-    WebsocketAction
+    WebsocketAction,
 ]
 
 
 class ActionRegistry:
-
     def __init__(self) -> None:
         self._actions: Dict[str, Action] = {}
 
@@ -51,7 +50,7 @@ class ActionRegistry:
         return [
             action for action in self._actions.values() if action.stage == stage_name
         ]
-            
+
 
 def make_action_registry():
     return ActionRegistry()

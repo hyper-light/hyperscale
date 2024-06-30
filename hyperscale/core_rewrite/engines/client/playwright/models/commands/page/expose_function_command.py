@@ -12,4 +12,3 @@ class ExposeFunctionCommand(BaseModel):
     name: StrictStr
     callback: Callable[..., Any]
     timeout: StrictInt | StrictFloat
-    

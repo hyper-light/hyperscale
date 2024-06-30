@@ -8,7 +8,6 @@ from .base_limiter import BaseLimiter
 
 
 class AdaptiveRateLimiter(BaseLimiter):
-
     __slots__ = (
         "max_rate",
         "min_rate",
@@ -26,25 +25,17 @@ class AdaptiveRateLimiter(BaseLimiter):
         "_current_time",
         "_previous_count",
         "_last_slope",
-        "_current_slope"
+        "_current_slope",
     )
 
-    def __init__(
-        self, 
-        limit: Limit
-    ):
-        super().__init__(
-            limit.max_requests,
-            limit.period
-        )
+    def __init__(self, limit: Limit):
+        super().__init__(limit.max_requests, limit.period)
 
         min_requests = limit.min_requests
         if min_requests is None:
             min_requests = math.ceil(self.max_rate * 0.1)
 
-        self.initial_rate = math.ceil(
-            (self.max_rate - min_requests)/2
-        )
+        self.initial_rate = math.ceil((self.max_rate - min_requests) / 2)
 
         self.min_rate = min_requests
 
@@ -52,7 +43,6 @@ class AdaptiveRateLimiter(BaseLimiter):
         self.rate_history = []
         self.moments = []
         self.waiting = []
-
 
         self._loop = asyncio.get_event_loop()
 
@@ -63,7 +53,6 @@ class AdaptiveRateLimiter(BaseLimiter):
         self.current_rate = self.initial_rate
 
     def get_next_rate(self):
-
         current_time = self._loop.time()
 
         elapsed_time = current_time - self.last_request_time
@@ -84,25 +73,23 @@ class AdaptiveRateLimiter(BaseLimiter):
         return self.current_rate
 
     def has_capacity(self, amount: float = 1) -> bool:
-
         expected_rate = self.get_next_rate()
 
         if (self._loop.time() - self._current_time) > self.time_period:
-            self._current_time = math.floor(
-                self._loop.time()/self.time_period
-            ) * self.time_period
+            self._current_time = (
+                math.floor(self._loop.time() / self.time_period) * self.time_period
+            )
 
             self._previous_count = self._level
             self._level = 0
 
         self._rate_per_sec = (
-            self._previous_count * (
-                self.time_period - (self._loop.time() - self._current_time)
-            )/self.time_period
+            self._previous_count
+            * (self.time_period - (self._loop.time() - self._current_time))
+            / self.time_period
         ) + (self._level + amount)
 
         if self._rate_per_sec < expected_rate:
-
             for fut in self._waiters.values():
                 if not fut.done():
                     fut.set_result(True)

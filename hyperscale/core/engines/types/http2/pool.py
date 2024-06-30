@@ -9,17 +9,18 @@ from .pipe import HTTP2Pipe
 
 
 class HTTP2Pool:
-
     __slots__ = (
-        'size',
-        'connections',
-        'pipes',
-        'timeouts',
-        'reset_connections',
-        'pool_type'
+        "size",
+        "connections",
+        "pipes",
+        "timeouts",
+        "reset_connections",
+        "pool_type",
     )
 
-    def __init__(self, size: int, timeouts: Timeouts, reset_connections: bool=False) -> None:
+    def __init__(
+        self, size: int, timeouts: Timeouts, reset_connections: bool = False
+    ) -> None:
         self.size = size
         self.connections: List[HTTP2Connection] = []
         self.pipes: List[HTTP2Pipe] = []
@@ -28,30 +29,29 @@ class HTTP2Pool:
         self.pool_type: RequestTypes = RequestTypes.HTTP2
 
     def create_pool(self) -> None:
+        self.pipes = [HTTP2Pipe(self.size) for _ in range(self.size)]
 
-        self.pipes = [ HTTP2Pipe(self.size) for _ in range(self.size) ]
-        
         self.connections = [
             HTTP2Connection(
-                randrange(1, 2**20 + 2, 2), 
-                self.timeouts, 
-                self.size, 
+                randrange(1, 2**20 + 2, 2),
+                self.timeouts,
+                self.size,
                 self.reset_connections,
-                self.pool_type
-            ) for _ in range(0, self.size * 2, 2)
+                self.pool_type,
+            )
+            for _ in range(0, self.size * 2, 2)
         ]
-
 
     def reset(self):
         self.pipes.append(HTTP2Pipe(self.size))
 
         self.connections.append(
             HTTP2Connection(
-                randrange(1, 2**20 + 2, 2), 
-                self.timeouts, 
-                self.size, 
+                randrange(1, 2**20 + 2, 2),
+                self.timeouts,
+                self.size,
                 self.reset_connections,
-                self.pool_type
+                self.pool_type,
             )
         )
 

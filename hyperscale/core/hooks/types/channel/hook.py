@@ -5,20 +5,19 @@ from hyperscale.core.hooks.types.base.hook_type import HookType
 
 
 class ChannelHook(Hook):
-
     def __init__(
-        self, 
-        name: str, 
-        shortname: str, 
+        self,
+        name: str,
+        shortname: str,
         call: Callable[..., Awaitable[Any]],
         *names: Tuple[str, ...],
-        order: int=1,
-        skip: bool=False
+        order: int = 1,
+        skip: bool = False,
     ) -> None:
         super().__init__(
-            name, 
-            shortname, 
-            call, 
+            name,
+            shortname,
+            call,
             skip=skip,
             order=order,
             hook_type=HookType.CHANNEL,
@@ -29,24 +28,17 @@ class ChannelHook(Hook):
         self.names = list(set(names))
 
     async def call(self, **kwargs):
-
         if self.skip:
             return kwargs
 
-        result = await super().call(**{
-            name: value for name, value in kwargs.items() if name in self.params
-        })
+        result = await super().call(
+            **{name: value for name, value in kwargs.items() if name in self.params}
+        )
 
         if isinstance(result, dict):
-            return {
-                **kwargs,
-                **result
-            }
+            return {**kwargs, **result}
 
-        return {
-            **kwargs,
-            self.shortname: result
-        }
+        return {**kwargs, self.shortname: result}
 
     def copy(self):
         channel_hook = ChannelHook(

@@ -1,21 +1,10 @@
 import asyncio
 import signal
-from asyncio import (
-    Transport,
-    DatagramTransport,
-    Protocol,
-    sleep
-)
+from asyncio import Transport, DatagramTransport, Protocol, sleep
 
 
 class Writer:
-    __slots__ = (
-        '_transport',
-        '_protocol',
-        '_reader',
-        '_loop',
-        '_complete_fut'
-    )
+    __slots__ = ("_transport", "_protocol", "_reader", "_loop", "_complete_fut")
     """Wraps a Transport.
     This exposes write(), writelines(), [can_]write_eof(),
     get_extra_info() and close().  It adds drain() which returns an
@@ -34,10 +23,10 @@ class Writer:
         self._complete_fut.set_result(None)
 
     def __repr__(self):
-        info = [self.__class__.__name__, f'transport={self._transport!r}']
+        info = [self.__class__.__name__, f"transport={self._transport!r}"]
         if self._reader is not None:
-            info.append(f'reader={self._reader!r}')
-        return '<{}>'.format(' '.join(info))
+            info.append(f"reader={self._reader!r}")
+        return "<{}>".format(" ".join(info))
 
     @property
     def transport(self):
@@ -93,21 +82,22 @@ class Writer:
             await sleep(0)
         await self._protocol._drain_helper()
 
-    async def start_tls(self, sslcontext, *, server_hostname=None,  ssl_handshake_timeout=None):
-
+    async def start_tls(
+        self, sslcontext, *, server_hostname=None, ssl_handshake_timeout=None
+    ):
         server_side = self._protocol._client_connected_cb is not None
         protocol = self._protocol
 
         await self.drain()
 
         new_transport = await self._loop.start_tls(  # type: ignore
-            self._transport, 
-            protocol, 
+            self._transport,
+            protocol,
             sslcontext,
-            server_side=server_side, 
+            server_side=server_side,
             server_hostname=server_hostname,
-            ssl_handshake_timeout=ssl_handshake_timeout
+            ssl_handshake_timeout=ssl_handshake_timeout,
         )
-        
+
         self._transport = new_transport
         protocol._replace_writer(self)

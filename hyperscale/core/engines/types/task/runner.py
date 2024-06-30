@@ -15,31 +15,27 @@ from .task import Task
 
 
 class MercuryTaskRunner(BaseEngine[Task, Union[BaseResult, TaskResult]]):
-
     __slots__ = (
-        'pool',
-        'session_id',
-        'timeouts',
-        'concurrency',
-        'registered',
-        'sem',
-        'active',
-        'waiter',
-        'closed',
-        'tracing_session'
+        "pool",
+        "session_id",
+        "timeouts",
+        "concurrency",
+        "registered",
+        "sem",
+        "active",
+        "waiter",
+        "closed",
+        "tracing_session",
     )
 
     def __init__(
-        self, 
-        concurrency: int=10**3, 
+        self,
+        concurrency: int = 10**3,
         timeouts: Timeouts = Timeouts(),
-        tracing_session: Optional[TraceSession]=None
+        tracing_session: Optional[TraceSession] = None,
     ) -> None:
-        super(
-            MercuryTaskRunner,
-            self
-        ).__init__()
-        
+        super(MercuryTaskRunner, self).__init__()
+
         self.session_id = str(uuid.uuid4())
 
         self.timeouts = timeouts
@@ -73,8 +69,9 @@ class MercuryTaskRunner(BaseEngine[Task, Union[BaseResult, TaskResult]]):
         self.concurrency -= decrease_capacity
         self.sem = Semaphore(self.concurrency)
 
-    async def execute_prepared_request(self, task: Task) -> Coroutine[Any, Any, Union[BaseResult, TaskResult]]:
-
+    async def execute_prepared_request(
+        self, task: Task
+    ) -> Coroutine[Any, Any, Union[BaseResult, TaskResult]]:
         trace: Union[Trace, None] = None
         if self.tracing_session:
             trace = self.tracing_session.create_trace()
@@ -85,46 +82,36 @@ class MercuryTaskRunner(BaseEngine[Task, Union[BaseResult, TaskResult]]):
         self.active += 1
 
         if trace and trace.on_connection_queued_start:
-            await trace.on_connection_queued_start(
-                trace.span,
-                task,
-                result
-            )
+            await trace.on_connection_queued_start(trace.span, task, result)
 
         start = 0
- 
+
         async with self.sem:
-
             if trace and trace.on_connection_queued_end:
-                await trace.on_connection_queued_end(
-                    trace.span,
-                    task,
-                    result
-                )
-            
-            try:
+                await trace.on_connection_queued_end(trace.span, task, result)
 
+            try:
                 if task.hooks.listen:
                     event = asyncio.Event()
                     task.hooks.channel_events.append(event)
                     await event.wait()
-                
+
                 if task.hooks.before:
                     task = await self.execute_before(task)
 
                 start = time.monotonic()
 
                 if trace and trace.on_task_start:
-                    await trace.on_task_start(
-                        trace.span,
-                        task,
-                        result
-                    )
+                    await trace.on_task_start(trace.span, task, result)
 
-                result: BaseResult = await task.execute(**{
-                    name: value for name, value in task.task_args.items() if name in task.params
-                })
-                
+                result: BaseResult = await task.execute(
+                    **{
+                        name: value
+                        for name, value in task.task_args.items()
+                        if name in task.params
+                    }
+                )
+
                 result.name = task.name
                 result.source = task.source
                 result.user = task.metadata.user
@@ -138,11 +125,11 @@ class MercuryTaskRunner(BaseEngine[Task, Union[BaseResult, TaskResult]]):
                     result = await self.execute_after(task, result)
 
                 if task.hooks.notify:
-                    for listener in task.hooks.listeners: 
+                    for listener in task.hooks.listeners:
                         if len(listener.hooks.channel_events) > 0:
                             event = listener.hooks.channel_events.pop()
                             if not event.is_set():
-                                event.set()   
+                                event.set()
 
             except Exception as e:
                 result = TaskResult(task)
@@ -153,15 +140,10 @@ class MercuryTaskRunner(BaseEngine[Task, Union[BaseResult, TaskResult]]):
                 result.error = str(e)
 
                 if trace and trace.on_task_error:
-                    await trace.on_task_error(
-                        trace.span,
-                        task,
-                        result
-                    )
+                    await trace.on_task_error(trace.span, task, result)
 
             self.active -= 1
             if self.waiter and self.active <= self.concurrency:
-
                 try:
                     self.waiter.set_result(None)
                     self.waiter = None
@@ -170,11 +152,7 @@ class MercuryTaskRunner(BaseEngine[Task, Union[BaseResult, TaskResult]]):
                     self.waiter = None
 
             if trace and trace.on_task_end:
-                await trace.on_task_end(
-                    trace.span,
-                    task,
-                    result
-                )
+                await trace.on_task_end(trace.span, task, result)
 
             return result
 

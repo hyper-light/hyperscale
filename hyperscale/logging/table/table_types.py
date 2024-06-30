@@ -6,7 +6,12 @@ from hyperscale.reporting.system.system_metrics_set import SystemMetricsSet
 
 ExecutionResults = Dict[str, StageMetricsSummary]
 
-GraphExecutionResults = Dict[str, Dict[str, Union[Dict[str, ExperimentMetricsSet], ExecutionResults, SystemMetricsSet]]]
+GraphExecutionResults = Dict[
+    str,
+    Dict[
+        str, Union[Dict[str, ExperimentMetricsSet], ExecutionResults, SystemMetricsSet]
+    ],
+]
 
 SystemMetricsCollection = Dict[str, SystemMetricsSet]
 

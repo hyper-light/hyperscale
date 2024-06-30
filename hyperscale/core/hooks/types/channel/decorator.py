@@ -9,20 +9,10 @@ from .validator import ChannelHookValidator
 
 
 @registrar(HookType.CHANNEL)
-def channel(
-    *names: Tuple[str, ...], 
-    order: int=1,
-    skip: bool=False
-):
-    
-    ChannelHookValidator(
-        names=names,
-        order=order,
-        skip=skip
-    )
-    
-    def wrapper(func) -> Hook:
+def channel(*names: Tuple[str, ...], order: int = 1, skip: bool = False):
+    ChannelHookValidator(names=names, order=order, skip=skip)
 
+    def wrapper(func) -> Hook:
         @functools.wraps(func)
         def decorator(*args, **kwargs):
             return func(*args, **kwargs)

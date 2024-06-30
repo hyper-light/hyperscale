@@ -1,32 +1,23 @@
 import os
 from dotenv import dotenv_values
-from typing import (
-    Dict, 
-    Union, 
-    Type,
-    TypeVar
-)
+from typing import Dict, Union, Type, TypeVar
 from .env import Env
 from .monitor_env import MonitorEnv
 from .replication_env import ReplicationEnv
 from .registrar_env import RegistrarEnv
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
-PrimaryType=Union[str, int, bool, float, bytes]
+PrimaryType = Union[str, int, bool, float, bytes]
 
 
-def load_env(
-    env: Type[T],  
-    env_file: str=None
-) -> T:
-    
+def load_env(env: Type[T], env_file: str = None) -> T:
     env_type: Union[Env, MonitorEnv, ReplicationEnv, RegistrarEnv] = env
     envars = env_type.types_map()
-    
+
     if env_file is None:
-        env_file = '.env'
+        env_file = ".env"
 
     values: Dict[str, PrimaryType] = {}
 
@@ -45,6 +36,4 @@ def load_env(
 
         values.update(env_file_values)
 
-    return env(**{
-        name: value for name, value in values.items() if value is not None
-    })
+    return env(**{name: value for name, value in values.items() if value is not None})

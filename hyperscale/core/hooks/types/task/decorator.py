@@ -11,27 +11,20 @@ from .validator import TaskHookValidator
 @registrar(HookType.TASK)
 def task(
     *names: Tuple[str, ...],
-    weight: int=1, 
-    order: int=1, 
-    skip: bool=False,
-    metadata: Dict[str, Union[str, int]]={}
+    weight: int = 1,
+    order: int = 1,
+    skip: bool = False,
+    metadata: Dict[str, Union[str, int]] = {},
 ):
-    
     TaskHookValidator(
-        names=names,
-        weight=weight,
-        order=order,
-        skip=skip,
-        metadata=metadata
+        names=names, weight=weight, order=order, skip=skip, metadata=metadata
     )
 
     def wrapper(func) -> Hook:
-
         @functools.wraps(func)
         def decorator(*args, **kwargs):
-
             return func(*args, **kwargs)
-                
+
         return decorator
 
     return wrapper

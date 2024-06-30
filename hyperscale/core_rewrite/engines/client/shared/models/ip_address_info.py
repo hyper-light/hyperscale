@@ -1,38 +1,16 @@
 import socket
-from typing import (
-    Literal,
-    Optional,
-    Tuple,
-    Union 
-)
+from typing import Literal, Optional, Tuple, Union
 
 
 class IpAddressInfo:
-    
     def __init__(
         self,
-        family: Union[
-            Literal[socket.AF_INET],
-            Literal[socket.AF_INET6]
-        ],
+        family: Union[Literal[socket.AF_INET], Literal[socket.AF_INET6]],
         socket_type: Literal[socket.SOCK_STREAM],
         protocol: Optional[int],
         cannonical_name: Optional[str],
-        address: Union[
-            Tuple[
-                str,
-                int
-            ],
-            Tuple[
-                str,
-                int,
-                int,
-                int
-            ]
-        ]
-
+        address: Union[Tuple[str, int], Tuple[str, int, int, int]],
     ) -> None:
-        
         if family == socket.AF_INET:
             host, port = address
 

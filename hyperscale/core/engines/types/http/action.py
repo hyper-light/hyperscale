@@ -11,43 +11,38 @@ from hyperscale.core.engines.types.common.types import RequestTypes
 
 
 class HTTPAction(BaseAction):
-
     __slots__ = (
-        'name',
-        'action_id',
-        'method',
-        'listeners',
-        'type',
-        'url',
-        'protocols',
-        '_headers',
-        '_data',
-        'encoded_data',
-        'encoded_headers',
-        'is_stream',
-        'ssl_context',
-        'redirects',
-        'action_args',
-        'mutations',
-        '_header_items'
+        "name",
+        "action_id",
+        "method",
+        "listeners",
+        "type",
+        "url",
+        "protocols",
+        "_headers",
+        "_data",
+        "encoded_data",
+        "encoded_headers",
+        "is_stream",
+        "ssl_context",
+        "redirects",
+        "action_args",
+        "mutations",
+        "_header_items",
     )
-    
+
     def __init__(
         self,
-        name: str, 
-        url: str, 
-        method: str = 'GET', 
-        headers: Dict[str, str] = {}, 
-        data: Union[str, dict, Iterator, bytes, None] = None, 
-        user: str=None, 
+        name: str,
+        url: str,
+        method: str = "GET",
+        headers: Dict[str, str] = {},
+        data: Union[str, dict, Iterator, bytes, None] = None,
+        user: str = None,
         tags: List[Dict[str, str]] = [],
-        redirects: int=3
+        redirects: int = 3,
     ) -> None:
-        super(HTTPAction, self).__init__(
-            name,
-            user,
-            tags
-        )
+        super(HTTPAction, self).__init__(name, user, tags)
 
         self.method = method.upper()
         self.type = RequestTypes.HTTP
@@ -95,7 +90,6 @@ class HTTPAction(BaseAction):
         self.encoded_headers = None
 
     def setup(self):
-
         if self.encoded_data is None:
             self._setup_data()
 
@@ -116,22 +110,16 @@ class HTTPAction(BaseAction):
                 self.encoded_data = chunks
 
             else:
-
                 if isinstance(self._data, dict):
-                    self.encoded_data = json.dumps(
-                        self._data
-                    ).encode()
+                    self.encoded_data = json.dumps(self._data).encode()
 
                 elif isinstance(self._data, tuple):
-                    self.encoded_data = urlencode(
-                        self._data
-                    ).encode()
+                    self.encoded_data = urlencode(self._data).encode()
 
                 elif isinstance(self._data, str):
                     self.encoded_data = self._data.encode()
 
     def _setup_headers(self) -> Union[bytes, Dict[str, str]]:
-    
         get_base = f"{self.method} {self.url.path} HTTP/1.1{NEW_LINE}"
 
         port = self.url.port or (443 if self.url.scheme == "https" else 80)
@@ -139,13 +127,13 @@ class HTTPAction(BaseAction):
         hostname = self.url.parsed.hostname.encode("idna").decode()
 
         if port not in [80, 443]:
-            hostname = f'{hostname}:{port}'
+            hostname = f"{hostname}:{port}"
 
         header_items = [
             ("HOST", hostname),
             ("User-Agent", "mercury-http"),
             ("Keep-Alive", "timeout=60, max=100000"),
-            ("Content-Length", self.size)
+            ("Content-Length", self.size),
         ]
 
         header_items.extend(self._header_items)

@@ -2,12 +2,8 @@ from .base_event import BaseEvent
 
 
 class InformationalResponseReceived(BaseEvent):
-    event_type='INFORMATIONAL_RESPONSE_RECEIVED'
-    __slots__ = (
-        'stream_id',
-        'headers',
-        'priority_updated'
-    )
+    event_type = "INFORMATIONAL_RESPONSE_RECEIVED"
+    __slots__ = ("stream_id", "headers", "priority_updated")
     """
     The InformationalResponseReceived event is fired when an informational
     response (that is, one whose status code is a 1XX code) is received from
@@ -29,6 +25,7 @@ class InformationalResponseReceived(BaseEvent):
     .. versionchanged:: 2.4.0
        Added ``priority_updated`` property.
     """
+
     def __init__(self):
         #: The Stream ID for the stream this informational response was made
         #: on.
@@ -46,5 +43,6 @@ class InformationalResponseReceived(BaseEvent):
 
     def __repr__(self):
         return "<InformationalResponseReceived stream_id:%s, headers:%s>" % (
-            self.stream_id, self.headers
+            self.stream_id,
+            self.headers,
         )

@@ -8,31 +8,31 @@ Implements the HPACK header compression algorithm as detailed by the IETF.
 
 from .hpack.table import HeaderTable, table_entry_size
 from .hpack.exceptions import (
-    HPACKDecodingError, OversizedHeaderListError, InvalidTableSizeError
+    HPACKDecodingError,
+    OversizedHeaderListError,
+    InvalidTableSizeError,
 )
 from .hpack.huffman_encoder import HuffmanEncoder
-from .hpack.constants import (
-    REQUEST_CODES, REQUEST_CODES_LENGTH
-)
+from .hpack.constants import REQUEST_CODES, REQUEST_CODES_LENGTH
 from .hpack.huffman_table import decode_huffman
 from .hpack.structs import HeaderTuple, NeverIndexedHeaderTuple
 
 
-INDEX_NONE = b'\x00'
-INDEX_NEVER = b'\x10'
-INDEX_INCREMENTAL = b'\x40'
+INDEX_NONE = b"\x00"
+INDEX_NEVER = b"\x10"
+INDEX_INCREMENTAL = b"\x40"
 
 # Precompute 2^i for 1-8 for use in prefix calcs.
 # Zero index is not used but there to save a subtraction
 # as prefix numbers are not zero indexed.
-_PREFIX_BIT_MAX_NUMBERS = [(2 ** i) - 1 for i in range(9)]
+_PREFIX_BIT_MAX_NUMBERS = [(2**i) - 1 for i in range(9)]
 
 basestring = (str, bytes)
 
 
 # We default the maximum header list we're willing to accept to 64kB. That's a
 # lot of headers, but if applications want to raise it they can do.
-DEFAULT_MAX_HEADER_LIST_SIZE = 2 ** 16
+DEFAULT_MAX_HEADER_LIST_SIZE = 2**16
 
 
 def _unicode_if_needed(header, raw):
@@ -43,8 +43,8 @@ def _unicode_if_needed(header, raw):
     name = bytes(header[0])
     value = bytes(header[1])
     if not raw:
-        name = name.decode('utf-8')
-        value = value.decode('utf-8')
+        name = name.decode("utf-8")
+        value = value.decode("utf-8")
     return header.__class__(name, value)
 
 
@@ -55,14 +55,10 @@ def encode_integer(integer, prefix_bits):
     """
 
     if integer < 0:
-        raise ValueError(
-            "Can only encode positive integers, got %s" % integer
-        )
+        raise ValueError("Can only encode positive integers, got %s" % integer)
 
     if prefix_bits < 1 or prefix_bits > 8:
-        raise ValueError(
-            "Prefix bits must be between 1 and 8, got %s" % prefix_bits
-        )
+        raise ValueError("Prefix bits must be between 1 and 8, got %s" % prefix_bits)
 
     max_number = _PREFIX_BIT_MAX_NUMBERS[prefix_bits]
 
@@ -89,14 +85,12 @@ def decode_integer(data, prefix_bits):
     integer.
     """
     if prefix_bits < 1 or prefix_bits > 8:
-        raise ValueError(
-            "Prefix bits must be between 1 and 8, got %s" % prefix_bits
-        )
+        raise ValueError("Prefix bits must be between 1 and 8, got %s" % prefix_bits)
 
     max_number = _PREFIX_BIT_MAX_NUMBERS[prefix_bits]
     index = 1
     shift = 0
-    mask = (0xFF >> (8 - prefix_bits))
+    mask = 0xFF >> (8 - prefix_bits)
 
     try:
         number = data[0] & mask
@@ -120,7 +114,6 @@ def decode_integer(data, prefix_bits):
     return number, index
 
 
-
 def _to_bytes(string):
     """
     Convert string to bytes.
@@ -128,7 +121,7 @@ def _to_bytes(string):
     if not isinstance(string, basestring):  # pragma: no cover
         string = str(string)
 
-    return string if isinstance(string, bytes) else string.encode('utf-8')
+    return string if isinstance(string, bytes) else string.encode("utf-8")
 
 
 class Encoder:
@@ -137,17 +130,11 @@ class Encoder:
     HTTP/2 header blocks.
     """
 
-    __slots__ = (
-        'header_table',
-        'huffman_coder',
-        'table_size_changes'
-    )
+    __slots__ = ("header_table", "huffman_coder", "table_size_changes")
 
     def __init__(self):
         self.header_table = HeaderTable()
-        self.huffman_coder = HuffmanEncoder(
-            REQUEST_CODES, REQUEST_CODES_LENGTH
-        )
+        self.huffman_coder = HuffmanEncoder(REQUEST_CODES, REQUEST_CODES_LENGTH)
         self.table_size_changes = []
 
     @property
@@ -229,19 +216,11 @@ class Encoder:
 
         # Add each header to the header block
         for header in headers:
-
             header_block.append(
-                self.add(
-                    (
-                        _to_bytes(header[0]),
-                        _to_bytes(header[1])
-                    ), 
-                    False, 
-                    huffman
-                )
+                self.add((_to_bytes(header[0]), _to_bytes(header[1])), False, huffman)
             )
 
-        header_block = b''.join(header_block)
+        header_block = b"".join(header_block)
 
         return header_block
 
@@ -280,9 +259,7 @@ class Encoder:
             # filter out headers which are known to be ineffective for
             # indexing since they just take space in the table and
             # pushed out other valuable headers.
-            encoded = self._encode_indexed_literal(
-                index, value, indexbit, huffman
-            )
+            encoded = self._encode_indexed_literal(index, value, indexbit, huffman)
             if not sensitive:
                 self.header_table.add(name, value)
 
@@ -313,9 +290,7 @@ class Encoder:
             name_len[0] |= 0x80
             value_len[0] |= 0x80
 
-        return b''.join(
-            [indexbit, bytes(name_len), name, bytes(value_len), value]
-        )
+        return b"".join([indexbit, bytes(name_len), name, bytes(value_len), value])
 
     def _encode_indexed_literal(self, index, value, indexbit, huffman=False):
         """
@@ -337,14 +312,14 @@ class Encoder:
         if huffman:
             value_len[0] |= 0x80
 
-        return b''.join([bytes(prefix), bytes(value_len), value])
+        return b"".join([bytes(prefix), bytes(value_len), value])
 
     def _encode_table_size_change(self):
         """
         Produces the encoded form of all header table size change context
         updates.
         """
-        block = b''
+        block = b""
         for size_bytes in self.table_size_changes:
             size_bytes = encode_integer(size_bytes, 5)
             size_bytes[0] |= 0x20
@@ -374,6 +349,7 @@ class Decoder:
         Defaults to 64kB.
     :type max_header_list_size: ``int``
     """
+
     def __init__(self, max_header_list_size=DEFAULT_MAX_HEADER_LIST_SIZE):
         self.header_table = HeaderTable()
 
@@ -450,14 +426,10 @@ class Decoder:
             encoding_update = True if current & 0x20 else False
 
             if indexed:
-                header, consumed = self._decode_indexed(
-                    data_mem[current_index:]
-                )
+                header, consumed = self._decode_indexed(data_mem[current_index:])
             elif literal_index:
                 # It's a literal header that does affect the header table.
-                header, consumed = self._decode_literal_index(
-                    data_mem[current_index:]
-                )
+                header, consumed = self._decode_literal_index(data_mem[current_index:])
             elif encoding_update:
                 # It's an update to the encoding context. These are forbidden
                 # in a header block after any actual header.
@@ -465,9 +437,7 @@ class Decoder:
                     raise HPACKDecodingError(
                         "Table size update not at the start of the block"
                     )
-                consumed = self._update_encoding_context(
-                    data_mem[current_index:]
-                )
+                consumed = self._update_encoding_context(data_mem[current_index:])
                 header = None
             else:
                 # It's a literal header that does not affect the header table.
@@ -481,8 +451,8 @@ class Decoder:
 
                 if inflated_size > self.max_header_list_size:
                     raise OversizedHeaderListError(
-                        "A header list larger than %d has been received" %
-                        self.max_header_list_size
+                        "A header list larger than %d has been received"
+                        % self.max_header_list_size
                     )
 
             current_index += consumed
@@ -514,9 +484,7 @@ class Decoder:
         # We've been asked to resize the header table.
         new_size, consumed = decode_integer(data, 5)
         if new_size > self.max_allowed_table_size:
-            raise InvalidTableSizeError(
-                "Encoder exceeded max allowable table size"
-            )
+            raise InvalidTableSizeError("Encoder exceeded max allowable table size")
         self.header_table_size = new_size
         return consumed
 
@@ -567,7 +535,7 @@ class Decoder:
             data = data[1:]
 
             length, consumed = decode_integer(data, 7)
-            name = data[consumed:consumed + length]
+            name = data[consumed : consumed + length]
             if len(name) != length:
                 raise HPACKDecodingError("Truncated header block")
 
@@ -575,11 +543,11 @@ class Decoder:
                 name = decode_huffman(name)
             total_consumed = consumed + length + 1  # Since we moved forward 1.
 
-        data = data[consumed + length:]
+        data = data[consumed + length :]
 
         # The header value is definitely length-based.
         length, consumed = decode_integer(data, 7)
-        value = data[consumed:consumed + length]
+        value = data[consumed : consumed + length]
         if len(value) != length:
             raise HPACKDecodingError("Truncated header block")
 

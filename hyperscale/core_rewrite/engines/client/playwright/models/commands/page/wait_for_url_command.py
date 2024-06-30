@@ -17,11 +17,6 @@ from pydantic import (
 class WaitForUrlCommand(BaseModel):
     url: StrictStr | Pattern[str] | Callable[[StrictStr], StrictBool]
     wait_until: Optional[
-        Literal[
-            'commit', 
-            'domcontentloaded', 
-            'load', 
-            'networkidle'
-        ]
+        Literal["commit", "domcontentloaded", "load", "networkidle"]
     ] = None
     timeout: StrictInt | StrictFloat
