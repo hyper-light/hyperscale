@@ -6,7 +6,7 @@ from hyperscale.testing import URL, HTTPResponse, Headers
 
 
 class Test(Workflow):
-    vus = 1000
+    vus = 125
     threads = 8
     duration = "1m"
 
