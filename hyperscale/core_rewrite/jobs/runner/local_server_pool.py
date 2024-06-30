@@ -34,6 +34,12 @@ async def run_server(
         await server.close()
 
 
+
+def abort(server: RemoteGraphController, run_task: asyncio.Future):
+    server.abort()
+    run_task.set_result(None)
+
+
 def run_thread(
     host: str,
     port: int,
@@ -62,39 +68,34 @@ def run_thread(
 
     server = RemoteGraphController(host, port, env)
 
-    run_task = asyncio.ensure_future(
-        run_server(
-            server,
-            worker_idx,
-            cert_path=cert_path,
-            key_path=key_path,
-        )
-    )
-
     for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
         loop.add_signal_handler(
             getattr(
                 signal,
                 signame,
             ),
-            run_task.cancel,
+            lambda signame=signame: abort(
+                server,
+            ),
         )
 
     try:
-        loop.run_until_complete(run_task)
+        loop.run_until_complete(
+            run_server(
+                server,
+                worker_idx,
+                cert_path=cert_path,
+                key_path=key_path,
+            )
+        )
 
     except KeyboardInterrupt:
-        pass
+        server.abort()
 
     except BrokenPipeError:
-        import traceback
-
-        print(traceback.format_exc())
-
+        server.abort()
     except Exception:
-        import traceback
-
-        print(traceback.format_exc())
+        server.abort()
 
 
 class LocalServerPool:
@@ -123,7 +124,7 @@ class LocalServerPool:
                     signal,
                     signame,
                 ),
-                self.close,
+                self.abort,
             )
 
     async def run_pool(
@@ -133,8 +134,6 @@ class LocalServerPool:
         cert_path: str | None = None,
         key_path: str | None = None,
     ):
-        if self._run_future is None:
-            self._run_future = asyncio.Future()
 
         await asyncio.gather(
             *[
@@ -151,10 +150,9 @@ class LocalServerPool:
                     ),
                 )
                 for worker_idx, address in enumerate(ip_range)
-            ]
+            ],
+            return_exceptions=True
         )
-
-        await self._run_future
 
     async def shutdown(self):
         with warnings.catch_warnings():
@@ -165,13 +163,8 @@ class LocalServerPool:
             for child in child_processes:
                 child.kill()
 
-            try:
-                self._run_future.set_result(None)
 
-            except asyncio.InvalidStateError:
-                pass
-
-    def close(self):
+    def abort(self):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self._executor.shutdown(cancel_futures=True, wait=False)
@@ -180,8 +173,7 @@ class LocalServerPool:
             for child in child_processes:
                 child.kill()
 
-            try:
-                self._run_future.set_result(None)
+    def cleanup(self):
+        self._executor.shutdown(wait=False)
 
-            except asyncio.InvalidStateError:
-                pass
+

@@ -104,6 +104,20 @@ class TaskRunner:
         self._run_cleanup = False
         await cancel(self._cleanup_task)
 
+    def abort(self):
+        for task in self.tasks.values():
+            task.abort()
+
+        self._run_cleanup = False
+
+        try:
+
+            self._cleanup_task.cancel()
+
+        except Exception:
+            pass
+
+
     async def _cleanup(self):
         while self._run_cleanup:
             await self._cleanup_scheduled_tasks()

@@ -306,6 +306,7 @@ class TCPProtocol(Generic[T, K]):
             )
 
         last_error: Optional[Exception] = None
+        tries: int = 0
 
         for _ in range(self._tcp_connect_retries):
             try:
@@ -345,12 +346,13 @@ class TCPProtocol(Generic[T, K]):
 
                 return instance
 
-            except ConnectionRefusedError as connection_error:
+            except Exception as connection_error:
+                tries += 1
                 last_error = connection_error
 
             await asyncio.sleep(1)
 
-        if last_error:
+        if last_error and tries >= self._tcp_connect_retries:
             raise last_error
 
     def _create_client_ssl_context(
@@ -883,25 +885,73 @@ class TCPProtocol(Generic[T, K]):
             client.abort()
 
         if self._sleep_task:
-            self._sleep_task.cancel()
 
             try:
-                await self._sleep_task.cancel()
+                self._sleep_task.cancel()
 
-            except (Exception, socket.error):
+            except Exception:
                 pass
 
         if self._cleanup_task:
-            self._cleanup_task.cancel()
 
             try:
-                await self._cleanup_task.cancel()
 
-            except (Exception, socket.error):
+                self._cleanup_task.cancel()
+
+            except Exception:
                 pass
 
         if self.tasks:
             await self.tasks.shutdown()
 
     def stop(self):
+        self._running = False
+        for client in self._client_transports.values():
+            client.abort()
+
+        if self._sleep_task:
+            try:
+
+                self._sleep_task.cancel()
+
+            except Exception:
+                pass
+
+        if self._cleanup_task:
+            try:
+
+                self._cleanup_task.cancel()
+
+            except Exception:
+                pass
+
         self._run_future.set_result(None)
+
+
+    def abort(self):
+        self._running = False
+        
+
+        for client in self._client_transports.values():
+            client.abort()
+
+        if self._sleep_task:
+            try:
+
+                self._sleep_task.cancel()
+
+            except Exception:
+                pass
+
+        if self._cleanup_task:
+            try:
+
+                self._cleanup_task.cancel()
+
+            except Exception:
+                pass
+
+        
+        self._run_future.set_result(None)
+
+     

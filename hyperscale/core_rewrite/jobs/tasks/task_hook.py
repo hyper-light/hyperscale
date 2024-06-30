@@ -85,6 +85,20 @@ class Task(Generic[T]):
 
         await self.cancel_schedule()
 
+    def abort(self):
+        for run in self._runs.values():
+            run.abort()
+
+        self._schedule_running = False
+
+        try:
+
+            self._schedule.cancel()
+
+        except Exception:
+            pass
+
+
     async def cleanup(self):
         match self.keep_policy:
             case "COUNT":

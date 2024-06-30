@@ -105,6 +105,17 @@ class Run:
             await cancel(self._task)
             self.status = RunStatus.CANCELLED
 
+    def abort(self):
+        if self.running and self.task_running:
+
+            try:
+                self._task.cancel()
+
+            except Exception:
+                pass
+            
+            self.status = RunStatus.CANCELLED
+
     def execute(self, *args, **kwargs):
         self._task = asyncio.create_task(self._execute(*args, **kwargs))
 

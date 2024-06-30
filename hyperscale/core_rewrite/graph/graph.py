@@ -80,7 +80,7 @@ class Graph:
         self._active_waiters: Dict[str, asyncio.Future | None] = {}
 
         self._workflows_by_name: Dict[str, Workflow] = {}
-        self._threads = os.cpu_count()
+        self._threads = psutil.cpu_count(logical=False)
 
         self._step_traversal_orders: Dict[
             str,

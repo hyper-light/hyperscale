@@ -1,4 +1,5 @@
 import os
+import psutil
 from typing import Callable, Dict, Union
 
 from pydantic import (
@@ -18,7 +19,7 @@ class Env(BaseModel):
     MERCURY_SYNC_LOGS_DIRECTORY: StrictStr = os.getcwd()
     MERCURY_SYNC_REQUEST_TIMEOUT: StrictStr = "30s"
     MERCURY_SYNC_LOG_LEVEL: StrictStr = "info"
-    MERCURY_SYNC_TASK_RUNNER_MAX_THREADS: StrictInt = os.cpu_count()
+    MERCURY_SYNC_TASK_RUNNER_MAX_THREADS: StrictInt = psutil.cpu_count(logical=False)
     MERCURY_SYNC_MAX_RUNNING_WORKFLOWS: StrictInt = 1
     MERCURY_SYNC_MAX_PENDING_WORKFLOWS: StrictInt = 100
     MERCURY_SYNC_CONTEXT_POLL_RATE: StrictStr = "1s"

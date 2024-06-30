@@ -6,8 +6,8 @@ from hyperscale.testing import URL, HTTP2Response
 
 
 class Test(Workflow):
-    vus = 166
-    threads = 6
+    vus = 125
+    threads = 8
     duration = "1m"
 
     @step()
@@ -18,8 +18,7 @@ class Test(Workflow):
 async def run():
     runner = LocalRunner(
         "0.0.0.0",
-        1000,
-        workers=6,
+        11223,
     )
 
     results = await runner.run(
