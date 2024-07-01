@@ -121,7 +121,20 @@ class LocalRunner:
                 await self._remote_manger.close()
                 await self._server_pool.shutdown()
 
+                close_task = asyncio.current_task()
+                for task in asyncio.all_tasks():
+                    try:
+                        if task != close_task and task.cancelled() is False:
+                            task.cancel()
+
+                    except Exception:
+                        pass
+
+                    except asyncio.CancelledError:
+                        pass
+                
                 return results
+            
         except Exception:
             try:
                 self._server_pool.abort()

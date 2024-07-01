@@ -34,6 +34,7 @@ async def run_server(
         server.abort()
 
     except Exception:
+        server.abort()
         import traceback
         print(traceback.format_exc())
 

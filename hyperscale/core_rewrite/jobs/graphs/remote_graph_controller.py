@@ -1,6 +1,6 @@
 import asyncio
 import os
-from collections import defaultdict
+from collections import defaultdict, Counter
 from socket import socket
 from typing import (
     Any,
@@ -9,6 +9,8 @@ from typing import (
     Tuple,
     TypeVar,
     List,
+    Callable,
+    Awaitable,
 )
 from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.core_rewrite.graph import Workflow
@@ -31,7 +33,6 @@ from hyperscale.core_rewrite.jobs.protocols import TCPProtocol
 from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.snowflake import Snowflake
 from hyperscale.core_rewrite.state import Context
-from .completion_counter import CompletionCounter
 
 from .workflow_runner import WorkflowRunner
 
@@ -81,13 +82,16 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         self._completed_counts: Dict[int, Dict[str, Dict[int, int]]] = defaultdict(
             lambda: defaultdict(
-                defaultdict(
-                    defaultdict(lambda: 0),
-                )
+                lambda: defaultdict(lambda: 0),
             )
         )
 
         self._context_poll_rate = TimeParser(env.MERCURY_SYNC_CONTEXT_POLL_RATE).time
+        self._completion_write_lock: Dict[int, Dict[str, Dict[int, asyncio.Lock]]] = defaultdict(
+            lambda: defaultdict(
+                lambda: defaultdict(asyncio.Lock)
+            )
+        )
 
     async def start_server(
         self,
@@ -147,7 +151,20 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         context: Context,
         threads: int,
         workflow_vus: List[int],
+        update_callback: Callable[
+            [int, WorkflowStatus],
+            Awaitable[None]
+        ],
     ):
+        task_id = self.id_generator.generate()
+        self.tasks.run(
+            "get_latest_completed",
+            run_id,
+            workflow.name,
+            update_callback,
+            run_id=task_id
+        )
+
         return await asyncio.gather(
             *[
                 self.submit(
@@ -203,16 +220,18 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         (shard_id, workflow_status) = response
 
-        status = workflow_status.data.status
-        workflow_name = workflow_status.data.workflow
-        run_id = workflow_status.run_id
+        if workflow_status.data:
 
-        snowflake = Snowflake.parse(shard_id)
-        node_id = snowflake.instance
+            status = workflow_status.data.status
+            workflow_name = workflow_status.data.workflow
+            run_id = workflow_status.run_id
 
-        self._statuses[run_id][workflow_name][node_id] = (
-            WorkflowStatus.map_value_to_status(status)
-        )
+            snowflake = Snowflake.parse(shard_id)
+            node_id = snowflake.instance
+
+            self._statuses[run_id][workflow_name][node_id] = (
+                WorkflowStatus.map_value_to_status(status)
+            )
 
         return response
 
@@ -351,11 +370,10 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
             status
         )
 
-
+        await self._completion_write_lock[run_id][workflow][node_id].acquire()
         self._completed_counts[run_id][workflow][node_id] = completed_count
-        current_completed_count = sum(self._completed_counts[run_id][workflow].values())
 
-        print(current_completed_count)
+        self._completion_write_lock[run_id][workflow][node_id].release()
 
         return JobContext(
             ReceivedReceipt(
@@ -411,7 +429,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         ),
         trigger="MANUAL",
         repeat="ALWAYS",
-        schedule="1s",
+        schedule="0.1s",
         max_age="1m",
         keep_policy="COUNT_AND_AGE",
     )
@@ -447,3 +465,36 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
                 run_id=run_id,
             ),
         )
+
+    @task(
+        keep=int(
+            os.getenv("HYPERSCALE_MAX_JOBS", 10),
+        ),
+        trigger="MANUAL",
+        repeat="ALWAYS",
+        schedule="0.1s",
+        max_age="1m",
+        keep_policy="COUNT_AND_AGE",
+    )
+    async def get_latest_completed(
+        self,
+        run_id: int,
+        workflow: str,
+        update_callback: Callable[
+            [int, WorkflowStatus],
+            Awaitable[None]
+        ]
+    ):
+
+        workflow_status: WorkflowStatus.SUBMITTED
+
+        status_counts = Counter(self._statuses[run_id][workflow].values())
+        for status, count in status_counts.items():
+            if count == self._run_workflow_expected_nodes[run_id][workflow]:
+                workflow_status = status
+
+                break
+        
+        completed_count = sum(self._completed_counts[run_id][workflow].values())
+
+        await update_callback(completed_count, workflow_status)

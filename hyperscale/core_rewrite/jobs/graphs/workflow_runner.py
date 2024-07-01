@@ -109,11 +109,19 @@ class WorkflowRunner:
             {},
         ).get(workflow, WorkflowStatus.UNKNOWN)
 
-        counter = self._completed_counts.get(run_id, {}).get(
-            workflow, CompletionCounter()
-        )
+        completed_count = 0
 
-        completed_count = counter.value()
+
+        try:
+            counter = self._completed_counts[run_id].get(
+                workflow, CompletionCounter()
+            )
+
+            completed_count = counter.value()
+
+        except Exception:
+            import traceback
+            print(traceback.format_exc())
 
         return (status, completed_count)
 
@@ -620,6 +628,7 @@ class WorkflowRunner:
                     result = err
 
                 context[complete.get_name()] = result
+                self._completed_counts[run_id][workflow_name].increment()
 
             self._pending[run_id][workflow_name].extend(pending)
 
@@ -636,8 +645,6 @@ class WorkflowRunner:
 
                 except asyncio.InvalidStateError:
                     self._active_waiters[run_id][workflow_name] = None
-
-        self._completed_counts[run_id][workflow_name].increment()
 
         return results
 

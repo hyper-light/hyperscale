@@ -20,6 +20,7 @@ from hyperscale.core_rewrite.jobs.models import InstanceRoleType
 from hyperscale.core_rewrite.jobs.models.env import Env
 from hyperscale.core_rewrite.jobs.workers import Provisioner, StagePriority
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
+from hyperscale.core_rewrite.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core_rewrite.results.workflow_types import (
     WorkflowContextResult,
     WorkflowStats,
@@ -290,6 +291,7 @@ class RemoteGraphManager:
             loaded_context,
             threads,
             workflow_vus,
+            self._update
         )
 
         worker_results = await self._controller.poll_for_workflow_complete(
@@ -380,6 +382,14 @@ class RemoteGraphManager:
         )
 
         return context[workflow]
+    
+    async def _update(
+        self,
+        completed: int,
+        status: WorkflowStatus,
+    ):
+        
+        print(completed, status)
 
     def _provision(
         self,
