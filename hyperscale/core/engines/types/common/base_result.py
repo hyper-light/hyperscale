@@ -1,4 +1,4 @@
-from typing import Coroutine, Dict, List, Union
+from typing import Dict, List, Union
 from .types import RequestTypes
 
 

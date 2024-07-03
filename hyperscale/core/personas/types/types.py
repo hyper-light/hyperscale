@@ -1,6 +1,3 @@
-from enum import Enum
-
-
 class PersonaTypes:
     APPROXIMATE_DISTRIBUTION = "APPROXIMATE-DISTRIBUTION"
     BATCHED = "BATCHED"

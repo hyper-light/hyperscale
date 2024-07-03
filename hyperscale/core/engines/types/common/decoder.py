@@ -7,11 +7,9 @@ Implements the HPACK header compression algorithm as detailed by the IETF.
 """
 
 from functools import lru_cache
-from .hpack.table import HeaderTable, table_entry_size
+from .hpack.table import HeaderTable
 from .hpack.exceptions import (
     HPACKDecodingError,
-    OversizedHeaderListError,
-    InvalidTableSizeError,
 )
 
 from .hpack.huffman_table import decode_huffman

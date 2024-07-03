@@ -1,5 +1,4 @@
-from pydantic import BaseModel, StrictInt, StrictStr
-from typing import Optional
+from pydantic import BaseModel, StrictInt
 
 
 class InjectJunkDataValidator(BaseModel):

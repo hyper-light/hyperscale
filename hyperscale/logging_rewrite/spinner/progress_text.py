@@ -1,5 +1,4 @@
 import asyncio
-import datetime
 from .timer import Timer
 
 

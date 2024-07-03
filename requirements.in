@@ -6,7 +6,6 @@ pytz
 tzlocal
 eventlet
 psutil
-aiologger
 yaspin
 fastapi
 dill

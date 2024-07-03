@@ -1,7 +1,4 @@
 import time
-from numpy import float32, float64, int16, int32, int64
-from typing import Any
-from datetime import datetime
 
 
 class AWSTimestreamErrorRecord:

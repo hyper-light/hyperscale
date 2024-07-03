@@ -4,7 +4,6 @@ import multiprocessing
 import signal
 import warnings
 from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import active_children
 from multiprocessing.context import SpawnContext
 from typing import Dict, List, Tuple
 
@@ -36,7 +35,9 @@ async def run_server(
     except Exception:
         server.abort()
         import traceback
+
         print(traceback.format_exc())
+
 
 def abort(server: RemoteGraphController, run_task: asyncio.Future):
     server.abort()

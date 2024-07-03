@@ -55,7 +55,7 @@ from ctypes import (
     c_size_t,
 )
 from ctypes import c_short, c_ushort, c_ubyte, c_char
-from ctypes import byref, POINTER, addressof
+from ctypes import byref, POINTER
 from ctypes import Structure, Union
 from ctypes import create_string_buffer, sizeof, memmove, cast
 from threading import Lock

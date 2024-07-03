@@ -52,8 +52,8 @@ class HyperscaleLogger:
             )
 
             logger: Logger[
-                AsyncLogger | AsyncSpinner | AsyncFilesystemLogger, 
-                SyncLogger | SyncFilesystemLogger | None
+                AsyncLogger | AsyncSpinner | AsyncFilesystemLogger,
+                SyncLogger | SyncFilesystemLogger | None,
             ] = Logger(config)
 
             if logger_type == LoggerTypes.CONSOLE:

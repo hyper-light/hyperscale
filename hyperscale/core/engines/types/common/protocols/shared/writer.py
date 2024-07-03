@@ -1,5 +1,4 @@
 import asyncio
-import signal
 from asyncio import Transport, DatagramTransport, Protocol, sleep
 
 

@@ -3,7 +3,7 @@ import struct
 from typing import Dict, Iterable, Tuple
 from .record_data import RecordData
 from .record_types import RecordType
-from .utils import load_domain_name, pack_domain_name
+from .utils import load_domain_name
 
 
 class NAPTRRecordData(RecordData):

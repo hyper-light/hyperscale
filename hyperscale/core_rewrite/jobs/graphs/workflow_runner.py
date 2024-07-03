@@ -111,16 +111,14 @@ class WorkflowRunner:
 
         completed_count = 0
 
-
         try:
-            counter = self._completed_counts[run_id].get(
-                workflow, CompletionCounter()
-            )
+            counter = self._completed_counts[run_id].get(workflow, CompletionCounter())
 
             completed_count = counter.value()
 
         except Exception:
             import traceback
+
             print(traceback.format_exc())
 
         return (status, completed_count)

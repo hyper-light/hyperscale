@@ -2,8 +2,6 @@
 
 __all__ = ("Lock", "Event", "Condition", "Semaphore", "BoundedSemaphore", "Barrier")
 
-import collections
-from asyncio import exceptions
 from asyncio import mixins
 
 

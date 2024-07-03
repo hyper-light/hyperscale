@@ -1,4 +1,4 @@
-from typing import List, Union, Dict
+from typing import List, Union
 from .types import HTTPCookie, HTTPCookieMap, HTTPEncodableValue
 
 

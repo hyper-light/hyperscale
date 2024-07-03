@@ -286,12 +286,7 @@ class RemoteGraphManager:
         # ## Send batched requests
 
         await self._controller.submit_workflow_to_workers(
-            run_id,
-            workflow,
-            loaded_context,
-            threads,
-            workflow_vus,
-            self._update
+            run_id, workflow, loaded_context, threads, workflow_vus, self._update
         )
 
         worker_results = await self._controller.poll_for_workflow_complete(
@@ -382,13 +377,12 @@ class RemoteGraphManager:
         )
 
         return context[workflow]
-    
+
     async def _update(
         self,
         completed: int,
         status: WorkflowStatus,
     ):
-        
         print(completed, status)
 
     def _provision(

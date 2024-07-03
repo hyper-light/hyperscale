@@ -132,9 +132,9 @@ class LocalRunner:
 
                     except asyncio.CancelledError:
                         pass
-                
+
                 return results
-            
+
         except Exception:
             try:
                 self._server_pool.abort()

@@ -1,5 +1,4 @@
 from __future__ import annotations
-import socket
 import struct
 from typing import Dict, Iterable, Tuple
 from .record_data import RecordData

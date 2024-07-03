@@ -13,11 +13,7 @@ from .types import *
 from .exceptions import InvalidFrameError, InvalidDataError
 from .types.base_frame import Frame
 from .types.attributes import (
-    Flag,
-    Flags,
-    _STRUCT_HBBBL,
     _STRUCT_H,
-    _STRUCT_B,
     _STRUCT_LL,
     _STRUCT_LB,
     _STRUCT_L,

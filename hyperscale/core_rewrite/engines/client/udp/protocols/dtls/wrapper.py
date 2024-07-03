@@ -39,7 +39,6 @@ import socket
 from .patch import do_patch
 
 do_patch()
-from .sslconnection import SSLContext, SSL
 from .err import *
 
 _logger = getLogger(__name__)

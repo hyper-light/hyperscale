@@ -14,7 +14,6 @@ from typing import Any, Coroutine, Dict, List, Mapping
 from aiologger.formatters.base import Formatter
 from aiologger.levels import LogLevel
 from yaspin.core import Yaspin, to_unicode
-from yaspin.spinners import Spinners
 
 from hyperscale.logging.spinner import ProgressText
 
@@ -45,7 +44,7 @@ class AsyncSpinner(Yaspin):
         logger_type: LoggerTypes = LoggerTypes.SPINNER,
         log_level: LogLevel = LogLevel.NOTSET,
         logger_enabled: bool = True,
-        spinner: Spinners = None,
+        spinner: Any = None,
         text: ProgressText = None,
         color: str = None,
         on_color: str = None,
