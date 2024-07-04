@@ -11,16 +11,15 @@ from hyperscale.core_rewrite.engines.client.shared.models import (
 
 
 class GraphQLHTTP2Response(HTTP2Response):
-    def __init__(
-        self,
-        url: URLMetadata,
-        method: Optional[Literal["GET", "POST"]] = None,
-        cookies: Optional[Cookies] = None,
-        status: Optional[int] = None,
-        status_message: Optional[str] = None,
-        headers: Dict[bytes, bytes] = {},
-        content: bytes = b"",
-        timings: Dict[
+    url: URLMetadata
+    method: Optional[Literal["GET", "POST"]] = None
+    cookies: Optional[Cookies] = None
+    status: Optional[int] = None
+    status_message: Optional[str] = None
+    headers: Optional[Dict[bytes, bytes]] = None
+    content: bytes = b""
+    timings: Optional[
+        Dict[
             Literal[
                 "request_start",
                 "connect_start",
@@ -32,21 +31,8 @@ class GraphQLHTTP2Response(HTTP2Response):
                 "request_end",
             ],
             float | None,
-        ] = None,
-    ):
-        super(
-            GraphQLHTTP2Response,
-            self,
-        ).__init__(
-            url,
-            method=method,
-            cookies=cookies,
-            status=status,
-            status_message=status_message,
-            headers=headers,
-            content=content,
-            timings=timings,
-        )
+        ]
+    ] = None
 
     @classmethod
     def response_type(cls):

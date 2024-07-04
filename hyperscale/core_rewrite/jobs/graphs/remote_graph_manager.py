@@ -18,9 +18,9 @@ from hyperscale.core_rewrite.graph.workflow import Workflow
 from hyperscale.core_rewrite.hooks import Hook, HookType
 from hyperscale.core_rewrite.jobs.models import InstanceRoleType
 from hyperscale.core_rewrite.jobs.models.env import Env
+from hyperscale.core_rewrite.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core_rewrite.jobs.workers import Provisioner, StagePriority
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
-from hyperscale.core_rewrite.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core_rewrite.results.workflow_types import (
     WorkflowContextResult,
     WorkflowStats,
@@ -383,7 +383,7 @@ class RemoteGraphManager:
         completed: int,
         status: WorkflowStatus,
     ):
-        print(completed, status)
+        pass
 
     def _provision(
         self,

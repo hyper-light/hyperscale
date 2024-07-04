@@ -19,41 +19,22 @@ T = TypeVar("T", bound=BaseModel)
 
 
 class UDPResponse(CallResult):
-    __slots__ = (
-        "url",
-        "error",
-        "content",
-        "timings",
-    )
-
-    def __init__(
-        self,
-        url: URLMetadata,
-        error: Optional[str] = None,
-        content: bytes = b"",
-        timings: Dict[
-            Literal[
-                "request_start",
-                "connect_start",
-                "connect_end",
-                "write_start",
-                "write_end",
-                "read_start",
-                "read_end",
-                "request_end",
-            ],
-            float | None,
-        ] = None,
-    ):
-        super(
-            UDPResponse,
-            self,
-        ).__init__()
-
-        self.url = url
-        self.error = error
-        self.content = content
-        self.timings = timings
+    url: URLMetadata
+    error: Optional[str] = None
+    content: bytes = b""
+    timings: Dict[
+        Literal[
+            "request_start",
+            "connect_start",
+            "connect_end",
+            "write_start",
+            "write_end",
+            "read_start",
+            "read_end",
+            "request_end",
+        ],
+        float | None,
+    ] = None
 
     @classmethod
     def response_type(cls):

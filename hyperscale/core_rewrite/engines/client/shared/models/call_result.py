@@ -1,10 +1,9 @@
 from typing import Any
 
+import msgspec
 
-class CallResult:
-    def __init__(self) -> None:
-        pass
 
+class CallResult(msgspec.Struct):
     @classmethod
     def response_type(cls) -> Any:
         return None

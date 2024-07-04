@@ -17,37 +17,25 @@ T = TypeVar("T")
 
 
 class HTTP2Response(CallResult):
-    __slots__ = (
-        "url",
-        "method",
-        "cookies",
-        "status",
-        "status_message",
-        "headers",
-        "content",
-        "timings",
-    )
-
-    def __init__(
-        self,
-        url: URLMetadata,
-        method: Optional[
-            Literal[
-                "GET",
-                "POST",
-                "HEAD",
-                "OPTIONS",
-                "PUT",
-                "PATCH",
-                "DELETE",
-            ]
-        ] = None,
-        cookies: Optional[Cookies] = None,
-        status: Optional[int] = None,
-        status_message: Optional[str] = None,
-        headers: Dict[bytes, bytes] = {},
-        content: bytes = b"",
-        timings: Dict[
+    url: URLMetadata
+    method: Optional[
+        Literal[
+            "GET",
+            "POST",
+            "HEAD",
+            "OPTIONS",
+            "PUT",
+            "PATCH",
+            "DELETE",
+        ]
+    ] = None
+    cookies: Optional[Cookies] = None
+    status: Optional[int] = None
+    status_message: Optional[str] = None
+    headers: Optional[Dict[bytes, bytes]] = None
+    content: bytes = b""
+    timings: Optional[
+        Dict[
             Literal[
                 "request_start",
                 "connect_start",
@@ -59,21 +47,8 @@ class HTTP2Response(CallResult):
                 "request_end",
             ],
             float | None,
-        ] = None,
-    ):
-        super(
-            HTTP2Response,
-            self,
-        ).__init__()
-
-        self.url = url
-        self.method = method
-        self.cookies = cookies
-        self.status = status
-        self.status_message = status_message
-        self.headers = headers
-        self.content = content
-        self.timings = timings
+        ]
+    ] = None
 
     @classmethod
     def response_type(cls):

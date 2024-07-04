@@ -1,10 +1,10 @@
 from typing import Optional
 
-from pydantic import BaseModel, StrictStr
+import msgspec
 
 
-class URLMetadata(BaseModel):
-    host: StrictStr
-    path: StrictStr
-    params: Optional[StrictStr] = None
-    query: Optional[StrictStr] = None
+class URLMetadata(msgspec.Struct):
+    host: str
+    path: str
+    params: Optional[str] = None
+    query: Optional[str] = None

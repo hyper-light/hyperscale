@@ -15,17 +15,14 @@ T = TypeVar("T")
 
 
 class GRPCResponse(HTTP2Response):
-    __slots__ = ("_data",)
-
-    def __init__(
-        self,
-        url: URLMetadata,
-        method: Optional[Literal["POST"]] = "POST",
-        status: Optional[int] = None,
-        status_message: Optional[str] = None,
-        headers: Dict[bytes, bytes] = {},
-        content: bytes = b"",
-        timings: Dict[
+    url: URLMetadata
+    method: Optional[Literal["POST"]] = "POST"
+    status: Optional[int] = None
+    status_message: Optional[str] = None
+    headers: Optional[Dict[bytes, bytes]] = None
+    content: bytes = b""
+    timings: Optional[
+        Dict[
             Literal[
                 "request_start",
                 "connect_start",
@@ -37,22 +34,10 @@ class GRPCResponse(HTTP2Response):
                 "request_end",
             ],
             float | None,
-        ] = None,
-    ):
-        super(
-            GRPCResponse,
-            self,
-        ).__init__(
-            url,
-            method=method,
-            status=status,
-            status_message=status_message,
-            headers=headers,
-            content=content,
-            timings=timings,
-        )
+        ]
+    ] = None
 
-        self._data: Optional[bytes] = None
+    _data: Optional[bytes] = None
 
     @classmethod
     def response_type(cls):
