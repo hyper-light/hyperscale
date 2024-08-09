@@ -1,4 +1,6 @@
 import asyncio
+import uvloop
+uvloop.install()
 
 from hyperscale.core_rewrite.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow, step
@@ -6,8 +8,7 @@ from hyperscale.testing import URL, HTTPResponse
 
 
 class Test(Workflow):
-    vus = 2000
-    threads = 8
+    vus = 16000
     duration = "1m"
 
     @step()
@@ -19,6 +20,7 @@ async def run():
     runner = LocalRunner(
         "0.0.0.0",
         15454,
+        workers=16
     )
 
     results = await runner.run(

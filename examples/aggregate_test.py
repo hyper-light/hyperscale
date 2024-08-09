@@ -4,17 +4,17 @@ import pprint
 from hyperscale.core_rewrite.graph import Graph
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
 from hyperscale.graph import Workflow, step
-from hyperscale.testing import URL, HTTP2Response
+from hyperscale.testing import URL, HTTPResponse
 
 
 class Test(Workflow):
-    vus = 400
-    threads = 4
+    vus = 1000
+    threads=12
     duration = "1m"
 
     @step()
-    async def login(self, url: URL = "https://http2.github.io/") -> HTTP2Response:
-        return await self.client.http2.get(url)
+    async def login(self, url: URL = "https://httpbin.org/get") -> HTTPResponse:
+        return await self.client.http.get(url)
 
 
 async def run():

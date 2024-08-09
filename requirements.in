@@ -27,3 +27,5 @@ playwright
 protobuf
 graphql-core
 cloudpickle
+orjson
+msgspec
