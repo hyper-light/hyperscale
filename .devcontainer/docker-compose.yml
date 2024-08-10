@@ -13,9 +13,9 @@ services:
         - ..:/workspace
         - ../.git:/workspace/.git
         - ../.devcontainer:/workspace/.devcontainer
-        - ~/.aws:/home/datavant/.aws
-        - ~/.ssh:/home/datavant/.ssh
-        - ~/.git:/home/datavant/.git
+        - ~/.aws:${HOME}/.aws
+        - ~/.ssh:${HOME}/.ssh
+        - ~/.git:${HOME}/.git
       ports:
         - 5003:5003
       stdin_open: true

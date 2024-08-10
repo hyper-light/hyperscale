@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-git config --global --add safe.directory /workspac
+git config --global --add safe.directory /workspace
 if [[ ! -d /workspace/.venv ]]; then
     uv venv
 fi
