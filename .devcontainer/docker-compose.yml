@@ -13,9 +13,9 @@ services:
         - ..:/workspace
         - ../.git:/workspace/.git
         - ../.devcontainer:/workspace/.devcontainer
-        - ~/.aws:${HOME}/.aws
-        - ~/.ssh:${HOME}/.ssh
-        - ~/.git:${HOME}/.git
+        - ${HOME}/.aws:/root/.aws
+        - ${HOME}/.ssh:/root/.ssh
+        - ${HOME}/.git:/root/.git
       ports:
         - 5003:5003
       stdin_open: true
