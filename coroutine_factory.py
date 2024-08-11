@@ -16,10 +16,7 @@ def create(message: str):
 async def main():
     spinner = AsyncSpinner()
 
-    await spinner.spin(
-        text="Hello world!",
-        color="cyan",
-    )
+    await spinner.spin(text="Hello world!", color=54, mode="extended")
     await asyncio.sleep(10)
 
     await spinner.fail(color="red")

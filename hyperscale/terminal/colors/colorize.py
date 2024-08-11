@@ -3,10 +3,11 @@ import os
 import sys
 from typing import Iterable
 
+from hyperscale.terminal.config.mode import TerminalMode
+
 from .attribute import Attribute
 from .color import Color
 from .highlight import Highlight
-from .mode import TerminalMode
 
 RESET = "\033[0m"
 
@@ -60,39 +61,34 @@ async def colorize(
     if (await _can_do_colour(no_color=no_color, force_color=force_color)) is False:
         return text
 
-    ansi_string = ""
+    ansi_string = str(text)
 
     if color is not None and mode == TerminalMode.COMPATIBILITY:
-        ansi_color_string = "\033[%dm" % (
-            Color.by_name(color) if isinstance(color, str) else color
+        ansi_string = "\033[%dm%s" % (
+            Color.by_name(color) if isinstance(color, str) else color,
+            ansi_string,
         )
-
-        ansi_string = f"{ansi_color_string}{text}"
 
     elif color is not None and mode == TerminalMode.EXTENDED:
-        ansi_256_color_fmt_str = (
-            "\033[38;5;%dm" % Color.by_name(color) if isinstance(color, str) else color
+        ansi_string = "\033[38:5:%dm%s" % (
+            Color.by_name(color) if isinstance(color, str) else color,
+            ansi_string,
         )
-        ansi_string = f"{ansi_256_color_fmt_str}{text}"
 
     if highlight is not None and mode == TerminalMode.COMPATIBILITY:
-        ansi_256_highlight_fmt_str = "\033[%dm" % (
-            Highlight.by_name(highlight) if isinstance(highlight, str) else highlight
+        ansi_string = "\033[%dm%s" % (
+            Highlight.by_name(highlight) if isinstance(highlight, str) else highlight,
+            ansi_string,
         )
 
-        ansi_string = f"{ansi_256_highlight_fmt_str}{ansi_string}"
-
-    elif highlight and mode == TerminalMode.COMPATIBILITY:
-        ansi_256_highlight_fmt_str = (
-            ansi_256_highlight_fmt_str % Highlight.by_name(highlight)
-            if isinstance(highlight, str)
-            else color
+    elif highlight and mode == TerminalMode.EXTENDED:
+        ansi_string = "\033[48:5:%dm%s" % (
+            Highlight.by_name(highlight) if isinstance(highlight, str) else color,
+            ansi_string,
         )
-        ansi_string = f"{ansi_256_highlight_fmt_str}{ansi_string}"
 
     if attrs is not None:
         for attr in attrs:
-            ansi_attribute_string = "\033[38;5;%dm" % Attribute.by_name(attr)
-            ansi_string = f"{ansi_attribute_string}{ansi_string}"
+            ansi_string = ("\033[%dm" % Attribute.by_name(attr), ansi_string)
 
     return ansi_string + RESET

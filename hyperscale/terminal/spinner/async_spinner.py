@@ -36,6 +36,7 @@ from hyperscale.terminal.colors import (
     HighlightName,
     colorize,
 )
+from hyperscale.terminal.config.mode import TerminalMode
 
 from .spinner import Spinner
 from .spinner_data import spinner_data
@@ -84,8 +85,10 @@ class AsyncSpinner:
             ],
         ]
         | None = None,
+        mode: Literal["extended", "compatability"] = "compatability",
     ):
         # Spinner
+        self._mode = TerminalMode.to_mode(mode)
         self._factory = SpinnerFactory(spinners=spinners)
         self._spinner = self._factory.get(spinner)
         self._frames = self._set_frames(self._spinner, reversal)
@@ -96,7 +99,6 @@ class AsyncSpinner:
         self._color = color
         self._highlight = highlight
         self._attrs = self._set_attrs(attrs) if attrs else set()
-        self._color_func = self._compose_color_func()
 
         # Other
         self._text = text
@@ -220,7 +222,6 @@ class AsyncSpinner:
     @color.setter
     def color(self, value: str) -> None:
         self._color = self._set_color(value) if value else value
-        self._color_func = self._compose_color_func()  # update
 
     @property
     def highlight(self) -> Optional[str]:
@@ -229,7 +230,6 @@ class AsyncSpinner:
     @highlight.setter
     def highlight(self, value: str) -> None:
         self._highlight = self._set_highlight(value) if value else value
-        self._color_func = self._compose_color_func()  # update
 
     @property
     def attrs(self) -> Sequence[str]:
@@ -239,7 +239,6 @@ class AsyncSpinner:
     def attrs(self, value: Sequence[str]) -> None:
         new_attrs = self._set_attrs(value) if value else set()
         self._attrs = self._attrs.union(new_attrs)
-        self._color_func = self._compose_color_func()  # update
 
     @property
     def side(self) -> str:
@@ -267,20 +266,52 @@ class AsyncSpinner:
             return time.monotonic() - self._start_time
         return self._stop_time - self._start_time
 
-    def _compose_color_func(self):
+    def _compose_color_func(
+        self,
+        color: str | None = None,
+        highlight: str | None = None,
+        attrs: Sequence[str] | None = None,
+        mode: TerminalMode = TerminalMode.COMPATIBILITY,
+    ):
         return functools.partial(
             colorize,
-            color=self._color,
-            highlight=self._highlight,
-            attrs=list(self._attrs),
+            color=color,
+            highlight=highlight,
+            attrs=list(attrs),
+            mode=mode,
         )
 
-    async def _compose_out(self, frame: str, mode: Optional[str] = None) -> str:
-        text = str(self._text)
+    async def _compose_out(
+        self,
+        frame: str,
+        text: str | bytes | ProgressText | None = None,
+        color: ColorName | None = None,
+        attrs: AttributeName | None = None,
+        highlight: HighlightName | None = None,
+        compose_mode: Optional[str] = None,
+        mode: TerminalMode = TerminalMode.COMPATIBILITY,
+    ) -> str:
+        if text:
+            text = str(text)
+
+        if color is None:
+            color = self._color
+
+        if highlight is None:
+            highlight = self._highlight
+
+        if attrs is None:
+            attrs = self._attrs
 
         # Colors
-        if self._color_func is not None:
-            frame = await self._color_func(frame)
+        if color:
+            frame = await colorize(
+                frame,
+                color=color,
+                attrs=attrs,
+                highlight=highlight,
+                mode=mode,
+            )
 
         # Position
         if self._side == "right":
@@ -292,9 +323,9 @@ class AsyncSpinner:
                 timedelta(seconds=sec), fsec
             )
         # Mode
-        if mode is None and self._text:
+        if compose_mode is None and text:
             out = f"\r{frame} {text}"
-        elif self._text:
+        elif text:
             out = f"{frame} {text}\n"
 
         elif mode is None:
@@ -339,17 +370,9 @@ class AsyncSpinner:
         text: str | bytes | ProgressText | None = None,
         color: ColorName | None = None,
         highlight: HighlightName | None = None,
+        attrs: Sequence[str] | None = None,
+        mode: Literal["extended", "compatability"] = "compatability",
     ):
-        if text:
-            self._text = text
-
-        if color:
-            self._color = color
-            self._color_func = self._compose_color_func()
-
-        if highlight:
-            self._highlight = highlight
-
         if self.enabled:
             if self._sigmap:
                 self._register_signal_handlers()
@@ -360,7 +383,15 @@ class AsyncSpinner:
             self._stop_spin = asyncio.Event()
             self._hide_spin = asyncio.Event()
             try:
-                self._spin_thread = asyncio.create_task(self._spin())
+                self._spin_thread = asyncio.create_task(
+                    self._spin(
+                        text=text,
+                        color=color,
+                        highlight=highlight,
+                        attrs=attrs,
+                        mode=TerminalMode.to_mode(mode),
+                    )
+                )
             finally:
                 # Ensure cursor is not hidden if any failure occurs that prevents
                 # getting it back
@@ -434,44 +465,66 @@ class AsyncSpinner:
 
     async def ok(
         self,
-        text="✔",
+        char="✔",
+        text: str | bytes | ProgressText | None = None,
         color: ColorName | None = None,
         highlight: HighlightName | None = None,
+        attrs: Sequence[str] | None = None,
+        mode: Literal["extended", "compatability"] = "compatability",
     ):
-        if color:
-            self._color = color
-            self._color_func = self._compose_color_func()
-
-        if highlight:
-            self._highlight = highlight
-
         if self.enabled:
             """Set Ok (success) finalizer to a spinner."""
-            _text = text if text else "✔"
-            await self._freeze(_text)
+            _char = char if char else "✔"
+            await self._freeze(
+                _char,
+                text=text,
+                color=color,
+                attrs=attrs,
+                highlight=highlight,
+                mode=TerminalMode.to_mode(mode),
+            )
 
     async def fail(
         self,
-        text="✘",
+        char="✘",
+        text: str | bytes | ProgressText | None = None,
         color: ColorName | None = None,
         highlight: HighlightName | None = None,
+        attrs: Sequence[str] | None = None,
+        mode: Literal["extended", "compatability"] = "compatability",
     ):
-        if color:
-            self._color = color
-            self._color_func = self._compose_color_func()
-
-        if highlight:
-            self._highlight = highlight
-
         if self.enabled:
             """Set fail finalizer to a spinner."""
-            _text = text if text else "✘"
-            await self._freeze(_text)
+            _char = char if char else "✘"
+            await self._freeze(
+                _char,
+                text=text,
+                color=color,
+                attrs=attrs,
+                highlight=highlight,
+                mode=TerminalMode.to_mode(mode),
+            )
 
-    async def _freeze(self, final_text):
+    async def _freeze(
+        self,
+        end_char: str,
+        text: str | bytes | ProgressText | None = None,
+        color: ColorName | None = None,
+        attrs: AttributeName | None = None,
+        highlight: HighlightName | None = None,
+        mode: TerminalMode = TerminalMode.COMPATIBILITY,
+    ):
         """Stop spinner, compose last frame and 'freeze' it."""
-        text = to_unicode(final_text)
-        self._last_frame = await self._compose_out(text, mode="last")
+        char = to_unicode(end_char)
+        self._last_frame = await self._compose_out(
+            char,
+            text=text,
+            color=color,
+            attrs=attrs,
+            highlight=highlight,
+            compose_mode="last",
+            mode=mode,
+        )
 
         # Should be stopped here, otherwise prints after
         # self._freeze call will mess up the spinner
@@ -481,7 +534,14 @@ class AsyncSpinner:
 
         self._cur_line_len = 0
 
-    async def _spin(self):
+    async def _spin(
+        self,
+        text: str | bytes | ProgressText | None = None,
+        color: ColorName | None = None,
+        highlight: HighlightName | None = None,
+        attrs: Sequence[str] | None = None,
+        mode: Literal["extended", "compatability"] = "compatability",
+    ):
         while not self._stop_spin.is_set():
             if self._hide_spin.is_set():
                 # Wait a bit to avoid wasting cycles
@@ -495,7 +555,14 @@ class AsyncSpinner:
 
             # Compose output
             spin_phase = next(self._cycle)
-            out = await self._compose_out(spin_phase)
+            out = await self._compose_out(
+                spin_phase,
+                text=text,
+                color=color,
+                attrs=attrs,
+                highlight=highlight,
+                mode=mode,
+            )
 
             if len(out) > terminal_width:
                 out = f"{out[:terminal_width-1]}..."
