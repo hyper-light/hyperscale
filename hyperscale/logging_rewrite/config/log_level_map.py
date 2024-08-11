@@ -1,6 +1,6 @@
 from typing import Dict
 
-from mkfst.logging.models import LogLevel
+from hyperscale.logging_rewrite.models import LogLevel
 
 
 class LogLevelMap:

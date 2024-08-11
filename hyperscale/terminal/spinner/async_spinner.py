@@ -7,7 +7,7 @@ import itertools
 import signal
 import sys
 import time
-from asyncio import Task
+from datetime import timedelta
 from enum import Enum
 from os import get_terminal_size
 from types import FrameType
@@ -18,22 +18,28 @@ from typing import (
     Dict,
     Iterator,
     List,
-    Mapping,
+    Literal,
     Optional,
     Sequence,
     Type,
     Union,
 )
 
-from aiologger.levels import LogLevel
-from termcolor import ATTRIBUTES, COLORS, HIGHLIGHTS, colored
-
 from hyperscale.logging.spinner import ProgressText
 from hyperscale.logging_rewrite import Logger
+from hyperscale.terminal.colors import (
+    Attribute,
+    AttributeName,
+    Color,
+    ColorName,
+    Highlight,
+    HighlightName,
+    colorize,
+)
 
-from .logger_types import LoggerTypes
-from .spinner import Spinner, default_spinner
+from .spinner import Spinner
 from .spinner_data import spinner_data
+from .spinner_factory import SpinnerFactory, SpinnerName
 from .to_unicode import to_unicode
 
 SignalHandlers = Union[Callable[[int, Optional[FrameType]], Any], int, None]
@@ -52,6 +58,7 @@ async def default_handler(signame: str, spinner: AsyncSpinner):  # pylint: disab
     ``signum`` and ``frame`` are mandatory arguments. Check ``signal.signal``
     function for more details.
     """
+    spinner.color = "red"
     await spinner.fail()
     await spinner.stop()
 
@@ -59,30 +66,35 @@ async def default_handler(signame: str, spinner: AsyncSpinner):  # pylint: disab
 class AsyncSpinner:
     def __init__(
         self,
-        logger_name: str = None,
-        logger_type: LoggerTypes = LoggerTypes.SPINNER,
-        log_level: LogLevel = LogLevel.NOTSET,
-        logger_enabled: bool = True,
-        spinner: Spinners = None,
-        text: ProgressText = None,
-        color: str = None,
-        on_color: str = None,
-        attrs: List[str] = None,
+        spinner: SpinnerName = None,
+        text: ProgressText | str | bytes = None,
+        color: ColorName = None,
+        highlight: HighlightName = None,
+        attrs: List[AttributeName] = None,
         reversal: bool = False,
-        side: str = "left",
+        side: Literal["left", "right"] = "left",
         sigmap: Dict[signal.Signals, Coroutine] = None,
         timer: bool = False,
         enabled: bool = True,
+        spinners: Dict[
+            str,
+            Dict[
+                Literal["frames", "interval"],
+                int | List[str],
+            ],
+        ]
+        | None = None,
     ):
         # Spinner
-        self._spinner = self._set_spinner(spinner)
+        self._factory = SpinnerFactory(spinners=spinners)
+        self._spinner = self._factory.get(spinner)
         self._frames = self._set_frames(self._spinner, reversal)
         self._interval = self._set_interval(self._spinner)
         self._cycle = self._set_cycle(self._frames)
 
         # Color Specification
-        self._color = self._set_color(color) if color else color
-        self._on_color = self._set_on_color(on_color) if on_color else on_color
+        self._color = color
+        self._highlight = highlight
         self._attrs = self._set_attrs(attrs) if attrs else set()
         self._color_func = self._compose_color_func()
 
@@ -103,7 +115,15 @@ class AsyncSpinner:
         self._hidden_level = 0
         self._cur_line_len = 0
 
-        self._sigmap = sigmap if sigmap else {}
+        self._sigmap = (
+            sigmap
+            if sigmap
+            else {
+                signal.SIGINT: default_handler,
+                signal.SIGTERM: default_handler,
+                signal.SIG_IGN: default_handler,
+            }
+        )
         # Maps signals to their default handlers in order to reset
         # custom handlers set by ``sigmap`` at the cleanup phase.
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
@@ -113,23 +133,10 @@ class AsyncSpinner:
         self.display = text
 
         self.enabled = enabled
-        self.logger_enabled = True
         self.logger_mode = LoggerMode.CONSOLE
 
         self._stdout_lock = asyncio.Lock()
         self._loop = asyncio.get_event_loop()
-
-    @staticmethod
-    def _set_spinner(spinner: Spinner) -> Spinner:
-        if hasattr(spinner, "frames") and hasattr(spinner, "interval"):
-            if not spinner.frames or not spinner.interval:
-                sp = default_spinner
-            else:
-                sp = spinner
-        else:
-            sp = default_spinner
-
-        return sp
 
     @staticmethod
     def _set_side(side: str) -> str:
@@ -149,7 +156,6 @@ class AsyncSpinner:
 
         # TODO (pavdmyt): support any type that implements iterable
         if isinstance(spinner.frames, (list, tuple)):
-            # Empty ``spinner.frames`` is handled by ``Yaspin._set_spinner``
             if spinner.frames and isinstance(spinner.frames[0], bytes):
                 uframes_seq = [to_unicode(frame) for frame in spinner.frames]
             else:
@@ -157,9 +163,6 @@ class AsyncSpinner:
 
         _frames = uframes or uframes_seq
         if not _frames:
-            # Empty ``spinner.frames`` is handled by ``Yaspin._set_spinner``.
-            # This code is very unlikely to be executed. However, it's still
-            # here to be on a safe side.
             raise ValueError(f"{spinner!r}: no frames found in spinner")
 
         # Builtin ``reversed`` returns reverse iterator,
@@ -180,183 +183,138 @@ class AsyncSpinner:
         return itertools.cycle(frames)
 
     @staticmethod
-    def _set_color(value: str) -> str:
-        if value not in COLORS:
+    def _set_color(value: str, default: int | None = None) -> str:
+        if value not in Color.names and default is None:
             raise ValueError(
                 "'{0}': unsupported color value. Use one of the: {1}".format(  # pylint: disable=consider-using-f-string
-                    value, ", ".join(COLORS.keys())
+                    value, ", ".join(Color.names.keys())
                 )
             )
-        return value
+        return Color.by_name(value, default=default)
 
     @staticmethod
-    def _set_on_color(value: str) -> str:
-        if value not in HIGHLIGHTS:
+    def _set_highlight(value: str, default: int | None = None) -> str:
+        if value not in Highlight.names and default is None:
             raise ValueError(
-                "'{0}': unsupported on_color value. "  # pylint: disable=consider-using-f-string
-                "Use one of the: {1}".format(value, ", ".join(HIGHLIGHTS.keys()))
+                "'{0}': unsupported highlight value. "  # pylint: disable=consider-using-f-string
+                "Use one of the: {1}".format(value, ", ".join(Highlight.names.keys()))
             )
-        return value
+        return Highlight.by_name(value, default=default)
 
     @staticmethod
     def _set_attrs(attrs: Sequence[str]) -> set[str]:
         for attr in attrs:
-            if attr not in ATTRIBUTES:
+            if attr not in Attribute.names:
                 raise ValueError(
                     "'{0}': unsupported attribute value. "  # pylint: disable=consider-using-f-string
-                    "Use one of the: {1}".format(attr, ", ".join(ATTRIBUTES.keys()))
+                    "Use one of the: {1}".format(
+                        attr, ", ".join(Attribute.names.keys())
+                    )
                 )
         return set(attrs)
 
-    def _compose_color_func(self) -> Optional[Callable[..., str]]:
-        if self.is_jupyter():
-            # ANSI Color Control Sequences are problematic in Jupyter
-            return None
+    @property
+    def color(self) -> Optional[str]:
+        return self._color
 
+    @color.setter
+    def color(self, value: str) -> None:
+        self._color = self._set_color(value) if value else value
+        self._color_func = self._compose_color_func()  # update
+
+    @property
+    def highlight(self) -> Optional[str]:
+        return self._highlight
+
+    @highlight.setter
+    def highlight(self, value: str) -> None:
+        self._highlight = self._set_highlight(value) if value else value
+        self._color_func = self._compose_color_func()  # update
+
+    @property
+    def attrs(self) -> Sequence[str]:
+        return list(self._attrs)
+
+    @attrs.setter
+    def attrs(self, value: Sequence[str]) -> None:
+        new_attrs = self._set_attrs(value) if value else set()
+        self._attrs = self._attrs.union(new_attrs)
+        self._color_func = self._compose_color_func()  # update
+
+    @property
+    def side(self) -> str:
+        return self._side
+
+    @side.setter
+    def side(self, value: str) -> None:
+        self._side = self._set_side(value)
+
+    @property
+    def reversal(self) -> bool:
+        return self._reversal
+
+    @reversal.setter
+    def reversal(self, value: bool) -> None:
+        self._reversal = value
+        self._frames = self._set_frames(self._spinner, self._reversal)
+        self._cycle = self._set_cycle(self._frames)
+
+    @property
+    def elapsed_time(self) -> float:
+        if self._start_time is None:
+            return 0
+        if self._stop_time is None:
+            return time.monotonic() - self._start_time
+        return self._stop_time - self._start_time
+
+    def _compose_color_func(self):
         return functools.partial(
-            colored,
+            colorize,
             color=self._color,
-            on_color=self._on_color,
+            highlight=self._highlight,
             attrs=list(self._attrs),
         )
 
-    def append_message(self, message: str) -> Coroutine[None]:
-        return self.display.append_cli_message(message)
+    async def _compose_out(self, frame: str, mode: Optional[str] = None) -> str:
+        text = str(self._text)
 
-    def set_default_message(self, message: str) -> Coroutine[None]:
-        return self.display.clear_and_replace(message)
+        # Colors
+        if self._color_func is not None:
+            frame = await self._color_func(frame)
 
-    def set_message_at(self, message_index: int, message: str) -> None:
-        if message_index < len(self.display.cli_messages):
-            self.display.cli_messages[message_index] = message
+        # Position
+        if self._side == "right":
+            frame, text = text, frame
+        # Timer
+        if self._timer:
+            sec, fsec = divmod(round(100 * self.elapsed_time), 100)
+            text += " ({}.{:02.0f})".format(  # pylint: disable=consider-using-f-string
+                timedelta(seconds=sec), fsec
+            )
+        # Mode
+        if mode is None and self._text:
+            out = f"\r{frame} {text}"
+        elif self._text:
+            out = f"{frame} {text}\n"
 
-    def finalize(self):
-        self.display.finalized = True
+        elif mode is None:
+            out = f"\r{frame}"
 
-    def group_finalize(self):
-        self.display.group_finalized = True
+        else:
+            out = f"{frame}\n"
 
-    async def debug(
-        self, message: str, *args: List[Any], **kwargs: Mapping[str, Any]
-    ) -> Task:
-        if self.logger_enabled:
-            await self._stdout_lock.acquire()
-            await self._clear_line()
-
-            # Ensure output is Unicode
-
-            log_result = await self.logger.debug(message, *args, **kwargs)
-
-            self._cur_line_len = 0
-            self._stdout_lock.release()
-
-            return log_result
-
-    async def info(
-        self, message: str, *args: List[Any], **kwargs: Mapping[str, Any]
-    ) -> Task:
-        if self.logger_enabled:
-            await self._stdout_lock.acquire()
-            await self._clear_line()
-
-            # Ensure output is Unicode
-
-            log_result = await self.logger.info(message, *args, **kwargs)
-
-            self._cur_line_len = 0
-            self._stdout_lock.release()
-
-            return log_result
-
-    async def warning(
-        self, message: str, *args: List[Any], **kwargs: Mapping[str, Any]
-    ) -> Task:
-        if self.logger_enabled:
-            await self._stdout_lock.acquire()
-            await self._clear_line()
-
-            # Ensure output is Unicode
-
-            log_result = await self.logger.warning(message, *args, **kwargs)
-
-            self._cur_line_len = 0
-            self._stdout_lock.release()
-            return log_result
-
-    async def warn(
-        self, message: str, *args: List[Any], **kwargs: Mapping[str, Any]
-    ) -> Task:
-        if self.logger_enabled:
-            await self._stdout_lock.acquire()
-            await self._clear_line()
-
-            # Ensure output is Unicode
-
-            log_result = await self.logger.warn(message, *args, **kwargs)
-
-            self._cur_line_len = 0
-            self._stdout_lock.release()
-            return log_result
-
-    async def error(
-        self, message: str, *args: List[Any], **kwargs: Mapping[str, Any]
-    ) -> Task:
-        if self.logger_enabled:
-            await self._stdout_lock.acquire()
-            await self._clear_line()
-
-            # Ensure output is Unicode
-
-            log_result = await self.logger.error(message, *args, **kwargs)
-
-            self._cur_line_len = 0
-            self._stdout_lock.release()
-            return log_result
-
-    async def critical(
-        self, message: str, *args: List[Any], **kwargs: Mapping[str, Any]
-    ) -> Task:
-        if self.logger_enabled:
-            await self._stdout_lock.acquire()
-            await self._clear_line()
-
-            # Ensure output is Unicode
-
-            log_result = await self.logger.critical(message, *args, **kwargs)
-
-            self._cur_line_len = 0
-            self._stdout_lock.release()
-            return log_result
-
-    async def fatal(
-        self, message: str, *args: List[Any], **kwargs: Mapping[str, Any]
-    ) -> Task:
-        if self.logger_enabled:
-            await self._stdout_lock.acquire()
-            await self._clear_line()
-
-            # Ensure output is Unicode
-
-            log_result = await self.logger.fatal(message, *args, **kwargs)
-
-            self._cur_line_len = 0
-            self._stdout_lock.release()
-            return log_result
+        return out
 
     async def __aenter__(self):
-        if self.logger_enabled:
-            self.display.group_timer.reset()
-            await self.start()
+        await self.spin()
 
         return self
 
     async def __aexit__(self, exc_type, exc_val, traceback):
         # Avoid stop() execution for the 2nd time
 
-        enabled = self.enabled and self.logger_enabled
-
         if (
-            enabled
+            self.enabled
             and self._spin_thread.done() is False
             and self._spin_thread.cancelled() is False
         ):
@@ -376,7 +334,22 @@ class AsyncSpinner:
 
         return inner
 
-    async def start(self):
+    async def spin(
+        self,
+        text: str | bytes | ProgressText | None = None,
+        color: ColorName | None = None,
+        highlight: HighlightName | None = None,
+    ):
+        if text:
+            self._text = text
+
+        if color:
+            self._color = color
+            self._color_func = self._compose_color_func()
+
+        if highlight:
+            self._highlight = highlight
+
         if self.enabled:
             if self._sigmap:
                 self._register_signal_handlers()
@@ -393,8 +366,6 @@ class AsyncSpinner:
                 # getting it back
                 await self._show_cursor()
 
-            self.display.start_cli_tasks()
-
     async def stop(self):
         if self.enabled:
             self._stop_time = time.time()
@@ -408,7 +379,6 @@ class AsyncSpinner:
                 await self._spin_thread
 
             await self._clear_line()
-            await self.display.stop_cli_tasks()
             await self._show_cursor()
 
     async def hide(self):
@@ -440,47 +410,68 @@ class AsyncSpinner:
             await self._clear_line()
 
     async def write(self, text):
-        if self.logger_enabled:
-            """Write text in the terminal without breaking the spinner."""
-            # similar to tqdm.write()
-            # https://pypi.python.org/pypi/tqdm#writing-messages
-            await self._stdout_lock.acquire()
-            await self._clear_line()
+        """Write text in the terminal without breaking the spinner."""
+        # similar to tqdm.write()
+        # https://pypi.python.org/pypi/tqdm#writing-messages
+        await self._stdout_lock.acquire()
+        await self._clear_line()
 
-            if isinstance(text, (str, bytes)):
-                _text = to_unicode(text)
-            else:
-                _text = str(text)
+        if isinstance(text, (str, bytes)):
+            _text = to_unicode(text)
+        else:
+            _text = str(text)
 
-            # Ensure output is Unicode
-            assert isinstance(_text, str)
+        # Ensure output is Unicode
+        assert isinstance(_text, str)
 
-            await self._loop.run_in_executor(
-                None,
-                sys.stdout.write,
-            )
+        await self._loop.run_in_executor(
+            None,
+            sys.stdout.write,
+        )
 
-            self._cur_line_len = 0
-            self._stdout_lock.release()
+        self._cur_line_len = 0
+        self._stdout_lock.release()
 
-    async def ok(self, text="OK"):
+    async def ok(
+        self,
+        text="✔",
+        color: ColorName | None = None,
+        highlight: HighlightName | None = None,
+    ):
+        if color:
+            self._color = color
+            self._color_func = self._compose_color_func()
+
+        if highlight:
+            self._highlight = highlight
+
         if self.enabled:
-            await self.display.stop_cli_tasks()
             """Set Ok (success) finalizer to a spinner."""
-            _text = text if text else "OK"
+            _text = text if text else "✔"
             await self._freeze(_text)
 
-    async def fail(self, text="FAIL"):
+    async def fail(
+        self,
+        text="✘",
+        color: ColorName | None = None,
+        highlight: HighlightName | None = None,
+    ):
+        if color:
+            self._color = color
+            self._color_func = self._compose_color_func()
+
+        if highlight:
+            self._highlight = highlight
+
         if self.enabled:
-            await self.display.stop_cli_tasks()
             """Set fail finalizer to a spinner."""
-            _text = text if text else "FAIL"
+            _text = text if text else "✘"
             await self._freeze(_text)
 
     async def _freeze(self, final_text):
         """Stop spinner, compose last frame and 'freeze' it."""
         text = to_unicode(final_text)
-        self._last_frame = self._compose_out(text, mode="last")
+        self._last_frame = await self._compose_out(text, mode="last")
 
         # Should be stopped here, otherwise prints after
         # self._freeze call will mess up the spinner
@@ -504,7 +495,7 @@ class AsyncSpinner:
 
             # Compose output
             spin_phase = next(self._cycle)
-            out = self._compose_out(spin_phase)
+            out = await self._compose_out(spin_phase)
 
             if len(out) > terminal_width:
                 out = f"{out[:terminal_width-1]}..."

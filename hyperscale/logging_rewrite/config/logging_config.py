@@ -1,7 +1,7 @@
 import contextvars
 from typing import List
 
-from mkfst.logging.models import LogLevel
+from hyperscale.logging_rewrite.models import LogLevel
 
 from .log_level_map import LogLevelMap
 
