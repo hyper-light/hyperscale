@@ -5,9 +5,9 @@ from typing import Iterable
 
 from hyperscale.terminal.config.mode import TerminalMode
 
-from .attribute import Attribute
-from .color import Color
-from .highlight import Highlight
+from .attributes.attribute import Attribute
+from .colors.color import Color
+from .colors.highlight import Highlight
 
 RESET = "\033[0m"
 
@@ -29,7 +29,7 @@ async def _can_do_colour(
     )
 
 
-async def colorize(
+async def stylize(
     text: str,
     color: str | int | None = None,
     highlight: str | int | None = None,

@@ -1,8 +1,7 @@
 import asyncio
 import functools
 
-from hyperscale.terminal.spinner import AsyncSpinner
-from hyperscale.terminal.text import Text
+from hyperscale.terminal.components import Link, Spinner
 
 
 async def coro(message: str):
@@ -14,20 +13,23 @@ def create(message: str):
 
 
 async def main():
-    spinner = AsyncSpinner()
+    spinner = Spinner()
 
-    await spinner.spin(text="Hello world!", color="hot_pink_5", mode="extended")
-    await asyncio.sleep(10)
+    # await spinner.spin(text="Hello world!", color="hot_pink_5", mode="extended")
+    # await asyncio.sleep(10)
 
-    await spinner.fail(color="red", text="Oops!")
+    # await spinner.ok(color="aquamarine_2", text="Done!", mode="extended")
 
-    await spinner.stop()
+    # await spinner.stop()
 
-    text = Text("Hello world!", color="blue")
+    # text = Text("Hello world!", color="blue")
 
-    message = await text.style()
+    # message = await text.style(color="blue_violet", mode="extended")
 
-    print(message)
+    link = Link("This is a link", "https://www.google.com/")
+    styled_link = await link.style(color="cadet_blue", mode="extended")
+
+    print(styled_link)
 
 
 asyncio.run(main())

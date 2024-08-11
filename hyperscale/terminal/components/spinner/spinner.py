@@ -27,19 +27,18 @@ from typing import (
 
 from hyperscale.logging.spinner import ProgressText
 from hyperscale.logging_rewrite import Logger
-from hyperscale.terminal.colors import (
-    Attribute,
-    AttributeName,
+from hyperscale.terminal.config.mode import TerminalMode
+from hyperscale.terminal.styling import stylize
+from hyperscale.terminal.styling.attributes import Attribute, AttributeName
+from hyperscale.terminal.styling.colors import (
     Color,
     ColorName,
     ExtendedColorName,
     Highlight,
     HighlightName,
-    colorize,
 )
-from hyperscale.terminal.config.mode import TerminalMode
 
-from .spinner import Spinner
+from .spinner_config import SpinnerConfig
 from .spinner_data import spinner_data
 from .spinner_factory import SpinnerFactory, SpinnerName
 from .to_unicode import to_unicode
@@ -53,7 +52,7 @@ class LoggerMode(Enum):
     SYSTEM = "system"
 
 
-async def default_handler(signame: str, spinner: AsyncSpinner):  # pylint: disable=unused-argument
+async def default_handler(signame: str, spinner: Spinner):  # pylint: disable=unused-argument
     """Signal handler, used to gracefully shut down the ``spinner`` instance
     when specified signal is received by the process running the ``spinner``.
 
@@ -65,7 +64,7 @@ async def default_handler(signame: str, spinner: AsyncSpinner):  # pylint: disab
     await spinner.stop()
 
 
-class AsyncSpinner:
+class Spinner:
     def __init__(
         self,
         spinner: SpinnerName = None,
@@ -150,7 +149,9 @@ class AsyncSpinner:
         return side
 
     @staticmethod
-    def _set_frames(spinner: Spinner, reversal: bool) -> Union[str, Sequence[str]]:
+    def _set_frames(
+        spinner: SpinnerConfig, reversal: bool
+    ) -> Union[str, Sequence[str]]:
         uframes = None  # unicode frames
         uframes_seq = None  # sequence of unicode frames
 
@@ -177,7 +178,7 @@ class AsyncSpinner:
         return frames
 
     @staticmethod
-    def _set_interval(spinner: Spinner) -> float:
+    def _set_interval(spinner: SpinnerConfig) -> float:
         # Milliseconds to Seconds
         return spinner.interval * 0.001
 
@@ -285,21 +286,6 @@ class AsyncSpinner:
             return time.monotonic() - self._start_time
         return self._stop_time - self._start_time
 
-    def _compose_color_func(
-        self,
-        color: str | None = None,
-        highlight: str | None = None,
-        attrs: Sequence[str] | None = None,
-        mode: TerminalMode = TerminalMode.COMPATIBILITY,
-    ):
-        return functools.partial(
-            colorize,
-            color=color,
-            highlight=highlight,
-            attrs=list(attrs),
-            mode=mode,
-        )
-
     async def _compose_out(
         self,
         frame: str,
@@ -324,7 +310,7 @@ class AsyncSpinner:
 
         # Colors
         if color:
-            frame = await colorize(
+            frame = await stylize(
                 frame,
                 color=color,
                 attrs=attrs,

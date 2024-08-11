@@ -83,9 +83,11 @@ class Color:
         mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ):
         if mode == TerminalMode.EXTENDED:
-            return cls.extended_names.get(color, default)
+            return cls.extended_names.get(
+                color, default if default else cls.extended_names.get("white")
+            )
 
-        return cls.names.get(color, default)
+        return cls.names.get(color, default if default else cls.names.get("white"))
 
     @classmethod
     def by_type(
@@ -95,6 +97,11 @@ class Color:
         mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ):
         if mode == TerminalMode.EXTENDED:
-            return cls.extended_types.get(color, default)
+            return cls.extended_types.get(
+                color,
+                default if default else cls.extended_types.get(ExtendedColorType.WHITE),
+            )
 
-        return cls.types.get(color, default)
+        return cls.types.get(
+            color, default if default else cls.types.get(BaseColorType.WHITE)
+        )

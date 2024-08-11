@@ -1,6 +1,6 @@
 from typing import Dict, List, Literal
 
-from .spinner import Spinner
+from .spinner_config import SpinnerConfig
 
 SpinnerName = Literal[
     "dots",
@@ -1267,12 +1267,12 @@ class SpinnerFactory:
             },
         )
 
-        return Spinner(**spinner)
+        return SpinnerConfig(**spinner)
 
     def create_spinner(self, spinner_name: str, frames: List[str], interval: int):
         self._spinners[spinner_name] = {"frames": frames, "inteval": interval}
 
-        return Spinner(
+        return SpinnerConfig(
             frames=frames,
             interval=interval,
         )

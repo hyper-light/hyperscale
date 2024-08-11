@@ -6,6 +6,6 @@ from pydantic import (
 )
 
 
-class Spinner(BaseModel):
+class SpinnerConfig(BaseModel):
     frames: conlist(StrictStr, min_length=1)
     interval: StrictInt
