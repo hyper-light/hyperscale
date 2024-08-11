@@ -36,7 +36,7 @@ class Link:
         self._attrs = self._set_attrs(attributes) if attributes else set()
 
     def __str__(self):
-        return self._styled or "\x1b]8;;%s\x1b\\%s" % (
+        return self._styled or "\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\" % (
             str(self._link.url),
             self._text,
         )
@@ -57,7 +57,7 @@ class Link:
         if attrs is None:
             attrs = self._attrs
 
-        link_fmt_str = "\x1b]8;;%s\x1b\\%s"
+        link_fmt_str = "\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\"
 
         if color or highlight:
             styled = await stylize(
