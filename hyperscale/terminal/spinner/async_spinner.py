@@ -32,6 +32,7 @@ from hyperscale.terminal.colors import (
     AttributeName,
     Color,
     ColorName,
+    ExtendedColorName,
     Highlight,
     HighlightName,
     colorize,
@@ -185,8 +186,16 @@ class AsyncSpinner:
         return itertools.cycle(frames)
 
     @staticmethod
-    def _set_color(value: str, default: int | None = None) -> str:
-        if value not in Color.names and default is None:
+    def _set_color(
+        value: str,
+        default: int | None = None,
+        mode: TerminalMode = TerminalMode.COMPATIBILITY,
+    ) -> str:
+        if (
+            value not in Color.names
+            or (value in Color.names and mode == TerminalMode.EXTENDED)
+            and default is None
+        ):
             raise ValueError(
                 "'{0}': unsupported color value. Use one of the: {1}".format(  # pylint: disable=consider-using-f-string
                     value, ", ".join(Color.names.keys())
@@ -195,8 +204,16 @@ class AsyncSpinner:
         return Color.by_name(value, default=default)
 
     @staticmethod
-    def _set_highlight(value: str, default: int | None = None) -> str:
-        if value not in Highlight.names and default is None:
+    def _set_highlight(
+        value: str,
+        default: int | None = None,
+        mode: TerminalMode = TerminalMode.COMPATIBILITY,
+    ) -> str:
+        if (
+            value not in Highlight.names
+            or (value not in Color.extended_names and mode == TerminalMode.EXTENDED)
+            and default is None
+        ):
             raise ValueError(
                 "'{0}': unsupported highlight value. "  # pylint: disable=consider-using-f-string
                 "Use one of the: {1}".format(value, ", ".join(Highlight.names.keys()))
@@ -221,7 +238,7 @@ class AsyncSpinner:
 
     @color.setter
     def color(self, value: str) -> None:
-        self._color = self._set_color(value) if value else value
+        self._color = self._set_color(value, mode=self._mode) if value else value
 
     @property
     def highlight(self) -> Optional[str]:
@@ -229,7 +246,9 @@ class AsyncSpinner:
 
     @highlight.setter
     def highlight(self, value: str) -> None:
-        self._highlight = self._set_highlight(value) if value else value
+        self._highlight = (
+            self._set_highlight(value, mode=self._mode) if value else value
+        )
 
     @property
     def attrs(self) -> Sequence[str]:
@@ -368,8 +387,8 @@ class AsyncSpinner:
     async def spin(
         self,
         text: str | bytes | ProgressText | None = None,
-        color: ColorName | None = None,
-        highlight: HighlightName | None = None,
+        color: ColorName | ExtendedColorName | None = None,
+        highlight: HighlightName | ExtendedColorName | None = None,
         attrs: Sequence[str] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
@@ -467,8 +486,8 @@ class AsyncSpinner:
         self,
         char="✔",
         text: str | bytes | ProgressText | None = None,
-        color: ColorName | None = None,
-        highlight: HighlightName | None = None,
+        color: ColorName | ExtendedColorName | None = None,
+        highlight: HighlightName | ExtendedColorName | None = None,
         attrs: Sequence[str] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
@@ -488,8 +507,8 @@ class AsyncSpinner:
         self,
         char="✘",
         text: str | bytes | ProgressText | None = None,
-        color: ColorName | None = None,
-        highlight: HighlightName | None = None,
+        color: ColorName | ExtendedColorName | None = None,
+        highlight: HighlightName | ExtendedColorName | None = None,
         attrs: Sequence[str] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
@@ -540,7 +559,7 @@ class AsyncSpinner:
         color: ColorName | None = None,
         highlight: HighlightName | None = None,
         attrs: Sequence[str] | None = None,
-        mode: Literal["extended", "compatability"] = "compatability",
+        mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ):
         while not self._stop_spin.is_set():
             if self._hide_spin.is_set():

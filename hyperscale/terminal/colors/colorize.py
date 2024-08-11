@@ -65,13 +65,13 @@ async def colorize(
 
     if color is not None and mode == TerminalMode.COMPATIBILITY:
         ansi_string = "\033[%dm%s" % (
-            Color.by_name(color) if isinstance(color, str) else color,
+            Color.by_name(color, mode=mode) if isinstance(color, str) else color,
             ansi_string,
         )
 
     elif color is not None and mode == TerminalMode.EXTENDED:
         ansi_string = "\033[38:5:%dm%s" % (
-            Color.by_name(color) if isinstance(color, str) else color,
+            Color.by_name(color, mode=mode) if isinstance(color, str) else color,
             ansi_string,
         )
 
