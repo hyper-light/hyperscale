@@ -40,7 +40,8 @@ from hyperscale.terminal.styling.colors import (
 
 from .spinner_config import SpinnerConfig
 from .spinner_data import spinner_data
-from .spinner_factory import SpinnerFactory, SpinnerName
+from .spinner_factory import SpinnerFactory
+from .spinner_types import SpinnerName
 from .to_unicode import to_unicode
 
 SignalHandlers = Union[Callable[[int, Optional[FrameType]], Any], int, None]
@@ -333,7 +334,7 @@ class Spinner:
         elif text:
             out = f"{frame} {text}\n"
 
-        elif mode is None:
+        elif compose_mode is None:
             out = f"\r{frame}"
 
         else:
@@ -397,7 +398,7 @@ class Spinner:
                         mode=TerminalMode.to_mode(mode),
                     )
                 )
-            finally:
+            except Exception:
                 # Ensure cursor is not hidden if any failure occurs that prevents
                 # getting it back
                 await self._show_cursor()
@@ -654,9 +655,14 @@ class Spinner:
 
     def _reset_signal_handlers(self):
         for sig, sig_handler in self._dfl_sigmap.items():
-            self._loop.add_signal_handler(
-                getattr(signal, sig.name),
-                lambda signame=sig.name: asyncio.create_task(
-                    sig_handler(signame, self)
-                ),
-            )
+            if sig and sig_handler:
+                self._loop.add_signal_handler(
+                    getattr(signal, sig.name),
+                    lambda signame=sig.name: asyncio.create_task(
+                        asyncio.to_thread(
+                            sig_handler,
+                            signame,
+                            self,
+                        )
+                    ),
+                )

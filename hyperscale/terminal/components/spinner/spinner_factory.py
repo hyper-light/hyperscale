@@ -1,92 +1,7 @@
 from typing import Dict, List, Literal
 
 from .spinner_config import SpinnerConfig
-
-SpinnerName = Literal[
-    "dots",
-    "dots2",
-    "dots3",
-    "dots4",
-    "dots5",
-    "dots6",
-    "dots7",
-    "dots8",
-    "dots9",
-    "dots10",
-    "dots11",
-    "dots12",
-    "dots13",
-    "dots8Bit",
-    "sand",
-    "line",
-    "line2",
-    "pipe",
-    "simpleDots",
-    "simpleDotsScrolling",
-    "star",
-    "star2",
-    "flip",
-    "hamburger",
-    "growVertical",
-    "growHorizontal",
-    "balloon",
-    "balloon2",
-    "boxBounce",
-    "boxBounce2",
-    "triangle",
-    "binary",
-    "arc",
-    "circle",
-    "squareCorners",
-    "circleQuarters",
-    "circleHalves",
-    "squish",
-    "toggle",
-    "toggle2",
-    "toggle3",
-    "toggle4",
-    "toggle5",
-    "toggle6",
-    "toggle7",
-    "toggle8",
-    "toggle9",
-    "toggle10",
-    "toggle11",
-    "toggle12",
-    "toggle13",
-    "arrow",
-    "arrow2",
-    "arrow3",
-    "bouncingBar",
-    "bouncingBall",
-    "smiley",
-    "monkey",
-    "hearts",
-    "clock",
-    "earth",
-    "material",
-    "moon",
-    "runner",
-    "pong",
-    "shark",
-    "dqpb",
-    "weather",
-    "christmas",
-    "grenade",
-    "point",
-    "layer" "betaWave",
-    "fingerDance",
-    "fistBump",
-    "soccerHeader",
-    "mindblown",
-    "speaker",
-    "orangePulse",
-    "bluePulse",
-    "orangeBluePulse",
-    "timeTravel",
-    "aesthetic",
-    "dwarfFortress",
-]
+from .spinner_types import SpinnerName
 
 
 class SpinnerFactory:
@@ -101,7 +16,7 @@ class SpinnerFactory:
         ]
         | None = None,
     ) -> None:
-        self._spinners: Dict[
+        self.types: Dict[
             SpinnerName,
             Dict[
                 Literal["inteval", "frames"],
@@ -1245,10 +1160,10 @@ class SpinnerFactory:
         }
 
         if spinners:
-            self._spinners.update(spinners)
+            self.types.update(spinners)
 
     def get(self, spinner_name: SpinnerName):
-        spinner = self._spinners.get(
+        spinner = self.types.get(
             spinner_name,
             {
                 "frames": [
@@ -1270,7 +1185,7 @@ class SpinnerFactory:
         return SpinnerConfig(**spinner)
 
     def create_spinner(self, spinner_name: str, frames: List[str], interval: int):
-        self._spinners[spinner_name] = {"frames": frames, "inteval": interval}
+        self.types[spinner_name] = {"frames": frames, "inteval": interval}
 
         return SpinnerConfig(
             frames=frames,
