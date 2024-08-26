@@ -12,7 +12,7 @@ class ProgressBarColorConfig(BaseModel):
     active_color_highlight: (
         HighlightName | ExtendedColorName | conint(ge=0, le=255) | None
     ) = None
-    ready_color: ColorName | ExtendedColorName | conint(ge=0, le=255) | None = "white"
+    ready_color: ColorName | ExtendedColorName | conint(ge=0, le=255) | None = None
     ready_color_highlight: (
         HighlightName | ExtendedColorName | conint(ge=0, le=255) | None
     ) = None
@@ -22,5 +22,9 @@ class ProgressBarColorConfig(BaseModel):
     ) = None
     ok_color: ColorName | ExtendedColorName | conint(ge=0, le=255) | None = "white"
     ok_color_highlight: (
+        HighlightName | ExtendedColorName | conint(ge=0, le=255) | None
+    ) = None
+    border_color: ColorName | ExtendedColorName | conint(ge=0, le=255) | None = "white"
+    border_color_highlight: (
         HighlightName | ExtendedColorName | conint(ge=0, le=255) | None
     ) = None

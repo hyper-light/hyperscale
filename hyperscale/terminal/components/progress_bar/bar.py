@@ -57,8 +57,7 @@ class Bar:
         self,
         total: int,
         chars: ProgressBarChars = None,
-        fill_colors: ProgressBarColorConfig | None = None,
-        border_colors: ProgressBarColorConfig | None = None,
+        colors: ProgressBarColorConfig | None = None,
         sigmap: Dict[signal.Signals, asyncio.Coroutine] = None,
         mode: TerminalMode = TerminalMode.COMPATIBILITY,
         enabled: bool = True,
@@ -78,7 +77,7 @@ class Bar:
 
             interval = spinner.interval
 
-        self._interval = interval
+        self._interval = interval * 0.001
         self._max_width_percentage = max_width_percentage
         self._bar_width: float = 0
         self._segment_size: float = 0
@@ -87,9 +86,9 @@ class Bar:
 
         self.segments.append(
             Segment(
-                chars.start_char,
+                chars,
                 SegmentType.START,
-                segment_colors=border_colors,
+                segment_colors=colors,
                 mode=mode,
             )
         )
@@ -100,7 +99,7 @@ class Bar:
                     chars,
                     SegmentType.BAR,
                     segment_default_char=chars.background_char,
-                    segment_colors=fill_colors,
+                    segment_colors=colors,
                     mode=mode,
                 )
                 for _ in range(self._total)
@@ -109,9 +108,9 @@ class Bar:
 
         self.segments.append(
             Segment(
-                chars.end_char,
+                chars,
                 SegmentType.END,
-                segment_default_char=border_colors,
+                colors,
                 mode=mode,
             )
         )
@@ -197,7 +196,7 @@ class Bar:
 
     async def __aenter__(self):
         if self._run_progress_bar is None:
-            self._run_progress_bar = asyncio.ensure_future(self._run())
+            self._run_progress_bar = asyncio.create_task(self._run())
 
         return self
 
@@ -231,7 +230,7 @@ class Bar:
         mode: Literal["extended", "compatability"] = "compatability",
     ):
         if self._run_progress_bar is None:
-            self._run_progress_bar = asyncio.ensure_future(
+            self._run_progress_bar = asyncio.create_task(
                 self._run(
                     text,
                     mode=mode,
@@ -292,7 +291,7 @@ class Bar:
                 self._stop_spin.set()
                 await self._spin_thread
 
-            self._run_progress_bar.set_result(None)
+            await self._run_progress_bar
             await self._clear_line()
             await self._show_cursor()
 
@@ -416,14 +415,14 @@ class Bar:
                 self.segments[self._active_segment_idx].status = SegmentStatus.OK
                 self._completed_segment_idx = self._active_segment_idx
 
-            if self._completed >= self._next_segment:
+            elif self._completed >= self._next_segment:
                 # First set the active segment to OK/Completed status
                 self.segments[self._active_segment_idx].status = SegmentStatus.OK
                 self._completed_segment_idx = self._active_segment_idx
                 self._active_segment_idx += 1
                 self._next_segment += self._segment_size
 
-                self.segments[self._active_segment_idx] = SegmentStatus.ACTIVE
+                self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
 
             terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
 
@@ -431,6 +430,7 @@ class Bar:
 
             # Compose output
             spin_phase = "".join([segment.next for segment in self.segments])
+
             out = await self._compose_out(
                 spin_phase,
                 text=text,
@@ -516,7 +516,7 @@ class Bar:
                 # interrupted stack frame. ``functools.partial`` solves
                 # the problem of passing spinner instance into the handler
                 # function.
-                sig_handler = functools.partial(sig_handler, spinner=self)
+                sig_handler = functools.partial(sig_handler, self)
 
             self._loop.add_signal_handler(
                 getattr(signal, sig.name),

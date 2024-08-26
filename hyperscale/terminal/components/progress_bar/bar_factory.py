@@ -26,26 +26,30 @@ class BarFactory:
     def create_bar(
         self,
         length: int,
-        active_char: FillCharName | SpinnerName | str | None = None,
-        ok_char: str = "✔",
-        fail_char: str = "✘",
+        active_char: SpinnerName | str = "dots",
+        ok_char: FillCharName | str = "block",
+        fail_char: FillCharName | str = "block",
         borders_char: StartCharName | EndCharName | str | None = None,
         background_char: BackgroundCharName | str | None = None,
-        fill_colors: ProgressBarColorConfig | None = None,
-        border_colors: ProgressBarColorConfig | None = None,
-        background_color: ProgressBarColorConfig | None = None,
+        colors: ProgressBarColorConfig | None = None,
         mode: Literal["compatability", "extended"] = "compatability",
     ):
         return Bar(
             length,
             ProgressBarChars(
                 **{
-                    "active_char": active_char,
+                    "active_char": self.fill.by_name(
+                        active_char,
+                        default=active_char,
+                    ),
                     "ok_char": self.fill.by_name(
                         ok_char,
                         default=ok_char,
                     ),
-                    "fail_char": fail_char,
+                    "fail_char": self.fill.by_name(
+                        fail_char,
+                        default=fail_char,
+                    ),
                     "start_char": self.start.by_name(borders_char),
                     "end_char": self.end.by_name(borders_char),
                     "background_char": self.background.by_name(
@@ -54,8 +58,6 @@ class BarFactory:
                     ),
                 }
             ),
-            fill_colors=fill_colors,
-            border_colors=border_colors,
-            background_color=background_color,
+            colors=colors,
             mode=TerminalMode.to_mode(mode),
         )
