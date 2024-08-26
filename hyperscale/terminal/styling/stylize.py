@@ -5,9 +5,10 @@ from typing import Iterable
 
 from hyperscale.terminal.config.mode import TerminalMode
 
-from .attributes.attribute import Attribute
-from .colors.color import Color
-from .colors.highlight import Highlight
+from .attributes.attribute import Attribute, AttributeName
+from .colors.color import Color, ColorName
+from .colors.extended_color import ExtendedColorName
+from .colors.highlight import Highlight, HighlightName
 
 RESET = "\033[0m"
 
@@ -31,9 +32,9 @@ async def _can_do_colour(
 
 async def stylize(
     text: str,
-    color: str | int | None = None,
-    highlight: str | int | None = None,
-    attrs: Iterable[str] | None = None,
+    color: ColorName | ExtendedColorName | int | None = None,
+    highlight: HighlightName | ExtendedColorName | int | None = None,
+    attrs: Iterable[AttributeName] | None = None,
     *,
     no_color: bool | None = None,
     force_color: bool | None = None,

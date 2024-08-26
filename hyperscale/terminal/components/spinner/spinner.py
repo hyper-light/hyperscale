@@ -10,7 +10,6 @@ import time
 from datetime import timedelta
 from enum import Enum
 from os import get_terminal_size
-from types import FrameType
 from typing import (
     Any,
     Callable,
@@ -41,10 +40,10 @@ from hyperscale.terminal.styling.colors import (
 from .spinner_config import SpinnerConfig
 from .spinner_data import spinner_data
 from .spinner_factory import SpinnerFactory
-from .spinner_types import SpinnerName
+from .spinner_types import SpinnerName, SpinnerType
 from .to_unicode import to_unicode
 
-SignalHandlers = Union[Callable[[int, Optional[FrameType]], Any], int, None]
+SignalHandlers = Union[Callable[[int, SpinnerType | None], Any], int, None]
 Spinners = Type[spinner_data]
 
 
@@ -69,10 +68,18 @@ class Spinner:
     def __init__(
         self,
         spinner: SpinnerName = None,
+        ok_char: str = "✔",
+        fail_char: str = "✘",
         text: ProgressText | str | bytes = None,
         color: ColorName = None,
         highlight: HighlightName = None,
         attrs: List[AttributeName] = None,
+        ok_color: ColorName | ExtendedColorName | None = None,
+        ok_highlight: HighlightName | ExtendedColorName | None = None,
+        ok_attrs: Sequence[str] | None = None,
+        fail_color: ColorName | ExtendedColorName | None = None,
+        fail_highlight: HighlightName | ExtendedColorName | None = None,
+        fail_attrs: Sequence[str] | None = None,
         reversal: bool = False,
         side: Literal["left", "right"] = "left",
         sigmap: Dict[signal.Signals, Coroutine] = None,
@@ -95,6 +102,16 @@ class Spinner:
         self._frames = self._set_frames(self._spinner, reversal)
         self._interval = self._set_interval(self._spinner)
         self._cycle = self._set_cycle(self._frames)
+
+        self._ok_char = ok_char
+        self._ok_char_color = ok_color
+        self._ok_char_highlight = ok_highlight
+        self._ok_char_attrs = ok_attrs
+
+        self._fail_char = fail_char
+        self._fail_char_color = fail_color
+        self._fail_char_highlight = fail_highlight
+        self._fail_char_attrs = fail_attrs
 
         # Color Specification
         self._color = color
@@ -140,6 +157,105 @@ class Spinner:
 
         self._stdout_lock = asyncio.Lock()
         self._loop = asyncio.get_event_loop()
+
+    async def get_fail_frame(
+        self,
+        char: str | None = None,
+        color: ColorName | ExtendedColorName | None = None,
+        highlight: HighlightName | ExtendedColorName | None = None,
+        attrs: Sequence[str] | None = None,
+        mode: Literal["extended", "compatability"] = "compatability",
+    ):
+        if char is None:
+            char = self._fail_char
+
+        if color is None:
+            color = self._fail_char_color
+
+        if highlight is None:
+            highlight = self._fail_char_highlight
+
+        if attrs is None:
+            attrs = self._fail_char_attrs
+
+        if color or highlight:
+            char = await stylize(
+                char,
+                color=color,
+                attrs=attrs,
+                highlight=highlight,
+                mode=TerminalMode.to_mode(mode),
+            )
+
+        return char
+
+    async def get_ok_frame(
+        self,
+        char: str | None = None,
+        color: ColorName | ExtendedColorName | None = None,
+        highlight: HighlightName | ExtendedColorName | None = None,
+        attrs: Sequence[str] | None = None,
+        mode: Literal["extended", "compatability"] = "compatability",
+    ):
+        if char is None:
+            char = self._ok_char
+
+        if color is None:
+            color = self._ok_char_color
+
+        if highlight is None:
+            highlight = self._ok_char_highlight
+
+        if attrs is None:
+            attrs = self._ok_char_attrs
+
+        if color or highlight:
+            char = await stylize(
+                char,
+                color=color,
+                attrs=attrs,
+                highlight=highlight,
+                mode=TerminalMode.to_mode(mode),
+            )
+
+        return char
+
+    async def get_spinner_frame(
+        self,
+        color: ColorName | ExtendedColorName | None = None,
+        highlight: HighlightName | ExtendedColorName | None = None,
+        attrs: Sequence[str] | None = None,
+        mode: Literal["extended", "compatability"] = "compatability",
+    ):
+        char = next(self._cycle)
+
+        if color is None:
+            color = self._color
+
+        if highlight is None:
+            highlight = self._highlight
+
+        if attrs is None:
+            attrs = self._attrs
+
+        if color or highlight:
+            char = await stylize(
+                char,
+                color=color,
+                attrs=attrs,
+                highlight=highlight,
+                mode=TerminalMode.to_mode(mode),
+            )
+
+        return char
+
+    @property
+    def ok_char(self):
+        return self._ok_char
+
+    @property
+    def interval(self):
+        return self._interval
 
     @staticmethod
     def _set_side(side: str) -> str:
@@ -471,13 +587,25 @@ class Spinner:
 
     async def ok(
         self,
-        char="✔",
+        char: str | None = None,
         text: str | bytes | ProgressText | None = None,
         color: ColorName | ExtendedColorName | None = None,
         highlight: HighlightName | ExtendedColorName | None = None,
         attrs: Sequence[str] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
+        if char is None:
+            char = self._ok_char
+
+        if color is None:
+            color = self._ok_char_color
+
+        if highlight is None:
+            highlight = self._ok_char_highlight
+
+        if attrs is None:
+            attrs = self._ok_char_attrs
+
         if self.enabled:
             """Set Ok (success) finalizer to a spinner."""
             _char = char if char else "✔"
@@ -492,13 +620,25 @@ class Spinner:
 
     async def fail(
         self,
-        char="✘",
+        char: str | None = None,
         text: str | bytes | ProgressText | None = None,
         color: ColorName | ExtendedColorName | None = None,
         highlight: HighlightName | ExtendedColorName | None = None,
         attrs: Sequence[str] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
+        if char is None:
+            char = self._fail_char
+
+        if color is None:
+            color = self._fail_char_color
+
+        if highlight is None:
+            highlight = self._fail_char_highlight
+
+        if attrs is None:
+            attrs = self._fail_char_attrs
+
         if self.enabled:
             """Set fail finalizer to a spinner."""
             _char = char if char else "✘"

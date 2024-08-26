@@ -2,5 +2,7 @@ from enum import Enum
 
 
 class SegmentStatus(Enum):
-    INACTIVE = "INACTIVE"
+    READY = "READY"
     ACTIVE = "ACTIVE"
+    OK = "OK"
+    FAILED = "FAILED"
