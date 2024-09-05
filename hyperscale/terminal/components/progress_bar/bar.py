@@ -9,13 +9,7 @@ import sys
 import time
 from enum import Enum
 from os import get_terminal_size
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Literal,
-    Type,
-)
+from typing import Any, AsyncGenerator, Callable, Dict, Iterable, Literal, Type
 
 from hyperscale.logging.spinner import ProgressText
 from hyperscale.logging_rewrite import Logger
@@ -49,13 +43,13 @@ async def default_handler(signame: str, bar: Bar):  # pylint: disable=unused-arg
     """
 
     await bar.fail()
-    await bar.stop()
+    await bar.cancel()
 
 
 class Bar:
     def __init__(
         self,
-        total: int,
+        data: int | Iterable[Any] | AsyncGenerator[Any, Any],
         chars: ProgressBarChars = None,
         colors: ProgressBarColorConfig | None = None,
         sigmap: Dict[signal.Signals, asyncio.Coroutine] = None,
@@ -64,6 +58,23 @@ class Bar:
         text: str | None = None,
         max_width_percentage: float = 0.5,
     ) -> None:
+        total: int = 0
+        if isinstance(data, int):
+            total = data
+            data = range(data)
+
+        elif not isinstance(data, int) and hasattr("__len__", data):
+            total = len(data)
+
+        elif not isinstance(data, int) and not inspect.isasyncgen(data):
+            total = len(list(data))
+
+        elif inspect.isasyncgen(data) and not hasattr("__len__", data):
+            raise Exception(
+                "Err. - cannot determine length of async generator without __len__ attribute."
+            )
+
+        self._data = data
         self._total = total
         self.mode = mode
 
@@ -129,8 +140,8 @@ class Bar:
         self._stdout_lock = asyncio.Lock()
         self._hidden_level = 0
         self._cur_line_len = 0
-        self._active_segment_idx = 0
-        self._completed_segment_idx = -1
+        self._active_segment_idx = 1
+        self._completed_segment_idx = 0
 
         self._sigmap = (
             sigmap
@@ -224,12 +235,24 @@ class Bar:
 
         return inner
 
-    def run(
+    async def run(
         self,
         text: str | bytes | ProgressText | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
         if self._run_progress_bar is None:
+            await asyncio.gather(*[segment.style() for segment in self.segments])
+            terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
+            self._terminal_width = terminal_size[0]
+
+            self._bar_width = math.ceil(
+                self._terminal_width * self._max_width_percentage
+            )
+
+            # If we have 1000 items with a bar width of 100, every 10 items we should increment a segment.
+            self._segment_size = self._total / self._bar_width
+            self._next_segment = self._segment_size
+
             self._run_progress_bar = asyncio.create_task(
                 self._run(
                     text,
@@ -237,30 +260,36 @@ class Bar:
                 )
             )
 
+    async def __aiter__(self):
+        if inspect.isasyncgen(self._data):
+            async for item in self._data:
+                yield item
+
+                self.update()
+
+            await self.ok()
+
+        if not inspect.isasyncgen(self._data):
+            for item in self._data:
+                yield item
+
+                self.update()
+
+            await self.ok()
+
     def update(self, amount: int | float = 1):
-        self._completed += amount
+        self._completed += amount * self._segment_size
 
     async def _run(
         self,
         text: str | bytes | ProgressText | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
-        await asyncio.gather(*[segment.style() for segment in self.segments])
-        terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
-        self._terminal_width = terminal_size[0]
-
-        self._bar_width = math.ceil(self._terminal_width * self._max_width_percentage)
-
-        # If we have 1000 items with a bar width of 100, every 10 items we should increment a segment.
-        self._segment_size = self._total / self._bar_width
-        self._next_segment = self._segment_size
-
         if text is None:
             text = self._text
 
         if self.enabled:
-            if self._sigmap:
-                self._register_signal_handlers()
+            self._register_signal_handlers()
 
             await self._hide_cursor()
             self._start_time = time.time()
@@ -292,6 +321,39 @@ class Bar:
                 await self._spin_thread
 
             await self._run_progress_bar
+            await self._clear_line()
+            await self._show_cursor()
+
+    async def cancel(self):
+        if self.enabled:
+            self._stop_time = time.time()
+
+            if self._dfl_sigmap:
+                # Reset registered signal handlers to default ones
+                self._reset_signal_handlers()
+
+            if not self._stop_spin.is_set():
+                self._stop_spin.set()
+
+                try:
+                    self._spin_thread.cancel()
+
+                except (
+                    asyncio.CancelledError,
+                    asyncio.InvalidStateError,
+                    asyncio.TimeoutError,
+                ):
+                    pass
+
+            try:
+                self._run_progress_bar.cancel()
+            except (
+                asyncio.CancelledError,
+                asyncio.InvalidStateError,
+                asyncio.TimeoutError,
+            ):
+                pass
+
             await self._clear_line()
             await self._show_cursor()
 
@@ -378,7 +440,8 @@ class Bar:
         text: str | bytes | ProgressText | None = None,
         mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ):
-        self.segments[self._active_segment_idx].status = status
+        active_segment_idx = min(self._active_segment_idx, self._total)
+        self.segments[active_segment_idx].status = status
 
         chars = "".join([segment.next for segment in self.segments])
 
@@ -403,6 +466,8 @@ class Bar:
         text: str | bytes | ProgressText | None = None,
         mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ):
+        self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
+
         while not self._stop_spin.is_set():
             if self._hide_spin.is_set():
                 # Wait a bit to avoid wasting cycles
@@ -411,7 +476,7 @@ class Bar:
 
             await self._stdout_lock.acquire()
 
-            if self._next_segment >= self._total:
+            if self._active_segment_idx >= self._total:
                 self.segments[self._active_segment_idx].status = SegmentStatus.OK
                 self._completed_segment_idx = self._active_segment_idx
 
@@ -501,38 +566,18 @@ class Bar:
                 "SIGKILL cannot be caught or ignored in POSIX systems."
             )
 
-        for sig, sig_handler in self._sigmap.items():
-            # A handler for a particular signal, once set, remains
-            # installed until it is explicitly reset. Store default
-            # signal handlers for subsequent reset at cleanup phase.
+        for sig in self._sigmap:
             dfl_handler = signal.getsignal(sig)
             self._dfl_sigmap[sig] = dfl_handler
 
-            # ``signal.SIG_DFL`` and ``signal.SIG_IGN`` are also valid
-            # signal handlers and are not callables.
-            if callable(sig_handler):
-                # ``signal.signal`` accepts handler function which is
-                # called with two arguments: signal number and the
-                # interrupted stack frame. ``functools.partial`` solves
-                # the problem of passing spinner instance into the handler
-                # function.
-                sig_handler = functools.partial(sig_handler, self)
-
             self._loop.add_signal_handler(
                 getattr(signal, sig.name),
-                lambda signame=sig.name: asyncio.create_task(sig_handler(self)),
+                lambda signame=sig.name: asyncio.create_task(
+                    default_handler(signame, self)
+                ),
             )
 
     def _reset_signal_handlers(self):
         for sig, sig_handler in self._dfl_sigmap.items():
             if sig and sig_handler:
-                self._loop.add_signal_handler(
-                    getattr(signal, sig.name),
-                    lambda signame=sig.name: asyncio.create_task(
-                        asyncio.to_thread(
-                            sig_handler,
-                            signame,
-                            self,
-                        )
-                    ),
-                )
+                signal.signal(sig, sig_handler)

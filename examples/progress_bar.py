@@ -10,7 +10,7 @@ async def run():
     factory = BarFactory()
 
     bar = factory.create_bar(
-        10,
+        20,
         borders_char="block_brace",
         colors=ProgressBarColorConfig(
             active_color="aquamarine_2",
@@ -19,10 +19,9 @@ async def run():
         ),
     )
 
-    bar.run()
+    await bar.run()
 
-    for _ in range(10):
-        bar.update()
+    async for _ in bar:
         await asyncio.sleep(1)
 
 
