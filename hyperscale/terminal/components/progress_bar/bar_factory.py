@@ -50,8 +50,14 @@ class BarFactory:
                         fail_char,
                         default=fail_char,
                     ),
-                    "start_char": self.start.by_name(borders_char),
-                    "end_char": self.end.by_name(borders_char),
+                    "start_char": self.start.by_name(
+                        borders_char,
+                        default=borders_char,
+                    ),
+                    "end_char": self.end.by_name(
+                        borders_char,
+                        default=borders_char,
+                    ),
                     "background_char": self.background.by_name(
                         background_char,
                         default=" ",

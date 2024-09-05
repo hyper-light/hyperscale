@@ -132,7 +132,7 @@ class Segment:
                         frame,
                         color=self.segment_colors.active_color,
                         highlight=self.segment_colors.active_color_highlight,
-                        mode=TerminalMode.to_mode(self.mode),
+                        mode=self.mode,
                     )
                     for frame in spinner.frames
                 ]
@@ -143,12 +143,12 @@ class Segment:
             self.segment_chars.ok_char,
             color=self.segment_colors.ok_color,
             highlight=self.segment_colors.ok_color_highlight,
-            mode=TerminalMode.to_mode(self.mode),
+            mode=self.mode,
         )
 
         self._styled_failed_state = await stylize(
             self.segment_chars.fail_char,
             color=self.segment_colors.fail_color,
             highlight=self.segment_colors.fail_color_highlight,
-            mode=TerminalMode.to_mode(self.mode),
+            mode=self.mode,
         )

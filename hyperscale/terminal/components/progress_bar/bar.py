@@ -489,10 +489,6 @@ class Bar:
 
                 self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
 
-            terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
-
-            terminal_width = terminal_size[0]
-
             # Compose output
             spin_phase = "".join([segment.next for segment in self.segments])
 
@@ -501,9 +497,6 @@ class Bar:
                 text=text,
                 mode=mode,
             )
-
-            if len(out) > terminal_width:
-                out = f"{out[:terminal_width-1]}..."
 
             # Write
 

@@ -11,12 +11,13 @@ async def run():
 
     bar = factory.create_bar(
         20,
-        borders_char="block_brace",
+        borders_char="|",
         colors=ProgressBarColorConfig(
-            active_color="aquamarine_2",
-            fail_color="hot_pink_3",
-            ok_color="white",
+            active_color="royal_blue",
+            fail_color="white",
+            ok_color="hot_pink_3",
         ),
+        mode="extended",
     )
 
     await bar.run()
