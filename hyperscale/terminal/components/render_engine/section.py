@@ -17,6 +17,7 @@ class Section:
 
         self.config = config
         self.components = components
+        self._blocks: List[str] = []
 
         self._actual_width = 0
         self._actual_height = 0
@@ -96,22 +97,6 @@ class Section:
 
         self._render_event = asyncio.Event()
 
-        self._blocks = [self._to_row() for _ in range(self._inner_height)]
-
-        if self.config.top_padding:
-            for _ in range(self.config.top_padding):
-                self._blocks.insert(0, self._to_row())
-
-        if self.config.bottom_padding:
-            for _ in range(self.config.bottom_padding):
-                self._blocks.append(self._to_row())
-
-        if self.config.top_border:
-            self._blocks.insert(0, self.config.top_border * self._actual_width)
-
-        if self.config.bottom_border:
-            self._blocks.append(self.config.bottom_border * self._actual_width)
-
         return self
 
     def _to_row(self):
@@ -134,6 +119,23 @@ class Section:
     def set_section_position(self, left_offset: int, top_offset: int):
         self.left_offset = left_offset
         self.top_offset = top_offset
+
+    def create_blocks(self):
+        self._blocks = [self._to_row() for _ in range(self._inner_height)]
+
+        if self.config.top_padding:
+            for _ in range(self.config.top_padding):
+                self._blocks.insert(0, self._to_row())
+
+        if self.config.bottom_padding:
+            for _ in range(self.config.bottom_padding):
+                self._blocks.append(self._to_row())
+
+        if self.config.top_border:
+            self._blocks.insert(0, self.config.top_border * self._actual_width)
+
+        if self.config.bottom_border:
+            self._blocks.append(self.config.bottom_border * self._actual_width)
 
     async def render(self):
         components = await asyncio.gather(
@@ -171,6 +173,11 @@ class Section:
             )
 
         return self._blocks
+
+    def fit_width(self, remainder: int):
+        self._inner_width += remainder
+        self._actual_width += remainder
+        self._center_width = math.floor(self._inner_width / 2)
 
     def fit_height(self, height: int):
         if self._actual_height >= height:

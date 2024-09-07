@@ -31,7 +31,7 @@ class Canvas:
         if width > self._max_width:
             width = self._max_width
 
-        if height is None or height > self._max_height:
+        if height is None:
             height = self._max_height
 
         self.width = width
@@ -49,8 +49,10 @@ class Canvas:
         row_idx = 0
         for section in sections:
             next_width = current_row_width + section.width
+            remainder = self.width - current_row_width
 
             if next_width > self.width:
+                self._sections[row_idx][-1].fit_width(remainder)
                 self._sections.append([section])
                 current_row_width = section.width
                 row_idx += 1
@@ -59,10 +61,14 @@ class Canvas:
                 current_row_width += section.width
                 self._sections[row_idx].append(section)
 
+        remainder = self.width - current_row_width
+        self._sections[-1][-1].fit_width(remainder)
+
         for row in self._sections:
             row_height = max([section.height for section in row])
 
             for section in row:
+                section.create_blocks()
                 section.fit_height(row_height)
 
     async def render(self):

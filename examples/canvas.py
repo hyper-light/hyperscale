@@ -17,7 +17,8 @@ async def display():
                     height="medium",
                     left_border="|",
                     top_border="-",
-                    bottom_border=" ",
+                    right_border="|",
+                    bottom_border="-",
                     left_padding=1,
                 ),
                 [
@@ -28,8 +29,8 @@ async def display():
                             mode="extended",
                         ),
                         Alignment(
-                            horizontal="left",
-                            vertical="bottom",
+                            horizontal="center",
+                            vertical="center",
                         ),
                     )
                 ],
@@ -84,7 +85,9 @@ async def display():
                     bottom_border="-",
                 )
             ),
-        ]
+        ],
+        width=102,
+        height=30,
     )
 
     print(await canvas.render())
