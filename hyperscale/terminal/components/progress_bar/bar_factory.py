@@ -33,6 +33,7 @@ class BarFactory:
         background_char: BackgroundCharName | str | None = None,
         colors: ProgressBarColorConfig | None = None,
         mode: Literal["compatability", "extended"] = "compatability",
+        disable_output: bool = False,
     ):
         return Bar(
             length,
@@ -62,8 +63,9 @@ class BarFactory:
                         background_char,
                         default=" ",
                     ),
-                }
+                },
             ),
             colors=colors,
+            disable_output=disable_output,
             mode=TerminalMode.to_mode(mode),
         )

@@ -34,12 +34,19 @@ class Text:
     def __str__(self):
         return self._styled or self._text
 
+    @property
+    def size(self):
+        return len(self._text)
+
+    async def get_next_frame(self) -> str:
+        return await self.style()
+
     async def style(
         self,
         color: ColorName | ExtendedColorName | None = None,
         highlight: HighlightName | ExtendedColorName | None = None,
         attrs: Sequence[str] | None = None,
-        mode: Literal["extended", "compatability"] = "compatability",
+        mode: Literal["extended", "compatability"] | None = None,
     ):
         if color is None:
             color = self._color
@@ -49,6 +56,9 @@ class Text:
 
         if attrs is None:
             attrs = self._attrs
+
+        if mode is None:
+            mode = self._mode
 
         if color or highlight:
             self._styled = await stylize(

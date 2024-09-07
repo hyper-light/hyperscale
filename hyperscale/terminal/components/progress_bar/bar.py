@@ -57,6 +57,7 @@ class Bar:
         enabled: bool = True,
         text: str | None = None,
         max_width_percentage: float = 0.5,
+        disable_output: bool = False,
     ) -> None:
         total: int = 0
         if isinstance(data, int):
@@ -94,6 +95,9 @@ class Bar:
         self._segment_size: float = 0
         self._next_segment: float = 0
         self._completed: int = 0
+        self._enable_output = disable_output is False
+
+        self._frame_queue: asyncio.Queue = None
 
         self.segments.append(
             Segment(
@@ -168,6 +172,10 @@ class Bar:
         self._terminal_width: int | float = 0
 
     @property
+    def size(self):
+        return self._total
+
+    @property
     def elapsed_time(self) -> float:
         if self._start_time is None:
             return 0
@@ -235,11 +243,20 @@ class Bar:
 
         return inner
 
+    async def get_next_frame(self) -> str:
+        if self._frame_queue:
+            return await self._frame_queue.get()
+
+        return ""
+
     async def run(
         self,
         text: str | bytes | ProgressText | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
+        if self._enable_output is False:
+            self._frame_queue = asyncio.Queue()
+
         if self._run_progress_bar is None:
             await asyncio.gather(*[segment.style() for segment in self.segments])
             terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
@@ -288,10 +305,12 @@ class Bar:
         if text is None:
             text = self._text
 
+        if self.enabled and self._enable_output:
+            await self._hide_cursor()
+
         if self.enabled:
             self._register_signal_handlers()
 
-            await self._hide_cursor()
             self._start_time = time.time()
             self._stop_time = None  # Reset value to properly calculate subsequent spinner starts (if any)  # pylint: disable=line-too-long
             self._stop_spin = asyncio.Event()
@@ -306,7 +325,8 @@ class Bar:
             except Exception:
                 # Ensure cursor is not hidden if any failure occurs that prevents
                 # getting it back
-                await self._show_cursor()
+                if self._enable_output:
+                    await self._show_cursor()
 
     async def stop(self):
         if self.enabled:
@@ -321,8 +341,10 @@ class Bar:
                 await self._spin_thread
 
             await self._run_progress_bar
-            await self._clear_line()
-            await self._show_cursor()
+
+            if self._enable_output:
+                await self._clear_line()
+                await self._show_cursor()
 
     async def cancel(self):
         if self.enabled:
@@ -354,8 +376,9 @@ class Bar:
             ):
                 pass
 
-            await self._clear_line()
-            await self._show_cursor()
+            if self._enable_output:
+                await self._clear_line()
+                await self._show_cursor()
 
     async def hide(self):
         """Hide the spinner to allow for custom writing to the terminal."""
@@ -366,11 +389,13 @@ class Bar:
         if thr_is_alive and not self._hide_spin.is_set():
             # set the hidden spinner flag
             self._hide_spin.set()
-            await self._clear_line()
 
-            # flush the stdout buffer so the current line
-            # can be rewritten to
-            await self._loop.run_in_executor(None, sys.stdout.flush)
+            if self._enable_output:
+                await self._clear_line()
+
+                # flush the stdout buffer so the current line
+                # can be rewritten to
+                await self._loop.run_in_executor(None, sys.stdout.flush)
 
     async def show(self):
         """Show the hidden spinner."""
@@ -383,6 +408,7 @@ class Bar:
             self._hide_spin.clear()
 
             # clear the current line so the spinner is not appended to it
+        if thr_is_alive and self._hide_spin.is_set() and self._enable_output:
             await self._clear_line()
 
     async def write(self, text):
@@ -390,7 +416,9 @@ class Bar:
         # similar to tqdm.write()
         # https://pypi.python.org/pypi/tqdm#writing-messages
         await self._stdout_lock.acquire()
-        await self._clear_line()
+
+        if self._enable_output:
+            await self._clear_line()
 
         if isinstance(text, (str, bytes)):
             _text = to_unicode(text)
@@ -400,10 +428,11 @@ class Bar:
         # Ensure output is Unicode
         assert isinstance(_text, str)
 
-        await self._loop.run_in_executor(
-            None,
-            sys.stdout.write,
-        )
+        if self._enable_output:
+            await self._loop.run_in_executor(
+                None,
+                sys.stdout.write,
+            )
 
         self._cur_line_len = 0
         self._stdout_lock.release()
@@ -453,11 +482,15 @@ class Bar:
             mode=mode,
         )
 
+        if self._frame_queue:
+            self._frame_queue.put_nowait(self._last_frame)
+
         # Should be stopped here, otherwise prints after
         # self._freeze call will mess up the spinner
         await self.stop()
 
-        await self._loop.run_in_executor(None, sys.stdout.write, self._last_frame)
+        if self._enable_output:
+            await self._loop.run_in_executor(None, sys.stdout.write, self._last_frame)
 
         self._cur_line_len = 0
 
@@ -498,13 +531,17 @@ class Bar:
                 mode=mode,
             )
 
+            if self._frame_queue:
+                self._frame_queue.put_nowait(out)
+
             # Write
 
-            await self._clear_line()
+            if self._enable_output:
+                await self._clear_line()
 
-            await self._loop.run_in_executor(None, sys.stdout.write, out)
+                await self._loop.run_in_executor(None, sys.stdout.write, out)
 
-            await self._loop.run_in_executor(None, sys.stdout.flush)
+                await self._loop.run_in_executor(None, sys.stdout.flush)
 
             self._cur_line_len = max(self._cur_line_len, len(out))
 

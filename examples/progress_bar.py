@@ -4,6 +4,7 @@ from hyperscale.terminal.components.progress_bar import (
     BarFactory,
     ProgressBarColorConfig,
 )
+from hyperscale.terminal.components.render_engine.canvas import Canvas
 
 
 async def run():
@@ -18,12 +19,15 @@ async def run():
             ok_color="hot_pink_3",
         ),
         mode="extended",
+        disable_output=True,
     )
 
-    await bar.run()
-
-    async for _ in bar:
-        await asyncio.sleep(1)
+    canvas = Canvas(100, 25)
+    # await bar.run()
+    # async for _ in bar:
+    #     frame = await bar.get_next_frame()
+    #     print(frame)
+    #     await asyncio.sleep(1)
 
 
 asyncio.run(run())

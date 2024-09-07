@@ -9,3 +9,4 @@ from pydantic import (
 class SpinnerConfig(BaseModel):
     frames: conlist(StrictStr, min_length=1)
     interval: StrictInt
+    size: StrictInt

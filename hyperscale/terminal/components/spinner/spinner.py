@@ -94,6 +94,7 @@ class Spinner:
         ]
         | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
+        disable_output: bool = False,
     ):
         # Spinner
         self._mode = TerminalMode.to_mode(mode)
@@ -134,6 +135,9 @@ class Spinner:
         self._stdout_lock = asyncio.Lock()
         self._hidden_level = 0
         self._cur_line_len = 0
+        self._enable_output = disable_output is False
+
+        self._frame_queue: asyncio.Queue = None
 
         self._sigmap = (
             sigmap
@@ -157,6 +161,16 @@ class Spinner:
 
         self._stdout_lock = asyncio.Lock()
         self._loop = asyncio.get_event_loop()
+
+    @property
+    def size(self):
+        return self._spinner.size
+
+    async def get_next_frame(self) -> str:
+        if self._frame_queue:
+            return await self._frame_queue.get()
+
+        return ""
 
     async def get_fail_frame(
         self,
@@ -517,7 +531,8 @@ class Spinner:
             except Exception:
                 # Ensure cursor is not hidden if any failure occurs that prevents
                 # getting it back
-                await self._show_cursor()
+                if self._enable_output:
+                    await self._show_cursor()
 
     async def stop(self):
         if self.enabled:
@@ -531,8 +546,9 @@ class Spinner:
                 self._stop_spin.set()
                 await self._spin_thread
 
-            await self._clear_line()
-            await self._show_cursor()
+            if self._enable_output:
+                await self._clear_line()
+                await self._show_cursor()
 
     async def hide(self):
         """Hide the spinner to allow for custom writing to the terminal."""
@@ -543,6 +559,8 @@ class Spinner:
         if thr_is_alive and not self._hide_spin.is_set():
             # set the hidden spinner flag
             self._hide_spin.set()
+
+        if thr_is_alive and not self._hide_spin.is_set() and self._enable_output:
             await self._clear_line()
 
             # flush the stdout buffer so the current line
@@ -559,6 +577,7 @@ class Spinner:
             # clear the hidden spinner flag
             self._hide_spin.clear()
 
+        if thr_is_alive and self._hide_spin.is_set() and self._enable_output:
             # clear the current line so the spinner is not appended to it
             await self._clear_line()
 
@@ -567,7 +586,9 @@ class Spinner:
         # similar to tqdm.write()
         # https://pypi.python.org/pypi/tqdm#writing-messages
         await self._stdout_lock.acquire()
-        await self._clear_line()
+
+        if self._enable_output:
+            await self._clear_line()
 
         if isinstance(text, (str, bytes)):
             _text = to_unicode(text)
@@ -672,11 +693,15 @@ class Spinner:
             mode=mode,
         )
 
+        if self._frame_queue:
+            self._frame_queue.put_nowait(self._last_frame)
+
         # Should be stopped here, otherwise prints after
         # self._freeze call will mess up the spinner
         await self.stop()
 
-        await self._loop.run_in_executor(None, sys.stdout.write, self._last_frame)
+        if self._enable_output:
+            await self._loop.run_in_executor(None, sys.stdout.write, self._last_frame)
 
         self._cur_line_len = 0
 
@@ -713,13 +738,16 @@ class Spinner:
             if len(out) > terminal_width:
                 out = f"{out[:terminal_width-1]}..."
 
+            if self._frame_queue:
+                self._frame_queue.put_nowait(self._last_frame)
+
             # Write
+            if self._enable_output:
+                await self._clear_line()
 
-            await self._clear_line()
+                await self._loop.run_in_executor(None, sys.stdout.write, out)
 
-            await self._loop.run_in_executor(None, sys.stdout.write, out)
-
-            await self._loop.run_in_executor(None, sys.stdout.flush)
+                await self._loop.run_in_executor(None, sys.stdout.flush)
 
             self._cur_line_len = max(self._cur_line_len, len(out))
 

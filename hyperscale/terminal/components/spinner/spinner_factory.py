@@ -1182,12 +1182,18 @@ class SpinnerFactory:
             },
         )
 
-        return SpinnerConfig(**spinner)
+        selected_spinner = dict(spinner)
+        selected_spinner["size"] = len(spinner["frames"][0])
+
+        return SpinnerConfig(**selected_spinner)
 
     def create_spinner(self, spinner_name: str, frames: List[str], interval: int):
         self.types[spinner_name] = {"frames": frames, "inteval": interval}
 
+        spinner_size = len(frames[0])
+
         return SpinnerConfig(
             frames=frames,
             interval=interval,
+            size=spinner_size,
         )

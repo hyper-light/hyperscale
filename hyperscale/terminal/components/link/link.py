@@ -41,12 +41,19 @@ class Link:
             self._text,
         )
 
+    @property
+    def size(self):
+        return len(self._text)
+
+    async def get_next_frame(self) -> str:
+        return await self.style()
+
     async def style(
         self,
         color: ColorName | ExtendedColorName | None = None,
         highlight: HighlightName | ExtendedColorName | None = None,
         attrs: Sequence[str] | None = None,
-        mode: Literal["extended", "compatability"] = "compatability",
+        mode: Literal["extended", "compatability"] | None = None,
     ):
         if color is None:
             color = self._color
@@ -56,6 +63,9 @@ class Link:
 
         if attrs is None:
             attrs = self._attrs
+
+        if mode is None:
+            mode = self._mode
 
         link_fmt_str = "\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\"
 
