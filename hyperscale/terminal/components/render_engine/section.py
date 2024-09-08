@@ -2,6 +2,9 @@ import asyncio
 import math
 from typing import Dict, List
 
+from hyperscale.terminal.config.mode import TerminalMode
+from hyperscale.terminal.styling import stylize
+
 from .component import Component
 from .section_config import SectionConfig, SectionSize
 
@@ -18,6 +21,8 @@ class Section:
         self.config = config
         self.components = components
         self._blocks: List[str] = []
+
+        self._mode = TerminalMode.to_mode(self.config.mode)
 
         self._actual_width = 0
         self._actual_height = 0
@@ -40,6 +45,8 @@ class Section:
         self._canvas = ""
         self._left_offset = 0
         self._top_offset = 0
+        self._border_pad_offset_left = 0
+        self._border_pad_offset_right = 0
 
         self._center_width = 0
         self._center_height = 0
@@ -99,7 +106,7 @@ class Section:
 
         return self
 
-    def _to_row(self):
+    async def _to_row(self):
         row = " " * self._inner_width
 
         if self.config.left_padding:
@@ -109,10 +116,26 @@ class Section:
             row += " " * self.config.right_padding
 
         if self.config.left_border:
-            row = self.config.left_border + row
+            left_border = await stylize(
+                self.config.left_border,
+                color=self.config.border_color,
+                mode=self._mode,
+            )
+
+            self._border_pad_offset_left = len(left_border)
+
+            row = left_border + row
 
         if self.config.right_border:
-            row += self.config.right_border
+            right_border = await stylize(
+                self.config.right_border,
+                color=self.config.border_color,
+                mode=self._mode,
+            )
+
+            self._border_pad_offset_right = len(right_border)
+
+            row += right_border
 
         return row
 
@@ -120,22 +143,36 @@ class Section:
         self.left_offset = left_offset
         self.top_offset = top_offset
 
-    def create_blocks(self):
-        self._blocks = [self._to_row() for _ in range(self._inner_height)]
+    async def create_blocks(self):
+        self._blocks = await asyncio.gather(
+            *[self._to_row() for _ in range(self._inner_height)]
+        )
 
         if self.config.top_padding:
             for _ in range(self.config.top_padding):
-                self._blocks.insert(0, self._to_row())
+                self._blocks.insert(0, await self._to_row())
 
         if self.config.bottom_padding:
             for _ in range(self.config.bottom_padding):
-                self._blocks.append(self._to_row())
+                self._blocks.append(await self._to_row())
 
         if self.config.top_border:
-            self._blocks.insert(0, self.config.top_border * self._actual_width)
+            top_border = await stylize(
+                self.config.top_border * self._actual_width,
+                color=self.config.border_color,
+                mode=self._mode,
+            )
+
+            self._blocks.insert(0, top_border)
 
         if self.config.bottom_border:
-            self._blocks.append(self.config.bottom_border * self._actual_width)
+            bottom_border = await stylize(
+                self.config.bottom_border * self._actual_width,
+                color=self.config.border_color,
+                mode=self._mode,
+            )
+
+            self._blocks.append(bottom_border)
 
     async def render(self):
         components = await asyncio.gather(
@@ -152,7 +189,7 @@ class Section:
 
         x_start_offset = self.config.left_padding
         if self.config.left_border:
-            x_start_offset += len(self.config.left_border)
+            x_start_offset += self._border_pad_offset_left
 
         y_start_offset = self.config.top_padding
         if self.config.top_border:
@@ -187,3 +224,5 @@ class Section:
 
         for _ in range(delta):
             self._blocks.append("".join([" " for _ in range(self._actual_width)]))
+
+        self._actual_height = height

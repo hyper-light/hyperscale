@@ -14,12 +14,13 @@ async def display():
             Section(
                 SectionConfig(
                     width="small",
-                    height="medium",
+                    height="xx-small",
                     left_border="|",
                     top_border="-",
                     right_border="|",
                     bottom_border="-",
-                    left_padding=1,
+                    border_color="aquamarine_2",
+                    mode="extended",
                 ),
                 [
                     Component(
@@ -38,7 +39,7 @@ async def display():
             Section(
                 SectionConfig(
                     width="large",
-                    height="medium",
+                    height="xx-small",
                     left_border="|",
                     top_border="-",
                     right_border="|",

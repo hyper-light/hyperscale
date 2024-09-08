@@ -2,6 +2,9 @@ from typing import Literal
 
 from pydantic import BaseModel, StrictInt, StrictStr
 
+from hyperscale.terminal.config.mode import TerminalDisplayMode
+from hyperscale.terminal.styling.colors import ColorName, ExtendedColorName
+
 SectionSize = Literal[
     "xx-small",
     "x-small",
@@ -25,3 +28,5 @@ class SectionConfig(BaseModel):
     bottom_border: StrictStr | None = None
     left_border: StrictStr | None = None
     right_border: StrictStr | None = None
+    border_color: ColorName | ExtendedColorName = "white"
+    mode: TerminalDisplayMode = "compatability"

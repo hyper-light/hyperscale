@@ -67,8 +67,9 @@ class Canvas:
         for row in self._sections:
             row_height = max([section.height for section in row])
 
+            await asyncio.gather(*[section.create_blocks() for section in sections])
+
             for section in row:
-                section.create_blocks()
                 section.fit_height(row_height)
 
     async def render(self):
@@ -80,6 +81,14 @@ class Canvas:
         rendered_blocks = await asyncio.gather(*[section.render() for section in row])
 
         base = rendered_blocks[0]
+        base_height = len(base)
+
+        max_height = max([section.height for section in row])
+
+        if max_height > base_height:
+            delta = max_height - base_height
+            for _ in range(delta):
+                base.append("".join([" " for _ in range(row[0].width)]))
 
         for segment in rendered_blocks[1:]:
             for idx, segment_row in enumerate(segment):
