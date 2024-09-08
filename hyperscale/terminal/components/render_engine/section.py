@@ -32,6 +32,7 @@ class Section:
         self._render_event: asyncio.Event = None
 
         self._scale: Dict[SectionSize, float] = {
+            "smallest": 0.05,
             "xx-small": 0.1,
             "x-small": 0.25,
             "small": 0.33,
@@ -201,11 +202,18 @@ class Section:
 
             line = self._blocks[y_start]
 
+            print(len(self._blocks))
+
+            x_end = x_start + frame_size
+            if x_end > self._actual_width:
+                print(x_end, self._actual_width, self.config.right_border)
+                x_end = self._actual_width + len(self._blocks) - 1
+
             self._blocks[y_start] = "".join(
                 [
                     line[:x_start],
                     frame,
-                    line[x_start + frame_size :],
+                    line[x_end:],
                 ]
             )
 

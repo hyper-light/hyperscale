@@ -41,13 +41,13 @@ class Component:
                 self._horizontal_position = 0 + self._horizontal_padding
 
             case "center":
-                self._horizontal_position = section_horizontal_center - math.ceil(
-                    self._frame_width / 2
+                self._horizontal_position = max(
+                    section_horizontal_center - math.ceil(self._frame_width / 2), 0
                 )
 
             case "right":
-                self._horizontal_position = (
-                    section_width - self._frame_width - self._horizontal_padding
+                self._horizontal_position = max(
+                    section_width - self._frame_width - self._horizontal_padding, 0
                 )
 
             case _:
@@ -76,6 +76,7 @@ class Component:
         section_vertical_center: int,
     ):
         frame = await self.component.get_next_frame()
+        self._frame_width = self.component.size
 
         if self._horizontal_position is None and self._vertical_position is None:
             self._frame_height = len(frame.split("\n"))

@@ -146,6 +146,7 @@ class Bar:
         self._cur_line_len = 0
         self._active_segment_idx = 1
         self._completed_segment_idx = 0
+        self._size: int = 0
 
         self._sigmap = (
             sigmap
@@ -173,7 +174,7 @@ class Bar:
 
     @property
     def size(self):
-        return self._total
+        return self._size
 
     @property
     def elapsed_time(self) -> float:
@@ -206,7 +207,7 @@ class Bar:
             out = f"{frame} {text}\n"
 
         elif compose_mode is None:
-            out = f"\r{frame}"
+            out = f"{frame}"
 
         else:
             out = f"{frame}\n"
@@ -244,8 +245,14 @@ class Bar:
         return inner
 
     async def get_next_frame(self) -> str:
+        if self._run_progress_bar is None:
+            await self.run()
+
         if self._frame_queue:
-            return await self._frame_queue.get()
+            frame = await self._frame_queue.get()
+            self._size = len(frame)
+
+            return frame
 
         return ""
 

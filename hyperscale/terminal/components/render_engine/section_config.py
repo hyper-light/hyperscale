@@ -6,6 +6,7 @@ from hyperscale.terminal.config.mode import TerminalDisplayMode
 from hyperscale.terminal.styling.colors import ColorName, ExtendedColorName
 
 SectionSize = Literal[
+    "smallest",
     "xx-small",
     "x-small",
     "small",

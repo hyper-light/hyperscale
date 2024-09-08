@@ -1,13 +1,29 @@
 import asyncio
 
+from hyperscale.terminal.components.progress_bar import (
+    BarFactory,
+    ProgressBarColorConfig,
+)
 from hyperscale.terminal.components.render_engine.canvas import Canvas
 from hyperscale.terminal.components.render_engine.component import Alignment, Component
 from hyperscale.terminal.components.render_engine.section import Section, SectionConfig
-from hyperscale.terminal.components.text import Text
 
 
 async def display():
     canvas = Canvas()
+
+    factory = BarFactory()
+
+    bar = factory.create_bar(
+        20,
+        colors=ProgressBarColorConfig(
+            active_color="royal_blue",
+            fail_color="white",
+            ok_color="hot_pink_3",
+        ),
+        mode="extended",
+        disable_output=True,
+    )
 
     await canvas.initialize(
         [
@@ -24,11 +40,7 @@ async def display():
                 ),
                 [
                     Component(
-                        Text(
-                            "Hello!",
-                            color="aquamarine_2",
-                            mode="extended",
-                        ),
+                        bar,
                         Alignment(
                             horizontal="center",
                             vertical="center",
