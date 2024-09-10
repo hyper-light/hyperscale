@@ -16,16 +16,26 @@ from .start_char import StartChar, StartCharName
 
 
 class BarFactory:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        default_size: int = 10,
+    ) -> None:
         self.fill = FillChar()
         self.start = StartChar()
         self.end = EndChar()
         self.background = BackgroundChar()
         self.spinner_types = [spinner.value for spinner in SpinnerType]
+        self._default_size = default_size
+
+    def set_default_size(
+        self,
+        size: int,
+    ):
+        self._default_size = size
 
     def create_bar(
         self,
-        length: int,
+        size: int | None = None,
         active_char: SpinnerName | str = "dots",
         ok_char: FillCharName | str = "block",
         fail_char: FillCharName | str = "block",
@@ -35,8 +45,11 @@ class BarFactory:
         mode: Literal["compatability", "extended"] = "compatability",
         disable_output: bool = False,
     ):
+        if size is None:
+            size = self._default_size
+
         return Bar(
-            length,
+            size,
             ProgressBarChars(
                 **{
                     "active_char": self.fill.by_name(

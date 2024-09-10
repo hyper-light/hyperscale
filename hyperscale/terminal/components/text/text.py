@@ -1,3 +1,5 @@
+import asyncio
+from os import get_terminal_size
 from typing import List, Literal, Sequence
 
 from hyperscale.terminal.config.mode import TerminalMode
@@ -29,8 +31,10 @@ class Text:
         self._color = color
         self._highlight = highlight
         self._mode = mode
+        self._max_size: int | None = None
         self._base_size = len(text)
         self._attrs = self._set_attrs(attributes) if attributes else set()
+        self._loop = asyncio.get_event_loop()
 
     def __str__(self):
         return self._styled or self._text
@@ -42,6 +46,17 @@ class Text:
     @property
     def size(self):
         return len(self._text)
+
+    async def fit(
+        self,
+        max_size: int | None = None,
+    ):
+        if max_size is None:
+            terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
+            max_size = terminal_size[0]
+
+        self._text = self._text[:max_size]
+        self._max_size = max_size
 
     async def get_next_frame(self) -> str:
         return await self.style()

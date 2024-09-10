@@ -77,6 +77,10 @@ class Bar:
 
         self._data = data
         self._total = total
+        self._max_size: int | None = None
+        self._chars = chars
+        self._colors = colors
+        self._mode = mode
         self.mode = mode
 
         self.segments: list[Segment] = []
@@ -98,37 +102,6 @@ class Bar:
         self._enable_output = disable_output is False
 
         self._frame_queue: asyncio.Queue = None
-
-        self.segments.append(
-            Segment(
-                chars,
-                SegmentType.START,
-                segment_colors=colors,
-                mode=mode,
-            )
-        )
-
-        self.segments.extend(
-            [
-                Segment(
-                    chars,
-                    SegmentType.BAR,
-                    segment_default_char=chars.background_char,
-                    segment_colors=colors,
-                    mode=mode,
-                )
-                for _ in range(self._total)
-            ]
-        )
-
-        self.segments.append(
-            Segment(
-                chars,
-                SegmentType.END,
-                colors,
-                mode=mode,
-            )
-        )
 
         # Other
         self._text = text
@@ -171,7 +144,6 @@ class Bar:
 
         self._stdout_lock = asyncio.Lock()
         self._loop = asyncio.get_event_loop()
-        self._terminal_width: int | float = 0
 
     @property
     def raw_size(self):
@@ -188,6 +160,68 @@ class Bar:
         if self._stop_time is None:
             return time.monotonic() - self._start_time
         return self._stop_time - self._start_time
+
+    async def fit(
+        self,
+        max_size: int | None = None,
+    ):
+        if max_size is None:
+            terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
+            max_size = terminal_size[0]
+
+        self.segments: list[Segment] = []
+
+        if self._chars.start_char:
+            max_size -= 1
+            self.segments.append(
+                Segment(
+                    self._chars,
+                    SegmentType.START,
+                    segment_colors=self._colors,
+                    mode=self._mode,
+                )
+            )
+
+        if self._chars.end_char:
+            max_size -= 1
+
+        if self._text:
+            text_length = len(self._text)
+            total_length = max_size + text_length
+            diff = total_length - max_size
+
+            bar_adjust = math.floor(diff / 2) + 3
+            text_adjust = math.ceil(diff / 2)
+
+            max_size -= bar_adjust
+            text_length = max(text_length - text_adjust, 0)
+
+            self._text = self._text[:text_length] + "..."
+
+        self.segments.extend(
+            [
+                Segment(
+                    self._chars,
+                    SegmentType.BAR,
+                    segment_default_char=self._chars.background_char,
+                    segment_colors=self._colors,
+                    mode=self._mode,
+                )
+                for _ in range(max_size)
+            ]
+        )
+
+        if self._chars.end_char:
+            self.segments.append(
+                Segment(
+                    self._chars,
+                    SegmentType.END,
+                    self._colors,
+                    mode=self._mode,
+                )
+            )
+
+        self._max_size = max_size
 
     async def _compose_out(
         self,
@@ -269,19 +303,16 @@ class Bar:
         if self._enable_output is False:
             self._frame_queue = asyncio.Queue()
 
+        if self._max_size is None:
+            terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
+            self._max_size = terminal_size[0]
+
         if self._run_progress_bar is None:
             await asyncio.gather(*[segment.style() for segment in self.segments])
-            terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
-            self._terminal_width = terminal_size[0]
-
-            self._bar_width = math.ceil(
-                self._terminal_width * self._max_width_percentage
-            )
 
             # If we have 1000 items with a bar width of 100, every 10 items we should increment a segment.
-            self._segment_size = self._total / self._bar_width
+            self._segment_size = self._total / self._max_size
             self._next_segment = self._segment_size
-
             self._run_progress_bar = asyncio.create_task(
                 self._run(
                     text,
@@ -300,6 +331,23 @@ class Bar:
 
         if not inspect.isasyncgen(self._data):
             for item in self._data:
+                if inspect.iscoroutine(item):
+                    item = await item
+
+                elif (
+                    isinstance(item, asyncio.Task)
+                    and not item.done()
+                    and not item.cancelled()
+                ):
+                    item = await item
+
+                elif (
+                    isinstance(item, asyncio.Future)
+                    and not item.done()
+                    and not item.cancelled()
+                ):
+                    item = await item
+
                 yield item
 
                 self.update()
@@ -307,7 +355,7 @@ class Bar:
             await self.ok()
 
     def update(self, amount: int | float = 1):
-        self._completed += amount * self._segment_size
+        self._completed += amount
 
     async def _run(
         self,
@@ -566,8 +614,8 @@ class Bar:
 
             self._stdout_lock.release()
 
-            if self._next_segment >= self._total:
-                await self.stop()
+            if self._next_segment > self._total:
+                break
 
     async def _clear_line(self):
         if sys.stdout.isatty():

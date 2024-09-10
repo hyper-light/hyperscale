@@ -199,8 +199,6 @@ class Section:
         for frame, y_pos, raw_size, horizontal_alignment in components:
             y_start = y_pos + y_start_offset
 
-            print(raw_size, self._inner_width)
-
             if horizontal_alignment == "left":
                 left_border = await self._recreate_left_border()
                 left_pad = self.config.left_padding * " "
@@ -248,8 +246,12 @@ class Section:
                 )
 
             else:
+                pad_size = self._inner_width - raw_size
                 left_border = await self._recreate_left_border()
-                left_pad = self.config.left_padding * " "
+                border_lengths = len(self.config.left_border) + len(
+                    self.config.right_border
+                )
+                left_pad = (self.config.left_padding + pad_size + border_lengths) * " "
 
                 right_border = await self._recreate_right_border()
                 right_pad = self.config.right_padding * " "
@@ -263,18 +265,6 @@ class Section:
                         right_border,
                     ]
                 )
-
-            # line = self._blocks[y_start]
-
-            # left_pad = line[:x_start]
-            # right_border = await self._recreate_right_border()
-            # right_pad = self.config.right_padding * " " + right_border
-
-            # left_pad, right_pad = self._adjust_line_pad(
-            #     horizontal_alignment,
-            #     left_pad,
-            #     right_pad,
-            # )
 
             self._blocks[y_start] = line
 
