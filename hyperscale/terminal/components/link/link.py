@@ -29,6 +29,7 @@ class Link:
     ) -> None:
         self._text = text
         self._link = LinkValidator(url=url)
+        self._base_size = len(text)
         self._styled: str | None = None
         self._color = color
         self._highlight = highlight
@@ -40,6 +41,10 @@ class Link:
             str(self._link.url),
             self._text,
         )
+
+    @property
+    def raw_size(self):
+        return self._base_size
 
     @property
     def size(self):

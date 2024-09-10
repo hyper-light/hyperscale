@@ -196,26 +196,90 @@ class Section:
         if self.config.top_border:
             y_start_offset += len(self.config.top_border.split("\n"))
 
-        for frame, x_pos, y_pos, frame_size in components:
-            x_start = x_pos + x_start_offset
+        for frame, y_pos, frame_width, horizontal_alignment in components:
             y_start = y_pos + y_start_offset
 
-            line = self._blocks[y_start]
+            if horizontal_alignment == "left":
+                left_border = await self._recreate_left_border()
+                left_pad = self.config.left_padding * " "
 
-            print(len(self._blocks))
+                right_border = await self._recreate_right_border()
+                right_pad = self.config.right_padding * " "
 
-            x_end = x_start + frame_size
-            if x_end > self._actual_width:
-                print(x_end, self._actual_width, self.config.right_border)
-                x_end = self._actual_width + len(self._blocks) - 1
+                line = "".join(
+                    [
+                        left_border,
+                        left_pad,
+                        frame,
+                        right_pad,
+                        right_border,
+                    ]
+                )
 
-            self._blocks[y_start] = "".join(
-                [
-                    line[:x_start],
-                    frame,
-                    line[x_end:],
-                ]
-            )
+            elif horizontal_alignment == "center":
+                left_border = await self._recreate_left_border()
+                left_pad = self.config.left_padding * " "
+
+                right_border = await self._recreate_right_border()
+                right_pad = self.config.right_padding * " "
+
+                left_border_length = 0
+                if self.config.left_border:
+                    left_border_length = len(self.config.left_border)
+
+                right_border_length = 0
+                if self.config.right_border:
+                    right_border_length = len(self.config.right_border)
+
+                left_center_pad, right_center_pad = self._generate_centering(
+                    len(left_border) - left_border_length,
+                    len(right_border) - right_border_length,
+                    frame_width,
+                )
+
+                left_pad += left_center_pad
+                right_pad += right_center_pad
+
+                line = "".join(
+                    [
+                        left_border,
+                        left_pad,
+                        frame,
+                        right_pad,
+                        right_border,
+                    ]
+                )
+
+            else:
+                left_border = await self._recreate_left_border()
+                left_pad = self.config.left_padding * " "
+
+                right_border = await self._recreate_right_border()
+                right_pad = self.config.right_padding * " "
+
+                line = "".join(
+                    [
+                        left_border,
+                        left_pad,
+                        frame,
+                        right_pad,
+                        right_border,
+                    ]
+                )
+
+            # line = self._blocks[y_start]
+
+            # left_pad = line[:x_start]
+            # right_border = await self._recreate_right_border()
+            # right_pad = self.config.right_padding * " " + right_border
+
+            # left_pad, right_pad = self._adjust_line_pad(
+            #     horizontal_alignment,
+            #     left_pad,
+            #     right_pad,
+            # )
+
+            self._blocks[y_start] = line
 
         return self._blocks
 
@@ -234,3 +298,72 @@ class Section:
             self._blocks.append("".join([" " for _ in range(self._actual_width)]))
 
         self._actual_height = height
+
+    async def _recreate_left_border(self):
+        if self.config.left_border:
+            return await stylize(
+                self.config.left_border,
+                color=self.config.border_color,
+                mode=TerminalMode.to_mode(self.config.mode),
+            )
+
+        return ""
+
+    async def _recreate_right_border(self):
+        if self.config.right_border:
+            return await stylize(
+                self.config.right_border,
+                color=self.config.border_color,
+                mode=TerminalMode.to_mode(self.config.mode),
+            )
+
+        return ""
+
+    def _generate_centering(
+        self,
+        left_length: int,
+        right_length: int,
+        frame_width: int,
+    ):
+        consumed_width = sum(
+            [
+                left_length,
+                right_length,
+                self.config.left_padding,
+                self.config.right_padding,
+            ]
+        )
+
+        if left_length < 1 and right_length < 1:
+            formatting_length = int((frame_width - self._actual_width) / 2)
+
+            left_pad = math.floor(formatting_length / 2)
+            right_pad = math.ceil(formatting_length / 2)
+            left_center_pad = left_pad * " "
+            right_center_pad = right_pad * " "
+
+            return (left_center_pad, right_center_pad)
+
+        inner_width = self._actual_width - consumed_width
+
+        if inner_width <= 0:
+            return ("", "")
+
+        remaining_width = self._actual_width - consumed_width
+        formatting_length = frame_width - self._inner_width
+        remainder = (self._actual_width - formatting_length) - 1
+
+        print(remainder, remaining_width, consumed_width, frame_width)
+
+        left_remainder = math.floor(remainder / 2)
+        right_remainder = math.ceil(remainder / 2)
+
+        left_center_pad = int(inner_width + left_remainder) * " "
+        right_center_pad = int(inner_width + right_remainder) * " "
+
+        return (
+            left_center_pad,
+            right_center_pad,
+        )
+
+    # def _generate_right_alignment(self):

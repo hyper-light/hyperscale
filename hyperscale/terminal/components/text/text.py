@@ -29,10 +29,15 @@ class Text:
         self._color = color
         self._highlight = highlight
         self._mode = mode
+        self._base_size = len(text)
         self._attrs = self._set_attrs(attributes) if attributes else set()
 
     def __str__(self):
         return self._styled or self._text
+
+    @property
+    def raw_size(self):
+        return self._base_size
 
     @property
     def size(self):

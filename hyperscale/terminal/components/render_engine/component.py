@@ -90,7 +90,7 @@ class Component:
 
         return (
             frame,
-            self._horizontal_position,
             self._vertical_position,
             self._frame_width,
+            self.alignment.horizontal,
         )

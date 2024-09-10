@@ -15,7 +15,7 @@ async def display():
     factory = BarFactory()
 
     bar = factory.create_bar(
-        20,
+        10,
         colors=ProgressBarColorConfig(
             active_color="royal_blue",
             fail_color="white",
@@ -32,9 +32,9 @@ async def display():
                     width="small",
                     height="xx-small",
                     left_border="|",
-                    top_border="-",
+                    top_border=" ",
                     right_border="|",
-                    bottom_border="-",
+                    bottom_border=" ",
                     border_color="aquamarine_2",
                     mode="extended",
                 ),
@@ -92,14 +92,12 @@ async def display():
                 SectionConfig(
                     width="full",
                     height="small",
-                    left_border="|",
                     top_border="-",
-                    right_border="|",
                     bottom_border="-",
                 )
             ),
         ],
-        width=102,
+        width=103,
         height=30,
     )
 

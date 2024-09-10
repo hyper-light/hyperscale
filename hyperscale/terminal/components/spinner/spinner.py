@@ -161,6 +161,11 @@ class Spinner:
 
         self._stdout_lock = asyncio.Lock()
         self._loop = asyncio.get_event_loop()
+        self._base_size = len(self._spinner.size) + len(text)
+
+    @property
+    def raw_size(self):
+        return self._base_size
 
     @property
     def size(self):

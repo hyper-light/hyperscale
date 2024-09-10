@@ -147,6 +147,7 @@ class Bar:
         self._active_segment_idx = 1
         self._completed_segment_idx = 0
         self._size: int = 0
+        self._base_size = len(self.segments)
 
         self._sigmap = (
             sigmap
@@ -171,6 +172,10 @@ class Bar:
         self._stdout_lock = asyncio.Lock()
         self._loop = asyncio.get_event_loop()
         self._terminal_width: int | float = 0
+
+    @property
+    def raw_size(self):
+        return self._base_size
 
     @property
     def size(self):
