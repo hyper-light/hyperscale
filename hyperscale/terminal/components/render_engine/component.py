@@ -91,6 +91,6 @@ class Component:
         return (
             frame,
             self._vertical_position,
-            self._frame_width,
+            self.component.raw_size,
             self.alignment.horizontal,
         )
