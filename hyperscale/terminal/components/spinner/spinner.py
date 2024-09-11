@@ -161,17 +161,17 @@ class Spinner:
 
         self._stdout_lock = asyncio.Lock()
         self._loop = asyncio.get_event_loop()
-        self._base_size = len(self._spinner.size) + len(text)
         self._max_size: int | None = None
         self._loop = asyncio.get_event_loop()
+        self._base_size = self._spinner.size + len(self._text)
 
     @property
     def raw_size(self):
-        return self._spinner.size + len(self._text)
+        return self._base_size
 
     @property
     def size(self):
-        return self._spinner.size + len(self._text)
+        return self._base_size
 
     async def fit(
         self,
@@ -182,11 +182,14 @@ class Spinner:
             max_size = terminal_size[0]
 
         max_size -= self._spinner.size
+        if max_size <= 0 and self._text:
+            self._text = ""
 
-        if self._text:
+        elif self._text:
             self._text = self._text[:max_size]
 
         self._max_size = max_size
+        self._base_size = self._spinner.size + len(self._text)
 
     async def get_next_frame(self) -> str:
         if self._frame_queue:

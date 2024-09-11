@@ -29,6 +29,12 @@ class Component:
         self._horizontal_padding = horizontal_padding
         self._vertical_padding = vertical_padding
 
+    async def fit(
+        self,
+        max_size: int,
+    ):
+        await self.fit(max_size)
+
     def _set_position(
         self,
         section_width: int,

@@ -38,6 +38,7 @@ class Link:
         self._mode = mode
         self._attrs = self._set_attrs(attributes) if attributes else set()
         self._loop = asyncio.get_event_loop()
+        self._base_size = len(text)
 
     def __str__(self):
         return self._styled or "\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\" % (
@@ -47,11 +48,11 @@ class Link:
 
     @property
     def raw_size(self):
-        return len(self._text)
+        return self._base_size
 
     @property
     def size(self):
-        return len(self._text)
+        return self._base_size
 
     async def fit(
         self,
@@ -63,6 +64,7 @@ class Link:
 
         self._text = self._text[:max_size]
         self._max_size = max_size
+        self._base_size = len(self._text)
 
     async def get_next_frame(self) -> str:
         return await self.style()

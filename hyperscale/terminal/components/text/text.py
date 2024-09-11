@@ -45,7 +45,7 @@ class Text:
 
     @property
     def size(self):
-        return len(self._text)
+        return self._base_size
 
     async def fit(
         self,
@@ -57,6 +57,7 @@ class Text:
 
         self._text = self._text[:max_size]
         self._max_size = max_size
+        self._base_size = len(self._text)
 
     async def get_next_frame(self) -> str:
         return await self.style()

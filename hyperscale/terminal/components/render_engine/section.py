@@ -1,10 +1,12 @@
 import asyncio
 import math
+from collections import defaultdict
 from typing import Dict, List
 
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.styling import stylize
 
+from .alignment import AlignmentPriority, VerticalAlignment
 from .component import Component
 from .section_config import SectionConfig, SectionSize
 
@@ -54,6 +56,30 @@ class Section:
 
         self.left_offset = 0
         self.top_offset = 0
+
+        self._alignment_priotity_map: Dict[AlignmentPriority, int] = {
+            "auto": -1,
+            "low": 0,
+            "medium": 1,
+            "high": 2,
+            "exclusive": 3,
+        }
+
+        self._alignment_adjust_map: Dict[AlignmentPriority, float] = {
+            "auto": 1,
+            "low": 0.25,
+            "medium": 0.5,
+            "high": 0.75,
+            "exclusive": 1,
+        }
+
+        self.component_alignments: Dict[
+            VerticalAlignment,
+            List[Component],
+        ] = defaultdict(list)
+
+        for component in self.components:
+            self.component_alignments[component.alignment.vertical].append(component)
 
     @property
     def width(self):
@@ -145,6 +171,10 @@ class Section:
         self.top_offset = top_offset
 
     async def create_blocks(self):
+        unaligned_components: List[Component] = []
+        for vertical_alignment in self.component_alignments:
+            aligned_components, unaligned_components = await self._align_components()
+
         self._blocks = await asyncio.gather(
             *[self._to_row() for _ in range(self._inner_height)]
         )
@@ -174,6 +204,52 @@ class Section:
             )
 
             self._blocks.append(bottom_border)
+
+    async def _align_components(self, unprioritized_components: List[Component]):
+        aligned_components: List[Component] = []
+        unaligned_components: List[Component] = []
+
+        prioritized_components = sorted(
+            unprioritized_components,
+            key=lambda component: component.alignment.priority,
+            reverse=True,
+        )
+
+        line_width = self._inner_width
+
+        consumed_width = 0
+        component_idx = 0
+
+        while len(prioritized_components) > 0:
+            # If we have remaining unaligned components from the previous line,
+            # take these first else take the next prioritized component.
+            if len(unaligned_components) > 0:
+                component = unaligned_components.pop()
+
+            else:
+                component = prioritized_components[component_idx]
+
+            if component.alignment.priority == "auto":
+                component_width = line_width - consumed_width
+
+            else:
+                component_width_adjustment = self._alignment_adjust_map[
+                    component.alignment.priority
+                ]
+
+                component_width = round(component_width_adjustment * line_width)
+
+            next_consumed_width = consumed_width + component_width
+            if next_consumed_width < line_width:
+                await component.fit(component_width)
+
+                consumed_width += component_width
+
+                aligned_components.append(component)
+
+            else:
+                unaligned_components.append(component)
+                consumed_width = 0
 
     async def render(self):
         components = await asyncio.gather(

@@ -25,6 +25,8 @@ async def display():
         disable_output=True,
     )
 
+    await bar.fit(30)
+
     await canvas.initialize(
         [
             Section(
@@ -42,7 +44,7 @@ async def display():
                     Component(
                         bar,
                         Alignment(
-                            horizontal="right",
+                            horizontal="center",
                             vertical="center",
                         ),
                     )
@@ -97,7 +99,7 @@ async def display():
                 )
             ),
         ],
-        width=103,
+        width=100,
         height=30,
     )
 
