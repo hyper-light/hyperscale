@@ -7,6 +7,7 @@ from hyperscale.terminal.components.progress_bar import (
 from hyperscale.terminal.components.render_engine.canvas import Canvas
 from hyperscale.terminal.components.render_engine.component import Alignment, Component
 from hyperscale.terminal.components.render_engine.section import Section, SectionConfig
+from hyperscale.terminal.components.text import Text
 
 
 async def display():
@@ -15,7 +16,6 @@ async def display():
     factory = BarFactory()
 
     bar = factory.create_bar(
-        26,
         colors=ProgressBarColorConfig(
             active_color="royal_blue",
             fail_color="white",
@@ -47,7 +47,14 @@ async def display():
                             horizontal="center",
                             vertical="center",
                         ),
-                    )
+                    ),
+                    Component(
+                        Text("Hello!"),
+                        Alignment(
+                            horizontal="right",
+                            vertical="center",
+                        ),
+                    ),
                 ],
             ),
             Section(

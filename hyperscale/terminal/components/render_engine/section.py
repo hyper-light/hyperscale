@@ -6,7 +6,7 @@ from typing import Dict, List
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.styling import stylize
 
-from .alignment import AlignmentPriority, VerticalAlignment
+from .alignment import AlignmentPriority, HorizontalAlignment, VerticalAlignment
 from .component import Component
 from .section_config import SectionConfig, SectionSize
 
@@ -32,6 +32,24 @@ class Section:
         self._inner_height = 0
 
         self._render_event: asyncio.Event = None
+
+        self._vertical_alignments: List[VerticalAlignment] = [
+            "top",
+            "center",
+            "bottom",
+        ]
+
+        self._horizontal_alignments: List[HorizontalAlignment] = [
+            "left",
+            "center",
+            "right",
+        ]
+
+        self._horizontal_alignment_priority_map: Dict[HorizontalAlignment, int] = {
+            "left": 0,
+            "center": 1,
+            "right": 2,
+        }
 
         self._scale: Dict[SectionSize, float] = {
             "smallest": 0.05,
@@ -172,8 +190,25 @@ class Section:
 
     async def create_blocks(self):
         unaligned_components: List[Component] = []
+        max_components_per_row = len(self._horizontal_alignments)
+
         for vertical_alignment in self.component_alignments:
-            aligned_components, unaligned_components = await self._align_components()
+            components = self.component_alignments[vertical_alignment]
+            row_components_count = len(components)
+
+            assert (
+                row_components_count <= max_components_per_row
+            ), f"Err. - too many components for vertical alignment position. Encountered - {row_components_count} - but maximum supported is - {max_components_per_row}"
+
+            aligned_components, unaligned_components = await self._align_components(
+                components
+            )
+
+            assert (
+                len(unaligned_components) == 0
+            ), f"Err. - Exceeded max width of section by {sum([component.raw_size for component in unaligned_components])} - please reduce the alignment priority or number of components for the vertical position - {vertical_alignment}"
+
+            self.components = aligned_components
 
         self._blocks = await asyncio.gather(
             *[self._to_row() for _ in range(self._inner_height)]
@@ -218,7 +253,7 @@ class Section:
         line_width = self._inner_width
 
         consumed_width = 0
-        component_idx = 0
+        horizontal_positions_count = len(self._horizontal_alignments)
 
         while len(prioritized_components) > 0:
             # If we have remaining unaligned components from the previous line,
@@ -227,10 +262,35 @@ class Section:
                 component = unaligned_components.pop()
 
             else:
-                component = prioritized_components[component_idx]
+                component = prioritized_components.pop()
 
             if component.alignment.priority == "auto":
-                component_width = line_width - consumed_width
+                horizontal_alignment_priority = (
+                    self._horizontal_alignment_priority_map.get(
+                        component.alignment.horizontal
+                    )
+                )
+
+                horizontal_priority_count = len(
+                    [
+                        unprioritized_component
+                        for unprioritized_component in unprioritized_components
+                        if unprioritized_component.alignment.priority == "auto"
+                        and self._horizontal_alignment_priority_map.get(
+                            unprioritized_component.alignment.horizontal
+                        )
+                        > horizontal_alignment_priority
+                    ]
+                )
+
+                left_space = horizontal_positions_count - horizontal_priority_count
+
+                component_width = round(
+                    (line_width - consumed_width)
+                    / (horizontal_priority_count + left_space)
+                )
+
+                print(component_width)
 
             else:
                 component_width_adjustment = self._alignment_adjust_map[
@@ -240,7 +300,7 @@ class Section:
                 component_width = round(component_width_adjustment * line_width)
 
             next_consumed_width = consumed_width + component_width
-            if next_consumed_width < line_width:
+            if next_consumed_width <= line_width:
                 await component.fit(component_width)
 
                 consumed_width += component_width
@@ -250,6 +310,11 @@ class Section:
             else:
                 unaligned_components.append(component)
                 consumed_width = 0
+
+        return (
+            aligned_components,
+            unaligned_components,
+        )
 
     async def render(self):
         components = await asyncio.gather(
@@ -263,6 +328,17 @@ class Section:
                 for component in self.components
             ]
         )
+
+        components_by_alignment: Dict[
+            VerticalAlignment, Dict[HorizontalAlignment, List[Component]]
+        ] = defaultdict(lambda: defaultdict(list))
+
+        for component in self.components:
+            vertical_alignment = component.alignment.vertical
+            horizontal_alignment = component.alignment.horizontal
+            components_by_alignment[vertical_alignment][horizontal_alignment].append(
+                component
+            )
 
         x_start_offset = self.config.left_padding
         if self.config.left_border:
