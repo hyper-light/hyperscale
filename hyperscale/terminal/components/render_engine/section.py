@@ -132,6 +132,7 @@ class Section:
             border_size = len(self.config.right_border)
             horizontal_padding += border_size
 
+        self._horizontal_padding = horizontal_padding
         self._inner_width = self._inner_width - horizontal_padding
 
         if self.config.top_border:
@@ -204,9 +205,14 @@ class Section:
                 components
             )
 
+            remaining = (
+                sum([component.raw_size for component in unaligned_components])
+                + sum([component.raw_size for component in aligned_components])
+            ) - self._inner_width
+
             assert (
                 len(unaligned_components) == 0
-            ), f"Err. - Exceeded max width of section by {sum([component.raw_size for component in unaligned_components])} - please reduce the alignment priority or number of components for the vertical position - {vertical_alignment}"
+            ), f"Err. - Exceeded max width of section by {remaining} - please increase the canvas width, reduce the alignment priority, or reduce the number of components for the vertical position - {vertical_alignment}"
 
             self.components = aligned_components
 
@@ -240,14 +246,16 @@ class Section:
 
             self._blocks.append(bottom_border)
 
-    async def _align_components(self, unprioritized_components: List[Component]):
+    async def _align_components(
+        self,
+        unprioritized_components: List[Component],
+    ):
         aligned_components: List[Component] = []
         unaligned_components: List[Component] = []
 
         prioritized_components = sorted(
             unprioritized_components,
             key=lambda component: component.alignment.priority,
-            reverse=True,
         )
 
         line_width = self._inner_width
@@ -285,25 +293,23 @@ class Section:
 
                 left_space = horizontal_positions_count - horizontal_priority_count
 
-                component_width = round(
+                component_width = int(
                     (line_width - consumed_width)
                     / (horizontal_priority_count + left_space)
                 )
-
-                print(component_width)
 
             else:
                 component_width_adjustment = self._alignment_adjust_map[
                     component.alignment.priority
                 ]
 
-                component_width = round(component_width_adjustment * line_width)
+                component_width = int(component_width_adjustment * line_width)
 
-            next_consumed_width = consumed_width + component_width
+            await component.fit(component_width)
+
+            next_consumed_width = consumed_width + component.raw_size
             if next_consumed_width <= line_width:
-                await component.fit(component_width)
-
-                consumed_width += component_width
+                consumed_width += component.raw_size
 
                 aligned_components.append(component)
 
@@ -329,96 +335,104 @@ class Section:
             ]
         )
 
-        components_by_alignment: Dict[
-            VerticalAlignment, Dict[HorizontalAlignment, List[Component]]
-        ] = defaultdict(lambda: defaultdict(list))
-
-        for component in self.components:
-            vertical_alignment = component.alignment.vertical
-            horizontal_alignment = component.alignment.horizontal
-            components_by_alignment[vertical_alignment][horizontal_alignment].append(
-                component
-            )
-
-        x_start_offset = self.config.left_padding
-        if self.config.left_border:
-            x_start_offset += self._border_pad_offset_left
-
         y_start_offset = self.config.top_padding
         if self.config.top_border:
             y_start_offset += len(self.config.top_border.split("\n"))
 
-        for frame, y_pos, raw_size, horizontal_alignment in components:
+        lines: Dict[int, List[str]] = defaultdict(list)
+
+        left_border = await self._recreate_left_border()
+        right_border = await self._recreate_right_border()
+
+        left_pad = self.config.left_padding * " "
+        right_pad = self.config.right_padding * " "
+
+        pad_size = (
+            self._inner_width - sum([raw_size for _, _, raw_size, _ in components])
+        ) / 2
+
+        left_pad_adjust = math.floor(pad_size)
+        right_pad_adjust = math.ceil(pad_size)
+
+        horizontal_prioritized_components = sorted(
+            components,
+            key=lambda component_config: self._horizontal_alignment_priority_map.get(
+                component_config[3]
+            ),
+        )
+
+        consumed_widths: List[int] = []
+
+        for (
+            frame,
+            y_pos,
+            raw_size,
+            horizontal_alignment,
+        ) in horizontal_prioritized_components:
             y_start = y_pos + y_start_offset
 
             if horizontal_alignment == "left":
-                left_border = await self._recreate_left_border()
-                left_pad = self.config.left_padding * " "
+                lines[y_start].append(frame)
 
-                right_border = await self._recreate_right_border()
-                right_pad = self.config.right_padding * " "
-
-                line = "".join(
-                    [
-                        left_border,
-                        left_pad,
-                        frame,
-                        right_pad,
-                        right_border,
-                    ]
-                )
+                consumed_widths.append(raw_size)
 
             elif horizontal_alignment == "center":
-                pad_size = (self._inner_width - raw_size) / 2
-                left_pad_adjust = math.floor(pad_size)
-                right_pad_adjust = math.ceil(pad_size)
+                lines[y_start].append(
+                    (left_pad_adjust * " ") + frame + (right_pad_adjust * " ")
+                )
 
-                left_border = await self._recreate_left_border()
-                left_pad = (
-                    self.config.left_padding
-                    + left_pad_adjust
-                    + len(self.config.left_border)
-                ) * " "
-
-                right_border = await self._recreate_right_border()
-                right_pad = (
-                    self.config.right_padding
-                    + right_pad_adjust
-                    + len(self.config.right_border)
-                ) * " "
-
-                line = "".join(
+                consumed_widths.extend(
                     [
-                        left_border,
-                        left_pad,
-                        frame,
-                        right_pad,
-                        right_border,
+                        left_pad_adjust,
+                        raw_size,
+                        right_pad_adjust,
                     ]
                 )
 
             else:
-                pad_size = self._inner_width - raw_size
-                left_border = await self._recreate_left_border()
-                border_lengths = len(self.config.left_border) + len(
-                    self.config.right_border
-                )
-                left_pad = (self.config.left_padding + pad_size + border_lengths) * " "
+                right_align_adjust = self._inner_width - sum(consumed_widths) - raw_size
 
-                right_border = await self._recreate_right_border()
-                right_pad = self.config.right_padding * " "
+                right_align_pad = right_align_adjust * " "
 
-                line = "".join(
+                lines[y_start].append(right_align_pad + frame)
+                consumed_widths.extend(
                     [
-                        left_border,
-                        left_pad,
-                        frame,
-                        right_pad,
-                        right_border,
+                        right_align_adjust,
+                        raw_size,
                     ]
                 )
 
-            self._blocks[y_start] = line
+        consumed_width = (
+            sum(consumed_widths) + self.config.left_padding + self.config.right_padding
+        )
+
+        if self.config.left_border is None and consumed_width < self._actual_width:
+            for y_start, line in lines.items():
+                line_length = len(line)
+                line.insert(line_length - 1, " ")
+
+                lines[y_start] = line
+
+        if self.config.right_border is None and consumed_width < self._actual_width:
+            for y_start, line in lines.items():
+                line_length = len(line)
+
+                line.insert(line_length - 1, " ")
+
+                lines[y_start] = line
+
+        for y_start, line in lines.items():
+            joined_line = "".join(line)
+
+            self._blocks[y_start] = "".join(
+                [
+                    left_border,
+                    left_pad,
+                    joined_line,
+                    right_pad,
+                    right_border,
+                ]
+            )
 
         return self._blocks
 

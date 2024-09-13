@@ -25,27 +25,32 @@ async def display():
         disable_output=True,
     )
 
-    await bar.fit(30)
-
     await canvas.initialize(
         [
             Section(
                 SectionConfig(
                     width="small",
                     height="xx-small",
-                    left_border="|",
                     top_border=" ",
-                    right_border="|",
                     bottom_border=" ",
                     border_color="aquamarine_2",
                     mode="extended",
                 ),
                 [
                     Component(
+                        Text("Hello!"),
+                        Alignment(
+                            horizontal="left",
+                            vertical="center",
+                            priority="low",
+                        ),
+                    ),
+                    Component(
                         bar,
                         Alignment(
                             horizontal="center",
                             vertical="center",
+                            priority="medium",
                         ),
                     ),
                     Component(
@@ -53,6 +58,7 @@ async def display():
                         Alignment(
                             horizontal="right",
                             vertical="center",
+                            priority="low",
                         ),
                     ),
                 ],
@@ -106,7 +112,7 @@ async def display():
                 )
             ),
         ],
-        width=100,
+        width=110,
         height=30,
     )
 

@@ -222,15 +222,8 @@ class Bar:
                 )
             )
 
-        additional_buffer_size = 0
-        if not self._chars.start_char:
-            additional_buffer_size += 1
-
-        if not self._chars.end_char:
-            additional_buffer_size += 1
-
         self._max_size = max_size
-        self._base_size = len(self.segments) + text_length + additional_buffer_size
+        self._base_size = len(self.segments) + text_length
 
     async def _compose_out(
         self,

@@ -31,17 +31,17 @@ class Component:
 
     @property
     def raw_size(self):
-        return self.component.raw_size
+        return self.component.raw_size + self._horizontal_padding
 
     @property
     def size(self):
-        return self.component.size
+        return self.component.size + self._horizontal_padding
 
     async def fit(
         self,
         max_size: int,
     ):
-        await self.component.fit(max_size)
+        await self.component.fit(max_size - self._horizontal_padding)
 
     def _set_position(
         self,
@@ -102,9 +102,18 @@ class Component:
                 section_vertical_center,
             )
 
+        if self._horizontal_padding:
+            frame = "".join(
+                [
+                    " " * self._horizontal_padding,
+                    frame,
+                    " " * self._horizontal_padding,
+                ]
+            )
+
         return (
             frame,
             self._vertical_position,
-            self.component.raw_size,
+            self.component.raw_size + self._horizontal_padding,
             self.alignment.horizontal,
         )
