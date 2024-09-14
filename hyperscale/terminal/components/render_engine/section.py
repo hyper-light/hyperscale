@@ -471,3 +471,9 @@ class Section:
             )
 
         return ""
+
+    async def stop(self):
+        await asyncio.gather(*[component.stop() for component in self.components])
+
+    async def abort(self):
+        await asyncio.gather(*[component.abort() for component in self.components])

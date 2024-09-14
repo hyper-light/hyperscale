@@ -96,3 +96,13 @@ class Canvas:
 
         self._total_size += len(segments)
         return "\n".join(segments)
+
+    async def stop(self):
+        await asyncio.gather(
+            *[section.stop() for row in self._sections for section in row]
+        )
+
+    async def abort(self):
+        await asyncio.gather(
+            *[section.abort() for row in self._sections for section in row]
+        )

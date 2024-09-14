@@ -165,3 +165,9 @@ class Text:
     def attrs(self, value: Sequence[str]) -> None:
         new_attrs = self._set_attrs(value) if value else set()
         self._attrs = self._attrs.union(new_attrs)
+
+    async def stop(self):
+        pass
+
+    async def abort(self):
+        pass

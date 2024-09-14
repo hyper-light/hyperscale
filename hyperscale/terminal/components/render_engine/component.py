@@ -117,3 +117,9 @@ class Component:
             self.component.raw_size + self._horizontal_padding,
             self.alignment.horizontal,
         )
+
+    async def stop(self):
+        await self.component.stop()
+
+    async def abort(self):
+        await self.component.abort()

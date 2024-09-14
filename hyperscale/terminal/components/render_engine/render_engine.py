@@ -25,6 +25,7 @@ async def default_handler(signame: str, engine: RenderEngine):  # pylint: disabl
     ``signum`` and ``frame`` are mandatory arguments. Check ``signal.signal``
     function for more details.
     """
+
     await engine.abort()
 
 
@@ -164,9 +165,10 @@ class RenderEngine:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
 
-        if self._spin_thread:
-            self._stop_run.set()
-            await self._spin_thread
+        await self.canvas.stop()
+
+        self._stop_run.set()
+        await self._spin_thread
 
         await self._run_engine
 
@@ -185,6 +187,8 @@ class RenderEngine:
     async def abort(self):
         self._stop_time = time.time()
 
+        await self.canvas.abort()
+
         if self._dfl_sigmap:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
@@ -202,15 +206,11 @@ class RenderEngine:
             ):
                 pass
 
+        if self._stdout_lock.locked():
+            self._stdout_lock.release()
+
         await self._stdout_lock.acquire()
         await self._clear_terminal()
-
-        frame = await self.canvas.render()
-        await asyncio.to_thread(sys.stdout.write, "\r\n")
-        await asyncio.to_thread(sys.stdout.write, frame)
-        await asyncio.to_thread(sys.stdout.write, "\n\n")
-        await asyncio.to_thread(sys.stdout.flush)
-        self._stdout_lock.release()
 
         try:
             self._run_engine.cancel()

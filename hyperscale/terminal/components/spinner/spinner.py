@@ -534,10 +534,10 @@ class Spinner:
         attrs: Sequence[str] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
-        if self.enabled:
-            if self._sigmap:
-                self._register_signal_handlers()
+        if self.enabled and self._sigmap and self._enable_output:
+            self._register_signal_handlers()
 
+        if self.enabled:
             await self._hide_cursor()
             self._start_time = time.time()
             self._stop_time = None  # Reset value to properly calculate subsequent spinner starts (if any)  # pylint: disable=line-too-long
@@ -570,6 +570,30 @@ class Spinner:
             if self._spin_thread:
                 self._stop_spin.set()
                 await self._spin_thread
+
+            if self._enable_output:
+                await self._clear_line()
+                await self._show_cursor()
+
+    async def abort(self):
+        if self.enabled:
+            self._stop_time = time.time()
+
+            if self._dfl_sigmap:
+                # Reset registered signal handlers to default ones
+                self._reset_signal_handlers()
+
+            if self._spin_thread:
+                self._stop_spin.set()
+                try:
+                    self._spin_thread.cancel()
+
+                except (
+                    asyncio.CancelledError,
+                    asyncio.InvalidStateError,
+                    asyncio.TimeoutError,
+                ):
+                    pass
 
             if self._enable_output:
                 await self._clear_line()

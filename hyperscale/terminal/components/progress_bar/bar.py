@@ -43,7 +43,7 @@ async def default_handler(signame: str, bar: Bar):  # pylint: disable=unused-arg
     """
 
     await bar.fail()
-    await bar.cancel()
+    await bar.stop()
 
 
 class Bar:
@@ -439,10 +439,9 @@ class Bar:
 
         if self.enabled and self._enable_output:
             await self._hide_cursor()
-
-        if self.enabled:
             self._register_signal_handlers()
 
+        if self.enabled:
             self._start_time = time.time()
             self._stop_time = None  # Reset value to properly calculate subsequent spinner starts (if any)  # pylint: disable=line-too-long
             self._stop_spin = asyncio.Event()
@@ -468,17 +467,33 @@ class Bar:
                 # Reset registered signal handlers to default ones
                 self._reset_signal_handlers()
 
-            if self._spin_thread:
-                self._stop_spin.set()
-                await self._spin_thread
+            self._stop_spin.set()
 
-            await self._run_progress_bar
+            try:
+                self._spin_thread.cancel()
+
+            except (
+                asyncio.CancelledError,
+                asyncio.TimeoutError,
+                asyncio.InvalidStateError,
+            ):
+                pass
+
+            try:
+                self._run_progress_bar.cancel()
+
+            except (
+                asyncio.CancelledError,
+                asyncio.TimeoutError,
+                asyncio.InvalidStateError,
+            ):
+                pass
 
             if self._enable_output:
                 await self._clear_line()
                 await self._show_cursor()
 
-    async def cancel(self):
+    async def abort(self):
         if self.enabled:
             self._stop_time = time.time()
 
