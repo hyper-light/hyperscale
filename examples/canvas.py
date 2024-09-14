@@ -43,19 +43,11 @@ async def display():
                 ),
                 [
                     Component(
-                        Text("Hello!"),
+                        bar,
                         Alignment(
                             horizontal="left",
                             vertical="center",
-                            priority="low",
-                        ),
-                    ),
-                    Component(
-                        bar,
-                        Alignment(
-                            horizontal="center",
-                            vertical="center",
-                            priority="medium",
+                            priority="high",
                         ),
                     ),
                     Component(

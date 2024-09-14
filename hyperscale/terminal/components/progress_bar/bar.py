@@ -423,7 +423,10 @@ class Bar:
             self._active_segment_idx = next_active_segment_idx
             self._next_segment += self._segment_size
 
-        if self._completed_segment_idx != self._active_segment_idx:
+        if (
+            self._completed_segment_idx < self._active_segment_idx
+            and self._active_segment_idx < self._max_size - 1
+        ):
             self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
 
     async def _run(

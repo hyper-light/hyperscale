@@ -27,7 +27,7 @@ class Canvas:
     ):
         terminal_size = await asyncio.to_thread(shutil.get_terminal_size)
 
-        self._max_width = terminal_size.columns * 1.75
+        self._max_width = terminal_size.columns * 1.5
         self._max_height = int(math.ceil(terminal_size.lines / 10.0)) * 10
 
         if width is None:

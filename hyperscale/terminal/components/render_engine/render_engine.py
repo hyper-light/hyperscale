@@ -109,15 +109,14 @@ class RenderEngine:
                 continue
 
             await self._stdout_lock.acquire()
+            await self._clear_terminal()
 
             frame = await self.canvas.render()
+
             await asyncio.to_thread(sys.stdout.write, "\r\n")
             await asyncio.to_thread(sys.stdout.write, frame)
-            await asyncio.to_thread(sys.stdout.write, "\r")
+            await asyncio.to_thread(sys.stdout.write, "\n\r")
             await asyncio.to_thread(sys.stdout.flush)
-
-            self._frame_height = len(frame.splitlines())
-            await self._clear_terminal()
 
             # Wait
             try:
@@ -150,12 +149,12 @@ class RenderEngine:
         if sys.stdout.isatty():
             # ANSI Control Sequence EL does not work in Jupyter
             await self._loop.run_in_executor(
-                None, sys.stdout.write, f"\033[{self.canvas.height + 4}A\033[2K"
+                None, sys.stdout.write, f"\033[{self.canvas.height + 4}A\033[4K"
             )
 
         else:
             await self._loop.run_in_executor(
-                None, sys.stdout.write, f"\033[{self._frame_height + 4}A\033[2K"
+                None, sys.stdout.write, f"\033[{self._frame_height + 4}A\033[4K"
             )
 
     async def stop(self):
@@ -177,7 +176,7 @@ class RenderEngine:
         frame = await self.canvas.render()
         await asyncio.to_thread(sys.stdout.write, "\r\n")
         await asyncio.to_thread(sys.stdout.write, frame)
-        await asyncio.to_thread(sys.stdout.write, "\n")
+        await asyncio.to_thread(sys.stdout.write, "\n\n")
         await asyncio.to_thread(sys.stdout.flush)
         self._stdout_lock.release()
 
@@ -209,7 +208,7 @@ class RenderEngine:
         frame = await self.canvas.render()
         await asyncio.to_thread(sys.stdout.write, "\r\n")
         await asyncio.to_thread(sys.stdout.write, frame)
-        await asyncio.to_thread(sys.stdout.write, "\n")
+        await asyncio.to_thread(sys.stdout.write, "\n\n")
         await asyncio.to_thread(sys.stdout.flush)
         self._stdout_lock.release()
 
