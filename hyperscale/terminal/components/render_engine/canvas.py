@@ -1,6 +1,6 @@
 import asyncio
 import math
-import os
+import shutil
 from typing import List
 
 from .section import Section
@@ -13,6 +13,11 @@ class Canvas:
         self._max_width = 0
         self._max_height = 0
         self._sections: List[List[Section]] = [[]]
+        self._total_size: int = 0
+
+    @property
+    def size(self):
+        return self._total_size
 
     async def initialize(
         self,
@@ -20,10 +25,10 @@ class Canvas:
         width: int | None = None,
         height: int | None = None,
     ):
-        terminal_size = await asyncio.to_thread(os.get_terminal_size)
+        terminal_size = await asyncio.to_thread(shutil.get_terminal_size)
 
-        self._max_width = terminal_size[0]
-        self._max_height = terminal_size[1]
+        self._max_width = terminal_size.columns * 1.75
+        self._max_height = int(math.ceil(terminal_size.lines / 10.0)) * 10
 
         if width is None:
             width = math.floor(self._max_width / 2)
@@ -73,25 +78,21 @@ class Canvas:
                 section.fit_height(row_height)
 
     async def render(self):
+        self._total_size = len(self._sections)
         canvas = await asyncio.gather(*[self._join_row(row) for row in self._sections])
 
+        self._total_size += len(canvas)
         return "\n".join(canvas)
 
     async def _join_row(self, row: List[Section]):
         rendered_blocks = await asyncio.gather(*[section.render() for section in row])
 
-        base = rendered_blocks[0]
-        base_height = len(base)
+        semgents_count = len(rendered_blocks[0])
 
-        max_height = max([section.height for section in row])
+        segments = ["" for _ in range(semgents_count)]
+        for segment in rendered_blocks:
+            for segment_idx, segement_row in enumerate(segment):
+                segments[segment_idx] += segement_row
 
-        if max_height > base_height:
-            delta = max_height - base_height
-            for _ in range(delta):
-                base.append("".join([" " for _ in range(row[0].width)]))
-
-        for segment in rendered_blocks[1:]:
-            for idx, segment_row in enumerate(segment):
-                base[idx] += segment_row
-
-        return "\n".join(base)
+        self._total_size += len(segments)
+        return "\n".join(segments)

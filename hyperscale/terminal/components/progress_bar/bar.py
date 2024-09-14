@@ -62,7 +62,7 @@ class Bar:
         total: int = 0
         if isinstance(data, int):
             total = data
-            data = range(data)
+            data = iter(range(data))
 
         elif not isinstance(data, int) and hasattr("__len__", data):
             total = len(data)
@@ -144,6 +144,10 @@ class Bar:
 
         self._stdout_lock = asyncio.Lock()
         self._loop = asyncio.get_event_loop()
+
+    @property
+    def total(self):
+        return self._total
 
     @property
     def raw_size(self):
@@ -313,14 +317,52 @@ class Bar:
             await asyncio.gather(*[segment.style() for segment in self.segments])
 
             # If we have 1000 items with a bar width of 100, every 10 items we should increment a segment.
-            self._segment_size = self._total / self._max_size
+
+            if self._total > self._max_size:
+                self._segment_size = self._total / self._max_size
+
+            else:
+                self._segment_size = self._max_size / self._total
+
             self._next_segment = self._segment_size
+
             self._run_progress_bar = asyncio.create_task(
                 self._run(
                     text,
                     mode=mode,
                 )
             )
+
+    async def __anext__(self):
+        total = self._total
+
+        item: Any | None = None
+
+        if self._max_size > self._total:
+            total = self.raw_size
+
+        if inspect.isasyncgen(self._data) and self._next_segment <= total:
+            item = await anext(self._data)
+
+            self.update()
+
+        elif self._next_segment <= total:
+            item = next(self._data)
+
+            if inspect.isawaitable(item):
+                item = await item
+
+            self.update()
+
+        else:
+            raise StopAsyncIteration(
+                "Err. - async bar iterable is exhausted. No more data!"
+            )
+
+        if self._next_segment > total:
+            await self.ok()
+
+        return item
 
     async def __aiter__(self):
         if inspect.isasyncgen(self._data):
@@ -331,23 +373,9 @@ class Bar:
 
             await self.ok()
 
-        if not inspect.isasyncgen(self._data):
+        else:
             for item in self._data:
-                if inspect.iscoroutine(item):
-                    item = await item
-
-                elif (
-                    isinstance(item, asyncio.Task)
-                    and not item.done()
-                    and not item.cancelled()
-                ):
-                    item = await item
-
-                elif (
-                    isinstance(item, asyncio.Future)
-                    and not item.done()
-                    and not item.cancelled()
-                ):
+                if inspect.isawaitable(item):
                     item = await item
 
                 yield item
@@ -357,7 +385,46 @@ class Bar:
             await self.ok()
 
     def update(self, amount: int | float = 1):
-        self._completed += amount
+        if self._total >= self._max_size:
+            self._completed += amount
+
+        else:
+            self._completed += amount * self._segment_size
+
+        total = self._total
+        if self._max_size > self._total:
+            total = self.raw_size
+
+        if self._completed >= total:
+            self.segments[self._active_segment_idx].status = SegmentStatus.OK
+            self._completed_segment_idx = self._active_segment_idx
+
+        elif self._completed >= self._next_segment and self._total >= self._max_size:
+            # First set the active segment to OK/Completed status
+            self.segments[self._active_segment_idx].status = SegmentStatus.OK
+            self._completed_segment_idx = self._active_segment_idx
+            self._active_segment_idx = min(
+                self._active_segment_idx + 1, self._max_size - 1
+            )
+            self._next_segment += self._segment_size
+
+        elif self._completed >= self._next_segment and self._total < self._max_size:
+            # First set the active segment to OK/Completed status
+            next_active_segment_idx = self._active_segment_idx + math.ceil(
+                self._max_size / self._total
+            )
+
+            next_active_segment_idx = min(next_active_segment_idx, self._max_size - 1)
+
+            for segment_idx in range(self._active_segment_idx, next_active_segment_idx):
+                self.segments[segment_idx].status = SegmentStatus.OK
+
+            self._completed_segment_idx = next_active_segment_idx - 1
+            self._active_segment_idx = next_active_segment_idx
+            self._next_segment += self._segment_size
+
+        if self._completed_segment_idx != self._active_segment_idx:
+            self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
 
     async def _run(
         self,
@@ -571,18 +638,10 @@ class Bar:
 
             await self._stdout_lock.acquire()
 
-            if self._active_segment_idx >= self._total:
-                self.segments[self._active_segment_idx].status = SegmentStatus.OK
-                self._completed_segment_idx = self._active_segment_idx
+            total = self._total
 
-            elif self._completed >= self._next_segment:
-                # First set the active segment to OK/Completed status
-                self.segments[self._active_segment_idx].status = SegmentStatus.OK
-                self._completed_segment_idx = self._active_segment_idx
-                self._active_segment_idx += 1
-                self._next_segment += self._segment_size
-
-                self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
+            if self._max_size > self._total:
+                total = self.raw_size
 
             # Compose output
             spin_phase = "".join([segment.next for segment in self.segments])
@@ -616,7 +675,7 @@ class Bar:
 
             self._stdout_lock.release()
 
-            if self._next_segment > self._total:
+            if self._next_segment > total:
                 break
 
     async def _clear_line(self):

@@ -4,18 +4,23 @@ from hyperscale.terminal.components.progress_bar import (
     BarFactory,
     ProgressBarColorConfig,
 )
-from hyperscale.terminal.components.render_engine.canvas import Canvas
-from hyperscale.terminal.components.render_engine.component import Alignment, Component
-from hyperscale.terminal.components.render_engine.section import Section, SectionConfig
+from hyperscale.terminal.components.render_engine import (
+    Alignment,
+    Component,
+    RenderEngine,
+    Section,
+    SectionConfig,
+)
 from hyperscale.terminal.components.text import Text
 
 
 async def display():
-    canvas = Canvas()
+    engine = RenderEngine()
 
     factory = BarFactory()
 
     bar = factory.create_bar(
+        size=20,
         colors=ProgressBarColorConfig(
             active_color="royal_blue",
             fail_color="white",
@@ -25,7 +30,7 @@ async def display():
         disable_output=True,
     )
 
-    await canvas.initialize(
+    await engine.initialize(
         [
             Section(
                 SectionConfig(
@@ -112,13 +117,16 @@ async def display():
                 )
             ),
         ],
-        width=110,
-        height=30,
     )
 
-    print(await canvas.render())
+    await engine.render()
+    items = []
 
-    await canvas.render()
+    async for idx in bar:
+        await asyncio.sleep(1)
+        items.append(idx)
+
+    await engine.stop()
 
 
 asyncio.run(display())
