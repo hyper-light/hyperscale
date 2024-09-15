@@ -172,6 +172,9 @@ class RenderEngine:
 
         await self._run_engine
 
+        if self._stdout_lock.locked():
+            self._stdout_lock.release()
+
         await self._stdout_lock.acquire()
         await self._clear_terminal()
 
