@@ -1,5 +1,4 @@
 import asyncio
-import os
 
 from hyperscale.terminal.components.progress_bar import (
     BarFactory,
@@ -21,7 +20,7 @@ async def display():
     factory = BarFactory()
 
     bar = factory.create_bar(
-        size=20,
+        20,
         colors=ProgressBarColorConfig(
             active_color="royal_blue",
             fail_color="white",
@@ -120,8 +119,6 @@ async def display():
         items.append(idx)
 
     await engine.stop()
-
-    os._exit(0)
 
 
 asyncio.run(display())

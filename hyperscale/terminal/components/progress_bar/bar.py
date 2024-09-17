@@ -246,22 +246,20 @@ class Bar:
         #         timedelta(seconds=sec), fsec
         #     )
         # Mode
-        if compose_mode is None and text:
+        if text:
             out = f"\r{frame} {text}"
-        elif text:
-            out = f"{frame} {text}\n"
-
-        elif compose_mode is None:
-            out = f"{frame}"
 
         else:
-            out = f"{frame}\n"
+            out = f"\r{frame}"
+
+        if compose_mode == "last" and self._enable_output:
+            out += "\n"
 
         return out
 
     async def __aenter__(self):
         if self._run_progress_bar is None:
-            self._run_progress_bar = asyncio.create_task(self._run())
+            self._run_progress_bar = asyncio.ensure_future(self._run())
 
         return self
 
@@ -326,7 +324,7 @@ class Bar:
 
             self._next_segment = self._segment_size
 
-            self._run_progress_bar = asyncio.create_task(
+            self._run_progress_bar = asyncio.ensure_future(
                 self._run(
                     text,
                     mode=mode,
@@ -341,12 +339,12 @@ class Bar:
         if self._max_size > self._total:
             total = self.raw_size
 
-        if inspect.isasyncgen(self._data) and self._next_segment <= total:
+        if inspect.isasyncgen(self._data) and self._completed <= total:
             item = await anext(self._data)
 
             self.update()
 
-        elif self._next_segment <= total:
+        elif self._completed <= total:
             item = next(self._data)
 
             if inspect.isawaitable(item):
@@ -359,9 +357,6 @@ class Bar:
                 "Err. - async bar iterable is exhausted. No more data!"
             )
 
-        if self._next_segment > total:
-            await self.ok()
-
         return item
 
     async def __aiter__(self):
@@ -370,8 +365,6 @@ class Bar:
                 yield item
 
                 self.update()
-
-            await self.ok()
 
         else:
             for item in self._data:
@@ -382,52 +375,31 @@ class Bar:
 
                 self.update()
 
-            await self.ok()
+        await self.ok()
 
     def update(self, amount: int | float = 1):
         if self._total >= self._max_size:
-            self._completed += amount
+            self._completed += amount / self._segment_size
 
         else:
             self._completed += amount * self._segment_size
 
-        total = self._total
-        if self._max_size > self._total:
-            total = self.raw_size
+        completed = round(self._completed)
+        last_segment = self._max_size
 
-        if self._completed >= total:
-            self.segments[self._active_segment_idx].status = SegmentStatus.OK
-            self._completed_segment_idx = self._active_segment_idx
+        if completed < last_segment:
+            for idx in range(completed):
+                self.segments[idx + 1].status = SegmentStatus.OK
 
-        elif self._completed >= self._next_segment and self._total >= self._max_size:
-            # First set the active segment to OK/Completed status
-            self.segments[self._active_segment_idx].status = SegmentStatus.OK
-            self._completed_segment_idx = self._active_segment_idx
-            self._active_segment_idx = min(
-                self._active_segment_idx + 1, self._max_size - 1
-            )
-            self._next_segment += self._segment_size
+            self.segments[completed].status = SegmentStatus.ACTIVE
 
-        elif self._completed >= self._next_segment and self._total < self._max_size:
-            # First set the active segment to OK/Completed status
-            next_active_segment_idx = self._active_segment_idx + math.ceil(
-                self._max_size / self._total
-            )
+        elif self.segments[0].segment_type == SegmentType.START:
+            for idx in range(completed):
+                self.segments[idx + 1].status = SegmentStatus.OK
 
-            next_active_segment_idx = min(next_active_segment_idx, self._max_size - 1)
-
-            for segment_idx in range(self._active_segment_idx, next_active_segment_idx):
-                self.segments[segment_idx].status = SegmentStatus.OK
-
-            self._completed_segment_idx = next_active_segment_idx - 1
-            self._active_segment_idx = next_active_segment_idx
-            self._next_segment += self._segment_size
-
-        if (
-            self._completed_segment_idx < self._active_segment_idx
-            and self._active_segment_idx < self._max_size - 1
-        ):
-            self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
+        else:
+            for idx in range(completed):
+                self.segments[idx].status = SegmentStatus.OK
 
     async def _run(
         self,
@@ -447,7 +419,7 @@ class Bar:
             self._stop_spin = asyncio.Event()
             self._hide_spin = asyncio.Event()
             try:
-                self._spin_thread = asyncio.create_task(
+                self._spin_thread = asyncio.ensure_future(
                     self._spin(
                         text=text,
                         mode=TerminalMode.to_mode(mode),
@@ -460,41 +432,58 @@ class Bar:
                     await self._show_cursor()
 
     async def stop(self):
-        if self.enabled:
-            self._stop_time = time.time()
+        if not self._enable_output:
+            chars = "".join([segment.next for segment in self.segments])
 
-            if self._dfl_sigmap:
-                # Reset registered signal handlers to default ones
-                self._reset_signal_handlers()
+            char = to_unicode(chars)
+            self._last_frame = await self._compose_out(
+                char,
+                compose_mode="last",
+                mode=self._mode,
+            )
 
-            self._stop_spin.set()
+        if self._frame_queue:
+            self._frame_queue.put_nowait(self._last_frame)
 
-            try:
-                self._spin_thread.cancel()
+        self._stop_time = time.time()
 
-            except (
-                asyncio.CancelledError,
-                asyncio.TimeoutError,
-                asyncio.InvalidStateError,
-            ):
-                pass
+        if self._dfl_sigmap:
+            # Reset registered signal handlers to default ones
+            self._reset_signal_handlers()
 
-            try:
-                self._run_progress_bar.cancel()
+        self._stop_spin.set()
 
-            except (
-                asyncio.CancelledError,
-                asyncio.TimeoutError,
-                asyncio.InvalidStateError,
-            ):
-                pass
+        try:
+            self._spin_thread.cancel()
+            await asyncio.sleep(0)
 
-            if self._enable_output:
-                await self._clear_line()
-                await self._show_cursor()
+        except (
+            asyncio.CancelledError,
+            asyncio.TimeoutError,
+            asyncio.InvalidStateError,
+        ):
+            pass
+
+        if self._enable_output:
+            await self._clear_line()
+
+        try:
+            self._run_progress_bar.cancel()
+            await asyncio.sleep(0)
+
+        except (
+            asyncio.CancelledError,
+            asyncio.TimeoutError,
+            asyncio.InvalidStateError,
+        ):
+            pass
+
+        if self._enable_output:
+            await self._show_cursor()
 
     async def abort(self):
         if self.enabled:
+            await self.fail()
             self._stop_time = time.time()
 
             if self._dfl_sigmap:
@@ -616,9 +605,6 @@ class Bar:
         text: str | bytes | ProgressText | None = None,
         mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ):
-        active_segment_idx = min(self._active_segment_idx, self._total)
-        self.segments[active_segment_idx].status = status
-
         chars = "".join([segment.next for segment in self.segments])
 
         char = to_unicode(chars)
@@ -693,13 +679,13 @@ class Bar:
 
             self._stdout_lock.release()
 
-            if self._next_segment > total:
+            if self._completed >= total:
                 break
 
     async def _clear_line(self):
         if sys.stdout.isatty():
             # ANSI Control Sequence EL does not work in Jupyter
-            await self._loop.run_in_executor(None, sys.stdout.write, "\r\033[K")
+            await self._loop.run_in_executor(None, sys.stdout.write, "\r\0332A\033[4K")
 
         else:
             fill = " " * self._cur_line_len
@@ -713,7 +699,6 @@ class Bar:
         if sys.stdout.isatty():
             # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
             await loop.run_in_executor(None, sys.stdout.write, "\033[?25h")
-
             await loop.run_in_executor(None, sys.stdout.flush)
 
     @staticmethod
@@ -741,7 +726,7 @@ class Bar:
 
             self._loop.add_signal_handler(
                 getattr(signal, sig.name),
-                lambda signame=sig.name: asyncio.create_task(
+                lambda signame=sig.name: asyncio.ensure_future(
                     default_handler(signame, self)
                 ),
             )

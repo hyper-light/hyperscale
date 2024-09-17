@@ -11,7 +11,6 @@ async def run():
 
     bar = factory.create_bar(
         20,
-        borders_char="|",
         colors=ProgressBarColorConfig(
             active_color="royal_blue",
             fail_color="white",
@@ -20,17 +19,14 @@ async def run():
         mode="extended",
     )
 
-    await bar.fit(40)
+    await bar.fit(31)
     await bar.run()
 
     items = []
 
-    for _ in range(20):
+    async for idx in bar:
         await asyncio.sleep(1)
-        item = await anext(bar)
-        items.append(item)
-
-    print(len(items))
+        items.append(idx)
 
 
 asyncio.run(run())

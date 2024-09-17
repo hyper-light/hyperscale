@@ -14,6 +14,7 @@ class Canvas:
         self._max_height = 0
         self._sections: List[List[Section]] = [[]]
         self._total_size: int = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
     def size(self):
@@ -25,7 +26,10 @@ class Canvas:
         width: int | None = None,
         height: int | None = None,
     ):
-        terminal_size = await asyncio.to_thread(shutil.get_terminal_size)
+        if self._loop is None:
+            self._loop = asyncio.get_event_loop()
+
+        terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
 
         self._max_width = terminal_size.columns * 1.5
         self._max_height = int(math.ceil(terminal_size.lines / 10.0)) * 10
