@@ -81,7 +81,7 @@ class RenderEngine:
 
     async def render(self):
         if self._run_engine is None:
-            self._run_engine = asyncio.create_task(self._run())
+            self._run_engine = asyncio.ensure_future(self._run())
 
     async def _run(self):
         self._loop = asyncio.get_event_loop()
@@ -96,7 +96,7 @@ class RenderEngine:
         self._stdout_lock = asyncio.Lock()
 
         try:
-            self._spin_thread = asyncio.create_task(self._execute_render_loop())
+            self._spin_thread = asyncio.ensure_future(self._execute_render_loop())
         except Exception:
             # Ensure cursor is not hidden if any failure occurs that prevents
             # getting it back
@@ -149,13 +149,15 @@ class RenderEngine:
     async def _clear_terminal(self):
         if sys.stdout.isatty():
             # ANSI Control Sequence EL does not work in Jupyter
-            await self._loop.run_in_executor(
-                None, sys.stdout.write, f"\033[{self.canvas.height + 4}A\033[4K"
+            await asyncio.to_thread(
+                sys.stdout.write,
+                f"\033[{self.canvas.height + 3}A\033[4K",
             )
 
         else:
-            await self._loop.run_in_executor(
-                None, sys.stdout.write, f"\033[{self._frame_height + 4}A\033[4K"
+            await asyncio.to_thread(
+                sys.stdout.write,
+                f"\033[{self._frame_height + 3}A\033[4K",
             )
 
     async def stop(self):
@@ -168,22 +170,20 @@ class RenderEngine:
         await self.canvas.stop()
 
         self._stop_run.set()
-        await self._spin_thread
+        try:
+            self._spin_thread.set_result(None)
+            await asyncio.sleep(0)
 
-        await self._run_engine
+        except Exception:
+            pass
 
-        if self._stdout_lock.locked():
-            self._stdout_lock.release()
+        try:
+            self._run_engine.set_result(None)
+        except Exception:
+            pass
 
-        await self._stdout_lock.acquire()
-        await self._clear_terminal()
-
-        frame = await self.canvas.render()
-        await asyncio.to_thread(sys.stdout.write, "\r\n")
-        await asyncio.to_thread(sys.stdout.write, frame)
-        await asyncio.to_thread(sys.stdout.write, "\n\n")
+        await asyncio.to_thread(sys.stdout.write, "\n")
         await asyncio.to_thread(sys.stdout.flush)
-        self._stdout_lock.release()
 
         await self._show_cursor()
 
