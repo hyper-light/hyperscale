@@ -109,9 +109,9 @@ class RenderEngine:
 
             frame = await self.canvas.render()
 
-            await self._loop.run_in_executor(None, sys.stdout.write, "\r\n")
+            await self._loop.run_in_executor(None, sys.stdout.write, "\r")
             await self._loop.run_in_executor(None, sys.stdout.write, frame)
-            await self._loop.run_in_executor(None, sys.stdout.write, "\n\r")
+            await self._loop.run_in_executor(None, sys.stdout.write, "\r")
             await self._loop.run_in_executor(None, sys.stdout.flush)
 
             # Wait
@@ -183,7 +183,7 @@ class RenderEngine:
 
         frame = await self.canvas.render()
 
-        await asyncio.to_thread(sys.stdout.write, "\r\n")
+        await asyncio.to_thread(sys.stdout.write, "\033[H\r")
         await asyncio.to_thread(sys.stdout.write, frame)
         await asyncio.to_thread(sys.stdout.write, "\n\r")
         await asyncio.to_thread(sys.stdout.flush)

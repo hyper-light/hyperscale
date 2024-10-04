@@ -83,23 +83,49 @@ class Canvas:
 
     async def render(self):
         self._total_size = len(self._sections)
-        canvas = await asyncio.gather(*[self._join_row(row) for row in self._sections])
+        terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
 
-        self._total_size += len(canvas)
-        return "\n".join(canvas)
+        width = terminal_size.columns
+        height = terminal_size.lines - 1
 
-    async def _join_row(self, row: List[Section]):
+        canvas_sections = await asyncio.gather(
+            *[
+                self._join_row(
+                    row,
+                    width,
+                )
+                for row in self._sections
+            ]
+        )
+
+        self._total_size += sum(
+            [len(canvas_section) for canvas_section in canvas_sections]
+        )
+
+        canvas = [line for canvas_section in canvas_sections for line in canvas_section]
+
+        self._total_size += len(canvas_sections)
+        return "\n".join(canvas[:height])
+
+    async def _join_row(
+        self,
+        row: List[Section],
+        width: int,
+    ):
         rendered_blocks = await asyncio.gather(*[section.render() for section in row])
 
-        semgents_count = len(rendered_blocks[0])
+        segments_count = len(rendered_blocks[0])
 
-        segments = ["" for _ in range(semgents_count)]
-        for segment in rendered_blocks:
+        segments = ["" for _ in range(segments_count)]
+
+        for base_idx, segment in enumerate(rendered_blocks):
             for segment_idx, segement_row in enumerate(segment):
                 segments[segment_idx] += segement_row
 
-        self._total_size += len(segments)
-        return "\n".join(segments)
+        for idx, segment_row in enumerate(segments):
+            segments[idx] = segment_row[:width]
+
+        return segments
 
     async def stop(self):
         await asyncio.gather(
