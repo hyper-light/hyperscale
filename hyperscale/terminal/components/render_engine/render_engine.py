@@ -104,11 +104,6 @@ class RenderEngine:
 
     async def _execute_render_loop(self):
         while not self._stop_run.is_set():
-            if self._hide_run.is_set():
-                # Wait a bit to avoid wasting cycles
-                await asyncio.sleep(self._interval)
-                continue
-
             await self._stdout_lock.acquire()
             await self._clear_terminal()
 
@@ -120,11 +115,7 @@ class RenderEngine:
             await asyncio.to_thread(sys.stdout.flush)
 
             # Wait
-            try:
-                await asyncio.wait_for(self._stop_run.wait(), timeout=self._interval)
-
-            except asyncio.TimeoutError:
-                pass
+            await asyncio.sleep(self._interval)
 
             self._stdout_lock.release()
 
@@ -151,13 +142,13 @@ class RenderEngine:
             # ANSI Control Sequence EL does not work in Jupyter
             await asyncio.to_thread(
                 sys.stdout.write,
-                f"\033[{self.canvas.height + 3}A\033[4K",
+                "\033[H",
             )
 
         else:
             await asyncio.to_thread(
                 sys.stdout.write,
-                f"\033[{self._frame_height + 3}A\033[4K",
+                "\033[H",
             )
 
     async def stop(self):
@@ -170,6 +161,10 @@ class RenderEngine:
         await self.canvas.stop()
 
         self._stop_run.set()
+
+        if self._stdout_lock.locked():
+            self._stdout_lock.release()
+
         try:
             self._spin_thread.set_result(None)
             await asyncio.sleep(0)
@@ -179,35 +174,45 @@ class RenderEngine:
 
         try:
             self._run_engine.set_result(None)
+            await asyncio.sleep(0)
         except Exception:
             pass
 
-        await asyncio.to_thread(sys.stdout.write, "\n")
+        await self._stdout_lock.acquire()
+        await self._clear_terminal()
+
+        frame = await self.canvas.render()
+
+        await asyncio.to_thread(sys.stdout.write, "\r\n")
+        await asyncio.to_thread(sys.stdout.write, frame)
+        await asyncio.to_thread(sys.stdout.write, "\n\r")
         await asyncio.to_thread(sys.stdout.flush)
+
+        self._stdout_lock.release()
 
         await self._show_cursor()
 
     async def abort(self):
         self._stop_time = time.time()
 
-        await self.canvas.abort()
+        await self.canvas.stop()
 
         if self._dfl_sigmap:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
 
-        if not self._stop_run.is_set():
-            self._stop_run.set()
+        self._stop_run.set()
 
-            try:
-                self._spin_thread.cancel()
+        try:
+            self._spin_thread.cancel()
+            await asyncio.sleep(0)
 
-            except (
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-            ):
-                pass
+        except (
+            asyncio.CancelledError,
+            asyncio.InvalidStateError,
+            asyncio.TimeoutError,
+        ):
+            pass
 
         if self._stdout_lock.locked():
             self._stdout_lock.release()
@@ -217,12 +222,15 @@ class RenderEngine:
 
         try:
             self._run_engine.cancel()
+            await asyncio.sleep(0)
         except (
             asyncio.CancelledError,
             asyncio.InvalidStateError,
             asyncio.TimeoutError,
         ):
             pass
+
+        self._stdout_lock.release()
 
         await self._show_cursor()
 

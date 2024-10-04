@@ -1,5 +1,4 @@
 import asyncio
-import os
 
 from hyperscale.terminal.components.progress_bar import (
     BarFactory,
@@ -116,12 +115,10 @@ async def display():
     items = []
 
     async for idx in bar:
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
         items.append(idx)
 
     await engine.stop()
-
-    os._exit(0)
 
 
 asyncio.run(display())

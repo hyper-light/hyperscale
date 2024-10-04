@@ -102,6 +102,7 @@ class Bar:
         self._enable_output = disable_output is False
 
         self._frame_queue: asyncio.Queue = None
+        self._update_lock: asyncio.Lock = None
 
         # Other
         self._text = text
@@ -114,6 +115,7 @@ class Bar:
         self._hide_bar: asyncio.Event | None = None
         self._run_progress_bar: asyncio.Future | None = None
         self._last_frames: list[str] | None = None
+        self._last_frame_ready: bool = False
         self._stdout_lock = asyncio.Lock()
         self._hidden_level = 0
         self._cur_line_len = 0
@@ -248,14 +250,17 @@ class Bar:
         # Mode
         if compose_mode is None and text:
             out = f"\r{frame} {text}"
-        elif text:
+        elif text and self._frame_queue is None:
             out = f"{frame} {text}\n"
 
         elif compose_mode is None:
             out = f"{frame}"
 
-        else:
+        elif self._frame_queue is None:
             out = f"{frame}\n"
+
+        else:
+            out = f"{frame}"
 
         return out
 
@@ -293,11 +298,14 @@ class Bar:
         if self._run_progress_bar is None:
             await self.run()
 
-        if self._frame_queue:
+        if self._frame_queue and not self._last_frame_ready:
             frame = await self._frame_queue.get()
             self._size = len(frame)
 
             return frame
+
+        elif self._frame_queue and self._last_frame_ready:
+            return self._last_frame
 
         return ""
 
@@ -306,6 +314,8 @@ class Bar:
         text: str | bytes | ProgressText | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
+        self._update_lock = asyncio.Lock()
+
         if self._enable_output is False:
             self._frame_queue = asyncio.Queue()
 
@@ -344,7 +354,7 @@ class Bar:
         if inspect.isasyncgen(self._data) and self._next_segment <= total:
             item = await anext(self._data)
 
-            self.update()
+            await self.update()
 
         elif self._next_segment <= total:
             item = next(self._data)
@@ -352,14 +362,14 @@ class Bar:
             if inspect.isawaitable(item):
                 item = await item
 
-            self.update()
+            await self.update()
 
         else:
             raise StopAsyncIteration(
                 "Err. - async bar iterable is exhausted. No more data!"
             )
 
-        if self._next_segment > total:
+        if self._next_segment >= total:
             await self.ok()
 
         return item
@@ -369,7 +379,7 @@ class Bar:
             async for item in self._data:
                 yield item
 
-                self.update()
+                await self.update()
 
             await self.ok()
 
@@ -380,54 +390,39 @@ class Bar:
 
                 yield item
 
-                self.update()
+                await self.update()
 
             await self.ok()
 
-    def update(self, amount: int | float = 1):
-        if self._total >= self._max_size:
-            self._completed += amount
+    async def update(self, amount: int | float = 1):
+        await self._update_lock.acquire()
 
-        else:
-            self._completed += amount * self._segment_size
+        self._completed += amount
+        segment_completed = self._completed * self._segment_size
 
-        total = self._total
-        if self._max_size > self._total:
-            total = self.raw_size
-
-        if self._completed >= total:
-            self.segments[self._active_segment_idx].status = SegmentStatus.OK
-            self._completed_segment_idx = self._active_segment_idx
-
-        elif self._completed >= self._next_segment and self._total >= self._max_size:
-            # First set the active segment to OK/Completed status
+        if segment_completed >= self._next_segment and self._completed < self._total:
             self.segments[self._active_segment_idx].status = SegmentStatus.OK
             self._completed_segment_idx = self._active_segment_idx
             self._active_segment_idx = min(
                 self._active_segment_idx + 1, self._max_size - 1
             )
-            self._next_segment += self._segment_size
 
-        elif self._completed >= self._next_segment and self._total < self._max_size:
-            # First set the active segment to OK/Completed status
-            next_active_segment_idx = self._active_segment_idx + math.ceil(
-                self._max_size / self._total
-            )
-
-            next_active_segment_idx = min(next_active_segment_idx, self._max_size - 1)
-
-            for segment_idx in range(self._active_segment_idx, next_active_segment_idx):
-                self.segments[segment_idx].status = SegmentStatus.OK
-
-            self._completed_segment_idx = next_active_segment_idx - 1
-            self._active_segment_idx = next_active_segment_idx
-            self._next_segment += self._segment_size
-
-        if (
-            self._completed_segment_idx < self._active_segment_idx
-            and self._active_segment_idx < self._max_size - 1
-        ):
             self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
+
+            self._next_segment += self._segment_size
+
+        elif self._completed >= self._total:
+            for segment in self.segments:
+                segment.status = SegmentStatus.OK
+
+            self._active_segment_idx = min(
+                self._active_segment_idx + 1, self._max_size - 1
+            )
+            self._completed_segment_idx = self._active_segment_idx
+
+            self._completed = self._total
+
+        self._update_lock.release()
 
     async def _run(
         self,
@@ -616,21 +611,21 @@ class Bar:
         text: str | bytes | ProgressText | None = None,
         mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ):
-        active_segment_idx = min(self._active_segment_idx, self._total)
+        active_segment_idx = self._max_size - 1
         self.segments[active_segment_idx].status = status
 
         chars = "".join([segment.next for segment in self.segments])
+        encoded_chars = to_unicode(chars)
 
-        char = to_unicode(chars)
         self._last_frame = await self._compose_out(
-            char,
+            encoded_chars,
             text=text,
             compose_mode="last",
             mode=mode,
         )
 
-        if self._frame_queue:
-            self._frame_queue.put_nowait(self._last_frame)
+        if self._frame_queue and not self._last_frame_ready:
+            self._last_frame_ready = True
 
         # Should be stopped here, otherwise prints after
         # self._freeze call will mess up the spinner
@@ -655,11 +650,6 @@ class Bar:
                 continue
 
             await self._stdout_lock.acquire()
-
-            total = self._total
-
-            if self._max_size > self._total:
-                total = self.raw_size
 
             # Compose output
             spin_phase = "".join([segment.next for segment in self.segments])
@@ -693,7 +683,7 @@ class Bar:
 
             self._stdout_lock.release()
 
-            if self._next_segment > total:
+            if self._completed >= self._total:
                 break
 
     async def _clear_line(self):
