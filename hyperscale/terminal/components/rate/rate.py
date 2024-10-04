@@ -2,6 +2,7 @@ import asyncio
 from os import get_terminal_size
 from typing import List, Literal, Sequence
 
+from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.styling import stylize
 from hyperscale.terminal.styling.attributes import (
@@ -16,24 +17,27 @@ from hyperscale.terminal.styling.colors import (
     HighlightName,
 )
 
-from .counter_config import CounterConfig
+from .rate_config import RateConfig
 
 
-class Counter:
+class Rate:
     def __init__(
         self,
-        config: CounterConfig,
+        config: RateConfig,
         color: ColorName | ExtendedColorName | None = None,
         highlight: HighlightName | ExtendedColorName | None = None,
         attributes: List[AttributeName] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ) -> None:
-        self._count = config.initial_amount
-        self._counter_lock = asyncio.Lock()
+        self._count = 0
+        self._rate_lock = asyncio.Lock()
 
         self._precision = config.precision
         self._unit = config.unit
-        self._text: str = ""
+        self._rate_unit = config.to_rate()
+        self._rate_as_seconds = TimeParser(self._rate_unit).time
+        self._last_elapsed: float | None = None
+
         self._styled: str | None = None
         self._color = color
         self._highlight = highlight
@@ -50,7 +54,7 @@ class Counter:
         self._loop = asyncio.get_event_loop()
 
     def __str__(self):
-        return self._styled or self._text
+        return self._styled or self._format_count()
 
     @property
     def raw_size(self):
@@ -88,29 +92,19 @@ class Counter:
         self,
         amount: int = 1,
     ):
-        await self._counter_lock.acquire()
+        await self._rate_lock.acquire()
 
         self._count += amount
 
-        self._counter_lock.release()
-
-    async def set(
-        self,
-        amount: int,
-    ):
-        await self._counter_lock.acquire()
-
-        self._count = amount
-
-        self._counter_lock.release()
+        self._rate_lock.release()
 
     async def get(self):
         return await self.get_next_frame()
 
     async def get_next_frame(self) -> str:
-        await self._counter_lock.acquire()
+        await self._rate_lock.acquire()
         count = await self.style()
-        self._counter_lock.release()
+        self._rate_lock.release()
 
         return count
 
