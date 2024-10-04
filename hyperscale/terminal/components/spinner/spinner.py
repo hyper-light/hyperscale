@@ -876,10 +876,13 @@ class Spinner:
                 self._loop.add_signal_handler(
                     getattr(signal, sig.name),
                     lambda signame=sig.name: asyncio.create_task(
-                        asyncio.to_thread(
-                            sig_handler,
-                            signame,
-                            self,
+                        self._loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                sig_handler,
+                                signame,
+                                self,
+                            ),
                         )
                     ),
                 )

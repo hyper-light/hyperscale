@@ -248,7 +248,7 @@ class Bar:
         #         timedelta(seconds=sec), fsec
         #     )
         # Mode
-        if compose_mode is None and text:
+        if text:
             out = f"\r{frame} {text}"
         elif text and self._frame_queue is None:
             out = f"{frame} {text}\n"
@@ -266,7 +266,7 @@ class Bar:
 
     async def __aenter__(self):
         if self._run_progress_bar is None:
-            self._run_progress_bar = asyncio.create_task(self._run())
+            self._run_progress_bar = asyncio.ensure_future(self._run())
 
         return self
 
@@ -336,7 +336,7 @@ class Bar:
 
             self._next_segment = self._segment_size
 
-            self._run_progress_bar = asyncio.create_task(
+            self._run_progress_bar = asyncio.ensure_future(
                 self._run(
                     text,
                     mode=mode,
@@ -351,12 +351,12 @@ class Bar:
         if self._max_size > self._total:
             total = self.raw_size
 
-        if inspect.isasyncgen(self._data) and self._next_segment <= total:
+        if inspect.isasyncgen(self._data) and self._completed <= total:
             item = await anext(self._data)
 
             await self.update()
 
-        elif self._next_segment <= total:
+        elif self._completed <= total:
             item = next(self._data)
 
             if inspect.isawaitable(item):
@@ -381,8 +381,6 @@ class Bar:
 
                 await self.update()
 
-            await self.ok()
-
         else:
             for item in self._data:
                 if inspect.isawaitable(item):
@@ -392,7 +390,7 @@ class Bar:
 
                 await self.update()
 
-            await self.ok()
+        await self.ok()
 
     async def update(self, amount: int | float = 1):
         await self._update_lock.acquire()
@@ -442,7 +440,7 @@ class Bar:
             self._stop_spin = asyncio.Event()
             self._hide_spin = asyncio.Event()
             try:
-                self._spin_thread = asyncio.create_task(
+                self._spin_thread = asyncio.ensure_future(
                     self._spin(
                         text=text,
                         mode=TerminalMode.to_mode(mode),
@@ -455,41 +453,58 @@ class Bar:
                     await self._show_cursor()
 
     async def stop(self):
-        if self.enabled:
-            self._stop_time = time.time()
+        if not self._enable_output:
+            chars = "".join([segment.next for segment in self.segments])
 
-            if self._dfl_sigmap:
-                # Reset registered signal handlers to default ones
-                self._reset_signal_handlers()
+            char = to_unicode(chars)
+            self._last_frame = await self._compose_out(
+                char,
+                compose_mode="last",
+                mode=self._mode,
+            )
 
-            self._stop_spin.set()
+        if self._frame_queue:
+            self._frame_queue.put_nowait(self._last_frame)
 
-            try:
-                self._spin_thread.cancel()
+        self._stop_time = time.time()
 
-            except (
-                asyncio.CancelledError,
-                asyncio.TimeoutError,
-                asyncio.InvalidStateError,
-            ):
-                pass
+        if self._dfl_sigmap:
+            # Reset registered signal handlers to default ones
+            self._reset_signal_handlers()
 
-            try:
-                self._run_progress_bar.cancel()
+        self._stop_spin.set()
 
-            except (
-                asyncio.CancelledError,
-                asyncio.TimeoutError,
-                asyncio.InvalidStateError,
-            ):
-                pass
+        try:
+            self._spin_thread.cancel()
+            await asyncio.sleep(0)
 
-            if self._enable_output:
-                await self._clear_line()
-                await self._show_cursor()
+        except (
+            asyncio.CancelledError,
+            asyncio.TimeoutError,
+            asyncio.InvalidStateError,
+        ):
+            pass
+
+        if self._enable_output:
+            await self._clear_line()
+
+        try:
+            self._run_progress_bar.cancel()
+            await asyncio.sleep(0)
+
+        except (
+            asyncio.CancelledError,
+            asyncio.TimeoutError,
+            asyncio.InvalidStateError,
+        ):
+            pass
+
+        if self._enable_output:
+            await self._show_cursor()
 
     async def abort(self):
         if self.enabled:
+            await self.fail()
             self._stop_time = time.time()
 
             if self._dfl_sigmap:
@@ -689,7 +704,7 @@ class Bar:
     async def _clear_line(self):
         if sys.stdout.isatty():
             # ANSI Control Sequence EL does not work in Jupyter
-            await self._loop.run_in_executor(None, sys.stdout.write, "\r\033[K")
+            await self._loop.run_in_executor(None, sys.stdout.write, "\r\0332A\033[4K")
 
         else:
             fill = " " * self._cur_line_len
@@ -703,7 +718,6 @@ class Bar:
         if sys.stdout.isatty():
             # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
             await loop.run_in_executor(None, sys.stdout.write, "\033[?25h")
-
             await loop.run_in_executor(None, sys.stdout.flush)
 
     @staticmethod
@@ -731,7 +745,7 @@ class Bar:
 
             self._loop.add_signal_handler(
                 getattr(signal, sig.name),
-                lambda signame=sig.name: asyncio.create_task(
+                lambda signame=sig.name: asyncio.ensure_future(
                     default_handler(signame, self)
                 ),
             )

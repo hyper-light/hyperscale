@@ -47,7 +47,7 @@ class RenderEngine:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._run_engine: asyncio.Future | None = None
         self._terminal_size: int = 0
-        self._spin_thread: asyncio.Task | None = None
+        self._spin_thread: asyncio.Future | None = None
         self._frame_height: int = 0
 
         self._sigmap = (
@@ -109,10 +109,10 @@ class RenderEngine:
 
             frame = await self.canvas.render()
 
-            await asyncio.to_thread(sys.stdout.write, "\r\n")
-            await asyncio.to_thread(sys.stdout.write, frame)
-            await asyncio.to_thread(sys.stdout.write, "\n\r")
-            await asyncio.to_thread(sys.stdout.flush)
+            await self._loop.run_in_executor(None, sys.stdout.write, "\r\n")
+            await self._loop.run_in_executor(None, sys.stdout.write, frame)
+            await self._loop.run_in_executor(None, sys.stdout.write, "\n\r")
+            await self._loop.run_in_executor(None, sys.stdout.flush)
 
             # Wait
             await asyncio.sleep(self._interval)
@@ -125,7 +125,6 @@ class RenderEngine:
         if sys.stdout.isatty():
             # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
             await loop.run_in_executor(None, sys.stdout.write, "\033[?25h")
-
             await loop.run_in_executor(None, sys.stdout.flush)
 
     @staticmethod
@@ -134,19 +133,20 @@ class RenderEngine:
         if sys.stdout.isatty():
             # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
             await loop.run_in_executor(None, sys.stdout.write, "\033[?25l")
-
             await loop.run_in_executor(None, sys.stdout.flush)
 
     async def _clear_terminal(self):
         if sys.stdout.isatty():
             # ANSI Control Sequence EL does not work in Jupyter
-            await asyncio.to_thread(
+            await self._loop.run_in_executor(
+                None,
                 sys.stdout.write,
                 "\033[H",
             )
 
         else:
-            await asyncio.to_thread(
+            await self._loop.run_in_executor(
+                None,
                 sys.stdout.write,
                 "\033[H",
             )

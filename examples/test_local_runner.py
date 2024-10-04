@@ -1,5 +1,7 @@
 import asyncio
+
 import uvloop
+
 uvloop.install()
 
 from hyperscale.core_rewrite.jobs.runner.local_runner import LocalRunner
@@ -17,11 +19,7 @@ class Test(Workflow):
 
 
 async def run():
-    runner = LocalRunner(
-        "0.0.0.0",
-        15454,
-        workers=16
-    )
+    runner = LocalRunner("0.0.0.0", 15454, workers=16)
 
     results = await runner.run(
         "test",

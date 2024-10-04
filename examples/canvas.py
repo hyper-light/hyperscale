@@ -20,7 +20,7 @@ async def display():
     factory = BarFactory()
 
     bar = factory.create_bar(
-        size=20,
+        20,
         colors=ProgressBarColorConfig(
             active_color="royal_blue",
             fail_color="white",
