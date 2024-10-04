@@ -138,17 +138,15 @@ class RenderEngine:
     async def _clear_terminal(self):
         if sys.stdout.isatty():
             # ANSI Control Sequence EL does not work in Jupyter
-            await self._loop.run_in_executor(
-                None,
+            await asyncio.to_thread(
                 sys.stdout.write,
-                "\033[H",
+                f"\033[{self.canvas.height + 3}A\033[4K",
             )
 
         else:
-            await self._loop.run_in_executor(
-                None,
+            await asyncio.to_thread(
                 sys.stdout.write,
-                "\033[H",
+                f"\033[{self._frame_height + 3}A\033[4K",
             )
 
     async def stop(self):
@@ -183,9 +181,10 @@ class RenderEngine:
 
         frame = await self.canvas.render()
 
-        await asyncio.to_thread(sys.stdout.write, "\033[H\r")
+        await asyncio.to_thread(sys.stdout.write, "\r")
         await asyncio.to_thread(sys.stdout.write, frame)
-        await asyncio.to_thread(sys.stdout.write, "\n\r")
+        await asyncio.to_thread(sys.stdout.write, "\r")
+        await asyncio.to_thread(sys.stdout.write, "\n")
         await asyncio.to_thread(sys.stdout.flush)
 
         self._stdout_lock.release()
