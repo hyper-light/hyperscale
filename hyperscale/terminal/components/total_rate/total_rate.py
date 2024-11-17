@@ -1,9 +1,8 @@
 import asyncio
 import time
 from os import get_terminal_size
-from typing import List, Literal, Sequence, Tuple
+from typing import List, Literal, Sequence
 
-from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.styling import stylize
 from hyperscale.terminal.styling.attributes import (
@@ -18,25 +17,22 @@ from hyperscale.terminal.styling.colors import (
     HighlightName,
 )
 
-from .windowed_rate_config import WindowedRateConfig
+from .total_rate_config import TotalRateConfig
 
 
-class WindowedRate:
+class TotalRate:
     def __init__(
         self,
-        config: WindowedRateConfig,
+        config: TotalRateConfig,
         color: ColorName | ExtendedColorName | None = None,
         highlight: HighlightName | ExtendedColorName | None = None,
         attributes: List[AttributeName] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ) -> None:
-        self._counts: List[Tuple[int | float, float]] = []
         self._rate_lock = asyncio.Lock()
 
         self._precision = config.precision
         self._unit = config.unit
-        self._rate_period_string = f"{config.rate_period}{config.rate_unit}"
-        self._rate_as_seconds = TimeParser(self._rate_period_string).time
         self._start: float | None = None
 
         self._styled: str | None = None
@@ -46,18 +42,16 @@ class WindowedRate:
         self._max_size: int | None = None
         self._base_size = self._precision + 1
 
-        self._places_map = {"t": 1e12, "b": 1e9, "m": 1e6, "k": 1e3}
-
         if config.unit:
             self._base_size += len(config.unit) + 1
 
         self._attrs = self._set_attrs(attributes) if attributes else set()
         self._loop = asyncio.get_event_loop()
+        self._places_map = {"t": 1e12, "b": 1e9, "m": 1e6, "k": 1e3}
 
-        self._next_time: float | None = None
+        self._count: int | float = 0
+        self._elapsed: int | float = 0
         self._start: float | None = None
-        self._last_elapsed = 1
-        self._last_count = 0
 
     def __str__(self):
         return self._styled or self._format_rate()
@@ -75,7 +69,7 @@ class WindowedRate:
         max_size: int | None = None,
     ):
         numerator_units_length = 2
-        denominator_units_lenght = 2
+        denominator_units_lenght = 1
         count_size = (
             self._precision + numerator_units_length + denominator_units_lenght + 1
         )
@@ -101,14 +95,14 @@ class WindowedRate:
 
     async def update(
         self,
-        amount: int,
+        amount: int | float,
     ):
         await self._rate_lock.acquire()
 
         if self._start is None:
             self._start = time.monotonic()
 
-        self._counts.append((amount, time.monotonic()))
+        self._count += amount
 
         self._rate_lock.release()
 
@@ -120,30 +114,6 @@ class WindowedRate:
 
         if self._start is None:
             self._start = time.monotonic()
-
-        current_time = time.monotonic()
-        window = current_time - self._rate_as_seconds
-
-        counts = [
-            amount
-            for amount, timestamp in self._counts
-            if timestamp >= window and timestamp <= current_time
-        ]
-
-        if len(counts) > 0:
-            self._last_count = sum(counts)
-
-        else:
-            self._last_count = 0
-
-        self._last_elapsed = time.monotonic() - self._start
-        self._start = time.monotonic()
-
-        self._counts = [
-            (amount, timestamp)
-            for amount, timestamp in self._counts
-            if timestamp > window
-        ]
 
         rate = await self.style()
         self._rate_lock.release()
@@ -174,7 +144,7 @@ class WindowedRate:
         if self._unit:
             rate = f"{rate} {self._unit}"
 
-        rate = f"{rate}/{self._rate_period_string}"
+        rate = f"{rate}/s"
 
         if color or highlight:
             self._styled = await stylize(
@@ -197,13 +167,9 @@ class WindowedRate:
             reverse=True,
         )
 
-        if self._last_elapsed < 1:
-            last_rate = self._last_count / (
-                self._rate_as_seconds * (1 - self._last_elapsed)
-            )
+        self._elapsed = time.monotonic() - self._start
 
-        else:
-            last_rate = self._last_count / (self._rate_as_seconds * self._last_elapsed)
+        last_rate = self._count / self._elapsed
 
         adjustment_idx = 0
         for place_unit, adjustment in sorted_places:

@@ -1,15 +1,26 @@
 import asyncio
 import time
 
-from hyperscale.terminal.components.rate import Rate, RateConfig
+from hyperscale.terminal.components.windowed_rate import (
+    WindowedRate,
+    WindowedRateConfig,
+)
+
+
+async def update_loop(rate: WindowedRate):
+    start = time.monotonic()
+    elapsed = 0
+
+    while elapsed < 120:
+        await asyncio.sleep(1)
+        await rate.update(amount=1000)
+
+        elapsed = time.monotonic() - start
 
 
 async def run():
-    rate = Rate(
-        RateConfig(
-            rate_period=1,
-            rate_unit="s",
-        ),
+    rate = WindowedRate(
+        WindowedRateConfig(),
         color="aquamarine_2",
         mode="extended",
     )
@@ -18,13 +29,16 @@ async def run():
     start = time.monotonic()
     elapsed = 0
 
+    update_task = asyncio.create_task(update_loop(rate))
+
     while elapsed < 120:
-        await rate.update(amount=100)
+        await asyncio.sleep(0.08)
         amount = await rate.get()
-        await asyncio.sleep(1)
         print(amount)
 
         elapsed = time.monotonic() - start
+
+    await update_task
 
 
 asyncio.run(run())
