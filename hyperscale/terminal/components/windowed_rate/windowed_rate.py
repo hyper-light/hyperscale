@@ -1,6 +1,7 @@
 import asyncio
+import time
 from os import get_terminal_size
-from typing import List, Literal, Sequence
+from typing import List, Literal, Sequence, Tuple
 
 from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.terminal.config.mode import TerminalMode
@@ -17,26 +18,26 @@ from hyperscale.terminal.styling.colors import (
     HighlightName,
 )
 
-from .rate_config import RateConfig
+from .windowed_rate_config import WindowedRateConfig
 
 
-class Rate:
+class WindowedRate:
     def __init__(
         self,
-        config: RateConfig,
+        config: WindowedRateConfig,
         color: ColorName | ExtendedColorName | None = None,
         highlight: HighlightName | ExtendedColorName | None = None,
         attributes: List[AttributeName] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ) -> None:
-        self._count = 0
+        self._counts: List[Tuple[int | float, float]] = []
         self._rate_lock = asyncio.Lock()
 
         self._precision = config.precision
         self._unit = config.unit
-        self._rate_unit = config.to_rate()
-        self._rate_as_seconds = TimeParser(self._rate_unit).time
-        self._last_elapsed: float | None = None
+        self._rate_period_string = f"{config.rate_period}{config.rate_unit}"
+        self._rate_as_seconds = TimeParser(self._rate_period_string).time
+        self._start: float | None = None
 
         self._styled: str | None = None
         self._color = color
@@ -53,8 +54,13 @@ class Rate:
         self._attrs = self._set_attrs(attributes) if attributes else set()
         self._loop = asyncio.get_event_loop()
 
+        self._next_time: float | None = None
+        self._start: float | None = None
+        self._last_elapsed = 1
+        self._last_count = 0
+
     def __str__(self):
-        return self._styled or self._format_count()
+        return self._styled or self._format_rate()
 
     @property
     def raw_size(self):
@@ -90,11 +96,14 @@ class Rate:
 
     async def update(
         self,
-        amount: int = 1,
+        amount: int,
     ):
         await self._rate_lock.acquire()
 
-        self._count += amount
+        if self._start is None:
+            self._start = time.monotonic()
+
+        self._counts.append((amount, time.monotonic()))
 
         self._rate_lock.release()
 
@@ -103,10 +112,41 @@ class Rate:
 
     async def get_next_frame(self) -> str:
         await self._rate_lock.acquire()
-        count = await self.style()
+
+        if self._start is None:
+            self._start = time.monotonic()
+
+        if self._next_time is None:
+            self._next_time = self._rate_as_seconds + self._start
+
+        current_time = time.monotonic()
+        window = current_time - self._rate_as_seconds
+
+        counts = [
+            amount
+            for amount, timestamp in self._counts
+            if timestamp >= window and timestamp <= current_time
+        ]
+
+        if len(counts) > 0:
+            self._last_count = sum(counts)
+
+        else:
+            self._last_count = 0
+
+        self._last_elapsed = time.monotonic() - self._start
+        self._start = time.monotonic()
+
+        self._counts = [
+            (amount, timestamp)
+            for amount, timestamp in self._counts
+            if timestamp > window
+        ]
+
+        rate = await self.style()
         self._rate_lock.release()
 
-        return count
+        return rate
 
     async def style(
         self,
@@ -115,7 +155,7 @@ class Rate:
         attrs: Sequence[str] | None = None,
         mode: Literal["extended", "compatability"] | None = None,
     ):
-        count = self._format_count()
+        rate = self._format_rate()
 
         if color is None:
             color = self._color
@@ -130,20 +170,22 @@ class Rate:
             mode = self._mode
 
         if self._unit:
-            count = f"{count} {self._unit}"
+            rate = f"{rate} {self._unit}"
+
+        rate = f"{rate}/{self._rate_period_string}"
 
         if color or highlight:
             self._styled = await stylize(
-                count,
+                rate,
                 color=color,
                 highlight=highlight,
                 attrs=attrs,
                 mode=TerminalMode.to_mode(mode),
             )
 
-        return self._styled or count
+        return self._styled or rate
 
-    def _format_count(self):
+    def _format_rate(self):
         selected_place_adjustment: int | None = None
         selected_place_unit: str | None = None
 
@@ -153,34 +195,58 @@ class Rate:
             reverse=True,
         )
 
+        if self._last_elapsed < 1:
+            last_rate = self._last_count * self._last_elapsed
+
+        else:
+            last_rate = self._last_count / self._last_elapsed
+
+        adjustment_idx = 0
         for place_unit, adjustment in sorted_places:
-            if self._count / adjustment >= 1:
+            if self._last_count / adjustment >= 1:
                 selected_place_adjustment = adjustment
                 selected_place_unit = place_unit
-
+                adjustment_idx += 1
                 break
 
-        count = str(self._count)
-        if selected_place_adjustment:
-            count = f"%.{self._precision}g" % (self._count / selected_place_adjustment)
+        if selected_place_adjustment is None:
+            selected_place_adjustment = 1
 
-        count_size = len(count)
-        precision_diff = self._precision - count_size
+        full_rate = str(last_rate)
+        full_rate_size = len(full_rate)
+        rate = f"%.{self._precision}g" % (last_rate / selected_place_adjustment)
+        rate_size = len(rate)
 
-        if count_size < self._precision and selected_place_adjustment is not None:
-            count = f"%.{precision_diff}f" % float(count)
+        if "." not in rate:
+            rate += "."
 
-        elif selected_place_adjustment is None:
-            precision_diff = (self._precision + 1) - count_size
-            count = f"%.{precision_diff}f" % float(count)
+        formatted_rate_size = len(rate)
+        max_size = self._precision + 1
 
-        if "." not in count:
-            count += "."
+        if formatted_rate_size > max_size:
+            rate = rate[: self._precision + 1]
+
+        elif formatted_rate_size < max_size:
+            current_digit = max_size
+            while len(rate) < max_size:
+                if current_digit < rate_size:
+                    rate += full_rate[current_digit]
+
+                else:
+                    rate += "0"
+
+                current_digit += 1
 
         if selected_place_unit:
-            count += selected_place_unit
+            rate += selected_place_unit
 
-        return str(count)
+        elif rate_size - 1 < full_rate_size:
+            rate += full_rate[rate_size + 1]
+
+        else:
+            rate += "0"
+
+        return rate
 
     @staticmethod
     def _set_color(

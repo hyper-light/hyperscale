@@ -163,28 +163,45 @@ class Counter:
             if self._count / adjustment >= 1:
                 selected_place_adjustment = adjustment
                 selected_place_unit = place_unit
-
                 break
 
-        count = str(self._count)
-        if selected_place_adjustment:
-            count = f"%.{self._precision}g" % (self._count / selected_place_adjustment)
+        if selected_place_adjustment is None:
+            selected_place_adjustment = 1
+
+        full_count = str(self._count)
+        full_count_size = len(full_count)
+        count = f"%.{self._precision}g" % (self._count / selected_place_adjustment)
 
         count_size = len(count)
-        precision_diff = self._precision - count_size
-
-        if count_size < self._precision and selected_place_adjustment is not None:
-            count = f"%.{precision_diff}f" % float(count)
-
-        elif selected_place_adjustment is None:
-            precision_diff = (self._precision + 1) - count_size
-            count = f"%.{precision_diff}f" % float(count)
 
         if "." not in count:
             count += "."
 
+        formatted_count_size = len(count)
+        max_size = self._precision + 1
+
+        if formatted_count_size > max_size:
+            count = count[: self._precision + 1]
+
+        elif formatted_count_size < max_size:
+            current_digit = max_size
+            while len(count) < max_size:
+                if current_digit < count_size:
+                    count += full_count[current_digit]
+
+                else:
+                    count += "0"
+
+                current_digit += 1
+
         if selected_place_unit:
             count += selected_place_unit
+
+        elif count_size - 1 < full_count_size:
+            count += full_count[count_size + 1]
+
+        else:
+            count += "0"
 
         return str(count)
 
