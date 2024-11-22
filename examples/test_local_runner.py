@@ -10,11 +10,11 @@ from hyperscale.testing import URL, HTTPResponse
 
 
 class Test(Workflow):
-    vus = 16000
+    vus = 4000
     duration = "1m"
 
     @step()
-    async def login(self, url: URL = "https://httpbin.org/get") -> HTTPResponse:
+    async def login(self, url: URL = "https://kiwifarms.st/") -> HTTPResponse:
         return await self.client.http.get(url)
 
 

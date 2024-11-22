@@ -1,8 +1,9 @@
 import asyncio
 import os
 import signal
-import psutil
 from typing import List
+
+import psutil
 
 from hyperscale.core_rewrite.graph import Graph, Workflow
 from hyperscale.core_rewrite.jobs.graphs.remote_graph_manager import RemoteGraphManager
@@ -59,6 +60,8 @@ class LocalRunner:
         timeout: int | float | str | None = None,
     ):
         loop = asyncio.get_event_loop()
+        close_task = asyncio.current_task()
+
         for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
             loop.add_signal_handler(
                 getattr(
@@ -121,7 +124,6 @@ class LocalRunner:
                 await self._remote_manger.close()
                 await self._server_pool.shutdown()
 
-                close_task = asyncio.current_task()
                 for task in asyncio.all_tasks():
                     try:
                         if task != close_task and task.cancelled() is False:
@@ -138,7 +140,6 @@ class LocalRunner:
         except Exception:
             try:
                 self._server_pool.abort()
-                self._remote_manger.abort()
 
             except Exception:
                 pass
@@ -146,5 +147,37 @@ class LocalRunner:
             except asyncio.CancelledError:
                 pass
 
+            try:
+                self._remote_manger.abort()
+
+            except Exception:
+                pass
+
         except asyncio.CancelledError:
-            pass
+            try:
+                self._remote_manger.abort()
+            except Exception:
+                pass
+
+            except asyncio.CancelledError:
+                pass
+
+            try:
+                self._server_pool.abort()
+            except Exception:
+                pass
+
+            except asyncio.CancelledError:
+                pass
+
+            close_task = asyncio.current_task()
+            for task in asyncio.all_tasks():
+                try:
+                    if task != close_task and task.cancelled() is False:
+                        task.cancel()
+
+                except Exception:
+                    pass
+
+                except asyncio.CancelledError:
+                    pass

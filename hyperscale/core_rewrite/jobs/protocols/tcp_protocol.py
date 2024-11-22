@@ -1,9 +1,9 @@
 import asyncio
 import inspect
 import pickle
+import signal
 import socket
 import ssl
-import signal
 import uuid
 from collections import defaultdict, deque
 from typing import (
@@ -984,7 +984,7 @@ class TCPProtocol(Generic[T, K]):
 
         if self._run_future:
             try:
-                self._run_future.set_result(None)
+                self._run_future.cancel()
 
             except asyncio.InvalidStateError:
                 pass
@@ -992,9 +992,11 @@ class TCPProtocol(Generic[T, K]):
             except asyncio.CancelledError:
                 pass
 
+        close_task = asyncio.current_task()
         for task in asyncio.all_tasks():
             try:
-                task.cancel()
+                if task != close_task and task.cancelled() is False:
+                    task.cancel()
 
             except Exception:
                 pass

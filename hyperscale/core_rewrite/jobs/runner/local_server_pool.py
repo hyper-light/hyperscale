@@ -21,22 +21,9 @@ async def run_server(
     cert_path: str | None = None,
     key_path: str | None = None,
 ):
-    try:
-        await server.start_server(cert_path=cert_path, key_path=key_path)
-        await server.run_forever()
-        await server.close()
-
-    except asyncio.CancelledError:
-        server.abort()
-
-    except KeyboardInterrupt:
-        server.abort()
-
-    except Exception:
-        server.abort()
-        import traceback
-
-        print(traceback.format_exc())
+    await server.start_server(cert_path=cert_path, key_path=key_path)
+    await server.run_forever()
+    await server.close()
 
 
 def abort(server: RemoteGraphController, run_task: asyncio.Future):
@@ -92,6 +79,8 @@ def run_thread(
             )
         )
 
+        return "COMPLETE"
+
     except Exception:
         try:
             server.abort()
@@ -117,6 +106,8 @@ def run_thread(
 
         except asyncio.CancelledError:
             pass
+
+    return "FAILED"
 
 
 class LocalServerPool:
@@ -207,4 +198,5 @@ class LocalServerPool:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+
             self._executor.shutdown(cancel_futures=True, wait=False)
