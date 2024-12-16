@@ -1,5 +1,6 @@
 import asyncio
 import socket
+from asyncio.sslproto import SSLProtocol
 from typing import Callable, Optional
 
 from aioquic.h3.connection import H3_ALPN
@@ -59,7 +60,19 @@ class UDPConnection:
             completed = True
         finally:
             if not completed:
-                self.socket.close()
+                try:
+                    if self.socket:
+                        self.socket.shutdown(socket.SHUT_RDWR)
+
+                except Exception:
+                    pass
+
+                try:
+                    if self.socket:
+                        self.socket.close()
+
+                except Exception:
+                    pass
         # connect
         self.loop = asyncio.get_event_loop()
         _, protocol = await self.loop.create_datagram_endpoint(
@@ -76,9 +89,32 @@ class UDPConnection:
 
         return protocol
 
-    async def close(self):
+    def close(self):
+        try:
+            if hasattr(self.transport, "_ssl_protocol") and isinstance(
+                self.transport._ssl_protocol, SSLProtocol
+            ):
+                self.transport._ssl_protocol.pause_writing()
+
+        except Exception:
+            pass
+
         try:
             self.transport.close()
+
+        except Exception:
+            pass
+
+        try:
+            if self.socket:
+                self.socket.shutdown(socket.SHUT_RDWR)
+
+        except Exception:
+            pass
+
+        try:
+            if self.socket:
+                self.socket.close()
 
         except Exception:
             pass

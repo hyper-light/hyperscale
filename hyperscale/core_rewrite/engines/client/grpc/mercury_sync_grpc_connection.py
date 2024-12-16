@@ -522,3 +522,7 @@ class MercurySyncGRPCConnection(MercurySyncHTTP2Connection, Generic[T]):
         ]
 
         return encoded_headers[0]
+    
+    def close(self):
+        for connection in self._connections:
+            connection.close()

@@ -727,3 +727,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             header_items += f"cookie: {encoded}{NEW_LINE}"
 
         return f"{header_items}{NEW_LINE}".encode()
+
+    def close(self):
+        for connection in self._connections:
+            connection.close()

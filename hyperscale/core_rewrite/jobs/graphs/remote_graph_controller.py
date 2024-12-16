@@ -1,17 +1,18 @@
 import asyncio
 import os
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
 from socket import socket
 from typing import (
     Any,
+    Awaitable,
+    Callable,
     Dict,
+    List,
     Set,
     Tuple,
     TypeVar,
-    List,
-    Callable,
-    Awaitable,
 )
+
 from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.core_rewrite.graph import Workflow
 from hyperscale.core_rewrite.jobs.hooks import (
@@ -100,10 +101,10 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
     ) -> None:
         self._workflows.setup()
         return await super().start_server(
-            cert_path,
-            key_path,
-            worker_socket,
-            worker_server,
+            cert_path=cert_path,
+            key_path=key_path,
+            worker_socket=worker_socket,
+            worker_server=worker_server,
         )
 
     async def connect_client(
@@ -401,7 +402,6 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
             job.context,
             job.vus,
         )
-
         if context is None:
             context = job.context
 
@@ -488,3 +488,11 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         completed_count = sum(self._completed_counts[run_id][workflow].values())
 
         await update_callback(completed_count, workflow_status)
+
+    async def close(self) -> None:
+        await super().close()
+        await self._workflows.close()
+
+    def abort(self) -> None:
+        super().abort()
+        self._workflows.abort()

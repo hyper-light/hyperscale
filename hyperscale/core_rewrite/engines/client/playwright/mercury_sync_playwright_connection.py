@@ -113,7 +113,7 @@ class MercurySyncPlaywrightConnection:
             ]
         )
 
-    async def close(
+    def close(
         self,
         run_before_unload: Optional[bool] = None,
         reason: Optional[str] = None,
@@ -122,17 +122,20 @@ class MercurySyncPlaywrightConnection:
         if timeout is None:
             timeout = self.timeouts.request_timeout * 1000
 
-        command = CloseCommand(
-            run_before_unload=run_before_unload, reason=reason, timeout=timeout
-        )
+        if len(self.sessions) > 0:
+            command = CloseCommand(
+                run_before_unload=run_before_unload, reason=reason, timeout=timeout
+            )
 
-        await asyncio.gather(
-            *[
-                session.close(
-                    run_before_unload=command.run_before_unload,
-                    reason=command.reason,
-                    timeout=self.timeouts.request_timeout,
-                )
-                for session in self.sessions
+            abort_futures = [
+                asyncio.ensure_future(session.close(     
+                        run_before_unload=command.run_before_unload,
+                        reason=command.reason,
+                        timeout=self.timeouts.request_timeout,
+                )) for session in self.sessions
             ]
-        )
+
+            for abort_future in abort_futures:
+                abort_future.set_result(None)
+                
+

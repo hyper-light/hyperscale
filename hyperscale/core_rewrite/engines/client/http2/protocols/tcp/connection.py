@@ -88,10 +88,32 @@ class TCPConnection:
 
         return reader, self._writer
 
-    async def close(self):
+    def close(self):
         try:
-            self.transport._ssl_protocol.pause_writing()
+            if hasattr(self.transport, "_ssl_protocol") and isinstance(
+                self.transport._ssl_protocol, SSLProtocol
+            ):
+                self.transport._ssl_protocol.pause_writing()
+
+        except Exception:
+            pass
+
+        try:
             self.transport.close()
+
+        except Exception:
+            pass
+
+        try:
+            if self.socket:
+                self.socket.shutdown(socket.SHUT_RDWR)
+
+        except Exception:
+            pass
+
+        try:
+            if self.socket:
+                self.socket.close()
 
         except Exception:
             pass

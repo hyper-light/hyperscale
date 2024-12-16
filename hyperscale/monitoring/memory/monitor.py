@@ -22,8 +22,8 @@ class MemoryMonitor(BaseMonitor):
 
         for monitor_name, metrics in monitor_stats.items():
             self.collected[monitor_name] = [
-                sum(cpu_usage)
-                for cpu_usage in itertools.zip_longest(*metrics, fillvalue=0)
+                sum(memory_usage)
+                for memory_usage in itertools.zip_longest(*metrics, fillvalue=0)
             ]
 
             self.stage_metrics[monitor_name] = self.collected[monitor_name]

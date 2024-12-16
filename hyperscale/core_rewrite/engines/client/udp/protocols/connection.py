@@ -64,8 +64,8 @@ class UDPConnection:
             except Exception as e:
                 raise e
 
-    async def close(self):
+    def close(self):
         try:
-            await self._connection_factory.close()
+            self._connection_factory.close()
         except Exception:
             pass

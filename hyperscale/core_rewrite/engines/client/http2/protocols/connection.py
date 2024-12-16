@@ -95,8 +95,8 @@ class HTTP2Connection:
     def read_headers(self):
         return self.stream.reader.read_headers()
 
-    async def close(self):
+    def close(self):
         try:
-            await self._connection_factory.close()
+            self._connection_factory.close()
         except Exception:
             pass

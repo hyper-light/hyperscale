@@ -1,6 +1,7 @@
 import asyncio
 import socket
 import ssl
+from asyncio.sslproto import SSLProtocol
 from typing import Callable
 
 from hyperscale.core_rewrite.engines.client.shared.protocols import (
@@ -50,9 +51,32 @@ class UDPConnection:
 
         return reader, self._writer
 
-    async def close(self):
+    def close(self):
+        try:
+            if hasattr(self.transport, "_ssl_protocol") and isinstance(
+                self.transport._ssl_protocol, SSLProtocol
+            ):
+                self.transport._ssl_protocol.pause_writing()
+
+        except Exception:
+            pass
+
         try:
             self.transport.close()
+
+        except Exception:
+            pass
+
+        try:
+            if self.socket:
+                self.socket.shutdown(socket.SHUT_RDWR)
+
+        except Exception:
+            pass
+
+        try:
+            if self.socket:
+                self.socket.close()
 
         except Exception:
             pass

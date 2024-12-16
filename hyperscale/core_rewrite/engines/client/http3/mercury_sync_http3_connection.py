@@ -1008,3 +1008,7 @@ class MercurySyncHTTP3Connection:
             encoded_data = data
 
         return encoded_data
+        
+    def close(self):
+        for connection in self._connections:
+            connection.close()

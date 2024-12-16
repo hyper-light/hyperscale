@@ -886,3 +886,7 @@ class MercurySyncWebsocketConnection:
         )
 
         return encoded_headers
+        
+    def close(self):
+        for connection in self._connections:
+            connection.close()

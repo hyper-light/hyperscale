@@ -2,10 +2,11 @@ import asyncio
 import functools
 import multiprocessing
 import signal
+import socket
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing.context import SpawnContext
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import psutil
 
@@ -15,26 +16,42 @@ from hyperscale.core_rewrite.jobs.graphs.remote_graph_controller import (
 from hyperscale.core_rewrite.jobs.models import Env
 
 
+def abort_server(server: RemoteGraphController):
+    try:
+        server.abort()
+
+    except Exception:
+        pass
+
+    except asyncio.CancelledError:
+        pass
+
+
 async def run_server(
     server: RemoteGraphController,
-    worker_idx: int,
+    worker_socket: socket.socket,
     cert_path: str | None = None,
     key_path: str | None = None,
 ):
-    await server.start_server(cert_path=cert_path, key_path=key_path)
-    await server.run_forever()
-    await server.close()
+    try:
+        await server.start_server(
+            cert_path=cert_path,
+            key_path=key_path,
+            worker_socket=worker_socket,
+        )
+        await server.run_forever()
+        await server.close()
 
+    except Exception:
+        import traceback
 
-def abort(server: RemoteGraphController, run_task: asyncio.Future):
-    server.abort()
+        print(traceback.format_exc())
+        pass
 
 
 def run_thread(
-    host: str,
-    port: int,
+    socket: socket.socket,
     worker_env: Dict[str, str | int | float | bool | None],
-    worker_idx: int,
     cert_path: str | None = None,
     key_path: str | None = None,
 ):
@@ -54,6 +71,8 @@ def run_thread(
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
+    host, port = socket.getsockname()
+
     env = Env(**worker_env)
 
     server = RemoteGraphController(host, port, env)
@@ -64,50 +83,31 @@ def run_thread(
                 signal,
                 signame,
             ),
-            lambda signame=signame: abort(
-                server,
-            ),
+            lambda signame=signame: server.abort(),
         )
 
     try:
         loop.run_until_complete(
             run_server(
                 server,
-                worker_idx,
+                socket,
                 cert_path=cert_path,
                 key_path=key_path,
             )
         )
 
-        return "COMPLETE"
-
     except Exception:
-        try:
-            server.abort()
+        import traceback
 
-        except Exception:
-            pass
-
-        except asyncio.InvalidStateError:
-            pass
-
-        except asyncio.CancelledError:
-            pass
+        print(traceback.format_exc())
+        abort_server(server)
+        pass
 
     except asyncio.CancelledError:
-        try:
-            server.abort()
+        import traceback
 
-        except Exception:
-            pass
-
-        except asyncio.InvalidStateError:
-            pass
-
-        except asyncio.CancelledError:
-            pass
-
-    return "FAILED"
+        print(traceback.format_exc())
+        abort_server(server)
 
 
 class LocalServerPool:
@@ -142,7 +142,7 @@ class LocalServerPool:
 
     def run_pool(
         self,
-        ip_range: List[Tuple[str, int]],
+        sockets: List[socket.socket],
         env: Env,
         cert_path: str | None = None,
         key_path: str | None = None,
@@ -153,15 +153,13 @@ class LocalServerPool:
                     self._executor,
                     functools.partial(
                         run_thread,
-                        address[0],
-                        address[1],
+                        socket,
                         env.model_dump(),
-                        worker_idx,
                         cert_path=cert_path,
                         key_path=key_path,
                     ),
                 )
-                for worker_idx, address in enumerate(ip_range)
+                for socket in sockets
             ],
             return_exceptions=True,
         )

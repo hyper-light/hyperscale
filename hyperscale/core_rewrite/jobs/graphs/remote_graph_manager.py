@@ -286,7 +286,12 @@ class RemoteGraphManager:
         # ## Send batched requests
 
         await self._controller.submit_workflow_to_workers(
-            run_id, workflow, loaded_context, threads, workflow_vus, self._update
+            run_id,
+            workflow,
+            loaded_context,
+            threads,
+            workflow_vus,
+            self._update,
         )
 
         worker_results = await self._controller.poll_for_workflow_complete(
@@ -439,8 +444,11 @@ class RemoteGraphManager:
                     "is_test": test_workflows[workflow_name],
                     "threads": config.get(
                         "threads",
-                        self._threads if test_workflows[workflow_name] else 0,
-                    ),
+                    )
+                    if config.get("threads")
+                    else self._threads
+                    if test_workflows[workflow_name]
+                    else 0,
                 }
                 for workflow_name, config in configs.items()
             ]

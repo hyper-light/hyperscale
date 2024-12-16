@@ -1,11 +1,12 @@
 import asyncio
-import sys
+import functools
 import socket
 import struct
+import sys
 import time
-import functools
 import uuid
-from typing import Tuple, Any
+from typing import Any, Tuple
+
 from .ping_type import PingType
 
 if sys.platform.startswith("win"):

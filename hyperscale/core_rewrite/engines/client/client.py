@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from typing import (
     Any,
@@ -28,7 +29,6 @@ class Client(Generic[Unpack[T]]):
         self.client_id = str(uuid.uuid4())
 
         self.next_name = None
-        self.suspend = False
 
         self.graphql = MercurySyncGraphQLConnection()
         self.graphqlh2 = MercurySyncGraphQLHTTP2Connection()
@@ -104,3 +104,29 @@ class Client(Generic[Unpack[T]]):
 
             case _:
                 raise Exception("Err. - invalid client type.")
+
+    def close(self):
+        clients: list[
+            MercurySyncGraphQLConnection
+            | MercurySyncGraphQLHTTP2Connection
+            | MercurySyncGRPCConnection
+            | MercurySyncHTTPConnection
+            | MercurySyncHTTP2Connection
+            | MercurySyncHTTP3Connection
+            | MercurySyncPlaywrightConnection
+            | MercurySyncUDPConnection
+            | MercurySyncWebsocketConnection,
+        ] = [
+            self.graphql,
+            self.graphqlh2,
+            self.grpc,
+            self.http,
+            self.http2,
+            self.http3,
+            self.playwright,
+            self.udp,
+            self.websocket,
+        ]
+
+        for client in clients:
+            client.close()

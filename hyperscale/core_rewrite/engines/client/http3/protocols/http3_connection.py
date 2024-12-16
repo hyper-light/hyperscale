@@ -55,6 +55,12 @@ class HTTP3Connection:
             except Exception as e:
                 raise e
 
-    async def close(self):
+    def close(self):
         if self.protocol:
-            self.protocol.close()
+            try:
+                self.protocol.close()
+
+            except Exception:
+                pass
+        
+        self._connection_factory.close()

@@ -1,12 +1,13 @@
 import asyncio
 import functools
-import psutil
 import signal
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from .exceptions import MonitorKilledError
-from typing import Dict, List, Union, Any
+from typing import Any, Dict, List, Union
 
+import psutil
+
+from .exceptions import MonitorKilledError
 
 WorkerMetrics = Dict[int, Dict[str, List[Union[int, float]]]]
 
@@ -72,7 +73,9 @@ class BaseMonitor:
         self._executor: Union[ThreadPoolExecutor, None] = None
 
     def start_background_monitor_sync(
-        self, monitor_name: str, interval_sec: Union[int, float] = 1
+        self,
+        monitor_name: str,
+        interval_sec: Union[int, float] = 1,
     ):
         if self._executor is None:
             self._executor = ThreadPoolExecutor(

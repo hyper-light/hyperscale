@@ -101,8 +101,5 @@ class HTTPConnection:
     def read_headers(self):
         return self.reader.read_headers()
 
-    async def close(self):
-        try:
-            await self._connection_factory.close()
-        except Exception:
-            pass
+    def close(self):
+        self._connection_factory.close()

@@ -1,5 +1,6 @@
 import asyncio
 import socket
+from asyncio.sslproto import SSLProtocol
 
 from hyperscale.core_rewrite.engines.client.shared.protocols import (
     _DEFAULT_LIMIT,
@@ -52,10 +53,34 @@ class TCPConnection:
 
         return reader, self._writer
 
-    async def close(self):
+    def close(self):
         try:
-            self.transport._ssl_protocol.pause_writing()
-            self.transport.close()
+            if hasattr(self.transport, "_ssl_protocol") and isinstance(
+                self.transport._ssl_protocol, SSLProtocol
+            ):
+                self.transport._ssl_protocol.pause_writing()
+
+        except Exception:
+            pass
+
+        try:
+            if self.transport and not self.transport.is_closing():
+                self.transport.pause_reading()
+                self.transport.close()
+
+        except Exception:
+            pass
+
+        try:
+            if self.socket:
+                self.socket.shutdown(socket.SHUT_RDWR)
+
+        except Exception:
+            pass
+
+        try:
+            if self.socket:
+                self.socket.close()
 
         except Exception:
             pass

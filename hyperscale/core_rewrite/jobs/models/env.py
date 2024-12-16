@@ -1,21 +1,22 @@
 import os
-import psutil
 from typing import Callable, Dict, Union
 
-from pydantic import (
-    BaseModel,
-    StrictInt,
-    StrictStr,
-)
+import psutil
+from pydantic import BaseModel, StrictFloat, StrictInt, StrictStr
 
 PrimaryType = Union[str, int, float, bytes, bool]
 
 
 class Env(BaseModel):
+    MERCURY_SYNC_MONITOR_SAMPLE_WINDOW: StrictStr = "5s"
+    MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL: StrictStr | StrictInt | StrictFloat = 0.1
+    MERCURY_SYNC_PROCESS_JOB_CPU_LIMIT: StrictFloat | StrictInt = 85
+    MERCURY_SYNC_PROCESS_JOB_MEMORY_LIMIT: StrictInt | StrictFloat = 2048
+    MERCURY_SYNC_CONNECT_RETRIES: StrictInt = 10
     MERCURY_SYNC_TCP_CONNECT_SECONDS: StrictStr = "10s"
     MERCURY_SYNC_CLEANUP_INTERVAL: StrictStr = "1m"
     MERCURY_SYNC_MAX_CONCURRENCY: StrictInt = 2048
-    MERCURY_SYNC_AUTH_SECRET: StrictStr
+    MERCURY_SYNC_AUTH_SECRET: StrictStr = "hyperscale"
     MERCURY_SYNC_LOGS_DIRECTORY: StrictStr = os.getcwd()
     MERCURY_SYNC_REQUEST_TIMEOUT: StrictStr = "30s"
     MERCURY_SYNC_LOG_LEVEL: StrictStr = "info"
@@ -27,6 +28,9 @@ class Env(BaseModel):
     @classmethod
     def types_map(self) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
+            "MERCURY_SYNC_PROCESS_JOB_CPU_LIMIT": float,
+            "MERCURY_SYNC_PROCESS_JOB_MEMORY_LIMIT": float,
+            "MERCURY_SYNC_CONNECT_RETRIES": int,
             "MERCURY_SYNC_TCP_CONNECT_SECONDS": str,
             "MERCURY_SYNC_CLEANUP_INTERVAL": str,
             "MERCURY_SYNC_MAX_CONCURRENCY": int,

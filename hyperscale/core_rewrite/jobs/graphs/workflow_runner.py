@@ -4,30 +4,35 @@ import math
 import time
 import warnings
 from collections import defaultdict
-from typing import (
-    Any,
-    AsyncGenerator,
-    Dict,
-    List,
-    Tuple,
-)
+from typing import Any, AsyncGenerator, Coroutine, Dict, List, Tuple
 
 import networkx
 import psutil
+
 from hyperscale.core_rewrite.engines.client import TimeParser
 from hyperscale.core_rewrite.engines.client.setup_clients import setup_client
 from hyperscale.core_rewrite.graph.workflow import Workflow
 from hyperscale.core_rewrite.hooks import Hook, HookType
 from hyperscale.core_rewrite.jobs.models.env import Env
 from hyperscale.core_rewrite.jobs.models.workflow_status import WorkflowStatus
+from hyperscale.core_rewrite.monitoring import CPUMonitor, MemoryMonitor
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
 from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.state import Context, ContextHook, StateAction
 from hyperscale.core_rewrite.state.workflow_context import WorkflowContext
 from hyperscale.core_rewrite.testing.models.base import OptimizedArg
+
 from .completion_counter import CompletionCounter
 
 warnings.simplefilter("ignore")
+
+
+async def guard_optimize_call(optimize_call: Coroutine[Any, Any, None]):
+    try:
+        await optimize_call
+
+    except Exception:
+        pass
 
 
 async def cancel_pending(pend: asyncio.Task):
@@ -80,6 +85,10 @@ class WorkflowRunner:
         self._completed_counts: Dict[int, Dict[str, CompletionCounter]] = defaultdict(
             dict
         )
+        self._running_workflows: Dict[int, Dict[str, Workflow]] = defaultdict(dict)
+
+        self._cpu_monitor = CPUMonitor(env)
+        self._memory_monitor = MemoryMonitor(env)
 
     def setup(self):
         if self._workflows_sem is None:
@@ -117,9 +126,7 @@ class WorkflowRunner:
             completed_count = counter.value()
 
         except Exception:
-            import traceback
-
-            print(traceback.format_exc())
+            pass
 
         return (status, completed_count)
 
@@ -171,6 +178,9 @@ class WorkflowRunner:
         async with self._workflows_sem:
             workflow_name = workflow.name
 
+            await self._cpu_monitor.start_background_monitor(run_id)
+            await self._memory_monitor.start_background_monitor(run_id)
+
             self.run_statuses[run_id][workflow_name] = WorkflowStatus.CREATED
 
             context = Context()
@@ -183,6 +193,8 @@ class WorkflowRunner:
             )
 
             self.run_statuses[run_id][workflow.name] = WorkflowStatus.RUNNING
+
+            self._running_workflows[run_id][workflow.name] = workflow
 
             try:
                 (results, updated_context) = await self._run_workflow(
@@ -206,8 +218,12 @@ class WorkflowRunner:
                 del self._active_waiters[run_id][workflow_name]
                 del self._max_active[run_id][workflow_name]
                 del self._pending[run_id][workflow_name]
+                del self._running_workflows[run_id][workflow.name]
 
                 self.run_statuses[run_id][workflow_name] = WorkflowStatus.COMPLETED
+
+                await self._cpu_monitor.stop_background_monitor(run_id)
+                await self._memory_monitor.stop_background_monitor(run_id)
 
                 return (
                     run_id,
@@ -219,6 +235,11 @@ class WorkflowRunner:
 
             except Exception as err:
                 self.run_statuses[run_id][workflow.name] = WorkflowStatus.FAILED
+                del self._running_workflows[run_id][workflow.name]
+
+                await self._cpu_monitor.stop_background_monitor(run_id)
+                await self._memory_monitor.stop_background_monitor(run_id)
+
                 return (
                     run_id,
                     None,
@@ -438,14 +459,18 @@ class WorkflowRunner:
 
                 await asyncio.gather(
                     *[
-                        arg.optimize(hook.engine_type)
+                        guard_optimize_call(
+                            arg.optimize(hook.engine_type),
+                        )
                         for arg in hook.optimized_args.values()
                     ]
                 )
 
                 await asyncio.gather(
                     *[
-                        workflow.client[hook.engine_type]._optimize(arg)
+                        guard_optimize_call(
+                            workflow.client[hook.engine_type]._optimize(arg),
+                        )
                         for arg in hook.optimized_args.values()
                     ]
                 )
@@ -513,7 +538,6 @@ class WorkflowRunner:
         elapsed = time.monotonic() - start
 
         await asyncio.gather(*completed)
-
         await asyncio.gather(
             *[
                 asyncio.create_task(cancel_pending(pend))
@@ -658,30 +682,42 @@ class WorkflowRunner:
 
         start = time.monotonic()
         while elapsed < duration:
-            remaining = duration - elapsed
+            try:
+                remaining = duration - elapsed
 
-            yield remaining
+                yield remaining
 
-            await asyncio.sleep(0)
+                await asyncio.sleep(0)
 
-            if (
-                self._active[run_id][workflow_name]
-                > self._max_active[run_id][workflow_name]
-                and self._active_waiters[run_id][workflow_name] is None
-            ):
-                self._active_waiters[run_id][workflow_name] = (
-                    asyncio.get_event_loop().create_future()
-                )
-
-                try:
-                    await asyncio.wait_for(
-                        self._active_waiters[run_id][workflow_name],
-                        timeout=remaining,
+                if (
+                    self._active[run_id][workflow_name]
+                    > self._max_active[run_id][workflow_name]
+                    and self._active_waiters[run_id][workflow_name] is None
+                ):
+                    self._active_waiters[run_id][workflow_name] = (
+                        asyncio.get_event_loop().create_future()
                     )
-                except asyncio.TimeoutError:
-                    pass
+
+                    try:
+                        await asyncio.wait_for(
+                            self._active_waiters[run_id][workflow_name],
+                            timeout=remaining,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+
+                elif self._cpu_monitor.check_lock(
+                    self._cpu_monitor.get_moving_median,
+                    run_id,
+                ):
+                    await self._cpu_monitor.lock(run_id)
+
+            except Exception:
+                pass
 
             elapsed = time.monotonic() - start
+
+        await self._cpu_monitor.stop_background_monitor(run_id)
 
     async def _provide_context(
         self,
@@ -719,3 +755,35 @@ class WorkflowRunner:
         )
 
         return context
+
+    async def close(self):
+        for job in self._running_workflows.values():
+            for workflow in job.values():
+                workflow.client.close()
+
+        try:
+            await self._cpu_monitor.stop_all_background_monitors()
+        except Exception:
+            pass
+
+        try:
+            await self._memory_monitor.stop_all_background_monitors()
+        except Exception:
+            pass
+
+    def abort(self):
+        for job in self._running_workflows.values():
+            for workflow in job.values():
+                workflow.client.close()
+
+        try:
+            self._cpu_monitor.abort_all_background_monitors()
+
+        except Exception:
+            pass
+
+        try:
+            self._memory_monitor.abort_all_background_monitors()
+
+        except Exception:
+            pass
