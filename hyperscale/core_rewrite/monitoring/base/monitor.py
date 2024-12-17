@@ -20,128 +20,194 @@ class BaseMonitor:
 
         self._sample_interval: float = sample_interval
 
-        self.active: Dict[str, List[tuple[float, int]]] = defaultdict(list)
+        self.active: Dict[int, Dict[str, List[tuple[float, int]]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
 
-        self._background_monitors: Dict[str, asyncio.Future] = {}
+        self._background_monitors: Dict[int, Dict[str, asyncio.Future]] = defaultdict(
+            dict
+        )
 
-        self._running_monitors: Dict[int, bool] = {}
+        self._running_monitors: Dict[int, Dict[str, bool]] = defaultdict(
+            lambda: defaultdict(lambda: False)
+        )
 
         self._loop: Union[asyncio.AbstractEventLoop, None] = None
         self._executor: Union[ThreadPoolExecutor, None] = None
-        self._locked_runs: Dict[int, asyncio.Lock] = {}
+        self._locked_runs: Dict[int, Dict[str, asyncio.Lock]] = defaultdict(
+            lambda: defaultdict(asyncio.Lock)
+        )
         self.limit: int | float = 0
 
     def _check_lock(
         self,
         measuable: Callable[
-            [int],
+            [int, str],
             Awaitable[int | float],
         ],
         run_id: int,
+        workflow_name: str,
         limit: int | float,
     ):
-        sample = measuable(run_id)
+        sample = measuable(run_id, workflow_name)
         return sample >= limit
 
-    def release_lock(self, run_id: int):
-        if self._locked_runs.get(run_id) and self._locked_runs[run_id].locked():
-            self._locked_runs[run_id].release()
+    def release_lock(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        if (
+            self._locked_runs.get(run_id)
+            and self._locked_runs[run_id][workflow_name].locked()
+        ):
+            self._locked_runs[run_id][workflow_name].release()
 
-    async def lock(self, run_id: int):
-        if self._locked_runs.get(run_id) is None:
-            self._locked_runs[run_id] = asyncio.Lock()
+    async def lock(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        if self._locked_runs[run_id].get(workflow_name) is None:
+            self._locked_runs[run_id][workflow_name] = asyncio.Lock()
 
-        await self._locked_runs[run_id].acquire()
+        await self._locked_runs[run_id][workflow_name].acquire()
 
-    def get_workflow_last(self, run_id: int):
-        if len(self.active[run_id]) < 1:
+    def get_workflow_last(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        if len(self.active[run_id][workflow_name]) < 1:
             return 0
 
-        _, last_amount = self.active[run_id][-1]
+        _, last_amount = self.active[run_id][workflow_name][-1]
 
         return last_amount
 
-    def get_moving_avg(self, run_id: int):
-        if len(self.active[run_id]) < 1:
+    def get_moving_avg(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        if len(self.active[run_id][workflow_name]) < 1:
             return 0
 
-        average = statistics.mean([sample for _, sample in self.active[run_id]])
+        average = statistics.mean(
+            [sample for _, sample in self.active[run_id][workflow_name]]
+        )
 
         return average
 
-    def get_moving_median(self, run_id: int):
-        if len(self.active[run_id]) < 1:
+    def get_moving_median(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        if len(self.active[run_id][workflow_name]) < 1:
             return 0
 
-        median = statistics.median([sample for _, sample in self.active[run_id]])
+        median = statistics.median(
+            [sample for _, sample in self.active[run_id][workflow_name]]
+        )
 
         return median
 
-    async def start_background_monitor(self, run_id: int):
-        self._running_monitors[run_id] = True
-        self._background_monitors[run_id] = asyncio.ensure_future(
-            self._update_background_monitor(run_id)
+    async def start_background_monitor(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        self._running_monitors[run_id][workflow_name] = True
+        self._background_monitors[run_id][workflow_name] = asyncio.ensure_future(
+            self._update_background_monitor(run_id, workflow_name)
         )
 
-    def update_monitor(str, run_id: int) -> Union[int, float]:
+    def update_monitor(str, _: int, __: str) -> Union[int, float]:
         raise NotImplementedError(
             "Monitor background update method must be implemented in non-base Monitor class."
         )
 
-    async def _update_background_monitor(self, run_id: int):
+    async def _update_background_monitor(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
         try:
-            while self._running_monitors.get(run_id):
-                await asyncio.to_thread(self.update_monitor, run_id)
+            while self._running_monitors[run_id].get(workflow_name):
+                await asyncio.to_thread(
+                    self.update_monitor,
+                    run_id,
+                    workflow_name,
+                )
                 await asyncio.sleep(self._sample_interval)
 
-                if self.get_moving_median(run_id) < self.limit:
-                    self.release_lock(run_id)
+                if (
+                    self.get_moving_median(
+                        run_id,
+                        workflow_name,
+                    )
+                    < self.limit
+                ):
+                    self.release_lock(run_id, workflow_name)
 
         except Exception:
             import traceback
 
             print(traceback.format_exc())
 
-    async def stop_background_monitor(self, run_id: int):
-        self._running_monitors[run_id] = False
+    async def stop_background_monitor(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        self._running_monitors[run_id][workflow_name] = False
 
-        self.release_lock(run_id)
+        self.release_lock(run_id, workflow_name)
 
-        if self._locked_runs.get(run_id):
-            del self._locked_runs[run_id]
+        if self._locked_runs[run_id].get(workflow_name):
+            del self._locked_runs[run_id][workflow_name]
 
-        if self._background_monitors.get(run_id):
+        if self._background_monitors[run_id].get(workflow_name):
             try:
-                self._background_monitors[run_id].set_result(None)
+                self._background_monitors[run_id][workflow_name].set_result(None)
 
             except Exception:
                 pass
 
-            del self._background_monitors[run_id]
+            del self._background_monitors[run_id][workflow_name]
 
     async def stop_all_background_monitors(self):
         if len(self.active) > 0:
             await asyncio.gather(
-                *[self.stop_background_monitor(run_id) for run_id in self.active]
+                *[
+                    self.stop_background_monitor(
+                        run_id,
+                        workflow_name,
+                    )
+                    for run_id, workflow_monitors in self.active.items()
+                    for workflow_name in workflow_monitors
+                ]
             )
 
             self.active.clear()
 
     def abort_all_background_monitors(self):
-        for run_id, monitor in self._background_monitors.items():
-            self._running_monitors[run_id] = False
+        for run_id, workflow_monitors in self._background_monitors.items():
+            for workflow_name, monitor in workflow_monitors.items():
+                self._running_monitors[run_id][workflow_name] = False
 
-            self.release_lock(run_id)
+                self.release_lock(run_id, workflow_name)
 
-            if self._locked_runs.get(run_id):
-                del self._locked_runs[run_id]
+                if self._locked_runs[run_id].get(workflow_name):
+                    del self._locked_runs[run_id][workflow_name]
 
-            try:
-                monitor.set_result(None)
+                try:
+                    monitor.set_result(None)
 
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-            del self.active[run_id]
+                del self.active[run_id][workflow_name]
 
         self._background_monitors.clear()

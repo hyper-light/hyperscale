@@ -294,9 +294,15 @@ class WorkflowResults:
         | List[UDPResponse]
         | List[WebsocketResponse],
     ) -> ResultSet:
+        errors = [error for error in results if isinstance(error, Exception)]
+
+        results = [result for result in results if result not in errors]
+
         if result_type == RequestType.PLAYWRIGHT:
             timing_results_set = [
-                self._process_playwright_timings(result) for result in results
+                self._process_playwright_timings(result)
+                for result in results
+                if result not in errors
             ]
 
             timing_stats: Dict[
@@ -308,7 +314,9 @@ class WorkflowResults:
 
         else:
             timing_results_set = [
-                self._process_http_or_udp_timings(result) for result in results
+                self._process_http_or_udp_timings(result)
+                for result in results
+                if result not in errors
             ]
 
             timing_stats: Dict[
@@ -342,21 +350,25 @@ class WorkflowResults:
                 )
 
         checks = Counter([result.check() for result in results])
-
-        contexts = Counter(
-            [result.context() for result in results if result.context() is not None]
-        )
-
         statuses = Counter([result.status for result in results])
+
+        result_contexts = [
+            result.context() for result in results if result.context() is not None
+        ]
+        errors_count = len(errors)
+        error_contexts = [str(error) for error in errors]
+        result_contexts.extend(error_contexts)
+
+        contexts = Counter(result_contexts)
 
         return {
             "workflow": workflow,
             "step": step_name,
             "timings": timing_stats,
             "counts": {
-                "executed": checks.get(True, 0) + checks.get(False, 0),
+                "executed": checks.get(True, 0) + checks.get(False, 0) + errors_count,
                 "succeeded": checks.get(True, 0),
-                "failed": checks.get(False, 0),
+                "failed": checks.get(False, 0) + errors_count,
                 "statuses": {code: count for code, count in statuses.items()},
             },
             "contexts": [

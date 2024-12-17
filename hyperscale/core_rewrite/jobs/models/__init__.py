@@ -1,4 +1,5 @@
 from .env import Env as Env
+from .graph_update import GraphUpdate as GraphUpdate
 from .instance_role_type import InstanceRoleType as InstanceRoleType
 from .job_context import JobContext as JobContext
 from .message import Message as Message

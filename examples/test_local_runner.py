@@ -10,7 +10,7 @@ from hyperscale.testing import URL, HTTPResponse
 
 
 class Test(Workflow):
-    vus = 64000
+    vus = 1000
     duration = "1m"
 
     @step()
@@ -18,7 +18,11 @@ class Test(Workflow):
         self,
         url: URL = "https://httpbin.org/get",
     ) -> HTTPResponse:
-        return await self.client.http.get(url)
+        response = await self.client.http.get(url)
+        assert (
+            response.status >= 200 and response.status < 300
+        ), f"Err. - Request returned status - {response.status}"
+        return response
 
 
 async def run():

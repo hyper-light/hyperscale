@@ -16,9 +16,8 @@ from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.core_rewrite.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core_rewrite.graph.workflow import Workflow
 from hyperscale.core_rewrite.hooks import Hook, HookType
-from hyperscale.core_rewrite.jobs.models import InstanceRoleType
+from hyperscale.core_rewrite.jobs.models import GraphUpdate, InstanceRoleType
 from hyperscale.core_rewrite.jobs.models.env import Env
-from hyperscale.core_rewrite.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core_rewrite.jobs.workers import Provisioner, StagePriority
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
 from hyperscale.core_rewrite.results.workflow_types import (
@@ -73,6 +72,7 @@ class RemoteGraphManager:
         self._controller: RemoteGraphController | None = None
         self._role = InstanceRoleType.PROVISIONER
         self._provisioner: Provisioner | None = None
+        self._graph_updates: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
         self._step_traversal_orders: Dict[
             str,
@@ -383,12 +383,8 @@ class RemoteGraphManager:
 
         return context[workflow]
 
-    async def _update(
-        self,
-        completed: int,
-        status: WorkflowStatus,
-    ):
-        pass
+    async def _update(self, update: GraphUpdate):
+        self._graph_updates[update.workflow].put_nowait(update)
 
     def _provision(
         self,

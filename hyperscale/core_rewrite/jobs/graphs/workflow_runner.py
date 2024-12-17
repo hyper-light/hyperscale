@@ -85,6 +85,7 @@ class WorkflowRunner:
         self._completed_counts: Dict[int, Dict[str, CompletionCounter]] = defaultdict(
             dict
         )
+        self._failed_counts: Dict[int, Dict[str, CompletionCounter]] = defaultdict(dict)
         self._running_workflows: Dict[int, Dict[str, Workflow]] = defaultdict(dict)
 
         self._cpu_monitor = CPUMonitor(env)
@@ -112,23 +113,58 @@ class WorkflowRunner:
         self,
         run_id: int,
         workflow: str,
-    ) -> Tuple[WorkflowStatus, int]:
+    ) -> Tuple[
+        WorkflowStatus,
+        int,
+        int,
+    ]:
         status = self.run_statuses.get(
             run_id,
             {},
         ).get(workflow, WorkflowStatus.UNKNOWN)
 
         completed_count = 0
+        failed_count = 0
 
         try:
-            counter = self._completed_counts[run_id].get(workflow, CompletionCounter())
-
-            completed_count = counter.value()
+            completed_counter = self._completed_counts[run_id].get(
+                workflow, CompletionCounter()
+            )
+            completed_count = completed_counter.value()
 
         except Exception:
             pass
 
-        return (status, completed_count)
+        try:
+            failed_counter = self._failed_counts[run_id].get(
+                workflow, CompletionCounter()
+            )
+            failed_count = failed_counter.value()
+
+        except Exception:
+            pass
+
+        return (
+            status,
+            completed_count,
+            failed_count,
+        )
+
+    def get_system_stats(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
+        return (
+            self._cpu_monitor.get_moving_avg(
+                run_id,
+                workflow_name,
+            ),
+            self._memory_monitor.get_moving_avg(
+                run_id,
+                workflow_name,
+            ),
+        )
 
     async def run(
         self,
@@ -178,8 +214,8 @@ class WorkflowRunner:
         async with self._workflows_sem:
             workflow_name = workflow.name
 
-            await self._cpu_monitor.start_background_monitor(run_id)
-            await self._memory_monitor.start_background_monitor(run_id)
+            await self._cpu_monitor.start_background_monitor(run_id, workflow_name)
+            await self._memory_monitor.start_background_monitor(run_id, workflow_name)
 
             self.run_statuses[run_id][workflow_name] = WorkflowStatus.CREATED
 
@@ -222,8 +258,14 @@ class WorkflowRunner:
 
                 self.run_statuses[run_id][workflow_name] = WorkflowStatus.COMPLETED
 
-                await self._cpu_monitor.stop_background_monitor(run_id)
-                await self._memory_monitor.stop_background_monitor(run_id)
+                await self._cpu_monitor.stop_background_monitor(
+                    run_id,
+                    workflow_name,
+                )
+                await self._memory_monitor.stop_background_monitor(
+                    run_id,
+                    workflow_name,
+                )
 
                 return (
                     run_id,
@@ -237,8 +279,14 @@ class WorkflowRunner:
                 self.run_statuses[run_id][workflow.name] = WorkflowStatus.FAILED
                 del self._running_workflows[run_id][workflow.name]
 
-                await self._cpu_monitor.stop_background_monitor(run_id)
-                await self._memory_monitor.stop_background_monitor(run_id)
+                await self._cpu_monitor.stop_background_monitor(
+                    run_id,
+                    workflow_name,
+                )
+                await self._memory_monitor.stop_background_monitor(
+                    run_id,
+                    workflow_name,
+                )
 
                 return (
                     run_id,
@@ -380,6 +428,7 @@ class WorkflowRunner:
     ]:
         self._active[run_id][workflow.name] = 0
         self._completed_counts[run_id][workflow.name] = CompletionCounter()
+        self._failed_counts[run_id][workflow.name] = CompletionCounter()
 
         config = {
             "vus": 1000,
@@ -647,6 +696,7 @@ class WorkflowRunner:
                     result = complete.result()
 
                 except Exception as err:
+                    self._failed_counts[run_id][workflow_name].increment()
                     result = err
 
                 context[complete.get_name()] = result
@@ -709,15 +759,24 @@ class WorkflowRunner:
                 elif self._cpu_monitor.check_lock(
                     self._cpu_monitor.get_moving_median,
                     run_id,
+                    workflow_name,
                 ):
-                    await self._cpu_monitor.lock(run_id)
+                    await self._cpu_monitor.lock(
+                        run_id,
+                        workflow_name,
+                    )
 
             except Exception:
-                pass
+                import traceback
+
+                print(traceback.format_exc())
 
             elapsed = time.monotonic() - start
 
-        await self._cpu_monitor.stop_background_monitor(run_id)
+        await self._cpu_monitor.stop_background_monitor(
+            run_id,
+            workflow_name,
+        )
 
     async def _provide_context(
         self,
