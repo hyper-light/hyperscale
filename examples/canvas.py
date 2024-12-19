@@ -68,7 +68,7 @@ async def display():
             Section(
                 SectionConfig(
                     width="small",
-                    height="small",
+                    height="xx-small",
                     left_border="|",
                     top_border="-",
                     right_border="|",
@@ -78,7 +78,7 @@ async def display():
             Section(
                 SectionConfig(
                     width="small",
-                    height="small",
+                    height="xx-small",
                     left_border="|",
                     top_border="-",
                     right_border="|",
@@ -88,7 +88,7 @@ async def display():
             Section(
                 SectionConfig(
                     width="small",
-                    height="small",
+                    height="xx-small",
                     left_border="|",
                     top_border="-",
                     right_border="|",
@@ -98,7 +98,7 @@ async def display():
             Section(
                 SectionConfig(
                     width="full",
-                    height="small",
+                    height="medium",
                     left_border="|",
                     top_border="-",
                     right_border="|",
@@ -110,12 +110,11 @@ async def display():
                         ScatterPlot(
                             PlotConfig(
                                 plot_name="Test",
-                                x_max=60,
-                                y_max=50,
                                 x_axis_name="Time (sec)",
                                 y_axis_name="Value",
-                                line_color="cyan",
+                                line_color="aquamarine_2",
                                 point_char="dot",
+                                terminal_mode="extended",
                             ),
                         ),
                         Alignment(
@@ -136,7 +135,7 @@ async def display():
     start = time.monotonic()
 
     async for idx in bar:
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
         data.append((elapsed, idx))
         await engine.update("scatter_plot_test", data)
         elapsed = time.monotonic() - start

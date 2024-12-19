@@ -246,6 +246,12 @@ class ScatterPlot:
         elif y_max is None:
             y_max = max(y_vals) * 1.1
 
+        if x_max <= self.config.x_min:
+            x_max = self.config.x_min + 1
+
+        if y_max <= self.config.y_min:
+            y_max = self.config.y_min + 1
+
         return (
             x_max,
             y_max,
