@@ -11,3 +11,4 @@ class Alignment(BaseModel):
     horizontal: HorizontalAlignment = "left"
     vertical: VerticalAlignment = "top"
     priority: AlignmentPriority = "auto"
+    vertical_priority: AlignmentPriority = "auto"

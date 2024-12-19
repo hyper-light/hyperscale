@@ -18,6 +18,8 @@ from hyperscale.terminal.components.spinner.spinner_factory import SpinnerFactor
 from hyperscale.terminal.components.spinner.spinner_types import SpinnerType
 from hyperscale.terminal.components.spinner.to_unicode import to_unicode
 from hyperscale.terminal.config.mode import TerminalMode
+from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
+from hyperscale.terminal.styling import stylize
 
 from .progress_bar_chars import ProgressBarChars
 from .progress_bar_color_config import ProgressBarColorConfig
@@ -59,6 +61,7 @@ class Bar:
         max_width_percentage: float = 0.5,
         disable_output: bool = False,
     ) -> None:
+        self.fit_type = WidgetFitDimensions.X_AXIS
         total: int = 0
         if isinstance(data, int):
             total = data
@@ -82,6 +85,13 @@ class Bar:
         self._colors = colors
         self._mode = mode
         self.mode = mode
+        self._bar_segment = Segment(
+            self._chars,
+            SegmentType.BAR,
+            segment_default_char=self._chars.background_char,
+            segment_colors=self._colors,
+            mode=self._mode,
+        )
 
         self.segments: list[Segment] = []
 
@@ -97,7 +107,6 @@ class Bar:
         self._max_width_percentage = max_width_percentage
         self._bar_width: float = 0
         self._segment_size: float = 0
-        self._next_segment: float = 0
         self._completed: int = 0
         self._enable_output = disable_output is False
 
@@ -169,16 +178,16 @@ class Bar:
 
     async def fit(
         self,
-        max_size: int | None = None,
+        max_width: int | None = None,
     ):
-        if max_size is None:
+        if max_width is None:
             terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
-            max_size = terminal_size[0]
+            max_width = terminal_size[0]
 
         self.segments: list[Segment] = []
 
-        if self._chars.start_char:
-            max_size -= 1
+        if self._chars.start_char and self._chars.start_char != "":
+            max_width -= 1
             self.segments.append(
                 Segment(
                     self._chars,
@@ -188,35 +197,35 @@ class Bar:
                 )
             )
 
-        if self._chars.end_char:
-            max_size -= 1
+        if self._chars.end_char and self._chars.end_char != "":
+            max_width -= 1
 
         text_length = 0
         if self._text:
             text_length = len(self._text)
-            total_length = max_size + text_length
-            diff = total_length - max_size
+            total_length = max_width + text_length
+            diff = total_length - max_width
 
             bar_adjust = math.floor(diff / 2) + 3
             text_adjust = math.ceil(diff / 2)
 
-            max_size -= bar_adjust
+            max_width -= bar_adjust
             text_length = max(text_length - text_adjust, 0)
 
             self._text = self._text[:text_length] + "..."
 
-        self.segments.extend(
-            [
-                Segment(
-                    self._chars,
-                    SegmentType.BAR,
-                    segment_default_char=self._chars.background_char,
-                    segment_colors=self._colors,
-                    mode=self._mode,
-                )
-                for _ in range(max_size)
-            ]
-        )
+        bar = [
+            Segment(
+                self._chars,
+                SegmentType.BAR,
+                segment_default_char=self._chars.background_char,
+                segment_colors=self._colors,
+                mode=self._mode,
+            )
+            for _ in range(max_width)
+        ]
+
+        self.segments.extend(bar)
 
         if self._chars.end_char:
             self.segments.append(
@@ -228,26 +237,19 @@ class Bar:
                 )
             )
 
-        self._max_size = max_size
+        self._max_size = max_width
         self._base_size = len(self.segments) + text_length
+        self._bar_width = len(bar)
 
     async def _compose_out(
         self,
         frame: str,
         text: str | bytes | ProgressText | None = None,
         compose_mode: str | None = None,
-        mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ) -> str:
         if text:
             text = str(text)
 
-        # Timer
-        # if self._timer:
-        #     sec, fsec = divmod(round(100 * self.elapsed_time), 100)
-        #     text += " ({}.{:02.0f})".format(  # pylint: disable=consider-using-f-string
-        #         timedelta(seconds=sec), fsec
-        #     )
-        # Mode
         if text:
             out = f"\r{frame} {text}"
         elif text and self._frame_queue is None:
@@ -302,19 +304,22 @@ class Bar:
             frame = await self._frame_queue.get()
             self._size = len(frame)
 
-            return frame
-
         elif self._frame_queue and self._last_frame_ready:
-            return self._last_frame
+            frame = self._last_frame
+            self._size = len(frame)
 
-        return ""
+        else:
+            frame = ""
+
+        return frame
 
     async def run(
         self,
         text: str | bytes | ProgressText | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ):
-        self._update_lock = asyncio.Lock()
+        if self._update_lock is None:
+            self._update_lock = asyncio.Lock()
 
         if self._enable_output is False:
             self._frame_queue = asyncio.Queue()
@@ -324,17 +329,12 @@ class Bar:
             self._max_size = terminal_size[0]
 
         if self._run_progress_bar is None:
+            await self._bar_segment.style()
             await asyncio.gather(*[segment.style() for segment in self.segments])
 
             # If we have 1000 items with a bar width of 100, every 10 items we should increment a segment.
 
-            if self._total > self._max_size:
-                self._segment_size = self._total / self._max_size
-
-            else:
-                self._segment_size = self._max_size / self._total
-
-            self._next_segment = self._segment_size
+            self._segment_size = self._total / self._bar_width
 
             self._run_progress_bar = asyncio.ensure_future(
                 self._run(
@@ -369,7 +369,7 @@ class Bar:
                 "Err. - async bar iterable is exhausted. No more data!"
             )
 
-        if self._next_segment >= total:
+        if self._completed >= total:
             await self.ok()
 
         return item
@@ -390,35 +390,16 @@ class Bar:
 
                 await self.update()
 
-        await self.ok()
+        if self._completed >= self._total:
+            await self.ok()
 
     async def update(self, amount: int | float = 1):
+        if self._update_lock is None:
+            self._update_lock = asyncio.Lock()
+
         await self._update_lock.acquire()
 
         self._completed += amount
-        segment_completed = self._completed * self._segment_size
-
-        if segment_completed >= self._next_segment and self._completed < self._total:
-            self.segments[self._active_segment_idx].status = SegmentStatus.OK
-            self._completed_segment_idx = self._active_segment_idx
-            self._active_segment_idx = min(
-                self._active_segment_idx + 1, self._max_size - 1
-            )
-
-            self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
-
-            self._next_segment += self._segment_size
-
-        elif self._completed >= self._total:
-            for segment in self.segments:
-                segment.status = SegmentStatus.OK
-
-            self._active_segment_idx = min(
-                self._active_segment_idx + 1, self._max_size - 1
-            )
-            self._completed_segment_idx = self._active_segment_idx
-
-            self._completed = self._total
 
         self._update_lock.release()
 
@@ -440,12 +421,7 @@ class Bar:
             self._stop_spin = asyncio.Event()
             self._hide_spin = asyncio.Event()
             try:
-                self._spin_thread = asyncio.ensure_future(
-                    self._spin(
-                        text=text,
-                        mode=TerminalMode.to_mode(mode),
-                    )
-                )
+                self._spin_thread = asyncio.ensure_future(self._spin(text=text))
             except Exception:
                 # Ensure cursor is not hidden if any failure occurs that prevents
                 # getting it back
@@ -453,19 +429,6 @@ class Bar:
                     await self._show_cursor()
 
     async def stop(self):
-        if not self._enable_output:
-            chars = "".join([segment.next for segment in self.segments])
-
-            char = to_unicode(chars)
-            self._last_frame = await self._compose_out(
-                char,
-                compose_mode="last",
-                mode=self._mode,
-            )
-
-        if self._frame_queue:
-            self._frame_queue.put_nowait(self._last_frame)
-
         self._stop_time = time.time()
 
         if self._dfl_sigmap:
@@ -597,47 +560,79 @@ class Bar:
     async def ok(
         self,
         text: str | bytes | ProgressText | None = None,
-        mode: Literal["extended", "compatability"] = "compatability",
     ):
         if self.enabled:
             """Set Ok (success) finalizer to a spinner."""
             await self._freeze(
                 SegmentStatus.OK,
                 text=text,
-                mode=TerminalMode.to_mode(mode),
             )
 
     async def fail(
         self,
         text: str | bytes | ProgressText | None = None,
-        mode: Literal["extended", "compatability"] = "compatability",
     ):
         if self.enabled:
             """Set fail finalizer to a spinner."""
             await self._freeze(
                 SegmentStatus.FAILED,
                 text=text,
-                mode=TerminalMode.to_mode(mode),
             )
 
     async def _freeze(
         self,
         status: SegmentStatus.OK | SegmentStatus.FAILED,
         text: str | bytes | ProgressText | None = None,
-        mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ):
         active_segment_idx = self._max_size - 1
         self.segments[active_segment_idx].status = status
 
-        chars = "".join([segment.next for segment in self.segments])
-        encoded_chars = to_unicode(chars)
+        active_idx = math.floor(self._completed * (self._bar_width / self._total))
+
+        segments: list[str] = []
+
+        if self._chars.start_char:
+            segments.append(self._chars.start_char)
+
+        if status == SegmentStatus.FAILED:
+            ok_chars = await stylize(
+                "".join([self._chars.ok_char for _ in range(0, active_idx)]),
+                color=self._colors.ok_color,
+                highlight=self._colors.ok_color_highlight,
+                mode=self._mode,
+            )
+            segments.extend(ok_chars)
+
+            segments.append(self._bar_segment.failed)
+
+            ready_chars = "".join(
+                [
+                    self._chars.background_char
+                    for _ in range(active_idx + 1, self._bar_width)
+                ]
+            )
+
+            segments.extend(ready_chars)
+
+        else:
+            ok_chars = await stylize(
+                "".join([self._chars.ok_char for _ in range(self._bar_width)]),
+                color=self._colors.ok_color,
+                highlight=self._colors.ok_color_highlight,
+                mode=self._mode,
+            )
+
+            segments.append(ok_chars)
+
+        if self._chars.end_char:
+            segments.append(self._chars.end_char)
 
         self._last_frame = await self._compose_out(
-            encoded_chars,
+            "".join(segments),
             text=text,
-            compose_mode="last",
-            mode=mode,
         )
+
+        self._frame_queue.put_nowait(self._last_frame)
 
         if self._frame_queue and not self._last_frame_ready:
             self._last_frame_ready = True
@@ -654,7 +649,6 @@ class Bar:
     async def _spin(
         self,
         text: str | bytes | ProgressText | None = None,
-        mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ):
         self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
 
@@ -666,13 +660,45 @@ class Bar:
 
             await self._stdout_lock.acquire()
 
-            # Compose output
-            spin_phase = "".join([segment.next for segment in self.segments])
+            active_idx = math.floor(self._completed * (self._bar_width / self._total))
+
+            segments: list[str] = []
+
+            if self._chars.start_char:
+                segments.append(self._chars.start_char)
+
+            if self._completed >= self.total:
+                segments = [self._bar_segment.ok for _ in range(self._bar_width)]
+
+            else:
+                ok_chars = await stylize(
+                    "".join([self._chars.ok_char for _ in range(0, active_idx)]),
+                    color=self._colors.ok_color,
+                    highlight=self._colors.ok_color_highlight,
+                    mode=self._mode,
+                )
+                segments.extend(ok_chars)
+
+                # segments.append(FillChar.by_name(self._chars.active_char))
+                segments.append(self._bar_segment.active)
+
+                ready_chars = "".join(
+                    [
+                        self._chars.background_char
+                        for _ in range(active_idx + 1, self._bar_width)
+                    ]
+                )
+
+                segments.extend(ready_chars)
+
+            if self._chars.end_char:
+                segments.append(self._chars.end_char)
+
+            spin_phase = "".join(segments)
 
             out = await self._compose_out(
                 spin_phase,
                 text=text,
-                mode=mode,
             )
 
             if self._frame_queue:

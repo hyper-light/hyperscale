@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from hyperscale.terminal.components.progress_bar import (
     BarFactory,
@@ -11,7 +12,10 @@ from hyperscale.terminal.components.render_engine import (
     Section,
     SectionConfig,
 )
-from hyperscale.terminal.components.text import Text
+from hyperscale.terminal.components.scatter_plot import (
+    PlotConfig,
+    ScatterPlot,
+)
 
 
 async def display():
@@ -20,7 +24,7 @@ async def display():
     factory = BarFactory()
 
     bar = factory.create_bar(
-        20,
+        60,
         colors=ProgressBarColorConfig(
             active_color="royal_blue",
             fail_color="white",
@@ -36,33 +40,24 @@ async def display():
                 SectionConfig(
                     width="small",
                     height="xx-small",
-                    top_border=" ",
-                    bottom_border=" ",
-                    border_color="aquamarine_2",
-                    mode="extended",
+                    left_border="|",
+                    top_border="-",
+                    right_border="|",
+                    bottom_border="-",
                 ),
                 [
                     Component(
+                        "progress_bar_example",
                         bar,
                         Alignment(
                             horizontal="left",
                             vertical="center",
-                            priority="high",
-                        ),
-                    ),
-                    Component(
-                        Text("Hello!"),
-                        Alignment(
-                            horizontal="right",
-                            vertical="center",
-                            priority="low",
                         ),
                     ),
                 ],
             ),
             Section(
                 SectionConfig(
-                    width="large",
                     height="xx-small",
                     left_border="|",
                     top_border="-",
@@ -104,19 +99,47 @@ async def display():
                 SectionConfig(
                     width="full",
                     height="small",
+                    left_border="|",
                     top_border="-",
+                    right_border="|",
                     bottom_border="-",
-                )
+                ),
+                [
+                    Component(
+                        "scatter_plot_test",
+                        ScatterPlot(
+                            PlotConfig(
+                                plot_name="Test",
+                                x_max=60,
+                                y_max=50,
+                                x_axis_name="Time (sec)",
+                                y_axis_name="Value",
+                                line_color="cyan",
+                                point_char="dot",
+                            ),
+                        ),
+                        Alignment(
+                            horizontal="center",
+                            priority="exclusive",
+                        ),
+                        horizontal_padding=2,
+                    )
+                ],
             ),
         ],
     )
 
     await engine.render()
-    items = []
+    data: list[tuple[int, int]] = []
+
+    elapsed = 0
+    start = time.monotonic()
 
     async for idx in bar:
         await asyncio.sleep(0.5)
-        items.append(idx)
+        data.append((elapsed, idx))
+        await engine.update("scatter_plot_test", data)
+        elapsed = time.monotonic() - start
 
     await engine.stop()
 

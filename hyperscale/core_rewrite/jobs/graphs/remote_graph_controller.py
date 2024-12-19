@@ -22,7 +22,6 @@ from hyperscale.core_rewrite.jobs.hooks import (
     task,
 )
 from hyperscale.core_rewrite.jobs.models import (
-    GraphUpdate,
     JobContext,
     ReceivedReceipt,
     Response,
@@ -358,9 +357,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         return JobContext(
             WorkflowStatusUpdate(
-                workflow_name,
-                node_id,
-                WorkflowStatus.SUBMITTED,
+                workflow_name, WorkflowStatus.SUBMITTED, node_id=node_id
             ),
             run_id=context.run_id,
         )
@@ -489,12 +486,12 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
             JobContext(
                 WorkflowStatusUpdate(
                     workflow_name,
-                    node_id,
                     status,
-                    completed_count,
-                    failed_count,
-                    avg_cpu_usage,
-                    avg_mem_usage,
+                    node_id=node_id,
+                    completed_count=completed_count,
+                    failed_count=failed_count,
+                    avg_cpu_usage=avg_cpu_usage,
+                    avg_mem_usage=avg_mem_usage,
                 ),
                 run_id=run_id,
             ),
@@ -515,7 +512,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         run_id: int,
         workflow: str,
         update_callback: Callable[
-            [GraphUpdate],
+            [WorkflowStatusUpdate],
             Awaitable[None],
         ],
     ):
@@ -529,20 +526,20 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
                 break
 
         completed_count = sum(self._completed_counts[run_id][workflow].values())
-        failed_counts = sum(self._failed_counts[run_id][workflow].values())
+        failed_count = sum(self._failed_counts[run_id][workflow].values())
         avg_cpu_usage = statistics.mean(
             self._cpu_usage_stats[run_id][workflow].values()
         )
         avg_mem_usage_mb = statistics.mean(self._memory_usage_stats[run_id][workflow])
 
         await update_callback(
-            GraphUpdate(
+            WorkflowStatusUpdate(
                 workflow,
                 workflow_status,
-                completed_count,
-                failed_counts,
-                avg_cpu_usage,
-                avg_mem_usage_mb,
+                completed_count=completed_count,
+                failed_count=failed_count,
+                avg_cpu_usage=avg_cpu_usage,
+                avg_mem_usage_mb=avg_mem_usage_mb,
             )
         )
 

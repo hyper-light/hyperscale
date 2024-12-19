@@ -1,8 +1,9 @@
 import asyncio
 from os import get_terminal_size
-from typing import List, Literal, Sequence
+from typing import List, Literal, Sequence, Set
 
 from hyperscale.terminal.config.mode import TerminalMode
+from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.terminal.styling import stylize
 from hyperscale.terminal.styling.attributes import (
     Attribute,
@@ -28,6 +29,7 @@ class Counter:
         attributes: List[AttributeName] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ) -> None:
+        self.fit_type = WidgetFitDimensions.X_AXIS
         self._count = config.initial_amount
         self._counter_lock = asyncio.Lock()
 
@@ -241,7 +243,7 @@ class Counter:
         return Highlight.by_name(value, default=default)
 
     @staticmethod
-    def _set_attrs(attrs: Sequence[str]) -> set[str]:
+    def _set_attrs(attrs: Sequence[str]) -> Set[str]:
         for attr in attrs:
             if attr not in Attribute.names:
                 raise ValueError(

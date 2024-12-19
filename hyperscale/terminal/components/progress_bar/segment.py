@@ -1,5 +1,4 @@
 import asyncio
-import itertools
 
 from hyperscale.terminal.components.spinner.spinner_factory import SpinnerFactory
 from hyperscale.terminal.config.mode import TerminalMode
@@ -34,6 +33,7 @@ class Segment:
         self._styled_start: str | None = None
         self._styled_end: str | None = None
         self.interval: int | None = None
+        self._active_frame_idx = 0
 
     @property
     def ok(self):
@@ -41,11 +41,13 @@ class Segment:
 
     @property
     def active(self):
-        return (
-            next(self._styled_active_state)
-            if isinstance(self._styled_active_state, itertools.cycle)
-            else None
-        )
+        if isinstance(self._styled_active_state, list):
+            frame = self._styled_active_state[self._active_frame_idx]
+            self._active_frame_idx = (self._active_frame_idx + 1) % len(
+                self._styled_active_state
+            )
+
+            return frame
 
     @property
     def ready(self):
@@ -75,6 +77,9 @@ class Segment:
 
             case SegmentStatus.OK:
                 return self.ok
+
+            case _:
+                return self.ready
 
     async def style(self):
         if self.segment_type == SegmentType.BAR:
@@ -125,18 +130,16 @@ class Segment:
 
         # We can avoid a lot of overhead by pre-styling the frames
         # to render
-        self._styled_active_state = itertools.cycle(
-            await asyncio.gather(
-                *[
-                    stylize(
-                        frame,
-                        color=self.segment_colors.active_color,
-                        highlight=self.segment_colors.active_color_highlight,
-                        mode=self.mode,
-                    )
-                    for frame in spinner.frames
-                ]
-            )
+        self._styled_active_state = await asyncio.gather(
+            *[
+                stylize(
+                    frame,
+                    color=self.segment_colors.active_color,
+                    highlight=self.segment_colors.active_color_highlight,
+                    mode=self.mode,
+                )
+                for frame in spinner.frames
+            ]
         )
 
         self._styled_ok_state = await stylize(

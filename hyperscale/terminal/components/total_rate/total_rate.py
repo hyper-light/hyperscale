@@ -4,6 +4,7 @@ from os import get_terminal_size
 from typing import List, Literal, Sequence
 
 from hyperscale.terminal.config.mode import TerminalMode
+from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.terminal.styling import stylize
 from hyperscale.terminal.styling.attributes import (
     Attribute,
@@ -29,6 +30,8 @@ class TotalRate:
         attributes: List[AttributeName] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ) -> None:
+        self.fit_type = WidgetFitDimensions.X_AXIS
+
         self._rate_lock = asyncio.Lock()
 
         self._precision = config.precision

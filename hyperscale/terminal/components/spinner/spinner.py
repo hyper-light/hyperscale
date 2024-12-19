@@ -27,6 +27,7 @@ from typing import (
 from hyperscale.logging.spinner import ProgressText
 from hyperscale.logging_rewrite import Logger
 from hyperscale.terminal.config.mode import TerminalMode
+from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.terminal.styling import stylize
 from hyperscale.terminal.styling.attributes import Attribute, AttributeName
 from hyperscale.terminal.styling.colors import (
@@ -96,6 +97,7 @@ class Spinner:
         mode: Literal["extended", "compatability"] = "compatability",
         disable_output: bool = False,
     ):
+        self.fit_type = WidgetFitDimensions.X_AXIS
         # Spinner
         self._mode = TerminalMode.to_mode(mode)
         self._factory = SpinnerFactory(spinners=spinners)
@@ -161,7 +163,6 @@ class Spinner:
 
         self._stdout_lock = asyncio.Lock()
         self._loop = asyncio.get_event_loop()
-        self._max_size: int | None = None
         self._loop = asyncio.get_event_loop()
         self._base_size = self._spinner.size + len(self._text)
 
@@ -173,23 +174,23 @@ class Spinner:
     def size(self):
         return self._base_size
 
-    async def fit(
-        self,
-        max_size: int | None = None,
-    ):
+    async def fit(self, max_size: int | None = None):
+        remaining_size = max_size
+
         if max_size is None:
             terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
             max_size = terminal_size[0]
+            remaining_size = max_size
 
-        max_size -= self._spinner.size
-        if max_size <= 0 and self._text:
+        remaining_size -= self._spinner.size
+        if remaining_size <= 0 and self._text:
             self._text = ""
 
         elif self._text:
-            self._text = self._text[:max_size]
+            self._text = self._text[:remaining_size]
+            remaining_size -= len(self._text)
 
-        self._max_size = max_size
-        self._base_size = self._spinner.size + len(self._text)
+        self._base_size = max_size
 
     async def get_next_frame(self) -> str:
         if self._frame_queue:

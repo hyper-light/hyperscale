@@ -16,7 +16,7 @@ from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.core_rewrite.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core_rewrite.graph.workflow import Workflow
 from hyperscale.core_rewrite.hooks import Hook, HookType
-from hyperscale.core_rewrite.jobs.models import GraphUpdate, InstanceRoleType
+from hyperscale.core_rewrite.jobs.models import InstanceRoleType, WorkflowStatusUpdate
 from hyperscale.core_rewrite.jobs.models.env import Env
 from hyperscale.core_rewrite.jobs.workers import Provisioner, StagePriority
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
@@ -383,7 +383,7 @@ class RemoteGraphManager:
 
         return context[workflow]
 
-    async def _update(self, update: GraphUpdate):
+    async def _update(self, update: WorkflowStatusUpdate):
         self._graph_updates[update.workflow].put_nowait(update)
 
     def _provision(

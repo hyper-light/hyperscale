@@ -5,6 +5,7 @@ from hyperscale.terminal.components.link import Link
 from hyperscale.terminal.components.progress_bar import Bar
 from hyperscale.terminal.components.spinner import Spinner
 from hyperscale.terminal.components.text import Text
+from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
 
 
 class Composite:
@@ -19,6 +20,7 @@ class Composite:
         ],
         space: int = 0,
     ) -> None:
+        self.fit_type = WidgetFitDimensions.X_AXIS
         self.components = components
         self._space = space
 

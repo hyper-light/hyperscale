@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Dict, List
 
 from hyperscale.terminal.config.mode import TerminalMode
+from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.terminal.styling import stylize
 
 from .alignment import AlignmentPriority, HorizontalAlignment, VerticalAlignment
@@ -30,6 +31,7 @@ class Section:
         self._actual_height = 0
         self._inner_width = 0
         self._inner_height = 0
+        self._alignment_remainder = 0
 
         self._render_event: asyncio.Event = None
 
@@ -144,7 +146,6 @@ class Section:
             vertical_padding += border_size
 
         self._inner_height = self._inner_height - vertical_padding
-
         self._center_width = math.floor(self._inner_width / 2)
         self._center_height = math.floor(self._inner_height / 2)
 
@@ -190,31 +191,27 @@ class Section:
         self.top_offset = top_offset
 
     async def create_blocks(self):
-        unaligned_components: List[Component] = []
-        max_components_per_row = len(self._horizontal_alignments)
+        aligned_components: List[Component] = []
 
-        for vertical_alignment in self.component_alignments:
-            components = self.component_alignments[vertical_alignment]
-            row_components_count = len(components)
-
-            assert (
-                row_components_count <= max_components_per_row
-            ), f"Err. - too many components for vertical alignment position. Encountered - {row_components_count} - but maximum supported is - {max_components_per_row}"
-
-            aligned_components, unaligned_components = await self._align_components(
-                components
+        if self._inner_height <= 1:
+            aligned_components = await self._align_row(
+                [
+                    component
+                    for vertical_alignment in self.component_alignments
+                    for component in self.component_alignments[vertical_alignment]
+                ]
             )
 
-            remaining = (
-                sum([component.raw_size for component in unaligned_components])
-                + sum([component.raw_size for component in aligned_components])
-            ) - self._inner_width
+        else:
+            for vertical_alignment in self.component_alignments:
+                aligned_components.extend(
+                    await self._align_row(
+                        self.component_alignments[vertical_alignment],
+                        vertical_alignment=vertical_alignment,
+                    )
+                )
 
-            assert (
-                len(unaligned_components) == 0
-            ), f"Err. - Exceeded max width of section by {remaining} - please increase the canvas width, reduce the alignment priority, or reduce the number of components for the vertical position - {vertical_alignment}"
-
-            self.components = aligned_components
+        self.components = aligned_components
 
         self._blocks = await asyncio.gather(
             *[self._to_row() for _ in range(self._inner_height)]
@@ -246,6 +243,34 @@ class Section:
 
             self._blocks.append(bottom_border)
 
+    async def _align_row(
+        self,
+        components: List[Component],
+        vertical_alignment: VerticalAlignment | None = None,
+    ):
+        row_components_count = len(components)
+        max_components_per_row = len(self._horizontal_alignments)
+
+        assert (
+            row_components_count <= max_components_per_row
+        ), f"Err. - too many components for vertical alignment position. Encountered - {row_components_count} - but maximum supported is - {max_components_per_row}"
+
+        (
+            aligned_components,
+            unaligned_components,
+        ) = await self._align_components(components)
+
+        remaining = (
+            sum([component.raw_size for component in unaligned_components])
+            + sum([component.raw_size for component in aligned_components])
+        ) - self._inner_width
+
+        assert (
+            len(unaligned_components) == 0
+        ), f"Err. - Exceeded max width of section by {remaining} - please increase the canvas width, reduce the alignment priority, or reduce the number of components for the vertical position - {vertical_alignment}"
+
+        return aligned_components
+
     async def _align_components(
         self,
         unprioritized_components: List[Component],
@@ -255,152 +280,187 @@ class Section:
 
         prioritized_components = sorted(
             unprioritized_components,
-            key=lambda component: component.alignment.priority,
+            key=lambda component: self._alignment_priotity_map.get(
+                component.alignment.priority, -1
+            ),
+            reverse=True,
         )
 
-        line_width = self._inner_width
-
-        consumed_width = 0
         horizontal_positions_count = len(self._horizontal_alignments)
+        vertical_positions_count = len(self._vertical_alignments)
 
-        while len(prioritized_components) > 0:
-            # If we have remaining unaligned components from the previous line,
-            # take these first else take the next prioritized component.
-            if len(unaligned_components) > 0:
-                component = unaligned_components.pop()
+        max_components = horizontal_positions_count * vertical_positions_count
 
-            else:
-                component = prioritized_components.pop()
+        if len(prioritized_components) > max_components:
+            prioritized_components = prioritized_components[:max_components]
 
-            if component.alignment.priority == "auto":
-                horizontal_alignment_priority = (
-                    self._horizontal_alignment_priority_map.get(
-                        component.alignment.horizontal
-                    )
+        remaining_width = self._inner_width
+
+        remaining_rows = self._inner_height
+
+        remaining_components = len(prioritized_components)
+
+        for component in prioritized_components:
+            (
+                consumed_width,
+                consumed_rows,
+                remaining_width,
+                remaining_rows,
+                remaining_components,
+            ) = self._calculate_component_alignment(
+                component,
+                remaining_width,
+                remaining_rows,
+                remaining_components,
+            )
+
+            if consumed_width and consumed_rows:
+                await component.fit(
+                    max_width=consumed_width,
+                    max_height=consumed_rows,
                 )
-
-                horizontal_priority_count = len(
-                    [
-                        unprioritized_component
-                        for unprioritized_component in unprioritized_components
-                        if unprioritized_component.alignment.priority == "auto"
-                        and self._horizontal_alignment_priority_map.get(
-                            unprioritized_component.alignment.horizontal
-                        )
-                        > horizontal_alignment_priority
-                    ]
-                )
-
-                left_space = horizontal_positions_count - horizontal_priority_count
-
-                component_width = int(
-                    (line_width - consumed_width)
-                    / (horizontal_priority_count + left_space)
-                )
-
-            else:
-                component_width_adjustment = self._alignment_adjust_map[
-                    component.alignment.priority
-                ]
-
-                component_width = int(component_width_adjustment * line_width)
-
-            await component.fit(component_width)
-
-            next_consumed_width = consumed_width + component.raw_size
-            if next_consumed_width <= line_width:
-                consumed_width += component.raw_size
 
                 aligned_components.append(component)
 
             else:
                 unaligned_components.append(component)
-                consumed_width = 0
 
         return (
             aligned_components,
             unaligned_components,
         )
 
+    def _calculate_component_alignment(
+        self,
+        component: Component,
+        remaining_width: int,
+        remaining_rows: int,
+        remaining_components: int,
+    ):
+        if remaining_rows <= 0:
+            return (
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+        if component.alignment.priority == "auto":
+            consumed_width = math.floor(remaining_width / remaining_components)
+
+        else:
+            consumed_width = math.floor(
+                remaining_width
+                * self._alignment_adjust_map[component.alignment.priority]
+            )
+
+        next_remaining_width = remaining_width - consumed_width
+
+        if (
+            remaining_rows > 0
+            and remaining_width <= 0
+            and component.fit_type != WidgetFitDimensions.X_Y_AXIS
+        ):
+            next_remaining_width = self._inner_width - consumed_width
+
+        consumed_rows = (
+            self._inner_height
+            if component.fit_type == WidgetFitDimensions.X_Y_AXIS
+            else 1
+        )
+
+        next_remaining_rows = remaining_rows - consumed_rows
+
+        return (
+            consumed_width,
+            consumed_rows,
+            next_remaining_width,
+            next_remaining_rows,
+            remaining_components - 1,
+        )
+
     async def render(self):
-        components = await asyncio.gather(
-            *[
-                component.render(
-                    self._inner_width,
-                    self._inner_height,
-                    self._center_width,
-                    self._center_height,
-                )
-                for component in self.components
-            ]
-        )
+        try:
+            components = await asyncio.gather(
+                *[
+                    component.render(
+                        self._inner_width,
+                        self._inner_height,
+                        self._center_width,
+                        self._center_height,
+                    )
+                    for component in self.components
+                ]
+            )
 
-        y_start_offset = self.config.top_padding
-        if self.config.top_border:
-            y_start_offset += len(self.config.top_border.split("\n"))
+            y_start_offset = self.config.top_padding
+            if self.config.top_border:
+                y_start_offset += len(self.config.top_border.split("\n"))
 
-        lines: Dict[int, List[str]] = defaultdict(list)
+            lines: Dict[int, List[str]] = defaultdict(list)
 
-        left_border = await self._recreate_left_border()
-        right_border = await self._recreate_right_border()
+            left_border = await self._recreate_left_border()
+            right_border = await self._recreate_right_border()
 
-        left_pad = self.config.left_padding * " "
-        right_pad = self.config.right_padding * " "
+            left_pad = self.config.left_padding * " "
+            right_pad = self.config.right_padding * " "
 
-        pad_size = (
-            self._inner_width - sum([raw_size for _, _, raw_size, _ in components])
-        ) / 2
+            pad_size = (
+                self._inner_width - sum([raw_size for _, _, raw_size, _ in components])
+            ) / 2
 
-        left_pad_adjust = math.floor(pad_size)
-        right_pad_adjust = math.ceil(pad_size)
+            left_pad_adjust = math.floor(pad_size)
+            right_pad_adjust = math.ceil(pad_size)
 
-        horizontal_prioritized_components = sorted(
-            components,
-            key=lambda component_config: self._horizontal_alignment_priority_map.get(
-                component_config[3]
-            ),
-        )
+            horizontal_prioritized_components = sorted(
+                components,
+                key=lambda component_config: self._horizontal_alignment_priority_map.get(
+                    component_config[3]
+                ),
+            )
 
-        consumed_widths: List[int] = []
+            consumed_widths: List[int] = []
 
-        for (
-            frame,
-            y_pos,
-            raw_size,
-            horizontal_alignment,
-        ) in horizontal_prioritized_components:
-            y_start = y_pos + y_start_offset
+            for (
+                frame,
+                y_pos,
+                raw_size,
+                horizontal_alignment,
+            ) in horizontal_prioritized_components:
+                y_start = y_pos + y_start_offset
 
-            if horizontal_alignment == "left":
-                lines[y_start].append(frame)
-
-                consumed_widths.append(raw_size)
-
-            elif horizontal_alignment == "center":
-                lines[y_start].append(
-                    (left_pad_adjust * " ") + frame + (right_pad_adjust * " ")
-                )
-
-                consumed_widths.extend(
-                    [
+                if isinstance(frame, str):
+                    (lines, consumed_widths) = self._render_frame_string(
+                        frame,
+                        y_pos,
+                        raw_size,
+                        y_start_offset,
                         left_pad_adjust,
-                        raw_size,
                         right_pad_adjust,
-                    ]
-                )
+                        horizontal_alignment,
+                        lines,
+                        consumed_widths,
+                    )
 
-            else:
-                right_align_adjust = self._inner_width - sum(consumed_widths) - raw_size
-
-                right_align_pad = right_align_adjust * " "
-
-                lines[y_start].append(right_align_pad + frame)
-                consumed_widths.extend(
-                    [
-                        right_align_adjust,
+                else:
+                    (lines, consumed_widths) = self._render_frames_from_list(
+                        frame,
+                        y_pos,
                         raw_size,
-                    ]
-                )
+                        y_start_offset,
+                        left_pad_adjust,
+                        right_pad_adjust,
+                        horizontal_alignment,
+                        lines,
+                        consumed_widths,
+                    )
+
+        except Exception:
+            import traceback
+
+            print(traceback.format_exc())
+            exit(0)
 
         consumed_width = (
             sum(consumed_widths) + self.config.left_padding + self.config.right_padding
@@ -435,6 +495,88 @@ class Section:
             )
 
         return self._blocks
+
+    def _render_frames_from_list(
+        self,
+        frames: list[str],
+        y_pos: int,
+        raw_size: int,
+        y_start_offset: int,
+        left_pad_adjust: int,
+        right_pad_adjust: int,
+        horizontal_alignment: HorizontalAlignment,
+        lines: Dict[int, List[str]],
+        consumed_widths: List[int],
+    ):
+        for frame in frames:
+            (lines, consumed_widths) = self._render_frame_string(
+                frame,
+                y_pos,
+                raw_size,
+                y_start_offset,
+                left_pad_adjust,
+                right_pad_adjust,
+                horizontal_alignment,
+                lines,
+                consumed_widths,
+            )
+
+            y_pos += 1
+
+        return (
+            lines,
+            consumed_widths,
+        )
+
+    def _render_frame_string(
+        self,
+        frame: str,
+        y_pos: int,
+        raw_size: int,
+        y_start_offset: int,
+        left_pad_adjust: int,
+        right_pad_adjust: int,
+        horizontal_alignment: HorizontalAlignment,
+        lines: Dict[int, List[str]],
+        consumed_widths: List[int],
+    ):
+        y_start = y_pos + y_start_offset
+
+        if horizontal_alignment == "left":
+            lines[y_start].append(frame)
+
+            consumed_widths.append(raw_size)
+
+        elif horizontal_alignment == "center":
+            lines[y_start].append(
+                (left_pad_adjust * " ") + frame + (right_pad_adjust * " ")
+            )
+
+            consumed_widths.extend(
+                [
+                    left_pad_adjust,
+                    raw_size,
+                    right_pad_adjust,
+                ]
+            )
+
+        else:
+            right_align_adjust = self._inner_width - sum(consumed_widths) - raw_size
+
+            right_align_pad = right_align_adjust * " "
+
+            lines[y_start].append(right_align_pad + frame)
+            consumed_widths.extend(
+                [
+                    right_align_adjust,
+                    raw_size,
+                ]
+            )
+
+        return (
+            lines,
+            consumed_widths,
+        )
 
     def fit_width(self, remainder: int):
         self._inner_width += remainder

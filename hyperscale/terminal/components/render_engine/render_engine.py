@@ -11,6 +11,15 @@ from typing import (
     List,
 )
 
+from hyperscale.terminal.components.counter import Counter
+from hyperscale.terminal.components.link import Link
+from hyperscale.terminal.components.progress_bar import Bar
+from hyperscale.terminal.components.scatter_plot import ScatterPlot
+from hyperscale.terminal.components.spinner import Spinner
+from hyperscale.terminal.components.text import Text
+from hyperscale.terminal.components.total_rate import TotalRate
+from hyperscale.terminal.components.windowed_rate import WindowedRate
+
 from .canvas import Canvas
 from .engine_config import EngineConfig
 from .section import Section
@@ -38,9 +47,22 @@ class RenderEngine:
         self.config = config
         self.canvas = Canvas()
 
+        self._components: Dict[
+            str,
+            Bar
+            | Counter
+            | Link
+            | ScatterPlot
+            | Spinner
+            | Text
+            | TotalRate
+            | WindowedRate,
+        ] = {}
+
         self._interval = 80 * 0.001
         if self.config:
             self._interval = config.refresh_rate * 0.001
+
         self._stop_run: asyncio.Event | None = None
         self._hide_run: asyncio.Event | None = None
         self._stdout_lock: asyncio.Lock | None = None
@@ -73,11 +95,24 @@ class RenderEngine:
             width = self.config.width
             height = self.config.height
 
+        self._components = {
+            component.name: component.component
+            for section in sections
+            for component in section.components
+        }
+
         await self.canvas.initialize(
             sections,
             width=width,
             height=height,
         )
+
+    async def update(
+        self,
+        name: str,
+        value: Any,
+    ):
+        await self._components[name].update(value)
 
     async def render(self):
         if self._run_engine is None:
@@ -187,7 +222,8 @@ class RenderEngine:
         await asyncio.to_thread(sys.stdout.write, "\n")
         await asyncio.to_thread(sys.stdout.flush)
 
-        self._stdout_lock.release()
+        if self._stdout_lock.locked():
+            self._stdout_lock.release()
 
         await self._show_cursor()
 

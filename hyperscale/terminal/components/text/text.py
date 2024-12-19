@@ -3,6 +3,7 @@ from os import get_terminal_size
 from typing import List, Literal, Sequence
 
 from hyperscale.terminal.config.mode import TerminalMode
+from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.terminal.styling import stylize
 from hyperscale.terminal.styling.attributes import (
     Attribute,
@@ -26,6 +27,8 @@ class Text:
         attributes: List[AttributeName] | None = None,
         mode: Literal["extended", "compatability"] = "compatability",
     ) -> None:
+        self.fit_type = WidgetFitDimensions.X_AXIS
+
         self._text = text
         self._styled: str | None = None
         self._color = color
@@ -55,7 +58,9 @@ class Text:
             terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
             max_size = terminal_size[0]
 
-        self._text = self._text[:max_size]
+        if max_size <= len(self._text):
+            self._text = self._text[:max_size]
+
         self._max_size = max_size
         self._base_size = len(self._text)
 

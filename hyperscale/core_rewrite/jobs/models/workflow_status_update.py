@@ -15,12 +15,12 @@ class WorkflowStatusUpdate:
     def __init__(
         self,
         workflow: str,
-        node_id: int,
         status: WorkflowStatus,
-        completed_count: int,
-        failed_count: int,
-        avg_cpu_usage: float,
-        avg_memory_usage_mb: float,
+        node_id: int | None = None,
+        completed_count: int | None = None,
+        failed_count: int | None = None,
+        avg_cpu_usage: float | None = None,
+        avg_memory_usage_mb: float | None = None,
     ) -> None:
         self.workflow = workflow
         self.node_id = node_id
