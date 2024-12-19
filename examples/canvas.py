@@ -12,9 +12,9 @@ from hyperscale.terminal.components.render_engine import (
     Section,
     SectionConfig,
 )
-from hyperscale.terminal.components.scatter_plot import (
-    PlotConfig,
-    ScatterPlot,
+from hyperscale.terminal.components.table import (
+    Table,
+    TableConfig,
 )
 
 
@@ -106,16 +106,35 @@ async def display():
                 ),
                 [
                     Component(
-                        "scatter_plot_test",
-                        ScatterPlot(
-                            PlotConfig(
-                                plot_name="Test",
-                                x_axis_name="Time (sec)",
-                                y_axis_name="Value",
-                                line_color="aquamarine_2",
-                                point_char="dot",
+                        "table_test",
+                        # ScatterPlot(
+                        #     PlotConfig(
+                        #         plot_name="Test",
+                        #         x_axis_name="Time (sec)",
+                        #         y_axis_name="Value",
+                        #         line_color="aquamarine_2",
+                        #         point_char="dot",
+                        #         terminal_mode="extended",
+                        #     ),
+                        # ),
+                        Table(
+                            TableConfig(
+                                headers={
+                                    "one": {
+                                        "field_type": "integer",
+                                    },
+                                    "two": {
+                                        "field_type": "integer",
+                                    },
+                                    "three": {
+                                        "precision": ".2f",
+                                        "field_type": "integer",
+                                    },
+                                    "four": {"field_type": "string"},
+                                },
+                                table_color="aquamarine_2",
                                 terminal_mode="extended",
-                            ),
+                            )
                         ),
                         Alignment(
                             horizontal="center",
@@ -134,10 +153,19 @@ async def display():
     elapsed = 0
     start = time.monotonic()
 
+    data = []
+
     async for idx in bar:
         await asyncio.sleep(1)
-        data.append((elapsed, idx))
-        await engine.update("scatter_plot_test", data)
+
+        if idx <= 15:
+            data.append({"one": idx})
+
+            await engine.update(
+                "table_test",
+                data,
+            )
+
         elapsed = time.monotonic() - start
 
     await engine.stop()

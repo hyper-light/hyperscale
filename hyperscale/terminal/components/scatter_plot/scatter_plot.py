@@ -3,13 +3,12 @@ from collections import OrderedDict, defaultdict
 from os import get_terminal_size
 from typing import Dict, List, Tuple, Union
 
-import plotille
-
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.terminal.styling.colors import Color
 
 from .plot_config import PlotConfig
+from .plotille import scatter
 from .point_char import PointChar
 
 CompletionRateSet = Tuple[str, List[Union[int, float]]]
@@ -84,7 +83,7 @@ class ScatterPlot:
             y_vals,
         ) = self._generate_x_and_y_vals()
 
-        plot: str = plotille.scatter(
+        plot: str = scatter(
             x_vals,
             y_vals,
             width=self._max_width,
@@ -134,54 +133,47 @@ class ScatterPlot:
         self._update_lock.release()
 
     async def get_next_frame(self):
-        try:
-            (
-                x_max,
-                y_max,
-                x_vals,
-                y_vals,
-            ) = self._generate_x_and_y_vals()
+        (
+            x_max,
+            y_max,
+            x_vals,
+            y_vals,
+        ) = self._generate_x_and_y_vals()
 
-            length_adjustments = self._get_plot_length_adjustments(
-                x_max,
-                y_max,
-                x_vals,
-                y_vals,
-            )
+        length_adjustments = self._get_plot_length_adjustments(
+            x_max,
+            y_max,
+            x_vals,
+            y_vals,
+        )
 
-            plot: str = plotille.scatter(
-                x_vals,
-                y_vals,
-                width=self._corrected_width,
-                height=self._corrected_height,
-                y_min=self.config.y_min,
-                y_max=int(round(y_max, 0)),
-                x_min=self.config.x_min,
-                x_max=int(round(x_max, 0)),
-                linesep="\n",
-                X_label=self.config.x_axis_name,
-                Y_label=self.config.y_axis_name,
-                lc=Color.by_name(
-                    self.config.line_color,
-                    mode=self._mode,
-                ),
-                color_mode="byte",
-                origin=self.config.use_origin,
-                marker=PointChar.by_name(self.config.point_char),
-            )
+        plot: str = scatter(
+            x_vals,
+            y_vals,
+            width=self._corrected_width,
+            height=self._corrected_height,
+            y_min=self.config.y_min,
+            y_max=int(round(y_max, 0)),
+            x_min=self.config.x_min,
+            x_max=int(round(x_max, 0)),
+            linesep="\n",
+            X_label=self.config.x_axis_name,
+            Y_label=self.config.y_axis_name,
+            lc=Color.by_name(
+                self.config.line_color,
+                mode=self._mode,
+            ),
+            color_mode="byte",
+            origin=self.config.use_origin,
+            marker=PointChar.by_name(self.config.point_char),
+        )
 
-            plot_lines = plot.split("\n")
+        plot_lines = plot.split("\n")
 
-            for idx, plot_line in enumerate(plot_lines):
-                plot_lines[idx] = plot_line + (" " * length_adjustments[idx])
+        for idx, plot_line in enumerate(plot_lines):
+            plot_lines[idx] = plot_line + (" " * length_adjustments[idx])
 
-            return plot_lines
-
-        except Exception:
-            import traceback
-
-            print(traceback.format_exc())
-            exit(0)
+        return plot_lines
 
     def _get_plot_length_adjustments(
         self,
@@ -190,7 +182,7 @@ class ScatterPlot:
         x_vals: list[int],
         y_vals: list[int],
     ):
-        plot: str = plotille.scatter(
+        plot: str = scatter(
             x_vals,
             y_vals,
             width=self._corrected_width,
@@ -209,7 +201,7 @@ class ScatterPlot:
         plot_lines = plot.split("\n")
         length_adjustments: list[int] = []
 
-        for idx, plot_line in enumerate(plot_lines):
+        for plot_line in plot_lines:
             if len(plot_line) <= self._max_width:
                 difference = self._max_width - len(plot_line)
                 length_adjustments.append(difference)

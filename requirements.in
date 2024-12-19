@@ -15,8 +15,6 @@ uvloop
 tdigest
 pydantic
 GitPython
-tabulate
-plotille
 python3-dtls
 zstandard
 cryptography
