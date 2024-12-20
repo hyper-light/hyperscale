@@ -113,17 +113,6 @@ class Table:
 
         return table_lines
 
-        # return await asyncio.gather(
-        #     *[
-        #         stylize(
-        #             line,
-        #             color=self.config.table_color,
-        #             mode=self._mode,
-        #         )
-        #         for line in table_lines
-        #     ]
-        # )
-
     def _format_data(self):
         data = self.data
 
