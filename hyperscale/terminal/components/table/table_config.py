@@ -14,6 +14,14 @@ from hyperscale.terminal.styling.colors import (
     ExtendedColorName,
 )
 
+from .tabulate import (
+    DataColorMap,
+    HeaderColorMap,
+    NumberAlignmentType,
+    StringAlignmentType,
+    TableFormatType,
+)
+
 
 class HeaderOptions(BaseModel):
     precision: StrictStr | None = None
@@ -27,20 +35,16 @@ class HeaderOptions(BaseModel):
 
 
 class TableConfig(BaseModel):
-    table_format: Literal[
-        "plain",
-        "simple",
-        "grid",
-        "orgtbl",
-        "rst",
-        "mediawiki",
-        "latex",
-    ] = "simple"
+    table_format: TableFormatType = "simple"
     null_value: StrictStr | StrictInt | StrictFloat | StrictBool = "None"
     headers: Dict[
         StrictStr,
         HeaderOptions,
     ]
     table_color: ColorName | ExtendedColorName | None = None
+    number_alignment_type: NumberAlignmentType | None = "right"
+    string_alignment_type: StringAlignmentType | None = "right"
     terminal_mode: TerminalDisplayMode = "compatability"
     pagination_refresh_rate: StrictInt | StrictFloat = 3
+    header_color_map: HeaderColorMap | None = None
+    data_color_map: DataColorMap | None = None

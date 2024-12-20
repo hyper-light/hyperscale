@@ -1,5 +1,6 @@
 """Pretty-print tabular data."""
 
+import asyncio
 import dataclasses
 import io
 import math
@@ -11,7 +12,14 @@ from functools import partial, reduce
 from html import escape as htmlescape
 from itertools import chain
 from itertools import zip_longest as izip_longest
-from typing import Any
+from typing import Any, Callable, Dict, Literal
+
+from hyperscale.terminal.config.mode import TerminalMode
+from hyperscale.terminal.styling import stylize
+from hyperscale.terminal.styling.colors import (
+    ColorName,
+    ExtendedColorName,
+)
 
 try:
     import wcwidth  # optional wide-character (CJK) support
@@ -275,13 +283,25 @@ LATEX_ESCAPE_RULES = {
 }
 
 
-def _latex_row(cell_values, colwidths, colaligns, escrules=LATEX_ESCAPE_RULES):
+async def _latex_row(
+    cell_values,
+    colwidths,
+    colaligns,
+    escrules=LATEX_ESCAPE_RULES,
+    table_color: ColorName | ExtendedColorName | None = None,
+    terminal_mode: TerminalMode = TerminalMode.COMPATIBILITY,
+):
     def escape_char(c):
         return escrules.get(c, c)
 
     escaped_values = ["".join(map(escape_char, cell)) for cell in cell_values]
     rowfmt = DataRow("", "&", "\\\\")
-    return _build_simple_row(escaped_values, rowfmt)
+    return await _build_simple_row(
+        escaped_values,
+        rowfmt,
+        table_color=table_color,
+        terminal_mode=terminal_mode,
+    )
 
 
 def _rst_escape_first_column(rows, headers):
@@ -301,6 +321,91 @@ def _rst_escape_first_column(rows, headers):
             new_row[0] = escape_empty(row[0])
         new_rows.append(new_row)
     return new_rows, new_headers
+
+
+HeaderColorMap = Dict[
+    str,
+    ColorName
+    | ExtendedColorName
+    | Callable[
+        [str],
+        ColorName | ExtendedColorName | None,
+    ],
+]
+
+
+DataColorMap = Dict[
+    str,
+    ColorName
+    | ExtendedColorName
+    | Callable[
+        [str],
+        ColorName | ExtendedColorName | None,
+    ]
+    | list[
+        Callable[
+            [str],
+            ColorName | ExtendedColorName | None,
+        ]
+    ],
+]
+
+
+TableFormatType = Literal[
+    "simple",
+    "plain",
+    "grid",
+    "simple_grid",
+    "rounded_grid",
+    "heavy_grid",
+    "mixed_grid",
+    "double_grid",
+    "fancy_grid",
+    "outline",
+    "simple_outline",
+    "rounded_outline",
+    "heavy_outline",
+    "mixed_outline",
+    "double_outline",
+    "fancy_outline",
+    "github",
+    "pipe",
+    "orgtbl",
+    "jira",
+    "presto",
+    "pretty",
+    "psql",
+    "rst",
+    "mediawiki",
+    "moinmoin",
+    "youtrack",
+    "html",
+    "unsafehtml",
+    "latex",
+    "latex_raw",
+    "latex_booktabs",
+    "latex_longtable",
+    "tsv",
+    "textile",
+    "asciidoc",
+]
+
+
+NumberAlignmentType = Literal[
+    "right",
+    "center",
+    "left",
+    "decimal",
+    "default",
+]
+
+
+StringAlignmentType = Literal[
+    "right",
+    "center",
+    "left",
+    "default",
+]
 
 
 _table_formats = {
@@ -1543,7 +1648,14 @@ def _wrap_text_to_colwidths(
     return result
 
 
-def _to_str(s, encoding="utf8", errors="ignore"):
+# ADD COLORIZATION HERE
+async def _to_str(
+    value: str | tuple[str, Any],
+    encoding="utf8",
+    errors="ignore",
+    color_map: HeaderColorMap | DataColorMap | None = None,
+    terminal_mode: TerminalMode | None = None,
+):
     """
     A type safe wrapper for converting a bytestring to str. This is essentially just
     a wrapper around .decode() intended for use with things like map(), but with some
@@ -1563,26 +1675,95 @@ def _to_str(s, encoding="utf8", errors="ignore"):
     "'42'"
 
     """
-    if isinstance(s, bytes):
-        return s.decode(encoding=encoding, errors=errors)
-    return str(s)
+    header: str | None = None
+    data: Any | None = None
+    if isinstance(value, tuple):
+        header, data = value
+
+    else:
+        header = value
+
+    if header and isinstance(header, bytes):
+        raw_string = header.decode(encoding=encoding, errors=errors)
+
+    elif header:
+        raw_string = str(header)
+
+    elif data and isinstance(data, bytes):
+        raw_string = data.decode(encoding=encoding, errors=errors)
+
+    else:
+        raw_string = str(data)
+
+    if color_map:
+        return await _stylize_string(
+            raw_string,
+            color_map,
+            terminal_mode,
+            header_key=header,
+        )
+
+    return raw_string
 
 
-def tabulate(
+async def _stylize_string(
+    value: str,
+    color_map: HeaderColorMap | DataColorMap,
+    terminal_mode: TerminalMode,
+    header_key: str = None,
+):
+    colorizer = color_map.get(header_key)
+
+    if isinstance(colorizer, str):
+        return await stylize(
+            value,
+            color=colorizer,
+            mode=terminal_mode,
+        )
+
+    elif isinstance(colorizer, list):
+        for colorizable in colorizer:
+            if color := colorizable(value):
+                value = await stylize(
+                    value,
+                    color=color,
+                    mode=terminal_mode,
+                )
+
+                break
+
+        return value
+
+    elif colorizer and (color := colorizer(value.strip())):
+        return await stylize(
+            value,
+            color=color,
+            mode=terminal_mode,
+        )
+
+    else:
+        return value
+
+
+async def tabulate(
     tabular_data,
     headers=(),
-    tablefmt="simple",
-    floatfmt=_DEFAULT_FLOATFMT,
-    intfmt=_DEFAULT_INTFMT,
-    numalign=_DEFAULT_ALIGN,
-    stralign=_DEFAULT_ALIGN,
+    tablefmt: TableFormatType = "simple",
+    floatfmt: str = _DEFAULT_FLOATFMT,
+    intfmt: str = _DEFAULT_INTFMT,
+    numalign: NumberAlignmentType = _DEFAULT_ALIGN,
+    stralign: StringAlignmentType = _DEFAULT_ALIGN,
     missingval=_DEFAULT_MISSINGVAL,
     showindex="default",
     disable_numparse=False,
     colalign=None,
     maxcolwidths=None,
     rowalign=None,
-    maxheadercolwidths=None,
+    maxheadercolwidths: int | None = None,
+    header_color_map: HeaderColorMap | None = None,
+    values_color_map: DataColorMap | None = None,
+    table_color: ColorName | ExtendedColorName | None = None,
+    terminal_mode: TerminalMode = TerminalMode.COMPATIBILITY,
 ):
     """Format a fixed width table for pretty printing.
 
@@ -2122,13 +2303,40 @@ def tabulate(
     #
     # convert the headers and rows into a single, tab-delimited string ensuring
     # that any bytestrings are decoded safely (i.e. errors ignored)
+
+    header_strings = await asyncio.gather(
+        *[
+            _to_str(
+                header,
+                color_map=header_color_map,
+                terminal_mode=terminal_mode,
+            )
+            for header in headers
+        ]
+    )
+
+    value_strings = await asyncio.gather(
+        *[
+            _to_str(
+                (
+                    headers[idx],
+                    value,
+                ),
+                color_map=values_color_map,
+                terminal_mode=terminal_mode,
+            )
+            for row in list_of_lists
+            for idx, value in enumerate(row)
+        ]
+    )
+
     plain_text = "\t".join(
         chain(
             # headers
-            map(_to_str, headers),
+            header_strings,
             # rows: chain the rows together into a single iterable after mapping
             # the bytestring conversino to each cell value
-            chain.from_iterable(map(_to_str, row) for row in list_of_lists),
+            chain.from_iterable(value_strings),
         )
     )
 
@@ -2217,8 +2425,18 @@ def tabulate(
     rowaligns = _expand_iterable(rowalign, len(rows), ra_default)
     _reinsert_separating_lines(rows, separating_lines)
 
-    return _format_table(
-        tablefmt, headers, rows, minwidths, aligns, is_multiline, rowaligns=rowaligns
+    return await _format_table(
+        tablefmt,
+        headers,
+        rows,
+        minwidths,
+        aligns,
+        is_multiline,
+        rowaligns=rowaligns,
+        header_color_map=header_color_map,
+        values_color_map=values_color_map,
+        table_color=table_color,
+        terminal_mode=terminal_mode,
     )
 
 
@@ -2262,25 +2480,87 @@ def _pad_row(cells, padding):
         return cells
 
 
-def _build_simple_row(padded_cells, rowfmt):
+async def _build_simple_row(
+    padded_cells,
+    rowfmt,
+    table_color: ColorName | ExtendedColorName | None = None,
+    terminal_mode: TerminalMode = TerminalMode.COMPATIBILITY,
+):
     "Format row according to DataRow format without padding."
     begin, sep, end = rowfmt
+    if begin != " " and table_color:
+        begin = await stylize(
+            begin,
+            color=table_color,
+            mode=terminal_mode,
+        )
+
+    if sep != " " and table_color:
+        sep = await stylize(
+            sep,
+            color=table_color,
+            mode=terminal_mode,
+        )
+
+    if end != " " and table_color:
+        end = await stylize(
+            end,
+            color=table_color,
+            mode=terminal_mode,
+        )
+
+    # cells = ""
+
+    # for cell in padded_cells:
+    #     cells += cell + sep
+
+    # Colorize Row
     return (begin + sep.join(padded_cells) + end).rstrip()
 
 
-def _build_row(padded_cells, colwidths, colaligns, rowfmt):
+async def _build_row(
+    padded_cells,
+    colwidths,
+    colaligns,
+    rowfmt,
+    table_color: ColorName | ExtendedColorName | None = None,
+    terminal_mode: TerminalMode = TerminalMode.COMPATIBILITY,
+):
     "Return a string which represents a row of data cells."
     if not rowfmt:
         return None
     if hasattr(rowfmt, "__call__"):
         return rowfmt(padded_cells, colwidths, colaligns)
     else:
-        return _build_simple_row(padded_cells, rowfmt)
+        return await _build_simple_row(
+            padded_cells,
+            rowfmt,
+            table_color=table_color,
+            terminal_mode=terminal_mode,
+        )
 
 
-def _append_basic_row(lines, padded_cells, colwidths, colaligns, rowfmt, rowalign=None):
+async def _append_basic_row(
+    lines,
+    padded_cells,
+    colwidths,
+    colaligns,
+    rowfmt,
+    rowalign=None,
+    table_color: ColorName | ExtendedColorName | None = None,
+    terminal_mode: TerminalMode = TerminalMode.COMPATIBILITY,
+):
     # NOTE: rowalign is ignored and exists for api compatibility with _append_multiline_row
-    lines.append(_build_row(padded_cells, colwidths, colaligns, rowfmt))
+    lines.append(
+        await _build_row(
+            padded_cells,
+            colwidths,
+            colaligns,
+            rowfmt,
+            table_color=table_color,
+            terminal_mode=terminal_mode,
+        )
+    )
     return lines
 
 
@@ -2297,8 +2577,16 @@ def _align_cell_veritically(text_lines, num_lines, column_width, row_alignment):
         return text_lines + blank * delta_lines
 
 
-def _append_multiline_row(
-    lines, padded_multiline_cells, padded_widths, colaligns, rowfmt, pad, rowalign=None
+async def _append_multiline_row(
+    lines,
+    padded_multiline_cells,
+    padded_widths,
+    colaligns,
+    rowfmt,
+    pad,
+    rowalign=None,
+    table_color: ColorName | ExtendedColorName | None = None,
+    terminal_mode: TerminalMode = TerminalMode.COMPATIBILITY,
 ):
     colwidths = [w - 2 * pad for w in padded_widths]
     cells_lines = [c.splitlines() for c in padded_multiline_cells]
@@ -2315,11 +2603,25 @@ def _append_multiline_row(
     lines_cells = [[cl[i] for cl in cells_lines] for i in range(nlines)]
     for ln in lines_cells:
         padded_ln = _pad_row(ln, pad)
-        _append_basic_row(lines, padded_ln, colwidths, colaligns, rowfmt)
+        await _append_basic_row(
+            lines,
+            padded_ln,
+            colwidths,
+            colaligns,
+            rowfmt,
+            table_color=table_color,
+            terminal_mode=terminal_mode,
+        )
     return lines
 
 
-def _build_line(colwidths, colaligns, linefmt):
+async def _build_line(
+    colwidths,
+    colaligns,
+    linefmt,
+    table_color: ColorName | ExtendedColorName | None = None,
+    terminal_mode: TerminalMode = TerminalMode.COMPATIBILITY,
+):
     "Return a string which represents a horizontal line."
     if not linefmt:
         return None
@@ -2327,12 +2629,37 @@ def _build_line(colwidths, colaligns, linefmt):
         return linefmt(colwidths, colaligns)
     else:
         begin, fill, sep, end = linefmt
+
         cells = [fill * w for w in colwidths]
-        return _build_simple_row(cells, (begin, sep, end))
+        row = await _build_simple_row(
+            cells,
+            (begin, sep, end),
+        )
+
+        return await stylize(
+            row,
+            color=table_color,
+            mode=terminal_mode,
+        )
 
 
-def _append_line(lines, colwidths, colaligns, linefmt):
-    lines.append(_build_line(colwidths, colaligns, linefmt))
+async def _append_line(
+    lines,
+    colwidths,
+    colaligns,
+    linefmt,
+    table_color: ColorName | ExtendedColorName | None = None,
+    terminal_mode: TerminalMode = TerminalMode.COMPATIBILITY,
+):
+    lines.append(
+        await _build_line(
+            colwidths,
+            colaligns,
+            linefmt,
+            table_color=table_color,
+            terminal_mode=terminal_mode,
+        )
+    )
     return lines
 
 
@@ -2349,10 +2676,36 @@ class JupyterHTMLStr(str):
         return self
 
 
-def _format_table(fmt, headers, rows, colwidths, colaligns, is_multiline, rowaligns):
+async def _format_table(
+    fmt: TableFormat,
+    headers: list[str],
+    rows,
+    colwidths,
+    colaligns,
+    is_multiline,
+    rowaligns,
+    header_color_map: HeaderColorMap | None = None,
+    values_color_map: DataColorMap | None = None,
+    table_color: ColorName | ExtendedColorName | None = None,
+    terminal_mode: TerminalMode = TerminalMode.COMPATIBILITY,
+):
     """Produce a plain-text representation of the table."""
+    stylized_headers = headers
+    if header_color_map:
+        stylized_headers = await asyncio.gather(
+            *[
+                _stylize_string(
+                    header,
+                    header_color_map,
+                    terminal_mode,
+                    header_key=header.strip(),
+                )
+                for header in headers
+            ]
+        )
+
     lines = []
-    hidden = fmt.with_header_hide if (headers and fmt.with_header_hide) else []
+    hidden = fmt.with_header_hide if (stylized_headers and fmt.with_header_hide) else []
     pad = fmt.padding
     headerrow = fmt.headerrow
 
@@ -2364,32 +2717,89 @@ def _format_table(fmt, headers, rows, colwidths, colaligns, is_multiline, rowali
         pad_row = _pad_row
         append_row = _append_basic_row
 
-    padded_headers = pad_row(headers, pad)
-    padded_rows = [pad_row(row, pad) for row in rows]
+    stylized_rows = rows
+    if values_color_map:
+        stylized_rows = await asyncio.gather(
+            *[
+                asyncio.gather(
+                    *[
+                        _stylize_string(
+                            value,
+                            values_color_map,
+                            terminal_mode,
+                            header_key=headers[idx].strip(),
+                        )
+                        for idx, value in enumerate(row)
+                    ]
+                )
+                for row in rows
+            ]
+        )
+
+    padded_headers = pad_row(stylized_headers, pad)
+    padded_rows = [pad_row(row, pad) for row in stylized_rows]
 
     if fmt.lineabove and "lineabove" not in hidden:
-        _append_line(lines, padded_widths, colaligns, fmt.lineabove)
+        await _append_line(
+            lines,
+            padded_widths,
+            colaligns,
+            fmt.lineabove,
+            table_color=table_color,
+            terminal_mode=terminal_mode,
+        )
 
     if padded_headers:
-        append_row(lines, padded_headers, padded_widths, colaligns, headerrow)
+        await append_row(
+            lines,
+            padded_headers,
+            padded_widths,
+            colaligns,
+            headerrow,
+            table_color=table_color,
+            terminal_mode=terminal_mode,
+        )
         if fmt.linebelowheader and "linebelowheader" not in hidden:
-            _append_line(lines, padded_widths, colaligns, fmt.linebelowheader)
+            await _append_line(
+                lines,
+                padded_widths,
+                colaligns,
+                fmt.linebelowheader,
+                table_color=table_color,
+                terminal_mode=terminal_mode,
+            )
 
     if padded_rows and fmt.linebetweenrows and "linebetweenrows" not in hidden:
         # initial rows with a line below
         for row, ralign in zip(padded_rows[:-1], rowaligns):
-            append_row(
-                lines, row, padded_widths, colaligns, fmt.datarow, rowalign=ralign
+            await append_row(
+                lines,
+                row,
+                padded_widths,
+                colaligns,
+                fmt.datarow,
+                rowalign=ralign,
+                table_color=table_color,
+                terminal_mode=terminal_mode,
             )
-            _append_line(lines, padded_widths, colaligns, fmt.linebetweenrows)
+            await _append_line(
+                lines,
+                padded_widths,
+                colaligns,
+                fmt.linebetweenrows,
+                table_color=table_color,
+                terminal_mode=terminal_mode,
+            )
         # the last row without a line below
-        append_row(
+        await append_row(
             lines,
             padded_rows[-1],
             padded_widths,
             colaligns,
             fmt.datarow,
             rowalign=rowaligns[-1],
+            table_color=table_color,
+            terminal_mode=terminal_mode,
         )
     else:
         separating_line = (
@@ -2403,14 +2813,36 @@ def _format_table(fmt, headers, rows, colwidths, colaligns, is_multiline, rowali
             # test to see if either the 1st column or the 2nd column (account for showindex) has
             # the SEPARATING_LINE flag
             if _is_separating_line(row):
-                _append_line(lines, padded_widths, colaligns, separating_line)
+                await _append_line(
+                    lines,
+                    padded_widths,
+                    colaligns,
+                    separating_line,
+                    table_color=table_color,
+                    terminal_mode=terminal_mode,
+                )
             else:
-                append_row(lines, row, padded_widths, colaligns, fmt.datarow)
+                await append_row(
+                    lines,
+                    row,
+                    padded_widths,
+                    colaligns,
+                    fmt.datarow,
+                    table_color=table_color,
+                    terminal_mode=terminal_mode,
+                )
 
     if fmt.linebelow and "linebelow" not in hidden:
-        _append_line(lines, padded_widths, colaligns, fmt.linebelow)
+        await _append_line(
+            lines,
+            padded_widths,
+            colaligns,
+            fmt.linebelow,
+            table_color=table_color,
+            terminal_mode=terminal_mode,
+        )
 
-    if headers or rows:
+    if stylized_headers or stylized_rows:
         output = "\n".join(lines)
         if fmt.lineabove == _html_begin_table_without_header:
             return JupyterHTMLStr(output)

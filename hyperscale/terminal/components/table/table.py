@@ -1,12 +1,10 @@
 import asyncio
 import math
 import time
-from collections import OrderedDict
 from typing import Any
 
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
-from hyperscale.terminal.styling import stylize
 
 from .table_config import HeaderOptions, TableConfig
 from .tabulate import tabulate
@@ -29,7 +27,7 @@ class Table:
         self._column_width = 0
         self._columns = len(self._header_keys)
 
-        self.data: list[OrderedDict] = []
+        self.data: list[list[Any]] = []
         self._update_lock: asyncio.Lock | None = None
         self.offset = 0
         self._start: float | None = None
@@ -54,7 +52,9 @@ class Table:
         self._max_height = max_height
         self._max_width = max_width
 
-        self._max_rows = max_height - 2
+        height_adjustment = await self._get_height_adjustment()
+
+        self._max_rows = max_height - height_adjustment
 
     async def update(
         self,
@@ -79,15 +79,61 @@ class Table:
         float_precision = self._get_field_precision("float")
         integer_precision = self._get_field_precision("integer")
 
-        if len(self.data) < 1:
-            self.data = [
+        data = self._format_data()
+
+        length_adjustment = await self._get_table_length_adjustment(
+            data,
+            float_precision,
+            integer_precision,
+        )
+
+        table: str = await tabulate(
+            data,
+            headers=self._header_keys,
+            missingval=self.config.null_value,
+            tablefmt=self.config.table_format,
+            floatfmt=float_precision,
+            intfmt=integer_precision,
+            numalign=self.config.number_alignment_type,
+            stralign=self.config.string_alignment_type,
+            maxcolwidths=self._column_width,
+            maxheadercolwidths=self._column_width,
+            header_color_map=self.config.header_color_map,
+            values_color_map=self.config.data_color_map,
+            table_color=self.config.table_color,
+            terminal_mode=self._mode,
+        )
+
+        table_lines = [line.strip("\n") for line in table.split("\n")]
+
+        for idx, table_line in enumerate(table_lines):
+            table_lines[idx] = table_line + (" " * length_adjustment)
+
+        self._elapsed = time.monotonic() - self._start
+
+        return table_lines
+
+        # return await asyncio.gather(
+        #     *[
+        #         stylize(
+        #             line,
+        #             color=self.config.table_color,
+        #             mode=self._mode,
+        #         )
+        #         for line in table_lines
+        #     ]
+        # )
+
+    def _format_data(self):
+        data = self.data
+
+        if len(data) < 1:
+            return [
                 [
                     self._get_default_by_type(self.config.headers[header])
                     for header in self._header_keys
                 ]
             ]
-
-        data = self.data
 
         data_length = len(data)
         if (
@@ -96,46 +142,65 @@ class Table:
         ):
             difference = data_length - self._max_rows
             self.offset = (self.offset + 1) % difference
-            data = self.data[self.offset : self._max_rows + self.offset]
+            data = data[self.offset : self._max_rows + self.offset]
             self._start = time.monotonic()
 
         elif data_length > self._max_rows:
-            data = self.data[self.offset : self._max_rows + self.offset]
+            data = data[self.offset : self._max_rows + self.offset]
 
-        table: str = tabulate(
+        return data
+
+    async def _get_height_adjustment(self):
+        float_precision = self._get_field_precision("float")
+        integer_precision = self._get_field_precision("integer")
+
+        data = self._format_data()
+
+        table: str = await tabulate(
             data,
             headers=self._header_keys,
             missingval=self.config.null_value,
             tablefmt=self.config.table_format,
             floatfmt=float_precision,
             intfmt=integer_precision,
+            numalign=self.config.number_alignment_type,
+            stralign=self.config.string_alignment_type,
+            maxcolwidths=self._column_width,
+            maxheadercolwidths=self._column_width,
+        )
+
+        return max(len(table.split("\n")) - 1, 0)
+
+    async def _get_table_length_adjustment(
+        self,
+        data: list[list[Any]],
+        float_precision: tuple[str, ...] | None,
+        integer_precision: tuple[str, ...] | None,
+    ):
+        table: str = await tabulate(
+            data,
+            headers=self._header_keys,
+            missingval=self.config.null_value,
+            tablefmt=self.config.table_format,
+            floatfmt=float_precision,
+            intfmt=integer_precision,
+            numalign=self.config.number_alignment_type,
+            stralign=self.config.string_alignment_type,
             maxcolwidths=self._column_width,
             maxheadercolwidths=self._column_width,
         )
 
         table_lines = table.split("\n")
+        length_adjustments: list[int] = []
 
-        for idx, table_line in enumerate(table_lines):
+        for table_line in table_lines:
+            difference = 0
             if len(table_line) <= self._max_width:
                 difference = self._max_width - len(table_line)
 
-            else:
-                difference = 0
+            length_adjustments.append(difference)
 
-            table_lines[idx] = table_line + (" " * difference)
-
-        self._elapsed = time.monotonic() - self._start
-
-        return await asyncio.gather(
-            *[
-                stylize(
-                    line,
-                    color=self.config.table_color,
-                    mode=self._mode,
-                )
-                for line in table_lines
-            ]
-        )
+        return max(length_adjustments)
 
     def _get_default_by_type(self, header: HeaderOptions):
         if header.default:

@@ -132,8 +132,17 @@ async def display():
                                     },
                                     "four": {"field_type": "string"},
                                 },
+                                header_color_map={
+                                    "one": "aquamarine_2",
+                                },
+                                data_color_map={
+                                    "two": lambda value: "hot_pink_3"
+                                    if "None" == value
+                                    else None
+                                },
                                 table_color="aquamarine_2",
                                 terminal_mode="extended",
+                                table_format="fancy_outline",
                             )
                         ),
                         Alignment(
