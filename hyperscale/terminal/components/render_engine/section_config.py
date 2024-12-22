@@ -28,6 +28,7 @@ class SectionConfig(BaseModel):
     top_border: StrictStr | None = None
     bottom_border: StrictStr | None = None
     left_border: StrictStr | None = None
+    inside_border: StrictStr | None = None
     right_border: StrictStr | None = None
     border_color: ColorName | ExtendedColorName = "white"
     mode: TerminalDisplayMode = "compatability"

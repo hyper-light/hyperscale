@@ -114,6 +114,9 @@ class ScatterPlot:
         height_difference = plot_height - self._max_height
         self._corrected_height = self._max_height - height_difference
 
+        if self._corrected_height <= 0:
+            raise Exception("Err. - Insufficient height for plot.")
+
     async def update(
         self,
         data: list[
@@ -123,14 +126,7 @@ class ScatterPlot:
             ]
         ],
     ):
-        if self._update_lock is None:
-            self._update_lock = asyncio.Lock()
-
-        await self._update_lock.acquire()
-
         self._data = data
-
-        self._update_lock.release()
 
     async def get_next_frame(self):
         (

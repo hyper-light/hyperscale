@@ -12,6 +12,10 @@ from hyperscale.terminal.components.render_engine import (
     Section,
     SectionConfig,
 )
+from hyperscale.terminal.components.scatter_plot import (
+    PlotConfig,
+    ScatterPlot,
+)
 from hyperscale.terminal.components.table import (
     Table,
     TableConfig,
@@ -39,7 +43,7 @@ async def display():
             Section(
                 SectionConfig(
                     width="small",
-                    height="xx-small",
+                    height="smallest",
                     left_border="|",
                     top_border="-",
                     right_border="|",
@@ -51,14 +55,13 @@ async def display():
                         bar,
                         Alignment(
                             horizontal="left",
-                            vertical="center",
                         ),
                     ),
                 ],
             ),
             Section(
                 SectionConfig(
-                    height="xx-small",
+                    height="smallest",
                     left_border="|",
                     top_border="-",
                     right_border="|",
@@ -97,60 +100,74 @@ async def display():
             ),
             Section(
                 SectionConfig(
-                    width="full",
+                    width="large",
                     height="medium",
                     left_border="|",
                     top_border="-",
+                    inside_border="|",
+                    right_border="|",
+                    bottom_border="-",
+                ),
+                [
+                    Component(
+                        "scatter_test",
+                        ScatterPlot(
+                            PlotConfig(
+                                plot_name="Test",
+                                x_axis_name="Time (sec)",
+                                y_axis_name="Value",
+                                line_color="aquamarine_2",
+                                point_char="dot",
+                                terminal_mode="extended",
+                            ),
+                        ),
+                        Alignment(
+                            horizontal="center",
+                        ),
+                        horizontal_padding=4,
+                    ),
+                ],
+            ),
+            Section(
+                SectionConfig(
+                    width="small",
+                    height="medium",
+                    left_border="|",
+                    top_border="-",
+                    inside_border="|",
                     right_border="|",
                     bottom_border="-",
                 ),
                 [
                     Component(
                         "table_test",
-                        # ScatterPlot(
-                        #     PlotConfig(
-                        #         plot_name="Test",
-                        #         x_axis_name="Time (sec)",
-                        #         y_axis_name="Value",
-                        #         line_color="aquamarine_2",
-                        #         point_char="dot",
-                        #         terminal_mode="extended",
-                        #     ),
-                        # ),
                         Table(
                             TableConfig(
                                 headers={
                                     "one": {
-                                        "field_type": "integer",
+                                        "precision": ".2f",
+                                        "color": "aquamarine_2",
                                     },
                                     "two": {
-                                        "field_type": "integer",
+                                        "data_color": lambda value: "hot_pink_3"
+                                        if value is None
+                                        else None
                                     },
                                     "three": {
                                         "precision": ".2f",
-                                        "field_type": "integer",
                                     },
-                                    "four": {"field_type": "string"},
+                                    "four": {},
                                 },
-                                header_color_map={
-                                    "one": "aquamarine_2",
-                                },
-                                data_color_map={
-                                    "two": lambda value: "hot_pink_3"
-                                    if "None" == value
-                                    else None
-                                },
-                                table_color="aquamarine_2",
+                                border_color="aquamarine_2",
                                 terminal_mode="extended",
-                                table_format="fancy_outline",
+                                table_format="simple",
                             )
                         ),
                         Alignment(
                             horizontal="center",
-                            priority="exclusive",
                         ),
                         horizontal_padding=2,
-                    )
+                    ),
                 ],
             ),
         ],
@@ -163,17 +180,25 @@ async def display():
     start = time.monotonic()
 
     data = []
+    table_data = []
 
     async for idx in bar:
         await asyncio.sleep(1)
 
         if idx <= 15:
-            data.append({"one": idx})
+            table_data.append({"one": idx})
 
             await engine.update(
                 "table_test",
-                data,
+                table_data,
             )
+
+        data.append((elapsed, idx))
+
+        await engine.update(
+            "scatter_test",
+            data,
+        )
 
         elapsed = time.monotonic() - start
 

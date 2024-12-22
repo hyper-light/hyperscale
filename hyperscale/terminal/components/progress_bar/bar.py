@@ -122,6 +122,7 @@ class Bar:
         # Helper flags
         self._stop_bar: asyncio.Event | None = None
         self._hide_bar: asyncio.Event | None = None
+        self._spin_thread: asyncio.Future | None = None
         self._run_progress_bar: asyncio.Future | None = None
         self._last_frames: list[str] | None = None
         self._last_frame_ready: bool = False
@@ -249,17 +250,7 @@ class Bar:
     ) -> str:
         if text:
             text = str(text)
-
-        if text:
-            out = f"\r{frame} {text}"
-        elif text and self._frame_queue is None:
-            out = f"{frame} {text}\n"
-
-        elif compose_mode is None:
-            out = f"{frame}"
-
-        elif self._frame_queue is None:
-            out = f"{frame}\n"
+            out = f"{frame} {text}"
 
         else:
             out = f"{frame}"
@@ -418,8 +409,8 @@ class Bar:
         if self.enabled:
             self._start_time = time.time()
             self._stop_time = None  # Reset value to properly calculate subsequent spinner starts (if any)  # pylint: disable=line-too-long
-            self._stop_spin = asyncio.Event()
-            self._hide_spin = asyncio.Event()
+            self._stop_bar = asyncio.Event()
+            self._hide_bar = asyncio.Event()
             try:
                 self._spin_thread = asyncio.ensure_future(self._spin(text=text))
             except Exception:
@@ -435,7 +426,8 @@ class Bar:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
 
-        self._stop_spin.set()
+        if self._stop_bar:
+            self._stop_bar.set()
 
         try:
             self._spin_thread.cancel()
@@ -474,8 +466,8 @@ class Bar:
                 # Reset registered signal handlers to default ones
                 self._reset_signal_handlers()
 
-            if not self._stop_spin.is_set():
-                self._stop_spin.set()
+            if not self._stop_bar.is_set():
+                self._stop_bar.set()
 
                 try:
                     self._spin_thread.cancel()
@@ -506,9 +498,9 @@ class Bar:
             self._spin_thread.done() is False and self._spin_thread.cancelled() is False
         )
 
-        if thr_is_alive and not self._hide_spin.is_set():
+        if thr_is_alive and not self._hide_bar.is_set():
             # set the hidden spinner flag
-            self._hide_spin.set()
+            self._hide_bar.set()
 
             if self._enable_output:
                 await self._clear_line()
@@ -523,12 +515,12 @@ class Bar:
             self._spin_thread.done() is False and self._spin_thread.cancelled() is False
         )
 
-        if thr_is_alive and self._hide_spin.is_set():
+        if thr_is_alive and self._hide_bar.is_set():
             # clear the hidden spinner flag
-            self._hide_spin.clear()
+            self._hide_bar.clear()
 
             # clear the current line so the spinner is not appended to it
-        if thr_is_alive and self._hide_spin.is_set() and self._enable_output:
+        if thr_is_alive and self._hide_bar.is_set() and self._enable_output:
             await self._clear_line()
 
     async def write(self, text):
@@ -652,15 +644,18 @@ class Bar:
     ):
         self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
 
-        while not self._stop_spin.is_set():
-            if self._hide_spin.is_set():
+        while not self._stop_bar.is_set():
+            if self._hide_bar.is_set():
                 # Wait a bit to avoid wasting cycles
                 await asyncio.sleep(self._interval)
                 continue
 
             await self._stdout_lock.acquire()
 
-            active_idx = math.floor(self._completed * (self._bar_width / self._total))
+            active_idx = min(
+                math.ceil(self._completed * self._bar_width / self._total),
+                self._bar_width,
+            )
 
             segments: list[str] = []
 
@@ -717,7 +712,7 @@ class Bar:
 
             # Wait
             try:
-                await asyncio.wait_for(self._stop_spin.wait(), timeout=self._interval)
+                await asyncio.wait_for(self._stop_bar.wait(), timeout=self._interval)
 
             except asyncio.TimeoutError:
                 pass

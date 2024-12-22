@@ -10,5 +10,5 @@ AlignmentPriority = Literal["low", "medium", "high", "exclusive", "auto"]
 class Alignment(BaseModel):
     horizontal: HorizontalAlignment = "left"
     vertical: VerticalAlignment = "top"
-    priority: AlignmentPriority = "auto"
+    horizontal_priority: AlignmentPriority = "auto"
     vertical_priority: AlignmentPriority = "auto"

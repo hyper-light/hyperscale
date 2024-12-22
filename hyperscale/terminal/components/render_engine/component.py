@@ -27,15 +27,22 @@ class Component:
         self.name = name
         self.component = component
         self.alignment = alignment
-        self._horizontal_position: int | None = None
-        self._vertical_position: int | None = None
-        self._frame_width: int = component.size
 
-        self._frame_height: int = 0
+        self._max_height: int = 0
+        self._max_width: int = 0
+
         self._horizontal_padding = horizontal_padding
         self._vertical_padding = vertical_padding
         self._left_remainder_pad = 0
         self._right_remainder_pad = 0
+
+    @property
+    def vertical_alignment(self):
+        return self.alignment.vertical
+
+    @property
+    def horizontal_alignment(self):
+        return self.alignment.horizontal
 
     @property
     def horizontal_padding(self):
@@ -58,6 +65,9 @@ class Component:
         max_width: int | None = None,
         max_height: int | None = None,
     ):
+        self._max_width = max_width
+        self._max_height = max_height
+
         match self.component.fit_type:
             case WidgetFitDimensions.X_AXIS:
                 await self.component.fit(max_width - self._horizontal_padding)
@@ -67,8 +77,8 @@ class Component:
 
             case WidgetFitDimensions.X_Y_AXIS:
                 await self.component.fit(
-                    max_width - self._horizontal_padding,
-                    max_height - self._vertical_padding,
+                    max_width=max_width - self._horizontal_padding,
+                    max_height=max_height - self._vertical_padding,
                 )
 
             case _:
@@ -76,89 +86,110 @@ class Component:
 
         remainder = max_width - self.component.raw_size - self._horizontal_padding
 
-        if remainder > 0:
-            self._left_remainder_pad = math.ceil(remainder / 2)
-            self._right_remainder_pad = math.floor(remainder / 2)
+        (
+            left_remainder_pad,
+            right_remainder_pad,
+        ) = self._set_horizontal_pad_remainder(remainder)
 
-    def _set_position(
+        self._left_remainder_pad = left_remainder_pad
+        self._right_remainder_pad = right_remainder_pad
+
+    def _set_horizontal_pad_remainder(
         self,
-        section_width: int,
-        section_height: int,
-        section_horizontal_center: int,
-        section_vertical_center: int,
+        remainder: int,
     ):
+        left_remainder_pad = 0
+        right_remainder_pad = 0
+
         match self.alignment.horizontal:
             case "left":
-                self._horizontal_position = (
-                    0 + self._horizontal_padding + self._left_remainder_pad
-                )
+                right_remainder_pad = remainder
 
             case "center":
-                self._horizontal_position = max(
-                    section_horizontal_center - math.ceil(self._frame_width / 2), 0
-                )
+                left_remainder_pad = math.ceil(remainder / 2)
+                right_remainder_pad = math.floor(remainder / 2)
 
             case "right":
-                self._horizontal_position = max(
-                    section_width
-                    - self._frame_width
-                    - self._horizontal_padding
-                    - self._right_remainder_pad,
-                    0,
-                )
+                left_remainder_pad = remainder
 
-            case _:
-                self._horizontal_position = (
-                    0 + self._horizontal_padding + self._left_remainder_pad
-                )
+        return (
+            left_remainder_pad,
+            right_remainder_pad,
+        )
+
+    async def render(self, render_idx: int):
+        frames: str | list[str] = await self.component.get_next_frame()
+
+        if isinstance(frames, str):
+            frames = [frames]
+
+        (
+            left_pad,
+            right_pad,
+        ) = self._calculate_left_and_right_pad()
+
+        frames = self._pad_frames_horizontal(
+            frames,
+            left_pad,
+            right_pad,
+        )
+
+        return (render_idx, self._pad_frames_vertical(frames))
+
+    def _pad_frames_horizontal(
+        self,
+        frames: list[str],
+        left_pad: int,
+        right_pad: int,
+    ):
+        padded_frames: list[str] = []
+        for frame in frames:
+            padded_frames.append(left_pad * " " + frame + right_pad * " ")
+
+        return padded_frames
+
+    def _pad_frames_vertical(self, frames: list[str]):
+        frames_height = len(frames)
+
+        remainder = self._max_height - frames_height
+
+        top_remainder = int(math.ceil(remainder / 2))
+        bottom_remainder = int(math.floor(remainder / 2))
+
+        adjusted_frames: list[str] = []
 
         match self.alignment.vertical:
             case "top":
-                self._vertical_position = 0 + self._vertical_padding
-
-            case "center":
-                self._vertical_position = section_vertical_center
-
-            case "bottom":
-                self._vertical_position = (
-                    section_height - self._frame_height - self._vertical_padding
+                adjusted_frames.extend(frames)
+                adjusted_frames.extend(
+                    [" " * self._max_width for _ in range(remainder)]
                 )
 
-            case _:
-                self._vertical_position = 0 + self._vertical_padding
+            case "center":
+                adjusted_frames.extend(
+                    [" " * self._max_width for _ in range(top_remainder)]
+                )
+                adjusted_frames.extend(frames)
+                adjusted_frames.extend(
+                    [" " * self._max_width for _ in range(bottom_remainder)]
+                )
 
-    async def render(
-        self,
-        section_width: int,
-        section_height: int,
-        section_horizontal_center: int,
-        section_vertical_center: int,
-    ):
-        frame: str | list[str] = await self.component.get_next_frame()
-        self._frame_width = self.component.raw_size
+            case "bottom":
+                adjusted_frames.extend(
+                    [" " * self._max_width for _ in range(remainder)]
+                )
 
-        if self._horizontal_position is None and self._vertical_position is None:
-            self._frame_height = (
-                len(frame.split("\n")) if isinstance(frame, str) else len(frame)
-            )
+                adjusted_frames.extend(frames)
 
-            self._set_position(
-                section_width,
-                section_height,
-                section_horizontal_center,
-                section_vertical_center,
-            )
+        return adjusted_frames
 
+    def _calculate_left_and_right_pad(self):
         left_pad = 0
         right_pad = 0
 
         match self.alignment.horizontal:
             case "left":
-                right_pad = (
-                    self._horizontal_padding
-                    + self._left_remainder_pad
-                    + self._right_remainder_pad
-                )
+                right_pad = self._horizontal_padding + self._right_remainder_pad
 
             case "center":
                 left_pad = (
@@ -169,11 +200,7 @@ class Component:
                 )
 
             case "right":
-                left_pad = (
-                    self._horizontal_padding
-                    + self._left_remainder_pad
-                    + self._right_remainder_pad
-                )
+                left_pad = self._horizontal_padding + self._left_remainder_pad
 
             case _:
                 left_pad = (
@@ -182,68 +209,10 @@ class Component:
                     + self._right_remainder_pad
                 )
 
-        if isinstance(frame, str):
-            frame = self._render_frame_string(
-                frame,
-                left_pad,
-                right_pad,
-            )
-
-        else:
-            frame = self._render_frame_string_list(
-                frame,
-                left_pad,
-                right_pad,
-            )
-
         return (
-            frame,
-            self._vertical_position,
-            self.component.raw_size
-            + self._horizontal_padding
-            + self._left_remainder_pad
-            + self._right_remainder_pad,
-            self.alignment.horizontal,
+            left_pad,
+            right_pad,
         )
-
-    def _render_frame_string(
-        self,
-        frame: str,
-        left_pad: int,
-        right_pad: int,
-    ):
-        frame_sections: list[str] = []
-
-        if left_pad:
-            frame_sections.append(" " * left_pad)
-
-        frame_sections.append(frame)
-
-        if right_pad:
-            frame_sections.append(" " * right_pad)
-
-        frame = "".join(frame_sections)
-
-        return frame
-
-    def _render_frame_string_list(
-        self,
-        frame: list[str],
-        left_pad: int,
-        right_pad: int,
-    ):
-        frame_segments: list[str] = []
-
-        for frame_segment in frame:
-            frame_segments.append(
-                self._render_frame_string(
-                    frame_segment,
-                    left_pad,
-                    right_pad,
-                )
-            )
-
-        return frame_segments
 
     async def stop(self):
         await self.component.stop()

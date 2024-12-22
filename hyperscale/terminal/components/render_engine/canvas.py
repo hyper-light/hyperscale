@@ -12,7 +12,8 @@ class Canvas:
         self.height = 0
         self._max_width = 0
         self._max_height = 0
-        self._sections: List[List[Section]] = [[]]
+        self._sections: List[Section] = []
+        self._section_rows: List[List[Section]] = []
         self._total_size: int = 0
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -31,7 +32,7 @@ class Canvas:
 
         terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
 
-        self._max_width = terminal_size.columns
+        self._max_width = int(terminal_size.columns * 1.25)
         self._max_height = int(math.ceil(terminal_size.lines / 10.0)) * 10
 
         if width is None:
@@ -46,93 +47,71 @@ class Canvas:
         self.width = width
         self.height = height
 
-        sections = [
+        self._sections = sections
+
+        for section in self._sections:
             section.initialize(
-                self.width,
-                self.height,
+                width,
+                height,
             )
-            for section in sections
-        ]
 
-        current_row_width = 0
-        row_idx = 0
-        for section in sections:
-            next_width = current_row_width + section.width
-            remainder = self.width - current_row_width
+        section_rows: list[list[Section]] = []
+        section_row: list[Section] = []
+        row_width = 0
 
-            if next_width > self.width:
-                self._sections[row_idx][-1].fit_width(remainder)
-                self._sections.append([section])
-                current_row_width = section.width
-                row_idx += 1
+        for section in self._sections:
+            row_width += section.width
+
+            if row_width <= self.width:
+                section_row.append(section)
 
             else:
-                current_row_width += section.width
-                self._sections[row_idx].append(section)
+                section_rows.append(list(section_row))
+                section_row = [section]
+                row_width = section.width
 
-        remainder = self.width - current_row_width
-        self._sections[-1][-1].fit_width(remainder)
+        if len(section_row) > 0:
+            section_rows.append(section_row)
 
-        for row in self._sections:
+        for row in section_rows:
+            remainder = self.width - sum([section.width for section in row])
+
+            row[-1].fit_width(remainder)
+
             row_height = max([section.height for section in row])
 
-            await asyncio.gather(*[section.create_blocks() for section in sections])
+            await asyncio.gather(*[section.fit_height(row_height) for section in row])
 
-            for section in row:
-                section.fit_height(row_height)
+        await asyncio.gather(*[section.create_blocks() for section in self._sections])
+
+        self._section_rows = section_rows
 
     async def render(self):
-        self._total_size = len(self._sections)
-        terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
+        section_row_sets: list[list[str]] = []
+        for section_row in self._section_rows:
+            row_lines: list[str] = []
 
-        width = terminal_size.columns
-        height = terminal_size.lines - 1
+            for section in section_row:
+                section_lines = await section.render()
 
-        canvas_sections = await asyncio.gather(
-            *[
-                self._join_row(
-                    row,
-                    width,
-                )
-                for row in self._sections
-            ]
-        )
+                for idx, line in enumerate(section_lines):
+                    if idx >= len(row_lines):
+                        row_lines.append(line)
 
-        self._total_size += sum(
-            [len(canvas_section) for canvas_section in canvas_sections]
-        )
+                    else:
+                        row_lines[idx] += line
 
-        canvas = [line for canvas_section in canvas_sections for line in canvas_section]
+            section_row_sets.append(row_lines)
 
-        self._total_size += len(canvas_sections)
-        return "\n".join(canvas[:height])
+        rows: list[str] = []
+        for section_row_set in section_row_sets:
+            for row in section_row_set:
+                rows.append(row)
 
-    async def _join_row(
-        self,
-        row: List[Section],
-        width: int,
-    ):
-        rendered_blocks = await asyncio.gather(*[section.render() for section in row])
-
-        segments_count = len(rendered_blocks[0])
-
-        segments = ["" for _ in range(segments_count)]
-
-        for base_idx, segment in enumerate(rendered_blocks):
-            for segment_idx, segement_row in enumerate(segment):
-                segments[segment_idx] += segement_row
-
-        for idx, segment_row in enumerate(segments):
-            segments[idx] = segment_row[:width]
-
-        return segments
+        return "\n".join(rows)
 
     async def stop(self):
-        await asyncio.gather(
-            *[section.stop() for row in self._sections for section in row]
-        )
+        await asyncio.gather(*[section.stop() for section in self._sections])
 
     async def abort(self):
-        await asyncio.gather(
-            *[section.abort() for row in self._sections for section in row]
-        )
+        await asyncio.gather(*[section.abort() for section in self._sections])

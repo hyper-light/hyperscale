@@ -1,4 +1,4 @@
-from typing import Dict, Literal
+from typing import Dict
 
 from pydantic import (
     BaseModel,
@@ -14,37 +14,23 @@ from hyperscale.terminal.styling.colors import (
     ExtendedColorName,
 )
 
-from .tabulate import (
-    DataColorMap,
-    HeaderColorMap,
-    NumberAlignmentType,
-    StringAlignmentType,
-    TableFormatType,
-)
+from .tabulate import CellAlignment, Colorizer, TableBorderType
 
 
 class HeaderOptions(BaseModel):
-    precision: StrictStr | None = None
-    field_type: Literal[
-        "string",
-        "integer",
-        "float",
-        "bool",
-    ]
+    precision_format: StrictStr | None = None
+    header_color: Colorizer | None = None
+    data_color: Colorizer | None = None
     default: StrictInt | StrictFloat | StrictBool | StrictStr | None = None
 
 
 class TableConfig(BaseModel):
-    table_format: TableFormatType = "simple"
-    null_value: StrictStr | StrictInt | StrictFloat | StrictBool = "None"
+    table_format: TableBorderType = "simple"
     headers: Dict[
         StrictStr,
         HeaderOptions,
     ]
-    table_color: ColorName | ExtendedColorName | None = None
-    number_alignment_type: NumberAlignmentType | None = "right"
-    string_alignment_type: StringAlignmentType | None = "right"
+    cell_alignment: CellAlignment = "CENTER"
+    border_color: ColorName | ExtendedColorName | None = None
     terminal_mode: TerminalDisplayMode = "compatability"
     pagination_refresh_rate: StrictInt | StrictFloat = 3
-    header_color_map: HeaderColorMap | None = None
-    data_color_map: DataColorMap | None = None

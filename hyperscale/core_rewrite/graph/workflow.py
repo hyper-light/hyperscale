@@ -6,6 +6,9 @@ from hyperscale.core_rewrite.snowflake.snowflake_generator import SnowflakeGener
 
 
 class Workflow:
+    vus = 1000
+    duration = "1m"
+
     def __init__(self):
         self.graph = __file__
         self.name = self.__class__.__name__
