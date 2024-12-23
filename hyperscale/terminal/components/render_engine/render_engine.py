@@ -47,7 +47,7 @@ async def handle_resize(engine: RenderEngine):
 
         terminal_size = await loop.run_in_executor(None, shutil.get_terminal_size)
 
-        width = int((terminal_size.columns * 1.25) / 2)
+        width = int(terminal_size.columns / 2)
 
         height = int(terminal_size.lines * 0.8)
 

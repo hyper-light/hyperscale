@@ -29,8 +29,6 @@ keywords = [
         'workflow'
 ]
 dependencies = [
-    "aiologger",
-    "yaspin",
     "attr",
     "networkx",
     "aiodns",
@@ -44,7 +42,6 @@ dependencies = [
     "tdigest",
     "pydantic",
     "GitPython",
-    "tabulate",
     "plotille",
     "zstandard",
     "cryptography",
