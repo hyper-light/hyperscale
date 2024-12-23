@@ -101,7 +101,6 @@ async def display():
                     height="medium",
                     left_border="|",
                     top_border="-",
-                    right_border="|",
                     bottom_border="-",
                 ),
                 [
@@ -128,6 +127,7 @@ async def display():
                 SectionConfig(
                     width="small",
                     height="medium",
+                    left_border="|",
                     top_border="-",
                     right_border="|",
                     bottom_border="-",

@@ -51,10 +51,15 @@ async def handle_resize(engine: RenderEngine):
         height = terminal_size.lines - 5
 
         width_threshold = 1
-        height_threshold = 1
+        height_threshold = width%31
 
         width_difference = abs(width - engine.canvas.width)
         height_difference = abs(height - engine.canvas.height)
+
+        width = max(
+            width - (width%3),
+            1
+        )
 
         if width_difference > width_threshold and height_difference > height_threshold:
             await engine.canvas.initialize(
@@ -153,6 +158,11 @@ class RenderEngine:
 
         if width is None:
             width = int(math.floor(terminal_size.columns * .75))
+
+        width = max(
+            width - (width%3),
+            1
+        )
 
         if height is None:
             height = terminal_size.lines - 5
