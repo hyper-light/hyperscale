@@ -114,8 +114,11 @@ class ScatterPlot:
         height_difference = plot_height - self._max_height
         self._corrected_height = self._max_height - height_difference
 
-        if self._corrected_height <= 0:
-            raise Exception("Err. - Insufficient height for plot.")
+        if self._corrected_height < 0:
+            self._corrected_height = 1
+
+        if self._corrected_width < 0:
+            self._corrected_width = 1
 
     async def update(
         self,
