@@ -21,7 +21,6 @@ from hyperscale.terminal.components.spinner import Spinner
 from hyperscale.terminal.components.text import Text
 from hyperscale.terminal.components.total_rate import TotalRate
 from hyperscale.terminal.components.windowed_rate import WindowedRate
-
 from .canvas import Canvas
 from .engine_config import EngineConfig
 from .section import Section
@@ -43,15 +42,13 @@ async def default_handler(signame: str, engine: RenderEngine):  # pylint: disabl
 async def handle_resize(engine: RenderEngine):
     try:
         await engine.pause()
-        await asyncio.sleep(engine._interval)
-
         loop = asyncio.get_event_loop()
 
         terminal_size = await loop.run_in_executor(None, shutil.get_terminal_size)
 
-        width = int(math.floor(terminal_size.columns / 1.5))
+        width = int(math.floor(terminal_size.columns * .75))
 
-        height = terminal_size.lines - 2
+        height = terminal_size.lines - 5
 
         width_threshold = 1
         height_threshold = 1
@@ -66,8 +63,6 @@ async def handle_resize(engine: RenderEngine):
                 height=height,
             )
 
-            await engine.reset()
-
         elif width_difference > width_threshold:
             await engine.canvas.initialize(
                 engine.canvas._sections,
@@ -75,18 +70,16 @@ async def handle_resize(engine: RenderEngine):
                 height=engine.canvas.height,
             )
 
-            await engine.reset()
-
         elif height_difference > height_threshold:
             await engine.canvas.initialize(
                 engine.canvas._sections,
                 width=engine.canvas.width,
                 height=height,
             )
-
-            await engine.reset()
+        
 
         await engine.resume()
+
 
     except Exception:
         import traceback
@@ -115,7 +108,7 @@ class RenderEngine:
             | WindowedRate,
         ] = {}
 
-        self._interval = round(1 / 60, 4)
+        self._interval = round(1 / 120, 4)
         if self.config:
             # self._interval = config.refresh_rate * 0.001
             self._interval = round(1 / config.refresh_rate, 4)
@@ -159,10 +152,10 @@ class RenderEngine:
             height = self.config.height
 
         if width is None:
-            width = int(math.floor(terminal_size.columns / 1.5))
+            width = int(math.floor(terminal_size.columns * .75))
 
         if height is None:
-            height = terminal_size.lines - 2
+            height = terminal_size.lines - 5
 
         self._components = {
             component.name: component.component
@@ -213,7 +206,7 @@ class RenderEngine:
 
                 frame = await self.canvas.render()
 
-                frame = f"\033[3J\033[H{frame}"
+                frame = f"\033[3J\033[H\n{frame}"
 
                 await self._loop.run_in_executor(None, sys.stdout.write, frame)
 
@@ -249,14 +242,17 @@ class RenderEngine:
         force: bool = False,
     ):
         if force:
-            await self._loop.run_in_executor(None, sys.stdout.write, "\033[?25h")
-            await asyncio.to_thread(sys.stdout.write, "\033[2J\033[H")
-            await self._loop.run_in_executor(None, sys.stdout.write, "\033[?25l")
+            await self._loop.run_in_executor(
+                None,
+                sys.stdout.write,
+                "\033[2J\033H",
+            )
 
         else:
-            await asyncio.to_thread(
+            await self._loop.run_in_executor(
+                None,
                 sys.stdout.write,
-                f"\033[{self.canvas.height}A\033[4K\033[H",
+                "\033[3J\033[H",
             )
 
     async def reset(self):

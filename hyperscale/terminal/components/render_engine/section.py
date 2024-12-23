@@ -162,6 +162,9 @@ class Section:
             reverse=True,
         )
 
+        if len(self._blocks) > 0:
+            self._blocks.clear()
+
         top_border = await self._create_border_row(self.config.top_border)
         if top_border:
             self._blocks.append(top_border)

@@ -86,8 +86,8 @@ class ScatterPlot:
         plot: str = scatter(
             x_vals,
             y_vals,
-            width=self._max_width,
-            height=self._max_height,
+            width=max(self._max_width, 1),
+            height=max(self._max_height, 1),
             y_min=self.config.y_min,
             y_max=int(round(y_max, 0)),
             x_min=self.config.x_min,
@@ -114,10 +114,10 @@ class ScatterPlot:
         height_difference = plot_height - self._max_height
         self._corrected_height = self._max_height - height_difference
 
-        if self._corrected_height < 0:
+        if self._corrected_height <= 0:
             self._corrected_height = 1
 
-        if self._corrected_width < 0:
+        if self._corrected_width <= 0:
             self._corrected_width = 1
 
     async def update(

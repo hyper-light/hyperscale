@@ -108,9 +108,13 @@ class Table:
             data_rows,
         )
 
-        for idx, line in enumerate(table_lines):
-            table_lines[idx] = line + self._width_adjust * " "
+        for idx, line in enumerate(table_lines):   
+            column_size = self._column_width * self._columns_count
+            difference = self._max_width - column_size
 
+            if difference > 0 and self._width_adjust > 0:
+                table_lines[idx] = line + self._width_adjust * " "
+            
         self._elapsed = time.monotonic() - self._start
 
         return table_lines

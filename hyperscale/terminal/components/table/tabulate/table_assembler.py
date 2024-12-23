@@ -1,6 +1,7 @@
 import asyncio
 import itertools
 import math
+from collections import OrderedDict
 from typing import (
     Any,
     Callable,
@@ -1185,6 +1186,7 @@ class TableAssembler:
         color_map: HeaderColorMap | DataColorMap | None = None,
     ):
         converted_data = self._convert_cell_to_string(data, header_key)
+
 
         data_length = len(converted_data)
         border_length = self._calculate_border_length(

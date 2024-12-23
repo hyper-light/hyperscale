@@ -19,6 +19,13 @@ class TableBorderCharset(BaseModel):
     separator_char: StrictStr | None = None
     end_char: StrictStr | None = None
 
+    def size(self):
+        chars = [self.begin_char, self.fill_char, self.separator_char, self. end_char]
+
+        return sum([
+            len(char) for char in chars if char is not None
+        ])
+
 
 class TableBorderLines(BaseModel):
     line_above: TableBorderCharset | None = None
