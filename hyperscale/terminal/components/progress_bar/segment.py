@@ -49,6 +49,8 @@ class Segment:
 
             return frame
 
+        return self._styled_active_state
+
     @property
     def ready(self):
         return self._styled_ready_state
@@ -67,19 +69,16 @@ class Segment:
 
         match self.status:
             case SegmentStatus.ACTIVE:
-                return self.active
+                return self._styled_active_state
 
             case SegmentStatus.READY:
-                return self.ready
+                return self._styled_ready_state
 
             case SegmentStatus.FAILED:
-                return self.failed
+                return self._styled_failed_state
 
             case SegmentStatus.OK:
-                return self.ok
-
-            case _:
-                return self.ready
+                return self._styled_ok_state
 
     async def style(self):
         if self.segment_type == SegmentType.BAR:

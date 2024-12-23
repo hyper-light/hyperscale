@@ -141,6 +141,12 @@ class Table:
 
         return data
 
+    async def pause(self):
+        pass
+
+    async def resume(self):
+        pass
+
     async def stop(self):
         pass
 

@@ -214,6 +214,12 @@ class Component:
             right_pad,
         )
 
+    async def pause(self):
+        await self.component.pause()
+
+    async def resume(self):
+        await self.component.resume()
+
     async def stop(self):
         await self.component.stop()
 

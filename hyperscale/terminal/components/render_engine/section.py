@@ -472,6 +472,12 @@ class Section:
 
         return fill_line
 
+    async def pause(self):
+        await asyncio.gather(*[component.pause() for component in self.components])
+
+    async def resume(self):
+        await asyncio.gather(*[component.resume() for component in self.components])
+
     async def stop(self):
         await asyncio.gather(*[component.stop() for component in self.components])
 

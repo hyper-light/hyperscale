@@ -220,3 +220,6 @@ hyperscale = "hyperscale.cli:run"
 
 [tool.setuptools.packages]
 find = {}  # Scanning implicit namespaces is active by default
+
+[tool.ruff]
+target-version = "py311"

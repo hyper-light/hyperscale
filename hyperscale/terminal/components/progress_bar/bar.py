@@ -5,18 +5,16 @@ import functools
 import inspect
 import math
 import signal
-import sys
 import time
 from enum import Enum
 from os import get_terminal_size
-from typing import Any, AsyncGenerator, Callable, Dict, Iterable, Literal, Type
+from typing import Any, AsyncGenerator, Callable, Dict, Iterable, Type
 
 from hyperscale.logging.spinner import ProgressText
 from hyperscale.logging_rewrite import Logger
 from hyperscale.terminal.components.spinner.spinner_data import spinner_data
 from hyperscale.terminal.components.spinner.spinner_factory import SpinnerFactory
 from hyperscale.terminal.components.spinner.spinner_types import SpinnerType
-from hyperscale.terminal.components.spinner.to_unicode import to_unicode
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.terminal.styling import stylize
@@ -242,15 +240,11 @@ class Bar:
         self._base_size = len(self.segments) + text_length
         self._bar_width = len(bar)
 
-    async def _compose_out(
-        self,
-        frame: str,
-        text: str | bytes | ProgressText | None = None,
-        compose_mode: str | None = None,
-    ) -> str:
-        if text:
-            text = str(text)
-            out = f"{frame} {text}"
+        await self._bar_segment.style()
+
+    async def _compose_out(self, frame: str) -> str:
+        if self._text:
+            out = f"{frame} {self._text}"
 
         else:
             out = f"{frame}"
@@ -288,51 +282,15 @@ class Bar:
         return inner
 
     async def get_next_frame(self) -> str:
-        if self._run_progress_bar is None:
-            await self.run()
-
-        if self._frame_queue and not self._last_frame_ready:
-            frame = await self._frame_queue.get()
-            self._size = len(frame)
-
-        elif self._frame_queue and self._last_frame_ready:
+        if self._last_frame_ready:
             frame = self._last_frame
             self._size = len(frame)
 
         else:
-            frame = ""
+            frame = await self._create_bar()
+            self._size = len(frame)
 
         return frame
-
-    async def run(
-        self,
-        text: str | bytes | ProgressText | None = None,
-        mode: Literal["extended", "compatability"] = "compatability",
-    ):
-        if self._update_lock is None:
-            self._update_lock = asyncio.Lock()
-
-        if self._enable_output is False:
-            self._frame_queue = asyncio.Queue()
-
-        if self._max_size is None:
-            terminal_size = await self._loop.run_in_executor(None, get_terminal_size)
-            self._max_size = terminal_size[0]
-
-        if self._run_progress_bar is None:
-            await self._bar_segment.style()
-            await asyncio.gather(*[segment.style() for segment in self.segments])
-
-            # If we have 1000 items with a bar width of 100, every 10 items we should increment a segment.
-
-            self._segment_size = self._total / self._bar_width
-
-            self._run_progress_bar = asyncio.ensure_future(
-                self._run(
-                    text,
-                    mode=mode,
-                )
-            )
 
     async def __anext__(self):
         total = self._total
@@ -394,184 +352,39 @@ class Bar:
 
         self._update_lock.release()
 
-    async def _run(
-        self,
-        text: str | bytes | ProgressText | None = None,
-        mode: Literal["extended", "compatability"] = "compatability",
-    ):
-        if text is None:
-            text = self._text
+    async def pause(self):
+        pass
 
-        if self.enabled and self._enable_output:
-            await self._hide_cursor()
-            self._register_signal_handlers()
-
-        if self.enabled:
-            self._start_time = time.time()
-            self._stop_time = None  # Reset value to properly calculate subsequent spinner starts (if any)  # pylint: disable=line-too-long
-            self._stop_bar = asyncio.Event()
-            self._hide_bar = asyncio.Event()
-            try:
-                self._spin_thread = asyncio.ensure_future(self._spin(text=text))
-            except Exception:
-                # Ensure cursor is not hidden if any failure occurs that prevents
-                # getting it back
-                if self._enable_output:
-                    await self._show_cursor()
+    async def resume(self):
+        pass
 
     async def stop(self):
-        self._stop_time = time.time()
-
-        if self._dfl_sigmap:
-            # Reset registered signal handlers to default ones
-            self._reset_signal_handlers()
-
-        if self._stop_bar:
-            self._stop_bar.set()
-
-        try:
-            self._spin_thread.cancel()
-            await asyncio.sleep(0)
-
-        except (
-            asyncio.CancelledError,
-            asyncio.TimeoutError,
-            asyncio.InvalidStateError,
-        ):
-            pass
-
-        if self._enable_output:
-            await self._clear_line()
-
-        try:
-            self._run_progress_bar.cancel()
-            await asyncio.sleep(0)
-
-        except (
-            asyncio.CancelledError,
-            asyncio.TimeoutError,
-            asyncio.InvalidStateError,
-        ):
-            pass
-
-        if self._enable_output:
-            await self._show_cursor()
+        pass
 
     async def abort(self):
-        if self.enabled:
-            await self.fail()
-            self._stop_time = time.time()
-
-            if self._dfl_sigmap:
-                # Reset registered signal handlers to default ones
-                self._reset_signal_handlers()
-
-            if not self._stop_bar.is_set():
-                self._stop_bar.set()
-
-                try:
-                    self._spin_thread.cancel()
-
-                except (
-                    asyncio.CancelledError,
-                    asyncio.InvalidStateError,
-                    asyncio.TimeoutError,
-                ):
-                    pass
-
-            try:
-                self._run_progress_bar.cancel()
-            except (
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-            ):
-                pass
-
-            if self._enable_output:
-                await self._clear_line()
-                await self._show_cursor()
-
-    async def hide(self):
-        """Hide the spinner to allow for custom writing to the terminal."""
-        thr_is_alive = self._spin_thread and (
-            self._spin_thread.done() is False and self._spin_thread.cancelled() is False
-        )
-
-        if thr_is_alive and not self._hide_bar.is_set():
-            # set the hidden spinner flag
-            self._hide_bar.set()
-
-            if self._enable_output:
-                await self._clear_line()
-
-                # flush the stdout buffer so the current line
-                # can be rewritten to
-                await self._loop.run_in_executor(None, sys.stdout.flush)
-
-    async def show(self):
-        """Show the hidden spinner."""
-        thr_is_alive = self._spin_thread and (
-            self._spin_thread.done() is False and self._spin_thread.cancelled() is False
-        )
-
-        if thr_is_alive and self._hide_bar.is_set():
-            # clear the hidden spinner flag
-            self._hide_bar.clear()
-
-            # clear the current line so the spinner is not appended to it
-        if thr_is_alive and self._hide_bar.is_set() and self._enable_output:
-            await self._clear_line()
-
-    async def write(self, text):
-        """Write text in the terminal without breaking the spinner."""
-        # similar to tqdm.write()
-        # https://pypi.python.org/pypi/tqdm#writing-messages
-        await self._stdout_lock.acquire()
-
-        if self._enable_output:
-            await self._clear_line()
-
-        if isinstance(text, (str, bytes)):
-            _text = to_unicode(text)
-        else:
-            _text = str(text)
-
-        # Ensure output is Unicode
-        assert isinstance(_text, str)
-
-        if self._enable_output:
-            await self._loop.run_in_executor(
-                None,
-                sys.stdout.write,
-            )
-
-        self._cur_line_len = 0
-        self._stdout_lock.release()
+        await self.fail()
+        self._stop_time = time.time()
+        pass
 
     async def ok(
         self,
         text: str | bytes | ProgressText | None = None,
     ):
-        if self.enabled:
-            """Set Ok (success) finalizer to a spinner."""
-            await self._freeze(
-                SegmentStatus.OK,
-                text=text,
-            )
+        await self._create_last_bar(
+            SegmentStatus.OK,
+            text=text,
+        )
 
     async def fail(
         self,
         text: str | bytes | ProgressText | None = None,
     ):
-        if self.enabled:
-            """Set fail finalizer to a spinner."""
-            await self._freeze(
-                SegmentStatus.FAILED,
-                text=text,
-            )
+        await self._create_last_bar(
+            SegmentStatus.FAILED,
+            text=text,
+        )
 
-    async def _freeze(
+    async def _create_last_bar(
         self,
         status: SegmentStatus.OK | SegmentStatus.FAILED,
         text: str | bytes | ProgressText | None = None,
@@ -619,159 +432,48 @@ class Bar:
         if self._chars.end_char:
             segments.append(self._chars.end_char)
 
-        self._last_frame = await self._compose_out(
-            "".join(segments),
-            text=text,
+        self._last_frame = await self._compose_out("".join(segments))
+        self._last_frame_ready = True
+
+    async def _create_bar(self):
+        active_idx = min(
+            math.ceil(self._completed * self._bar_width / self._total),
+            self._bar_width,
         )
 
-        self._frame_queue.put_nowait(self._last_frame)
+        if active_idx >= self._bar_width:
+            active_idx = self._bar_width - 1
 
-        if self._frame_queue and not self._last_frame_ready:
-            self._last_frame_ready = True
+        segments: list[str] = []
 
-        # Should be stopped here, otherwise prints after
-        # self._freeze call will mess up the spinner
-        await self.stop()
-
-        if self._enable_output:
-            await self._loop.run_in_executor(None, sys.stdout.write, self._last_frame)
-
-        self._cur_line_len = 0
-
-    async def _spin(
-        self,
-        text: str | bytes | ProgressText | None = None,
-    ):
-        self.segments[self._active_segment_idx].status = SegmentStatus.ACTIVE
-
-        while not self._stop_bar.is_set():
-            if self._hide_bar.is_set():
-                # Wait a bit to avoid wasting cycles
-                await asyncio.sleep(self._interval)
-                continue
-
-            await self._stdout_lock.acquire()
-
-            active_idx = min(
-                math.ceil(self._completed * self._bar_width / self._total),
-                self._bar_width,
-            )
-
-            segments: list[str] = []
-
-            if self._chars.start_char:
-                segments.append(self._chars.start_char)
-
-            if self._completed >= self.total:
-                segments = [self._bar_segment.ok for _ in range(self._bar_width)]
-
-            else:
-                ok_chars = await stylize(
-                    "".join([self._chars.ok_char for _ in range(0, active_idx)]),
-                    color=self._colors.ok_color,
-                    highlight=self._colors.ok_color_highlight,
-                    mode=self._mode,
-                )
-                segments.extend(ok_chars)
-
-                # segments.append(FillChar.by_name(self._chars.active_char))
-                segments.append(self._bar_segment.active)
-
-                ready_chars = "".join(
-                    [
-                        self._chars.background_char
-                        for _ in range(active_idx + 1, self._bar_width)
-                    ]
-                )
-
-                segments.extend(ready_chars)
-
-            if self._chars.end_char:
-                segments.append(self._chars.end_char)
-
-            spin_phase = "".join(segments)
-
-            out = await self._compose_out(
-                spin_phase,
-                text=text,
-            )
-
-            if self._frame_queue:
-                self._frame_queue.put_nowait(out)
-
-            # Write
-
-            if self._enable_output:
-                await self._clear_line()
-
-                await self._loop.run_in_executor(None, sys.stdout.write, out)
-
-                await self._loop.run_in_executor(None, sys.stdout.flush)
-
-            self._cur_line_len = max(self._cur_line_len, len(out))
-
-            # Wait
-            try:
-                await asyncio.wait_for(self._stop_bar.wait(), timeout=self._interval)
-
-            except asyncio.TimeoutError:
-                pass
-
-            self._stdout_lock.release()
-
-            if self._completed >= self._total:
-                break
-
-    async def _clear_line(self):
-        if sys.stdout.isatty():
-            # ANSI Control Sequence EL does not work in Jupyter
-            await self._loop.run_in_executor(None, sys.stdout.write, "\r\0332A\033[4K")
+        if self._chars.start_char:
+            segments.append(self._chars.start_char)
 
         else:
-            fill = " " * self._cur_line_len
-            await self._loop.run_in_executor(
-                None, sys.stdout.write, sys.stdout.write, f"\r{fill}\r"
+            ok_chars = await stylize(
+                "".join([self._chars.ok_char for _ in range(0, active_idx)]),
+                color=self._colors.ok_color,
+                highlight=self._colors.ok_color_highlight,
+                mode=self._mode,
             )
 
-    @staticmethod
-    async def _show_cursor():
-        loop = asyncio.get_event_loop()
-        if sys.stdout.isatty():
-            # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
-            await loop.run_in_executor(None, sys.stdout.write, "\033[?25h")
-            await loop.run_in_executor(None, sys.stdout.flush)
+            segments.extend(ok_chars)
 
-    @staticmethod
-    async def _hide_cursor():
-        loop = asyncio.get_event_loop()
-        if sys.stdout.isatty():
-            # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
-            await loop.run_in_executor(None, sys.stdout.write, "\033[?25l")
+            # segments.append(FillChar.by_name(self._chars.active_char))
+            segments.append(self._bar_segment.active)
 
-            await loop.run_in_executor(None, sys.stdout.flush)
-
-    def _register_signal_handlers(self):
-        # SIGKILL cannot be caught or ignored, and the receiving
-        # process cannot perform any clean-up upon receiving this
-        # signal.
-        if signal.SIGKILL in self._sigmap:
-            raise ValueError(
-                "Trying to set handler for SIGKILL signal. "
-                "SIGKILL cannot be caught or ignored in POSIX systems."
+            ready_chars = "".join(
+                [
+                    self._chars.background_char
+                    for _ in range(active_idx + 1, self._bar_width)
+                ]
             )
 
-        for sig in self._sigmap:
-            dfl_handler = signal.getsignal(sig)
-            self._dfl_sigmap[sig] = dfl_handler
+            segments.extend(ready_chars)
 
-            self._loop.add_signal_handler(
-                getattr(signal, sig.name),
-                lambda signame=sig.name: asyncio.ensure_future(
-                    default_handler(signame, self)
-                ),
-            )
+        if self._chars.end_char:
+            segments.append(self._chars.end_char)
 
-    def _reset_signal_handlers(self):
-        for sig, sig_handler in self._dfl_sigmap.items():
-            if sig and sig_handler:
-                signal.signal(sig, sig_handler)
+        spin_phase = "".join(segments)
+
+        return await self._compose_out(spin_phase)

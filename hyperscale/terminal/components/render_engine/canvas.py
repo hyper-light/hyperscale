@@ -108,7 +108,19 @@ class Canvas:
             for row in section_row_set:
                 rows.append(row)
 
-        return "\n".join(rows)
+        # terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
+        # height_threshold = int(terminal_size.lines * 0.8)
+
+        # if height_threshold < len(rows):
+        #     return rows[:height_threshold]
+
+        return rows
+
+    async def pause(self):
+        await asyncio.gather(*[section.pause() for section in self._sections])
+
+    async def resume(self):
+        await asyncio.gather(*[section.resume() for section in self._sections])
 
     async def stop(self):
         await asyncio.gather(*[section.stop() for section in self._sections])
