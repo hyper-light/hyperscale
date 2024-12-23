@@ -315,7 +315,7 @@ class RenderEngine:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
 
-        self._stop_run.set()git config pull.rebase falsegit config pull.rebase false
+        self._stop_run.set()
 
         if self._stdout_lock.locked():
             self._stdout_lock.release()
