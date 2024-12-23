@@ -6,7 +6,6 @@ pytz
 tzlocal
 eventlet
 psutil
-fastapi
 dill
 scipy
 art
