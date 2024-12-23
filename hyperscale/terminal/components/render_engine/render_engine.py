@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import shutil
 import signal
 import sys
@@ -42,17 +43,18 @@ async def default_handler(signame: str, engine: RenderEngine):  # pylint: disabl
 async def handle_resize(engine: RenderEngine):
     try:
         await engine.pause()
+        await asyncio.sleep(engine._interval)
 
         loop = asyncio.get_event_loop()
 
         terminal_size = await loop.run_in_executor(None, shutil.get_terminal_size)
 
-        width = int((terminal_size.columns * 1.25) / 2)
+        width = int(math.floor(terminal_size.columns / 1.5))
 
-        height = int(terminal_size.lines * 0.8)
+        height = terminal_size.lines - 2
 
-        width_threshold = width * 0.05
-        height_threshold = height * 0.05
+        width_threshold = 1
+        height_threshold = 1
 
         width_difference = abs(width - engine.canvas.width)
         height_difference = abs(height - engine.canvas.height)
@@ -64,6 +66,8 @@ async def handle_resize(engine: RenderEngine):
                 height=height,
             )
 
+            await engine.reset()
+
         elif width_difference > width_threshold:
             await engine.canvas.initialize(
                 engine.canvas._sections,
@@ -71,12 +75,16 @@ async def handle_resize(engine: RenderEngine):
                 height=engine.canvas.height,
             )
 
+            await engine.reset()
+
         elif height_difference > height_threshold:
             await engine.canvas.initialize(
                 engine.canvas._sections,
                 width=engine.canvas.width,
                 height=height,
             )
+
+            await engine.reset()
 
         await engine.resume()
 
@@ -107,11 +115,10 @@ class RenderEngine:
             | WindowedRate,
         ] = {}
 
-        # self._interval = 80 * 0.001
-        self._interval = 1 / 60
+        self._interval = round(1 / 60, 4)
         if self.config:
             # self._interval = config.refresh_rate * 0.001
-            self._interval = 1 / config.refresh_rate
+            self._interval = round(1 / config.refresh_rate, 4)
 
         self._stop_run: asyncio.Event | None = None
         self._hide_run: asyncio.Event | None = None
@@ -141,9 +148,21 @@ class RenderEngine:
     ):
         width: int | None = None
         height: int | None = None
+
+        if self._loop is None:
+            self._loop = asyncio.get_event_loop()
+
+        terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
+
         if self.config:
             width = self.config.width
             height = self.config.height
+
+        if width is None:
+            width = int(math.floor(terminal_size.columns / 1.5))
+
+        if height is None:
+            height = terminal_size.lines - 2
 
         self._components = {
             component.name: component.component
@@ -192,21 +211,17 @@ class RenderEngine:
             try:
                 await self._stdout_lock.acquire()
 
-                frame_lines = await self.canvas.render()
-                await self._clear_terminal(lines=len(frame_lines))
+                frame = await self.canvas.render()
 
-                await self._loop.run_in_executor(None, sys.stdout.write, "\r")
-                await self._loop.run_in_executor(
-                    None, sys.stdout.write, "\n".join(frame_lines)
-                )
-                await self._loop.run_in_executor(None, sys.stdout.write, "\r")
-                await self._loop.run_in_executor(None, sys.stdout.flush)
+                frame = f"\033[3J\033[H{frame}"
 
-                # Wait
-                await asyncio.sleep(self._interval)
+                await self._loop.run_in_executor(None, sys.stdout.write, frame)
 
                 if self._stdout_lock.locked():
                     self._stdout_lock.release()
+
+                # Wait
+                await asyncio.sleep(self._interval)
 
             except Exception:
                 import traceback
@@ -231,20 +246,24 @@ class RenderEngine:
 
     async def _clear_terminal(
         self,
-        lines: int = None,
         force: bool = False,
     ):
-        if lines is None:
-            lines = self.canvas.height
-
-        lines = int(lines * 1.5)
-
         if force:
+            await self._loop.run_in_executor(None, sys.stdout.write, "\033[?25h")
             await asyncio.to_thread(sys.stdout.write, "\033[2J\033[H")
+            await self._loop.run_in_executor(None, sys.stdout.write, "\033[?25l")
 
-        await asyncio.to_thread(
+        else:
+            await asyncio.to_thread(
+                sys.stdout.write,
+                f"\033[{self.canvas.height}A\033[4K\033[H",
+            )
+
+    async def reset(self):
+        await self._loop.run_in_executor(
+            None,
             sys.stdout.write,
-            f"\033[{lines}A\033[4K\033[H",
+            await self.canvas.create_reset_frame(),
         )
 
     async def pause(self):
@@ -259,13 +278,13 @@ class RenderEngine:
             self._stop_run.set()
 
         try:
-            self._spin_thread.set_result(None)
+            await self._spin_thread
 
         except Exception:
             pass
 
         try:
-            self._run_engine.set_result(None)
+            await self._run_engine
         except Exception:
             pass
 
@@ -273,8 +292,6 @@ class RenderEngine:
 
     async def resume(self):
         try:
-            await self.canvas.resume()
-
             self._start_time = time.time()
             self._stop_time = None
             self._stop_run = asyncio.Event()
@@ -298,8 +315,6 @@ class RenderEngine:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
 
-        await self.canvas.stop()
-
         self._stop_run.set()
 
         if self._stdout_lock.locked():
@@ -320,14 +335,12 @@ class RenderEngine:
 
         await self._stdout_lock.acquire()
 
-        frame_lines = await self.canvas.render()
-        await self._clear_terminal(lines=len(frame_lines))
+        frame = await self.canvas.render()
 
-        await asyncio.to_thread(sys.stdout.write, "\r")
-        await asyncio.to_thread(sys.stdout.write, "\n".join(frame_lines))
-        await asyncio.to_thread(sys.stdout.write, "\r")
-        await asyncio.to_thread(sys.stdout.write, "\n")
-        await asyncio.to_thread(sys.stdout.flush)
+        frame = f"\033[3J\033[H{frame}\n"
+
+        await self._loop.run_in_executor(None, sys.stdout.write, frame)
+        await self._loop.run_in_executor(None, sys.stdout.flush)
 
         if self._stdout_lock.locked():
             self._stdout_lock.release()

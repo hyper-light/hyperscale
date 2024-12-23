@@ -459,7 +459,6 @@ class Bar:
 
             segments.extend(ok_chars)
 
-            # segments.append(FillChar.by_name(self._chars.active_char))
             segments.append(self._bar_segment.active)
 
             ready_chars = "".join(

@@ -1,5 +1,4 @@
 import asyncio
-import math
 import shutil
 from typing import List
 
@@ -29,20 +28,6 @@ class Canvas:
     ):
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
-
-        terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
-
-        self._max_width = int(terminal_size.columns * 1.25)
-        self._max_height = int(math.ceil(terminal_size.lines / 10.0)) * 10
-
-        if width is None:
-            width = math.floor(self._max_width / 2)
-
-        if width > self._max_width:
-            width = self._max_width
-
-        if height is None:
-            height = self._max_height
 
         self.width = width
         self.height = height
@@ -108,13 +93,16 @@ class Canvas:
             for row in section_row_set:
                 rows.append(row)
 
-        # terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
-        # height_threshold = int(terminal_size.lines * 0.8)
+        return "\n".join([line + "\r" for line in rows])
 
-        # if height_threshold < len(rows):
-        #     return rows[:height_threshold]
+    async def create_reset_frame(self):
+        terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
 
-        return rows
+        reset_frame = "\n".join(
+            [" " * terminal_size.columns for _ in range(terminal_size.lines)]
+        )
+
+        return f"\r{reset_frame}\r"
 
     async def pause(self):
         await asyncio.gather(*[section.pause() for section in self._sections])
