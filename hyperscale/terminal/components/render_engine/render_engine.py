@@ -46,20 +46,17 @@ async def handle_resize(engine: RenderEngine):
 
         terminal_size = await loop.run_in_executor(None, shutil.get_terminal_size)
 
-        width = int(math.floor(terminal_size.columns * .75))
+        width = int(math.floor(terminal_size.columns * 0.75))
 
         height = terminal_size.lines - 5
 
         width_threshold = 1
-        height_threshold = width%31
+        height_threshold = width % 31
 
         width_difference = abs(width - engine.canvas.width)
         height_difference = abs(height - engine.canvas.height)
 
-        width = max(
-            width - (width%3),
-            1
-        )
+        width = max(width - (width % 3), 1)
 
         if width_difference > width_threshold and height_difference > height_threshold:
             await engine.canvas.initialize(
@@ -81,10 +78,8 @@ async def handle_resize(engine: RenderEngine):
                 width=engine.canvas.width,
                 height=height,
             )
-        
 
         await engine.resume()
-
 
     except Exception:
         import traceback
@@ -157,12 +152,9 @@ class RenderEngine:
             height = self.config.height
 
         if width is None:
-            width = int(math.floor(terminal_size.columns * .75))
+            width = int(math.floor(terminal_size.columns * 0.75))
 
-        width = max(
-            width - (width%3),
-            1
-        )
+        width = max(width - (width % 3), 1)
 
         if height is None:
             height = terminal_size.lines - 5
