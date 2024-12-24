@@ -16,6 +16,8 @@ class Word:
     def to_ascii(
         self,
         formatter_set: dict[str, FormatterSet] | None = None,
+        max_width: int | None = None,
+        max_height: int | None = None,
     ):
         letters = [
             self._lettering.get_letter(char)
@@ -39,10 +41,25 @@ class Word:
                 else:
                     word_lines[line_idx] += letter_line
 
+        height_offset = 0
+        word_height = len(word_lines)
+        if max_height and max_height < word_height:
+            height_offset = word_height - max_height
+
+        width_offset = 0
+        word_width = max([len(line) for line in word_lines])
+        if max_width and max_width < word_width:
+            width_offset = word_width - max_width
+
         return FormattedWord(
             plaintext_word=self._plaintext_word,
-            ascii="\n".join(word_lines),
-            height=len(word_lines),
+            ascii="\n".join(
+                [
+                    word_lines[idx][width_offset:]
+                    for idx in range(height_offset, word_height)
+                ]
+            ),
+            height=word_height,
             width=max([len(line) for line in word_lines]),
         )
 
