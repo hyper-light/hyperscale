@@ -1,23 +1,43 @@
-from hyperscale.terminal.components.header.font.word import Word
+import asyncio
+from hyperscale.terminal.components.header import Header, HeaderConfig
 
 
-def run():
-    word = Word("hyperscale")
-    header_word = word.to_ascii(
-        formatter_set={
-            "y": [
-                lambda letter, idx: "\n".join(
-                    [" " + line for line in letter.split("\n")]
-                )
-                if idx == 1
-                else letter
-            ]
-        },
+async def run():
+    header = Header(
+        HeaderConfig(
+            header_text="hyperscale",
+            formatters={
+                "y": [
+                    lambda letter, _: "\n".join(
+                        [" " + line for line in letter.split("\n")]
+                    )
+                ],
+                "l": [
+                    lambda letter, _: "\n".join(
+                        [
+                            line[:-1] if idx == 2 else line
+                            for idx, line in enumerate(letter.split("\n"))
+                        ]
+                    )
+                ],
+                "e": [
+                    lambda letter, idx: "\n".join(
+                        [
+                            line[1:] if idx < 2 else line
+                            for idx, line in enumerate(letter.split("\n"))
+                        ]
+                    )
+                    if idx == 9
+                    else letter
+                ],
+            },
+            color="aquamarine_2",
+            terminal_mode="extended",
+        )
     )
 
-    print(header_word.ascii)
-    print(header_word.height)
-    print(header_word.width)
+    await header.fit(100, 10)
+    print(await header.get_next_frame())
 
 
-run()
+asyncio.run(run())

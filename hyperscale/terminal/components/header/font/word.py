@@ -51,14 +51,14 @@ class Word:
         if max_width and max_width < word_width:
             width_offset = word_width - max_width
 
+        ascii_lines = [
+            word_lines[idx][width_offset:] for idx in range(height_offset, word_height)
+        ]
+
         return FormattedWord(
             plaintext_word=self._plaintext_word,
-            ascii="\n".join(
-                [
-                    word_lines[idx][width_offset:]
-                    for idx in range(height_offset, word_height)
-                ]
-            ),
+            ascii="\n".join(ascii_lines),
+            ascii_lines=ascii_lines,
             height=word_height,
             width=max([len(line) for line in word_lines]),
         )

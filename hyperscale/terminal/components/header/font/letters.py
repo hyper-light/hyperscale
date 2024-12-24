@@ -1,4 +1,45 @@
+from typing import Literal
 from .formatted_letter import FormattedLetter
+
+
+SupportedLetters = Literal[
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+]
 
 
 class Letters:
@@ -203,14 +244,16 @@ class Letters:
         indented_ascii_letter: str,
         plaintext_letter: str,
     ):
-        letter_lines = indented_ascii_letter.split("\n")
+        letter_lines = [
+            line for line in indented_ascii_letter.split("\n") if len(line.strip()) > 0
+        ]
 
         leading_spaces_count: list[int] = []
 
         for line in letter_lines:
             space_count = 0
 
-            for char in line[1:]:
+            for char in line:
                 if char == " ":
                     space_count += 1
 
@@ -218,12 +261,12 @@ class Letters:
                     leading_spaces_count.append(space_count)
                     break
 
-        dedent_spaces = min(leading_spaces_count) + 1
+        dedent_spaces = min(leading_spaces_count)
 
         dedented_lines: list[str] = []
         line_widths: list[int] = []
 
-        for line in letter_lines[1:]:
+        for line in letter_lines:
             dedented_line = line[dedent_spaces:].rstrip()
 
             line_widths.append(len(dedented_line))

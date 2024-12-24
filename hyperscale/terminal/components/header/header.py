@@ -1,13 +1,13 @@
+import math
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.styling import stylize
 from typing import Any
-from .header_text import (
-    MEDI,
-    LARG,
-    XL,
-)
 
 from .header_config import HeaderConfig
+from .font import (
+    FormattedWord,
+    Word,
+)
 
 
 class Header:
@@ -16,14 +16,10 @@ class Header:
         config: HeaderConfig,
     ):
         self._config = config
-        self._headers: dict[tuple[int, int], str] = {
-            (1, 3): "\033[1m\033[3m\033[4m hyperscale",
-            (3, 5): MEDI,
-            (5, 8): LARG,
-            (8, 100): XL,
-        }
+        self._word = Word(self._config.header_text)
 
         self._styled_header: str = ""
+        self._formatted_word: FormattedWord | None = None
         self._max_width = 0
         self._max_height = 0
         self._mode = TerminalMode.to_mode(self._config.terminal_mode)
@@ -39,35 +35,106 @@ class Header:
     async def fit(
         self,
         max_width: int,
-        max_height: int,
+        max_height: int | None = None,
     ):
-        selected_header: str = ""
-
-        for size_range, Header in self._headers.items():
-            min_size, max_size = size_range
-            if max_height >= min_size and max_height < max_size:
-                selected_header = Header
-
-                break
-
-        header_lines = [
-            line[:max_width]
-            for line in selected_header.split("\n")
-            if len(line) > max_width
-        ]
-
-        header_lines = [
-            line + " " * (max_width - len(line))
-            for line in selected_header.split("\n")
-            if len(line) < max_width
-        ]
-
-        self._styled_header = await stylize(
-            "\n".join(header_lines), color=self._config.color, mode=self._mode
+        self._formatted_word = self._word.to_ascii(
+            formatter_set=self._config.formatters,
+            max_width=max_width,
+            max_height=max_height,
         )
+
+        if max_height is None:
+            max_height = self._formatted_word.height
+
+        if max_width is None:
+            max_width = self._formatted_word.width
 
         self._max_width = max_width
         self._max_height = max_height
+
+        if max_width > self._formatted_word.width:
+            self._formatted_word = self._pad_word_width()
+
+        if max_height > self._formatted_word.height:
+            self._formatted_word = self._pad_word_height()
+
+        self._styled_header = await stylize(
+            self._formatted_word.ascii,
+            color=self._config.color,
+            highlight=self._config.highlight,
+            attrs=self._config.attributes,
+            mode=self._mode,
+        )
+
+    def _pad_word_width(self):
+        padded_lines: list[str] = []
+        for line in self._formatted_word.ascii_lines:
+            difference = max(self._max_width - len(line), 0)
+
+            if self._config.horizontal_alignment == "left":
+                padded_lines.append(line + " " * difference)
+
+            elif self._config.horizontal_alignment == "center":
+                left_pad = " " * math.ceil(difference / 2)
+                right_pad = " " * math.floor(difference / 2)
+
+                padded_lines.append(left_pad + line + right_pad)
+
+            elif self._config.horizontal_alignment == "right":
+                padded_lines.append(" " * difference + line)
+
+        return FormattedWord(
+            plaintext_word=self._formatted_word.plaintext_word,
+            ascii="\n".join(padded_lines),
+            ascii_lines=padded_lines,
+            height=self._formatted_word.height,
+            width=self._max_width,
+        )
+
+    def _pad_word_height(self):
+        word_lines = self._formatted_word.ascii_lines
+
+        difference = max(self._max_height - self._formatted_word.height, 0)
+
+        if self._config.vertical_alignment == "top":
+            word_lines = self._pad_bottom(word_lines, difference)
+
+        elif self._config.vertical_alignment == "center":
+            top_pad = math.floor(difference / 2)
+            bottom_pad = math.ceil(difference / 2)
+
+            word_lines = self._pad_top(word_lines, top_pad)
+            word_lines = self._pad_bottom(word_lines, bottom_pad)
+
+        elif self._config.vertical_alignment == "bottom":
+            word_lines = self._pad_top(word_lines, difference)
+
+        return FormattedWord(
+            plaintext_word=self._formatted_word.plaintext_word,
+            ascii="\n".join(word_lines),
+            ascii_lines=word_lines,
+            height=self._max_height,
+            width=self._formatted_word.width,
+        )
+
+    def _pad_top(
+        self,
+        word_lines: list[str],
+        amount: int,
+    ):
+        for _ in range(amount):
+            word_lines.insert(0, " " * self._max_width)
+
+        return word_lines
+
+    def _pad_bottom(
+        self,
+        word_lines: list[str],
+        amount: int,
+    ):
+        word_lines.extend([" " * self._max_width for _ in range(amount)])
+
+        return word_lines
 
     async def update(self, _: Any):
         pass
