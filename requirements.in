@@ -7,8 +7,8 @@ tzlocal
 eventlet
 psutil
 dill
-scipy
 art
+scipy
 scikit-learn
 uvloop
 tdigest
@@ -25,4 +25,4 @@ graphql-core
 cloudpickle
 orjson
 msgspec
-plotilles
+plotille
