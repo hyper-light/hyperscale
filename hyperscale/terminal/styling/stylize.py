@@ -90,6 +90,6 @@ async def stylize(
 
     if attrs is not None:
         for attr in attrs:
-            ansi_string = ("\033[%dm" % Attribute.by_name(attr), ansi_string)
+            ansi_string = "\033[%dm%s" % (Attribute.by_name(attr), ansi_string)
 
     return ansi_string + RESET

@@ -32,6 +32,7 @@ async def run():
                 ],
             },
             color="aquamarine_2",
+            attributes=["bold"],
             terminal_mode="extended",
         )
     )
