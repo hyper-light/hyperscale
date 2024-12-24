@@ -1,6 +1,8 @@
-from .letters import Letters
 from typing import Callable, List
+
+from .letters import Letters
 from .formatted_letter import FormattedLetter
+from .formatted_word import FormattedWord
 
 Formatter = Callable[[str, int], str]
 FormatterSet = List[Formatter]
@@ -22,7 +24,6 @@ class Word:
         ]
 
         word_lines: list[str] = []
-
         for letter_idx, letter in enumerate(letters):
             if formatter_set:
                 letter = self._apply_formatters(
@@ -38,7 +39,12 @@ class Word:
                 else:
                     word_lines[line_idx] += letter_line
 
-        return "\n".join(word_lines)
+        return FormattedWord(
+            plaintext_word=self._plaintext_word,
+            ascii="\n".join(word_lines),
+            height=len(word_lines),
+            width=max([len(line) for line in word_lines]),
+        )
 
     def _apply_formatters(
         self,
