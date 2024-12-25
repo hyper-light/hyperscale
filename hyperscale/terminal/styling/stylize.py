@@ -82,9 +82,11 @@ async def stylize(
             ansi_string,
         )
 
-    elif highlight and mode == TerminalMode.EXTENDED:
+    elif highlight is not None and mode == TerminalMode.EXTENDED:
         ansi_string = "\033[48:5:%dm%s" % (
-            Highlight.by_name(highlight) if isinstance(highlight, str) else color,
+            Highlight.by_name(highlight, mode=mode)
+            if isinstance(highlight, str)
+            else color,
             ansi_string,
         )
 

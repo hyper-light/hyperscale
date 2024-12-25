@@ -19,7 +19,7 @@ class HeaderConfig(BaseModel):
     color: ColorName | ExtendedColorName | None = None
     horizontal_alignment: HeaderHorizontalAlignment = "left"
     vertical_alignment: HeaderVerticalAlignment = "center"
-    highlight: HighlightName | None = None
+    highlight: HighlightName | ExtendedColorName | None = None
     attributes: List[AttributeName] | None = None
     terminal_mode: TerminalDisplayMode = "compatability"
     formatters: Dict[SupportedLetters, FormatterSet] | None = None

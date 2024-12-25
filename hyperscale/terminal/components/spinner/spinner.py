@@ -44,8 +44,8 @@ class Spinner:
         ok_char: str = "✔",
         fail_char: str = "✘",
         text: ProgressText | str | bytes = None,
-        color: ColorName = None,
-        highlight: HighlightName = None,
+        color: ColorName | ExtendedColorName = None,
+        highlight: HighlightName | ExtendedColorName = None,
         attrs: List[AttributeName] = None,
         ok_color: ColorName | ExtendedColorName | None = None,
         ok_highlight: HighlightName | ExtendedColorName | None = None,
@@ -173,7 +173,7 @@ class Spinner:
         text: str | bytes | ProgressText | None = None,
         color: ColorName | None = None,
         attrs: AttributeName | None = None,
-        highlight: HighlightName | None = None,
+        highlight: HighlightName | ExtendedColorName | None = None,
         mode: TerminalMode = TerminalMode.COMPATIBILITY,
     ) -> str:
         if text:

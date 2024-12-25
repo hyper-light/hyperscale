@@ -80,6 +80,7 @@ async def display():
                                     ],
                                 },
                                 color="aquamarine_2",
+                                highlight="medium_violet_red",
                                 attributes=["bold"],
                                 terminal_mode="extended",
                             )
