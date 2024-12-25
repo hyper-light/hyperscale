@@ -1,10 +1,8 @@
 import asyncio
 import itertools
 import math
-from collections import OrderedDict
 from typing import (
     Any,
-    Callable,
     Dict,
     Literal,
 )
@@ -14,26 +12,13 @@ from hyperscale.terminal.styling import stylize
 from hyperscale.terminal.styling.colors import (
     ColorName,
     ExtendedColorName,
+    Colorizer,
 )
 
 from .cell_alignment import CellAlignment, CellAlignmentMap, CellAlignmentType
 from .charset_position_type import CharsetPositionType
 from .table_border_lines import TableBorderCharset, TableBorderLines
 
-Colorizer = (
-    ColorName
-    | ExtendedColorName
-    | Callable[
-        [str],
-        ColorName | ExtendedColorName | None,
-    ]
-    | list[
-        Callable[
-            [str],
-            ColorName | ExtendedColorName | None,
-        ]
-    ]
-)
 
 HeaderColorMap = Dict[str, Colorizer]
 
@@ -1186,7 +1171,6 @@ class TableAssembler:
         color_map: HeaderColorMap | DataColorMap | None = None,
     ):
         converted_data = self._convert_cell_to_string(data, header_key)
-
 
         data_length = len(converted_data)
         border_length = self._calculate_border_length(

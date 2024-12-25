@@ -23,10 +23,12 @@ async def _can_do_colour(
     if force_color is not None and force_color:
         return True
 
+    loop = asyncio.get_event_loop()
+
     return (
         hasattr(sys.stdout, "isatty")
-        and await asyncio.to_thread(sys.stdout.isatty)
-        and await asyncio.to_thread(os.environ.get, "TERM") != "dumb"
+        and await loop.run_in_executor(None, sys.stdout.isatty)
+        and await loop.run_in_executor(None, os.environ.get, "TERM") != "dumb"
     )
 
 
