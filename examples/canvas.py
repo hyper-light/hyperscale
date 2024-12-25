@@ -1,6 +1,8 @@
 import asyncio
 import time
 
+from hyperscale.terminal.components.header import Header, HeaderConfig
+
 from hyperscale.terminal.components.progress_bar import (
     BarFactory,
     ProgressBarColorConfig,
@@ -41,6 +43,52 @@ async def display():
     await engine.initialize(
         [
             Section(
+                SectionConfig(height="xx-small", width="full"),
+                [
+                    Component(
+                        "header",
+                        Header(
+                            HeaderConfig(
+                                header_text="hyperscale",
+                                formatters={
+                                    "y": [
+                                        lambda letter, _: "\n".join(
+                                            [" " + line for line in letter.split("\n")]
+                                        )
+                                    ],
+                                    "l": [
+                                        lambda letter, _: "\n".join(
+                                            [
+                                                line[:-1] if idx == 2 else line
+                                                for idx, line in enumerate(
+                                                    letter.split("\n")
+                                                )
+                                            ]
+                                        )
+                                    ],
+                                    "e": [
+                                        lambda letter, idx: "\n".join(
+                                            [
+                                                line[1:] if idx < 2 else line
+                                                for idx, line in enumerate(
+                                                    letter.split("\n")
+                                                )
+                                            ]
+                                        )
+                                        if idx == 9
+                                        else letter
+                                    ],
+                                },
+                                color="aquamarine_2",
+                                attributes=["bold"],
+                                terminal_mode="extended",
+                            )
+                        ),
+                        Alignment(),
+                    )
+                ],
+            ),
+            Section(
                 SectionConfig(
                     width="small",
                     height="smallest",
@@ -54,6 +102,7 @@ async def display():
                         bar,
                         Alignment(
                             horizontal="left",
+                            vertical="center",
                         ),
                     ),
                 ],
@@ -65,7 +114,7 @@ async def display():
                     top_border="-",
                     right_border="|",
                     bottom_border="-",
-                )
+                ),
             ),
             Section(
                 SectionConfig(
@@ -165,6 +214,7 @@ async def display():
                 ],
             ),
         ],
+        horizontal_padding=4,
     )
 
     await engine.render()

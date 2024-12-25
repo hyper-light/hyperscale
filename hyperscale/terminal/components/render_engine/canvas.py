@@ -15,6 +15,16 @@ class Canvas:
         self._section_rows: List[List[Section]] = []
         self._total_size: int = 0
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._horizontal_padding: int = 0
+        self._vertical_padding: int = 0
+
+    @property
+    def total_width(self):
+        return self.width + self._horizontal_padding
+
+    @property
+    def total_height(self):
+        return self.height + self._vertical_padding
 
     @property
     def size(self):
@@ -25,7 +35,12 @@ class Canvas:
         sections: List[Section],
         width: int | None = None,
         height: int | None = None,
+        horizontal_padding: int = 0,
+        vertical_padding: int = 0,
     ):
+        self._horizontal_padding = horizontal_padding
+        self._vertical_padding = vertical_padding
+
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
 
@@ -93,7 +108,31 @@ class Canvas:
             for row in section_row_set:
                 rows.append(row)
 
-        return "\n".join([line + "\r" for line in rows])
+        return "\n".join(
+            [
+                self._apply_horizontal_padding(line) + "\r"
+                for line in self._apply_vertical_padding(rows)
+            ]
+        )
+
+    def _apply_horizontal_padding(self, line: str):
+        if self._horizontal_padding > 0:
+            line = (
+                " " * self._horizontal_padding + line + " " * self._horizontal_padding
+            )
+
+        return line
+
+    def _apply_vertical_padding(self, lines: list[str]):
+        if self._vertical_padding > 0:
+            for _ in range(self._vertical_padding):
+                padding_line = " " * self.width
+
+                lines.insert(0, padding_line)
+
+            lines.extend([" " * self.width for _ in range(self._vertical_padding)])
+
+        return lines
 
     async def create_reset_frame(self):
         terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)

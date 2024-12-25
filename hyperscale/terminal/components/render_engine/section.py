@@ -52,12 +52,12 @@ class Section:
         }
 
         self._scale: Dict[SectionSize, float] = {
-            "smallest": 0.05,
-            "xx-small": 0.1,
+            "smallest": 0.1,
+            "xx-small": 0.15,
             "x-small": 0.25,
-            "small": 1/3,
+            "small": 1 / 3,
             "medium": 0.5,
-            "large": 2/3,
+            "large": 2 / 3,
             "x-large": 0.75,
             "xx-large": 0.85,
             "full": 0.99,

@@ -28,7 +28,7 @@ from .section import Section
 SignalHandlers = Callable[[int], Any] | int | None
 
 
-async def default_handler(signame: str, engine: RenderEngine):  # pylint: disable=unused-argument
+async def default_handler(_: str, engine: RenderEngine):  # pylint: disable=unused-argument
     """Signal handler, used to gracefully shut down the ``spinner`` instance
     when specified signal is received by the process running the ``spinner``.
 
@@ -53,28 +53,25 @@ async def handle_resize(engine: RenderEngine):
         width_threshold = 1
         height_threshold = width % 31
 
-        width_difference = abs(width - engine.canvas.width)
-        height_difference = abs(height - engine.canvas.height)
+        width_difference = abs(width - engine.canvas.total_width)
+        height_difference = abs(height - engine.canvas.total_height)
 
         width = max(width - (width % 3), 1)
 
         if width_difference > width_threshold and height_difference > height_threshold:
-            await engine.canvas.initialize(
-                engine.canvas._sections,
+            await engine.resize(
                 width=width,
                 height=height,
             )
 
         elif width_difference > width_threshold:
-            await engine.canvas.initialize(
-                engine.canvas._sections,
+            await engine.resize(
                 width=width,
                 height=engine.canvas.height,
             )
 
         elif height_difference > height_threshold:
-            await engine.canvas.initialize(
-                engine.canvas._sections,
+            await engine.resize(
                 width=engine.canvas.width,
                 height=height,
             )
@@ -121,6 +118,8 @@ class RenderEngine:
         self._terminal_size: int = 0
         self._spin_thread: asyncio.Future | None = None
         self._frame_height: int = 0
+        self._horizontal_padding: int = 0
+        self._vertical_padding: int = 0
 
         self._sigmap = (
             sigmap
@@ -138,9 +137,17 @@ class RenderEngine:
     async def initialize(
         self,
         sections: List[Section],
+        horizontal_padding: int = 0,
+        vertical_padding: int = 0,
     ):
         width: int | None = None
         height: int | None = None
+
+        if horizontal_padding != self._vertical_padding:
+            self._horizontal_padding = horizontal_padding
+
+        if vertical_padding != self._vertical_padding:
+            self._vertical_padding = vertical_padding
 
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
@@ -148,16 +155,18 @@ class RenderEngine:
         terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
 
         if self.config:
-            width = self.config.width
-            height = self.config.height
+            width = self.config.width - self._horizontal_padding
+            height = self.config.height - self._vertical_padding
 
         if width is None:
-            width = int(math.floor(terminal_size.columns * 0.75))
+            width = (
+                int(math.floor(terminal_size.columns * 0.75)) - self._horizontal_padding
+            )
 
         width = max(width - (width % 3), 1)
 
         if height is None:
-            height = terminal_size.lines - 5
+            height = terminal_size.lines - 5 - self._vertical_padding
 
         self._components = {
             component.name: component.component
@@ -169,6 +178,21 @@ class RenderEngine:
             sections,
             width=width,
             height=height,
+            horizontal_padding=self._horizontal_padding,
+            vertical_padding=self._vertical_padding,
+        )
+
+    async def resize(
+        self,
+        width: int,
+        height: int,
+    ):
+        await self.canvas.initialize(
+            self.canvas._sections,
+            width=width,
+            height=height,
+            horizontal_padding=self._horizontal_padding,
+            vertical_padding=self._vertical_padding,
         )
 
     async def update(

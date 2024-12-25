@@ -1,5 +1,7 @@
 import math
+import asyncio
 from hyperscale.terminal.config.mode import TerminalMode
+from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.terminal.styling import stylize
 from typing import Any
 
@@ -15,10 +17,11 @@ class Header:
         self,
         config: HeaderConfig,
     ):
+        self.fit_type = WidgetFitDimensions.X_Y_AXIS
         self._config = config
         self._word = Word(self._config.header_text)
 
-        self._styled_header: str = ""
+        self._styled_header_lines: list[str] = []
         self._formatted_word: FormattedWord | None = None
         self._max_width = 0
         self._max_height = 0
@@ -34,7 +37,7 @@ class Header:
 
     async def fit(
         self,
-        max_width: int,
+        max_width: int | None = None,
         max_height: int | None = None,
     ):
         self._formatted_word = self._word.to_ascii(
@@ -52,20 +55,6 @@ class Header:
         self._max_width = max_width
         self._max_height = max_height
 
-        if max_width > self._formatted_word.width:
-            self._formatted_word = self._pad_word_width()
-
-        if max_height > self._formatted_word.height:
-            self._formatted_word = self._pad_word_height()
-
-        self._styled_header = await stylize(
-            self._formatted_word.ascii,
-            color=self._config.color,
-            highlight=self._config.highlight,
-            attrs=self._config.attributes,
-            mode=self._mode,
-        )
-
     def _pad_word_width(self):
         padded_lines: list[str] = []
         for line in self._formatted_word.ascii_lines:
@@ -75,7 +64,7 @@ class Header:
                 padded_lines.append(line + " " * difference)
 
             elif self._config.horizontal_alignment == "center":
-                left_pad = " " * math.ceil(difference / 2)
+                left_pad = " " * math.floor(difference / 2)
                 right_pad = " " * math.floor(difference / 2)
 
                 padded_lines.append(left_pad + line + right_pad)
@@ -101,7 +90,7 @@ class Header:
 
         elif self._config.vertical_alignment == "center":
             top_pad = math.floor(difference / 2)
-            bottom_pad = math.ceil(difference / 2)
+            bottom_pad = math.floor(difference / 2)
 
             word_lines = self._pad_top(word_lines, top_pad)
             word_lines = self._pad_bottom(word_lines, bottom_pad)
@@ -140,7 +129,25 @@ class Header:
         pass
 
     async def get_next_frame(self):
-        return self._styled_header
+        if self._max_width > self._formatted_word.width:
+            self._formatted_word = self._pad_word_width()
+
+        if self._max_height > self._formatted_word.height:
+            self._formatted_word = self._pad_word_height()
+
+        styled_header_lines: list[str] = []
+        for line in self._formatted_word.ascii_lines:
+            styled_header_lines.append(
+                await stylize(
+                    line,
+                    color=self._config.color,
+                    highlight=self._config.highlight,
+                    attrs=self._config.attributes,
+                    mode=self._mode,
+                )
+            )
+
+        return styled_header_lines
 
     async def pause(self):
         pass
