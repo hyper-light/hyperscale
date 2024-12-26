@@ -48,6 +48,10 @@ class Table:
         max_width: int | None = None,
         max_height: int | None = None,
     ):
+        
+        if self._update_lock is None:
+            self._update_lock = asyncio.Lock()
+            
         self._column_width = int(math.floor(max_width / self._columns_count))
 
         table_size = self._column_width * self._columns_count

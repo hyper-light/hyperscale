@@ -105,7 +105,7 @@ class RenderEngine:
             | WindowedRate,
         ] = {}
 
-        self._interval = round(1 / 120, 4)
+        self._interval = round(1 / 30, 4)
         if self.config:
             # self._interval = config.refresh_rate * 0.001
             self._interval = round(1 / config.refresh_rate, 4)
