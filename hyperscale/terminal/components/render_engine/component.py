@@ -1,7 +1,7 @@
 import math
 
 from hyperscale.terminal.components.link import Link
-from hyperscale.terminal.components.progress_bar import Bar
+from hyperscale.terminal.components.progress_bar import ProgressBar
 from hyperscale.terminal.components.scatter_plot import ScatterPlot
 from hyperscale.terminal.components.spinner import Spinner
 from hyperscale.terminal.components.text import Text
@@ -16,7 +16,7 @@ class Component:
     def __init__(
         self,
         name: str,
-        component: Text | Spinner | Link | Bar | ScatterPlot | TotalRate | WindowedRate,
+        component: Text | Spinner | Link | ProgressBar | ScatterPlot | TotalRate | WindowedRate,
         alignment: Alignment | None = None,
         horizontal_padding: int = 0,
         vertical_padding: int = 0,

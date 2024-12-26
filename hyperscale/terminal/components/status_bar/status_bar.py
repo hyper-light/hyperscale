@@ -1,3 +1,4 @@
+import asyncio
 import math
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
@@ -12,6 +13,7 @@ class StatusBar:
     ):
         self.fit_type = WidgetFitDimensions.X_AXIS
         self._config = config
+        self._default_status = config.default_status
 
         status_styling_map = self._config.status_styles
         if status_styling_map is None:
@@ -21,6 +23,9 @@ class StatusBar:
 
         self._status: str | None = None
         self._max_width: int = 0
+
+        self._update_lock: asyncio.Lock | None = None
+
         self._mode = TerminalMode.to_mode(self._config.terminal_mode)
 
     @property
@@ -32,9 +37,17 @@ class StatusBar:
         return self._max_width
 
     async def update(self, status: str):
+        await self._update_lock.acquire()
+
         self._status = status
 
+        self._update_lock.release()
+
     async def fit(self, max_width: int | None = None):
+
+        if self._update_lock is None:
+            self._update_lock = asyncio.Lock()
+
         self._max_width = max_width
 
     async def get_next_frame(self):
@@ -54,13 +67,18 @@ class StatusBar:
                 status_text,
                 color=get_style(
                     status_styles.get("color"),
+                    self._status,
                 ),
                 highlight=get_style(
                     status_styles.get("highlight"),
+                    self._status,
                 ),
-                attrs=get_style(
-                    status_styles.get("attrs"),
-                ),
+                attrs=[
+                    get_style(
+                        attr,
+                        self._status,
+                    ) for attr in status_styles.get("attrs", [])
+                ],
                 mode=self._mode,
             )
 
@@ -74,10 +92,12 @@ class StatusBar:
         pass
 
     async def stop(self):
-        pass
+        if self._update_lock.locked():
+            self._update_lock.release()
 
     async def abort(self):
-        pass
+        if self._update_lock.locked():
+            self._update_lock.release()
 
     def _trim_status_text(
         self,

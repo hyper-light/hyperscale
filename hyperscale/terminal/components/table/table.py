@@ -152,7 +152,9 @@ class Table:
         pass
 
     async def stop(self):
-        pass
+        if self._update_lock.locked():
+            self._update_lock.release()
 
     async def abort(self):
-        pass
+        if self._update_lock.locked():
+            self._update_lock.release()

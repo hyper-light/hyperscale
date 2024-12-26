@@ -8,8 +8,7 @@ from pydantic import (
 
 from hyperscale.terminal.config.mode import TerminalDisplayMode
 from hyperscale.terminal.styling.colors import (
-    ColorName,
-    ExtendedColorName,
+    Colorizer
 )
 
 from .point_char import PointCharName
@@ -27,6 +26,6 @@ class PlotConfig(BaseModel):
     x_max: StrictInt | StrictFloat | None = None
     y_max: StrictInt | StrictFloat | None = None
     use_origin: StrictBool = True
-    line_color: ColorName | ExtendedColorName | None = None
+    line_color: Colorizer | None = None
     terminal_mode: TerminalDisplayMode = "compatability"
     point_char: PointCharName | None = None

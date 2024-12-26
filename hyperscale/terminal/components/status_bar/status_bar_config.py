@@ -2,7 +2,7 @@ from hyperscale.terminal.styling.attributes import Attributizer
 from hyperscale.terminal.styling.colors import Colorizer, HighlightColorizer
 from hyperscale.terminal.config.mode import TerminalDisplayMode
 from pydantic import BaseModel, StrictStr, StrictInt
-from typing import Dict, Literal
+from typing import Dict, Literal, List
 
 
 HorizontalAlignment = Literal["left", "center", "right"]
@@ -11,12 +11,13 @@ StylingMap = Dict[
     StrictStr,
     Dict[
         Literal["color", "highlight", "attrs"],
-        Colorizer | HighlightColorizer | Attributizer | None,
+        Colorizer | HighlightColorizer | List[Attributizer] | None,
     ],
 ]
 
 
 class StatusBarConfig(BaseModel):
+    default_status: StrictStr
     status_styles: StylingMap | None = None
     horizontal_padding: StrictInt = 0
     horizontal_alignment: HorizontalAlignment = "center"

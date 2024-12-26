@@ -1,8 +1,8 @@
-import math
 import asyncio
+import math
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
-from hyperscale.terminal.styling import stylize
+from hyperscale.terminal.styling import stylize, get_style
 from typing import Any
 
 from .header_config import HeaderConfig
@@ -25,6 +25,7 @@ class Header:
         self._formatted_word: FormattedWord | None = None
         self._max_width = 0
         self._max_height = 0
+
         self._mode = TerminalMode.to_mode(self._config.terminal_mode)
 
     @property
@@ -140,9 +141,11 @@ class Header:
             styled_header_lines.append(
                 await stylize(
                     line,
-                    color=self._config.color,
-                    highlight=self._config.highlight,
-                    attrs=self._config.attributes,
+                    color=get_style(self._config.color),
+                    highlight=get_style(self._config.highlight),
+                    attrs=[
+                        get_style(attr) for attr in self._config.attributes
+                    ] if self._config.attributes else None,
                     mode=self._mode,
                 )
             )

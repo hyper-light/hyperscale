@@ -8,7 +8,7 @@ from typing import (
 )
 
 from hyperscale.terminal.config.mode import TerminalMode
-from hyperscale.terminal.styling import stylize
+from hyperscale.terminal.styling import stylize, get_style
 from hyperscale.terminal.styling.colors import (
     ColorName,
     ExtendedColorName,
@@ -1422,35 +1422,14 @@ class TableAssembler:
         color_key: str,
     ):
         colorizer = color_map.get(color_key)
-
-        if isinstance(colorizer, str):
-            return await stylize(
-                data,
-                color=colorizer,
-                mode=self._terminal_mode,
-            )
-
-        elif isinstance(colorizer, list):
-            for colorizable in colorizer:
-                if color := colorizable(data):
-                    data = await stylize(
-                        data,
-                        color=color,
-                        mode=self._terminal_mode,
-                    )
-
-                    break
-
+        if colorizer is None:
             return data
-
-        elif colorizer and (color := colorizer(raw_value)):
-            return await stylize(
-                data,
-                color=color,
-                mode=self._terminal_mode,
-            )
-
-        return data
+        
+        return await stylize(
+            data,
+            color=get_style(colorizer, raw_value),
+            mode=self._terminal_mode
+        )
 
     def _calculate_start_border_length(self, charset: TableBorderCharset):
         if charset.begin_char and charset.separator_char:

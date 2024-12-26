@@ -4,8 +4,8 @@ import time
 from hyperscale.terminal.components.header import Header, HeaderConfig
 
 from hyperscale.terminal.components.progress_bar import (
-    BarFactory,
-    ProgressBarColorConfig,
+    ProgressBar,
+    ProgressBarConfig,
 )
 from hyperscale.terminal.components.render_engine import (
     Alignment,
@@ -27,18 +27,16 @@ from hyperscale.terminal.components.table import (
 async def display():
     engine = RenderEngine()
 
-    factory = BarFactory()
-
-    bar = factory.create_bar(
-        60,
-        colors=ProgressBarColorConfig(
+    bar = ProgressBar(
+        ProgressBarConfig(
+            data=60,
             active_color="royal_blue",
-            fail_color="white",
-            ok_color="hot_pink_3",
-        ),
-        mode="extended",
-        disable_output=True,
+            failed_color="white",
+            complete_color="hot_pink_3",
+            terminal_mode="extended",
+        )
     )
+
 
     await engine.initialize(
         [
@@ -80,7 +78,6 @@ async def display():
                                     ],
                                 },
                                 color="aquamarine_2",
-                                highlight="medium_violet_red",
                                 attributes=["bold"],
                                 terminal_mode="extended",
                             )

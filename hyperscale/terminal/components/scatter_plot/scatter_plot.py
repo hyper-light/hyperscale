@@ -1,10 +1,10 @@
 import asyncio
 from collections import OrderedDict, defaultdict
-from os import get_terminal_size
 from typing import Dict, List, Tuple, Union
 
 from hyperscale.terminal.config.mode import TerminalMode
 from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
+from hyperscale.terminal.styling import get_style
 from hyperscale.terminal.styling.colors import Color
 
 from .plot_config import PlotConfig
@@ -38,7 +38,6 @@ class ScatterPlot:
         )
         self.actions_and_tasks_tables: Dict[str, str] = {}
 
-        self._loop: asyncio.AbstractEventLoop | None = None
         self._update_lock: asyncio.Lock | None = None
 
     @property
@@ -54,24 +53,9 @@ class ScatterPlot:
         max_width: int | None = None,
         max_height: int | None = None,
     ):
-        terminal_width = 0
-        terminal_height = 0
-
-        if self._loop is None:
-            self._loop = asyncio.get_event_loop()
-
-        if max_width is None or max_height is None:
-            terminal_width, terminal_height = await self._loop.run_in_executor(
-                None, get_terminal_size
-            )
-
-        if max_width is None:
-            max_width = terminal_width
-
-        self._width = max_width
-
-        if max_height is None:
-            max_height = terminal_height
+        
+        if self._update_lock is None:
+            self._update_lock = asyncio.Lock()
 
         self._max_width = max_width
         self._max_height = max_height
@@ -95,10 +79,6 @@ class ScatterPlot:
             linesep="\n",
             X_label=self.config.x_axis_name,
             Y_label=self.config.y_axis_name,
-            lc=Color.by_name(
-                self.config.line_color,
-                mode=self._mode,
-            ),
             color_mode="byte",
             origin=self.config.use_origin,
             marker=PointChar.by_name(self.config.point_char),
@@ -129,7 +109,11 @@ class ScatterPlot:
             ]
         ],
     ):
+        await self._update_lock.acquire()
+
         self._data = data
+
+        self._update_lock.release()
 
     async def get_next_frame(self):
         (
@@ -159,7 +143,10 @@ class ScatterPlot:
             X_label=self.config.x_axis_name,
             Y_label=self.config.y_axis_name,
             lc=Color.by_name(
-                self.config.line_color,
+                get_style(
+                    self.config.line_color, 
+                    self._data,
+                ),
                 mode=self._mode,
             ),
             color_mode="byte",
@@ -257,7 +244,9 @@ class ScatterPlot:
         pass
 
     async def stop(self):
-        pass
+        if self._update_lock.locked():
+            self._update_lock.release()
 
     async def abort(self):
-        pass
+        if self._update_lock.locked():
+            self._update_lock.release()

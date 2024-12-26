@@ -1,4 +1,4 @@
-from pydantic import BaseModel, StrictInt, StrictStr
+from pydantic import BaseModel, StrictStr
 from hyperscale.terminal.config.mode import TerminalDisplayMode
 from hyperscale.terminal.styling.attributes import (
     Attributizer,
@@ -10,10 +10,9 @@ from hyperscale.terminal.styling.colors import (
 from typing import List
 
 
-class TotalRateConfig(BaseModel):
-    attributes: List[Attributizer] | None = None
+class TextConfig(BaseModel):
+    default_text: StrictStr = ""
     color: Colorizer | None = None
     highlight: HighlightColorizer | None = None
-    precision: StrictInt = 3
+    attributes: List[Attributizer] | None = None
     terminal_mode: TerminalDisplayMode = 'compatability'
-    unit: StrictStr | None = None

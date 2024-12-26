@@ -1,6 +1,6 @@
 from typing import Dict, List, Literal
 
-from .spinner_config import SpinnerConfig
+from .spinner_frames_set import SpinnerFramesSet
 from .spinner_types import SpinnerName
 
 
@@ -1183,16 +1183,18 @@ class SpinnerFactory:
         )
 
         selected_spinner = dict(spinner)
-        selected_spinner["size"] = len(spinner["frames"][0])
+        selected_spinner["size"] = max([
+            len(frame) for frame in spinner['frames']
+        ])
 
-        return SpinnerConfig(**selected_spinner)
+        return SpinnerFramesSet(**selected_spinner)
 
     def create_spinner(self, spinner_name: str, frames: List[str], interval: int):
         self.types[spinner_name] = {"frames": frames, "inteval": interval}
 
         spinner_size = len(frames[0])
 
-        return SpinnerConfig(
+        return SpinnerFramesSet(
             frames=frames,
             interval=interval,
             size=spinner_size,

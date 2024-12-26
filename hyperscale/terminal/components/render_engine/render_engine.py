@@ -15,7 +15,7 @@ from typing import (
 
 from hyperscale.terminal.components.counter import Counter
 from hyperscale.terminal.components.link import Link
-from hyperscale.terminal.components.progress_bar import Bar
+from hyperscale.terminal.components.progress_bar import ProgressBar
 from hyperscale.terminal.components.scatter_plot import ScatterPlot
 from hyperscale.terminal.components.spinner import Spinner
 from hyperscale.terminal.components.text import Text
@@ -95,7 +95,7 @@ class RenderEngine:
 
         self._components: Dict[
             str,
-            Bar
+            ProgressBar
             | Counter
             | Link
             | ScatterPlot
@@ -395,7 +395,12 @@ class RenderEngine:
             self._stdout_lock.release()
 
         await self._stdout_lock.acquire()
-        await self._clear_terminal()
+        
+        frame = await self.canvas.render()
+
+        frame = f"\033[3J\033[H\n{frame}"
+
+        await self._loop.run_in_executor(None, sys.stdout.write, frame)
 
         try:
             self._run_engine.cancel()

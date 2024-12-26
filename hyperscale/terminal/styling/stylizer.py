@@ -19,6 +19,3 @@ def get_style(
         for style_func in stylizer:
             if style := style_func(*args, **kwargs):
                 return style
-
-    else:
-        raise Exception("Err. - Invalid stylizer!")
