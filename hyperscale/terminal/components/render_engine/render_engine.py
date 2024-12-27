@@ -272,8 +272,7 @@ class Terminal:
                     self._stdout_lock.release()
 
             except Exception:
-                import traceback
-                print(traceback.format_exc())
+                await self.abort()
 
                 # Wait
             await asyncio.sleep(self._interval)
