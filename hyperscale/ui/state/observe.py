@@ -1,5 +1,4 @@
 import asyncio
-import functools
 from typing import TypeVar, Callable, Awaitable, TypeVar
 from pydantic import StrictStr, StrictInt, StrictFloat
 from typing import List, Callable, Awaitable, TypeVar, Tuple, Dict, Any
