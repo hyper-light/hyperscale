@@ -8,21 +8,19 @@ from hyperscale.terminal.components.text import Text
 from hyperscale.terminal.components.total_rate import TotalRate
 from hyperscale.terminal.components.windowed_rate import WindowedRate
 from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
-from typing import List, TypeVar, Generic
+from typing import List
 
 from .alignment import Alignment
 
 
-S = TypeVar('S')
 
-
-class Component(Generic[S]):
+class Component:
     def __init__(
         self,
         name: str,
         component: Text | Spinner | Link | ProgressBar | ScatterPlot | TotalRate | WindowedRate,
-        subscriptions: List[S] | None = None,
         alignment: Alignment | None = None,
+        subscriptions: List[str] | None = None,
         horizontal_padding: int = 0,
         vertical_padding: int = 0,
     ) -> None:
@@ -41,6 +39,7 @@ class Component(Generic[S]):
 
         self._max_height: int = 0
         self._max_width: int = 0
+        alignment: Alignment | None = None,
 
         self._horizontal_padding = horizontal_padding
         self._vertical_padding = vertical_padding
@@ -70,6 +69,10 @@ class Component(Generic[S]):
     @property
     def fit_type(self):
         return self.component.fit_type
+    
+    @property
+    def update_func(self):
+        return self.component.update
 
     async def fit(
         self,

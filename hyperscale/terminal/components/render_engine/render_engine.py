@@ -11,10 +11,7 @@ from typing import (
     Callable,
     Dict,
     List,
-    Generic,
-    TypeVar
 )
-
 from hyperscale.terminal.components.counter import Counter
 from hyperscale.terminal.components.link import Link
 from hyperscale.terminal.components.progress_bar import ProgressBar
@@ -23,7 +20,7 @@ from hyperscale.terminal.components.spinner import Spinner
 from hyperscale.terminal.components.text import Text
 from hyperscale.terminal.components.total_rate import TotalRate
 from hyperscale.terminal.components.windowed_rate import WindowedRate
-from hyperscale.terminal.state import Action, ActionData
+from hyperscale.terminal.state import Action, ActionData, observe
 from .canvas import Canvas
 from .engine_config import EngineConfig
 from .section import Section
@@ -87,14 +84,12 @@ async def handle_resize(engine: RenderEngine):
         pass
 
 
-K = TypeVar('K')
-
-
-class RenderEngine(Generic[K]):
+class RenderEngine:
     def __init__(
         self,
+        sections: List[Section],
+        actions: List[Action[Any, ActionData]] | None = None,
         config: EngineConfig | None = None,
-        actions: K| None = None,
         sigmap: Dict[signal.Signals, asyncio.Coroutine] = None,
     ) -> None:
         self.config = config
@@ -122,11 +117,6 @@ class RenderEngine(Generic[K]):
 
         self._interval = round(1 / refresh_rate, 4)
 
-        if actions is None:
-            actions = {}
-        
-        self.actions = actions
-
         self._stop_run: asyncio.Event | None = None
         self._hide_run: asyncio.Event | None = None
         self._stdout_lock: asyncio.Lock | None = None
@@ -150,10 +140,58 @@ class RenderEngine(Generic[K]):
         # Maps signals to their default handlers in order to reset
         # custom handlers set by ``sigmap`` at the cleanup phase.
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
+        self._sections = sections
 
-    async def initialize(
+        components = {
+            component.name: component
+            for section in sections
+            for component in section.components
+        }
+
+        if actions is None:
+            actions = []
+
+        for action in actions:
+
+            topic = action.__name__
+
+            subscriptions = [
+                component.update_func 
+                for component in components.values() 
+                if topic in component.subscriptions
+            ]
+
+            if len(subscriptions) > 0:
+                observe(topic, subscriptions)  
+
+    async def resize(
         self,
-        sections: List[Section],
+        width: int,
+        height: int,
+    ):
+        await self.canvas.initialize(
+            self.canvas._sections,
+            width=width,
+            height=height,
+            horizontal_padding=self._horizontal_padding,
+            vertical_padding=self._vertical_padding,
+        )
+
+    async def render(
+        self,
+        horizontal_padding: int = 0,
+        vertical_padding: int = 0,
+    ):
+        if self._run_engine is None:
+            await self._initialize_canvas(
+                horizontal_padding=horizontal_padding,
+                vertical_padding=vertical_padding,
+            )
+
+            self._run_engine = asyncio.ensure_future(self._run())
+
+    async def _initialize_canvas(
+        self,
         horizontal_padding: int = 0,
         vertical_padding: int = 0,
     ):
@@ -185,43 +223,14 @@ class RenderEngine(Generic[K]):
         if height is None:
             height = terminal_size.lines - 5 - self._vertical_padding
 
-        self._components = {
-            component.name: component.component
-            for section in sections
-            for component in section.components
-        }
 
         await self.canvas.initialize(
-            sections,
+            self._sections,
             width=width,
             height=height,
             horizontal_padding=self._horizontal_padding,
             vertical_padding=self._vertical_padding,
         )
-
-    async def resize(
-        self,
-        width: int,
-        height: int,
-    ):
-        await self.canvas.initialize(
-            self.canvas._sections,
-            width=width,
-            height=height,
-            horizontal_padding=self._horizontal_padding,
-            vertical_padding=self._vertical_padding,
-        )
-
-    async def update(
-        self,
-        name: str,
-        value: Any,
-    ):
-        await self._components[name].update(value)
-
-    async def render(self):
-        if self._run_engine is None:
-            self._run_engine = asyncio.ensure_future(self._run())
 
     async def _run(self):
         self._loop = asyncio.get_event_loop()
@@ -247,20 +256,26 @@ class RenderEngine(Generic[K]):
         await self._clear_terminal(force=True)
 
         while not self._stop_run.is_set():
-            await self._stdout_lock.acquire()
+            try:
 
-            frame = await self.canvas.render()
+                await self._stdout_lock.acquire()
 
-            frame = f"\033[3J\033[H\n{frame}"
+                frame = await self.canvas.render()
 
-            await self._loop.run_in_executor(None, sys.stdout.write, frame)
+                frame = f"\033[3J\033[H\n{frame}"
 
-            if self._stdout_lock.locked():
-                self._stdout_lock.release()
+                await self._loop.run_in_executor(None, sys.stdout.write, frame)
 
-            # Wait
+                if self._stdout_lock.locked():
+                    self._stdout_lock.release()
+
+            except Exception:
+                import traceback
+                print(traceback.format_exc())
+
+                # Wait
             await asyncio.sleep(self._interval)
-            
+
     @staticmethod
     async def _show_cursor():
         loop = asyncio.get_event_loop()

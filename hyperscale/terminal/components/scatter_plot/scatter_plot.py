@@ -128,7 +128,7 @@ class ScatterPlot:
 
     async def update(
         self,
-        data: list[
+        data: int | float | list[
             tuple[
                 int | float,
                 int | float,
