@@ -30,8 +30,14 @@ async def add(count: int):
     return count + 1
 
 
+@Terminal.action
 async def update_timings(timings: list[tuple[int, int]]):
     return timings
+
+
+@Terminal.action
+async def update_table(rows: list[dict[str, int]]):
+    return rows
 
 
 async def display():
@@ -171,6 +177,7 @@ async def display():
                     Alignment(
                         horizontal="center",
                     ),
+                    subscriptions=['update_timings'],
                     horizontal_padding=4,
                 ),
             ],
@@ -212,6 +219,7 @@ async def display():
                     Alignment(
                         horizontal="center",
                     ),
+                    subscriptions=['update_table'],
                     horizontal_padding=2,
                 ),
             ],
@@ -237,7 +245,14 @@ async def display():
     for idx in range(60):
         await asyncio.sleep(1)
 
+        data.append((elapsed, idx))
+
+        if idx < 15:
+            table_data.append({'one': idx})
+            await update_table(table_data)
+
         await add(idx)
+        await update_timings(data)
         
         elapsed = time.monotonic() - start
 

@@ -175,7 +175,7 @@ class Table:
             and self._elapsed > self.config.pagination_refresh_rate
         ):
             difference = data_length - adjusted_max_rows
-            self.offset = (self.offset + 1) % difference
+            self.offset = (self.offset + 1) % (difference + 1)
             data = data[self.offset : adjusted_max_rows + self.offset]
 
         elif data_length > adjusted_max_rows:
