@@ -145,19 +145,6 @@ class Canvas:
 
         return lines
 
-    async def create_reset_frame(self):
-        terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
-
-        reset_frame = "\n".join(
-            [" " * terminal_size.columns for _ in range(terminal_size.lines)]
-        )
-
-        return f"\r{reset_frame}\r"
-    
-    def reset(self):
-        for section in self._sections:
-            section.reset()
-
     async def pause(self):
         await asyncio.gather(*[section.pause() for section in self._sections])
 
