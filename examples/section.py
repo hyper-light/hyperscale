@@ -1,17 +1,17 @@
 import asyncio
 import time
 
-from hyperscale.terminal.components.render_engine import (
+from hyperscale.ui.components.terminal import (
     Alignment,
     Component,
     Section,
     SectionConfig,
 )
-from hyperscale.terminal.components.scatter_plot import (
+from hyperscale.ui.components.scatter_plot import (
     PlotConfig,
     ScatterPlot,
 )
-from hyperscale.terminal.components.table import (
+from hyperscale.ui.components.table import (
     Table,
     TableConfig,
 )

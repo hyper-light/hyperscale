@@ -1,5 +1,5 @@
-from hyperscale.terminal.styling.colors import Colorizer, HighlightColorizer
-from hyperscale.terminal.styling.attributes import AttributeName
+from hyperscale.ui.styling.colors import Colorizer, HighlightColorizer
+from hyperscale.ui.styling.attributes import AttributeName
 from pydantic import BaseModel
 from typing import Dict, Literal, TypeVar, Type, Generic
 

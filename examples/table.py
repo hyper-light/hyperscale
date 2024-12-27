@@ -1,10 +1,10 @@
 import asyncio
 
-from hyperscale.terminal.components.render_engine import (
+from hyperscale.ui.components.terminal import (
     Alignment,
     Component,
 )
-from hyperscale.terminal.components.table import (
+from hyperscale.ui.components.table import (
     Table,
     TableConfig,
 )

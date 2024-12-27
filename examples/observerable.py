@@ -1,7 +1,7 @@
 import asyncio
 import inspect
 from typing import Dict, Generic, TypeVar, Callable, Awaitable
-from hyperscale.terminal.state import Action, ActionData
+from hyperscale.ui.state import Action, ActionData
 
 K = TypeVar('K', bound=dict)
 S = TypeVar('S', bound=dict)

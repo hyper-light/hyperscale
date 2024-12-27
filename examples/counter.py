@@ -1,6 +1,6 @@
 import asyncio
 
-from hyperscale.terminal.components.counter import Counter
+from hyperscale.ui.components.counter import Counter
 
 
 async def run():

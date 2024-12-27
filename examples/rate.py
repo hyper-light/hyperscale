@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from hyperscale.terminal.components.windowed_rate import (
+from hyperscale.ui.components.windowed_rate import (
     WindowedRate,
     WindowedRateConfig,
 )

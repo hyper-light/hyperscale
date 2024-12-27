@@ -1,8 +1,8 @@
 import asyncio
 from collections import OrderedDict
 
-from hyperscale.terminal.config.mode import TerminalMode
-from hyperscale.terminal.styling import stylize
+from hyperscale.ui.config.mode import TerminalMode
+from hyperscale.ui.styling import stylize
 
 
 async def style():

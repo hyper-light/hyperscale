@@ -1,6 +1,6 @@
 import asyncio
 
-from hyperscale.terminal.components.scatter_plot import (
+from hyperscale.ui.components.scatter_plot import (
     PlotConfig,
     ScatterPlot,
 )

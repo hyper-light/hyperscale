@@ -1,6 +1,6 @@
 import asyncio
 
-from hyperscale.terminal.components.progress_bar import (
+from hyperscale.ui.components.progress_bar import (
     BarFactory,
     ProgressBarColorConfig,
 )

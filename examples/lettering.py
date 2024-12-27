@@ -1,5 +1,5 @@
 import asyncio
-from hyperscale.terminal.components.header import Header, HeaderConfig
+from hyperscale.ui.components.header import Header, HeaderConfig
 
 
 async def run():
