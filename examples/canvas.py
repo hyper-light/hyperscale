@@ -24,11 +24,10 @@ from hyperscale.ui.components.table import (
 )
 
 
-class Example:
 
-    @Terminal.action
-    async def add(self, count: int):
-        return count + 1
+@Terminal.action
+async def add(count: int):
+    return count + 1
 
 
 async def update_timings(timings: list[tuple[int, int]]):
@@ -219,7 +218,6 @@ async def display():
         ),
     ]
 
-    ex = Example()
     engine = Terminal(sections)
 
 
@@ -239,7 +237,7 @@ async def display():
     for idx in range(60):
         await asyncio.sleep(1)
 
-        await ex.add(idx)
+        await add(idx)
         
         elapsed = time.monotonic() - start
 

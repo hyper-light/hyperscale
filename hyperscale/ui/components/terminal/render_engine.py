@@ -91,10 +91,8 @@ class SubscriptionSet:
 
 
 class Terminal:
-    actions: List[Action[Any, ActionData]] = []
+    _actions: List[Action[Any, ActionData]] = []
     _updates = SubscriptionSet()
-    events: asyncio.Queue[tuple[str, ActionData]] = asyncio.Queue()
-
 
     def __init__(
         self,
@@ -146,7 +144,7 @@ class Terminal:
             for component in section.components
         }
 
-        for action in self.actions:
+        for action in self._actions:
             topic = action.__name__
 
             subscriptions = [
@@ -160,7 +158,7 @@ class Terminal:
 
     @classmethod
     def action(cls, func: Action[K, T]):
-        cls.actions.append(func)
+        cls._actions.append(func)
         return observe(
             func,
             cls._updates
