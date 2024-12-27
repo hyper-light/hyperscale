@@ -24,7 +24,6 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 # THE SOFTWARE.
 
 from math import log
-import os
 
 from ._colors import color
 from ._figure import Figure
@@ -32,7 +31,7 @@ from ._input_formatter import InputFormatter
 from ._util import hist as compute_hist
 
 
-def hist_aggregated(counts, bins, width=80, log_scale=False, linesep=os.linesep,
+def hist_aggregated(counts, bins, width=80, log_scale=False, linesep='\n',
                     lc=None, bg=None, color_mode='names'):
     """
     Create histogram for aggregated data.
@@ -44,7 +43,7 @@ def hist_aggregated(counts, bins, width=80, log_scale=False, linesep=os.linesep,
                              Hence, `len(bins) == len(counts) + 1`.
         width: int           The number of characters for the width (columns).
         log_scale: bool      Scale the histogram with `log` function.
-        linesep: str         The requested line seperator. default: os.linesep
+        linesep: str         The requested line seperator. default: NEWLINE
         lc: multiple         Give the line color.
         bg: multiple         Give the background color.
         color_mode: str      Specify color input mode; 'names' (default), 'byte' or 'rgb'
@@ -80,7 +79,7 @@ def hist_aggregated(counts, bins, width=80, log_scale=False, linesep=os.linesep,
     return linesep.join(canvas)
 
 
-def hist(X, bins=40, width=80, log_scale=False, linesep=os.linesep,
+def hist(X, bins=40, width=80, log_scale=False, linesep='\n',
          lc=None, bg=None, color_mode='names'):
     """Create histogram over `X` from left to right
 
@@ -92,7 +91,7 @@ def hist(X, bins=40, width=80, log_scale=False, linesep=os.linesep,
         bins: int            The number of bins to put X entries in (rows).
         width: int           The number of characters for the width (columns).
         log_scale: bool      Scale the histogram with `log` function.
-        linesep: str         The requested line seperator. default: os.linesep
+        linesep: str         The requested line seperator. default: NEWLINE
         lc: multiple         Give the line color.
         bg: multiple         Give the background color.
         color_mode: str      Specify color input mode; 'names' (default), 'byte' or 'rgb'
@@ -106,7 +105,7 @@ def hist(X, bins=40, width=80, log_scale=False, linesep=os.linesep,
                            linesep=linesep, lc=lc, bg=bg, color_mode=color_mode)
 
 
-def histogram(X, bins=160, width=80, height=40, X_label='X', Y_label='Counts', linesep=os.linesep,
+def histogram(X, bins=160, width=80, height=40, X_label='X', Y_label='Counts', linesep='\n',
               x_min=None, x_max=None, y_min=None, y_max=None,
               lc=None, bg=None, color_mode='names'):
     """Create histogram over `X`
@@ -121,7 +120,7 @@ def histogram(X, bins=160, width=80, height=40, X_label='X', Y_label='Counts', l
         height: int          The number of characters for the height (rows).
         X_label: str         Label for X-axis.
         Y_label: str         Label for Y-axis. max 8 characters.
-        linesep: str         The requested line seperator. default: os.linesep
+        linesep: str         The requested line seperator. default: NEWLINE
         x_min, x_max: float  Limits for the displayed X values.
         y_min, y_max: float  Limits for the displayed Y values.
         lc: multiple         Give the line color.
@@ -157,7 +156,7 @@ def histogram(X, bins=160, width=80, height=40, X_label='X', Y_label='Counts', l
     return fig.show()
 
 
-def scatter(X, Y, width=80, height=40, X_label='X', Y_label='Y', linesep=os.linesep,
+def scatter(X, Y, width=80, height=40, X_label='X', Y_label='Y', linesep='\n',
             x_min=None, x_max=None, y_min=None, y_max=None,
             lc=None, bg=None, color_mode='names', origin=True,
             marker=None):
@@ -173,7 +172,7 @@ def scatter(X, Y, width=80, height=40, X_label='X', Y_label='Y', linesep=os.line
         hight: int           The number of characters for the hight (rows) of the canvas.
         X_label: str         Label for X-axis.
         Y_label: str         Label for Y-axis. max 8 characters.
-        linesep: str         The requested line seperator. default: os.linesep
+        linesep: str         The requested line seperator. default: NEWLINE
         x_min, x_max: float  Limits for the displayed X values.
         y_min, y_max: float  Limits for the displayed Y values.
         lc: multiple         Give the line color.
@@ -190,7 +189,7 @@ def scatter(X, Y, width=80, height=40, X_label='X', Y_label='Y', linesep=os.line
                 x_min, x_max, y_min, y_max, lc, bg, color_mode, origin, marker)
 
 
-def plot(X, Y, width=80, height=40, X_label='X', Y_label='Y', linesep=os.linesep, interp='linear',
+def plot(X, Y, width=80, height=40, X_label='X', Y_label='Y', linesep='\n', interp='linear',
          x_min=None, x_max=None, y_min=None, y_max=None,
          lc=None, bg=None, color_mode='names', origin=True,
          marker=None):
@@ -203,7 +202,7 @@ def plot(X, Y, width=80, height=40, X_label='X', Y_label='Y', linesep=os.linesep
         hight: int             The number of characters for the hight (rows) of the canvas.
         X_label: str           Label for X-axis.
         Y_label: str           Label for Y-axis. max 8 characters.
-        linesep: str           The requested line seperator. default: os.linesep
+        linesep: str           The requested line seperator. default: NEWLINE
         interp: Optional[str]  Specify interpolation; values None, 'linear'
         x_min, x_max: float    Limits for the displayed X values.
         y_min, y_max: float    Limits for the displayed Y values.

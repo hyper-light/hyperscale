@@ -84,9 +84,7 @@ async def handle_resize(engine: RenderEngine):
         await engine.resume()
 
     except Exception:
-        import traceback
-
-        print(traceback.format_exc())
+        pass
 
 
 K = TypeVar('K')
@@ -249,26 +247,20 @@ class RenderEngine(Generic[K]):
         await self._clear_terminal(force=True)
 
         while not self._stop_run.is_set():
-            try:
-                await self._stdout_lock.acquire()
+            await self._stdout_lock.acquire()
 
-                frame = await self.canvas.render()
+            frame = await self.canvas.render()
 
-                frame = f"\033[3J\033[H\n{frame}"
+            frame = f"\033[3J\033[H\n{frame}"
 
-                await self._loop.run_in_executor(None, sys.stdout.write, frame)
+            await self._loop.run_in_executor(None, sys.stdout.write, frame)
 
-                if self._stdout_lock.locked():
-                    self._stdout_lock.release()
+            if self._stdout_lock.locked():
+                self._stdout_lock.release()
 
-                # Wait
-                await asyncio.sleep(self._interval)
-
-            except Exception:
-                import traceback
-
-                print(traceback.format_exc())
-
+            # Wait
+            await asyncio.sleep(self._interval)
+            
     @staticmethod
     async def _show_cursor():
         loop = asyncio.get_event_loop()
@@ -302,9 +294,6 @@ class RenderEngine(Generic[K]):
                 sys.stdout.write,
                 "\033[3J\033[H",
             )
-
-    def reset(self):
-        self.canvas.reset()
         
     async def pause(self):
         await self.canvas.pause()
@@ -341,9 +330,6 @@ class RenderEngine(Generic[K]):
 
             self._spin_thread = asyncio.ensure_future(self._execute_render_loop())
         except Exception:
-            import traceback
-
-            print(traceback.format_exc())
             # Ensure cursor is not hidden if any failure occurs that prevents
             # getting it back
             await self._show_cursor()

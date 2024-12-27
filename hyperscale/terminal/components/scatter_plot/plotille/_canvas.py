@@ -23,7 +23,6 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-import os
 
 from ._colors import rgb2byte
 from ._dots import Dots
@@ -362,7 +361,7 @@ class Canvas(object):
 
             self._canvas[y][x].bg = value
 
-    def plot(self, linesep=os.linesep):
+    def plot(self, linesep='\n'):
         """Transform canvas into `print`-able string
 
         Parameters:

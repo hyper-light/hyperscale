@@ -25,7 +25,6 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 from datetime import timedelta
 from itertools import cycle
-import os
 
 from ._canvas import Canvas
 from ._colors import color, rgb2byte
@@ -76,7 +75,7 @@ class Figure(object):
         self._color_kwargs = {'mode': 'names'}
         self._with_colors = True
         self._origin = True
-        self.linesep = os.linesep
+        self.linesep = '\n'
         self.background = None
         self.x_label = 'X'
         self.y_label = 'Y'

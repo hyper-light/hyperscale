@@ -121,8 +121,7 @@ class Section:
         if self._last_component_render:
             self._last_component_render = None
 
-        if self._render_offset:
-            self._render_offset.clear()
+        self._render_offset.clear()
 
         width_scale = self._scale[self.config.width]
         height_scale = self._scale[self.config.height]
@@ -525,9 +524,6 @@ class Section:
 
         return fill_line
     
-    def reset(self):
-        self._blocks.clear()
-
     async def pause(self):
         await asyncio.gather(*[component.pause() for component in self.components])
 

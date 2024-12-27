@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Tuple, Union
 
@@ -49,6 +50,8 @@ class ScatterPlot:
 
         self._update_lock: asyncio.Lock | None = None
         self._updates: asyncio.Queue | None = None
+        self._line_color = config.line_color
+        self._is_atty = True
 
     @property
     def raw_size(self):
@@ -115,6 +118,12 @@ class ScatterPlot:
 
         self._last_rendered_frames.clear()
 
+        loop = asyncio.get_event_loop()
+        self._is_atty = loop.run_in_executor(None, sys.stdout.isatty)
+
+        if self._is_atty is False:
+            self._line_color = None
+
         self._updates.put_nowait([])
 
     async def update(
@@ -167,7 +176,7 @@ class ScatterPlot:
                 Y_label=self.config.y_axis_name,
                 lc=Color.by_name(
                     get_style(
-                        self.config.line_color, 
+                        self._line_color, 
                         self._data,
                     ),
                     mode=self._mode,

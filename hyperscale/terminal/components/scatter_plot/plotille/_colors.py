@@ -24,11 +24,10 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 # THE SOFTWARE.
 
 import colorsys
-import os
 import sys
 
 
-def color(text, fg=None, bg=None, mode='names', no_color=False, full_reset=True):  # noqa: C901 complex (12)
+def color(text, fg=None, bg=None, mode='names', no_color=False, force_color: bool=False, full_reset=True):  # noqa: C901 complex (12)
     """Surround `text` with control characters for coloring
 
     c.f. http://en.wikipedia.org/wiki/ANSI_escape_code
@@ -85,20 +84,13 @@ def color(text, fg=None, bg=None, mode='names', no_color=False, full_reset=True)
     if fg is None and bg is None:
         return text
 
-    if no_color or os.environ.get('NO_COLOR'):
+    if no_color:
         #  https://no-color.org/
         return text
 
     # similar to https://nodejs.org/api/tty.html#tty_writestream_getcolordepth_env
     # except for only on or of
-    force_color = os.environ.get('FORCE_COLOR')
     if force_color:
-        force_color = force_color.strip().lower()
-        if force_color in ('0', 'false', 'none'):
-            return text
-
-    if not force_color and not _isatty():
-        # only color if tty (not a redirect / pipe)
         return text
 
     start = ''
@@ -176,10 +168,6 @@ def _value_to_index(v, off=55, steps=40):
     if idx < 0:
         return 0
     return int(round(idx))
-
-
-def _isatty():
-    return sys.stdout.isatty()
 
 
 def _names(fg, bg):

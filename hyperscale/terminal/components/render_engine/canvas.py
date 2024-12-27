@@ -17,6 +17,8 @@ class Canvas:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._horizontal_padding: int = 0
         self._vertical_padding: int = 0
+        self._top_pad: list[str] = []
+        self._bottom_pad: list[str] = []
 
     @property
     def total_width(self):
@@ -85,6 +87,16 @@ class Canvas:
         await asyncio.gather(*[section.create_blocks() for section in self._sections])
 
         self._section_rows = section_rows
+        
+        total_line_width = sum([self._horizontal_padding, self.width, self._horizontal_padding])
+
+        self._top_pad.clear()
+        for _ in range(self._vertical_padding):
+            padding_line = " " * total_line_width + "\r"
+            self._top_pad.append(padding_line)
+
+        self._bottom_pad.clear()
+        self._bottom_pad.extend([" " * total_line_width + "\r" for _ in range(self._vertical_padding)])
 
     async def render(self):
         section_row_sets: list[list[str]] = []
@@ -103,17 +115,16 @@ class Canvas:
 
             section_row_sets.append(row_lines)
 
-        rows: list[str] = []
-        for section_row_set in section_row_sets:
-            for row in section_row_set:
-                rows.append(row)
+        rows: list[str] = list(self._top_pad)
+        rows.extend([
+            " " * self._horizontal_padding + row + " " * self._horizontal_padding + "\r" 
+            for section_row_set in section_row_sets 
+            for row in section_row_set
+        ])
 
-        return "\n".join(
-            [
-                self._apply_horizontal_padding(line) + "\r"
-                for line in self._apply_vertical_padding(rows)
-            ]
-        )
+        rows.extend(self._bottom_pad)
+
+        return "\n".join(rows)
 
     def _apply_horizontal_padding(self, line: str):
         if self._horizontal_padding > 0:
