@@ -8,15 +8,20 @@ from hyperscale.terminal.components.text import Text
 from hyperscale.terminal.components.total_rate import TotalRate
 from hyperscale.terminal.components.windowed_rate import WindowedRate
 from hyperscale.terminal.config.widget_fit_dimensions import WidgetFitDimensions
+from typing import List, TypeVar, Generic
 
 from .alignment import Alignment
 
 
-class Component:
+S = TypeVar('S')
+
+
+class Component(Generic[S]):
     def __init__(
         self,
         name: str,
         component: Text | Spinner | Link | ProgressBar | ScatterPlot | TotalRate | WindowedRate,
+        subscriptions: List[S] | None = None,
         alignment: Alignment | None = None,
         horizontal_padding: int = 0,
         vertical_padding: int = 0,
@@ -24,9 +29,15 @@ class Component:
         if alignment is None:
             alignment = Alignment()
 
+
+        if subscriptions is None:
+            subscriptions = []
+
         self.name = name
         self.component = component
         self.alignment = alignment
+        self.subscriptions = subscriptions
+        self._last_frame: list[str] | None = None
 
         self._max_height: int = 0
         self._max_width: int = 0
@@ -67,6 +78,9 @@ class Component:
     ):
         self._max_width = max_width
         self._max_height = max_height
+        
+        if self._last_frame:
+            self._last_frame = None
 
         match self.component.fit_type:
             case WidgetFitDimensions.X_AXIS:
@@ -118,23 +132,42 @@ class Component:
         )
 
     async def render(self, render_idx: int):
-        frames: str | list[str] = await self.component.get_next_frame()
 
-        if isinstance(frames, str):
-            frames = [frames]
+        render: tuple[str | list[str], bool] = await self.component.get_next_frame()
 
-        (
-            left_pad,
-            right_pad,
-        ) = self._calculate_left_and_right_pad()
+        frames, execute_rerender = render
 
-        frames = self._pad_frames_horizontal(
-            frames,
-            left_pad,
-            right_pad,
+        if self._last_frame is None or execute_rerender:
+
+            if isinstance(frames, str):
+                frames = [frames]
+
+            (
+                left_pad,
+                right_pad,
+            ) = self._calculate_left_and_right_pad()
+
+            frames = self._pad_frames_horizontal(
+                frames,
+                left_pad,
+                right_pad,
+            )
+
+            padded_frames = self._pad_frames_vertical(frames)
+
+            self._last_frame = padded_frames
+
+            return (
+                render_idx, 
+                padded_frames, 
+                execute_rerender,
+            )
+        
+        return (
+            render_idx, 
+            self._last_frame, 
+            execute_rerender,
         )
-
-        return (render_idx, self._pad_frames_vertical(frames))
 
     def _pad_frames_horizontal(
         self,

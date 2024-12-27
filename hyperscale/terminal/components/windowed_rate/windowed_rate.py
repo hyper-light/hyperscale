@@ -9,6 +9,8 @@ from hyperscale.terminal.styling import stylize, get_style
 
 from .windowed_rate_config import WindowedRateConfig
 
+Sample = tuple[int | float, float]
+
 
 class WindowedRate:
     def __init__(
@@ -27,7 +29,6 @@ class WindowedRate:
         self._start: float | None = None
         self._last_elapsed = 1
         self._last_count = 0
-        self._start: float | None = None
 
         self._rate_period_string = f"{config.rate_period}{config.rate_unit}"
         self._rate_as_seconds = TimeParser(self._rate_period_string).time
@@ -36,9 +37,15 @@ class WindowedRate:
 
         self._max_width: int | None = None
         self._windowed_rate_width = 0
-
+        
         self._update_lock: asyncio.Lock | None = None
+        self._updates: asyncio.Queue[Sample] | None = None
+
+        self._refresh_start: float | None = None
+        self._refresh_elapsed = 0
+
         self._mode = TerminalMode.to_mode(config.terminal_mode)
+        self._last_frame: str | None = None
 
     @property
     def raw_size(self):
@@ -52,6 +59,13 @@ class WindowedRate:
         self,
         max_width: int | None = None,
     ):
+        
+        if self._update_lock is None:
+            self._update_lock = asyncio.Lock()
+
+        if self._updates is None:
+            self._updates = asyncio.Queue()
+
         numerator_units_length = 2
         denominator_units_lenght = 2
         count_size = (
@@ -81,11 +95,38 @@ class WindowedRate:
         if self._start is None:
             self._start = time.monotonic()
 
-        self._counts.append((amount, time.monotonic()))
+        self._updates.put_nowait((amount, time.monotonic()))
 
         self._update_lock.release()
 
-    async def get_next_frame(self) -> str:
+    async def get_next_frame(self):
+        
+        if self._refresh_start is None:
+            self._refresh_start = time.monotonic()
+
+        sample = await self._check_if_should_rerender()
+
+        rerender = False
+
+        if sample:
+            self._last_frame = await self._render(sample=sample)
+            rerender = True
+        
+        elif self._refresh_elapsed > self._rate_as_seconds or self._last_frame is None:
+            self._last_frame = await self._render()
+            rerender = True
+
+            self._refresh_start = time.monotonic()
+            self._refresh_elapsed = 0
+        
+        self._refresh_elapsed = time.monotonic() - self._refresh_start
+
+        return self._last_frame, rerender
+
+    async def _render(self, sample: Sample | None = None):
+
+        if sample:
+            self._counts.append(sample)
 
         if self._start is None:
             self._start = time.monotonic()
@@ -109,6 +150,7 @@ class WindowedRate:
         self._start = time.monotonic()
 
         rate = self._format_rate()
+
         formatted_rate = await stylize(
             rate,
             color=get_style(
@@ -202,6 +244,18 @@ class WindowedRate:
             rate += "0"
 
         return rate
+    
+    async def _check_if_should_rerender(self):
+        await self._update_lock.acquire()
+
+        data: Sample | None = None
+        
+        if self._updates.empty() is False:
+            data = await self._updates.get()
+
+        self._update_lock.release()
+
+        return data
 
     async def pause(self):
         pass

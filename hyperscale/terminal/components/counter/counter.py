@@ -16,7 +16,6 @@ class Counter:
         self._styled: str | None = None
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
-        self._count = config.initial_amount
         self._unit = config.unit
 
         self._max_width: int | None = None
@@ -26,6 +25,9 @@ class Counter:
             self._counter_size += len(config.unit) + 1
 
         self._update_lock: asyncio.Lock | None = None
+        self._updates: asyncio.Queue[int] | None = None
+
+        self._last_count_frame: str | None = None
 
         self._places_map = {"t": 1e12, "b": 1e9, "m": 1e6, "k": 1e3}
 
@@ -42,78 +44,77 @@ class Counter:
         max_width: int | None = None,
     ):
         
+        self._max_width = max_width
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
+
+        if self._updates is None:
+            self._updates = asyncio.Queue()
 
         count_size = self._config.precision + 2
         max_width -= count_size
 
-        self._max_width = count_size
+        self._max_width = max_width
         self._counter_size = count_size
 
         if self._unit:
-            max_width -= 1
+            space_size = 1
+            unit_width = max_width - count_size - space_size
 
-            self._unit = self._unit[:max_width]
+            self._unit = self._unit[:unit_width]
 
             unit_size = len(self._unit) + 1
 
-            self._max_width += unit_size
             self._counter_size += unit_size
 
+        self._updates.put_nowait(self._config.initial_amount)
+
     async def update(
-        self,
-        amount: int = 1,
-    ):
-        await self._update_lock.acquire()
-
-        self._count += amount
-
-        self._update_lock.release()
-
-    async def set(
         self,
         amount: int,
     ):
         await self._update_lock.acquire()
 
-        self._count = amount
+        self._updates.put_nowait(amount)
 
         self._update_lock.release()
 
-    async def get(self):
-        return await self.get_next_frame()
+    async def get_next_frame(self):
 
-    async def get_next_frame(self) -> str:
-        await self._update_lock.acquire()
-        count = await self._style()
-        self._update_lock.release()
+        amount = await self._check_if_should_rerender()
 
-        return count
+        if amount is None and self._last_count_frame:
+            return self._last_count_frame, False
+        
+        elif amount is None:
+            return await self._rerender(self._config.initial_amount), True
+        
+        return await self._rerender(amount), True
+        
+    async def _rerender(self, amount: int):
 
-    async def _style(self):
-        count = self._format_count()
+        count = self._format_count(amount)
 
         return await stylize(
             count,
             color=get_style(
                 self._config.color, 
-                self._count,
+                amount,
             ),
             highlight=get_style(
                 self._config.highlight, 
-                self._count,
+                amount,
             ),
             attrs=[
                 get_style(
                     attr,
-                    self._count,
+                    amount,
                 ) for attr in self._config.attributes
             ] if self._config.attributes else None,
             mode=TerminalMode.to_mode(self._mode),
         )
 
-    def _format_count(self):
+    def _format_count(self, amount: int):
         selected_place_adjustment: int | None = None
         selected_place_unit: str | None = None
 
@@ -124,7 +125,7 @@ class Counter:
         )
 
         for place_unit, adjustment in sorted_places:
-            if self._count / adjustment >= 1:
+            if amount / adjustment >= 1:
                 selected_place_adjustment = adjustment
                 selected_place_unit = place_unit
                 break
@@ -132,10 +133,10 @@ class Counter:
         if selected_place_adjustment is None:
             selected_place_adjustment = 1
 
-        full_count = str(self._count)
+        full_count = str(amount)
         full_count_size = len(full_count)
         count = f"%.{self._config.precision}g" % (
-            self._count / selected_place_adjustment
+            amount / selected_place_adjustment
         )
 
         count_size = len(count)
@@ -170,6 +171,18 @@ class Counter:
             count += "0"
 
         return str(count)
+    
+    async def _check_if_should_rerender(self):
+        await self._update_lock.acquire()
+
+        data: int | None = None
+        
+        if self._updates.empty() is False:
+            data = await self._updates.get()
+
+        self._update_lock.release()
+
+        return data
 
     async def pause(self):
         pass

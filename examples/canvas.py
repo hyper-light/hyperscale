@@ -22,10 +22,23 @@ from hyperscale.terminal.components.table import (
     Table,
     TableConfig,
 )
+from hyperscale.terminal.state import action
+
+@action
+async def add(previous: str, _: str):
+    return previous
+
+
+@action
+def sub(previous: int, update: int):
+    return previous - update
 
 
 async def display():
-    engine = RenderEngine()
+    engine = RenderEngine(actions={
+        'add': add,
+        'sub': sub
+    })
 
     bar = ProgressBar(
         ProgressBarConfig(
@@ -213,6 +226,7 @@ async def display():
             ),
         ],
         horizontal_padding=4,
+        vertical_padding=1,
     )
 
     await engine.render()

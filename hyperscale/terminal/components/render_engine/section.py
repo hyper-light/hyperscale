@@ -95,6 +95,12 @@ class Section:
 
         self._components_map = {component.name: component for component in components}
 
+        self._bottom_padding: str | None = None
+        self._bottom_border: str | None = None
+        self._last_render: List[str] | None = None
+        self._last_component_render: List[str] | None = None
+        self._render_offset: Dict[int, tuple[int, int]] = {}
+
     @property
     def width(self):
         return self._actual_width
@@ -108,6 +114,16 @@ class Section:
         canvas_width: int,
         canvans_height: int,
     ):
+        
+        if self._last_render:
+            self._last_render = None
+
+        if self._last_component_render:
+            self._last_component_render = None
+
+        if self._render_offset:
+            self._render_offset.clear()
+
         width_scale = self._scale[self.config.width]
         height_scale = self._scale[self.config.height]
 
@@ -175,6 +191,16 @@ class Section:
         )
         if top_padding:
             self._blocks.extend(top_padding)
+
+
+        if self.config.bottom_padding:
+            self._bottom_padding = await self._create_padding_row(
+                    self.config.bottom_padding,
+                    self.components,
+            )
+
+        if self.config.bottom_border:
+            self._bottom_border = await self._create_border_row(self.config.bottom_border)
 
         remaining_width = self._inner_width
         remaining_height = self._inner_height
@@ -289,7 +315,7 @@ class Section:
     ):
         if padding_rows < 1:
             return None
-
+        
         padding_row: str = " "
 
         if self.config.left_border:
@@ -311,11 +337,19 @@ class Section:
         return [padding_row for _ in range(padding_rows)]
 
     async def render(self):
-        if len(self.components) > 0:
-            return await self._render_with_components()
 
+        components_count = len(self.components) 
+
+        if components_count > 0:
+            return await self._render_with_components()
+        elif self._last_render is None:
+            render = await self._render_without_components()
+            self._last_render = render
+
+            return render
+        
         else:
-            return await self._render_without_components()
+            return self._last_render
 
     async def _render_without_components(self):
         blocks = list(self._blocks)
@@ -330,16 +364,11 @@ class Section:
         else:
             blocks.append(await self._create_fill_line())
 
-        bottom_padding = await self._create_padding_row(
-            self.config.bottom_padding,
-            self.components,
-        )
-        if bottom_padding:
-            blocks.extend(bottom_padding)
+        if self._bottom_padding:
+            blocks.extend(self._bottom_padding)
 
-        bottom_border = await self._create_border_row(self.config.bottom_border)
-        if bottom_border:
-            blocks.append(bottom_border)
+        if self._bottom_border:
+            blocks.append(self._bottom_border)
 
         return blocks
 
@@ -351,6 +380,12 @@ class Section:
             ]
         )
 
+        if len([rerender for _, _, rerender in components if rerender is False]) == len(self.components) and self._last_render:
+            return self._last_render
+        
+        if self._last_component_render is None:
+            self._last_component_render = []
+
         ordered_lines = sorted(components, key=lambda render: render[0])
 
         last_component_idx = len(ordered_lines) - 1
@@ -358,68 +393,83 @@ class Section:
         lines: list[str] = []
         line_widths: list[int] = []
 
-        for render_idx, rendered_lines in ordered_lines:
+        for render_idx, rendered_lines, rerender in ordered_lines:
             component = self.components[render_idx]
 
-            left_border = ""
-            if self.config.left_border:
-                left_border = await stylize(
-                    self.config.left_border,
-                    color=self.config.border_color,
-                    mode=TerminalMode.to_mode(self.config.mode),
-                )
+            if rerender or self._render_offset.get(render_idx) is None:
 
-            inside_border = ""
-            if self.config.inside_border:
-                inside_border = await stylize(
-                    self.config.inside_border,
-                    color=self.config.border_color,
-                    mode=TerminalMode.to_mode(self.config.mode),
-                )
+                self._last_component_render.clear()
 
-            right_border = ""
-            if self.config.right_border:
-                right_border = await stylize(
-                    self.config.right_border,
-                    color=self.config.border_color,
-                    mode=TerminalMode.to_mode(self.config.mode),
-                )
+                left_border = ""
+                if self.config.left_border:
+                    left_border = await stylize(
+                        self.config.left_border,
+                        color=self.config.border_color,
+                        mode=TerminalMode.to_mode(self.config.mode),
+                    )
 
-            for idx, line in enumerate(rendered_lines):
-                assembled_line = await self._assemble_line(line)
+                inside_border = ""
+                if self.config.inside_border:
+                    inside_border = await stylize(
+                        self.config.inside_border,
+                        color=self.config.border_color,
+                        mode=TerminalMode.to_mode(self.config.mode),
+                    )
 
-                if render_idx == 0 and self.config.left_border:
-                    assembled_line = left_border + assembled_line
+                right_border = ""
+                if self.config.right_border:
+                    right_border = await stylize(
+                        self.config.right_border,
+                        color=self.config.border_color,
+                        mode=TerminalMode.to_mode(self.config.mode),
+                    )
 
-                if render_idx < last_component_idx and self.config.inside_border:
-                    assembled_line += inside_border
+                for idx, line in enumerate(rendered_lines):
+                    assembled_line = await self._assemble_line(line)
 
-                if render_idx == last_component_idx and self.config.right_border:
-                    assembled_line = assembled_line + right_border
+                    if render_idx == 0 and self.config.left_border:
+                        assembled_line = left_border + assembled_line
 
-                if len(lines) <= idx:
-                    lines.append(assembled_line)
-                    line_widths.append(component.raw_size)
+                    if render_idx < last_component_idx and self.config.inside_border:
+                        assembled_line += inside_border
 
-                else:
-                    lines[idx] += assembled_line
-                    line_widths[idx] += component.raw_size
+                    if render_idx == last_component_idx and self.config.right_border:
+                        assembled_line = assembled_line + right_border
+
+                    if len(lines) <= idx:
+                        self._render_offset[render_idx] = (0, len(assembled_line))
+                        lines.append(assembled_line)
+                        self._last_component_render.append(assembled_line)
+                        line_widths.append(component.raw_size)
+
+                    else:
+                        line_length = len(lines[idx])
+                        self._render_offset[render_idx] = (line_length, line_length + len(assembled_line))
+
+                        lines[idx] += assembled_line
+                        self._last_component_render[idx] += assembled_line
+                        line_widths[idx] += component.raw_size
+
+            else:
+                start, end = self._render_offset[render_idx]
+                for idx, line in enumerate(self._last_component_render):
+                    lines[idx] += line[start: end]
 
         blocks = list(self._blocks)
         blocks.extend(lines)
 
-        bottom_padding = await self._create_padding_row(
-            self.config.bottom_padding,
-            self.components,
-        )
-        if bottom_padding:
-            blocks.extend(bottom_padding)
+        if self._bottom_padding:
+            blocks.extend(self._bottom_padding)
 
-        bottom_border = await self._create_border_row(self.config.bottom_border)
-        if bottom_border:
-            blocks.append(bottom_border)
+        if self._bottom_border:
+            blocks.append(self._bottom_border)
+
+        self._last_render = blocks
 
         return blocks
+    
+    def _rerender_component_lines(self):
+        pass
 
     async def _assemble_line(self, line: str):
         assembled_line: str = ""
@@ -474,6 +524,9 @@ class Section:
             )
 
         return fill_line
+    
+    def reset(self):
+        self._blocks.clear()
 
     async def pause(self):
         await asyncio.gather(*[component.pause() for component in self.components])

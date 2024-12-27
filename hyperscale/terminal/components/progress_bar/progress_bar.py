@@ -47,14 +47,20 @@ class ProgressBar:
 
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
-        self._completed: int = 0
+        self._last_completed: int = 0
         self._next_spinner_frame = 0
 
+        self._updates: asyncio.Queue[int | float] | None = None
         self._update_lock: asyncio.Lock = None
 
         self._size: int = 0
         self._max_width: int = 0
         self._bar_width: float = 0
+
+        self._last_completed_segments: str = ""
+        self._last_ready_segments: str = ""
+        self._stylized_start_border: str | None = None
+        self._stylized_end_border: str | None = None
 
     @property
     def raw_size(self):
@@ -72,6 +78,9 @@ class ProgressBar:
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
+        if self._updates is None:
+            self._updates = asyncio.Queue()
+
         self._max_width = max_width
         bar_width = max_width
 
@@ -84,6 +93,14 @@ class ProgressBar:
         self._max_width = max_width
         self._bar_width = bar_width
 
+        self._last_completed_segments: str = ""
+        self._stylized_start_border: str | None = None
+        self._stylized_end_border: str | None = None
+
+        self._last_ready_segments = await self._rerender_incomplete(0, 0)
+
+        self._updates.put_nowait(0)
+
     async def __aenter__(self):
         return self
 
@@ -93,18 +110,6 @@ class ProgressBar:
         await self.ok()
 
         return False  # nothing is handled
-
-    def __call__(self, fn):
-        @functools.wraps(fn)
-        async def inner(*args, **kwargs):
-            async with self:
-                if inspect.iscoroutinefunction(fn):
-                    return await fn(*args, **kwargs)
-
-                else:
-                    return fn(*args, **kwargs)
-
-        return inner
 
     async def get_next_frame(self) -> str:
 
@@ -119,17 +124,17 @@ class ProgressBar:
             frame = await self._create_bar()
             self._size = len(frame)
 
-        return frame
+        return frame, True
 
     async def __anext__(self):
         item: Any | None = None
 
-        if inspect.isasyncgen(self._data) and self._completed <= self._total:
+        if inspect.isasyncgen(self._data) and self._last_completed <= self._total:
             item = await anext(self._data)
 
             await self.update()
 
-        elif self._completed <= self._total:
+        elif self._last_completed <= self._total:
             item = next(self._data)
 
             if inspect.isawaitable(item):
@@ -142,17 +147,22 @@ class ProgressBar:
                 "Err. - async bar iterable is exhausted. No more data!"
             )
 
-        if self._completed >= self._total:
+        if self._last_completed >= self._total:
             await self.ok()
 
         return item
 
     async def __aiter__(self):
+
+        completed = 0
+
         if inspect.isasyncgen(self._data):
             async for item in self._data:
                 yield item
 
-                await self.update()
+                completed += 1
+
+                await self.update(completed)
 
         else:
             for item in self._data:
@@ -161,20 +171,20 @@ class ProgressBar:
 
                 yield item
 
-                await self.update()
+                completed += 1
 
-        if self._completed >= self._total:
+                await self.update(completed)
+
+        if completed >= self._total:
             await self.ok()
 
-    async def update(self, amount: int | float = 1):
+    async def update(self, amount: int | float):
         await self._update_lock.acquire()
 
-        next_amount = self._completed + amount
+        if amount >= self._total:
+            amount = self._total
 
-        if next_amount >= self._total:
-            next_amount = self._total
-
-        self._completed = next_amount
+        self._updates.put_nowait(amount)
 
         self._update_lock.release()
 
@@ -189,7 +199,7 @@ class ProgressBar:
             self._update_lock.release()
 
         await self._update_lock.acquire()
-        if self._completed >= self._total:
+        if self._last_completed >= self._total:
             self._bar_status = ProgressBarStatus.COMPLETE
 
         else:
@@ -216,140 +226,167 @@ class ProgressBar:
         self._update_lock.release()
 
     async def _create_last_bar(self):
-        active_idx = math.floor(self._completed * (self._bar_width / self._total))
+
+
+        completed = await self._check_if_should_rerender()
+        if completed is None:
+            completed = self._last_completed
+
+        active_idx = self._completed_to_active_idx(completed)
 
         segments: list[str] = []
 
+        if self._start and self._stylized_start_border is None:
+            self._stylized_start_border = await self._render_start_border(completed)
+
         if self._start:
-            segments.append(
-                await stylize(
-                    self._start,
-                    color=get_style(self._config.border_color, self._data),
-                    highlight=get_style(self._config.border_highlight, self._data),
-                    mode=self._mode,
-                )
-            )
+            segments.append(self._stylized_start_border)
 
         if self._bar_status == ProgressBarStatus.FAILED:
 
             segments.extend(
-                await stylize(
-                    "".join([self._complete for _ in range(0, active_idx)]),
-                    color=get_style(self._config.complete_color, self._data),
-                    highlight=get_style(self._config.complete_highlight, self._data),
-                    mode=self._mode,
-                )
+                await self._rerender_completed(active_idx, completed)
             )
 
             segments.append(
                 await stylize(
                     self._failed,
-                    color=get_style(self._config.failed_color, self._data),
-                    highlight=get_style(self._config.failed_highlight, self._data),
+                    color=get_style(self._config.failed_color, completed),
+                    highlight=get_style(self._config.failed_highlight, completed),
                     mode=self._mode,
                 )
             )
 
             segments.extend(
-                await stylize(
-                    "".join(
-                        [
-                            self._incomplete
-                            for _ in range(active_idx + 1, self._bar_width)
-                        ]
-                    ),
-                    color=get_style(self._config.incomplete_color, self._data),
-                    highlight=get_style(self._config.incomplete_highlight, self._data),
-                    mode=self._mode,
-                )
+                await self._rerender_incomplete(active_idx, completed)
             )
 
         else:
             segments.append(
                 await stylize(
                     "".join([self._complete for _ in range(self._bar_width)]),
-                    color=get_style(self._config.complete_color, self._data),
-                    highlight=get_style(self._config.complete_highlight, self._data),
+                    color=get_style(self._config.complete_color, completed),
+                    highlight=get_style(self._config.complete_highlight, completed),
                     mode=self._mode,
                 )
             )
 
+        if self._end and self._stylized_end_border is None:
+            self._stylized_end_border = await self._render_end_border(completed)
+
         if self._end:
-            segments.append(
-                await stylize(
-                    self._end,
-                    color=get_style(self._config.border_color, self._data),
-                    highlight=get_style(self._config.border_color, self._data),
-                    mode=self._mode,
-                )
-            )
+            segments.append(self._stylized_end_border)
 
         return "".join(segments)
 
     async def _create_bar(self):
-        active_idx = min(
-            math.ceil(self._completed * self._bar_width / self._total),
-            self._bar_width,
+
+        completed = await self._check_if_should_rerender()
+
+        active_idx = 0
+        if completed:
+            active_idx = self._completed_to_active_idx(completed)
+    
+
+        segments: list[str] = []
+
+        if self._start and self._stylized_start_border is None:
+            self._stylized_start_border = await self._render_start_border(completed)
+
+        if self._start:
+            segments.append(self._stylized_start_border)
+
+        if completed is not None:
+            self._last_completed_segments = await self._rerender_completed(active_idx, completed)
+
+        segments.extend(self._last_completed_segments)
+
+        segments.append(
+            await stylize(
+                self._active[self._next_spinner_frame],
+                color=get_style(self._config.active_color, completed),
+                highlight=get_style(self._config.active_highlight, completed),
+                mode=self._mode,
+            )
         )
+
+        self._next_spinner_frame = (self._next_spinner_frame + 1) % len(self._active)
+
+        if completed is not None:
+            self._last_ready_segments = await self._rerender_incomplete(active_idx, completed)
+            self._last_completed = completed
+
+        segments.extend(self._last_ready_segments)
+
+        if self._end and self._stylized_end_border is None:
+            self._stylized_end_border = await self._render_end_border(completed)
+
+        if self._end:
+            segments.append(self._stylized_end_border)
+
+
+        return "".join(segments)
+    
+    async def _rerender_completed(
+        self, 
+        active_idx: int,
+        completed: int,
+    ):
+        return await stylize(
+            "".join([self._complete for _ in range(0, active_idx)]),
+            color=get_style(self._config.complete_color, completed),
+            highlight=get_style(self._config.complete_highlight, completed),
+            mode=self._mode,
+        )
+    
+    async def _rerender_incomplete(
+        self, 
+        active_idx: int,
+        completed: int,
+    ):
+        return await stylize(
+            "".join(
+                [
+                    self._incomplete
+                    for _ in range(active_idx + 1, self._bar_width)
+                ]
+            ),
+            color=get_style(self._config.incomplete_color, completed),
+            highlight=get_style(self._config.incomplete_highlight, completed),
+            mode=self._mode,
+        )
+    
+    async def _render_start_border(self, completed: int):
+        return await stylize(
+            self._start,
+            color=get_style(self._config.border_color, completed),
+            highlight=get_style(self._config.border_highlight, completed),
+            mode=self._mode,
+        )
+    
+    async def _render_end_border(self, completed: int):
+        return await stylize(
+            self._end,
+            color=get_style(self._config.border_color, completed),
+            highlight=get_style(self._config.border_color, completed),
+            mode=self._mode,
+        )
+    
+    async def _check_if_should_rerender(self):
+        await self._update_lock.acquire()
+
+        amount: int | float | None = None
+        if self._updates.empty() is False:
+            amount = await self._updates.get()
+        
+        self._update_lock.release()
+
+        return amount
+        
+    def _completed_to_active_idx(self, completed: int | float) -> int:
+        active_idx = math.floor(completed * (self._bar_width / self._total))
 
         if active_idx >= self._bar_width:
             active_idx = self._bar_width - 1
 
-        segments: list[str] = []
-
-        if self._start:
-            segments.append(
-                await stylize(
-                    self._start,
-                    color=get_style(self._config.border_color, self._data),
-                    highlight=get_style(self._config.border_highlight, self._data),
-                    mode=self._mode,
-                )
-            )
-
-        else:
-            segments.extend(
-                await stylize(
-                    "".join([self._complete for _ in range(0, active_idx)]),
-                    color=get_style(self._config.complete_color, self._data),
-                    highlight=get_style(self._config.complete_highlight, self._data),
-                    mode=self._mode,
-                )
-            )
-
-            segments.append(
-                await stylize(
-                    self._active[self._next_spinner_frame],
-                    color=get_style(self._config.active_color, self._data),
-                    highlight=get_style(self._config.active_highlight, self._data),
-                    mode=self._mode,
-                )
-            )
-
-            self._next_spinner_frame = (self._next_spinner_frame + 1) % len(self._active)
-
-            segments.extend(
-                await stylize(
-                    "".join(
-                        [
-                            self._incomplete
-                            for _ in range(active_idx + 1, self._bar_width)
-                        ]
-                    ),
-                    color=get_style(self._config.incomplete_color, self._data),
-                    highlight=get_style(self._config.incomplete_highlight, self._data),
-                    mode=self._mode,
-                )
-            )
-
-        if self._end:
-            segments.append(
-                await stylize(
-                    self._end,
-                    color=get_style(self._config.border_color, self._data),
-                    highlight=get_style(self._config.border_color, self._data),
-                    mode=self._mode,
-                )
-            )
-
-        return "".join(segments)
+        return active_idx

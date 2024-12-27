@@ -150,7 +150,7 @@ class Header:
                 )
             )
 
-        return styled_header_lines
+        return styled_header_lines, False
 
     async def pause(self):
         pass

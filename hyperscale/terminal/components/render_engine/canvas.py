@@ -81,7 +81,7 @@ class Canvas:
             row_height = max([section.height for section in row])
 
             await asyncio.gather(*[section.fit_height(row_height) for section in row])
-
+            
         await asyncio.gather(*[section.create_blocks() for section in self._sections])
 
         self._section_rows = section_rows
@@ -142,6 +142,10 @@ class Canvas:
         )
 
         return f"\r{reset_frame}\r"
+    
+    def reset(self):
+        for section in self._sections:
+            section.reset()
 
     async def pause(self):
         await asyncio.gather(*[section.pause() for section in self._sections])

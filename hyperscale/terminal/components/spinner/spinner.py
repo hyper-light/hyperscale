@@ -78,7 +78,7 @@ class Spinner:
         if self._spinner_status in [SpinnerStatus.OK, SpinnerStatus.FAILED]:
             return self._create_last_frame()
 
-        return await self._create_next_spin_frame()
+        return await self._create_next_spin_frame(), True
 
     async def pause(self):
         pass

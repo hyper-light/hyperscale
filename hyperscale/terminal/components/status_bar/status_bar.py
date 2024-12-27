@@ -21,10 +21,12 @@ class StatusBar:
 
         self._status_styles = status_styling_map
 
-        self._status: str | None = None
         self._max_width: int = 0
 
         self._update_lock: asyncio.Lock | None = None
+        self._updates: asyncio.Queue[str] | None = None
+
+        self._last_frame: str | None = None
 
         self._mode = TerminalMode.to_mode(self._config.terminal_mode)
 
@@ -36,24 +38,45 @@ class StatusBar:
     def size(self):
         return self._max_width
 
-    async def update(self, status: str):
-        await self._update_lock.acquire()
-
-        self._status = status
-
-        self._update_lock.release()
-
     async def fit(self, max_width: int | None = None):
 
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
+        if self._updates is None:
+            self._updates = asyncio.Queue()
+
+        self._last_frame = None
         self._max_width = max_width
+        self._updates.put_nowait(self._default_status)
+
+    async def update(self, status: str):
+        await self._update_lock.acquire()
+
+        self._updates.put_nowait(status)
+
+        self._update_lock.release()
 
     async def get_next_frame(self):
+        status = await self._check_if_should_rerender()
+
+        if status:
+            frame = await self._rerender(status)
+            self._last_frame = frame
+
+            return frame, True
+        
+        elif self._last_frame is None:
+            self._last_frame = await self._rerender(self._default_status)
+
+            return self._last_frame, True
+        
+        return self._last_frame, False
+
+    async def _rerender(self, status: str):
         status_text = (
             " " * self._config.horizontal_padding
-            + self._status
+            + status
             + " " * self._config.horizontal_padding
         )
 
@@ -62,21 +85,21 @@ class StatusBar:
         if status_text_width > self._max_width:
             status_text = self._trim_status_text(status_text)
 
-        if status_styles := self._status_styles.get(self._status):
+        if status_styles := self._status_styles.get(status):
             status_text = await stylize(
                 status_text,
                 color=get_style(
                     status_styles.get("color"),
-                    self._status,
+                    status,
                 ),
                 highlight=get_style(
                     status_styles.get("highlight"),
-                    self._status,
+                    status,
                 ),
                 attrs=[
                     get_style(
                         attr,
-                        self._status,
+                        status,
                     ) for attr in status_styles.get("attrs", [])
                 ],
                 mode=self._mode,
@@ -98,6 +121,18 @@ class StatusBar:
     async def abort(self):
         if self._update_lock.locked():
             self._update_lock.release()
+
+    
+    async def _check_if_should_rerender(self):
+        await self._update_lock.acquire()
+
+        status: str | None = None
+        if self._updates.empty() is False:
+            status = await self._updates.get()
+        
+        self._update_lock.release()
+
+        return status
 
     def _trim_status_text(
         self,

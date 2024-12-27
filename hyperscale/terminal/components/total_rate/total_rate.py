@@ -19,7 +19,6 @@ class TotalRate:
         self._unit = config.unit
         self._precision = config.precision
 
-        self._count: int | float = 0
         self._elapsed: int | float = 0
         self._start: float | None = None
 
@@ -29,6 +28,11 @@ class TotalRate:
         self._places_map = {"t": 1e12, "b": 1e9, "m": 1e6, "k": 1e3}
 
         self._update_lock: asyncio.Lock | None = None
+        self._updates: asyncio.Queue[int | float] | None = None
+
+
+        self._last_frame: str | None = None
+
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
     @property
@@ -47,12 +51,14 @@ class TotalRate:
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
+        if self._updates is None:
+            self._updates = asyncio.Queue()
+
         numerator_units_length = 2
         denominator_units_lenght = 1
         count_size = (
             self._precision + numerator_units_length + denominator_units_lenght + 1
         )
-
 
         self._max_width = max_width
         total_rate_width = count_size
@@ -67,6 +73,7 @@ class TotalRate:
             total_rate_width += unit_size
 
         self._total_rate_width = total_rate_width
+        self._updates.put_nowait(0)
 
     async def update(
         self,
@@ -77,16 +84,32 @@ class TotalRate:
         if self._start is None:
             self._start = time.monotonic()
 
-        self._count += amount
+        self._updates.put_nowait(amount)
 
         self._update_lock.release()
 
-    async def get_next_frame(self) -> str:
+    async def get_next_frame(self):
+        
+        count = await self._check_if_should_rerender()
+
+        if count:
+            frame = await self._rerender(count)
+            self._last_frame = frame
+
+            return frame, True
+        
+        elif self._last_frame is None:
+            self._last_frame = await self._rerender(0)
+            return self._last_frame, True
+        
+        return self._last_frame, False
+
+    async def _rerender(self, count: int | float):
 
         if self._start is None:
             self._start = time.monotonic()
 
-        rate = self._format_rate()
+        rate = self._format_rate(count)
 
 
         if self._unit:
@@ -99,24 +122,24 @@ class TotalRate:
             rate,
             color=get_style(
                 self._config.color, 
-                self._count,
+                count,
                 self._elapsed, 
             ),
             highlight=get_style(
                 self._config.highlight,
-                self._count,
+                count,
                 self._elapsed, 
             ),
             attrs=[
                 get_style(
                     attr,
-                    self._count,
+                    count,
                     self._elapsed, 
                 ) for attr in self._config.attributes
             ] if self._config.attributes else None
         )
 
-    def _format_rate(self):
+    def _format_rate(self, count: int | float):
         selected_place_adjustment: int | None = None
         selected_place_unit: str | None = None
 
@@ -128,7 +151,7 @@ class TotalRate:
 
         self._elapsed = time.monotonic() - self._start
 
-        last_rate = self._count / self._elapsed
+        last_rate = count / self._elapsed
 
         adjustment_idx = 0
         for place_unit, adjustment in sorted_places:
@@ -176,6 +199,18 @@ class TotalRate:
             rate += "0"
 
         return rate
+    
+    async def _check_if_should_rerender(self):
+        await self._update_lock.acquire()
+
+        data: int | float | None = None
+        
+        if self._updates.empty() is False:
+            data = await self._updates.get()
+
+        self._update_lock.release()
+
+        return data
 
     async def pause(self):
         pass

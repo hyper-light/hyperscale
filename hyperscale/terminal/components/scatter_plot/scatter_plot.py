@@ -27,6 +27,15 @@ class ScatterPlot:
             ]
         ] = []
 
+        self._last_state: List[
+            tuple[
+                int | float,
+                int | float,
+            ]
+        ] = []
+
+        self._last_rendered_frames: list[str] = []
+
         self._max_height = 0
         self._max_width = 0
         self._corrected_width: int | None = None
@@ -39,6 +48,7 @@ class ScatterPlot:
         self.actions_and_tasks_tables: Dict[str, str] = {}
 
         self._update_lock: asyncio.Lock | None = None
+        self._updates: asyncio.Queue | None = None
 
     @property
     def raw_size(self):
@@ -57,6 +67,9 @@ class ScatterPlot:
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
+        if self._updates is None:
+            self._updates = asyncio.Queue()
+
         self._max_width = max_width
         self._max_height = max_height
 
@@ -65,7 +78,7 @@ class ScatterPlot:
             y_max,
             x_vals,
             y_vals,
-        ) = self._generate_x_and_y_vals()
+        ) = self._generate_x_and_y_vals([])
 
         plot: str = scatter(
             x_vals,
@@ -100,6 +113,10 @@ class ScatterPlot:
         if self._corrected_width <= 0:
             self._corrected_width = 1
 
+        self._last_rendered_frames.clear()
+
+        self._updates.put_nowait([])
+
     async def update(
         self,
         data: list[
@@ -111,55 +128,71 @@ class ScatterPlot:
     ):
         await self._update_lock.acquire()
 
-        self._data = data
+        self._updates.put_nowait(data)
 
         self._update_lock.release()
 
     async def get_next_frame(self):
-        (
-            x_max,
-            y_max,
-            x_vals,
-            y_vals,
-        ) = self._generate_x_and_y_vals()
+       
 
-        length_adjustments = self._get_plot_length_adjustments(
-            x_max,
-            y_max,
-            x_vals,
-            y_vals,
-        )
+        data = await self._check_if_should_rerender()
 
-        plot: str = scatter(
-            x_vals,
-            y_vals,
-            width=self._corrected_width,
-            height=self._corrected_height,
-            y_min=self.config.y_min,
-            y_max=int(round(y_max, 0)),
-            x_min=self.config.x_min,
-            x_max=int(round(x_max, 0)),
-            linesep="\n",
-            X_label=self.config.x_axis_name,
-            Y_label=self.config.y_axis_name,
-            lc=Color.by_name(
-                get_style(
-                    self.config.line_color, 
-                    self._data,
+        if data:
+
+            (
+                x_max,
+                y_max,
+                x_vals,
+                y_vals,
+            ) = self._generate_x_and_y_vals(data)
+
+            length_adjustments = self._get_plot_length_adjustments(
+                x_max,
+                y_max,
+                x_vals,
+                y_vals,
+            )
+
+            plot: str = scatter(
+                x_vals,
+                y_vals,
+                width=self._corrected_width,
+                height=self._corrected_height,
+                y_min=self.config.y_min,
+                y_max=int(round(y_max, 0)),
+                x_min=self.config.x_min,
+                x_max=int(round(x_max, 0)),
+                linesep="\n",
+                X_label=self.config.x_axis_name,
+                Y_label=self.config.y_axis_name,
+                lc=Color.by_name(
+                    get_style(
+                        self.config.line_color, 
+                        self._data,
+                    ),
+                    mode=self._mode,
                 ),
-                mode=self._mode,
-            ),
-            color_mode="byte",
-            origin=self.config.use_origin,
-            marker=PointChar.by_name(self.config.point_char),
-        )
+                color_mode="byte",
+                origin=self.config.use_origin,
+                marker=PointChar.by_name(self.config.point_char),
+            )
 
-        plot_lines = plot.split("\n")
+            plot_lines = plot.split("\n")
 
-        for idx, plot_line in enumerate(plot_lines):
-            plot_lines[idx] = plot_line + (" " * length_adjustments[idx])
+            for idx, plot_line in enumerate(plot_lines):
+                plot_lines[idx] = plot_line + (" " * length_adjustments[idx])
 
-        return plot_lines
+            self._last_rendered_frames = plot_lines
+            self._last_state = self._data
+
+            return plot_lines, True
+        
+        return self._last_rendered_frames, False
+    
+    async def _check_if_should_rerender(self):
+        if self._updates.empty() is False:
+            return await self._updates.get()
+
 
     def _get_plot_length_adjustments(
         self,
@@ -197,7 +230,14 @@ class ScatterPlot:
 
         return length_adjustments
 
-    def _generate_x_and_y_vals(self):
+    def _generate_x_and_y_vals(
+        self, 
+        data: list[
+            tuple[
+                int | float,
+                int | float,
+            ]
+        ]):
         x_range = self.config.x_range
         if x_range and self.config.x_range_inclusive:
             x_vals = [idx for idx in range(self.config.x_range_start, x_range + 1)]
@@ -206,9 +246,9 @@ class ScatterPlot:
             x_vals = [idx for idx in range(self.config.x_range_start, x_range + 1)]
 
         else:
-            x_vals = [x_val for x_val, _ in self._data]
+            x_vals = [x_val for x_val, _ in data]
 
-        y_vals = [y_val for _, y_val in self._data]
+        y_vals = [y_val for _, y_val in data]
 
         x_max = self.config.x_max
         if x_max is None and len(x_vals) < 1:

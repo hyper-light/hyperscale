@@ -11,7 +11,7 @@ from typing import List
 
 
 class TextConfig(BaseModel):
-    default_text: StrictStr = ""
+    text: StrictStr 
     color: Colorizer | None = None
     highlight: HighlightColorizer | None = None
     attributes: List[Attributizer] | None = None

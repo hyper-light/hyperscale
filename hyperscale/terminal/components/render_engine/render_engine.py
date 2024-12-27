@@ -11,6 +11,8 @@ from typing import (
     Callable,
     Dict,
     List,
+    Generic,
+    TypeVar
 )
 
 from hyperscale.terminal.components.counter import Counter
@@ -21,9 +23,11 @@ from hyperscale.terminal.components.spinner import Spinner
 from hyperscale.terminal.components.text import Text
 from hyperscale.terminal.components.total_rate import TotalRate
 from hyperscale.terminal.components.windowed_rate import WindowedRate
+from hyperscale.terminal.state import Action, ActionData
 from .canvas import Canvas
 from .engine_config import EngineConfig
 from .section import Section
+from .refresh_rate import RefreshRateMap, RefreshRate
 
 SignalHandlers = Callable[[int], Any] | int | None
 
@@ -51,7 +55,7 @@ async def handle_resize(engine: RenderEngine):
         height = terminal_size.lines - 5
 
         width_threshold = 1
-        height_threshold = width % 31
+        height_threshold = 1
 
         width_difference = abs(width - engine.canvas.total_width)
         height_difference = abs(height - engine.canvas.total_height)
@@ -76,6 +80,7 @@ async def handle_resize(engine: RenderEngine):
                 height=height,
             )
 
+
         await engine.resume()
 
     except Exception:
@@ -84,10 +89,14 @@ async def handle_resize(engine: RenderEngine):
         print(traceback.format_exc())
 
 
-class RenderEngine:
+K = TypeVar('K')
+
+
+class RenderEngine(Generic[K]):
     def __init__(
         self,
         config: EngineConfig | None = None,
+        actions: K| None = None,
         sigmap: Dict[signal.Signals, asyncio.Coroutine] = None,
     ) -> None:
         self.config = config
@@ -105,10 +114,20 @@ class RenderEngine:
             | WindowedRate,
         ] = {}
 
-        self._interval = round(1 / 30, 4)
-        if self.config:
-            # self._interval = config.refresh_rate * 0.001
-            self._interval = round(1 / config.refresh_rate, 4)
+        refresh_rate = RefreshRate.MEDIUM.value
+
+        if config and config.override_refresh_rate is None:
+            refresh_rate = RefreshRateMap.to_refresh_rate(config.refresh_profile).value
+        
+        elif config and config.override_refresh_rate:
+            refresh_rate = config.override_refresh_rate
+
+        self._interval = round(1 / refresh_rate, 4)
+
+        if actions is None:
+            actions = {}
+        
+        self.actions = actions
 
         self._stop_run: asyncio.Event | None = None
         self._hide_run: asyncio.Event | None = None
@@ -226,6 +245,9 @@ class RenderEngine:
             await self._show_cursor()
 
     async def _execute_render_loop(self):
+
+        await self._clear_terminal(force=True)
+
         while not self._stop_run.is_set():
             try:
                 await self._stdout_lock.acquire()
@@ -281,13 +303,9 @@ class RenderEngine:
                 "\033[3J\033[H",
             )
 
-    async def reset(self):
-        await self._loop.run_in_executor(
-            None,
-            sys.stdout.write,
-            await self.canvas.create_reset_frame(),
-        )
-
+    def reset(self):
+        self.canvas.reset()
+        
     async def pause(self):
         await self.canvas.pause()
 
