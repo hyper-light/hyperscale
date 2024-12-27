@@ -15,7 +15,7 @@ BarTextPosition = Literal["left", "right"]
 
 
 class ProgressBarConfig(BaseModel):
-    data: StrictInt | Iterable[Any] | AsyncGenerator[Any, Any]
+    total: StrictInt
     active: SpinnerName | StrictStr = "dots"
     active_color: Colorizer | None = None
     active_highlight: HighlightColorizer | None = None
@@ -35,30 +35,6 @@ class ProgressBarConfig(BaseModel):
 
     class Config:
         arbitrary_types_allowed=True
-
-    def get_data_and_total(self):
-        data = self.data
-        total: int = 0
-
-        if isinstance(data, int):
-            total = data
-            data = iter(range(data))
-
-        elif not isinstance(data, int) and hasattr("__len__", data):
-            total = len(data)
-
-        elif not isinstance(data, int) and not inspect.isasyncgen(data):
-            total = len(list(data))
-
-        elif inspect.isasyncgen(data) and not hasattr("__len__", data):
-            raise Exception(
-                "Err. - cannot determine length of async generator without __len__ attribute."
-            )
-
-        return (
-            data,
-            total,
-        )
 
     def get_static_chars(self):
         complete_char = FillChar.by_name(self.complete, default=self.complete)

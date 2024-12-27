@@ -20,10 +20,7 @@ class ProgressBar:
         self.fit_type = WidgetFitDimensions.X_AXIS
         self._config = config
 
-        data, total = config.get_data_and_total()
-
-        self._data = data
-        self._total = total
+        self._total = config.total
 
         (
             complete_char,
@@ -101,16 +98,6 @@ class ProgressBar:
 
         self._updates.put_nowait(0)
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, traceback):
-        # Avoid stop() execution for the 2nd time
-
-        await self.ok()
-
-        return False  # nothing is handled
-
     async def get_next_frame(self) -> str:
 
         if self._bar_status == ProgressBarStatus.READY:
@@ -126,63 +113,12 @@ class ProgressBar:
 
         return frame, True
 
-    async def __anext__(self):
-        item: Any | None = None
-
-        if inspect.isasyncgen(self._data) and self._last_completed <= self._total:
-            item = await anext(self._data)
-
-            await self.update()
-
-        elif self._last_completed <= self._total:
-            item = next(self._data)
-
-            if inspect.isawaitable(item):
-                item = await item
-
-            await self.update()
-
-        else:
-            raise StopAsyncIteration(
-                "Err. - async bar iterable is exhausted. No more data!"
-            )
-
-        if self._last_completed >= self._total:
-            await self.ok()
-
-        return item
-
-    async def __aiter__(self):
-
-        completed = 0
-
-        if inspect.isasyncgen(self._data):
-            async for item in self._data:
-                yield item
-
-                completed += 1
-
-                await self.update(completed)
-
-        else:
-            for item in self._data:
-                if inspect.isawaitable(item):
-                    item = await item
-
-                yield item
-
-                completed += 1
-
-                await self.update(completed)
-
-        if completed >= self._total:
-            await self.ok()
-
     async def update(self, amount: int | float):
         await self._update_lock.acquire()
 
         if amount >= self._total:
             amount = self._total
+            self._bar_status = ProgressBarStatus.COMPLETE
 
         self._updates.put_nowait(amount)
 

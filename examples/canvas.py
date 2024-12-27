@@ -10,7 +10,7 @@ from hyperscale.terminal.components.progress_bar import (
 from hyperscale.terminal.components.render_engine import (
     Alignment,
     Component,
-    RenderEngine,
+    Terminal,
     Section,
     SectionConfig,
 )
@@ -26,6 +26,7 @@ from hyperscale.terminal.components.table import (
 
 class Example:
 
+    @Terminal.action
     async def add(self, count: int):
         return count + 1
 
@@ -35,16 +36,6 @@ async def update_timings(timings: list[tuple[int, int]]):
 
 
 async def display():
-    bar = ProgressBar(
-        ProgressBarConfig(
-            data=60,
-            active_color="royal_blue",
-            failed_color="white",
-            complete_color="hot_pink_3",
-            terminal_mode="extended",
-        )
-    )
-
     sections = [
         Section(
             SectionConfig(height="xx-small", width="full"),
@@ -103,7 +94,15 @@ async def display():
             [
                 Component(
                     "progress_bar_example",
-                    bar,
+                    ProgressBar(
+                        ProgressBarConfig(
+                            total=60,
+                            active_color="royal_blue",
+                            failed_color="white",
+                            complete_color="hot_pink_3",
+                            terminal_mode="extended",
+                        )
+                    ),
                     Alignment(
                         horizontal="left",
                         vertical="center",
@@ -220,9 +219,8 @@ async def display():
         ),
     ]
 
-    engine = RenderEngine(sections, actions=[Example.add])
-
     ex = Example()
+    engine = Terminal(sections)
 
 
     await engine.render(
@@ -238,11 +236,11 @@ async def display():
     data = []
     table_data = []
 
-    async for idx in bar:
+    for idx in range(60):
         await asyncio.sleep(1)
 
         await ex.add(idx)
-
+        
         elapsed = time.monotonic() - start
 
     await engine.stop()

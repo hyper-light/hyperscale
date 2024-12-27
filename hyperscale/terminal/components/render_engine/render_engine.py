@@ -11,15 +11,8 @@ from typing import (
     Callable,
     Dict,
     List,
+    TypeVar,
 )
-from hyperscale.terminal.components.counter import Counter
-from hyperscale.terminal.components.link import Link
-from hyperscale.terminal.components.progress_bar import ProgressBar
-from hyperscale.terminal.components.scatter_plot import ScatterPlot
-from hyperscale.terminal.components.spinner import Spinner
-from hyperscale.terminal.components.text import Text
-from hyperscale.terminal.components.total_rate import TotalRate
-from hyperscale.terminal.components.windowed_rate import WindowedRate
 from hyperscale.terminal.state import Action, ActionData, observe
 from .canvas import Canvas
 from .engine_config import EngineConfig
@@ -29,7 +22,11 @@ from .refresh_rate import RefreshRateMap, RefreshRate
 SignalHandlers = Callable[[int], Any] | int | None
 
 
-async def default_handler(_: str, engine: RenderEngine):  # pylint: disable=unused-argument
+K = TypeVar('K')
+T = TypeVar('T', bound=ActionData)
+
+
+async def default_handler(_: str, engine: Terminal):  # pylint: disable=unused-argument
     """Signal handler, used to gracefully shut down the ``spinner`` instance
     when specified signal is received by the process running the ``spinner``.
 
@@ -40,7 +37,7 @@ async def default_handler(_: str, engine: RenderEngine):  # pylint: disable=unus
     await engine.abort()
 
 
-async def handle_resize(engine: RenderEngine):
+async def handle_resize(engine: Terminal):
     try:
         await engine.pause()
         loop = asyncio.get_event_loop()
@@ -84,28 +81,29 @@ async def handle_resize(engine: RenderEngine):
         pass
 
 
-class RenderEngine:
+class SubscriptionSet:
+
+    def __init__(self):
+        self.updates: Dict[str, List[Callable[[ActionData], None]]] = {}
+
+    def add_topic(self, topic: str, update_funcs: List[Callable[[ActionData], None]]):
+        self.updates[topic] = update_funcs
+
+
+class Terminal:
+    actions: List[Action[Any, ActionData]] = []
+    _updates = SubscriptionSet()
+    events: asyncio.Queue[tuple[str, ActionData]] = asyncio.Queue()
+
+
     def __init__(
         self,
         sections: List[Section],
-        actions: List[Action[Any, ActionData]] | None = None,
         config: EngineConfig | None = None,
         sigmap: Dict[signal.Signals, asyncio.Coroutine] = None,
     ) -> None:
         self.config = config
         self.canvas = Canvas()
-
-        self._components: Dict[
-            str,
-            ProgressBar
-            | Counter
-            | Link
-            | ScatterPlot
-            | Spinner
-            | Text
-            | TotalRate
-            | WindowedRate,
-        ] = {}
 
         refresh_rate = RefreshRate.MEDIUM.value
 
@@ -142,27 +140,31 @@ class RenderEngine:
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
         self._sections = sections
 
-        components = {
+        self._components = {
             component.name: component
             for section in sections
             for component in section.components
         }
 
-        if actions is None:
-            actions = []
-
-        for action in actions:
-
+        for action in self.actions:
             topic = action.__name__
 
             subscriptions = [
                 component.update_func 
-                for component in components.values() 
+                for component in self._components.values() 
                 if topic in component.subscriptions
             ]
 
             if len(subscriptions) > 0:
-                observe(topic, subscriptions)  
+                self._updates.add_topic(topic, subscriptions)
+
+    @classmethod
+    def action(cls, func: Action[K, T]):
+        cls.actions.append(func)
+        return observe(
+            func,
+            cls._updates
+        )
 
     async def resize(
         self,
