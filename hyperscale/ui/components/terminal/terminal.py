@@ -139,9 +139,8 @@ class Terminal:
         self._sections = sections
 
         self._components = {
-            component.name: component
-            for section in sections
-            for component in section.components
+            section.component.name: section.component
+            for section in sections if section.component
         }
 
         for action, alias in self._actions:
@@ -277,7 +276,8 @@ class Terminal:
                     self._stdout_lock.release()
 
             except Exception:
-                await self.abort()
+                import traceback
+                print(traceback.format_exc())
 
                 # Wait
             await asyncio.sleep(self._interval)

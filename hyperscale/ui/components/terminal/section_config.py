@@ -5,7 +5,20 @@ from pydantic import BaseModel, StrictInt, StrictStr
 from hyperscale.ui.config.mode import TerminalDisplayMode
 from hyperscale.ui.styling.colors import ColorName, ExtendedColorName
 
-SectionSize = Literal[
+HorizontalSectionSize = Literal[
+    "auto",
+    "smallest",
+    "xx-small",
+    "x-small",
+    "small",
+    "medium",
+    "large",
+    "x-large",
+    "xx-large",
+    "full",
+]
+
+VerticalSectionSize = Literal[
     "smallest",
     "xx-small",
     "x-small",
@@ -19,8 +32,8 @@ SectionSize = Literal[
 
 
 class SectionConfig(BaseModel):
-    width: SectionSize = "medium"
-    height: SectionSize = "medium"
+    width: HorizontalSectionSize = "auto"
+    height: VerticalSectionSize = "medium"
     left_padding: StrictInt = 0
     right_padding: StrictInt = 0
     top_padding: StrictInt = 0

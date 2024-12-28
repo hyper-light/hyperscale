@@ -1,5 +1,5 @@
 import asyncio
-import shutil
+import math
 from typing import List
 
 from .section import Section
@@ -61,7 +61,18 @@ class Canvas:
         section_row: list[Section] = []
         row_width = 0
 
+        auto_sections: list[Section] = []
+
         for section in self._sections:
+
+
+            remainder = self.width - row_width
+            if section.config.width == 'auto' and remainder > 0:
+                section.initialize(
+                        remainder,
+                        height,
+                    )
+
             row_width += section.width
 
             if row_width <= self.width:
@@ -69,6 +80,7 @@ class Canvas:
 
             else:
                 section_rows.append(list(section_row))
+                auto_sections.clear()
                 section_row = [section]
                 row_width = section.width
 

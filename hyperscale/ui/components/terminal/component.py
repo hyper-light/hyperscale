@@ -134,7 +134,7 @@ class Component:
             right_remainder_pad,
         )
 
-    async def render(self, render_idx: int):
+    async def render(self):
 
         render: tuple[str | list[str], bool] = await self.component.get_next_frame()
 
@@ -161,13 +161,11 @@ class Component:
             self._last_frame = padded_frames
 
             return (
-                render_idx, 
                 padded_frames, 
                 execute_rerender,
             )
         
         return (
-            render_idx, 
             self._last_frame, 
             execute_rerender,
         )
