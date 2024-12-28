@@ -13,6 +13,7 @@ from hyperscale.ui.components.terminal import (
     Terminal,
     Section,
     SectionConfig,
+    action
 )
 from hyperscale.ui.components.scatter_plot import (
     PlotConfig,
@@ -25,17 +26,17 @@ from hyperscale.ui.components.table import (
 
 
 
-@Terminal.action
+@action
 async def add(count: int):
     return count + 1
 
 
-@Terminal.action
+@action
 async def update_timings(timings: list[tuple[int, int]]):
     return timings
 
 
-@Terminal.action
+@action
 async def update_table(rows: list[dict[str, int]]):
     return rows
 

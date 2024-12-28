@@ -157,7 +157,7 @@ class Terminal:
                 self._updates.add_topic(topic, subscriptions)
 
     @classmethod
-    def action(cls, func: Action[K, T]):
+    def wrap_action(cls, func: Action[K, T]):
         cls._actions.append(func)
         return observe(
             func,
