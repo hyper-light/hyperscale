@@ -166,7 +166,7 @@ class Counter:
             if selected_place_unit:
                 count += selected_place_unit
 
-            elif count_size - 1 < full_count_size:
+            elif count_size + 1 < full_count_size:
                 count += full_count[count_size + 1]
 
             else:
