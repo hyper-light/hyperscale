@@ -91,7 +91,7 @@ class SubscriptionSet:
 
 
 class Terminal:
-    _actions: List[Action[Any, ActionData]] = []
+    _actions: List[tuple[Action[Any, ActionData], str | None]] = []
     _updates = SubscriptionSet()
 
     def __init__(
@@ -144,24 +144,31 @@ class Terminal:
             for component in section.components
         }
 
-        for action in self._actions:
-            topic = action.__name__
+        for action, alias in self._actions:
+
+            if alias is None:
+                alias = action.__name__
 
             subscriptions = [
                 component.update_func 
                 for component in self._components.values() 
-                if topic in component.subscriptions
+                if alias in component.subscriptions
             ]
 
             if len(subscriptions) > 0:
-                self._updates.add_topic(topic, subscriptions)
+                self._updates.add_topic(alias, subscriptions)
 
     @classmethod
-    def wrap_action(cls, func: Action[K, T]):
-        cls._actions.append(func)
+    def wrap_action(
+        cls, 
+        func: Action[K, T],
+        alias: str | None = None,
+    ):
+        cls._actions.append((func, alias))
         return observe(
             func,
-            cls._updates
+            cls._updates,
+            alias=alias,
         )
 
     async def resize(

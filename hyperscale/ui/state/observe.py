@@ -35,15 +35,17 @@ class SubscriptionSet:
 
 def observe(
     trigger: Action[K, T], 
-    subscriptions: SubscriptionSet
+    subscriptions: SubscriptionSet,
+    alias: str | None = None
 ) -> Action[K, T]:
     
-    topic = trigger.__name__
+    if alias is None:
+        alias = trigger.__name__
 
     async def wrap(*args, **kwargs):
 
         result = await trigger(*args, **kwargs)
-        await asyncio.gather(*[update(result) for update in subscriptions.updates[topic]])
+        await asyncio.gather(*[update(result) for update in subscriptions.updates[alias]])
 
         return result
     

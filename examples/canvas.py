@@ -26,17 +26,17 @@ from hyperscale.ui.components.table import (
 
 
 
-@action
+@action(alias='add_to_total')
 async def add(count: int):
     return count + 1
 
 
-@action
+@action()
 async def update_timings(timings: list[tuple[int, int]]):
     return timings
 
 
-@action
+@action()
 async def update_table(rows: list[dict[str, int]]):
     return rows
 
@@ -113,7 +113,7 @@ async def display():
                         horizontal="left",
                         vertical="center",
                     ),
-                    subscriptions=['add'],
+                    subscriptions=['add_to_total'],
                 ),
             ],
         ),

@@ -1,11 +1,12 @@
 from .terminal import Terminal
-from hyperscale.ui.state import Action, ActionData
-from typing import TypeVar
 
 
-K = TypeVar('K')
-T = TypeVar('T', bound=ActionData)
+def action(alias: str | None = None):
 
-
-def action(action: Action[K, T]):
-    return Terminal.wrap_action(action)
+    def wrap(action):
+        return Terminal.wrap_action(
+            action,
+            alias=alias,
+        )
+    
+    return wrap
