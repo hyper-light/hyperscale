@@ -20,15 +20,9 @@ class WindowedRate:
         self.fit_type = WidgetFitDimensions.X_AXIS
         self._config = config
 
-        self._counts: List[Tuple[int | float, float]] = []
-
         self._precision = config.precision
         self._unit = config.unit
-
-        self._next_time: float | None = None
-        self._start: float | None = None
-        self._last_elapsed = 1
-        self._last_count = 0
+        self._last_samples: list[tuple[int | float, float]] = []
 
         self._rate_period_string = f"{config.rate_period}{config.rate_unit}"
         self._rate_as_seconds = TimeParser(self._rate_period_string).time
@@ -67,9 +61,9 @@ class WindowedRate:
             self._updates = asyncio.Queue()
 
         numerator_units_length = 2
-        denominator_units_lenght = 2
+        denominator_units_length = len(self._rate_period_string)
         count_size = (
-            self._precision + numerator_units_length + denominator_units_lenght + 1
+            self._precision + numerator_units_length + denominator_units_length + 1
         )
 
         self._max_width = max_width
@@ -85,17 +79,15 @@ class WindowedRate:
             windowed_rate_width += unit_size
 
         self._windowed_rate_width = windowed_rate_width
+        self._updates.put_nowait([(0, time.monotonic())])
 
     async def update(
         self,
-        amount: int,
+        samples: list[tuple[int | float, float]],
     ):
         await self._update_lock.acquire()
 
-        if self._start is None:
-            self._start = time.monotonic()
-
-        self._updates.put_nowait((amount, time.monotonic()))
+        self._updates.put_nowait(samples)
 
         self._update_lock.release()
 
@@ -104,16 +96,17 @@ class WindowedRate:
         if self._refresh_start is None:
             self._refresh_start = time.monotonic()
 
-        sample = await self._check_if_should_rerender()
+        samples = await self._check_if_should_rerender()
 
         rerender = False
 
-        if sample:
-            self._last_frame = await self._render(sample=sample)
+        if samples:
+            self._last_frame = await self._render(samples)
+            self._last_samples = samples
             rerender = True
         
         elif self._refresh_elapsed > self._rate_as_seconds or self._last_frame is None:
-            self._last_frame = await self._render()
+            self._last_frame = await self._render(self._last_samples)
             rerender = True
 
             self._refresh_start = time.monotonic()
@@ -123,64 +116,48 @@ class WindowedRate:
 
         return self._last_frame, rerender
 
-    async def _render(self, sample: Sample | None = None):
-
-        if sample:
-            self._counts.append(sample)
-
-        if self._start is None:
-            self._start = time.monotonic()
+    async def _render(self, samples: List[Sample]):
 
         current_time = time.monotonic()
         window = current_time - self._rate_as_seconds
 
-        counts = [
+        count = sum([
             amount
-            for amount, timestamp in self._counts
+            for amount, timestamp in samples
             if timestamp >= window and timestamp <= current_time
-        ]
+        ])
 
-        if len(counts) > 0:
-            self._last_count = sum(counts)
+        rate = self._format_rate(count)
 
-        else:
-            self._last_count = 0
-
-        self._last_elapsed = time.monotonic() - self._start
-        self._start = time.monotonic()
-
-        rate = self._format_rate()
+        if self._unit:
+            rate = f"{rate} {self._unit}"
+        
+        rate = rate + "/" + self._rate_period_string
 
         formatted_rate = await stylize(
             rate,
             color=get_style(
                 self._config.color, 
-                counts,
-                self._last_elapsed, 
+                count,
+                window, 
             ),
             highlight=get_style(
                 self._config.highlight,
-                counts,
-                self._last_elapsed, 
+                count,
+                window, 
             ),
             attrs=[
                 get_style(
                     attr,
-                    counts,
-                    self._last_elapsed, 
+                    count,
+                    window, 
                 ) for attr in self._config.attributes
             ] if self._config.attributes else None
         )
 
-        self._counts = [
-            (amount, timestamp)
-            for amount, timestamp in self._counts
-            if timestamp > window
-        ]
-
         return formatted_rate
 
-    def _format_rate(self):
+    def _format_rate(self, count : int):
         selected_place_adjustment: int | None = None
         selected_place_unit: str | None = None
 
@@ -190,17 +167,11 @@ class WindowedRate:
             reverse=True,
         )
 
-        if self._last_elapsed < 1:
-            last_rate = self._last_count / (
-                self._rate_as_seconds * (1 - self._last_elapsed)
-            )
-
-        else:
-            last_rate = self._last_count / (self._rate_as_seconds * self._last_elapsed)
+        rate_amount = float(count)
 
         adjustment_idx = 0
         for place_unit, adjustment in sorted_places:
-            if last_rate / adjustment >= 1:
+            if rate_amount / adjustment >= 1:
                 selected_place_adjustment = adjustment
                 selected_place_unit = place_unit
                 adjustment_idx += 1
@@ -209,9 +180,9 @@ class WindowedRate:
         if selected_place_adjustment is None:
             selected_place_adjustment = 1
 
-        full_rate = str(last_rate)
+        full_rate = str(rate_amount)
         full_rate_size = len(full_rate)
-        rate = f"%.{self._precision}g" % (last_rate / selected_place_adjustment)
+        rate = f"%.{self._precision}g" % (rate_amount / selected_place_adjustment)
         rate_size = len(rate)
 
         if "." not in rate:
@@ -237,18 +208,18 @@ class WindowedRate:
         if selected_place_unit:
             rate += selected_place_unit
 
-        elif rate_size - 1 < full_rate_size:
+        elif rate_size + 1 < full_rate_size:
             rate += full_rate[rate_size + 1]
 
         else:
             rate += "0"
-
+        
         return rate
     
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
-        data: Sample | None = None
+        data: List[Sample] | None = None
         
         if self._updates.empty() is False:
             data = await self._updates.get()

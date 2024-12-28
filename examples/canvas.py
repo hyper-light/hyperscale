@@ -19,6 +19,14 @@ from hyperscale.ui.components.counter import (
     Counter,
     CounterConfig
 )
+from hyperscale.ui.components.total_rate import (
+    TotalRate,
+    TotalRateConfig
+)
+from hyperscale.ui.components.windowed_rate import (
+    WindowedRate,
+    WindowedRateConfig
+)
 from hyperscale.ui.components.scatter_plot import (
     PlotConfig,
     ScatterPlot,
@@ -34,11 +42,14 @@ from hyperscale.ui.components.table import (
 async def add(count: int):
     return count + 1
 
+@action()
+async def update_rate(data: list[tuple[int | float, float]]):
+    return data
+
 
 @action()
 async def update_timings(timings: list[tuple[int, int]]):
     return timings
-
 
 @action()
 async def update_table(rows: list[dict[str, int]]):
@@ -158,7 +169,18 @@ async def display():
                 left_border="|",
                 top_border="-",
                 bottom_border="-",
-            )
+            ),
+            [
+                Component(
+                    'total_rate',
+                    TotalRate(
+                        TotalRateConfig(
+                            terminal_mode='extended'
+                        )
+                    ),
+                    subscriptions=['add_to_total']
+                )
+            ]
         ),
         Section(
             SectionConfig(
@@ -168,7 +190,18 @@ async def display():
                 top_border="-",
                 right_border="|",
                 bottom_border="-",
-            )
+            ),
+            [
+                Component(
+                    'windowed_rate',
+                    WindowedRate(
+                        WindowedRateConfig(
+                            rate_period=5
+                        )
+                    ),
+                    subscriptions=['update_rate']
+                )
+            ]
         ),
         Section(
             SectionConfig(
@@ -258,6 +291,7 @@ async def display():
 
     data = []
     table_data = []
+    samples = []
 
     for idx in range(60):
         await asyncio.sleep(1)
@@ -267,6 +301,10 @@ async def display():
         if idx < 15:
             table_data.append({'one': idx})
             await update_table(table_data)
+
+        samples.append((99 * 10e3, time.monotonic()))
+        
+        await update_rate(samples)
 
         await add(idx)
         await update_timings(data)

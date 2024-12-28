@@ -192,7 +192,7 @@ class TotalRate:
         if selected_place_unit:
             rate += selected_place_unit
 
-        elif rate_size - 1 < full_rate_size:
+        elif rate_size + 1 < full_rate_size:
             rate += full_rate[rate_size + 1]
 
         else:
