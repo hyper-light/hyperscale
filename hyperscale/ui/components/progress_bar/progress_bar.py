@@ -61,6 +61,9 @@ class ProgressBar:
         self._last_ready_segments: str = ""
         self._stylized_start_border: str | None = None
         self._stylized_end_border: str | None = None
+        self._stylized_fail: str | None = None
+        self._stylized_complete: str | None = None
+        self._stylized_active: list[str] | None = None
 
     @property
     def raw_size(self):
@@ -98,6 +101,47 @@ class ProgressBar:
         self._stylized_end_border: str | None = None
 
         self._last_ready_segments = await self._rerender_incomplete(0, 0)
+
+        if self._stylized_fail is None and (
+            isinstance(self._config.failed_color, str) or self._config.failed_color is None
+        ) and (
+            isinstance(self._config.failed_highlight, str) or self._config.failed_highlight is None
+        ):
+            self._stylized_fail = await stylize(
+                self._failed,
+                color=get_style(self._config.failed_color),
+                highlight=get_style(self._config.failed_highlight),
+                mode=self._mode,
+            )
+
+        if self._stylized_complete is None and (
+            isinstance(self._config.complete_color, str) or self._config.complete_color is None
+        ) and (
+            isinstance(self._config.complete_highlight, str) or self._config.complete_highlight is None
+        ):
+            self._stylized_complete = await stylize(
+                "".join([self._complete for _ in range(self._bar_width)]),
+                color=get_style(self._config.complete_color),
+                highlight=get_style(self._config.complete_highlight),
+                mode=self._mode,
+            )
+
+        if self._stylized_active is None and (
+            isinstance(self._config.active_color, str) or self._config.active_color is None
+        ) and (
+            isinstance(self._config.active_color, str) or self._config.active_highlight is None
+        ):
+            self._stylized_active = []
+
+            for frame in self._active:
+                self._stylized_active.append(
+                    await stylize(
+                        frame,
+                        color=get_style(self._config.active_color),
+                        highlight=get_style(self._config.active_highlight),
+                        mode=self._mode,
+                    )
+                )
 
         self._updates.put_nowait(0)
 
@@ -193,7 +237,7 @@ class ProgressBar:
                     color=get_style(self._config.failed_color, completed),
                     highlight=get_style(self._config.failed_highlight, completed),
                     mode=self._mode,
-                )
+                ) if self._stylized_fail is None else self._stylized_fail
             )
 
             segments.extend(
@@ -207,7 +251,7 @@ class ProgressBar:
                     color=get_style(self._config.complete_color, completed),
                     highlight=get_style(self._config.complete_highlight, completed),
                     mode=self._mode,
-                )
+                ) if self._stylized_complete is None else self._stylized_complete
             )
 
         if self._end and self._stylized_end_border is None:
@@ -246,7 +290,7 @@ class ProgressBar:
                 color=get_style(self._config.active_color, completed),
                 highlight=get_style(self._config.active_highlight, completed),
                 mode=self._mode,
-            )
+            ) if self._stylized_active is None else self._stylized_active[self._next_spinner_frame]
         )
 
         self._next_spinner_frame = (self._next_spinner_frame + 1) % len(self._active)

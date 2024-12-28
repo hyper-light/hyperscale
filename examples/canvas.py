@@ -280,11 +280,13 @@ async def display():
             await update_table(table_data)
 
         samples.append((1, time.monotonic()))
-        
-        await update_rate(samples)
 
-        await add(idx)
-        await update_timings(data)
+
+        await asyncio.gather(*[
+            update_rate(samples),
+            add(idx),
+            update_timings(data)
+        ])
         
         elapsed = time.monotonic() - start
 
