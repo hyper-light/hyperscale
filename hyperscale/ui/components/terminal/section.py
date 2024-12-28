@@ -27,27 +27,6 @@ class Section:
         self._actual_height = 0
         self._inner_width = 0
         self._inner_height = 0
-        self._alignment_remainder = 0
-
-        self._render_event: asyncio.Event = None
-
-        self._vertical_alignments: List[VerticalAlignment] = [
-            "top",
-            "center",
-            "bottom",
-        ]
-
-        self._horizontal_alignments: List[HorizontalAlignment] = [
-            "left",
-            "center",
-            "right",
-        ]
-
-        self._horizontal_alignment_priority_map: Dict[HorizontalAlignment, int] = {
-            "left": 0,
-            "center": 1,
-            "right": 2,
-        }
 
         self._scale: Dict[HorizontalSectionSize | VerticalSectionSize, float] = {
             "auto": 1,
@@ -62,41 +41,9 @@ class Section:
             "full": 0.99,
         }
 
-        self._canvas = ""
-        self._left_offset = 0
-        self._top_offset = 0
-        self._border_pad_offset_left = 0
-        self._border_pad_offset_right = 0
-
-        self._center_width = 0
-        self._center_height = 0
-
-        self.left_offset = 0
-        self.top_offset = 0
-
-        self._insert_offset = 0
-
-        self._alignment_priority_map: Dict[AlignmentPriority, int] = {
-            "auto": -1,
-            "low": 0,
-            "medium": 1,
-            "high": 2,
-            "exclusive": 3,
-        }
-
-        self._alignment_adjust_map: Dict[AlignmentPriority, float] = {
-            "auto": 1,
-            "low": 0.25,
-            "medium": 0.5,
-            "high": 0.75,
-            "exclusive": 1,
-        }
-
         self._bottom_padding: str | None = None
         self._bottom_border: str | None = None
         self._last_render: List[str] | None = None
-        self._last_component_render: List[str] | None = None
-        self._render_offset: Dict[int, tuple[int, int]] = {}
 
     @property
     def width(self):
@@ -114,11 +61,6 @@ class Section:
         
         if self._last_render:
             self._last_render = None
-
-        if self._last_component_render:
-            self._last_component_render = None
-
-        self._render_offset.clear()
         
         width_scale = self._scale[self.config.width]
         self._actual_width = math.floor(width_scale * canvas_width)
@@ -151,11 +93,6 @@ class Section:
 
         self._inner_height = self._actual_height - vertical_padding
 
-        self._center_width = math.floor(self._inner_width / 2)
-        self._center_height = math.floor(self._inner_height / 2)
-
-        self._render_event = asyncio.Event()
-
         return self
 
     async def create_blocks(self):
@@ -181,44 +118,6 @@ class Section:
 
         if self.component:
             await self.component.fit(self._inner_width, self._inner_height)
-
-
-    def _calculate_component_width(
-        self,
-        component: Component,
-        remaining_width: int,
-        remaining_components: int,
-    ):
-        horizontal_priority_adjustment = self._alignment_adjust_map[
-            component.alignment.horizontal_priority
-        ]
-
-        if component.alignment.horizontal_priority == "exclusive":
-            return self._inner_width
-
-        elif component.alignment.horizontal_priority == "auto":
-            return int(remaining_width / remaining_components)
-
-        else:
-            return int(self._inner_width * horizontal_priority_adjustment)
-
-    def _calculate_component_height(
-        self,
-        component: Component,
-        remaining_height: int,
-    ):
-        vertical_priority_adjustment = self._alignment_adjust_map[
-            component.alignment.vertical_priority
-        ]
-
-        if component.alignment.vertical_priority == "exclusive":
-            return self._inner_height
-
-        elif component.alignment.vertical_priority == "auto":
-            return remaining_height
-
-        else:
-            return int(self._inner_height * vertical_priority_adjustment)
 
     async def _create_border_row(
         self,
@@ -295,9 +194,6 @@ class Section:
 
         if rerender is False and self._last_render:
             return self._last_render
-        
-        if self._last_component_render is None:
-            self._last_component_render = []
 
         left_border = ""
         if self.config.left_border:
@@ -340,11 +236,9 @@ class Section:
 
             if len(lines) <= idx:
                 lines.append(assembled_line)
-                self._last_component_render.append(assembled_line)
 
             else:
                 lines[idx] += assembled_line
-                self._last_component_render[idx] += assembled_line
 
         blocks = list(self._blocks)
         blocks.extend(lines)
@@ -374,7 +268,6 @@ class Section:
     def fit_width(self, remainder: int):
         self._inner_width += remainder
         self._actual_width += remainder
-        self._center_width = math.floor(self._inner_width / 2)
 
     async def fit_height(self, height: int):
         if self._actual_height >= height:
