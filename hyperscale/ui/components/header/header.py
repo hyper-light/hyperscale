@@ -15,13 +15,16 @@ from .font import (
 class Header:
     def __init__(
         self,
+        name: str,
         config: HeaderConfig,
     ):
         self.fit_type = WidgetFitDimensions.X_Y_AXIS
+        self.name = name
+
         self._config = config
         self._word = Word(self._config.header_text)
 
-        self._styled_header_lines: list[str] = []
+        self._styled_header_lines: list[str] | None = None
         self._formatted_word: FormattedWord | None = None
         self._max_width = 0
         self._max_height = 0
@@ -41,6 +44,9 @@ class Header:
         max_width: int | None = None,
         max_height: int | None = None,
     ):
+        
+        self._styled_header_lines = None
+
         self._formatted_word = self._word.to_ascii(
             formatter_set=self._config.formatters,
             max_width=max_width,
@@ -130,6 +136,13 @@ class Header:
         pass
 
     async def get_next_frame(self):
+
+        if self._styled_header_lines is None:
+            self._styled_header_lines = await self._render()
+
+        return self._styled_header_lines, False
+
+    async def _render(self):
         if self._max_width > self._formatted_word.width:
             self._formatted_word = self._pad_word_width()
 
@@ -150,7 +163,7 @@ class Header:
                 )
             )
 
-        return styled_header_lines, False
+        return styled_header_lines
 
     async def pause(self):
         pass

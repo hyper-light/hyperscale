@@ -51,11 +51,9 @@ class Canvas:
 
         self._sections = sections
 
-        for section in self._sections:
-            section.initialize(
-                width,
-                height,
-            )
+        await asyncio.gather(*[
+            section.resize(width, height) for section in self._sections
+        ])
 
         section_rows: list[list[Section]] = []
         section_row: list[Section] = []
@@ -68,7 +66,7 @@ class Canvas:
 
             remainder = self.width - row_width
             if section.config.width == 'auto' and remainder > 0:
-                section.initialize(
+                await section.resize(
                         remainder,
                         height,
                     )

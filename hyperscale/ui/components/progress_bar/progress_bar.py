@@ -15,9 +15,12 @@ from .progress_bar_status import ProgressBarStatus
 class ProgressBar:
     def __init__(
         self,
+        name: str,
         config: ProgressBarConfig,
     ) -> None:
         self.fit_type = WidgetFitDimensions.X_AXIS
+        self.name = name
+
         self._config = config
 
         self._total = config.total
@@ -98,7 +101,7 @@ class ProgressBar:
 
         self._updates.put_nowait(0)
 
-    async def get_next_frame(self) -> str:
+    async def get_next_frame(self):
 
         if self._bar_status == ProgressBarStatus.READY:
             self._bar_status == ProgressBarStatus.ACTIVE
@@ -111,7 +114,7 @@ class ProgressBar:
             frame = await self._create_bar()
             self._size = len(frame)
 
-        return frame, True
+        return [frame], True
 
     async def update(self, amount: int | float):
         await self._update_lock.acquire()

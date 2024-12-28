@@ -17,9 +17,12 @@ from .spinner_status import SpinnerStatus
 class Spinner:
     def __init__(
         self,
+        name: str,
         config: SpinnerConfig
     ):
         self.fit_type = WidgetFitDimensions.X_AXIS
+        self._name = name
+
         self._config = config
         # Spinner
         factory = SpinnerFactory()
@@ -70,15 +73,17 @@ class Spinner:
         self._base_size = self._spinner_size + len(self._text)
         self._max_width = max_width
 
-    async def get_next_frame(self) -> str:
+    async def get_next_frame(self):
 
         if self._spinner_status == SpinnerStatus.READY:
             self._spinner_size = SpinnerStatus.ACTIVE
 
         if self._spinner_status in [SpinnerStatus.OK, SpinnerStatus.FAILED]:
-            return self._create_last_frame()
+            frame = self._create_last_frame()
+            return [frame], True
 
-        return await self._create_next_spin_frame(), True
+        frame = await self._create_next_spin_frame()
+        return [frame], True
 
     async def pause(self):
         pass

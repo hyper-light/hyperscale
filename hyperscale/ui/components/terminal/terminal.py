@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import asyncio
 import math
 import shutil
@@ -18,6 +19,7 @@ from .canvas import Canvas
 from .engine_config import EngineConfig
 from .section import Section
 from .refresh_rate import RefreshRateMap, RefreshRate
+
 
 SignalHandlers = Callable[[int], Any] | int | None
 
@@ -48,8 +50,8 @@ async def handle_resize(engine: Terminal):
 
         height = terminal_size.lines - 5
 
-        width_threshold = 1
-        height_threshold = 1
+        width_threshold = 0
+        height_threshold = 0
 
         width_difference = abs(width - engine.canvas.total_width)
         height_difference = abs(height - engine.canvas.total_height)
@@ -136,12 +138,8 @@ class Terminal:
         # Maps signals to their default handlers in order to reset
         # custom handlers set by ``sigmap`` at the cleanup phase.
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
-        self._sections = sections
 
-        self._components = {
-            section.component.name: section.component
-            for section in sections if section.component
-        }
+        self._sections = sections
 
         for action, alias in self._actions:
 
@@ -149,9 +147,9 @@ class Terminal:
                 alias = action.__name__
 
             subscriptions = [
-                component.update_func 
-                for component in self._components.values() 
-                if alias in component.subscriptions
+                section.component.update 
+                for section in self._sections
+                if section.component and alias in section.subscriptions
             ]
 
             if len(subscriptions) > 0:

@@ -31,6 +31,10 @@ VerticalSectionSize = Literal[
 ]
 
 
+HorizontalAlignment = Literal["left", "center", "right"]
+VerticalAlignment = Literal["top", "center", "bottom"]
+
+
 class SectionConfig(BaseModel):
     width: HorizontalSectionSize = "auto"
     height: VerticalSectionSize = "medium"
@@ -45,3 +49,5 @@ class SectionConfig(BaseModel):
     right_border: StrictStr | None = None
     border_color: ColorName | ExtendedColorName = "white"
     mode: TerminalDisplayMode = "compatability"
+    horizontal_alignment: HorizontalAlignment = "left"
+    vertical_alignment: VerticalAlignment = "top"

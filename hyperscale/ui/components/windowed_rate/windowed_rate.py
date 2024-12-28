@@ -15,9 +15,12 @@ Sample = tuple[int | float, float]
 class WindowedRate:
     def __init__(
         self,
+        name: str,
         config: WindowedRateConfig,
     ) -> None:
         self.fit_type = WidgetFitDimensions.X_AXIS
+        self.name= name
+
         self._config = config
 
         self._precision = config.precision
@@ -39,7 +42,7 @@ class WindowedRate:
         self._refresh_elapsed = 0
 
         self._mode = TerminalMode.to_mode(config.terminal_mode)
-        self._last_frame: str | None = None
+        self._last_frame: list[str] | None = None
 
     @property
     def raw_size(self):
@@ -101,12 +104,15 @@ class WindowedRate:
         rerender = False
 
         if samples:
-            self._last_frame = await self._render(samples)
+            frame = await self._render(samples)
+            self._last_frame = [frame]
+
             self._last_samples = samples
             rerender = True
         
         elif self._refresh_elapsed > self._rate_as_seconds or self._last_frame is None:
-            self._last_frame = await self._render(self._last_samples)
+            frame = await self._render(self._last_samples)
+            self._last_frame = [frame]
             rerender = True
 
             self._refresh_start = time.monotonic()

@@ -8,8 +8,6 @@ from hyperscale.ui.components.progress_bar import (
     ProgressBarConfig,
 )
 from hyperscale.ui.components.terminal import (
-    Alignment,
-    Component,
     Terminal,
     Section,
     SectionConfig,
@@ -64,46 +62,43 @@ async def display():
                 height="xx-small", 
                 width="full"
             ),
-            Component(
+            component=Header(
                 "header",
-                Header(
-                    HeaderConfig(
-                        header_text="hyperscale",
-                        formatters={
-                            "y": [
-                                lambda letter, _: "\n".join(
-                                    [" " + line for line in letter.split("\n")]
-                                )
-                            ],
-                            "l": [
-                                lambda letter, _: "\n".join(
-                                    [
-                                        line[:-1] if idx == 2 else line
-                                        for idx, line in enumerate(
-                                            letter.split("\n")
-                                        )
-                                    ]
-                                )
-                            ],
-                            "e": [
-                                lambda letter, idx: "\n".join(
-                                    [
-                                        line[1:] if idx < 2 else line
-                                        for idx, line in enumerate(
-                                            letter.split("\n")
-                                        )
-                                    ]
-                                )
-                                if idx == 9
-                                else letter
-                            ],
-                        },
-                        color="aquamarine_2",
-                        attributes=["bold"],
-                        terminal_mode="extended",
-                    )
-                ),
-                Alignment(),
+                HeaderConfig(
+                    header_text="hyperscale",
+                    formatters={
+                        "y": [
+                            lambda letter, _: "\n".join(
+                                [" " + line for line in letter.split("\n")]
+                            )
+                        ],
+                        "l": [
+                            lambda letter, _: "\n".join(
+                                [
+                                    line[:-1] if idx == 2 else line
+                                    for idx, line in enumerate(
+                                        letter.split("\n")
+                                    )
+                                ]
+                            )
+                        ],
+                        "e": [
+                            lambda letter, idx: "\n".join(
+                                [
+                                    line[1:] if idx < 2 else line
+                                    for idx, line in enumerate(
+                                        letter.split("\n")
+                                    )
+                                ]
+                            )
+                            if idx == 9
+                            else letter
+                        ],
+                    },
+                    color="aquamarine_2",
+                    attributes=["bold"],
+                    terminal_mode="extended",
+                )
             ),
         ),
         Section(
@@ -113,24 +108,20 @@ async def display():
                 left_border="|",
                 top_border="-",
                 bottom_border="-",
+                horizontal_alignment="left",
+                vertical_alignment="center",
             ),
-            Component(
+            component=ProgressBar(
                 "progress_bar_example",
-                ProgressBar(
-                    ProgressBarConfig(
-                        total=60,
-                        active_color="royal_blue",
-                        failed_color="white",
-                        complete_color="hot_pink_3",
-                        terminal_mode="extended",
-                    )
-                ),
-                Alignment(
-                    horizontal="left",
-                    vertical="center",
-                ),
-                subscriptions=['add_to_total'],
+                ProgressBarConfig(
+                    total=60,
+                    active_color="royal_blue",
+                    failed_color="white",
+                    complete_color="hot_pink_3",
+                    terminal_mode="extended",
+                )
             ),
+            subscriptions=['add_to_total'],
         ),
         Section(
             SectionConfig(
@@ -150,15 +141,13 @@ async def display():
                 top_border="-",
                 bottom_border="-",
             ),
-            Component(
-                'counter',
-                Counter(
-                    CounterConfig(
-                        terminal_mode='extended'
-                    )
-                ),
-                subscriptions=['add_to_total']
+            component=Counter(
+            'counter',
+                CounterConfig(
+                    terminal_mode='extended'
+                )
             ),
+            subscriptions=['add_to_total']
         ),
         Section(
             SectionConfig(
@@ -168,15 +157,13 @@ async def display():
                 top_border="-",
                 bottom_border="-",
             ),
-            Component(
+            component=TotalRate(
                 'total_rate',
-                TotalRate(
                     TotalRateConfig(
                         terminal_mode='extended'
                     )
                 ),
-                subscriptions=['add_to_total']
-            ),
+            subscriptions=['add_to_total']
         ),
         Section(
             SectionConfig(
@@ -186,15 +173,13 @@ async def display():
                 top_border="-",
                 bottom_border="-",
             ),
-            Component(
-                'windowed_rate',
-                WindowedRate(
+            component=WindowedRate(
+                    'windowed_rate',
                     WindowedRateConfig(
                         rate_period=5
                     )
                 ),
-                subscriptions=['update_rate']
-            ),
+            subscriptions=['update_rate']
         ),
         Section(
             SectionConfig(
@@ -212,25 +197,22 @@ async def display():
                 left_border="|",
                 top_border="-",
                 bottom_border="-",
+                left_padding=4,
+                right_padding=4,
+                horizontal_alignment="center",
             ),
-            Component(
+            component=ScatterPlot(
                 "scatter_test",
-                ScatterPlot(
-                    PlotConfig(
-                        plot_name="Test",
-                        x_axis_name="Time (sec)",
-                        y_axis_name="Value",
-                        line_color="aquamarine_2",
-                        point_char="dot",
-                        terminal_mode="extended",
-                    ),
+                PlotConfig(
+                    plot_name="Test",
+                    x_axis_name="Time (sec)",
+                    y_axis_name="Value",
+                    line_color="aquamarine_2",
+                    point_char="dot",
+                    terminal_mode="extended",
                 ),
-                Alignment(
-                    horizontal="center",
-                ),
-                subscriptions=['update_timings'],
-                horizontal_padding=4,
             ),
+            subscriptions=['update_timings'],
         ),
         Section(
             SectionConfig(
@@ -240,37 +222,34 @@ async def display():
                 top_border="-",
                 right_border="|",
                 bottom_border="-",
+                left_padding=2,
+                right_padding=2,
+                horizontal_alignment="center",
             ),
-            Component(
+            component=Table(
                 "table_test",
-                Table(
-                    TableConfig(
-                        headers={
-                            "one": {
-                                "precision": ".2f",
-                                "color": "aquamarine_2",
-                            },
-                            "two": {
-                                "data_color": lambda value: "hot_pink_3"
-                                if value is None
-                                else None
-                            },
-                            "three": {
-                                "precision": ".2f",
-                            },
-                            "four": {},
+                TableConfig(
+                    headers={
+                        "one": {
+                            "precision": ".2f",
+                            "color": "aquamarine_2",
                         },
-                        border_color="aquamarine_2",
-                        terminal_mode="extended",
-                        table_format="simple",
-                    )
-                ),
-                Alignment(
-                    horizontal="center",
-                ),
-                subscriptions=['update_table'],
-                horizontal_padding=2,
+                        "two": {
+                            "data_color": lambda value: "hot_pink_3"
+                            if value is None
+                            else None
+                        },
+                        "three": {
+                            "precision": ".2f",
+                        },
+                        "four": {},
+                    },
+                    border_color="aquamarine_2",
+                    terminal_mode="extended",
+                    table_format="simple",
+                )
             ),
+            subscriptions=['update_table'],
         ),
     ]
 

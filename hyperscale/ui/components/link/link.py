@@ -18,8 +18,13 @@ URLTextPair = Dict[
 
 
 class Link:
-    def __init__(self, config: LinkConfig) -> None:
+    def __init__(
+        self,
+        name: str, 
+        config: LinkConfig
+    ) -> None:
         self.fit_type = WidgetFitDimensions.X_AXIS
+        self.name = name
 
         self._config = config
 
@@ -75,6 +80,7 @@ class Link:
     async def get_next_frame(self):
 
         (link, text) = await self._check_if_should_rerender()
+        rerender = False
 
         if link or text:
             frame = await self._rerender(
@@ -82,19 +88,19 @@ class Link:
                 text if text else self._config.link_text,
             )
 
-            self._last_frame = frame
-
-            return frame, True
+            self._last_frame = [frame]
+            rerender = True
         
         elif self._last_frame is None:
-            self._last_frame = await self._rerender(
+            frame = await self._rerender(
                 self._config.link_url,
                 self._config.link_text,
             )
 
-            return self._last_frame, True
+            self._last_frame = [frame]
+            rerender = True
         
-        return self._last_frame, False
+        return self._last_frame, rerender
 
     async def _rerender(
         self, 

@@ -11,9 +11,12 @@ from .total_rate_config import TotalRateConfig
 class TotalRate:
     def __init__(
         self,
+        name: str,
         config: TotalRateConfig,
     ) -> None:
         self.fit_type = WidgetFitDimensions.X_AXIS
+        self.name = name
+
         self._config = config
 
         self._unit = config.unit
@@ -91,18 +94,19 @@ class TotalRate:
     async def get_next_frame(self):
         
         count = await self._check_if_should_rerender()
+        rerender = False
 
-        if count:
+        if count is not None:
             frame = await self._rerender(count)
-            self._last_frame = frame
-
-            return frame, True
+            self._last_frame = [frame]
+            rerender = True
         
         elif self._last_frame is None:
-            self._last_frame = await self._rerender(0)
-            return self._last_frame, True
+            frame = await self._rerender(0)
+            self._last_frame = [frame]
+            rerender = True
         
-        return self._last_frame, False
+        return self._last_frame, rerender
 
     async def _rerender(self, count: int | float):
 

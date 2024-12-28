@@ -9,9 +9,12 @@ from .status_bar_config import StatusBarConfig, StylingMap
 class StatusBar:
     def __init__(
         self,
+        name: str,
         config: StatusBarConfig,
     ):
         self.fit_type = WidgetFitDimensions.X_AXIS
+        self._name = name
+
         self._config = config
         self._default_status = config.default_status
 
@@ -26,7 +29,7 @@ class StatusBar:
         self._update_lock: asyncio.Lock | None = None
         self._updates: asyncio.Queue[str] | None = None
 
-        self._last_frame: str | None = None
+        self._last_frame: list[str] | None = None
 
         self._mode = TerminalMode.to_mode(self._config.terminal_mode)
 
@@ -60,18 +63,19 @@ class StatusBar:
     async def get_next_frame(self):
         status = await self._check_if_should_rerender()
 
+        rerender = False
+
         if status:
             frame = await self._rerender(status)
-            self._last_frame = frame
-
-            return frame, True
+            self._last_frame = [frame]
+            rerender = True
         
         elif self._last_frame is None:
-            self._last_frame = await self._rerender(self._default_status)
-
-            return self._last_frame, True
+            frame = await self._rerender(self._default_status)
+            self._last_frame = [frame]
+            rerender = True
         
-        return self._last_frame, False
+        return self._last_frame, rerender
 
     async def _rerender(self, status: str):
         status_text = (

@@ -5,20 +5,37 @@ from typing import Any, Dict, List
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.styling import stylize
 
-from .alignment import AlignmentPriority, HorizontalAlignment, VerticalAlignment
-from .component import Component
+from hyperscale.ui.components.counter import Counter
+from hyperscale.ui.components.header import Header
+from hyperscale.ui.components.link import Link
+from hyperscale.ui.components.progress_bar import ProgressBar
+from hyperscale.ui.components.scatter_plot import ScatterPlot
+from hyperscale.ui.components.spinner import Spinner
+from hyperscale.ui.components.text import Text
+from hyperscale.ui.components.total_rate import TotalRate
+from hyperscale.ui.components.windowed_rate import WindowedRate
+from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
+
 from .section_config import SectionConfig, HorizontalSectionSize, VerticalSectionSize
+
+
 
 
 class Section:
     def __init__(
         self,
         config: SectionConfig,
-        component: Component | None = None,
+        component: Counter | Header | Text | Spinner | Link | ProgressBar | ScatterPlot | TotalRate | WindowedRate | None = None,
+        subscriptions: List[str] | None = None,
     ) -> None:
+
+        if subscriptions is None:
+            subscriptions = []
 
         self.config = config
         self.component = component
+        self.subscriptions = subscriptions
+
         self._blocks: List[str] = []
 
         self._mode = TerminalMode.to_mode(self.config.mode)
@@ -27,6 +44,9 @@ class Section:
         self._actual_height = 0
         self._inner_width = 0
         self._inner_height = 0
+
+        self._left_remainder_pad = 0
+        self._right_remainder_pad = 0
 
         self._scale: Dict[HorizontalSectionSize | VerticalSectionSize, float] = {
             "auto": 1,
@@ -53,7 +73,7 @@ class Section:
     def height(self):
         return self._actual_height
 
-    def initialize(
+    async def resize(
         self,
         canvas_width: int,
         canvans_height: int,
@@ -80,7 +100,6 @@ class Section:
             border_size = len(self.config.right_border)
             horizontal_padding += border_size
 
-        self._horizontal_padding = horizontal_padding
         self._inner_width = self._actual_width - horizontal_padding
 
         if self.config.top_border:
@@ -92,8 +111,6 @@ class Section:
             vertical_padding += border_size
 
         self._inner_height = self._actual_height - vertical_padding
-
-        return self
 
     async def create_blocks(self):
 
@@ -117,8 +134,51 @@ class Section:
             self._bottom_border = await self._create_border_row(self.config.bottom_border)
 
         if self.component:
-            await self.component.fit(self._inner_width, self._inner_height)
+            await self._fit_component()
 
+
+    async def render(self):
+
+        if self.component:
+            return await self._render_with_component()
+        elif self._last_render is None:
+            render = await self._render_without_component()
+            self._last_render = render
+
+            return render
+        
+        else:
+            return self._last_render
+        
+    async def _fit_component(self):
+
+        match self.component.fit_type:
+            case WidgetFitDimensions.X_AXIS:
+                await self.component.fit(self._inner_width)
+
+            case WidgetFitDimensions.Y_AXIS:
+                await self.component.fit(self._inner_height)
+
+            case WidgetFitDimensions.X_Y_AXIS:
+                await self.component.fit(
+                    max_width=self._inner_width,
+                    max_height=self._inner_height,
+                )
+
+            case _:
+                await self.component.fit(self._inner_width)
+
+        remainder = self._inner_width - self.component.raw_size 
+
+        (
+            left_remainder_pad,
+            right_remainder_pad,
+        ) = self._set_horizontal_pad_remainder(remainder)
+
+        self._left_remainder_pad = left_remainder_pad
+        self._right_remainder_pad = right_remainder_pad
+
+        
     async def _create_border_row(
         self,
         border_char: str,
@@ -154,19 +214,29 @@ class Section:
             padding_row += self.config.right_border
 
         return [padding_row for _ in range(padding_rows)]
+    
+    def _set_horizontal_pad_remainder(
+        self,
+        remainder: int,
+    ):
+        left_remainder_pad = 0
+        right_remainder_pad = 0
 
-    async def render(self):
+        match self.config.horizontal_alignment:
+            case "left":
+                right_remainder_pad = remainder
 
-        if self.component:
-            return await self._render_with_component()
-        elif self._last_render is None:
-            render = await self._render_without_component()
-            self._last_render = render
+            case "center":
+                left_remainder_pad = math.ceil(remainder / 2)
+                right_remainder_pad = math.floor(remainder / 2)
 
-            return render
-        
-        else:
-            return self._last_render
+            case "right":
+                left_remainder_pad = remainder
+
+        return (
+            left_remainder_pad,
+            right_remainder_pad,
+        )
 
     async def _render_without_component(self):
         blocks = list(self._blocks)
@@ -190,23 +260,18 @@ class Section:
         return blocks
 
     async def _render_with_component(self):
-        (rendered_lines, rerender) = await self.component.render()
+        (rendered_lines, rerender) = await self.component.get_next_frame()
 
         if rerender is False and self._last_render:
             return self._last_render
+        
+        left_pad = " " * (self.config.left_padding + self._left_remainder_pad)
+        right_pad = " " * (self.config.right_padding + self._right_remainder_pad)
 
         left_border = ""
         if self.config.left_border:
             left_border = await stylize(
                 self.config.left_border,
-                color=self.config.border_color,
-                mode=TerminalMode.to_mode(self.config.mode),
-            )
-
-        inside_border = ""
-        if self.config.inside_border:
-            inside_border = await stylize(
-                self.config.inside_border,
                 color=self.config.border_color,
                 mode=TerminalMode.to_mode(self.config.mode),
             )
@@ -218,30 +283,22 @@ class Section:
                 color=self.config.border_color,
                 mode=TerminalMode.to_mode(self.config.mode),
             )
-
-
-        lines: list[str] = []
+        
+        rendered_lines = self._pad_frames_vertical(rendered_lines)
 
         for idx, line in enumerate(rendered_lines):
-            assembled_line = await self._assemble_line(line)
+            assembled_line = left_pad + line + right_pad
 
             if self.config.left_border:
                 assembled_line = left_border + assembled_line
 
-            if self.config.inside_border:
-                assembled_line += inside_border
-
             if self.config.right_border:
                 assembled_line = assembled_line + right_border
 
-            if len(lines) <= idx:
-                lines.append(assembled_line)
-
-            else:
-                lines[idx] += assembled_line
+            rendered_lines[idx] = assembled_line
 
         blocks = list(self._blocks)
-        blocks.extend(lines)
+        blocks.extend(rendered_lines)
 
         if self._bottom_padding:
             blocks.extend(self._bottom_padding)
@@ -252,18 +309,42 @@ class Section:
         self._last_render = blocks
 
         return blocks
-    
-    def _rerender_component_lines(self):
-        pass
 
-    async def _assemble_line(self, line: str):
-        assembled_line: str = ""
+    def _pad_frames_vertical(self, frames: list[str]):
+        frames_height = len(frames)
 
-        assembled_line += self.config.left_padding * " "
-        assembled_line += line
-        assembled_line += self.config.right_padding * " "
+        remainder = self._inner_height - frames_height
 
-        return assembled_line
+        top_remainder = int(math.ceil(remainder / 2))
+        bottom_remainder = int(math.floor(remainder / 2))
+
+        adjusted_frames: list[str] = []
+        
+
+        match self.config.vertical_alignment:
+            case "top":
+                adjusted_frames.extend(frames)
+                adjusted_frames.extend(
+                    [" " * self.component.raw_size for _ in range(remainder)]
+                )
+
+            case "center":
+                adjusted_frames.extend(
+                    [" " * self.component.raw_size for _ in range(top_remainder)]
+                )
+                adjusted_frames.extend(frames)
+                adjusted_frames.extend(
+                    [" " * self.component.raw_size for _ in range(bottom_remainder)]
+                )
+
+            case "bottom":
+                adjusted_frames.extend(
+                    [" " * self.component.raw_size for _ in range(remainder)]
+                )
+
+                adjusted_frames.extend(frames)
+
+        return adjusted_frames
 
     def fit_width(self, remainder: int):
         self._inner_width += remainder

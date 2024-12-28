@@ -2,15 +2,19 @@ import asyncio
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.ui.styling import stylize, get_style
+from typing import List
 from .counter_config import CounterConfig
 
 
 class Counter:
     def __init__(
         self,
+        name: str,
         config: CounterConfig,
     ) -> None:
         self.fit_type = WidgetFitDimensions.X_AXIS
+        self.name = name
+
         self._config = config
 
         self._styled: str | None = None
@@ -24,7 +28,7 @@ class Counter:
         self._update_lock: asyncio.Lock | None = None
         self._updates: asyncio.Queue[int] | None = None
 
-        self._last_count_frame: str | None = None
+        self._last_count_frame: List[str] | None = None
 
         self._places_map = {"t": 1e12, "b": 1e9, "m": 1e6, "k": 1e3}
 
@@ -77,17 +81,19 @@ class Counter:
     async def get_next_frame(self):
 
         amount = await self._check_if_should_rerender()
+        rerender = False
 
-        if amount is None and self._last_count_frame:
-            return self._last_count_frame, False
+        if amount is not None:
+            frame = await self._rerender(amount)
+            self._last_count_frame = [frame]
+            rerender = True
         
-        elif amount is None:
-            return await self._rerender(self._config.initial_amount), True
+        elif self._last_count_frame is None:
+            frame = await self._rerender(self._config.initial_amount)
+            self._last_count_frame = [frame]
+            rerender = True
         
-        frame = await self._rerender(amount)
-        self._last_count_frame = frame
-
-        return frame, True
+        return self._last_count_frame, rerender
         
     async def _rerender(self, amount: int):
 

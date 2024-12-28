@@ -16,9 +16,15 @@ CompletionRateSet = Tuple[str, List[Union[int, float]]]
 
 
 class ScatterPlot:
-    def __init__(self, config: PlotConfig) -> None:
-        self.config = config
+    def __init__(
+        self, 
+        name: str,
+        config: PlotConfig
+    ) -> None:
         self.fit_type = WidgetFitDimensions.X_Y_AXIS
+        self.name = name
+
+        self._config = config
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
         self._data: list[
@@ -88,16 +94,16 @@ class ScatterPlot:
             y_vals,
             width=max(self._max_width, 1),
             height=max(self._max_height, 1),
-            y_min=self.config.y_min,
+            y_min=self._config.y_min,
             y_max=int(round(y_max, 0)),
-            x_min=self.config.x_min,
+            x_min=self._config.x_min,
             x_max=int(round(x_max, 0)),
             linesep="\n",
-            X_label=self.config.x_axis_name,
-            Y_label=self.config.y_axis_name,
+            X_label=self._config.x_axis_name,
+            Y_label=self._config.y_axis_name,
             color_mode="byte",
-            origin=self.config.use_origin,
-            marker=PointChar.by_name(self.config.point_char),
+            origin=self._config.use_origin,
+            marker=PointChar.by_name(self._config.point_char),
         )
 
         plot_lines = plot.split("\n")
@@ -167,13 +173,13 @@ class ScatterPlot:
                 y_vals,
                 width=self._corrected_width,
                 height=self._corrected_height,
-                y_min=self.config.y_min,
+                y_min=self._config.y_min,
                 y_max=int(round(y_max, 0)),
-                x_min=self.config.x_min,
+                x_min=self._config.x_min,
                 x_max=int(round(x_max, 0)),
                 linesep="\n",
-                X_label=self.config.x_axis_name,
-                Y_label=self.config.y_axis_name,
+                X_label=self._config.x_axis_name,
+                Y_label=self._config.y_axis_name,
                 lc=Color.by_name(
                     get_style(
                         self._line_color, 
@@ -182,8 +188,8 @@ class ScatterPlot:
                     mode=self._mode,
                 ),
                 color_mode="byte",
-                origin=self.config.use_origin,
-                marker=PointChar.by_name(self.config.point_char),
+                origin=self._config.use_origin,
+                marker=PointChar.by_name(self._config.point_char),
             )
 
             plot_lines = plot.split("\n")
@@ -215,15 +221,15 @@ class ScatterPlot:
             y_vals,
             width=self._corrected_width,
             height=self._corrected_height,
-            y_min=self.config.y_min,
+            y_min=self._config.y_min,
             y_max=int(round(y_max, 0)),
-            x_min=self.config.x_min,
+            x_min=self._config.x_min,
             x_max=int(round(x_max, 0)),
             linesep="\n",
-            X_label=self.config.x_axis_name,
-            Y_label=self.config.y_axis_name,
-            origin=self.config.use_origin,
-            marker=PointChar.by_name(self.config.point_char),
+            X_label=self._config.x_axis_name,
+            Y_label=self._config.y_axis_name,
+            origin=self._config.use_origin,
+            marker=PointChar.by_name(self._config.point_char),
         )
 
         plot_lines = plot.split("\n")
@@ -247,37 +253,37 @@ class ScatterPlot:
                 int | float,
             ]
         ]):
-        x_range = self.config.x_range
-        if x_range and self.config.x_range_inclusive:
-            x_vals = [idx for idx in range(self.config.x_range_start, x_range + 1)]
+        x_range = self._config.x_range
+        if x_range and self._config.x_range_inclusive:
+            x_vals = [idx for idx in range(self._config.x_range_start, x_range + 1)]
 
         elif x_range:
-            x_vals = [idx for idx in range(self.config.x_range_start, x_range + 1)]
+            x_vals = [idx for idx in range(self._config.x_range_start, x_range + 1)]
 
         else:
             x_vals = [x_val for x_val, _ in data]
 
         y_vals = [y_val for _, y_val in data]
 
-        x_max = self.config.x_max
+        x_max = self._config.x_max
         if x_max is None and len(x_vals) < 1:
             x_max = self._max_width * 0.8
 
         elif x_max is None:
             x_max = max(x_vals) * 1.1
 
-        y_max = self.config.y_max
+        y_max = self._config.y_max
         if y_max is None and len(y_vals) < 1:
             y_max = self._max_height
 
         elif y_max is None:
             y_max = max(y_vals) * 1.1
 
-        if x_max <= self.config.x_min:
-            x_max = self.config.x_min + 1
+        if x_max <= self._config.x_min:
+            x_max = self._config.x_min + 1
 
-        if y_max <= self.config.y_min:
-            y_max = self.config.y_min + 1
+        if y_max <= self._config.y_min:
+            y_max = self._config.y_min + 1
 
         return (
             x_max,

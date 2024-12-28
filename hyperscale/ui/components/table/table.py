@@ -13,12 +13,15 @@ from .tabulate import TableAssembler
 class Table:
     def __init__(
         self,
+        name: str,
         config: TableConfig,
     ):
-        self.config = config
-        self._mode = TerminalMode.to_mode(self.config.terminal_mode)
-        self._header_keys = list(config.headers.keys())
         self.fit_type = WidgetFitDimensions.X_Y_AXIS
+        self.name = name
+
+        self._config = config
+        self._mode = TerminalMode.to_mode(self._config.terminal_mode)
+        self._header_keys = list(config.headers.keys())
 
         self._max_height = 0
         self._max_width = 0
@@ -70,30 +73,30 @@ class Table:
         self._max_width = max_width
 
         self._assembler = TableAssembler(
-            self.config.table_format,
+            self._config.table_format,
             self._column_width,
             self._columns_count,
-            cell_alignment=self.config.cell_alignment,
+            cell_alignment=self._config.cell_alignment,
             field_format_map={
                 header: header_config.precision_format
-                for header, header_config in self.config.headers.items()
+                for header, header_config in self._config.headers.items()
                 if header_config.precision_format is not None
             },
             field_default_map={
                 header: header_config.default
-                for header, header_config in self.config.headers.items()
+                for header, header_config in self._config.headers.items()
             },
             header_color_map={
                 header: header_config.header_color
-                for header, header_config in self.config.headers.items()
+                for header, header_config in self._config.headers.items()
                 if header_config.header_color is not None
             },
             data_color_map={
                 header: header_config.data_color
-                for header, header_config in self.config.headers.items()
+                for header, header_config in self._config.headers.items()
                 if header_config.data_color is not None
             },
-            border_color=self.config.border_color,
+            border_color=self._config.border_color,
             terminal_mode=self._mode,
         )
 
@@ -122,20 +125,21 @@ class Table:
 
         if data:
             table_lines = await self._rerender(data)
+            self._last_rendered_frames = table_lines
+
             self._last_state = data
             rerender = True
 
-        elif self._elapsed > self.config.pagination_refresh_rate:
+        elif self._elapsed > self._config.pagination_refresh_rate:
             table_lines = await self._rerender(self._last_state)
+            self._last_rendered_frames = table_lines
+
             self._start = time.monotonic()
             rerender = True
 
-        else:
-            table_lines = self._last_rendered_frames
-
         self._elapsed = time.monotonic() - self._start
     
-        return table_lines, rerender
+        return self._last_rendered_frames, rerender
     
     async def _rerender(self, data: list[list[Any]]):
 
@@ -143,7 +147,7 @@ class Table:
         data_rows = self._cycle_data_rows(data, height_adjustment)
 
         table_lines: list[str] = await self._assembler.create_table_lines(
-            [header for header in self.config.headers.keys()],
+            [header for header in self._config.headers.keys()],
             data_rows,
         )
 
@@ -153,8 +157,6 @@ class Table:
 
             if difference > 0 and self._width_adjust > 0:
                 table_lines[idx] = line + self._width_adjust * " "
-        
-        self._last_rendered_frames = table_lines
 
         return table_lines
 
@@ -172,7 +174,7 @@ class Table:
 
         if (
             data_length > adjusted_max_rows
-            and self._elapsed > self.config.pagination_refresh_rate
+            and self._elapsed > self._config.pagination_refresh_rate
         ):
             difference = data_length - adjusted_max_rows
             self.offset = (self.offset + 1) % (difference + 1)
