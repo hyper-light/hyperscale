@@ -15,6 +15,10 @@ from hyperscale.ui.components.terminal import (
     SectionConfig,
     action
 )
+from hyperscale.ui.components.counter import (
+    Counter,
+    CounterConfig
+)
 from hyperscale.ui.components.scatter_plot import (
     PlotConfig,
     ScatterPlot,
@@ -42,6 +46,7 @@ async def update_table(rows: list[dict[str, int]]):
 
 
 async def display():
+
     sections = [
         Section(
             SectionConfig(height="xx-small", width="full"),
@@ -133,7 +138,18 @@ async def display():
                 left_border="|",
                 top_border="-",
                 bottom_border="-",
-            )
+            ),
+            [
+                Component(
+                    'counter',
+                    Counter(
+                        CounterConfig(
+                            terminal_mode='extended'
+                        )
+                    ),
+                    subscriptions=['add_to_total']
+                )
+            ]
         ),
         Section(
             SectionConfig(

@@ -19,10 +19,7 @@ class Counter:
         self._unit = config.unit
 
         self._max_width: int | None = None
-        self._counter_size = config.precision + 1
-
-        if config.unit:
-            self._counter_size += len(config.unit) + 1
+        self._counter_size = 0
 
         self._update_lock: asyncio.Lock | None = None
         self._updates: asyncio.Queue[int] | None = None
@@ -43,7 +40,6 @@ class Counter:
         self,
         max_width: int | None = None,
     ):
-        
         self._max_width = max_width
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
@@ -52,7 +48,6 @@ class Counter:
             self._updates = asyncio.Queue()
 
         count_size = self._config.precision + 2
-        max_width -= count_size
 
         self._max_width = max_width
         self._counter_size = count_size
@@ -89,7 +84,10 @@ class Counter:
         elif amount is None:
             return await self._rerender(self._config.initial_amount), True
         
-        return await self._rerender(amount), True
+        frame = await self._rerender(amount)
+        self._last_count_frame = frame
+
+        return frame, True
         
     async def _rerender(self, amount: int):
 
@@ -115,6 +113,8 @@ class Counter:
         )
 
     def _format_count(self, amount: int):
+
+        amount = float(amount)
         selected_place_adjustment: int | None = None
         selected_place_unit: str | None = None
 
@@ -123,6 +123,7 @@ class Counter:
             key=lambda adjustment: adjustment[1],
             reverse=True,
         )
+
 
         for place_unit, adjustment in sorted_places:
             if amount / adjustment >= 1:
@@ -147,29 +148,33 @@ class Counter:
         formatted_count_size = len(count)
         max_size = self._config.precision + 1
 
-        if formatted_count_size > max_size:
-            count = count[: self._config.precision + 1]
+        try:
+            if formatted_count_size > max_size:
+                count = count[: self._config.precision + 1]
 
-        elif formatted_count_size < max_size:
-            current_digit = max_size
-            while len(count) < max_size:
-                if current_digit < count_size:
-                    count += full_count[current_digit]
+            elif formatted_count_size < max_size:
+                current_digit = max_size
+                while len(count) < max_size:
+                    if current_digit < count_size:
+                        count += full_count[current_digit]
 
-                else:
-                    count += "0"
+                    else:
+                        count += "0"
 
-                current_digit += 1
+                    current_digit += 1
 
-        if selected_place_unit:
-            count += selected_place_unit
+            if selected_place_unit:
+                count += selected_place_unit
 
-        elif count_size - 1 < full_count_size:
-            count += full_count[count_size + 1]
+            elif count_size - 1 < full_count_size:
+                count += full_count[count_size + 1]
 
-        else:
-            count += "0"
+            else:
+                count += "0"
 
+        except Exception:
+            return ''
+        
         return str(count)
     
     async def _check_if_should_rerender(self):
