@@ -142,7 +142,7 @@ async def display():
                 bottom_border="-",
             ),
             component=Counter(
-            'counter',
+                'counter',
                 CounterConfig(
                     terminal_mode='extended'
                 )
@@ -159,10 +159,10 @@ async def display():
             ),
             component=TotalRate(
                 'total_rate',
-                    TotalRateConfig(
-                        terminal_mode='extended'
-                    )
-                ),
+                TotalRateConfig(
+                    terminal_mode='extended'
+                )
+            ),
             subscriptions=['add_to_total']
         ),
         Section(
@@ -174,11 +174,11 @@ async def display():
                 bottom_border="-",
             ),
             component=WindowedRate(
-                    'windowed_rate',
-                    WindowedRateConfig(
-                        rate_period=5
-                    )
-                ),
+                'windowed_rate',
+                WindowedRateConfig(
+                    rate_period=5
+                )
+            ),
             subscriptions=['update_rate']
         ),
         Section(
@@ -279,7 +279,7 @@ async def display():
             table_data.append({'one': idx})
             await update_table(table_data)
 
-        samples.append((99 * 10e3, time.monotonic()))
+        samples.append((1, time.monotonic()))
         
         await update_rate(samples)
 

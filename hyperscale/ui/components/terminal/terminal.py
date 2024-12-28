@@ -266,7 +266,7 @@ class Terminal:
 
                 frame = await self.canvas.render()
 
-                frame = f"\033[3J\033[H\n{frame}"
+                frame = f"\033[3J\033[H{frame}"
 
                 await self._loop.run_in_executor(None, sys.stdout.write, frame)
 
@@ -382,7 +382,7 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        frame = f"\033[3J\033[H\n{frame}\n"
+        frame = f"\033[3J\033[H{frame}\n"
 
         await self._loop.run_in_executor(None, sys.stdout.write, frame)
         await self._loop.run_in_executor(None, sys.stdout.flush)
@@ -421,7 +421,7 @@ class Terminal:
         
         frame = await self.canvas.render()
 
-        frame = f"\033[3J\033[H\n{frame}"
+        frame = f"\033[3J\033[H{frame}"
 
         await self._loop.run_in_executor(None, sys.stdout.write, frame)
 

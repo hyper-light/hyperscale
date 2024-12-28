@@ -64,6 +64,10 @@ class Section:
         self._bottom_padding: str | None = None
         self._bottom_border: str | None = None
         self._last_render: List[str] | None = None
+        self._left_pad: str = ""
+        self._right_pad: str = ""
+        self._left_border: str | None = None
+        self._right_border: str | None = None
 
     @property
     def width(self):
@@ -133,8 +137,25 @@ class Section:
         if self.config.bottom_border:
             self._bottom_border = await self._create_border_row(self.config.bottom_border)
 
+        if self.config.left_border:
+            self._left_border = await stylize(
+                self.config.left_border,
+                color=self.config.border_color,
+                mode=TerminalMode.to_mode(self.config.mode),
+            )
+
+        if self.config.right_border:
+            self._right_border = await stylize(
+                self.config.right_border,
+                color=self.config.border_color,
+                mode=TerminalMode.to_mode(self.config.mode),
+            )
+
         if self.component:
             await self._fit_component()
+
+        self._left_pad = " " * (self.config.left_padding + self._left_remainder_pad)
+        self._right_pad = " " * (self.config.right_padding + self._right_remainder_pad)
 
 
     async def render(self):
@@ -265,35 +286,16 @@ class Section:
         if rerender is False and self._last_render:
             return self._last_render
         
-        left_pad = " " * (self.config.left_padding + self._left_remainder_pad)
-        right_pad = " " * (self.config.right_padding + self._right_remainder_pad)
-
-        left_border = ""
-        if self.config.left_border:
-            left_border = await stylize(
-                self.config.left_border,
-                color=self.config.border_color,
-                mode=TerminalMode.to_mode(self.config.mode),
-            )
-
-        right_border = ""
-        if self.config.right_border:
-            right_border = await stylize(
-                self.config.right_border,
-                color=self.config.border_color,
-                mode=TerminalMode.to_mode(self.config.mode),
-            )
-        
         rendered_lines = self._pad_frames_vertical(rendered_lines)
 
         for idx, line in enumerate(rendered_lines):
-            assembled_line = left_pad + line + right_pad
+            assembled_line = self._left_pad + line + self._right_pad
 
             if self.config.left_border:
-                assembled_line = left_border + assembled_line
+                assembled_line = self._left_border + assembled_line
 
             if self.config.right_border:
-                assembled_line = assembled_line + right_border
+                assembled_line = assembled_line + self._right_border
 
             rendered_lines[idx] = assembled_line
 
