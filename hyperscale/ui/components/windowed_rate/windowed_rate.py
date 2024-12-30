@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import List, Tuple
+from typing import List
 
 from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.ui.config.mode import TerminalMode

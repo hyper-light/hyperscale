@@ -67,15 +67,15 @@ class StatusBar:
 
         if status:
             frame = await self._rerender(status)
-            self._last_frame = [frame]
+            self._last_frame = frame
             rerender = True
         
         elif self._last_frame is None:
             frame = await self._rerender(self._default_status)
-            self._last_frame = [frame]
+            self._last_frame = frame
             rerender = True
         
-        return self._last_frame, rerender
+        return [self._last_frame], rerender
 
     async def _rerender(self, status: str):
         status_text = (
