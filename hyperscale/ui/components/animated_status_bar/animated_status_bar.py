@@ -1,14 +1,46 @@
 import asyncio
 import math
 import time
-
+import random
 from typing import Literal
 
 from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.ui.styling import stylize, get_style
-from .animated_status_bar_config import AnimatedStatusBarConfig, StylingMap, AnimationDirection
+from hyperscale.ui.styling.attributes import Attributizer
+from hyperscale.ui.styling.colors import Colorizer, HighlightColorizer
+from typing import Dict, List
+from .animated_status_bar_config import AnimatedStatusBarConfig, AnimationConfig, AnimationDirection, AnimationType
+
+
+StylingMap = Dict[
+    str,
+    Dict[
+        Literal[
+            "primary_color", 
+            "primary_highlight", 
+            "primary_attrs",
+            "secondary_color", 
+            "secondary_highlight", 
+            "secondary_attrs",
+        ],
+        Colorizer | HighlightColorizer | List[Attributizer] | None,
+    ]
+]
+
+
+AnimationMap = Dict[
+    str,
+    List[AnimationType]
+]
+
+
+AnimationDirectionMap = Dict[
+    str,
+    AnimationDirection
+]
+
 
 
 class AnimatedStatusBar:
@@ -47,11 +79,31 @@ class AnimatedStatusBar:
         self._active_segment: Literal['active', 'inactive'] = 'active'
         self._precomputed_frames: dict[tuple[str, str, str, int], str] = {}
 
-        status_styling_map = self._config.status_styles
-        if status_styling_map is None:
-            status_styling_map: StylingMap = {}
+        animations = self._config.animations
+        if animations is None:
+            animations: AnimationConfig = {}
 
-        self._status_styles = status_styling_map
+        self._status_styles: StylingMap = {
+            status: {
+                style_key: style_value for style_key, style_value in config.items() 
+                if style_key in [
+                    "primary_color", 
+                    "primary_highlight", 
+                    "primary_attrs",
+                    "secondary_color", 
+                    "secondary_highlight", 
+                    "secondary_attrs",
+                ]
+            } for status, config in animations.items() 
+        }
+
+        self._animations: AnimationMap = {
+            status: config.get('animations', []) for status, config in animations.items()
+        }
+
+        self._animation_directions: AnimationDirectionMap = {
+            status: config.get('direction', 'forward') for status, config in animations.items()
+        }
 
         self._max_width: int = 0
 
@@ -99,6 +151,8 @@ class AnimatedStatusBar:
 
         rerender = False
         render_fraction = self._duration_seconds/len(self._current_status)
+        if 'blink' in self._animations.get(self._current_status):
+            render_fraction = self._duration_seconds/2
 
         elapsed = time.monotonic() - self._start
 
@@ -141,7 +195,7 @@ class AnimatedStatusBar:
             ))
         ):
             status_size = len(status) + (2 * self._additional_padding)
-            self._active_idx = (self._active_idx + 1)%status_size
+            self._active_idx = self._update_active_idx(status_size)
 
             self._update_current_bounce_direction()
             self._update_active_segment()
@@ -155,18 +209,50 @@ class AnimatedStatusBar:
         )
 
         status_text_width = len(status)
-
         if status_text_width > self._max_width:
             status = self._trim_status_text(status)
 
-        if 'rotate' in self._config.animation_type:
+        animations = self._animations.get(self._current_status)
+
+        if 'rotate' in animations:
             status_text = await self._apply_rotate_animation(status)
 
-        elif 'swipe' in self._config.animation_type:
-            return await self._apply_swipe_animation(status)
+        elif 'swipe' in animations:
+            status_text = await self._apply_swipe_animation(status)
+        
+        elif 'stripe' in animations:
+            status_text = await self._apply_stripe_animation(status)
+
+        elif 'blink' in animations:
+            status_text = await self._apply_blink_animation(status)
+        
+        elif 'vegas' in animations:
+            status_text = await self._apply_vegas_animation(status)
+
+        elif 'color' in animations or 'highlight' in animations:
+            status_text = await self._apply_color_or_highlight_animation(status)
 
         else:
-            status_text = await self._apply_color_or_highlight_animation(status)     
+            status_styles = self._status_styles.get(self._current_status, {})
+            
+            status_text = await stylize(
+                status,
+                color=get_style(
+                    status_styles.get('primary_color'),
+                    status,
+                ),
+                highlight=get_style(
+                    status_styles.get('primary_highlight'),
+                    status,
+                ),
+                attrs=[
+                    get_style(
+                        attr,
+                        status,
+                    ) for attr in status_styles.get('primary_attrs', [])
+                ],
+                mode=self._mode,
+            ) 
 
         remainder = self._max_width - status_text_width
         return self._pad_status_text_horizontal(status_text, remainder)
@@ -184,7 +270,7 @@ class AnimatedStatusBar:
             status_length = (self._additional_padding * 2 ) + len(status)
             animation_length = status_length * 2
 
-            if 'rotate' in self._config.animation_type:
+            if 'rotate' in self._animations.get(self._current_status):
                 animation_length = status_length * 4
 
             for _ in range(animation_length):
@@ -194,7 +280,186 @@ class AnimatedStatusBar:
                 self._precomputed_frames[cache_key] = frame
 
             self._active_idx = 0
-            self._current_direction = 'reverse' if self._config.animation_direction == 'reverse' else 'forward'
+            self._current_direction = 'reverse' if self._animation_directions.get(self._current_status) == 'reverse' else 'forward'
+
+    async def _apply_blink_animation(
+        self,
+        status: str,
+    ):
+        
+        status_length = len(status)
+        status_styles = self._status_styles.get(self._current_status, {})
+        
+        if self._active_idx == 0:
+            blink_styled_status = " "  * status_length
+
+        else:
+            blink_styled_status = await stylize(
+                status,
+                color=get_style(
+                    status_styles.get('primary_color'),
+                    status,
+                ) if 'color' in self._animations.get(self._current_status) else None,
+                highlight=get_style(
+                    status_styles.get('primary_highlight'),
+                    status,
+                ) if 'highlight' in self._animations.get(self._current_status) else None,
+                attrs=[
+                    get_style(
+                        attr,
+                        status,
+                    ) for attr in status_styles.get('primary_attrs', [])
+                ],
+                mode=self._mode,
+            )
+
+        self._active_idx = self._update_active_idx(status_length)
+
+        return self._pad_status_text_horizontal(blink_styled_status, self._space_padding)
+
+    async def _apply_stripe_animation(
+        self,
+        status: str,
+    ):
+        status_length = len(status)
+        status_styles = self._status_styles.get(self._current_status, {})
+
+        if self._current_direction == 'forward':
+            striped_styled_status = await self._apply_forward_stripe_animation(
+                status,
+                status_length,
+                status_styles,
+            )
+
+        else:
+            striped_styled_status = await self._apply_reverse_stripe_animation(
+                status,
+                status_length,
+                status_styles,
+            )
+        
+        self._update_current_bounce_direction()
+
+        return self._pad_status_text_horizontal(striped_styled_status, self._space_padding)
+
+
+    async def _apply_forward_stripe_animation(
+        self,
+        status: str,
+        status_length: str,
+        status_styles: StylingMap,
+    ):
+        
+        striped_styled_status = ""
+
+        for idx, char in enumerate(status):
+            if idx == self._active_idx - 1:
+                striped_styled_status += await stylize(
+                    char,
+                    color=get_style(
+                        status_styles.get('primary_color'),
+                        status,
+                    ) if 'color' in self._animations.get(self._current_status) else None,
+                    highlight=get_style(
+                        status_styles.get('primary_highlight'),
+                        status,
+                    ) if 'highlight' in self._animations.get(self._current_status) else None,
+                    attrs=[
+                        get_style(
+                            attr,
+                            status,
+                        ) for attr in status_styles.get('primary_attrs', [])
+                    ],
+                    mode=self._mode,
+                )
+
+            else:
+                striped_styled_status += " "
+                
+        self._active_idx = self._update_active_idx(status_length)
+
+        return striped_styled_status
+
+    async def _apply_reverse_stripe_animation(
+        self,
+        status: str,
+        status_length: str,
+        status_styles: StylingMap,
+    ):
+        
+        striped_styled_status = ""
+
+        active_idx = status_length - self._active_idx
+
+        for idx, char in enumerate(status):
+            if idx == active_idx:
+                striped_styled_status += await stylize(
+                    char,
+                    color=get_style(
+                        status_styles.get('primary_color'),
+                        status,
+                    ) if 'color' in self._animations.get(self._current_status) else None,
+                    highlight=get_style(
+                        status_styles.get('primary_highlight'),
+                        status,
+                    ) if 'highlight' in self._animations.get(self._current_status) else None,
+                    attrs=[
+                        get_style(
+                            attr,
+                            status,
+                        ) for attr in status_styles.get('primary_attrs', [])
+                    ],
+                    mode=self._mode,
+                )
+
+            else:
+                striped_styled_status += " "
+                
+        self._active_idx = self._update_active_idx(status_length)
+
+        return striped_styled_status
+
+    async def _apply_vegas_animation(
+        self,
+        status: str,
+    ):
+        
+        status_length = len(status)
+
+        status_idxs = list(range(status_length))
+        active_idxs = [random.randrange(0, status_length) for _ in status_idxs]
+        inactive_idxs = [idx for idx in status_idxs if idx not in active_idxs]
+
+        status_styles = self._status_styles.get(self._current_status, {})
+
+        vegas_styled_status = ""
+
+        for idx in status_idxs:
+
+            if idx in inactive_idxs:
+                vegas_styled_status += " "
+
+            else:
+                vegas_styled_status += await stylize(
+                    status[idx],
+                    color=get_style(
+                        status_styles.get('primary_color'),
+                        status,
+                    ) if 'color' in self._animations.get(self._current_status) else None,
+                    highlight=get_style(
+                        status_styles.get('primary_highlight'),
+                        status,
+                    ) if 'highlight' in self._animations.get(self._current_status) else None,
+                    attrs=[
+                        get_style(
+                            attr,
+                            status,
+                        ) for attr in status_styles.get('primary_attrs', [])
+                    ],
+                    mode=self._mode,
+                )
+
+        return self._pad_status_text_horizontal(vegas_styled_status, self._space_padding)
 
     async def _apply_swipe_animation(
         self,
@@ -230,6 +495,7 @@ class AnimatedStatusBar:
         )
 
         return self._create_status_string(
+            status,
             active_text,
             inactive_text,
             status_length,
@@ -261,6 +527,7 @@ class AnimatedStatusBar:
         )
 
         return self._create_status_string(
+            status,
             active_text,
             inactive_text,
             status_length,
@@ -282,12 +549,11 @@ class AnimatedStatusBar:
                 color=get_style(
                     status_styles.get('primary_color'),
                     status,
-                ) if 'color' in self._config.animation_type else None,
+                ) if 'color' in self._animations.get(self._current_status) else None,
                 highlight=get_style(
                     status_styles.get('primary_highlight'),
                     status,
-                ) if 'highlight' in self._config.animation_type else None
-                    ,
+                ) if 'highlight' in self._animations.get(self._current_status) else None,
                 attrs=[
                     get_style(
                         attr,
@@ -302,12 +568,11 @@ class AnimatedStatusBar:
                 color=get_style(
                     status_styles.get('secondary_color'),
                     status,
-                ) if 'color' in self._config.animation_type else None,
+                ) if 'color' in self._animations.get(self._current_status) else None,
                 highlight=get_style(
                     status_styles.get('secondary_highight'),
                     status,
-                ) if 'highlight' in self._config.animation_type else None
-                    ,
+                ) if 'highlight' in self._animations.get(self._current_status) else None,
                 attrs=[
                     get_style(
                         attr,
@@ -323,12 +588,11 @@ class AnimatedStatusBar:
                 color=get_style(
                     status_styles.get('primary_color'),
                     status,
-                ) if 'color' in self._config.animation_type else None,
+                ) if 'color' in self._animations.get(self._current_status) else None,
                 highlight=get_style(
                     status_styles.get('primary_highlight'),
                     status,
-                ) if 'highlight' in self._config.animation_type else None
-                    ,
+                ) if 'highlight' in self._animations.get(self._current_status) else None,
                 attrs=[
                     get_style(
                         attr,
@@ -343,12 +607,11 @@ class AnimatedStatusBar:
                 color=get_style(
                     status_styles.get('secondary_color'),
                     status,
-                ) if 'color' in self._config.animation_type else None,
+                ) if 'color' in self._animations.get(self._current_status) else None,
                 highlight=get_style(
                     status_styles.get('secondary_highlight'),
                     status,
-                ) if 'highlight' in self._config.animation_type else None
-                    ,
+                ) if 'highlight' in self._animations.get(self._current_status) else None,
                 attrs=[
                     get_style(
                         attr,
@@ -366,12 +629,13 @@ class AnimatedStatusBar:
 
     def _create_status_string(
         self,
+        status: str,
         active_text: str,
         inactive_text: str,
         status_length: int,
     ):
 
-        self._active_idx = (self._active_idx + 1)%status_length
+        self._active_idx = self._update_active_idx(status_length)
 
         if self._current_direction == 'forward':
             status = active_text + inactive_text
@@ -379,7 +643,7 @@ class AnimatedStatusBar:
         else:
             status = inactive_text + active_text
 
-        if self._active_idx == 0 and self._config.animation_direction == 'bounce' and self._active_segment == 'inactive':
+        if self._active_idx == 0 and self._animation_directions.get(self._current_status) == 'bounce' and self._active_segment == 'inactive':
             self._current_direction = 'reverse' if self._current_direction == 'forward' else 'forward'
 
         self._update_active_segment()
@@ -403,7 +667,7 @@ class AnimatedStatusBar:
             status
         )
 
-        match self._config.animation_direction:
+        match self._animation_directions.get(self._current_status):
             case "forward":
                 chunks = self._get_forward_rotation_animation_chunks(status)
          
@@ -417,7 +681,7 @@ class AnimatedStatusBar:
                 chunks = self._get_forward_rotation_animation_chunks(status)
 
         active_text, inactive_text = chunks
-        has_coloring_animation = 'highlight' in self._config.animation_type or 'color' in self._config.animation_type
+        has_coloring_animation = 'highlight' in self._animations.get(self._current_status)or 'color' in self._animations.get(self._current_status)
 
         if (status_styles := self._status_styles.get(self._current_status)) and has_coloring_animation:
 
@@ -426,11 +690,11 @@ class AnimatedStatusBar:
                 color=get_style(
                     status_styles.get('primary_color'),
                     status,
-                ) if 'color' in self._config.animation_type else None,
+                ) if 'color' in self._animations.get(self._current_status) else None,
                 highlight=get_style(
                     status_styles.get('primary_highlight'),
                     status,
-                ) if 'highlight' in self._config.animation_type else None
+                ) if 'highlight' in self._animations.get(self._current_status) else None
                     ,
                 attrs=[
                     get_style(
@@ -449,15 +713,14 @@ class AnimatedStatusBar:
                         status_styles.get('secondary_status_styles := self._status_styles.get(self._current_status)color')
                     ),
                     status,
-                ) if 'color' in self._config.animation_type else None,
+                ) if 'color' in self._animations.get(self._current_status) else None,
                 highlight=get_style(
                     status_styles.get(
                         'primary_highlight',
                         status_styles.get('secondary_highlight')
                     ),
                     status,
-                ) if 'highlight' in self._config.animation_type else None
-                    ,
+                ) if 'highlight' in self._animations.get(self._current_status) else None,
                 attrs=[
                     get_style(
                         attr,
@@ -512,7 +775,7 @@ class AnimatedStatusBar:
     ):
         status_length = len(status)
 
-        self._active_idx = (self._active_idx + 1)%status_length
+        self._active_idx = self._update_active_idx(status_length)
 
 
         active_idx = self._active_idx * -1
@@ -531,7 +794,7 @@ class AnimatedStatusBar:
     ): 
         status_length = len(status)
 
-        self._active_idx = (self._active_idx + 1)%status_length
+        self._active_idx = self._update_active_idx(status_length)
 
         
         active_idx = self._active_idx
@@ -558,8 +821,17 @@ class AnimatedStatusBar:
 
         return chunks
     
+    def _update_active_idx(
+        self,
+        status_length: int
+    ):
+        if 'blink' in self._animations.get(self._current_status):
+            return (self._active_idx + 1)%2
+        
+        return (self._active_idx + 1)%status_length
+    
     def _update_current_bounce_direction(self):
-        if self._active_idx == 0 and self._active_segment == 'inactive' and self._config.animation_direction == 'bounce':
+        if self._active_idx == 0 and self._active_segment == 'inactive' and self._animation_directions.get(self._current_status) == 'bounce':
             self._current_direction = 'reverse' if self._current_direction == 'forward' else 'forward'
 
     async def pause(self):

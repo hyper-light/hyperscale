@@ -6,23 +6,33 @@ from typing import Dict, Literal, List
 
 
 AnimationDirection = Literal["forward", "reverse", "bounce"]
-AnimationType = Literal["highlight", "color", "rotate", 'swipe']
+AnimationType = Literal[
+    "highlight", 
+    "color", 
+    "rotate", 
+    'swipe', 
+    'vegas', 
+    'stripe',
+    'blink',
+]
 
 HorizontalAlignment = Literal["left", "center", "right"]
 
-StylingMap = Dict[
+AnimationConfig = Dict[
     StrictStr,
     Dict[
         Literal[
+            "animations", 
+            "direction",
             "primary_color", 
             "primary_highlight", 
             "primary_attrs",
             "secondary_color", 
             "secondary_highlight", 
-            "secondary_attrs"
+            "secondary_attrs",
         ],
-        Colorizer | HighlightColorizer | List[Attributizer] | None,
-    ],
+        List[AnimationType] | AnimationDirection | Colorizer | HighlightColorizer | List[Attributizer] | None,
+    ]
 ]
 
 TimeUnit = Literal['h', 'm', 's']
@@ -30,7 +40,7 @@ TimeUnit = Literal['h', 'm', 's']
 
 class AnimatedStatusBarConfig(BaseModel):
     default_status: StrictStr
-    status_styles: StylingMap | None = None
+    animations: AnimationConfig | None = None
     horizontal_padding: StrictInt = 0
     animation_duration: StrictInt | StrictFloat = 0.5
     animation_duration_unit: TimeUnit = 's'

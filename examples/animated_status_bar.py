@@ -11,7 +11,7 @@ async def run():
         'test',
         AnimatedStatusBarConfig(
             default_status='ready',
-            status_styles={
+            animations={
                 'ready': {
                     'primary_color': 'black',
                     'primary_highlight': 'aquamarine_2',
@@ -24,9 +24,7 @@ async def run():
                     'primary_highlight': 'light_red'
                 }
             },
-            animation_type=['highlight', 'color', 'swipe'],
             horizontal_padding=2,
-            animation_direction='reverse',
             terminal_mode='extended'
     ))
 
