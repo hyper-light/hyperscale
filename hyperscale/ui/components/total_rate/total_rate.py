@@ -9,6 +9,7 @@ from .total_rate_config import TotalRateConfig
 
 
 class TotalRate:
+    
     def __init__(
         self,
         name: str,
