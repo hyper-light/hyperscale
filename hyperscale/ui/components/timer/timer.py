@@ -227,3 +227,17 @@ class Timer:
         self._update_lock.release()
 
         return data
+    
+    async def pause(self):
+        pass
+
+    async def resume(self):
+        pass
+
+    async def stop(self):
+        if self._update_lock.locked():
+            self._update_lock.release()
+
+    async def abort(self):
+        if self._update_lock.locked():
+            self._update_lock.release()
