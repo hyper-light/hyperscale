@@ -27,18 +27,15 @@ class Timer:
     ):
         self.fit_type = WidgetFitDimensions.X_AXIS
         self.name = name
-
         self._config = config
 
         self._start: float | None = None
 
         self._max_width: int | None = None
-
         self._time_width = 6
 
         self._update_lock: asyncio.Lock | None = None
         self._updates: asyncio.Queue[int | float] | None = None
-
 
         self._last_frame: str | None = None
         self._current_unit_granularity: UnitGranularity = 'seconds'
@@ -182,7 +179,6 @@ class Timer:
             elapsed,
         )
 
-
     async def _format_time_string(
         self, 
         time_string: str, 
@@ -215,7 +211,6 @@ class Timer:
 
         return [self._last_frame], True
     
-        
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
