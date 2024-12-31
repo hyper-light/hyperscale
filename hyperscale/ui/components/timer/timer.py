@@ -146,7 +146,6 @@ class Timer:
             time_string,
             elapsed,
         )
-
         
     def _create_time_string(
         self,
@@ -193,7 +192,6 @@ class Timer:
 
         else:
             return 'years'
-
 
     def _create_seconds_string(self, elapsed: float):
 
