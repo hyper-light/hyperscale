@@ -4,8 +4,9 @@ import time
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.ui.styling import stylize, get_style
-from typing import Any, Literal
+from typing import Any, Literal, Tuple, Dict
 from .timer_config import TimerConfig
+from .timer_status import TimerStatus
 
 
 UnitGranularity = Literal[
@@ -15,6 +16,11 @@ UnitGranularity = Literal[
     'days',
     'weeks',
     'years'
+]
+
+TimerSignal = Tuple[
+    float | None, 
+    TimerStatus
 ]
 
 
@@ -33,23 +39,13 @@ class Timer:
 
         self._max_width: int | None = None
         self._time_width = 6
+        self._status = TimerStatus.STOPPED
 
         self._update_lock: asyncio.Lock | None = None
-        self._updates: asyncio.Queue[int | float] | None = None
+        self._updates: asyncio.Queue[TimerSignal] | None = None
 
         self._last_frame: str | None = None
         self._current_unit_granularity: UnitGranularity = 'seconds'
-        self._granularity_map: dict[
-            UnitGranularity,
-            float
-        ] = {
-            'seconds': 0.01,
-            'minutes': 1,
-            'hours': 60,
-            'days': 3600,
-            'weeks': 86400,
-            'years': 604800
-        }
 
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
@@ -74,53 +70,123 @@ class Timer:
 
         self._max_width = max_width
 
-        self._updates.put_nowait(0)
+        self._updates.put_nowait((None, self._status))
 
-    async def update(
-        self,
-        _: Any = None,
-    ):
+    async def update(self, *_: Tuple[Any]):
         await self._update_lock.acquire()
 
-        if self._start is None:
-            self._start = time.monotonic()
+        if self._status == TimerStatus.STOPPED:
+            self._updates.put_nowait((time.monotonic(), TimerStatus.STARTING))
 
-        self._updates.put_nowait(time.monotonic())
+        elif self._status == TimerStatus.RUNNING:
+            self._updates.put_nowait((None, TimerStatus.STOPPING))
+
+        else:
+            self._updates.put_nowait((None, self._status))
 
         self._update_lock.release()
 
     async def get_next_frame(self):
+        
+        timer, action = await self._check_if_should_rerender()
 
-        if self._start is None:
-            self._start = time.monotonic()
+        self._status = action
+        elapsed = 0.00
+
+        match action:
+            case TimerStatus.STOPPED:
+                elapsed = 0.00
+
+            case TimerStatus.STOPPING:
+                elapsed = time.monotonic() - self._start if self._start else 0.00
+                self._status = TimerStatus.STOPPED
+                self._start = None
+
+            case TimerStatus.STARTING:
+                self._start = timer
+                elapsed = time.monotonic() - self._start
+                self._status = TimerStatus.RUNNING
+
+            case TimerStatus.RUNNING:
+                elapsed = time.monotonic() - self._start
+
+        if self._status == TimerStatus.STOPPED and self._last_frame:
+            return [self._last_frame], False
+        
+        time_string = self._create_time_string(elapsed)
+
+        return await self._format_time_string(
+            time_string,
+            elapsed,
+        )
 
         
-        timer_start = await self._check_if_should_rerender()
-        if timer_start:
-            self._start = timer_start
+    def _create_time_string(
+        self,
+        elapsed: float,
+    ):  
+        
+        self._current_unit_granularity = self._set_current_unit_granularity(elapsed)
+
+        match self._current_unit_granularity:
+            case 'seconds':
+                return self._create_seconds_string(elapsed)
+            
+            case 'minutes':
+                return self._create_minutes_string(elapsed)
+            
+            case 'hours':
+                return self._create_hours_string(elapsed)
+            
+            case 'days':
+                return self._create_days_string(elapsed)
+            
+            case 'weeks':
+                return self._create_weeks_string(elapsed)
+            
+            case _:
+                return self._create_seconds_string(elapsed)
+            
+    def _set_current_unit_granularity(self, elapsed: float):
+
+        if elapsed < 60:
+            return 'seconds'
+
+        elif elapsed < 3600:
+            return 'minutes'
+
+        elif elapsed < 86400:
+            return 'hours'
+
+        elif elapsed < 604800:
+            return 'days'
+
+        elif elapsed < 3.154e7:
+            return 'weeks'
+
+        else:
+            return 'years'
 
 
-        elapsed = time.monotonic() - self._start
-
-        if elapsed < self._granularity_map.get(self._current_unit_granularity, 0.01) and self._last_frame:
-            return [self._last_frame], False
+    def _create_seconds_string(self, elapsed: float):
 
         seconds_whole = int(elapsed)%60
         seconds_decimal = int((elapsed % 1) * 100)
 
-        time_string = ""
-
-        if seconds_whole > 0 and seconds_whole < 10:
+        if seconds_whole < 10:
             time_string = f' {seconds_whole:01d}.{seconds_decimal:02d}s'
 
         elif seconds_whole >= 10 and seconds_whole < 60:
             time_string = f'{seconds_whole:02d}.{seconds_decimal:02d}s'
 
+        return time_string
+    
+    def _create_minutes_string(self, elapsed: float):
+
         minutes = (elapsed/60)
         minutes_whole = int(minutes)%60
 
-        if minutes_whole > 0 and self._current_unit_granularity == 'seconds':
-            self._current_unit_granularity = 'minutes'
+        seconds_whole = int(elapsed)%60
 
         if minutes_whole > 0 and minutes_whole < 10:
             time_string = f' {minutes_whole:01d}m' + f'{seconds_whole:02d}s'
@@ -128,32 +194,43 @@ class Timer:
         elif minutes_whole >= 10 and minutes_whole < 60:
             time_string = f'{minutes_whole:02d}m' + f'{seconds_whole:02d}s'
 
+        return time_string
+    
+    def _create_hours_string(self, elapsed: float):
+
         hours = (elapsed/3600)
         hours_whole = int(hours)%24
 
-        if hours_whole > 0 and self._current_unit_granularity == 'minutes':
-            self._current_unit_granularity = 'hours'
+        minutes_whole = int(elapsed/60)%60
+
+        self._carry = minutes_whole
 
         if hours_whole > 0 and hours_whole < 10:
             time_string = f' {hours_whole:01d}h' + f'{minutes_whole:02d}m'
 
         elif hours_whole >= 10 and hours_whole < 24:
             time_string = f'{hours_whole:02d}h' + f'{minutes_whole:02d}m'
+
+        return time_string
+    
+    def _create_days_string(self, elapsed: float):
         
         days = elapsed/86400
-        days_whole = int(days)
+        days_whole = int(days)%7
 
-        if days_whole > 0 and self._current_unit_granularity == 'hours':
-            self._current_unit_granularity = 'days'
+        hours_whole = int(elapsed/3600)%24
 
         if days_whole > 0 and days_whole < 7:
             time_string = f' {days_whole:01d}d' + f'{hours_whole:02d}h'
+
+        return time_string
+    
+    def _create_weeks_string(self, elapsed: float):
         
         weeks = elapsed/604800
-        weeks_whole = int(weeks)
+        weeks_whole = int(weeks)%52
 
-        if weeks_whole > 0 and self._current_unit_granularity == 'days':
-            self._current_unit_granularity = 'weeks'
+        days_whole = int(elapsed/86400)%7
 
         if weeks_whole > 0 and weeks_whole < 10:
             time_string = f' {weeks_whole:01d}w' + f'{days_whole:02d}d'
@@ -161,12 +238,15 @@ class Timer:
         elif weeks_whole >= 10 and weeks_whole < 52:
             time_string = f'{weeks_whole:02d}w' + f'{days_whole:02d}d'
 
+        return time_string
+    
+    def _create_years_string(self, elapsed: float):
+
         years = elapsed/3.154e7
         years_whole = int(years)
         years_decimal = int((years % 1) * 10)
 
-        if years_whole > 0 and self._current_unit_granularity == 'weeks':
-            self._current_unit_granularity = 'years'
+        weeks_whole = int(elapsed/604800)%52
 
         if years_whole > 0 and years_whole < 10:
             time_string = f' {years_whole:01d}y' + f'{weeks_whole:02d}w'
@@ -174,11 +254,8 @@ class Timer:
         elif years_whole >= 10:
             time_string = f'{years_whole}.' +  f'{years_decimal:02d}y'
 
-        return await self._format_time_string(
-            time_string,
-            elapsed,
-        )
-
+        return time_string
+    
     async def _format_time_string(
         self, 
         time_string: str, 
@@ -214,13 +291,13 @@ class Timer:
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
-        data: float | None = None
+        data: TimerSignal = (None, self._status)
         
         if self._updates.empty() is False:
             data = await self._updates.get()
 
         self._update_lock.release()
-
+        
         return data
     
     async def pause(self):

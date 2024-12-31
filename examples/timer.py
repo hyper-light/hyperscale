@@ -34,6 +34,9 @@ async def run():
         await asyncio.sleep(1/30)
         elapsed = time.monotonic() - start
 
+        if elapsed >= 90:
+            await timer.update()
+
     print("\033[?25h")
 
 
