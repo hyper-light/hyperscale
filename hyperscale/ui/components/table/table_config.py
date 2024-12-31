@@ -31,6 +31,7 @@ class TableConfig(BaseModel):
         HeaderOptions,
     ]
     cell_alignment: CellAlignment = "CENTER"
+    minimum_column_width: StrictInt | None = None
     border_color: ColorName | ExtendedColorName | None = None
     terminal_mode: TerminalDisplayMode = "compatability"
     pagination_refresh_rate: StrictInt | StrictFloat = 3

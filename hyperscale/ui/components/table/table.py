@@ -27,16 +27,20 @@ class Table:
         self._max_width = 0
 
         self._column_width = 0
-        self._columns_count = len(self._header_keys)
+        self._total_columns = len(self._header_keys)
+        self._columns_count = self._total_columns
+        self._use_header_rotation = False
         self._width_adjust = 0
 
-        self._last_state: list[list[Any]] = []
+        self._last_state: list[dict[str, Any]] = []
         self._last_rendered_frames: list[str] = []
 
         self._updates: asyncio.Queue | None = None
         self._update_lock: asyncio.Lock | None = None
+        self._current_headers: list[str] = self._header_keys
 
         self.offset = 0
+        self.header_offset = 0
         self._start: float | None = None
         self._elapsed: float = 0
 
@@ -63,6 +67,21 @@ class Table:
             self._updates = asyncio.Queue()
 
         self._column_width = int(math.floor(max_width / self._columns_count))
+        self._headers_rotate_count = 0
+
+        header_rotation_enabled = self._config.minimum_column_width is not None
+        if header_rotation_enabled and self._column_width < self._config.minimum_column_width:
+            max_headers = max(
+                int(math.floor(max_width/self._config.minimum_column_width)),
+                1
+            )
+
+            self._columns_count = max_headers
+            self._headers_rotate_count = (self._total_columns%max_headers) + 1
+            self._column_width = int(math.floor(max_width / max_headers))
+            self._current_headers = self._current_headers[:max_headers]
+
+            self._use_header_rotation = True
 
         table_size = self._column_width * self._columns_count
 
@@ -118,7 +137,6 @@ class Table:
         if self._start is None:
             self._start = time.monotonic()
 
-
         data = await self._check_if_should_rerender()
 
         rerender = False
@@ -141,13 +159,20 @@ class Table:
     
         return self._last_rendered_frames, rerender
     
-    async def _rerender(self, data: list[list[Any]]):
+    async def _rerender(self, data: list[dict[str, Any]]):
+        if self._use_header_rotation:
+            self._current_headers = self._cycle_headers()
+
+        data = [
+            [row.get(header) for header in self._current_headers]
+            for row in data
+        ]
 
         height_adjustment = self._assembler.calculate_height_offset(data)
         data_rows = self._cycle_data_rows(data, height_adjustment)
 
         table_lines: list[str] = await self._assembler.create_table_lines(
-            [header for header in self._config.headers.keys()],
+            self._current_headers,
             data_rows,
         )
 
@@ -185,18 +210,23 @@ class Table:
 
         return data
     
+    def _cycle_headers(self):
+
+        rotated_headers = self._current_headers
+
+        if self._elapsed >= self._config.pagination_refresh_rate:
+            self.header_offset = (self.header_offset + 1)%self._headers_rotate_count
+            rotated_headers = self._header_keys[self.header_offset:self._columns_count + self.header_offset]
+
+        return rotated_headers
+    
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
-        data: list[list[Any]] | None = None
+        data: list[dict[str, Any]] | None = None
         
         if self._updates.empty() is False:
-            update_data: list[dict[str, Any]] = await self._updates.get()
-
-            data = [
-                [row.get(header) for header in self._header_keys][: self._columns_count]
-                for row in update_data
-            ]
+            data: list[dict[str, Any]] = await self._updates.get()
 
         self._update_lock.release()
 

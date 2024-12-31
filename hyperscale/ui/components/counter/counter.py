@@ -181,7 +181,10 @@ class Counter:
         except Exception:
             return ''
         
-        return str(count)
+        if self._unit:
+            count = f'{count} {self._unit}'
+        
+        return count
     
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
@@ -196,7 +199,7 @@ class Counter:
         return data
 
     async def pause(self):
-        pass
+        passself._unit
 
     async def resumse(self):
         pass

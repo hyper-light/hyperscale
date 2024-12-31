@@ -33,7 +33,10 @@ from hyperscale.ui.components.table import (
     Table,
     TableConfig,
 )
-
+from hyperscale.ui.components.timer import (
+    Timer,
+    TimerConfig,
+)
 
 
 @action(alias='add_to_total')
@@ -52,6 +55,10 @@ async def update_timings(timings: list[tuple[int, int]]):
 @action()
 async def update_table(rows: list[dict[str, int]]):
     return rows
+
+@action()
+async def update_timer():
+    return
 
 
 async def display():
@@ -144,6 +151,7 @@ async def display():
             component=Counter(
                 'counter',
                 CounterConfig(
+                    unit='total actions',
                     terminal_mode='extended'
                 )
             ),
@@ -160,6 +168,7 @@ async def display():
             component=TotalRate(
                 'total_rate',
                 TotalRateConfig(
+                    unit='aps',
                     terminal_mode='extended'
                 )
             ),
@@ -176,6 +185,7 @@ async def display():
             component=WindowedRate(
                 'windowed_rate',
                 WindowedRateConfig(
+                    unit='aps',
                     rate_period=5
                 )
             ),
@@ -189,6 +199,14 @@ async def display():
                 right_border="|",
                 bottom_border="-",
             ),
+            component=Timer(
+                'timer',
+                TimerConfig(
+                    color='aquamarine_2',
+                    terminal_mode='extended',
+                )
+            ),
+            subscriptions=['update_timer']
         ),
         Section(
             SectionConfig(
@@ -243,7 +261,9 @@ async def display():
                             "precision": ".2f",
                         },
                         "four": {},
+                        "five": {}
                     },
+                    minimum_column_width=10,
                     border_color="aquamarine_2",
                     terminal_mode="extended",
                     table_format="simple",
@@ -270,6 +290,8 @@ async def display():
     table_data = []
     samples = []
 
+    await update_timer()
+
     for idx in range(60):
         await asyncio.sleep(1)
 
@@ -289,6 +311,8 @@ async def display():
         ])
         
         elapsed = time.monotonic() - start
+
+    await update_timer()
 
     await engine.stop()
 

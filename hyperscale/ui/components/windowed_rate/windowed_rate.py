@@ -134,9 +134,6 @@ class WindowedRate:
         ])
 
         rate = self._format_rate(count)
-
-        if self._unit:
-            rate = f"{rate} {self._unit}"
         
         rate = rate + "/" + self._rate_period_string
 
@@ -219,6 +216,10 @@ class WindowedRate:
 
         else:
             rate += "0"
+
+        
+        if self._unit:
+            rate = f"{rate} {self._unit}"
         
         return rate
     
