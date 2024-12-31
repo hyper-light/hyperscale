@@ -20,12 +20,11 @@ async def run():
     await timer.fit(max_width=12)
     
     loop = asyncio.get_event_loop()
-    start = time.monotonic()
     elapsed = 0
 
-    # word = " hello "
-
     await timer.update()
+
+    start = time.monotonic()
 
     while elapsed < 3650:
         frame, _ = await timer.get_next_frame()
@@ -34,8 +33,9 @@ async def run():
         await asyncio.sleep(1/30)
         elapsed = time.monotonic() - start
 
-        if elapsed >= 90:
+        if elapsed > 90:
             await timer.update()
+            break
 
     print("\033[?25h")
 

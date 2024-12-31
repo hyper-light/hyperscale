@@ -36,6 +36,8 @@ class Timer:
         self._config = config
 
         self._start: float | None = None
+        self._refresh_start: float | None = None
+        self._refresh_elapsed: float = 0
 
         self._max_width: int | None = None
         self._time_width = 6
@@ -46,6 +48,17 @@ class Timer:
 
         self._last_frame: str | None = None
         self._current_unit_granularity: UnitGranularity = 'seconds'
+        self._granularity_map: dict[
+            UnitGranularity,
+            float
+        ] = {
+            'seconds': 0.1,
+            'minutes': 1,
+            'hours': 60,
+            'days': 3600,
+            'weeks': 86400,
+            'years': 604800
+        }
 
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
@@ -87,6 +100,9 @@ class Timer:
         self._update_lock.release()
 
     async def get_next_frame(self):
+
+        if self._refresh_start is None:
+            self._refresh_start = time.monotonic()
         
         timer, action = await self._check_if_should_rerender()
 
@@ -99,7 +115,6 @@ class Timer:
 
             case TimerStatus.STOPPING:
                 elapsed = time.monotonic() - self._start if self._start else 0.00
-                self._status = TimerStatus.STOPPED
                 self._start = None
 
             case TimerStatus.STARTING:
@@ -110,7 +125,19 @@ class Timer:
             case TimerStatus.RUNNING:
                 elapsed = time.monotonic() - self._start
 
+        timer_granularity = self._granularity_map.get(self._current_unit_granularity, 0.1)
+        self._refresh_elapsed = time.monotonic() - self._refresh_start
+
         if self._status == TimerStatus.STOPPED and self._last_frame:
+            self._refresh_start = time.monotonic()
+            return [self._last_frame], False
+        
+        elif self._status == TimerStatus.STOPPING:
+            self._refresh_start = time.monotonic()
+            self._status = TimerStatus.STOPPED
+        
+        elif self._refresh_elapsed >= timer_granularity and self._last_frame:
+            self._refresh_start = time.monotonic()
             return [self._last_frame], False
         
         time_string = self._create_time_string(elapsed)
@@ -171,13 +198,13 @@ class Timer:
     def _create_seconds_string(self, elapsed: float):
 
         seconds_whole = int(elapsed)%60
-        seconds_decimal = int((elapsed % 1) * 100)
+        seconds_decimal = int((elapsed % 1) * 10)
 
         if seconds_whole < 10:
-            time_string = f' {seconds_whole:01d}.{seconds_decimal:02d}s'
+            time_string = f'  {seconds_whole:01d}.{seconds_decimal:1d}s'
 
         elif seconds_whole >= 10 and seconds_whole < 60:
-            time_string = f'{seconds_whole:02d}.{seconds_decimal:02d}s'
+            time_string = f' {seconds_whole:02d}.{seconds_decimal:1d}s'
 
         return time_string
     
