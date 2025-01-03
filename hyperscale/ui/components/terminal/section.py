@@ -120,29 +120,6 @@ class Section(Generic[T]):
         if component := self.components.get(component_name):
             self._active_component = component_name
             self.component = component
-    
-    async def replace(
-        self,
-        component: (
-            Counter 
-            | Header 
-            | Text 
-            | Spinner 
-            | Link 
-            | ProgressBar 
-            | ScatterPlot 
-            | TotalRate 
-            | WindowedRate 
-        )
-    ):
-        component_name = component.name
-
-        if self.components.get(component_name) is None:
-            self.components[component_name] = component
-
-        self._active_component = component_name
-        self.component = component
-        await self._fit_components(component_name=component_name)
 
     async def resize(
         self,

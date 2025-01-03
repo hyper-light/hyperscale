@@ -1,12 +1,12 @@
 from .terminal import Terminal
 
 
-def action(alias: str | None = None):
+def action(default_channel: str | None = None):
 
     def wrap(action):
         return Terminal.wrap_action(
             action,
-            alias=alias,
+            default_channel=default_channel,
         )
     
     return wrap

@@ -29,6 +29,7 @@ from hyperscale.core_rewrite.state import (
     ContextHook,
     StateAction,
 )
+from hyperscale.ui import InterfaceUpdatesController
 
 from .remote_graph_controller import RemoteGraphController
 from .workflow_runner import cancel_pending
@@ -65,10 +66,12 @@ WorkflowVUs = Dict[str, List[int]]
 
 
 class RemoteGraphManager:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        updates: InterfaceUpdatesController,
+    ) -> None:
 
-        self.active_workflows: list[str] = []
-
+        self._updates = updates
         self._workers: List[Tuple[str, int]] | None = None
         self._workflows: Dict[str, Workflow] = {}
         self._threads = psutil.cpu_count(logical=False)
@@ -182,10 +185,10 @@ class RemoteGraphManager:
         for workflow_set in workflow_traversal_order:
             provisioned_batch, workflow_vus = self._provision(workflow_set)
 
-            self.active_workflows = [
+            await self._updates.update_active_workflows([
                 workflow_name for group in provisioned_batch
                 for workflow_name, _, _ in group
-            ]
+            ])
 
             results = await asyncio.gather(
                 *[

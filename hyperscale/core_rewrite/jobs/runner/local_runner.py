@@ -11,7 +11,7 @@ from hyperscale.core_rewrite.graph import Graph, Workflow
 from hyperscale.core_rewrite.jobs.graphs.remote_graph_manager import RemoteGraphManager
 from hyperscale.core_rewrite.jobs.models import Env
 from hyperscale.core_rewrite.jobs.protocols.socket import bind_tcp_socket
-from hyperscale.ui import HyperscaleInterface
+from hyperscale.ui import HyperscaleInterface, InterfaceUpdatesController
 
 from .local_server_pool import LocalServerPool
 
@@ -49,12 +49,15 @@ class LocalRunner:
             )
 
         self._env = env
-        self._interface = HyperscaleInterface()
+        
         self.host = host
         self.port = port
         self._workers = workers
 
-        self._remote_manger = RemoteGraphManager()
+        updates = InterfaceUpdatesController()
+        
+        self._interface = HyperscaleInterface(updates)
+        self._remote_manger = RemoteGraphManager(updates)
         self._server_pool = LocalServerPool(pool_size=self._workers)
         self._pool_task: asyncio.Task | None = None
 
@@ -81,7 +84,8 @@ class LocalRunner:
                 ),
             )
 
-        # self._interface.run()
+        self._interface.initialize(workflows)
+        await self._interface.run()
 
         try:
             if self._workers <= 1:
@@ -134,6 +138,8 @@ class LocalRunner:
                     except asyncio.CancelledError:
                         pass
 
+                await self._interface.stop()
+
                 return results
 
         except Exception:
@@ -141,7 +147,6 @@ class LocalRunner:
                 self._remote_manger.abort()
             except Exception:
                 pass
-
             except asyncio.CancelledError:
                 pass
 
@@ -149,7 +154,14 @@ class LocalRunner:
                 self._server_pool.abort()
             except Exception:
                 pass
+            except asyncio.CancelledError:
+                pass
 
+            try:
+                await self._interface.abort()
+
+            except Exception:
+                pass
             except asyncio.CancelledError:
                 pass
 
@@ -169,6 +181,14 @@ class LocalRunner:
             except Exception:
                 pass
 
+            except asyncio.CancelledError:
+                pass
+
+            try:
+                await self._interface.abort()
+
+            except Exception:
+                pass
             except asyncio.CancelledError:
                 pass
 

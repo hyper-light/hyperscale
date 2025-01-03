@@ -24,4 +24,4 @@ K = TypeVar('K')
 T = TypeVar('T', bound=ActionData)
 
 
-Action = Callable[[K], Awaitable[T]]
+Action = Callable[[K], Awaitable[Tuple[str, T]]]

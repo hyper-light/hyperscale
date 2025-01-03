@@ -1,6 +1,5 @@
 import asyncio
 from typing import TypeVar
-from .message import Message
 from .state_types import ActionData, Action
 from .subscription_set import SubscriptionSet
 
@@ -12,25 +11,31 @@ T = TypeVar('T', bound=ActionData)
 def observe(
     trigger: Action[K, T], 
     subscriptions: SubscriptionSet,
-    alias: str | None = None,
+    default_channel: str | None = None,
 ) -> Action[K, T]:
     
-    if alias is None:
-        alias = trigger.__name__
+    if default_channel is None:
+        default_channel = trigger.__name__
 
     async def wrap(*args, **kwargs):
 
-        result: Message[T] | T = await trigger(*args, **kwargs)
+        result = await trigger(*args, **kwargs)
 
-        if isinstance(result, Message) and (
-            updates := subscriptions.updates.get(result.channel)
-        ):
-            await asyncio.gather(*[
-                update(result.data) for update in updates
-            ])
-            
+        channel = default_channel
+        data: ActionData | None = None
+
+        if isinstance(result, tuple) and len(result) == 2:
+            channel, data = result
+            updates = subscriptions.updates.get(channel)
+
         else:
-            await asyncio.gather(*[update(result) for update in subscriptions.updates[alias]])
+            updates = subscriptions.updates.get(channel)
+            data = result
+
+        if updates is not None:
+            await asyncio.gather(*[
+                update(data) for update in updates
+            ])
 
         return result
     

@@ -1,3 +1,5 @@
+import math
+
 from hyperscale.core_rewrite.graph import Workflow
 from hyperscale.ui.components.counter import Counter, CounterConfig
 from hyperscale.ui.components.header import Header, HeaderConfig
@@ -83,17 +85,17 @@ def generate_ui_sections(
                 horizontal_alignment='center',
                 vertical_alignment="center",
             ),
-            component=[
+            components=[
                 ProgressBar(
                     f"run_progress_{worklow_name}",
                     ProgressBarConfig(
-                        total=time_limit_seconds,
+                        total=math.floor(time_limit_seconds),
                         active_color="royal_blue",
                         failed_color="white",
                         complete_color="hot_pink_3",
                         terminal_mode="extended",
                     ),
-                    subscriptions=['update_run_timer'],
+                    subscriptions=[f'update_run_progress_{worklow_name}'],
                 ) for worklow_name, time_limit_seconds in workflow_configs
             ],
         ),

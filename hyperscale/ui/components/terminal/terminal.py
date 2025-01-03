@@ -13,23 +13,14 @@ from typing import (
     Dict,
     List,
     TypeVar,
+    Awaitable,
 )
-
-from hyperscale.ui.components.counter import Counter
-from hyperscale.ui.components.header import Header
-from hyperscale.ui.components.link import Link
-from hyperscale.ui.components.progress_bar import ProgressBar
-from hyperscale.ui.components.scatter_plot import ScatterPlot
-from hyperscale.ui.components.spinner import Spinner
-from hyperscale.ui.components.text import Text
-from hyperscale.ui.components.total_rate import TotalRate
-from hyperscale.ui.components.windowed_rate import WindowedRate
 
 from hyperscale.ui.state import Action, ActionData, observe, SubscriptionSet
 from .canvas import Canvas
 from .engine_config import EngineConfig
 from .refresh_rate import RefreshRateMap, RefreshRate
-from .section import Section, Component
+from .section import Section
 
 
 SignalHandlers = Callable[[int], Any] | int | None
@@ -146,10 +137,10 @@ class Terminal:
 
         components: dict[str, tuple[list[str], Action[ActionData, ActionData]]] = {}
 
-        for action, alias in self._actions:
+        for action, default_channel in self._actions:
 
-            if alias is None:
-                alias = action.__name__
+            if default_channel is None:
+                default_channel = action.__name__
 
 
             components.update({
@@ -162,11 +153,11 @@ class Terminal:
             subscriptions = [
                 section.component.update 
                 for section in sections
-                if section.has_component and alias in section.component.subscriptions
+                if section.has_component and default_channel in section.component.subscriptions
             ]
 
             if len(subscriptions) > 0:
-                self._updates.add_topic(alias, subscriptions)
+                self._updates.add_topic(default_channel, subscriptions)
 
         for subscriptions, update in components.values():
             for subscription in subscriptions:
@@ -176,13 +167,13 @@ class Terminal:
     def wrap_action(
         cls, 
         func: Action[K, T],
-        alias: str | None = None,
+        default_channel: str | None = None,
     ):
-        cls._actions.append((func, alias))
+        cls._actions.append((func, default_channel))
         return observe(
             func,
             cls._updates,
-            alias=alias,
+            default_channel=default_channel,
         )
     
     async def set_component_active(self, component_name: str):
@@ -202,26 +193,6 @@ class Terminal:
         if component := self.canvas.get_component(component_name):
             component.subscriptions.append(channel)
             self._updates.add_topic(channel, [component.update])
-    
-    async def replace(
-        self,
-        components: List[
-            Counter 
-            | Header 
-            | Text 
-            | Spinner 
-            | Link 
-            | ProgressBar 
-            | ScatterPlot 
-            | TotalRate 
-            | WindowedRate 
-        ],
-    ):
-        await self._stdout_lock.acquire()
-        await self.canvas.replace(components)
-
-        if self._stdout_lock.locked():
-            self._stdout_lock.release()
 
     async def resize(
         self,
@@ -237,6 +208,7 @@ class Terminal:
 
     async def render(
         self,
+        notifications: list[Callable[[], Awaitable[None]]] | None = None,
         horizontal_padding: int = 0,
         vertical_padding: int = 0,
     ):
@@ -246,7 +218,9 @@ class Terminal:
                 vertical_padding=vertical_padding,
             )
 
-            self._run_engine = asyncio.ensure_future(self._run())
+            self._run_engine = asyncio.ensure_future(self._run(
+                notifications=notifications
+            ))
 
     async def _initialize_canvas(
         self,
@@ -289,7 +263,10 @@ class Terminal:
             vertical_padding=self._vertical_padding,
         )
 
-    async def _run(self):
+    async def _run(
+        self,
+        notifications: list[Callable[[], Awaitable[None]]] | None = None,
+    ):
         self._loop = asyncio.get_event_loop()
         await self._hide_cursor()
 
@@ -302,13 +279,18 @@ class Terminal:
         self._stdout_lock = asyncio.Lock()
 
         try:
-            self._spin_thread = asyncio.ensure_future(self._execute_render_loop())
+            self._spin_thread = asyncio.ensure_future(self._execute_render_loop(
+                notifications=notifications,
+            ))
         except Exception:
             # Ensure cursor is not hidden if any failure occurs that prevents
             # getting it back
             await self._show_cursor()
 
-    async def _execute_render_loop(self):
+    async def _execute_render_loop(
+        self,
+        notifications: list[Callable[[], Awaitable[None]]] | None = None,
+    ):
 
         await self._clear_terminal(force=True)
 
@@ -325,6 +307,9 @@ class Terminal:
 
                 if self._stdout_lock.locked():
                     self._stdout_lock.release()
+
+                if notifications:
+                    await asyncio.gather(*notifications)
 
             except Exception:
                 pass

@@ -11,12 +11,12 @@ from hyperscale.testing import URL, HTTPResponse
 
 class Test(Workflow):
     vus = 16000
-    duration = "1h"
+    duration = "1m"
 
     @step()
     async def login(
         self,
-        url: URL = "https://kiwifarms.st/webmanifest.php",
+        url: URL = "https://httpbin.org/get",
     ) -> HTTPResponse:
         response = await self.client.http.get(url)
         assert (

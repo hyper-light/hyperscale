@@ -42,7 +42,6 @@ from hyperscale.ui.components.text import (
     Text,
     TextConfig,
 )
-from hyperscale.ui.state import Message
 
 
 
@@ -57,9 +56,9 @@ async def add(count: int):
     if channel == 'add_to_total_two' and next_count > 30:
         next_count = 30
 
-    return Message(
-        channel=channel,
-        data=next_count
+    return (
+        channel,
+        next_count,
     )
 
 @action()
@@ -361,7 +360,6 @@ async def display():
     samples = []
 
     active_progress_bar = 'progress_bar_one'
-    active_channel = 'add_to_total'
 
     await update_timer()
 
@@ -374,16 +372,9 @@ async def display():
             await update_table(table_data)
 
 
-        if idx%5 == 0 and idx > 0 and active_progress_bar != 'progress_bar_two':
-            active_progress_bar = 'progress_bar_two'
-            active_channel = 'add_to_total_two'
+        if idx%5 == 0 and idx > 0:
+            active_progress_bar = 'progress_bar_two' if active_progress_bar == 'progress_bar_one' else 'progress_bar_one'
             await engine.set_component_active(active_progress_bar)
-
-        elif active_progress_bar != 'progress_bar_one':
-            active_progress_bar = 'progress_bar_one'
-            active_channel = 'add_to_total'
-            await engine.set_component_active(active_progress_bar)
-            
 
         samples.append((1, time.monotonic()))
 
