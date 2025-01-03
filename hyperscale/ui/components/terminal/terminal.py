@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 import asyncio
+import functools
 import math
 import shutil
 import signal
@@ -24,21 +25,11 @@ from .section import Section
 
 
 SignalHandlers = Callable[[int], Any] | int | None
+Notification = Callable[[], Awaitable[None]]
 
 
 K = TypeVar('K')
 T = TypeVar('T', bound=ActionData)
-
-
-async def default_handler(_: str, engine: Terminal):  # pylint: disable=unused-argument
-    """Signal handler, used to gracefully shut down the ``spinner`` instance
-    when specified signal is received by the process running the ``spinner``.
-
-    ``signum`` and ``frame`` are mandatory arguments. Check ``signal.signal``
-    function for more details.
-    """
-
-    await engine.abort()
 
 
 async def handle_resize(engine: Terminal):
@@ -82,8 +73,7 @@ async def handle_resize(engine: Terminal):
         await engine.resume()
 
     except Exception:
-        import traceback
-        print(traceback.format_exc())
+        pass
 
 
 
@@ -120,16 +110,8 @@ class Terminal:
         self._frame_height: int = 0
         self._horizontal_padding: int = 0
         self._vertical_padding: int = 0
+        self._notifications: List[Notification] | None = None
 
-        self._sigmap = (
-            sigmap
-            if sigmap
-            else {
-                signal.SIGINT: default_handler,
-                signal.SIGTERM: default_handler,
-                signal.SIG_IGN: default_handler,
-            }
-        )
         # Maps signals to their default handlers in order to reset
         # custom handlers set by ``sigmap`` at the cleanup phase.
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
@@ -177,6 +159,10 @@ class Terminal:
         )
     
     async def set_component_active(self, component_name: str):
+
+        if self._stdout_lock is None:
+            self._stdout_lock = asyncio.Lock()
+
         await self._stdout_lock.acquire()
 
         if section := self.canvas.get_section(component_name):
@@ -213,14 +199,15 @@ class Terminal:
         vertical_padding: int = 0,
     ):
         if self._run_engine is None:
+
+            self._notifications = notifications
+
             await self._initialize_canvas(
                 horizontal_padding=horizontal_padding,
                 vertical_padding=vertical_padding,
             )
 
-            self._run_engine = asyncio.ensure_future(self._run(
-                notifications=notifications
-            ))
+            self._run_engine = asyncio.ensure_future(self._run())
 
     async def _initialize_canvas(
         self,
@@ -263,10 +250,7 @@ class Terminal:
             vertical_padding=self._vertical_padding,
         )
 
-    async def _run(
-        self,
-        notifications: list[Callable[[], Awaitable[None]]] | None = None,
-    ):
+    async def _run(self):
         self._loop = asyncio.get_event_loop()
         await self._hide_cursor()
 
@@ -276,21 +260,18 @@ class Terminal:
         self._stop_time = None  # Reset value to properly calculate subsequent spinner starts (if any)  # pylint: disable=line-too-long
         self._stop_run = asyncio.Event()
         self._hide_run = asyncio.Event()
-        self._stdout_lock = asyncio.Lock()
+
+        if self._stdout_lock is None:
+            self._stdout_lock = asyncio.Lock()
 
         try:
-            self._spin_thread = asyncio.ensure_future(self._execute_render_loop(
-                notifications=notifications,
-            ))
+            self._spin_thread = asyncio.ensure_future(self._execute_render_loop())
         except Exception:
             # Ensure cursor is not hidden if any failure occurs that prevents
             # getting it back
             await self._show_cursor()
 
-    async def _execute_render_loop(
-        self,
-        notifications: list[Callable[[], Awaitable[None]]] | None = None,
-    ):
+    async def _execute_render_loop(self):
 
         await self._clear_terminal(force=True)
 
@@ -308,8 +289,10 @@ class Terminal:
                 if self._stdout_lock.locked():
                     self._stdout_lock.release()
 
-                if notifications:
-                    await asyncio.gather(*notifications)
+                if self._notifications:
+                    await asyncio.gather(*[
+                        notification() for notification in self._notifications
+                    ])
 
             except Exception:
                 pass
@@ -421,7 +404,7 @@ class Terminal:
 
         frame = f"\033[3J\033[H{frame}\n"
 
-        await self._loop.run_in_executor(None, sys.stdout.write, frame)
+        # await self._loop.run_in_executor(None, sys.stdout.write, frame)
         await self._loop.run_in_executor(None, sys.stdout.flush)
 
         if self._stdout_lock.locked():
@@ -460,7 +443,7 @@ class Terminal:
 
         frame = f"\033[3J\033[H{frame}"
 
-        await self._loop.run_in_executor(None, sys.stdout.write, frame)
+        # await self._loop.run_in_executor(None, sys.stdout.write, frame)
 
         try:
             self._run_engine.cancel()
@@ -482,26 +465,6 @@ class Terminal:
                 signal.signal(sig, sig_handler)
 
     def _register_signal_handlers(self):
-        # SIGKILL cannot be caught or ignored, and the receiving
-        # process cannot perform any clean-up upon receiving this
-        # signal.
-        if signal.SIGKILL in self._sigmap:
-            raise ValueError(
-                "Trying to set handler for SIGKILL signal. "
-                "SIGKILL cannot be caught or ignored in POSIX systems."
-            )
-
-        for sig in self._sigmap:
-            dfl_handler = signal.getsignal(sig)
-            self._dfl_sigmap[sig] = dfl_handler
-
-            self._loop.add_signal_handler(
-                getattr(signal, sig.name),
-                lambda signame=sig.name: asyncio.create_task(
-                    default_handler(signame, self)
-                ),
-            )
-
         self._loop.add_signal_handler(
             signal.SIGWINCH, lambda: asyncio.create_task(handle_resize(self))
         )

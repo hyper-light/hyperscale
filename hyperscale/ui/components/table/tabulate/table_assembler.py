@@ -979,9 +979,6 @@ class TableAssembler:
     ):
         data_and_spacer_lines: list[str] = []
 
-        if len(headers) < self.columns_count:
-            print(len(headers))
-
         data_lines = await asyncio.gather(
             *[
                 self._create_data_line(

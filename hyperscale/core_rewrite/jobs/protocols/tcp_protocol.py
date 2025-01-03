@@ -210,15 +210,10 @@ class TCPProtocol(Generic[T, K]):
                     )
 
                 except OSError:
-                    import traceback
-
-                    print(traceback.format_exc())
                     pass
 
                 except Exception:
-                    import traceback
-
-                    print(traceback.format_exc())
+                    pass
 
                 self.server_socket.setblocking(False)
 
@@ -252,9 +247,7 @@ class TCPProtocol(Generic[T, K]):
                     self.connected = True
 
                 except Exception:
-                    import traceback
-
-                    print(traceback.format_exc())
+                    pass
 
                 self._cleanup_task = self._loop.create_task(self._cleanup())
 
@@ -271,9 +264,7 @@ class TCPProtocol(Generic[T, K]):
                     )
 
         except Exception:
-            import traceback
-
-            print(traceback.format_exc())
+            pass
 
     def __iter__(self):
         for node_id in self._node_host_map:
@@ -403,9 +394,7 @@ class TCPProtocol(Generic[T, K]):
                     )
 
         except Exception:
-            import traceback
-
-            print(traceback.format_exc())
+            pass
 
     def _create_client_ssl_context(
         self, cert_path: Optional[str] = None, key_path: Optional[str] = None

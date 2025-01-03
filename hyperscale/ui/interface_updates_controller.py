@@ -26,7 +26,7 @@ class InterfaceUpdatesController:
         workflows: list[str]
     ):
         await self._update_lock.acquire()
-        self._active_workflows_updates.put(workflows)
+        self._active_workflows_updates.put_nowait(workflows)
 
         if self._update_lock.locked():
             self._update_lock.release()

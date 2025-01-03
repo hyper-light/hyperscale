@@ -767,9 +767,7 @@ class WorkflowRunner:
                     )
 
             except Exception:
-                import traceback
-
-                print(traceback.format_exc())
+                pass
 
             elapsed = time.monotonic() - start
 

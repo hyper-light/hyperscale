@@ -186,7 +186,7 @@ class RemoteGraphManager:
             provisioned_batch, workflow_vus = self._provision(workflow_set)
 
             await self._updates.update_active_workflows([
-                workflow_name for group in provisioned_batch
+                workflow_name.lower() for group in provisioned_batch
                 for workflow_name, _, _ in group
             ])
 

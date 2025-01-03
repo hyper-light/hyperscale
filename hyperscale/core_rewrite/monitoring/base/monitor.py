@@ -152,9 +152,7 @@ class BaseMonitor:
                     self.release_lock(run_id, workflow_name)
 
         except Exception:
-            import traceback
-
-            print(traceback.format_exc())
+            pass
 
     async def stop_background_monitor(
         self,

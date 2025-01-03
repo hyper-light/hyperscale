@@ -1,4 +1,4 @@
-from .terminal import Terminal
+from hyperscale.ui.components.terminal.terminal import Terminal
 
 
 def action(default_channel: str | None = None):

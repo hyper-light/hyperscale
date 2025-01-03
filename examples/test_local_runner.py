@@ -18,11 +18,7 @@ class Test(Workflow):
         self,
         url: URL = "https://httpbin.org/get",
     ) -> HTTPResponse:
-        response = await self.client.http.get(url)
-        assert (
-            response.status >= 200 and response.status < 300
-        ), f"Err. - Request returned status - {response.status}"
-        return response
+        return await self.client.http.get(url)
 
 
 async def run():

@@ -43,9 +43,6 @@ async def run_server(
         await server.close()
 
     except Exception:
-        import traceback
-
-        print(traceback.format_exc())
         pass
 
 
@@ -97,16 +94,9 @@ def run_thread(
         )
 
     except Exception:
-        import traceback
-
-        print(traceback.format_exc())
-        abort_server(server)
         pass
 
     except asyncio.CancelledError:
-        import traceback
-
-        print(traceback.format_exc())
         abort_server(server)
 
 

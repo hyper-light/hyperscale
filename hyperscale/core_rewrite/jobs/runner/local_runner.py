@@ -18,14 +18,31 @@ from .local_server_pool import LocalServerPool
 allow_connection_pickling()
 
 
-def abort(
+async def abort(
     manager: RemoteGraphManager,
     server: LocalServerPool,
+    interface: HyperscaleInterface,
 ):
+    
+    try:
+        await interface.abort()
+
+    except Exception:
+        pass
+
+    except asyncio.CancelledError:
+        pass
+
     try:
         manager.abort()
-        server.abort()
+    except Exception:
+        pass
 
+    except asyncio.CancelledError:
+        pass
+
+    try:
+        server.abort()
     except Exception:
         pass
 
@@ -73,16 +90,23 @@ class LocalRunner:
         close_task = asyncio.current_task()
 
         for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
+
+            sig = getattr(
+                signal,
+                signame,
+            )
+
             loop.add_signal_handler(
-                getattr(
-                    signal,
-                    signame,
-                ),
-                lambda signame=signame: abort(
-                    self._remote_manger,
-                    self._server_pool,
+                sig,
+                lambda signame=signame: asyncio.create_task(
+                    abort(
+                        self._remote_manger,
+                        self._server_pool,
+                        self._interface
+                    )
                 ),
             )
+
 
         self._interface.initialize(workflows)
         await self._interface.run()
@@ -143,6 +167,15 @@ class LocalRunner:
                 return results
 
         except Exception:
+
+            try:
+                await self._interface.abort()
+
+            except Exception:
+                pass
+            except asyncio.CancelledError:
+                pass
+            
             try:
                 self._remote_manger.abort()
             except Exception:
@@ -152,14 +185,6 @@ class LocalRunner:
 
             try:
                 self._server_pool.abort()
-            except Exception:
-                pass
-            except asyncio.CancelledError:
-                pass
-
-            try:
-                await self._interface.abort()
-
             except Exception:
                 pass
             except asyncio.CancelledError:
@@ -168,6 +193,15 @@ class LocalRunner:
             self._kill_processes()
 
         except asyncio.CancelledError:
+
+            try:
+                await self._interface.abort()
+
+            except Exception:
+                pass
+            except asyncio.CancelledError:
+                pass
+
             try:
                 self._remote_manger.abort()
             except Exception:
@@ -181,14 +215,6 @@ class LocalRunner:
             except Exception:
                 pass
 
-            except asyncio.CancelledError:
-                pass
-
-            try:
-                await self._interface.abort()
-
-            except Exception:
-                pass
             except asyncio.CancelledError:
                 pass
 
@@ -209,7 +235,11 @@ class LocalRunner:
     def _kill_processes(self):
         child_processes = active_children()
         for child in child_processes:
-            child.kill()
+            try:
+                child.kill()
+
+            except Exception:
+                pass
 
         process = current_process()
         if process:
