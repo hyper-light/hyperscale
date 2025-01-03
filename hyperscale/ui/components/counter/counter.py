@@ -11,11 +11,16 @@ class Counter:
         self,
         name: str,
         config: CounterConfig,
+        subscriptions: list[str] | None = None,
     ) -> None:
         self.fit_type = WidgetFitDimensions.X_AXIS
         self.name = name
 
+        if subscriptions is None:
+            subscriptions = []
+
         self._config = config
+        self.subscriptions = subscriptions
 
         self._styled: str | None = None
         self._mode = TerminalMode.to_mode(config.terminal_mode)
@@ -199,7 +204,7 @@ class Counter:
         return data
 
     async def pause(self):
-        passself._unit
+        pass
 
     async def resumse(self):
         pass

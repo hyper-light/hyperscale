@@ -14,11 +14,22 @@ from typing import (
     List,
     TypeVar,
 )
-from hyperscale.ui.state import Action, ActionData, observe
+
+from hyperscale.ui.components.counter import Counter
+from hyperscale.ui.components.header import Header
+from hyperscale.ui.components.link import Link
+from hyperscale.ui.components.progress_bar import ProgressBar
+from hyperscale.ui.components.scatter_plot import ScatterPlot
+from hyperscale.ui.components.spinner import Spinner
+from hyperscale.ui.components.text import Text
+from hyperscale.ui.components.total_rate import TotalRate
+from hyperscale.ui.components.windowed_rate import WindowedRate
+
+from hyperscale.ui.state import Action, ActionData, observe, SubscriptionSet
 from .canvas import Canvas
 from .engine_config import EngineConfig
-from .section import Section
 from .refresh_rate import RefreshRateMap, RefreshRate
+from .section import Section, Component
 
 
 SignalHandlers = Callable[[int], Any] | int | None
@@ -80,16 +91,9 @@ async def handle_resize(engine: Terminal):
         await engine.resume()
 
     except Exception:
-        pass
+        import traceback
+        print(traceback.format_exc())
 
-
-class SubscriptionSet:
-
-    def __init__(self):
-        self.updates: Dict[str, List[Callable[[ActionData], None]]] = {}
-
-    def add_topic(self, topic: str, update_funcs: List[Callable[[ActionData], None]]):
-        self.updates[topic] = update_funcs
 
 
 class Terminal:
@@ -103,7 +107,7 @@ class Terminal:
         sigmap: Dict[signal.Signals, asyncio.Coroutine] = None,
     ) -> None:
         self.config = config
-        self.canvas = Canvas()
+        self.canvas = Canvas(sections)
 
         refresh_rate = RefreshRate.MEDIUM.value
 
@@ -139,21 +143,34 @@ class Terminal:
         # custom handlers set by ``sigmap`` at the cleanup phase.
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
 
-        self._sections = sections
+
+        components: dict[str, tuple[list[str], Action[ActionData, ActionData]]] = {}
 
         for action, alias in self._actions:
 
             if alias is None:
                 alias = action.__name__
 
+
+            components.update({
+                component.name: (
+                    component.subscriptions,
+                    component.update
+                ) for section in sections for component in section.components.values()
+            })
+
             subscriptions = [
                 section.component.update 
-                for section in self._sections
-                if section.component and alias in section.subscriptions
+                for section in sections
+                if section.has_component and alias in section.component.subscriptions
             ]
 
             if len(subscriptions) > 0:
                 self._updates.add_topic(alias, subscriptions)
+
+        for subscriptions, update in components.values():
+            for subscription in subscriptions:
+                self._updates.add_topic(subscription, [update])
 
     @classmethod
     def wrap_action(
@@ -167,6 +184,44 @@ class Terminal:
             cls._updates,
             alias=alias,
         )
+    
+    async def set_component_active(self, component_name: str):
+        await self._stdout_lock.acquire()
+
+        if section := self.canvas.get_section(component_name):
+            section.set_active(component_name)
+
+        if self._stdout_lock.locked():
+            self._stdout_lock.release()
+    
+    def add_channel(
+        self,
+        component_name: str,
+        channel: str,
+    ):
+        if component := self.canvas.get_component(component_name):
+            component.subscriptions.append(channel)
+            self._updates.add_topic(channel, [component.update])
+    
+    async def replace(
+        self,
+        components: List[
+            Counter 
+            | Header 
+            | Text 
+            | Spinner 
+            | Link 
+            | ProgressBar 
+            | ScatterPlot 
+            | TotalRate 
+            | WindowedRate 
+        ],
+    ):
+        await self._stdout_lock.acquire()
+        await self.canvas.replace(components)
+
+        if self._stdout_lock.locked():
+            self._stdout_lock.release()
 
     async def resize(
         self,
@@ -174,7 +229,6 @@ class Terminal:
         height: int,
     ):
         await self.canvas.initialize(
-            self.canvas._sections,
             width=width,
             height=height,
             horizontal_padding=self._horizontal_padding,
@@ -229,7 +283,6 @@ class Terminal:
 
 
         await self.canvas.initialize(
-            self._sections,
             width=width,
             height=height,
             horizontal_padding=self._horizontal_padding,
@@ -274,8 +327,7 @@ class Terminal:
                     self._stdout_lock.release()
 
             except Exception:
-                import traceback
-                print(traceback.format_exc())
+                pass
 
                 # Wait
             await asyncio.sleep(self._interval)

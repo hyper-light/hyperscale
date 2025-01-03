@@ -13,6 +13,8 @@ async def run():
             default_status='ready',
             animations={
                 'ready': {
+                    'animations': ['stripe', 'highlight', 'color'],
+                    'direction': 'bounce',
                     'primary_color': 'black',
                     'primary_highlight': 'aquamarine_2',
                     'secondary_color': 'black',

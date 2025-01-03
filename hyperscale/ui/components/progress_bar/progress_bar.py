@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
-import inspect
 import math
 from typing import Any
 from hyperscale.ui.config.mode import TerminalMode
@@ -17,11 +15,16 @@ class ProgressBar:
         self,
         name: str,
         config: ProgressBarConfig,
+        subscriptions: list[str] | None = None,
     ) -> None:
         self.fit_type = WidgetFitDimensions.X_AXIS
         self.name = name
 
+        if subscriptions is None:
+            subscriptions = []
+
         self._config = config
+        self.subscriptions = subscriptions
 
         self._total = config.total
 

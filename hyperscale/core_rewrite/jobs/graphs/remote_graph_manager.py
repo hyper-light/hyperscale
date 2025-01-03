@@ -66,6 +66,9 @@ WorkflowVUs = Dict[str, List[int]]
 
 class RemoteGraphManager:
     def __init__(self) -> None:
+
+        self.active_workflows: list[str] = []
+
         self._workers: List[Tuple[str, int]] | None = None
         self._workflows: Dict[str, Workflow] = {}
         self._threads = psutil.cpu_count(logical=False)
@@ -178,6 +181,11 @@ class RemoteGraphManager:
 
         for workflow_set in workflow_traversal_order:
             provisioned_batch, workflow_vus = self._provision(workflow_set)
+
+            self.active_workflows = [
+                workflow_name for group in provisioned_batch
+                for workflow_name, _, _ in group
+            ]
 
             results = await asyncio.gather(
                 *[
@@ -382,6 +390,10 @@ class RemoteGraphManager:
         )
 
         return context[workflow]
+    
+    async def get_workflow_update(self, workflow: str) -> WorkflowStatusUpdate | None:
+        if self._graph_updates[workflow].empty() is False:
+            return await self._graph_updates[workflow].get()
 
     async def _update(self, update: WorkflowStatusUpdate):
         self._graph_updates[update.workflow].put_nowait(update)

@@ -42,6 +42,8 @@ class SectionConfig(BaseModel):
     right_padding: StrictInt = 0
     top_padding: StrictInt = 0
     bottom_padding: StrictInt = 0
+    max_height: StrictInt | None = None
+    max_width: StrictInt | None = None
     top_border: StrictStr | None = None
     bottom_border: StrictStr | None = None
     left_border: StrictStr | None = None

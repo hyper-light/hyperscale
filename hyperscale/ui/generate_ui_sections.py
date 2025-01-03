@@ -1,97 +1,31 @@
-import asyncio
-import functools
-import time
-
+from hyperscale.core_rewrite.graph import Workflow
+from hyperscale.ui.components.counter import Counter, CounterConfig
 from hyperscale.ui.components.header import Header, HeaderConfig
+from hyperscale.ui.components.progress_bar import ProgressBar, ProgressBarConfig
+from hyperscale.ui.components.scatter_plot import PlotConfig, ScatterPlot
+from hyperscale.ui.components.table import Table, TableConfig
+from hyperscale.ui.components.text import Text, TextConfig
+from hyperscale.ui.components.terminal import Section, SectionConfig
+from hyperscale.ui.components.text import Text, TextConfig
+from hyperscale.ui.components.timer import Timer, TimerConfig
+from hyperscale.ui.components.total_rate import TotalRate, TotalRateConfig
 
-from hyperscale.ui.components.progress_bar import (
-    ProgressBar,
-    ProgressBarConfig,
-)
-from hyperscale.ui.components.terminal import (
-    Terminal,
-    Section,
-    SectionConfig,
-    action
-)
-from hyperscale.ui.components.counter import (
-    Counter,
-    CounterConfig
-)
-from hyperscale.ui.components.total_rate import (
-    TotalRate,
-    TotalRateConfig
-)
-from hyperscale.ui.components.windowed_rate import (
-    WindowedRate,
-    WindowedRateConfig
-)
-from hyperscale.ui.components.scatter_plot import (
-    PlotConfig,
-    ScatterPlot,
-)
-from hyperscale.ui.components.table import (
-    Table,
-    TableConfig,
-)
-from hyperscale.ui.components.timer import (
-    Timer,
-    TimerConfig,
-)
-from hyperscale.ui.components.text import (
-    Text,
-    TextConfig,
-)
-from hyperscale.ui.state import Message
+from hyperscale.core_rewrite.engines.client import TimeParser
+
+from typing import List
 
 
-
-@action()
-async def add(count: int):
-    next_count = count + 1
-
-    channel = 'add_to_total'
-    if count%2 == 1:
-        channel = 'add_to_total_two'
-
-    if channel == 'add_to_total_two' and next_count > 30:
-        next_count = 30
-
-    return Message(
-        channel=channel,
-        data=next_count
-    )
-
-@action()
-async def update_rate(data: list[tuple[int | float, float]]):
-    return data
-
-
-@action()
-async def update_timings(timings: list[tuple[int, int]]):
-    return timings
-
-@action()
-async def update_table(stats: dict[str, dict[str, int]]):
-
-    return [
-        {
-            'step': step_name,
-            'complete': step.get('completed', 0),
-            'success':step.get('success', 0),
-            'failed': step.get('failed', 0)
-        } for step_name, step in stats.items()
+def generate_ui_sections(
+    workflows: List[Workflow],
+):
+    workflow_configs: list[tuple[str, int]] = [
+        (
+            workflow.name.lower(),
+            TimeParser(workflow.duration).time
+        ) for workflow in workflows
     ]
 
-@action()
-async def update_timer():
-    return
-
-
-async def display():
-    
-
-    sections = [
+    return [
         Section(
             SectionConfig(
                 height="xx-small", 
@@ -136,7 +70,7 @@ async def display():
                         terminal_mode="extended",
                     )
                 ),
-            ]
+            ],
         ),
         Section(
             SectionConfig(
@@ -149,28 +83,18 @@ async def display():
                 horizontal_alignment='center',
                 vertical_alignment="center",
             ),
-            components=[
+            component=[
                 ProgressBar(
-                    "progress_bar_one",
+                    f"run_progress_{worklow_name}",
                     ProgressBarConfig(
-                        total=60,
+                        total=time_limit_seconds,
                         active_color="royal_blue",
                         failed_color="white",
                         complete_color="hot_pink_3",
                         terminal_mode="extended",
                     ),
-                    subscriptions=['add_to_total'],
-                ),
-                ProgressBar(
-                    "progress_bar_two",
-                    ProgressBarConfig(
-                        total=30,
-                        active_color="royal_blue",
-                        failed_color="white",
-                        complete_color="hot_pink_3",
-                        terminal_mode="extended",
-                    ),
-                ),
+                    subscriptions=['update_run_timer'],
+                ) for worklow_name, time_limit_seconds in workflow_configs
             ],
         ),
         Section(
@@ -187,11 +111,12 @@ async def display():
             ),
             components=[
                 Text(
-                    'text',
+                    f'run_message_display_{workflow_name}',
                     TextConfig(
                         text='Initializing...',
-                    )
-                )
+                    ),
+                    subscriptions=[f'update_run_message_{workflow_name}']
+                ) for workflow_name, _ in workflow_configs
             ],
         ),
         Section(
@@ -206,15 +131,15 @@ async def display():
             ),
             components=[
                 Timer(
-                    'timer',
+                    f'run_timer_{workflow_name}',
                     TimerConfig(
                         color='aquamarine_2',
                         terminal_mode='extended',
                         horizontal_alignment='center',
                     ),
-                    subscriptions=['update_timer'],
-                ),
-            ],
+                    subscriptions=[f'update_run_timer_{workflow_name}']
+                ) for workflow_name, _ in workflow_configs
+            ]
         ),
         Section(
             SectionConfig(
@@ -230,14 +155,14 @@ async def display():
             ),
             components=[
                 Counter(
-                    'counter',
+                    f'executions_counter_{workflow_name}',
                     CounterConfig(
                         unit='total actions',
                         terminal_mode='extended'
                     ),
-                    subscriptions=['add_to_total'],
-                ),
-            ],
+                    subscriptions=[f'update_total_executions_{workflow_name}']
+                ) for workflow_name, _ in workflow_configs
+            ]
         ),
         Section(
             SectionConfig(
@@ -252,14 +177,14 @@ async def display():
             ),
             components=[
                 TotalRate(
-                    'total_rate',
+                    f'total_executions_{workflow_name}',
                     TotalRateConfig(
                         unit='aps',
                         terminal_mode='extended'
                     ),
-                    subscriptions=['add_to_total'],
-                )
-            ],
+                    subscriptions=[f'update_total_executions_{workflow_name}'],
+                ) for workflow_name, _ in workflow_configs
+            ]
         ),
         Section(
             SectionConfig(
@@ -274,18 +199,18 @@ async def display():
             ),
             components=[
                 ScatterPlot(
-                    "scatter_test",
+                    f"executions_over_time_{workflow_name}",
                     PlotConfig(
                         plot_name="Completions Per. Second",
                         x_axis_name="Time (sec)",
-                        y_axis_name="Executions",
+                        y_axis_name="Value",
                         line_color="aquamarine_2",
                         point_char="dot",
                         terminal_mode="extended",
                     ),
-                    subscriptions=['update_timings'],
-                )
-            ],
+                    subscriptions=[f'update_execution_timings_{workflow_name}'],
+                ) for workflow_name, _ in workflow_configs
+            ]
         ),
         Section(
             SectionConfig(
@@ -301,17 +226,16 @@ async def display():
             ),
             components=[
                 Table(
-                    "table_test",
+                    f"execution_stats_table_{workflow_name}",
                     TableConfig(
                         headers={
                             "step": {
                                 "default": "N/A",
-                                'fixed': True
                             },
-                            "complete": {
+                            "completed": {
                                 "default": 0,
                             },
-                            "success": {
+                            "succeeded": {
                                 "data_color": lambda value: "aquamarine_2"
                                 if value > 0
                                 else None,
@@ -324,80 +248,13 @@ async def display():
                                 "default": 0
                             },
                         },
-                        minimum_column_width=12,
+                        minimum_column_width=8,
                         border_color="aquamarine_2",
                         terminal_mode="extended",
                         table_format="simple",
-                        no_update_on_push=True,
                     ),
-                    subscriptions=['update_table'],
-                )
-            ],
+                    subscriptions=[f'update_execution_stats_{workflow_name}'],
+                ) for workflow_name, _ in workflow_configs
+            ]
         ),
     ]
-
-    engine = Terminal(sections)
-
-    engine.add_channel('progress_bar_two', 'add_to_total_two')
-
-    await engine.render(
-        horizontal_padding=4,
-        vertical_padding=1,
-    )
-
-    data: list[tuple[int, int]] = []
-
-    elapsed = 0
-    start = time.monotonic()
-
-    data = []
-    table_data = {
-        'http_get_login': {
-            'completed': 0,
-            'success': 0,
-            'failed': 0
-        }
-    }
-    samples = []
-
-    active_progress_bar = 'progress_bar_one'
-    active_channel = 'add_to_total'
-
-    await update_timer()
-
-    for idx in range(60):
-        await asyncio.sleep(1)
-
-        data.append((elapsed, idx))
-
-        if idx < 15:
-            await update_table(table_data)
-
-
-        if idx%5 == 0 and idx > 0 and active_progress_bar != 'progress_bar_two':
-            active_progress_bar = 'progress_bar_two'
-            active_channel = 'add_to_total_two'
-            await engine.set_component_active(active_progress_bar)
-
-        elif active_progress_bar != 'progress_bar_one':
-            active_progress_bar = 'progress_bar_one'
-            active_channel = 'add_to_total'
-            await engine.set_component_active(active_progress_bar)
-            
-
-        samples.append((1, time.monotonic()))
-
-
-        await asyncio.gather(*[
-            add(idx),
-            update_timings(data)
-        ])
-        
-        elapsed = time.monotonic() - start
-
-    await update_timer()
-
-    await engine.stop()
-
-
-asyncio.run(display())

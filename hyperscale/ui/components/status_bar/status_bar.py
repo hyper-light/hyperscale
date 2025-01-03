@@ -11,11 +11,17 @@ class StatusBar:
         self,
         name: str,
         config: StatusBarConfig,
+        subscriptions: list[str] | None = None,
     ):
         self.fit_type = WidgetFitDimensions.X_AXIS
         self._name = name
 
+        if subscriptions is None:
+            subscriptions = []
+
         self._config = config
+        self.subscriptions = subscriptions
+        
         self._default_status = config.default_status
 
         status_styling_map = self._config.status_styles

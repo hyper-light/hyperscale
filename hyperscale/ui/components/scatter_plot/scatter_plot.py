@@ -19,12 +19,18 @@ class ScatterPlot:
     def __init__(
         self, 
         name: str,
-        config: PlotConfig
+        config: PlotConfig,
+        subscriptions: list[str] | None = None,
     ) -> None:
         self.fit_type = WidgetFitDimensions.X_Y_AXIS
         self.name = name
 
+        if subscriptions is None:
+            subscriptions = []
+
         self._config = config
+        self.subscriptions = subscriptions
+        
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
         self._data: list[

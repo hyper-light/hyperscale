@@ -21,12 +21,17 @@ class Link:
     def __init__(
         self,
         name: str, 
-        config: LinkConfig
+        config: LinkConfig,
+        subscriptions: list[str] | None = None,
     ) -> None:
         self.fit_type = WidgetFitDimensions.X_AXIS
         self.name = name
 
+        if subscriptions is None:
+            subscriptions = []
+
         self._config = config
+        self.subscriptions = subscriptions
 
         self._text: str = config.link_text
         self._link: LinkValidator | None = config.link_url

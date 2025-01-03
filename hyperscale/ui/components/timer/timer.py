@@ -1,6 +1,6 @@
 import asyncio
 import time
-
+import math
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.ui.styling import stylize, get_style
@@ -18,6 +18,7 @@ UnitGranularity = Literal[
     'years'
 ]
 
+
 TimerSignal = Tuple[
     float | None, 
     TimerStatus
@@ -30,17 +31,22 @@ class Timer:
         self,
         name: str,
         config: TimerConfig,
+        subscriptions: list[str] | None = None,
     ):
         self.fit_type = WidgetFitDimensions.X_AXIS
         self.name = name
+
+        if subscriptions is None:
+            subscriptions = []
+
         self._config = config
+        self.subscriptions = subscriptions
 
         self._start: float | None = None
         self._refresh_start: float | None = None
         self._refresh_elapsed: float = 0
 
         self._max_width: int | None = None
-        self._time_width = 6
         self._status = TimerStatus.STOPPED
 
         self._update_lock: asyncio.Lock | None = None
@@ -64,11 +70,11 @@ class Timer:
 
     @property
     def raw_size(self):
-        return self._time_width
+        return self._max_width
 
     @property
     def size(self):
-        return self._time_width
+        return self._max_width
     
     async def fit(
         self,
@@ -85,7 +91,7 @@ class Timer:
 
         self._updates.put_nowait((None, self._status))
 
-    async def update(self, *_: Tuple[Any]):
+    async def update(self, *args: Tuple[Any], **kwargs: Dict[str, Any]):
         await self._update_lock.acquire()
 
         if self._status == TimerStatus.STOPPED:
@@ -199,10 +205,10 @@ class Timer:
         seconds_decimal = int((elapsed % 1) * 10)
 
         if seconds_whole < 10:
-            time_string = f'  {seconds_whole:01d}.{seconds_decimal:1d}s'
+            time_string = f'{seconds_whole:01d}.{seconds_decimal:1d}s'
 
         elif seconds_whole >= 10 and seconds_whole < 60:
-            time_string = f' {seconds_whole:02d}.{seconds_decimal:1d}s'
+            time_string = f'{seconds_whole:02d}.{seconds_decimal:1d}s'
 
         return time_string
     
@@ -214,7 +220,7 @@ class Timer:
         seconds_whole = int(elapsed)%60
 
         if minutes_whole > 0 and minutes_whole < 10:
-            time_string = f' {minutes_whole:01d}m' + f'{seconds_whole:02d}s'
+            time_string = f'{minutes_whole:01d}m' + f'{seconds_whole:02d}s'
 
         elif minutes_whole >= 10 and minutes_whole < 60:
             time_string = f'{minutes_whole:02d}m' + f'{seconds_whole:02d}s'
@@ -231,7 +237,7 @@ class Timer:
         self._carry = minutes_whole
 
         if hours_whole > 0 and hours_whole < 10:
-            time_string = f' {hours_whole:01d}h' + f'{minutes_whole:02d}m'
+            time_string = f'{hours_whole:01d}h' + f'{minutes_whole:02d}m'
 
         elif hours_whole >= 10 and hours_whole < 24:
             time_string = f'{hours_whole:02d}h' + f'{minutes_whole:02d}m'
@@ -246,7 +252,7 @@ class Timer:
         hours_whole = int(elapsed/3600)%24
 
         if days_whole > 0 and days_whole < 7:
-            time_string = f' {days_whole:01d}d' + f'{hours_whole:02d}h'
+            time_string = f'{days_whole:01d}d' + f'{hours_whole:02d}h'
 
         return time_string
     
@@ -258,7 +264,7 @@ class Timer:
         days_whole = int(elapsed/86400)%7
 
         if weeks_whole > 0 and weeks_whole < 10:
-            time_string = f' {weeks_whole:01d}w' + f'{days_whole:02d}d'
+            time_string = f'{weeks_whole:01d}w' + f'{days_whole:02d}d'
 
         elif weeks_whole >= 10 and weeks_whole < 52:
             time_string = f'{weeks_whole:02d}w' + f'{days_whole:02d}d'
@@ -274,7 +280,7 @@ class Timer:
         weeks_whole = int(elapsed/604800)%52
 
         if years_whole > 0 and years_whole < 10:
-            time_string = f' {years_whole:01d}y' + f'{weeks_whole:02d}w'
+            time_string = f'{years_whole:01d}y' + f'{weeks_whole:02d}w'
 
         elif years_whole >= 10:
             time_string = f'{years_whole}.' +  f'{years_decimal:02d}y'
@@ -288,6 +294,7 @@ class Timer:
     ):
 
         time_string = time_string[:self._max_width]
+        remainder = self._max_width - len(time_string)
         
         if self._config.color or self._config.highlight or self._config.attributes:
             time_string = await stylize(
@@ -309,6 +316,9 @@ class Timer:
                 mode=self._mode,
             )
 
+        if remainder > 0:
+            time_string = self._pad_status_text_horizontal(time_string, remainder)
+
         self._last_frame = time_string
 
         return [self._last_frame], True
@@ -325,6 +335,24 @@ class Timer:
         
         return data
     
+    def _pad_status_text_horizontal(
+        self,
+        status_text: str,
+        remainder: int,
+    ):
+        match self._config.horizontal_alignment:
+            case 'left':
+                return status_text + (remainder * ' ')
+            
+            case 'center':
+                left_pad = math.ceil(remainder / 2)
+                right_pad = math.floor(remainder / 2)
+
+                return " " * left_pad + status_text + " " * right_pad
+            
+            case 'right':
+                return (remainder * ' ') + status_text
+            
     async def pause(self):
         pass
 

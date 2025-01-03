@@ -11,6 +11,7 @@ from hyperscale.ui.styling import stylize, get_style
 from hyperscale.ui.styling.attributes import Attributizer
 from hyperscale.ui.styling.colors import Colorizer, HighlightColorizer
 from typing import Dict, List
+
 from .animated_status_bar_config import AnimatedStatusBarConfig, AnimationConfig, AnimationDirection, AnimationType
 
 
@@ -48,11 +49,17 @@ class AnimatedStatusBar:
         self,
         name: str,
         config: AnimatedStatusBarConfig,
+        subscriptions: list[str] | None = None,
     ):
         self.fit_type = WidgetFitDimensions.X_AXIS
-        self._name = name
+        self.name = name
+
+        if subscriptions is None:
+            subscriptions = []
 
         self._config = config
+        self.subscriptions = subscriptions
+        
         self._current_status = config.default_status
 
         duration_string = f'{config.animation_duration}{config.animation_duration_unit}'
@@ -254,7 +261,7 @@ class AnimatedStatusBar:
                 mode=self._mode,
             ) 
 
-        remainder = self._max_width - status_text_width
+        remainder = self._max_width - status_text_width - self._space_padding
         return self._pad_status_text_horizontal(status_text, remainder)
     
     async def _precompute_status_styles(self):

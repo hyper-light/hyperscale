@@ -1,11 +1,13 @@
 import asyncio
 import math
+import uuid
 from typing import Any, Dict, List
 
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.styling import stylize
 
 from hyperscale.ui.components.counter import Counter
+from hyperscale.ui.components.empty import Empty
 from hyperscale.ui.components.header import Header
 from hyperscale.ui.components.link import Link
 from hyperscale.ui.components.progress_bar import ProgressBar
@@ -15,26 +17,59 @@ from hyperscale.ui.components.text import Text
 from hyperscale.ui.components.total_rate import TotalRate
 from hyperscale.ui.components.windowed_rate import WindowedRate
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
+from typing import Generic, TypeVar
 
 from .section_config import SectionConfig, HorizontalSectionSize, VerticalSectionSize
 
 
+Component = (
+    Counter
+    | Empty
+    | Header
+    | Link
+    | ProgressBar
+    | ScatterPlot
+    | Spinner
+    | Text
+    | TotalRate
+    | WindowedRate
+)
 
 
-class Section:
+T = TypeVar(
+    'T', 
+    bound=list[Component]
+)
+
+
+class Section(Generic[T]):
     def __init__(
         self,
         config: SectionConfig,
-        component: Counter | Header | Text | Spinner | Link | ProgressBar | ScatterPlot | TotalRate | WindowedRate | None = None,
-        subscriptions: List[str] | None = None,
+        components: T | None = None,
     ) -> None:
+        
+        self._empty = False
+        
+        if components is None or (
+            isinstance(components, list)
+            and len(components) < 1
+        ):
+            components = [
+                Empty(str(uuid.uuid4()))
+            ]
 
-        if subscriptions is None:
-            subscriptions = []
+            self._empty = True
 
         self.config = config
-        self.component = component
-        self.subscriptions = subscriptions
+
+        self.component_names = [component.name for component in components]
+        self.components: Dict[str, Component] = {
+            component.name: component for component in components
+        }
+    
+        self._active_component = self.component_names[0]
+        self.component = self.components[self._active_component]
 
         self._blocks: List[str] = []
 
@@ -58,7 +93,7 @@ class Section:
             "large": 2 /3,
             "x-large": 0.75,
             "xx-large": 0.85,
-            "full": 0.99,
+            "full": 1,
         }
 
         self._bottom_padding: str | None = None
@@ -70,12 +105,44 @@ class Section:
         self._right_border: str | None = None
 
     @property
+    def has_component(self):
+        return self._empty is False
+
+    @property
     def width(self):
         return self._actual_width
 
     @property
     def height(self):
         return self._actual_height
+    
+    def set_active(self, component_name: str):
+        if component := self.components.get(component_name):
+            self._active_component = component_name
+            self.component = component
+    
+    async def replace(
+        self,
+        component: (
+            Counter 
+            | Header 
+            | Text 
+            | Spinner 
+            | Link 
+            | ProgressBar 
+            | ScatterPlot 
+            | TotalRate 
+            | WindowedRate 
+        )
+    ):
+        component_name = component.name
+
+        if self.components.get(component_name) is None:
+            self.components[component_name] = component
+
+        self._active_component = component_name
+        self.component = component
+        await self._fit_components(component_name=component_name)
 
     async def resize(
         self,
@@ -92,6 +159,12 @@ class Section:
 
         height_scale = self._scale[self.config.height]
         self._actual_height = math.floor(height_scale * canvans_height)
+
+        if self.config.max_width and self._actual_width > self.config.max_width:
+            self._actual_width = self.config.max_width
+
+        if self.config.max_height and self._actual_height > self.config.max_height:
+            self._actual_height = self.config.max_height
 
         horizontal_padding = self.config.left_padding + self.config.right_padding
         vertical_padding = self.config.top_padding + self.config.bottom_padding
@@ -151,17 +224,17 @@ class Section:
                 mode=TerminalMode.to_mode(self.config.mode),
             )
 
-        if self.component:
-            await self._fit_component()
+        if self._empty is False:
+            await self._fit_components()
 
         self._left_pad = " " * (self.config.left_padding + self._left_remainder_pad)
         self._right_pad = " " * (self.config.right_padding + self._right_remainder_pad)
 
 
     async def render(self):
-
-        if self.component:
+        if self._empty is False:
             return await self._render_with_component()
+        
         elif self._last_render is None:
             render = await self._render_without_component()
             self._last_render = render
@@ -171,25 +244,42 @@ class Section:
         else:
             return self._last_render
         
-    async def _fit_component(self):
+    async def _fit_components(
+        self,
+        component_name: str | None = None
+    ):
+        
+        if component_name and (
+            component := self.components.get(component_name)
+        ):
+            await self._fit_component(component)
 
-        match self.component.fit_type:
+        else:
+            await asyncio.gather(*[
+                self._fit_component(component) for component in self.components.values()
+            ])
+
+    async def _fit_component(
+        self,
+        component: Component,
+    ):
+        match component.fit_type:
             case WidgetFitDimensions.X_AXIS:
-                await self.component.fit(self._inner_width)
+                await component.fit(self._inner_width)
 
             case WidgetFitDimensions.Y_AXIS:
-                await self.component.fit(self._inner_height)
+                await component.fit(self._inner_height)
 
             case WidgetFitDimensions.X_Y_AXIS:
-                await self.component.fit(
+                await component.fit(
                     max_width=self._inner_width,
                     max_height=self._inner_height,
                 )
 
             case _:
-                await self.component.fit(self._inner_width)
+                await component.fit(self._inner_width)
 
-        remainder = self._inner_width - self.component.raw_size 
+        remainder = self._inner_width - component.raw_size 
 
         (
             left_remainder_pad,
@@ -229,7 +319,13 @@ class Section:
                 mode=self._mode,
             )
 
-        padding_row += " " * self.component.raw_size
+        if self.config.left_padding:
+            padding_row += " " * self.config.left_padding
+
+        padding_row += " " * self._inner_width
+
+        if self.config.right_padding:
+            padding_row += " " * self.config.right_padding
 
         if self.config.right_border:
             padding_row += self.config.right_border
@@ -393,17 +489,17 @@ class Section:
         return fill_line
     
     async def pause(self):
-        if self.component:
+        if self._empty is False:
             await self.component.pause()
 
     async def resume(self):
-        if self.component:
+        if self._empty is False:
             await self.component.resume()
 
     async def stop(self):
-        if self.component:
+        if self._empty is False:
             await self.component.stop()
 
     async def abort(self):
-        if self.component:
+        if self._empty is False:
             await self.component.abort()

@@ -18,12 +18,18 @@ class Spinner:
     def __init__(
         self,
         name: str,
-        config: SpinnerConfig
+        config: SpinnerConfig,
+        subscriptions: list[str] | None = None,
     ):
         self.fit_type = WidgetFitDimensions.X_AXIS
         self._name = name
 
+        if subscriptions is None:
+            subscriptions = []
+
         self._config = config
+        self.subscriptions = subscriptions
+        
         # Spinner
         factory = SpinnerFactory()
         spinner = factory.get(config.spinner)

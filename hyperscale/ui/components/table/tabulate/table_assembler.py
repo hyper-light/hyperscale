@@ -59,6 +59,7 @@ class TableAssembler:
         border_type: TableBorderType,
         column_size: int,
         columns_count: int,
+        max_width: int,
         cell_alignment: CellAlignment = "LEFT",
         field_format_map: Dict[str, str] | None = None,
         field_default_map: Dict[str, Any] | None = None,
@@ -70,8 +71,9 @@ class TableAssembler:
         self._border_type = border_type
         self._cell_alignment_map = CellAlignmentMap()
         self._cell_alignment = self._cell_alignment_map.by_name(cell_alignment)
-        self._column_size = column_size
-        self._columns_count = columns_count
+        self.columns_size = column_size
+        self.columns_count = columns_count
+        self.max_width = max_width
 
         if field_format_map is None:
             field_format_map = {}
@@ -928,6 +930,13 @@ class TableAssembler:
         headers: list[str],
         data: list[list[Any]],
     ) -> list[str]:
+        
+
+        headers_count = len(headers)
+        if headers_count < self.columns_count:
+            self.columns_count = headers_count
+            self.columns_size = math.floor(self.max_width/self.columns_count)
+
         lines: list[str] = []
 
         lines.append(await self._create_line_above())
@@ -970,6 +979,9 @@ class TableAssembler:
     ):
         data_and_spacer_lines: list[str] = []
 
+        if len(headers) < self.columns_count:
+            print(len(headers))
+
         data_lines = await asyncio.gather(
             *[
                 self._create_data_line(
@@ -1007,7 +1019,7 @@ class TableAssembler:
                         idx,
                     ),
                 )
-                for idx in range(self._columns_count)
+                for idx in range(self.columns_count)
             ]
         )
 
@@ -1027,7 +1039,7 @@ class TableAssembler:
                         idx,
                     ),
                 )
-                for idx in range(self._columns_count)
+                for idx in range(self.columns_count)
             ]
         )
 
@@ -1047,7 +1059,7 @@ class TableAssembler:
                         idx,
                     ),
                 )
-                for idx in range(self._columns_count)
+                for idx in range(self.columns_count)
             ]
         )
 
@@ -1067,7 +1079,7 @@ class TableAssembler:
                         idx,
                     ),
                 )
-                for idx in range(self._columns_count)
+                for idx in range(self.columns_count)
             ]
         )
 
@@ -1090,7 +1102,7 @@ class TableAssembler:
                     header_key=header,
                     color_map=self._header_color_map,
                 )
-                for idx, header in enumerate(headers[: self._columns_count])
+                for idx, header in enumerate(headers[: self.columns_count])
             ]
         )
 
@@ -1101,6 +1113,7 @@ class TableAssembler:
         headers: list[str],
         row: list[Any],
     ) -> str | None:
+
         data_cells = await asyncio.gather(
             *[
                 self._create_cell(
@@ -1116,7 +1129,7 @@ class TableAssembler:
                     header_key=headers[idx],
                     color_map=self._data_color_map,
                 )
-                for idx in range(self._columns_count)
+                for idx in range(self.columns_count)
             ]
         )
 
@@ -1135,7 +1148,7 @@ class TableAssembler:
             position_type,
         )
 
-        fill_size = self._column_size - border_length
+        fill_size = self.columns_size - border_length
 
         match position_type:
             case CharsetPositionType.START:
@@ -1170,6 +1183,10 @@ class TableAssembler:
         header_key: str | None = None,
         color_map: HeaderColorMap | DataColorMap | None = None,
     ):
+        
+        if data is None:
+            data = self._field_default_map.get(header_key)
+
         converted_data = self._convert_cell_to_string(data, header_key)
 
         data_length = len(converted_data)
@@ -1269,7 +1286,7 @@ class TableAssembler:
         self,
         charset: TableBorderCharset,
     ):
-        inbetween_cells = self._columns_count - 2
+        inbetween_cells = self.columns_count - 2
 
         start_cell_border_length = self._calculate_start_border_length(charset)
 
@@ -1314,14 +1331,14 @@ class TableAssembler:
         header_length: int,
         border_length: int,
     ):
-        padding_total = self._column_size - header_length - border_length
+        padding_total = self.columns_size - header_length - border_length
         adjusted_header_length = 0
 
         if padding_total < 0:
             difference = abs(padding_total)
             adjusted_header_length = header_length - difference
 
-            padding_total = self._column_size - adjusted_header_length - border_length
+            padding_total = self.columns_size - adjusted_header_length - border_length
 
         padding_left = 0
         padding_right = 0
@@ -1457,7 +1474,7 @@ class TableAssembler:
         return len(charset.end_char)
 
     def _calculate_position_type(self, idx: int):
-        last_idx = self._columns_count - 1
+        last_idx = self.columns_count - 1
 
         if idx == 0:
             return CharsetPositionType.START

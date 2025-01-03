@@ -10,12 +10,17 @@ class Text:
     def __init__(
         self,
         name: str,
-        config: TextConfig
+        config: TextConfig,
+        subscriptions: list[str] | None = None,
     ) -> None:
         self.fit_type = WidgetFitDimensions.X_AXIS
         self.name = name
 
+        if subscriptions is None:
+            subscriptions = []
+
         self._config = config
+        self.subscriptions = subscriptions
 
         self._max_width: int | None = None
         self._text_width = 0

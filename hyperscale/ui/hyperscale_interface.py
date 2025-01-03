@@ -1,33 +1,70 @@
-import math
-
-from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
+import asyncio
 from hyperscale.core_rewrite.graph import Workflow
-from hyperscale.ui.components.progress_bar import (
-    BarFactory,
-    ProgressBarColorConfig,
-)
-from hyperscale.ui.components.terminal import (
-    RenderEngine,
-    Section,
-)
+from hyperscale.ui.components.terminal import Terminal, Section
+from .generate_ui_sections import generate_ui_sections
 
 
 class HyperscaleInterface:
-    def __init__(self):
-        self._engine = RenderEngine()
-        self._bar_factory = BarFactory()
-        self.workflow_sections: dict[str, Section] = []
+    def __init__(
+        self,
+        padding: tuple[int, int] | None = None
+    ):
+        
+        if padding is None:
+            padding = (4, 1)
 
-    async def initialize(self, workflows: list[Workflow]):
-        for workflow in workflows:
-            workflow_duration_seconds = math.ceil(TimeParser(workflow.duration).time)
-            bar = self._bar_factory.create_bar(
-                int(workflow_duration_seconds),
-                colors=ProgressBarColorConfig(
-                    active_color="royal_blue",
-                    fail_color="white",
-                    ok_color="hot_pink_3",
-                ),
-                mode="extended",
-                disable_output=True,
+
+        self._terminal: Terminal | None = None
+
+        horizontal_padding, vertical_padding = padding
+
+        self._horizontal_padding = horizontal_padding
+        self._vertical_padding = vertical_padding
+
+        self._terminal_task: asyncio.Task | None = None
+
+    def initialize(
+        self,
+        workflows: list[Workflow],
+    ):
+        sections: list[Section] = generate_ui_sections(workflows)
+        self._terminal = Terminal(sections)
+
+    def run(self):
+
+        if self._terminal is None:
+            raise Exception('Err. - Terminal not initialized.')
+
+        if self._terminal_task is None:
+            self._terminal_task = asyncio.ensure_future(
+                self._terminal.render(
+                    horizontal_padding=self._horizontal_padding,
+                    vertical_padding=self._vertical_padding,
+                )
             )
+
+    async def stop(self):
+        if self._terminal:
+            await self._terminal.stop()
+            await self._terminal_task
+
+    async def abort(self):
+
+        if self._terminal is None:
+            return
+
+        try:
+            await self._terminal.abort()
+        except Exception:
+            pass
+
+        if self._terminal_task is None:
+            return
+    
+        try:
+            self._terminal_task.cancel()
+            self._terminal_task.set_result(None)
+
+        except Exception:
+            pass
+    

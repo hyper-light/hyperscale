@@ -17,11 +17,17 @@ class Header:
         self,
         name: str,
         config: HeaderConfig,
+        subscriptions: list[str] | None = None,
     ):
         self.fit_type = WidgetFitDimensions.X_Y_AXIS
         self.name = name
 
+        if subscriptions is None:
+            subscriptions = []
+
         self._config = config
+        self.subscriptions = subscriptions
+        
         self._word = Word(self._config.header_text)
 
         self._styled_header_lines: list[str] | None = None

@@ -17,11 +17,16 @@ class WindowedRate:
         self,
         name: str,
         config: WindowedRateConfig,
+        subscriptions: list[str] | None = None,
     ) -> None:
         self.fit_type = WidgetFitDimensions.X_AXIS
-        self.name= name
+        self.name = name
+
+        if subscriptions is None:
+            subscriptions = []
 
         self._config = config
+        self.subscriptions = subscriptions
 
         self._precision = config.precision
         self._unit = config.unit

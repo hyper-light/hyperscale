@@ -11,6 +11,7 @@ from hyperscale.core_rewrite.graph import Graph, Workflow
 from hyperscale.core_rewrite.jobs.graphs.remote_graph_manager import RemoteGraphManager
 from hyperscale.core_rewrite.jobs.models import Env
 from hyperscale.core_rewrite.jobs.protocols.socket import bind_tcp_socket
+from hyperscale.ui import HyperscaleInterface
 
 from .local_server_pool import LocalServerPool
 
@@ -48,6 +49,7 @@ class LocalRunner:
             )
 
         self._env = env
+        self._interface = HyperscaleInterface()
         self.host = host
         self.port = port
         self._workers = workers
@@ -78,6 +80,8 @@ class LocalRunner:
                     self._server_pool,
                 ),
             )
+
+        # self._interface.run()
 
         try:
             if self._workers <= 1:
@@ -133,9 +137,6 @@ class LocalRunner:
                 return results
 
         except Exception:
-            import traceback
-
-            print(traceback.format_exc())
             try:
                 self._remote_manger.abort()
             except Exception:
