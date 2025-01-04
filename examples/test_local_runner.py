@@ -10,7 +10,7 @@ from hyperscale.testing import URL, HTTPResponse
 
 
 class Test(Workflow):
-    vus = 1000
+    vus = 4000
     duration = "1m"
 
     @step()

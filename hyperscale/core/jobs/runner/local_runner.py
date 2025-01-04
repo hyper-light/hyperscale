@@ -7,6 +7,7 @@ from typing import List
 
 import psutil
 
+from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph import Graph, Workflow
 from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
 from hyperscale.core.jobs.models import Env
@@ -69,13 +70,14 @@ class LocalRunner:
             )
 
         if workers is None:
-            workers = psutil.cpu_count(logical=False) 
+            workers = psutil.cpu_count(logical=False)
 
         self._env = env
         
         self.host = host
         self.port = port
         self._workers = workers
+        self._worker_connect_timeout = TimeParser(env.MERCURY_SYNC_TCP_CONNECT_SECONDS).time
 
         updates = InterfaceUpdatesController()
         
@@ -118,6 +120,9 @@ class LocalRunner:
         if terminal_ui_enabled:
             self._interface.initialize(workflows)
             await self._interface.run()
+
+        if timeout is None:
+            timeout = self._worker_connect_timeout
 
         try:
             if self._workers <= 1:
