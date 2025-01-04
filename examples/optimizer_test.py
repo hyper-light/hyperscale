@@ -1,7 +1,7 @@
 import asyncio
 
-from hyperscale.core_rewrite.graph import Workflow
-from hyperscale.core_rewrite.jobs import Env, RemoteGraphManager
+from hyperscale.core.graph import Workflow
+from hyperscale.core.jobs import Env, RemoteGraphManager
 
 
 async def return_response(_: int, workflow: Workflow):

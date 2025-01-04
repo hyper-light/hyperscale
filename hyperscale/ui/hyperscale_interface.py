@@ -1,6 +1,6 @@
 import asyncio
 import time
-from hyperscale.core_rewrite.graph import Workflow
+from hyperscale.core.graph import Workflow
 from hyperscale.ui.components.terminal import Terminal, Section
 from .generate_ui_sections import generate_ui_sections
 from .hyperscale_interface_config import HyperscaleInterfaceConfig

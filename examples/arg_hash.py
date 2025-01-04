@@ -2,7 +2,7 @@ import threading
 import uuid
 from typing import Optional
 
-from hyperscale.core_rewrite.snowflake.snowflake_generator import SnowflakeGenerator
+from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 
 
 class OptimizedArg:

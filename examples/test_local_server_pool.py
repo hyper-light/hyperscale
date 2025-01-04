@@ -1,7 +1,7 @@
 import asyncio
 
-from hyperscale.core_rewrite.jobs.models import Env
-from hyperscale.core_rewrite.jobs.runner.local_server_pool import LocalServerPool
+from hyperscale.core.jobs.models import Env
+from hyperscale.core.jobs.runner.local_server_pool import LocalServerPool
 
 
 async def run():

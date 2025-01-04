@@ -1,6 +1,6 @@
 import math
 
-from hyperscale.core_rewrite.graph import Workflow
+from hyperscale.core.graph import Workflow
 from hyperscale.ui.components.counter import Counter, CounterConfig
 from hyperscale.ui.components.header import Header, HeaderConfig
 from hyperscale.ui.components.progress_bar import ProgressBar, ProgressBarConfig
@@ -12,7 +12,7 @@ from hyperscale.ui.components.text import Text, TextConfig
 from hyperscale.ui.components.timer import Timer, TimerConfig
 from hyperscale.ui.components.total_rate import TotalRate, TotalRateConfig
 
-from hyperscale.core_rewrite.engines.client import TimeParser
+from hyperscale.core.engines.client import TimeParser
 
 from typing import List
 

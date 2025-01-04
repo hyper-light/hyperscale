@@ -5,8 +5,8 @@ from typing import Generic, Literal, TypeVar
 
 import dill
 
-from hyperscale.core_rewrite import Graph, Workflow, step
-from hyperscale.core_rewrite.engines.client.http import HTTPResponse
+from hyperscale.core import Graph, Workflow, step
+from hyperscale.core.engines.client.http import HTTPResponse
 
 
 class Result:

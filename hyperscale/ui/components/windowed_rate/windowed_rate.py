@@ -2,7 +2,7 @@ import asyncio
 import time
 from typing import List
 
-from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
+from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.ui.styling import stylize, get_style

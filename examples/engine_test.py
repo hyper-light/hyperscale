@@ -1,6 +1,6 @@
 import asyncio
 
-from hyperscale.core_rewrite.engines.client.playwright import (
+from hyperscale.core.engines.client.playwright import (
     MercurySyncPlaywrightConnection,
 )
 

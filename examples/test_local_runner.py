@@ -4,7 +4,7 @@ import uvloop
 
 uvloop.install()
 
-from hyperscale.core_rewrite.jobs.runner.local_runner import LocalRunner
+from hyperscale.core.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow, step
 from hyperscale.testing import URL, HTTPResponse
 
