@@ -3,9 +3,6 @@ from typing import List
 
 from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.reporting.metric import MetricsSet, MetricType
-from hyperscale.reporting.processed_result.types.base_processed_result import (
-    BaseProcessedResult,
-)
 
 try:
     from aio_statsd import DogStatsdClient
@@ -19,9 +16,13 @@ try:
 except Exception:
     from hyperscale.reporting.types.empty import Empty as StatsD
 
-    DogStatsdClient = None
-    DogStatsDConfig = None
     has_connector = False
+
+    class DogStatsDConfig:
+        pass
+
+    class DogStatsdClient:
+        pass
 
 
 class DogStatsD(StatsD):
@@ -71,28 +72,7 @@ class DogStatsD(StatsD):
 
         self.statsd_type = "StatsD"
 
-    async def submit_events(self, events: List[BaseProcessedResult]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Events to {self.statsd_type}"
-        )
-
-        for event in events:
-            time_update_function = self._update_map.get("gauge")
-            time_update_function(f"{event.name}_time", event.time)
-
-            if event.success:
-                success_update_function = self._update_map.get("increment")
-                success_update_function(f"{event.name}_success", 1)
-
-            else:
-                failed_update_function = self._update_map.get("increment")
-                failed_update_function(f"{event.name}_failed", 1)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Events to {self.statsd_type}"
-        )
-
-    async def submit_custom(self, metrics_sets: List[MetricsSet]):
+    async def submit_metrics(self, metrics_sets: List[MetricsSet]):
         await self.logger.filesystem.aio["hyperscale.reporting"].info(
             f"{self.metadata_string} - Submitting Custom Metrics to {self.statsd_type}"
         )

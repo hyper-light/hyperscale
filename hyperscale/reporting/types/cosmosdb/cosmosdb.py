@@ -2,19 +2,7 @@ import uuid
 from typing import Dict, List
 
 from hyperscale.logging.hyperscale_logger import HyperscaleLogger
-from hyperscale.reporting.experiment.experiments_collection import (
-    ExperimentMetricsCollectionSet,
-)
 from hyperscale.reporting.metric import MetricsSet
-from hyperscale.reporting.metric.stage_streams_set import StageStreamsSet
-from hyperscale.reporting.processed_result.types.base_processed_result import (
-    BaseProcessedResult,
-)
-from hyperscale.reporting.system.system_metrics_set import (
-    SessionMetricsCollection,
-    SystemMetricsCollection,
-    SystemMetricsSet,
-)
 
 from .cosmosdb_config import CosmosDBConfig
 
@@ -24,9 +12,13 @@ try:
 
     has_connector = True
 except Exception:
-    CosmosClient = None
-    PartitionKey = None
     has_connector = False
+
+    class CosmosClient:
+        pass
+
+    class PartitionKey:
+        pass
 
 
 class CosmosDB:
@@ -109,253 +101,7 @@ class CosmosDB:
         await self.logger.filesystem.aio["hyperscale.reporting"].info(
             f"{self.metadata_string} - Created or set Database - {self.database_name}"
         )
-
-    async def submit_session_system_metrics(
-        self, system_metrics_sets: List[SystemMetricsSet]
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Creating Session System Metrics container - {self.session_system_metrics_container_name} with Partition Key /{self.system_metrics_partition} if not exists"
-        )
-        self.session_system_metrics_container = (
-            await self.database.create_container_if_not_exists(
-                self.session_system_metrics_container_name,
-                PartitionKey(f"/{self.system_metrics_partition}"),
-            )
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Created or set Session System Metrics container - {self.session_system_metrics_container_name} with Partition Key /{self.system_metrics_partition}"
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Session System Metrics to container - {self.session_system_metrics_container_name} with Partition Key /{self.system_metrics_partition}"
-        )
-
-        rows: List[SessionMetricsCollection] = []
-
-        for metrics_set in system_metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Session System Metrics Set - {metrics_set.system_metrics_set_id}"
-            )
-
-            for monitor_metrics in metrics_set.session_cpu_metrics.values():
-                rows.append(monitor_metrics)
-
-            for monitor_metrics in metrics_set.session_memory_metrics.values():
-                rows.append(monitor_metrics)
-
-        for metrics_set in rows:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Session System Metrics Group - {metrics_set.name}:{metrics_set.group}"
-            )
-
-            await self.session_system_metrics_container.upsert_item(
-                {"id": str(uuid.uuid4()), **metrics_set.record}
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Session System Metrics to container - {self.session_system_metrics_container_name} with Partition Key /{self.system_metrics_partition}"
-        )
-
-    async def submit_stage_system_metrics(
-        self, system_metrics_sets: List[SystemMetricsSet]
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Creating Stage System Metrics container - {self.stage_system_metrics_container_name} with Partition Key /{self.system_metrics_partition} if not exists"
-        )
-        self.stage_system_metrics_container = (
-            await self.database.create_container_if_not_exists(
-                self.stage_system_metrics_container_name,
-                PartitionKey(f"/{self.system_metrics_partition}"),
-            )
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Created or set Stage System Metrics container - {self.stage_system_metrics_container_name} with Partition Key /{self.system_metrics_partition}"
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Stage System Metrics to container - {self.stage_system_metrics_container_name} with Partition Key /{self.system_metrics_partition}"
-        )
-
-        rows: List[SystemMetricsCollection] = []
-
-        for metrics_set in system_metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Stage System Metrics Set - {metrics_set.system_metrics_set_id}"
-            )
-
-            cpu_metrics = metrics_set.cpu
-            memory_metrics = metrics_set.memory
-
-            for stage_name, stage_cpu_metrics in cpu_metrics.metrics.items():
-                for monitor_metrics in stage_cpu_metrics.values():
-                    rows.append(monitor_metrics.record)
-
-                stage_memory_metrics = memory_metrics.metrics.get(stage_name)
-                for monitor_metrics in stage_memory_metrics.values():
-                    rows.append(monitor_metrics.record)
-
-                stage_mb_per_vu_metrics = metrics_set.mb_per_vu.get(stage_name)
-
-                if stage_mb_per_vu_metrics:
-                    rows.append(stage_mb_per_vu_metrics.record)
-
-        for metrics_set in rows:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Stage System Metrics Group - {metrics_set.name}:{metrics_set.group}"
-            )
-
-            await self.stage_system_metrics_container.upsert_item(
-                {"id": str(uuid.uuid4()), **metrics_set.record}
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Stage System Metrics to container - {self.stage_system_metrics_container_name} with Partition Key /{self.system_metrics_partition}"
-        )
-
-    async def submit_streams(self, stream_metrics: Dict[str, StageStreamsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Creating Streams container - {self.streams_container_name} with Partition Key /{self.streams_partition_key} if not exists"
-        )
-        self.streams_container = await self.database.create_container_if_not_exists(
-            self.streams_container_name, PartitionKey(f"/{self.streams_partition_key}")
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Created or set Streams container - {self.streams_container_name} with Partition Key /{self.streams_partition_key}"
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Streams to container - {self.streams_container_name} with Partition Key /{self.streams_partition_key}"
-        )
-        for stage_name, stream in stream_metrics.items():
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Streams Set - {stage_name}:{stream.stream_set_id}"
-            )
-
-            for group_name, group in stream.grouped.items():
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Streams Group - {group_name}:{stream.stream_set_id}"
-                )
-
-                await self.streams_container.upsert_item(
-                    {
-                        "id": str(uuid.uuid4()),
-                        "name": f"{stage_name}_stream",
-                        "stage": stage_name,
-                        "group": group_name,
-                        **group,
-                    }
-                )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Streams to container - {self.streams_container_name} with Partition Key /{self.streams_partition_key}"
-        )
-
-    async def submit_experiments(
-        self, experiment_metrics: ExperimentMetricsCollectionSet
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Creating Experiments container - {self.experiments_container_name} with Partition Key /{self.experiments_partition_key} if not exists"
-        )
-        self.experiments_container = await self.database.create_container_if_not_exists(
-            self.experiments_container_name,
-            PartitionKey(f"/{self.experiments_partition_key}"),
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Created or set Experiment container - {self.experiments_container_name} with Partition Key /{self.experiments_partition_key}"
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Experiment to container - {self.experiments_container_name} with Partition Key /{self.experiments_partition_key}"
-        )
-        for experiment in experiment_metrics.experiments:
-            await self.experiments_container.upsert_item(
-                {"id": str(uuid.uuid4()), **experiment}
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Experiments to container - {self.experiments_container_name} with Partition Key /{self.experiments_partition_key}"
-        )
-
-    async def submit_variants(self, experiment_metrics: ExperimentMetricsCollectionSet):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Creating Variants container - {self.variants_container_name} with Partition Key /{self.variants_partition_key} if not exists"
-        )
-        self.variants_container = await self.database.create_container_if_not_exists(
-            self.variants_container_name,
-            PartitionKey(f"/{self.variants_partition_key}"),
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Created or set Variants container - {self.variants_container_name} with Partition Key /{self.variants_partition_key}"
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Variant to container - {self.variants_container_name} with Partition Key /{self.variants_partition_key}"
-        )
-        for variant in experiment_metrics.variants:
-            await self.variants_container.upsert_item(
-                {"id": str(uuid.uuid4()), **variant}
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Variants to container - {self.variants_container_name} with Partition Key /{self.variants_partition_key}"
-        )
-
-    async def submit_mutations(
-        self, experiment_metrics: ExperimentMetricsCollectionSet
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Creating Mutations container - {self.mutations_container_name} with Partition Key /{self.mutations_partition_key} if not exists"
-        )
-        self.mutations_container = await self.database.create_container_if_not_exists(
-            self.mutations_container_name,
-            PartitionKey(f"/{self.mutations_partition_key}"),
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Created or set Mutations container - {self.mutations_container_name} with Partition Key /{self.mutations_partition_key}"
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Mutation to container - {self.mutations_container_name} with Partition Key /{self.mutations_partition_key}"
-        )
-        for mutation in experiment_metrics.mutations:
-            await self.mutations_container.upsert_item(
-                {"id": str(uuid.uuid4()), **mutation}
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Mutations to container - {self.mutations_container_name} with Partition Key /{self.mutations_partition_key}"
-        )
-
-    async def submit_events(self, events: List[BaseProcessedResult]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Creating Events container - {self.events_container_name} with Partition Key /{self.events_partition_key} if not exists"
-        )
-        self.events_container = await self.database.create_container_if_not_exists(
-            self.events_container_name, PartitionKey(f"/{self.events_partition_key}")
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Created or set Events container - {self.events_container_name} with Partition Key /{self.events_partition_key}"
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Events to container - {self.events_container_name} with Partition Key /{self.events_partition_key}"
-        )
-        for event in events:
-            await self.events_container.upsert_item(
-                {"id": str(uuid.uuid4()), **event.record}
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Events to container - {self.events_container_name} with Partition Key /{self.events_partition_key}"
-        )
-
+        
     async def submit_common(self, metrics_sets: List[MetricsSet]):
         await self.logger.filesystem.aio["hyperscale.reporting"].info(
             f"{self.metadata_string} - Creating Shared Metrics container - {self.shared_metrics_container_name} with Partition Key /{self.metrics_partition_key} if not exists"

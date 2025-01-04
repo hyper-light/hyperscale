@@ -31,7 +31,7 @@ from .models.metric import (
     SAMPLE,
     Metric,
 )
-from .workflow_types import (
+from hyperscale.reporting.results_types import (
     CheckSet,
     ContextCount,
     CountResults,
@@ -43,7 +43,9 @@ from .workflow_types import (
     StatsResults,
     StatTypes,
     WorkflowStats,
+
 )
+
 
 
 class WorkflowResults:

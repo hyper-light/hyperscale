@@ -3,9 +3,6 @@ from typing import List
 
 from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.reporting.metric import MetricType
-from hyperscale.reporting.processed_result.types.base_processed_result import (
-    BaseProcessedResult,
-)
 
 try:
     from aio_statsd import TelegrafStatsdClient
@@ -19,8 +16,12 @@ try:
 except Exception:
     from hyperscale.reporting.types.empty import Empty as StatsD
 
-    TelegrafStatsDConfig = None
-    TelegrafStatsdClient = None
+    class TelegrafStatsDConfig:
+        pass
+
+    class TelegrafStatsdClient:
+        pass
+
     has_connector = False
 
 
@@ -69,24 +70,3 @@ class TelegrafStatsD(StatsD):
         self.logger.initialize()
 
         self.statsd_type = "TelegrafStatsD"
-
-    async def submit_events(self, events: List[BaseProcessedResult]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Events to {self.statsd_type}"
-        )
-
-        for event in events:
-            time_update_function = self._update_map.get("gauge")
-            time_update_function(f"{event.name}_time", event.time)
-
-            if event.success:
-                success_update_function = self._update_map.get("increment")
-                success_update_function(f"{event.name}_success", 1)
-
-            else:
-                failed_update_function = self._update_map.get("increment")
-                failed_update_function(f"{event.name}_failed", 1)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Events to {self.statsd_type}"
-        )

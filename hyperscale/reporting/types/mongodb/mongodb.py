@@ -2,19 +2,7 @@ import uuid
 from typing import Dict, List
 
 from hyperscale.logging.hyperscale_logger import HyperscaleLogger
-from hyperscale.reporting.experiment.experiments_collection import (
-    ExperimentMetricsCollectionSet,
-)
 from hyperscale.reporting.metric import MetricsSet
-from hyperscale.reporting.metric.stage_streams_set import StageStreamsSet
-from hyperscale.reporting.processed_result.types.base_processed_result import (
-    BaseProcessedResult,
-)
-from hyperscale.reporting.system.system_metrics_set import (
-    SessionMetricsCollection,
-    SystemMetricsCollection,
-    SystemMetricsSet,
-)
 
 from .mongodb_config import MongoDBConfig
 
@@ -24,8 +12,10 @@ try:
     has_connector = True
 
 except Exception:
-    AsyncIOMotorClient = None
     has_connector = False
+
+    class AsyncIOMotorClient:
+        pass
 
 
 class MongoDB:
@@ -78,134 +68,6 @@ class MongoDB:
 
         await self.logger.filesystem.aio["hyperscale.reporting"].info(
             f"{self.metadata_string} - Connected to MongoDB instance at - {self.host} - Database: {self.database_name}"
-        )
-
-    async def submit_session_system_metrics(
-        self, system_metrics_sets: List[SystemMetricsSet]
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Session System Metrics to Bucket - {self.session_system_metrics_collection}"
-        )
-
-        metrics_sets: List[SessionMetricsCollection] = []
-
-        for metrics_set in system_metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Session System Metrics - {metrics_set.system_metrics_set_id}"
-            )
-            for monitor_metrics in metrics_set.session_cpu_metrics.values():
-                metrics_sets.append(monitor_metrics.record)
-
-            for monitor_metrics in metrics_set.session_memory_metrics.values():
-                metrics_sets.append(monitor_metrics.record)
-
-        await self.database[self.metrics_collection].insert_many(metrics_sets)
-
-    async def submit_stage_system_metrics(
-        self, system_metrics_sets: List[SystemMetricsSet]
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Stage System Metrics to Bucket - {self.session_system_metrics_collection}"
-        )
-
-        metrics_sets: List[SystemMetricsCollection] = []
-
-        for metrics_set in system_metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Stage System Metrics - {metrics_set.system_metrics_set_id}"
-            )
-
-            cpu_metrics = metrics_set.cpu
-            memory_metrics = metrics_set.memory
-
-            for stage_name, stage_cpu_metrics in cpu_metrics.metrics.items():
-                for monitor_metrics in stage_cpu_metrics.values():
-                    metrics_sets.append(monitor_metrics.record)
-
-                stage_memory_metrics = memory_metrics.metrics.get(stage_name)
-                for monitor_metrics in stage_memory_metrics.values():
-                    metrics_sets.append(monitor_metrics.record)
-
-                stage_mb_per_vu_metrics = metrics_set.mb_per_vu.get(stage_name)
-
-                if stage_mb_per_vu_metrics:
-                    metrics_sets.append(stage_mb_per_vu_metrics.record)
-
-        await self.database[self.metrics_collection].insert_many(metrics_sets)
-
-    async def submit_streams(self, stream_metrics: Dict[str, StageStreamsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Streams to Bucket - {self.streams_collection}"
-        )
-
-        records = []
-        for stage_name, stream in stream_metrics.items():
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Streams - {stage_name}:{stream.stream_set_id}"
-            )
-
-            for group_name, group in stream.grouped.items():
-                records.append(
-                    {
-                        "name": f"{stage_name}_streams",
-                        "stage": stage_name,
-                        "group": group_name,
-                        **group,
-                    }
-                )
-
-        await self.database[self.metrics_collection].insert_many(records)
-
-    async def submit_experiments(
-        self, experiment_metrics: ExperimentMetricsCollectionSet
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Experiments to Collection - {self.experiments_collection}"
-        )
-        await self.database[self.events_collection].insert_many(
-            experiment_metrics.experiments
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Experiments to Collection - {self.experiments_collection}"
-        )
-
-    async def submit_variants(self, experiment_metrics: ExperimentMetricsCollectionSet):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Variants to Collection - {self.variants_collection}"
-        )
-        await self.database[self.events_collection].insert_many(
-            experiment_metrics.variants
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Variants to Collection - {self.variants_collection}"
-        )
-
-    async def submit_mutations(
-        self, experiment_metrics: ExperimentMetricsCollectionSet
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Mutations to Collection - {self.mutations_collection}"
-        )
-        await self.database[self.events_collection].insert_many(
-            experiment_metrics.mutations
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Mutations to Collection - {self.mutations_collection}"
-        )
-
-    async def submit_events(self, events: List[BaseProcessedResult]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Events to Collection - {self.events_collection}"
-        )
-        await self.database[self.events_collection].insert_many(
-            [event.record for event in events]
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Events to Collection - {self.events_collection}"
         )
 
     async def submit_common(self, metrics_sets: List[MetricsSet]):

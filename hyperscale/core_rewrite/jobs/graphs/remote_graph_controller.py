@@ -239,6 +239,8 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         while polling:
             await asyncio.sleep(self._context_poll_rate)
 
+            await self._leader_lock.acquire()
+
             acknowledged_starts_count = len(self._acknowledged_starts)
 
             if (
@@ -261,6 +263,12 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
                     'initializing',
                     f'Starting - {acknowledged_starts_count}/{workers} - threads'
                 )
+
+            if self._leader_lock.locked():
+                self._leader_lock.release()
+
+        if self._leader_lock.locked():
+            self._leader_lock.release()
 
 
     async def poll_for_workflow_complete(
@@ -298,6 +306,12 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
                     workflow_slug,
                     f'Running - {workflow_name} - {completions_count}/{assigned_workers} workers complete'
                 )
+
+            if self._leader_lock.locked():
+                self._leader_lock.release()
+        
+        if self._leader_lock.locked():
+            self._leader_lock.release()
 
         return (
             self._results[run_id][workflow_name],
@@ -386,7 +400,8 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         self._acknowledged_starts.add(node_id)
 
-        self._leader_lock.release()
+        if self._leader_lock.locked():
+            self._leader_lock.release()
 
     @receive()
     async def process_results(
@@ -430,7 +445,8 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         self._completions[run_id][workflow_name].add(node_id)
 
-        self._leader_lock.release()
+        if self._leader_lock.locked():
+            self._leader_lock.release()
 
         return JobContext(
             ReceivedReceipt(

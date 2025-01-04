@@ -3,19 +3,7 @@ import uuid
 from typing import Any, Dict, List
 
 from hyperscale.logging.hyperscale_logger import HyperscaleLogger
-from hyperscale.reporting.experiment.experiments_collection import (
-    ExperimentMetricsCollectionSet,
-)
 from hyperscale.reporting.metric import MetricsSet
-from hyperscale.reporting.metric.stage_streams_set import StageStreamsSet
-from hyperscale.reporting.processed_result.types.base_processed_result import (
-    BaseProcessedResult,
-)
-from hyperscale.reporting.system.system_metrics_set import (
-    SessionMetricsCollection,
-    SystemMetricsCollection,
-    SystemMetricsSet,
-)
 
 from .kafka_config import KafkaConfig
 
@@ -25,8 +13,10 @@ try:
     has_connector = True
 
 except Exception:
-    AIOKafkaProducer = None
     has_connector = False
+
+    class AIOKafkaProducer:
+        pass
 
 
 class Kafka:
@@ -104,222 +94,6 @@ class Kafka:
 
         await self.logger.filesystem.aio["hyperscale.reporting"].info(
             f"{self.metadata_string} - Connected to Kafka at - {self.host}"
-        )
-
-    async def submit_session_system_metrics(
-        self, system_metrics_sets: List[SystemMetricsSet]
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Session System Metric to Topic - {self.session_system_metrics_topic} - Partition - {self.system_metrics_partition}"
-        )
-
-        batch = self._producer.create_batch()
-
-        metrics_sets: List[SessionMetricsCollection] = []
-
-        for metrics_set in system_metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Session System Metrics - {metrics_set.system_metrics_set_id}"
-            )
-            for monitor_metrics in metrics_set.session_cpu_metrics.values():
-                metrics_sets.append(monitor_metrics)
-
-            for monitor_metrics in metrics_set.session_memory_metrics.values():
-                metrics_sets.append(monitor_metrics)
-
-        for metric_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Session System Metric - {metric_set.name}:{metric_set.group}"
-            )
-
-            batch.append(
-                value=json.dumps(metric_set.record).encode("utf-8"),
-                timestamp=None,
-                key=bytes(f"{metric_set.name}_{metric_set.group}", "utf"),
-            )
-
-        await self._producer.send_batch(
-            batch,
-            self.session_system_metrics_topic,
-            partition=self.system_metrics_partition,
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Session System Metric to Topic - {self.session_system_metrics_topic} - Partition - {self.system_metrics_partition}"
-        )
-
-    async def submit_stage_system_metrics(
-        self, system_metrics_sets: List[SystemMetricsSet]
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Stage System Metric to Topic - {self.stage_system_metrics_topic} - Partition - {self.system_metrics_partition}"
-        )
-
-        batch = self._producer.create_batch()
-
-        metrics_sets: List[SystemMetricsCollection] = []
-
-        for metrics_set in system_metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Stage System Metrics - {metrics_set.system_metrics_set_id}"
-            )
-
-            cpu_metrics = metrics_set.cpu
-            memory_metrics = metrics_set.memory
-
-            for stage_name, stage_cpu_metrics in cpu_metrics.metrics.items():
-                for monitor_metrics in stage_cpu_metrics.values():
-                    metrics_sets.append(monitor_metrics)
-
-                stage_memory_metrics = memory_metrics.metrics.get(stage_name)
-                for monitor_metrics in stage_memory_metrics.values():
-                    metrics_sets.append(monitor_metrics)
-
-                stage_mb_per_vu_metrics = metrics_set.mb_per_vu.get(stage_name)
-
-                if stage_mb_per_vu_metrics:
-                    metrics_sets.append(stage_mb_per_vu_metrics)
-
-        for metric_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Stage System Metric - {metric_set.name}:{metric_set.group}"
-            )
-
-            batch.append(
-                value=json.dumps(metric_set.record).encode("utf-8"),
-                timestamp=None,
-                key=bytes(f"{metric_set.name}_{metric_set.group}", "utf"),
-            )
-
-        await self._producer.send_batch(
-            batch,
-            self.stage_system_metrics_topic,
-            partition=self.system_metrics_partition,
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Stage System Metric to Topic - {self.stage_system_metrics_topic} - Partition - {self.system_metrics_partition}"
-        )
-
-    async def submit_streams(self, stream_metrics: Dict[str, StageStreamsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Streams to Topic - {self.streams_topic} - Partition - {self.streams_partition}"
-        )
-
-        batch = self._producer.create_batch()
-        for stage_name, stream in stream_metrics.items():
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Streams - {stage_name}:{stream.stream_set_id}"
-            )
-
-            for group_name, group in stream.grouped.items():
-                batch.append(
-                    value=json.dumps(
-                        {
-                            **group,
-                            "name": f"{stage_name}_streams",
-                            "stage": stage_name,
-                            "group": group_name,
-                        }
-                    ).encode("utf-8"),
-                    timestamp=None,
-                    key=bytes(f"{stage_name}_{group_name}", "utf"),
-                )
-
-        await self._producer.send_batch(
-            batch, self.streams_topic, partition=self.streams_partition
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Streams to Topic - {self.streams_topic} - Partition - {self.streams_partition}"
-        )
-
-    async def submit_experiments(
-        self, experiment_metrics: ExperimentMetricsCollectionSet
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Experiments to Topic - {self.experiments_topic} - Partition - {self.experiments_partition}"
-        )
-
-        batch = self._producer.create_batch()
-        for experiment in experiment_metrics.experiment_summaries:
-            batch.append(
-                value=json.dumps(experiment.record).encode("utf-8"),
-                timestamp=None,
-                key=bytes(experiment.experiment_name, "utf"),
-            )
-
-        await self._producer.send_batch(
-            batch, self.experiments_topic, partition=self.experiments_partition
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Experiments to Topic - {self.experiments_topic} - Partition - {self.experiments_partition}"
-        )
-
-    async def submit_variants(self, experiment_metrics: ExperimentMetricsCollectionSet):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Variants to Topic - {self.variants_topic} - Partition - {self.experiments_partition}"
-        )
-
-        batch = self._producer.create_batch()
-        for variant in experiment_metrics.variant_summaries:
-            batch.append(
-                value=json.dumps(variant.record).encode("utf-8"),
-                timestamp=None,
-                key=bytes(variant.variant_name, "utf"),
-            )
-
-        await self._producer.send_batch(
-            batch, self.variants_topic, partition=self.experiments_partition
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Variants to Topic - {self.variants_topic} - Partition - {self.experiments_partition}"
-        )
-
-    async def submit_mutations(
-        self, experiment_metrics: ExperimentMetricsCollectionSet
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Mutations to Topic - {self.mutations_topic} - Partition - {self.experiments_partition}"
-        )
-
-        batch = self._producer.create_batch()
-        for mutation in experiment_metrics.mutation_summaries:
-            batch.append(
-                value=json.dumps(mutation.record).encode("utf-8"),
-                timestamp=None,
-                key=bytes(mutation.mutation_name, "utf"),
-            )
-
-        await self._producer.send_batch(
-            batch, self.mutations_topic, partition=self.events_partition
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Mutations to Topic - {self.mutations_topic} - Partition - {self.experiments_partition}"
-        )
-
-    async def submit_events(self, events: List[BaseProcessedResult]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Events to Topic - {self.events_topic} - Partition - {self.events_partition}"
-        )
-
-        batch = self._producer.create_batch()
-        for event in events:
-            batch.append(
-                value=json.dumps(event.record).encode("utf-8"),
-                timestamp=None,
-                key=bytes(event.name, "utf"),
-            )
-
-        await self._producer.send_batch(
-            batch, self.events_topic, partition=self.events_partition
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Events to Topic - {self.events_topic} - Partition - {self.events_partition}"
         )
 
     async def submit_common(self, metrics_sets: List[MetricsSet]):

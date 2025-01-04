@@ -13,7 +13,6 @@ from typing import (
     get_type_hints,
 )
 
-from hyperscale.core.engines.types.common.base_action import BaseAction
 from hyperscale.core_rewrite.engines.client.shared.models import (
     CallResult,
     RequestType,
@@ -37,7 +36,7 @@ class Hook:
     def __init__(
         self,
         call: Callable[
-            ..., Awaitable[Any] | Awaitable[BaseAction] | Awaitable[CallResult]
+            ..., Awaitable[Any] | Awaitable[CallResult]
         ],
         dependencies: List[str],
         timeouts: Optional[Timeouts] = None,

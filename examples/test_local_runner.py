@@ -1,5 +1,5 @@
 import asyncio
-import gc
+import json
 import uvloop
 
 uvloop.install()
@@ -24,13 +24,18 @@ class Test(Workflow):
 async def run():
     runner = LocalRunner("127.0.0.1", 15454)
 
-    await runner.run(
+    results = await runner.run(
         "test",
         [Test()],
     )
 
     runner.close()
 
+    return results
+
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    results = asyncio.run(run())
+
+    with open('results.json', 'w+') as results_file:
+        json.dump(results, results_file, indent=4)

@@ -1,3 +1,5 @@
+from typing import Type
+
 try:
     from hyperscale.reporting.types.statsd.statsd import StatsD
 
@@ -8,7 +10,10 @@ try:
 except Exception:
     from hyperscale.reporting.types.empty import Empty as StatsD
 
-    NetdataConfig = None
+
+    class NetdataConfig:
+        pass
+
     has_connector = False
 
 

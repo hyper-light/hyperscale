@@ -243,7 +243,6 @@ class TCPProtocol(Generic[T, K]):
                 self.server_socket.setblocking(False)
 
             elif self.connected is False and worker_socket:
-                worker_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 self.server_socket = worker_socket
                 host, port = worker_socket.getsockname()
 
@@ -357,9 +356,9 @@ class TCPProtocol(Generic[T, K]):
 
             if cert_path and key_path:
                 self._client_ssl_context = self._create_client_ssl_context(
-                    cert_path=cert_path, key_path=key_path
+                    cert_path=cert_path, 
+                    key_path=key_path,
                 )
-
 
             while True:
                 try:
@@ -400,7 +399,6 @@ class TCPProtocol(Generic[T, K]):
 
                     self._node_host_map[instance] = address
                     self._nodes.put_no_wait(instance)
-
 
                     self._connect_lock.release()
 

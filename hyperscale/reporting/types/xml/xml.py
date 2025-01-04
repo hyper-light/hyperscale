@@ -14,14 +14,7 @@ from xml.dom.minidom import parseString
 import psutil
 
 from hyperscale.logging.hyperscale_logger import HyperscaleLogger
-from hyperscale.reporting.experiment.experiments_collection import (
-    ExperimentMetricsCollectionSet,
-)
 from hyperscale.reporting.metric.metrics_set import MetricsSet
-from hyperscale.reporting.metric.stage_streams_set import StageStreamsSet
-from hyperscale.reporting.processed_result.types.base_processed_result import (
-    BaseProcessedResult,
-)
 from hyperscale.reporting.system.system_metrics_set import SystemMetricsSet
 
 from .xml_config import XMLConfig
@@ -29,7 +22,9 @@ from .xml_config import XMLConfig
 try:
     from dicttoxml import dicttoxml
 except Exception:
-    dicttoxml = object
+
+    def dicttoxml(*args, **kwargs):
+        pass
 
 collections.Iterable = collections.abc.Iterable
 
@@ -261,121 +256,6 @@ class XML:
             f"{self.metadata_string} - Saved Stage System Metrics to file - {self.stage_system_metrics_filepath}"
         )
 
-    async def submit_streams(self, stream_metrics: Dict[str, StageStreamsSet]):
-        if self.streams_file is None:
-            self.streams_file = await self._loop.run_in_executor(
-                self._executor,
-                functools.partial(open, self.streams_metrics_filepath, self.write_mode),
-            )
-
-            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-                self._loop.add_signal_handler(
-                    getattr(signal, signame),
-                    lambda signame=signame: handle_loop_stop(
-                        signame, self._executor, self._loop, self.streams_file
-                    ),
-                )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Saving Streams to file - {self.streams_metrics_filepath}"
-        )
-
-        streams_data = [
-            {"stage": stream_name, **stream_set.grouped}
-            for stream_name, stream_set in stream_metrics.items()
-        ]
-
-        streams_xml = dicttoxml(streams_data, custom_root="streams")
-
-        streams_xml = parseString(streams_xml)
-
-        await self._loop.run_in_executor(
-            self._executor, self.streams_file.write, streams_xml.toprettyxml()
-        )
-
-    async def submit_experiments(
-        self, experiment_metrics: ExperimentMetricsCollectionSet
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Saving Experiments to file - {self.experiments_filepath}"
-        )
-
-        if self.experiments_file is None:
-            self.experiments_file = await self._loop.run_in_executor(
-                self._executor,
-                functools.partial(open, self.experiments_filepath, self.write_mode),
-            )
-
-            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-                self._loop.add_signal_handler(
-                    getattr(signal, signame),
-                    lambda signame=signame: handle_loop_stop(
-                        signame, self._executor, self._loop, self.experiments_file
-                    ),
-                )
-
-        experiments_xml = dicttoxml(
-            experiment_metrics.experiments, custom_root="experiments"
-        )
-
-        experiments_xml = parseString(experiments_xml)
-
-        await self._loop.run_in_executor(
-            self._executor, self.experiments_file.write, experiments_xml.toprettyxml()
-        )
-
-    async def submit_variants(self, experiment_metrics: ExperimentMetricsCollectionSet):
-        if self.variants_file is None:
-            self.variants_file = await self._loop.run_in_executor(
-                self._executor,
-                functools.partial(open, self.variants_filepath, self.write_mode),
-            )
-
-            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-                self._loop.add_signal_handler(
-                    getattr(signal, signame),
-                    lambda signame=signame: handle_loop_stop(
-                        signame, self._executor, self._loop, self.variants_file
-                    ),
-                )
-
-        variants_xml = dicttoxml(experiment_metrics.variants, custom_root="variants")
-
-        variants_xml = parseString(variants_xml)
-
-        await self._loop.run_in_executor(
-            self._executor, self.variants_file.write, variants_xml.toprettyxml()
-        )
-
-    async def submit_mutations(
-        self, experiment_metrics: ExperimentMetricsCollectionSet
-    ):
-        if self.mutations_file is None:
-            self.mutations_file = await self._loop.run_in_executor(
-                self._executor,
-                functools.partial(open, self.mutations_filepath, self.write_mode),
-            )
-
-            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-                self._loop.add_signal_handler(
-                    getattr(signal, signame),
-                    lambda signame=signame: handle_loop_stop(
-                        signame, self._executor, self._loop, self.mutations_file
-                    ),
-                )
-
-        mutations_xml = dicttoxml(experiment_metrics.mutations, custom_root="mutations")
-
-        mutations_xml = parseString(mutations_xml)
-
-        await self._loop.run_in_executor(
-            self._executor, self.mutations_file.write, mutations_xml.toprettyxml()
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Saved Events to file - {self.events_filepath}"
-        )
-
     async def connect(self):
         self._loop = asyncio._get_running_loop()
         await self.logger.filesystem.aio["hyperscale.reporting"].debug(
@@ -391,35 +271,6 @@ class XML:
 
         self.events_filepath = os.path.join(
             directory, f"{filename}_{events_file_timestamp}.xml"
-        )
-
-    async def submit_events(self, events: List[BaseProcessedResult]):
-        if self.events_file is None:
-            self.events_file = await self._loop.run_in_executor(
-                self._executor,
-                functools.partial(open, self.events_filepath, self.write_mode),
-            )
-
-            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-                self._loop.add_signal_handler(
-                    getattr(signal, signame),
-                    lambda signame=signame: handle_loop_stop(
-                        signame, self._executor, self._loop, self.events_file
-                    ),
-                )
-
-        events_xml = dicttoxml(
-            [event.to_dict() for event in events], custom_root="events"
-        )
-
-        events_xml = parseString(events_xml)
-
-        await self._loop.run_in_executor(
-            self._executor, self.events_file.write, events_xml.toprettyxml()
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Saved Events to file - {self.events_filepath}"
         )
 
     async def submit_common(self, metrics: List[MetricsSet]):

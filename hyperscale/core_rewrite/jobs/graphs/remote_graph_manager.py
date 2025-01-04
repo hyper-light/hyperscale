@@ -12,7 +12,6 @@ from typing import (
 )
 
 import networkx
-import psutil
 
 from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
 from hyperscale.core_rewrite.graph.dependent_workflow import DependentWorkflow
@@ -22,10 +21,6 @@ from hyperscale.core_rewrite.jobs.models import InstanceRoleType, WorkflowStatus
 from hyperscale.core_rewrite.jobs.models.env import Env
 from hyperscale.core_rewrite.jobs.workers import Provisioner, StagePriority
 from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
-from hyperscale.core_rewrite.results.workflow_types import (
-    WorkflowContextResult,
-    WorkflowStats,
-)
 from hyperscale.core_rewrite.state import (
     Context,
     ContextHook,
@@ -41,27 +36,22 @@ from hyperscale.ui.actions import (
     update_workflow_executions_rates,
     update_workflow_execution_stats,
 )
+from hyperscale.reporting.results_types import (
+    RunResults, 
+    WorkflowResultsSet,
+    WorkflowContextResult,
+    WorkflowStats,
+)
 
 from .remote_graph_controller import RemoteGraphController
 from .workflow_runner import cancel_pending
 
-WorkflowResultsSet = WorkflowStats | WorkflowContextResult
+
 NodeResults = Tuple[
     WorkflowResultsSet,
     Context,
 ]
 
-RunResults = Dict[
-    Literal[
-        "workflow",
-        "results",
-    ],
-    str
-    | Dict[
-        str,
-        WorkflowStats | WorkflowContextResult,
-    ],
-]
 
 ProvisionedBatch = List[
     List[

@@ -2,17 +2,22 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Union
 
-from hyperscale.core.engines.types.tracing.tracing_types import (
+from .tracing_types import (
     RequestHook,
     ResponseHook,
     TraceSignal,
     UrlFilter,
 )
-from hyperscale.core.engines.types.tracing.url_filters import (
-    default_params_strip_filter,
-)
+from hyperscale.core_rewrite.engines.client.shared.models.url import URL
+
 
 OpenTelemetryTracingConfig = Union[UrlFilter, RequestHook, ResponseHook, TraceSignal]
+
+
+def default_params_strip_filter(url: URL) -> str:
+    return url.parsed._replace(
+        query=None
+    ).geturl()
 
 
 class TracingConfig:
