@@ -91,19 +91,21 @@ class Timer:
 
         self._updates.put_nowait((None, self._status))
 
-    async def update(self, *args: Tuple[Any], **kwargs: Dict[str, Any]):
+    async def update(self, run_timer: bool):
+
         await self._update_lock.acquire()
 
-        if self._status == TimerStatus.STOPPED:
+        if run_timer:
             self._updates.put_nowait((time.monotonic(), TimerStatus.STARTING))
 
-        elif self._status == TimerStatus.RUNNING:
+        elif run_timer is False:
             self._updates.put_nowait((None, TimerStatus.STOPPING))
 
         else:
             self._updates.put_nowait((None, self._status))
 
-        self._update_lock.release()
+        if self._update_lock.locked():
+            self._update_lock.release()
 
     async def get_next_frame(self):
 
@@ -331,7 +333,8 @@ class Timer:
         if self._updates.empty() is False:
             data = await self._updates.get()
 
-        self._update_lock.release()
+        if self._update_lock.locked():
+            self._update_lock.release()
         
         return data
     

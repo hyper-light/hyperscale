@@ -1,5 +1,5 @@
 import asyncio
-
+import gc
 import uvloop
 
 uvloop.install()
@@ -10,7 +10,7 @@ from hyperscale.testing import URL, HTTPResponse
 
 
 class Test(Workflow):
-    vus = 16000
+    vus = 1000
     duration = "1m"
 
     @step()
@@ -22,14 +22,14 @@ class Test(Workflow):
 
 
 async def run():
-    runner = LocalRunner("0.0.0.0", 15454)
+    runner = LocalRunner("127.0.0.1", 15454)
 
-    results = await runner.run(
+    await runner.run(
         "test",
         [Test()],
     )
 
-    print(results)
+    runner.close()
 
 
 if __name__ == "__main__":

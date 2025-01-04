@@ -7,7 +7,14 @@ from hyperscale.ui.styling.colors import (
     Colorizer,
     HighlightColorizer,
 )
-from typing import List
+from typing import List, Literal
+
+
+HorizontalAlignment = Literal[
+    "left",
+    "center",
+    "right"
+]
 
 
 class TextConfig(BaseModel):
@@ -15,4 +22,5 @@ class TextConfig(BaseModel):
     color: Colorizer | None = None
     highlight: HighlightColorizer | None = None
     attributes: List[Attributizer] | None = None
+    horizontal_alignment: HorizontalAlignment = 'center'
     terminal_mode: TerminalDisplayMode = 'compatability'

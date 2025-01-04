@@ -1,5 +1,4 @@
 import socket
-import sys
 
 
 def bind_tcp_socket(host: str, port: int) -> socket.socket:
@@ -15,7 +14,7 @@ def bind_tcp_socket(host: str, port: int) -> socket.socket:
         sock.bind((host, port))
 
     except OSError:
-        sys.exit(1)
+        pass
 
     sock.setblocking(False)
     sock.set_inheritable(True)
@@ -31,7 +30,7 @@ def bind_udp_socket(host: str, port: int) -> socket.socket:
         sock.bind((host, port))
 
     except OSError:
-        sys.exit(1)
+        pass
 
     sock.setblocking(False)
     sock.set_inheritable(True)

@@ -65,7 +65,8 @@ class TCPProtocol(Generic[T, K]):
         self.connected = False
         self._running = False
 
-        self._client_transports: Dict[str, asyncio.Transport] = {}
+        self._client_transports: Dict[tuple[str, int], asyncio.Transport] = {}
+        self._client_sockets: Dict[tuple[str, int], socket.socket] = {}
         self._server: asyncio.Server = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._waiters: Dict[str, Deque[asyncio.Future]] = defaultdict(deque)
@@ -101,6 +102,7 @@ class TCPProtocol(Generic[T, K]):
         self._node_host_map: Dict[int, Tuple[str, int]] = {}
         self._nodes: Optional[LockedSet[int]] = None
         self._abort_handle_created: bool = None
+        self._connect_lock: asyncio.Lock | None = None
 
     @property
     def nodes(self):
@@ -117,6 +119,19 @@ class TCPProtocol(Generic[T, K]):
         worker_server: Optional[asyncio.Server] = None,
     ):
         try:
+            if self._loop is None:
+                self._loop = asyncio.get_event_loop()
+
+            if not self._abort_handle_created:
+                for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
+                    self._loop.add_signal_handler(
+                        getattr(
+                            signal,
+                            signame,
+                        ),
+                        self.abort,
+                    )
+
             self._events: Dict[str, Callable[[int, T], Awaitable[K]]] = {
                 name: receive_hook
                 for name, receive_hook in inspect.getmembers(
@@ -154,6 +169,9 @@ class TCPProtocol(Generic[T, K]):
 
             if self._nodes is None:
                 self._nodes: LockedSet[int] = LockedSet()
+
+            if self._connect_lock is None:
+                self._connect_lock = asyncio.Lock()
 
             if self.id_generator is None:
                 self.id_generator = SnowflakeGenerator(self._node_id_base)
@@ -199,25 +217,33 @@ class TCPProtocol(Generic[T, K]):
                     cert_path=cert_path, key_path=key_path
                 )
 
+            
+
             if self.connected is False and worker_socket is None:
                 self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-                try:
-                    await asyncio.to_thread(
-                        self.server_socket.bind,
-                        (self.host, self.port),
-                    )
+                while True:
+                    try:
+                        await asyncio.to_thread(
+                            self.server_socket.bind,
+                            (self.host, self.port),
+                        )
 
-                except OSError:
-                    pass
+                        await asyncio.sleep(1)
 
-                except Exception:
-                    pass
+                        break
+
+                    except OSError:
+                        pass
+
+                    except Exception:
+                        pass
 
                 self.server_socket.setblocking(False)
 
             elif self.connected is False and worker_socket:
+                worker_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 self.server_socket = worker_socket
                 host, port = worker_socket.getsockname()
 
@@ -252,16 +278,6 @@ class TCPProtocol(Generic[T, K]):
                 self._cleanup_task = self._loop.create_task(self._cleanup())
 
             self._start_tasks()
-
-            if not self._abort_handle_created:
-                for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-                    self._loop.add_signal_handler(
-                        getattr(
-                            signal,
-                            signame,
-                        ),
-                        self.abort,
-                    )
 
         except Exception:
             pass
@@ -304,6 +320,22 @@ class TCPProtocol(Generic[T, K]):
         key_path: Optional[str] = None,
         worker_socket: Optional[socket.socket] = None,
     ) -> int | None:
+        
+        if self._loop is None:
+                self._loop = asyncio.get_event_loop()
+        
+        if not self._abort_handle_created:
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
+                self._loop.add_signal_handler(
+                    getattr(
+                        signal,
+                        signame,
+                    ),
+                    self.abort,
+                )
+
+        await self._connect_lock.acquire()
+
         try:
             if self._semaphore is None:
                 self._semaphore = asyncio.Semaphore(self._max_concurrency)
@@ -323,22 +355,19 @@ class TCPProtocol(Generic[T, K]):
             if self._decompressor is None:
                 self._decompressor = zstandard.ZstdDecompressor()
 
-            if self._loop is None:
-                self._loop = asyncio.get_event_loop()
-
             if cert_path and key_path:
                 self._client_ssl_context = self._create_client_ssl_context(
                     cert_path=cert_path, key_path=key_path
                 )
 
-            last_error: Optional[Exception] = None
-            tries: int = 0
 
-            for _ in range(self._tcp_connect_retries):
+            while True:
                 try:
                     if worker_socket is None:
                         tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        self._client_sockets[address] = tcp_socket
+
                         await self._loop.run_in_executor(
                             None, tcp_socket.connect, address
                         )
@@ -372,29 +401,23 @@ class TCPProtocol(Generic[T, K]):
                     self._node_host_map[instance] = address
                     self._nodes.put_no_wait(instance)
 
+
+                    self._connect_lock.release()
+
                     return instance
 
-                except Exception as connection_error:
-                    tries += 1
-                    last_error = connection_error
+                except Exception:
+                    pass
+
+                except OSError:
+                    pass
 
                 await asyncio.sleep(1)
 
-            if last_error and tries >= self._tcp_connect_retries:
-                raise last_error
-
-            if not self._abort_handle_created:
-                for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-                    self._loop.add_signal_handler(
-                        getattr(
-                            signal,
-                            signame,
-                        ),
-                        self.abort,
-                    )
-
         except Exception:
             pass
+
+        self._connect_lock.release()
 
     def _create_client_ssl_context(
         self, cert_path: Optional[str] = None, key_path: Optional[str] = None
@@ -681,6 +704,7 @@ class TCPProtocol(Generic[T, K]):
     ) -> None:
         decompressed = b""
         try:
+
             decompressed = self._decompressor.decompress(data)
 
         except Exception as decompression_error:
@@ -927,6 +951,27 @@ class TCPProtocol(Generic[T, K]):
         for client in self._client_transports.values():
             client.abort()
 
+        for tcp_socket in self._client_sockets.values():
+            try:
+                tcp_socket.close()
+
+            except Exception:
+                pass
+
+        if self._server:
+            try:
+                self._server.close()
+
+            except Exception:
+                pass
+
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+
+            except Exception:
+                pass
+
         if self._sleep_task:
             try:
                 self._sleep_task.cancel()
@@ -961,6 +1006,17 @@ class TCPProtocol(Generic[T, K]):
             except asyncio.CancelledError:
                 pass
 
+        if self._run_future:
+            try:
+                self._run_future.set_result(None)
+
+            except asyncio.InvalidStateError:
+                pass
+
+            except asyncio.CancelledError:
+                pass
+
+
     def stop(self):
         if self._run_future:
             try:
@@ -982,8 +1038,22 @@ class TCPProtocol(Generic[T, K]):
             except Exception:
                 pass
 
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+
+            except Exception:
+                pass
+
         for client in self._client_transports.values():
             client.abort()
+
+        for tcp_socket in self._client_sockets.values():
+            try:
+                tcp_socket.close()
+
+            except Exception:
+                pass
 
         if self._sleep_task:
             try:

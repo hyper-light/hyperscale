@@ -4,7 +4,7 @@ import math
 import time
 import warnings
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Coroutine, Dict, List, Tuple
+from typing import Any, AsyncGenerator, Coroutine, Dict, List, Tuple, Literal
 
 import networkx
 import psutil
@@ -23,6 +23,14 @@ from hyperscale.core_rewrite.state.workflow_context import WorkflowContext
 from hyperscale.core_rewrite.testing.models.base import OptimizedArg
 
 from .completion_counter import CompletionCounter
+
+
+StepStatsType = Literal[
+    "total",
+    "ok",
+    "failed",
+]
+
 
 warnings.simplefilter("ignore")
 
@@ -79,6 +87,19 @@ class WorkflowRunner:
         )
         self._threads = psutil.cpu_count(logical=False)
         self._workflows_sem: asyncio.Semaphore | None = None
+        self._workflow_hooks: Dict[int, Dict[str, List[str]]] = defaultdict(dict)
+
+        self._workflow_step_stats: Dict[
+            int, 
+            Dict[
+                tuple[str, str], 
+                Dict[
+                    StepStatsType,
+                    CompletionCounter,
+                ]
+            ]
+        ] = defaultdict(dict)
+
         self._max_running_workflows = env.MERCURY_SYNC_MAX_RUNNING_WORKFLOWS
         self._max_pending_workflows = env.MERCURY_SYNC_MAX_PENDING_WORKFLOWS
         self._run_check_lock: asyncio.Lock | None = None
@@ -117,6 +138,7 @@ class WorkflowRunner:
         WorkflowStatus,
         int,
         int,
+        Dict[str, Dict[StepStatsType, int]]
     ]:
         status = self.run_statuses.get(
             run_id,
@@ -125,6 +147,22 @@ class WorkflowRunner:
 
         completed_count = 0
         failed_count = 0
+
+        workflow_hooks = self._workflow_hooks[run_id].get(workflow, [])
+
+        worklow_hook_stats: Dict[
+            str, 
+            Dict[
+                StepStatsType, 
+                int
+            ]
+        ] = {
+            hook: {
+                "total": 0,
+                "ok": 0,
+                "failed": 0
+            } for hook in workflow_hooks
+        }
 
         try:
             completed_counter = self._completed_counts[run_id].get(
@@ -144,10 +182,24 @@ class WorkflowRunner:
         except Exception:
             pass
 
+        try:
+
+            for (workflow_name, hook_name), stats in self._workflow_step_stats[run_id].items():
+                if workflow_name == workflow:
+                    worklow_hook_stats[hook_name] = {
+                        "total": stats["total"].value(),
+                        "ok": stats["ok"].value(),
+                        "failed": stats["failed"].value(),
+                    }
+        
+        except Exception:
+            pass
+
         return (
             status,
             completed_count,
             failed_count,
+            worklow_hook_stats,
         )
 
     def get_system_stats(
@@ -474,6 +526,16 @@ class WorkflowRunner:
             )
         }
 
+        self._workflow_hooks[run_id][workflow] = list(hooks.keys())
+
+        for hook in hooks:
+            stats_key = (workflow.name, hook)
+            self._workflow_step_stats[run_id][stats_key] = {
+                'total': CompletionCounter(),
+                'ok': CompletionCounter(),
+                'failed': CompletionCounter(),
+            }
+
         step_graph = networkx.DiGraph()
 
         for hook in hooks.values():
@@ -692,14 +754,21 @@ class WorkflowRunner:
             results.extend(completed)
 
             for complete in completed:
+                step_name = complete.get_name()
+
+                self._workflow_step_stats[run_id][(workflow_name, step_name)]["total"].increment()
+
                 try:
                     result = complete.result()
+                    self._workflow_step_stats[run_id][(workflow_name, step_name)]["ok"].increment()
 
                 except Exception as err:
                     self._failed_counts[run_id][workflow_name].increment()
+                    self._workflow_step_stats[run_id][(workflow_name, step_name)]["failed"].increment()
+
                     result = err
 
-                context[complete.get_name()] = result
+                context[step_name] = result
                 self._completed_counts[run_id][workflow_name].increment()
 
             self._pending[run_id][workflow_name].extend(pending)
@@ -831,7 +900,11 @@ class WorkflowRunner:
     def abort(self):
         for job in self._running_workflows.values():
             for workflow in job.values():
-                workflow.client.close()
+                try:
+                    workflow.client.close()
+
+                except Exception:
+                    pass
 
         try:
             self._cpu_monitor.abort_all_background_monitors()

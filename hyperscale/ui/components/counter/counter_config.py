@@ -5,7 +5,14 @@ from hyperscale.ui.styling.colors import (
 )
 from hyperscale.ui.styling.attributes import Attributizer
 from hyperscale.ui.config.mode import TerminalDisplayMode
-from typing import List
+from typing import List, Literal
+
+
+HorizontalAlignment = Literal[
+    "left",
+    "center",
+    "right"
+]
 
 
 class CounterConfig(BaseModel):
@@ -15,4 +22,5 @@ class CounterConfig(BaseModel):
     color: Colorizer | None = None
     highlight: HighlightColorizer | None = None
     attributes: List[Attributizer] | None = None
+    horizontal_alignment: HorizontalAlignment = 'center'
     terminal_mode: TerminalDisplayMode = "compatability"

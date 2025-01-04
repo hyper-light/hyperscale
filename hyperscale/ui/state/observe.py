@@ -32,10 +32,10 @@ def observe(
             updates = subscriptions.updates.get(channel)
             data = result
 
-        if updates is not None:
+        if updates is not None and data is not None:
             await asyncio.gather(*[
                 update(data) for update in updates
-            ])
+            ], return_exceptions=True)
 
         return result
     

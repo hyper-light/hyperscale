@@ -1,6 +1,7 @@
 import asyncio
 import os
 import statistics
+import time
 from collections import Counter, defaultdict
 from socket import socket
 from typing import (
@@ -12,6 +13,7 @@ from typing import (
     Set,
     Tuple,
     TypeVar,
+    Literal
 )
 
 from hyperscale.core_rewrite.engines.client.time_parser import TimeParser
@@ -35,6 +37,7 @@ from hyperscale.core_rewrite.jobs.protocols import TCPProtocol
 from hyperscale.core_rewrite.results.workflow_types import WorkflowStats
 from hyperscale.core_rewrite.snowflake import Snowflake
 from hyperscale.core_rewrite.state import Context
+from hyperscale.ui.actions import update_active_workflow_message
 
 from .workflow_runner import WorkflowRunner
 
@@ -56,6 +59,18 @@ NodeData = Dict[
     ],
 ]
 
+StepStatsType = Literal[
+    "total",
+    "ok",
+    "failed",
+]
+
+
+StepStatsUpdate = Dict[
+    str,
+    Dict[StepStatsType, int]
+]
+
 
 class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
     def __init__(
@@ -67,6 +82,8 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         super().__init__(host, port, env)
 
         self._workflows = WorkflowRunner(env)
+
+        self._acknowledged_starts: set[int] = set()
 
         self._results: NodeData[WorkflowResult] = defaultdict(lambda: defaultdict(dict))
         self._errors: NodeData[Exception] = defaultdict(lambda: defaultdict(dict))
@@ -94,6 +111,20 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
             )
         )
 
+        self._step_stats: Dict[int, Dict[str, Dict[int, StepStatsUpdate]]] = defaultdict(
+            lambda: defaultdict(
+                lambda: defaultdict(
+                    lambda: defaultdict(
+                        lambda: {
+                            "total": 0,
+                            "ok": 0,
+                            "failed": 0
+                        }
+                    )
+                )
+            )
+        )
+
         self._cpu_usage_stats: Dict[int, Dict[str, Dict[int, float]]] = defaultdict(
             lambda: defaultdict(lambda: defaultdict(lambda: 0))
         )
@@ -109,6 +140,8 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
             defaultdict(lambda: defaultdict(lambda: defaultdict(asyncio.Lock)))
         )
 
+        self._leader_lock: asyncio.Lock | None = None
+
     async def start_server(
         self,
         cert_path: str | None = None,
@@ -116,6 +149,10 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         worker_socket: socket | None = None,
         worker_server: asyncio.Server | None = None,
     ) -> None:
+        
+        if self._leader_lock is None:
+            self._leader_lock = asyncio.Lock()
+
         self._workflows.setup()
         return await super().start_server(
             cert_path=cert_path,
@@ -189,6 +226,42 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
                 for idx in range(threads)
             ]
         )
+    
+    async def poll_for_start(
+        self,
+        workers: int
+    ):
+        polling = True
+
+        start = time.monotonic()
+        elapsed = 0
+
+        while polling:
+            await asyncio.sleep(self._context_poll_rate)
+
+            acknowledged_starts_count = len(self._acknowledged_starts)
+
+            if (
+                acknowledged_starts_count
+                >= workers
+            ):
+                await update_active_workflow_message(
+                    'initializing',
+                    f'Starting - {acknowledged_starts_count}/{workers} - threads'
+                )
+
+                break
+
+            elapsed = time.monotonic() - start
+
+            if elapsed > 1:
+                start = time.monotonic()
+
+                await update_active_workflow_message(
+                    'initializing',
+                    f'Starting - {acknowledged_starts_count}/{workers} - threads'
+                )
+
 
     async def poll_for_workflow_complete(
         self,
@@ -197,18 +270,49 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
     ):
         polling = True
 
+        workflow_slug = workflow_name.lower()
+
+        start = time.monotonic()
+        elapsed = 0
+
         while polling:
             await asyncio.sleep(self._context_poll_rate)
 
-            if (
-                len(self._completions[run_id][workflow_name])
-                >= self._run_workflow_expected_nodes[run_id][workflow_name]
-            ):
-                polling = False
+            completions_count = len(self._completions[run_id][workflow_name])
+            assigned_workers = self._run_workflow_expected_nodes[run_id][workflow_name]
+
+            if completions_count >= assigned_workers:
+                await update_active_workflow_message(
+                    workflow_slug,
+                    f'Running - {workflow_name} - {completions_count}/{assigned_workers} workers complete'
+                )
+
+                break
+
+            elapsed = time.monotonic() - start
+
+            if elapsed > 1:
+                start = time.monotonic()
+
+                await update_active_workflow_message(
+                    workflow_slug,
+                    f'Running - {workflow_name} - {completions_count}/{assigned_workers} workers complete'
+                )
 
         return (
             self._results[run_id][workflow_name],
             self._node_context[run_id],
+        )
+    
+    @send()
+    async def acknowledge_start(
+        self,
+        leader_address: tuple[str, int],
+    ):
+        return await self.send(
+            "receive_start_acknowledgement",
+            JobContext(None),
+            target_address=leader_address
         )
 
     @send()
@@ -269,6 +373,20 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
             ),
             node_id=node_id,
         )
+    
+    @receive()
+    async def receive_start_acknowledgement(
+        self,
+        shard_id: int,
+        _: JobContext[None]
+    ):
+        await self._leader_lock.acquire()
+        snowflake = Snowflake.parse(shard_id)
+        node_id = snowflake.instance
+
+        self._acknowledged_starts.add(node_id)
+
+        self._leader_lock.release()
 
     @receive()
     async def process_results(
@@ -287,6 +405,8 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         workflow_context = workflow_results.data.context
         error = workflow_results.data.error
         status = workflow_results.data.status
+
+        await self._leader_lock.acquire()
 
         await asyncio.gather(
             *[
@@ -309,6 +429,8 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         self._errors[run_id][workflow_name][node_id] = Exception(error)
 
         self._completions[run_id][workflow_name].add(node_id)
+
+        self._leader_lock.release()
 
         return JobContext(
             ReceivedReceipt(
@@ -357,7 +479,9 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         return JobContext(
             WorkflowStatusUpdate(
-                workflow_name, WorkflowStatus.SUBMITTED, node_id=node_id
+                workflow_name, 
+                WorkflowStatus.SUBMITTED, 
+                node_id=node_id,
             ),
             run_id=context.run_id,
         )
@@ -377,6 +501,8 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         completed_count = update.data.completed_count
         failed_count = update.data.failed_count
 
+        step_stats = update.data.step_stats
+
         avg_cpu_usage = update.data.avg_cpu_usage
         avg_memory_usage_mb = update.data.avg_memory_usage_mb
 
@@ -388,6 +514,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         self._completed_counts[run_id][workflow][node_id] = completed_count
         self._failed_counts[run_id][workflow][node_id] = failed_count
+        self._step_stats[run_id][workflow][node_id] = step_stats
 
         self._cpu_usage_stats[run_id][workflow][node_id] = avg_cpu_usage
         self._memory_usage_stats[run_id][workflow][node_id] = avg_memory_usage_mb
@@ -464,6 +591,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
             status,
             completed_count,
             failed_count,
+            step_stats,
         ) = self._workflows.get_running_workflow_stats(
             run_id,
             workflow_name,
@@ -490,8 +618,9 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
                     node_id=node_id,
                     completed_count=completed_count,
                     failed_count=failed_count,
+                    step_stats=step_stats,
                     avg_cpu_usage=avg_cpu_usage,
-                    avg_mem_usage=avg_mem_usage,
+                    avg_memory_usage_mb=avg_mem_usage,
                 ),
                 run_id=run_id,
             ),
@@ -504,8 +633,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         trigger="MANUAL",
         repeat="ALWAYS",
         schedule="0.1s",
-        max_age="1m",
-        keep_policy="COUNT_AND_AGE",
+        keep_policy="COUNT",
     )
     async def get_latest_completed(
         self,
@@ -515,8 +643,8 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
             [WorkflowStatusUpdate],
             Awaitable[None],
         ],
-    ):
-        workflow_status: WorkflowStatus.SUBMITTED
+    ):  
+        workflow_status = WorkflowStatus.SUBMITTED
 
         status_counts = Counter(self._statuses[run_id][workflow].values())
         for status, count in status_counts.items():
@@ -527,10 +655,27 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         completed_count = sum(self._completed_counts[run_id][workflow].values())
         failed_count = sum(self._failed_counts[run_id][workflow].values())
-        avg_cpu_usage = statistics.mean(
-            self._cpu_usage_stats[run_id][workflow].values()
-        )
-        avg_mem_usage_mb = statistics.mean(self._memory_usage_stats[run_id][workflow])
+
+        step_stats: StepStatsUpdate = defaultdict(lambda: {
+            "ok": 0,
+            "total": 0,
+            "failed": 0,
+        })
+
+        for _, stats_update in self._step_stats[run_id][workflow].items():
+            for hook, stats_set in stats_update.items():
+                for stats_type, stat in stats_set.items():
+                    step_stats[hook][stats_type] += stat
+
+        cpu_usage_stats = self._cpu_usage_stats[run_id][workflow].values()
+        avg_cpu_usage = 0
+        if len(cpu_usage_stats) > 0:
+            avg_cpu_usage = statistics.mean(cpu_usage_stats)
+
+        memory_usage_stats = self._memory_usage_stats[run_id][workflow].values()
+        avg_mem_usage_mb = 0
+        if len(memory_usage_stats) > 0:
+            avg_mem_usage_mb = statistics.mean(memory_usage_stats)
 
         await update_callback(
             WorkflowStatusUpdate(
@@ -538,11 +683,11 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
                 workflow_status,
                 completed_count=completed_count,
                 failed_count=failed_count,
+                step_stats=step_stats,
                 avg_cpu_usage=avg_cpu_usage,
-                avg_mem_usage_mb=avg_mem_usage_mb,
+                avg_memory_usage_mb=avg_mem_usage_mb,
             )
         )
-
     async def close(self) -> None:
         await super().close()
         await self._workflows.close()

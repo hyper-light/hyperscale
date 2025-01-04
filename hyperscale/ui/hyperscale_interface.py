@@ -2,7 +2,6 @@ import asyncio
 import time
 from hyperscale.core_rewrite.graph import Workflow
 from hyperscale.ui.components.terminal import Terminal, Section
-from .actions import update_active_workflow_message
 from .generate_ui_sections import generate_ui_sections
 from .hyperscale_interface_config import HyperscaleInterfaceConfig
 from .interface_updates_controller import InterfaceUpdatesController
@@ -32,18 +31,21 @@ class HyperscaleInterface:
         self._updates = updates
 
         self._active_workflow = 'initializing'
+        self._active_workflows: list[str] = []
 
         self._terminal_task: asyncio.Task | None = None
         self._run_switch_loop: asyncio.Event | None = None
         self._active_workflows: list[str] = []
-        self._action_names: list[str] = [
-            'update_run_progress',
-            'update_run_message',
-            'update_run_timer',
-            'update_total_executions',
-            'update_total_executions',
-            'update_execution_timings',
-            'update_execution_stats',
+
+        self._component_names = [
+            'run_progress',
+            'run_message_display',
+            'run_timer',
+            'executions_counter',
+            'total_executions',
+            'executions_over_time',
+            'execution_stats_table',
+
         ]
 
         self._current_active_idx: int = 0
@@ -65,12 +67,10 @@ class HyperscaleInterface:
         if self._terminal_task is None:
             self._run_switch_loop = asyncio.Event()
             self._initial_tasks_set = asyncio.Future()
-            self._updated_active_workflows  = asyncio.Event()
 
             self._terminal_task = asyncio.ensure_future(self._run())
 
             await self._terminal.render(
-                notifications=[self._check_for_updates],
                 horizontal_padding=self._horizontal_padding,
                 vertical_padding=self._vertical_padding,
             )
@@ -80,47 +80,23 @@ class HyperscaleInterface:
         while not self._run_switch_loop.is_set():
             await asyncio.gather(*[
                 self._terminal.set_component_active(
-                    f'{action_name}_{self._active_workflow}' 
-                ) for action_name in self._action_names
+                    f'{component_name}_{self._active_workflow}' 
+                ) for component_name in self._component_names
             ])
 
-            await self._updated_active_workflows.wait()
+            active_workflows_update: list[str] | None = await self._updates.get_active_workflows(
+                self._config.update_interval
+            )
 
-            if len(self._active_workflows) > 0:
-                self._current_active_idx = (self._current_active_idx)%len(self._active_workflows)
-                self._active_workflow = self._active_workflows[self._current_active_idx]
-            
-                await update_active_workflow_message(
-                    self._active_workflow,
-                    f'Running - {self._active_workflow}',
-                )
-
-
-    async def _check_for_updates(self):
-        try:
-
-            if self._start is None:
-                self._start = time.monotonic()
-
-
-            elapsed = time.monotonic() - self._start
-  
-            active_workflows_update = await self._updates.get_active_workflows()
-
-            if active_workflows_update:
+            if isinstance(active_workflows_update, list):
                 self._active_workflows = active_workflows_update
                 self._current_active_idx = 0
+                self._active_workflow = active_workflows_update[self._current_active_idx]
 
-                self._updated_active_workflows.set() 
 
-            elif elapsed > self._config.update_interval:
-                self._start = 0
-                self._updated_active_workflows.set() 
-
-        except Exception:
-           import traceback
-           print(traceback.format_exc())
-
+            elif len(self._active_workflows) > 0:
+                self._current_active_idx = (self._current_active_idx + 1)%len(self._active_workflows)
+                self._active_workflow = self._active_workflows[self._current_active_idx]
 
     async def stop(self):
 

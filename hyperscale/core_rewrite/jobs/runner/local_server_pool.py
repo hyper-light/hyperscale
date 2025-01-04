@@ -5,6 +5,7 @@ import signal
 import socket
 import warnings
 from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import active_children
 from multiprocessing.context import SpawnContext
 from typing import Dict, List
 
@@ -28,6 +29,7 @@ def abort_server(server: RemoteGraphController):
 
 
 async def run_server(
+    leader_address: tuple[str, int],
     server: RemoteGraphController,
     worker_socket: socket.socket,
     cert_path: str | None = None,
@@ -39,6 +41,16 @@ async def run_server(
             key_path=key_path,
             worker_socket=worker_socket,
         )
+        await asyncio.sleep(1)
+
+        try:
+
+            await server.connect_client(leader_address)
+            await server.acknowledge_start(leader_address)
+
+        except Exception:
+            pass
+
         await server.run_forever()
         await server.close()
 
@@ -47,6 +59,7 @@ async def run_server(
 
 
 def run_thread(
+    leader_address: tuple[str, int],
     socket: socket.socket,
     worker_env: Dict[str, str | int | float | bool | None],
     cert_path: str | None = None,
@@ -86,6 +99,7 @@ def run_thread(
     try:
         loop.run_until_complete(
             run_server(
+                leader_address,
                 server,
                 socket,
                 cert_path=cert_path,
@@ -94,7 +108,7 @@ def run_thread(
         )
 
     except Exception:
-        pass
+        abort_server(server)
 
     except asyncio.CancelledError:
         abort_server(server)
@@ -103,8 +117,9 @@ def run_thread(
 class LocalServerPool:
     def __init__(
         self,
-        pool_size: int = psutil.cpu_count(logical=False),
+        pool_size: int,
     ) -> None:
+
         self._pool_size = pool_size
         self._context: SpawnContext | None = None
         self._executor: ProcessPoolExecutor | None = None
@@ -132,6 +147,7 @@ class LocalServerPool:
 
     def run_pool(
         self,
+        leader_address: tuple[str, int],
         sockets: List[socket.socket],
         env: Env,
         cert_path: str | None = None,
@@ -143,6 +159,7 @@ class LocalServerPool:
                     self._executor,
                     functools.partial(
                         run_thread,
+                        leader_address,
                         socket,
                         env.model_dump(),
                         cert_path=cert_path,
@@ -169,7 +186,7 @@ class LocalServerPool:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self._executor.shutdown(cancel_futures=True, wait=False)
+            self._executor.shutdown()
 
     def abort(self):
         try:
@@ -187,4 +204,4 @@ class LocalServerPool:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
-            self._executor.shutdown(cancel_futures=True, wait=False)
+            self._executor.shutdown()

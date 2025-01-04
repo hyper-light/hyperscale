@@ -1,4 +1,5 @@
 import asyncio
+import math
 from hyperscale.ui.config.mode import TerminalMode
 from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.ui.styling import stylize, get_style
@@ -39,11 +40,11 @@ class Counter:
 
     @property
     def raw_size(self):
-        return self._counter_size
+        return self._max_width
 
     @property
     def size(self):
-        return self._counter_size
+        return self._max_width
 
     async def fit(
         self,
@@ -58,7 +59,6 @@ class Counter:
 
         count_size = self._config.precision + 2
 
-        self._max_width = max_width
         self._counter_size = count_size
 
         if self._unit:
@@ -81,7 +81,8 @@ class Counter:
 
         self._updates.put_nowait(amount)
 
-        self._update_lock.release()
+        if self._update_lock.locked():
+            self._update_lock.release()
 
     async def get_next_frame(self):
 
@@ -103,8 +104,9 @@ class Counter:
     async def _rerender(self, amount: int):
 
         count = self._format_count(amount)
+        remainder = self._max_width - len(count)
 
-        return await stylize(
+        stylized_count = await stylize(
             count,
             color=get_style(
                 self._config.color, 
@@ -122,6 +124,8 @@ class Counter:
             ] if self._config.attributes else None,
             mode=TerminalMode.to_mode(self._mode),
         )
+
+        return self._pad_count_horizontal(stylized_count, remainder)
 
     def _format_count(self, amount: int):
 
@@ -199,9 +203,29 @@ class Counter:
         if self._updates.empty() is False:
             data = await self._updates.get()
 
-        self._update_lock.release()
+        if self._update_lock.locked():
+            self._update_lock.release()
 
         return data
+    
+    def _pad_count_horizontal(
+        self,
+        status_text: str,
+        remainder: int,
+    ):
+        
+        match self._config.horizontal_alignment:
+            case 'left':
+                return status_text + (remainder * ' ')
+            
+            case 'center':
+                left_pad = math.ceil(remainder / 2)
+                right_pad = math.floor(remainder / 2)
+
+                return " " * left_pad + status_text + " " * right_pad
+            
+            case 'right':
+                return (remainder * ' ') + status_text
 
     async def pause(self):
         pass

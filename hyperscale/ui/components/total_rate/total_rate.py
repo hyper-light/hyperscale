@@ -1,4 +1,5 @@
 import asyncio
+import math
 import time
 
 from hyperscale.ui.config.mode import TerminalMode
@@ -6,6 +7,7 @@ from hyperscale.ui.config.widget_fit_dimensions import WidgetFitDimensions
 from hyperscale.ui.styling import stylize, get_style
 
 from .total_rate_config import TotalRateConfig
+from .total_rate_status import TotalRateStatus
 
 
 class TotalRate:
@@ -23,6 +25,8 @@ class TotalRate:
             subscriptions = []
 
         self._config = config
+        self._status: TotalRateStatus = TotalRateStatus.READY
+
         self.subscriptions = subscriptions
 
         self._unit = config.unit
@@ -37,7 +41,12 @@ class TotalRate:
         self._places_map = {"t": 1e12, "b": 1e9, "m": 1e6, "k": 1e3}
 
         self._update_lock: asyncio.Lock | None = None
-        self._updates: asyncio.Queue[int | float] | None = None
+        self._updates: asyncio.Queue[
+            tuple[
+                int | float | None,
+                TotalRateStatus,
+            ]
+        ] | None = None
 
 
         self._last_frame: str | None = None
@@ -46,11 +55,11 @@ class TotalRate:
 
     @property
     def raw_size(self):
-        return self._total_rate_width
+        return self._max_width
 
     @property
     def size(self):
-        return self._total_rate_width
+        return self._max_width
 
     async def fit(
         self,
@@ -82,27 +91,49 @@ class TotalRate:
             total_rate_width += unit_size
 
         self._total_rate_width = total_rate_width
-        self._updates.put_nowait(0)
 
     async def update(
         self,
-        amount: int | float,
+        update: tuple[
+            int | float | None,
+            bool
+        ],
     ):
         await self._update_lock.acquire()
+
+        amount, run_timer = update
 
         if self._start is None:
             self._start = time.monotonic()
 
-        self._updates.put_nowait(amount)
+        if run_timer:
+            self._updates.put_nowait((amount, TotalRateStatus.RUNNING))
 
-        self._update_lock.release()
+        elif run_timer is False:
+            self._updates.put_nowait((None, TotalRateStatus.STOPPED))
+
+        else:
+            self._updates.put_nowait((None, self._status))
+
+        if self._update_lock.locked():
+            self._update_lock.release()
 
     async def get_next_frame(self):
         
-        count = await self._check_if_should_rerender()
+        update = await self._check_if_should_rerender()
         rerender = False
 
-        if count is not None:
+        count, status = update
+
+        if self._status == TotalRateStatus.READY and status == TotalRateStatus.RUNNING:
+            self._status = status
+
+        elif self._status == TotalRateStatus.RUNNING and status == TotalRateStatus.STOPPED:
+            self._status = status        
+
+        if count is not None and self._status == TotalRateStatus.RUNNING:
+            self._status = status
+
             frame = await self._rerender(count)
             self._last_frame = [frame]
             rerender = True
@@ -111,7 +142,7 @@ class TotalRate:
             frame = await self._rerender(0)
             self._last_frame = [frame]
             rerender = True
-        
+
         return self._last_frame, rerender
 
     async def _rerender(self, count: int | float):
@@ -123,8 +154,9 @@ class TotalRate:
 
         rate = f"{rate}/s"
 
+        remainder = self._max_width - len(rate)
 
-        return await stylize(
+        stylized_rate = await stylize(
             rate,
             color=get_style(
                 self._config.color, 
@@ -144,6 +176,8 @@ class TotalRate:
                 ) for attr in self._config.attributes
             ] if self._config.attributes else None
         )
+
+        return self._pad_rate_horizontal(stylized_rate, remainder)
 
     def _format_rate(self, count: int | float):
         selected_place_adjustment: int | None = None
@@ -209,15 +243,40 @@ class TotalRate:
 
         return rate
     
+    def _pad_rate_horizontal(
+        self,
+        status_text: str,
+        remainder: int,
+    ):
+        match self._config.horizontal_alignment:
+            case 'left':
+                return status_text + (remainder * " ")
+            
+            case 'center':
+                left_pad = math.ceil(remainder / 2)
+                right_pad = math.floor(remainder / 2)
+
+                return " " * left_pad + status_text + " " * right_pad
+            
+            case 'right':
+                return (remainder * ' ') + status_text
+    
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
-        data: int | float | None = None
+        data: tuple[
+            int | float | None,
+            TotalRateStatus,
+        ] = (
+            None,
+            self._status
+        )
         
         if self._updates.empty() is False:
             data = await self._updates.get()
 
-        self._update_lock.release()
+        if self._update_lock.locked():
+            self._update_lock.release()
 
         return data
 

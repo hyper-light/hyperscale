@@ -2,4 +2,4 @@ from pydantic import BaseModel, StrictInt
 
 
 class HyperscaleInterfaceConfig(BaseModel):
-    update_interval: StrictInt = 10
+    update_interval: StrictInt = 5

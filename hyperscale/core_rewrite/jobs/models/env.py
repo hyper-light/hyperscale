@@ -23,7 +23,7 @@ class Env(BaseModel):
     MERCURY_SYNC_TASK_RUNNER_MAX_THREADS: StrictInt = psutil.cpu_count(logical=False)
     MERCURY_SYNC_MAX_RUNNING_WORKFLOWS: StrictInt = 1
     MERCURY_SYNC_MAX_PENDING_WORKFLOWS: StrictInt = 100
-    MERCURY_SYNC_CONTEXT_POLL_RATE: StrictStr = "1s"
+    MERCURY_SYNC_CONTEXT_POLL_RATE: StrictStr = "0.1s"
 
     @classmethod
     def types_map(self) -> Dict[str, Callable[[str], PrimaryType]]:

@@ -110,7 +110,6 @@ class Terminal:
         self._frame_height: int = 0
         self._horizontal_padding: int = 0
         self._vertical_padding: int = 0
-        self._notifications: List[Notification] | None = None
 
         # Maps signals to their default handlers in order to reset
         # custom handlers set by ``sigmap`` at the cleanup phase.
@@ -194,13 +193,10 @@ class Terminal:
 
     async def render(
         self,
-        notifications: list[Callable[[], Awaitable[None]]] | None = None,
         horizontal_padding: int = 0,
         vertical_padding: int = 0,
     ):
         if self._run_engine is None:
-
-            self._notifications = notifications
 
             await self._initialize_canvas(
                 horizontal_padding=horizontal_padding,
@@ -283,16 +279,10 @@ class Terminal:
                 frame = await self.canvas.render()
 
                 frame = f"\033[3J\033[H{frame}"
-
                 await self._loop.run_in_executor(None, sys.stdout.write, frame)
 
                 if self._stdout_lock.locked():
                     self._stdout_lock.release()
-
-                if self._notifications:
-                    await asyncio.gather(*[
-                        notification() for notification in self._notifications
-                    ])
 
             except Exception:
                 pass
@@ -404,7 +394,7 @@ class Terminal:
 
         frame = f"\033[3J\033[H{frame}\n"
 
-        # await self._loop.run_in_executor(None, sys.stdout.write, frame)
+        await self._loop.run_in_executor(None, sys.stdout.write, frame)
         await self._loop.run_in_executor(None, sys.stdout.flush)
 
         if self._stdout_lock.locked():
@@ -443,7 +433,7 @@ class Terminal:
 
         frame = f"\033[3J\033[H{frame}"
 
-        # await self._loop.run_in_executor(None, sys.stdout.write, frame)
+        await self._loop.run_in_executor(None, sys.stdout.write, frame)
 
         try:
             self._run_engine.cancel()

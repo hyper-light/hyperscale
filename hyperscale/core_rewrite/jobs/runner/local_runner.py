@@ -12,6 +12,7 @@ from hyperscale.core_rewrite.jobs.graphs.remote_graph_manager import RemoteGraph
 from hyperscale.core_rewrite.jobs.models import Env
 from hyperscale.core_rewrite.jobs.protocols.socket import bind_tcp_socket
 from hyperscale.ui import HyperscaleInterface, InterfaceUpdatesController
+from hyperscale.ui.actions import update_active_workflow_message
 
 from .local_server_pool import LocalServerPool
 
@@ -56,7 +57,7 @@ class LocalRunner:
         host: str,
         port: int,
         env: Env | None = None,
-        workers: int = psutil.cpu_count(logical=False),
+        workers: int | None = None,
     ) -> None:
         if env is None:
             env = Env(
@@ -64,6 +65,9 @@ class LocalRunner:
                     "MERCURY_SYNC_AUTH_SECRET", "hyperscalelocal"
                 ),
             )
+
+        if workers is None:
+            workers = max(psutil.cpu_count(logical=False) - 2 , 1)
 
         self._env = env
         
@@ -74,8 +78,8 @@ class LocalRunner:
         updates = InterfaceUpdatesController()
         
         self._interface = HyperscaleInterface(updates)
-        self._remote_manger = RemoteGraphManager(updates)
-        self._server_pool = LocalServerPool(pool_size=self._workers)
+        self._remote_manger = RemoteGraphManager(updates, self._workers)
+        self._server_pool = LocalServerPool(self._workers)
         self._pool_task: asyncio.Task | None = None
 
     async def run(
@@ -117,9 +121,16 @@ class LocalRunner:
                 return await graph.run()
 
             else:
+
+                await update_active_workflow_message(
+                    'initializing',
+                    'Starting worker servers...'
+                )
+
                 worker_sockets, worker_ips = await self._bin_and_check_socket_range()
 
                 self._server_pool.setup()
+
                 await self._remote_manger.start(
                     self.host,
                     self.port,
@@ -129,6 +140,7 @@ class LocalRunner:
                 )
 
                 self._server_pool.run_pool(
+                    (self.host, self.port),
                     worker_sockets,
                     self._env,
                     cert_path=cert_path,
@@ -137,8 +149,6 @@ class LocalRunner:
 
                 await self._remote_manger.connect_to_workers(
                     worker_ips,
-                    cert_path=cert_path,
-                    key_path=key_path,
                     timeout=timeout,
                 )
 
@@ -147,22 +157,10 @@ class LocalRunner:
                     workflows,
                 )
 
+                await self._interface.stop()
                 await self._remote_manger.shutdown_workers()
                 await self._remote_manger.close()
                 await self._server_pool.shutdown()
-
-                for task in asyncio.all_tasks():
-                    try:
-                        if task != close_task and task.cancelled() is False:
-                            task.cancel()
-
-                    except Exception:
-                        pass
-
-                    except asyncio.CancelledError:
-                        pass
-
-                await self._interface.stop()
 
                 return results
 
@@ -189,8 +187,6 @@ class LocalRunner:
                 pass
             except asyncio.CancelledError:
                 pass
-
-            self._kill_processes()
 
         except asyncio.CancelledError:
 
@@ -230,9 +226,7 @@ class LocalRunner:
                 except asyncio.CancelledError:
                     pass
 
-            self._kill_processes()
-
-    def _kill_processes(self):
+    def close(self):
         child_processes = active_children()
         for child in child_processes:
             try:
@@ -270,12 +264,15 @@ class LocalRunner:
                 try:
                     worker_socket = bind_tcp_socket(self.host, port)
                     worker_ips.append((self.host, port))
+                    worker_sockets.append(worker_socket)
 
                     testing_port = False
-                    worker_sockets.append(worker_socket)
 
                 except OSError:
                     port += self._workers + 1
                     await asyncio.sleep(0.1)
 
+        if len(worker_sockets) < self._workers:
+            raise Exception('Err. - Insufficient sockets binned.')
+        
         return (worker_sockets, worker_ips)

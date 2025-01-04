@@ -27,6 +27,28 @@ def generate_ui_sections(
         ) for workflow in workflows
     ]
 
+    text_components = [
+        Text(
+            f'run_message_display_{workflow_name}',
+            TextConfig(
+                text='Initializing...',
+            ),
+            subscriptions=[f'update_run_message_{workflow_name}']
+        ) for workflow_name, _ in workflow_configs
+    ]
+
+    print([
+        component.name for component in text_components
+    ])
+
+    text_components.insert(0, Text(
+        f'run_message_display_initializing',
+        TextConfig(
+            text='Initializing...',
+        ),
+        subscriptions=[f'update_run_message_initializing']
+    ))
+
     return [
         Section(
             SectionConfig(
@@ -95,7 +117,7 @@ def generate_ui_sections(
                         complete_color="hot_pink_3",
                         terminal_mode="extended",
                     ),
-                    subscriptions=[f'update_run_progress_{worklow_name}'],
+                    subscriptions=[f'update_run_progress_seconds_{worklow_name}'],
                 ) for worklow_name, time_limit_seconds in workflow_configs
             ],
         ),
@@ -111,15 +133,7 @@ def generate_ui_sections(
                 horizontal_alignment='center',
                 vertical_alignment='center',
             ),
-            components=[
-                Text(
-                    f'run_message_display_{workflow_name}',
-                    TextConfig(
-                        text='Initializing...',
-                    ),
-                    subscriptions=[f'update_run_message_{workflow_name}']
-                ) for workflow_name, _ in workflow_configs
-            ],
+            components=text_components,
         ),
         Section(
             SectionConfig(
@@ -184,7 +198,7 @@ def generate_ui_sections(
                         unit='aps',
                         terminal_mode='extended'
                     ),
-                    subscriptions=[f'update_total_executions_{workflow_name}'],
+                    subscriptions=[f'update_total_executions_rate_{workflow_name}'],
                 ) for workflow_name, _ in workflow_configs
             ]
         ),
@@ -210,7 +224,7 @@ def generate_ui_sections(
                         point_char="dot",
                         terminal_mode="extended",
                     ),
-                    subscriptions=[f'update_execution_timings_{workflow_name}'],
+                    subscriptions=[f'update_execution_rates_{workflow_name}'],
                 ) for workflow_name, _ in workflow_configs
             ]
         ),
@@ -234,10 +248,10 @@ def generate_ui_sections(
                             "step": {
                                 "default": "N/A",
                             },
-                            "completed": {
+                            "total": {
                                 "default": 0,
                             },
-                            "succeeded": {
+                            "ok": {
                                 "data_color": lambda value: "aquamarine_2"
                                 if value > 0
                                 else None,

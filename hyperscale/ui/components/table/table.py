@@ -175,7 +175,8 @@ class Table:
 
         self._updates.put_nowait(data)
 
-        self._update_lock.release()
+        if self._update_lock.locked():
+            self._update_lock.release()
         
     async def get_next_frame(self):
         if self._start is None:
@@ -287,7 +288,8 @@ class Table:
         if self._updates.empty() is False:
             data: list[dict[str, Any]] = await self._updates.get()
 
-        self._update_lock.release()
+        if self._update_lock.locked():
+            self._update_lock.release()
 
         return data
 
