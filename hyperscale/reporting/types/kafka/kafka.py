@@ -2,7 +2,7 @@ import json
 import uuid
 from typing import Any, Dict, List
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+
 from hyperscale.reporting.metric import MetricsSet
 
 from .kafka_config import KafkaConfig

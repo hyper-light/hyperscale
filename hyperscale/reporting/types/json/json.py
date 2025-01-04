@@ -14,7 +14,7 @@ from typing import Dict, List, TextIO, Union
 
 import psutil
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+
 from hyperscale.reporting.metric import MetricsSet
 
 from .json_config import JSONConfig

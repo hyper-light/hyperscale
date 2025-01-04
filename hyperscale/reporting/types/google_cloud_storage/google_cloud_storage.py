@@ -7,7 +7,7 @@ from typing import Dict, List
 
 import psutil
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+
 from hyperscale.reporting.metric import MetricsSet
 
 from .google_cloud_storage_config import GoogleCloudStorageConfig

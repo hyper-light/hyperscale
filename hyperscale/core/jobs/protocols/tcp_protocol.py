@@ -95,6 +95,7 @@ class TCPProtocol(Generic[T, K]):
         self._cleanup_interval = TimeParser(env.MERCURY_SYNC_CLEANUP_INTERVAL).time
 
         self._request_timeout = TimeParser(env.MERCURY_SYNC_REQUEST_TIMEOUT).time
+        self._connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_TIMEOUT).time
 
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
         self._tcp_connect_retries = env.MERCURY_SYNC_CONNECT_RETRIES
@@ -216,8 +217,6 @@ class TCPProtocol(Generic[T, K]):
                 self._server_ssl_context = self._create_server_ssl_context(
                     cert_path=cert_path, key_path=key_path
                 )
-
-            
 
             if self.connected is False and worker_socket is None:
                 self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -362,13 +361,17 @@ class TCPProtocol(Generic[T, K]):
 
             while True:
                 try:
+                    
                     if worker_socket is None:
                         tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                         self._client_sockets[address] = tcp_socket
 
-                        await self._loop.run_in_executor(
-                            None, tcp_socket.connect, address
+                        await asyncio.wait_for(
+                            self._loop.run_in_executor(
+                                None, tcp_socket.connect, address
+                            ),
+                            timeout=self._connect_timeout
                         )
 
                         tcp_socket.setblocking(False)
@@ -376,19 +379,25 @@ class TCPProtocol(Generic[T, K]):
                     else:
                         tcp_socket = worker_socket
 
-                    client_transport, _ = await self._loop.create_connection(
-                        lambda: MercurySyncTCPClientProtocol(self.read),
-                        sock=tcp_socket,
-                        ssl=self._client_ssl_context,
+                    client_transport, _ = await asyncio.wait_for(
+                        self._loop.create_connection(
+                            lambda: MercurySyncTCPClientProtocol(self.read),
+                            sock=tcp_socket,
+                            ssl=self._client_ssl_context,
+                        ),
+                        timeout=self._connect_timeout
                     )
 
                     self._client_transports[address] = client_transport
 
-                    result: Tuple[int, Message[None]] = await self.send(
-                        None,
-                        None,
-                        target_address=address,
-                        request_type="connect",
+                    result: Tuple[int, Message[None]] = await asyncio.wait_for(
+                        self.send(
+                            None,
+                            None,
+                            target_address=address,
+                            request_type="connect",
+                        ),
+                        timeout=self._connect_timeout
                     )
 
                     shard_id, _ = result
@@ -400,7 +409,8 @@ class TCPProtocol(Generic[T, K]):
                     self._node_host_map[instance] = address
                     self._nodes.put_no_wait(instance)
 
-                    self._connect_lock.release()
+                    if self._connect_lock.locked():
+                        self._connect_lock.release()
 
                     return instance
 
@@ -415,7 +425,11 @@ class TCPProtocol(Generic[T, K]):
         except Exception:
             pass
 
-        self._connect_lock.release()
+        except asyncio.CancelledError:
+            pass
+        
+        if self._connect_lock.locked():
+            self._connect_lock.release()
 
     def _create_client_ssl_context(
         self, cert_path: Optional[str] = None, key_path: Optional[str] = None

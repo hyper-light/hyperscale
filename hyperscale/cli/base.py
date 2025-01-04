@@ -5,7 +5,7 @@ from typing import Any, Callable, List, Optional, Union
 import click
 from art import text2art
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+
 
 
 class CLI(click.MultiCommand):

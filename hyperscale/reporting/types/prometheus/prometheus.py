@@ -3,7 +3,7 @@ import functools
 import uuid
 from typing import Dict, List
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+
 from hyperscale.reporting.metric import MetricsSet, MetricType
 
 try:

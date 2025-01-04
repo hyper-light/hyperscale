@@ -6,7 +6,6 @@ from typing import Dict, List
 
 import psutil
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.reporting.metric import MetricsSet
 
 from .aws_timestream_config import AWSTimestreamConfig
@@ -51,17 +50,7 @@ class AWSTimestream:
         self._loop = asyncio.get_event_loop()
         self.metadata_string: str = None
 
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
-
     async def connect(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Opening session - {self.session_uuid}"
-        )
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Opening amd authorizing connection to AWS - Region: {self.region_name}"
-        )
-
         self.client = await self._loop.run_in_executor(
             self._executor,
             functools.partial(
@@ -74,9 +63,6 @@ class AWSTimestream:
         )
 
         try:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Creating table - Database: {self.database_name} - if not exists"
-            )
 
             await self._loop.run_in_executor(
                 self._executor,
@@ -85,25 +71,11 @@ class AWSTimestream:
                 ),
             )
 
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Created table - Database: {self.database_name} - if not exists"
-            )
-
         except Exception:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Skipping creation of table - Database: {self.database_name} - if not exists"
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Successfully opened connection to AWS - Region: {self.region_name}"
-        )
+            pass
 
     async def submit_common(self, metrics: List[MetricsSet]):
         try:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Creating table - Database: {self.database_name} - Table: {self.metrics_table_name} - if not exists"
-            )
-
             await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
@@ -114,25 +86,12 @@ class AWSTimestream:
                 ),
             )
 
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Created table - Database: {self.database_name} - Table: {self.metrics_table_name} - if not exists"
-            )
-
         except Exception:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Skipping creation of table - Database: {self.database_name} - Table: {self.metrics_table_name} - if not exists"
-            )
+            pass
 
         records = []
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Shared Metrics - Database: {self.database_name} - Table: {self.events_table_name} - if not exists"
-        )
 
         for metrics_set in metrics:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
             for field, value in metrics_set.common_stats.items():
                 timestream_record = AWSTimestreamRecord(
                     record_type="stage_metrics",
@@ -157,15 +116,8 @@ class AWSTimestream:
             ),
         )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Shared Metrics - Database: {self.database_name} - Table: {self.events_table_name} - if not exists"
-        )
-
     async def submit_metrics(self, metrics: List[MetricsSet]):
         try:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Creating table - Database: {self.database_name} - Table: {self.metrics_table_name} - if not exists"
-            )
 
             await self._loop.run_in_executor(
                 self._executor,
@@ -177,29 +129,13 @@ class AWSTimestream:
                 ),
             )
 
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Created table - Database: {self.database_name} - Table: {self.metrics_table_name} - if not exists"
-            )
-
         except Exception:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Skipping creation of table - Database: {self.database_name} - Table: {self.metrics_table_name} - if not exists"
-            )
+            pass
 
         records = []
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Metrics - Database: {self.database_name} - Table: {self.events_table_name} - if not exists"
-        )
 
         for metrics_set in metrics:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
             for group_name, group in metrics_set.groups.items():
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Metrics Group - {group_name}"
-                )
 
                 metric_result = {**group.stats, **group.custom}
 
@@ -227,16 +163,8 @@ class AWSTimestream:
             ),
         )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Metrics - Database: {self.database_name} - Table: {self.events_table_name} - if not exists"
-        )
-
     async def submit_custom(self, metrics_sets: List[MetricsSet]):
         try:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Creating table - Database: {self.database_name} - Table: {self.metrics_table_name} - if not exists"
-            )
-
             await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
@@ -247,29 +175,14 @@ class AWSTimestream:
                 ),
             )
 
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Created table - Database: {self.database_name} - Table: {self.metrics_table_name} - if not exists"
-            )
-
         except Exception:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Skipping creation of table - Database: {self.database_name} - Table: {self.metrics_table_name} - if not exists"
-            )
+            pass
 
         records = []
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Metrics - Database: {self.database_name} - Table: {self.events_table_name} - if not exists"
-        )
+
 
         for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
             for custom_metric in metrics_set.custom_metrics.values():
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Metrics Group - Custom"
-                )
 
                 timestream_record = AWSTimestreamRecord(
                     record_type="metric",
@@ -294,16 +207,8 @@ class AWSTimestream:
             ),
         )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Metrics - Database: {self.database_name} - Table: {self.events_table_name} - if not exists"
-        )
-
     async def submit_errors(self, metrics_sets: List[MetricsSet]):
         try:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Creating table - Database: {self.database_name} - Table: {self.errors_table_name} - if not exists"
-            )
-
             await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
@@ -314,25 +219,12 @@ class AWSTimestream:
                 ),
             )
 
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Created table - Database: {self.database_name} - Table: {self.errors_table_name} - if not exists"
-            )
-
         except Exception:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Skipping creation of table - Database: {self.database_name} - Table: {self.errors_table_name} - if not exists"
-            )
+            pass
 
         error_records = []
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Errors Metrics - Database: {self.database_name} - Table: {self.events_table_name} - if not exists"
-        )
 
         for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Errors Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
             for error in metrics_set.errors:
                 timestream_record = AWSTimestreamErrorRecord(
                     record_name=metrics_set.name,
@@ -355,11 +247,5 @@ class AWSTimestream:
             ),
         )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Errors Metrics - Database: {self.database_name} - Table: {self.events_table_name} - if not exists"
-        )
-
     async def close(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Closing session - {self.session_uuid}"
-        )
+        pass

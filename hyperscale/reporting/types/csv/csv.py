@@ -11,7 +11,7 @@ from typing import List, TextIO
 
 import psutil
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+
 from hyperscale.reporting.metric.metrics_set import MetricsSet
 
 from .csv_config import CSVConfig

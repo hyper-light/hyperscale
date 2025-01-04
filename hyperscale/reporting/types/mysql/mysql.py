@@ -2,7 +2,7 @@ import uuid
 import warnings
 from typing import Dict, List
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+
 from hyperscale.reporting.metric import MetricsSet, MetricType
 
 from .mysql_config import MySQLConfig

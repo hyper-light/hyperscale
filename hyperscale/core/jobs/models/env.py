@@ -19,6 +19,7 @@ class Env(BaseModel):
     MERCURY_SYNC_AUTH_SECRET: StrictStr = "hyperscale"
     MERCURY_SYNC_LOGS_DIRECTORY: StrictStr = os.getcwd()
     MERCURY_SYNC_REQUEST_TIMEOUT: StrictStr = "30s"
+    MERCURY_SYNC_CONNECT_TIMEOUT: StrictStr = "1s"
     MERCURY_SYNC_LOG_LEVEL: StrictStr = "info"
     MERCURY_SYNC_TASK_RUNNER_MAX_THREADS: StrictInt = psutil.cpu_count(logical=False)
     MERCURY_SYNC_MAX_RUNNING_WORKFLOWS: StrictInt = 1
@@ -37,6 +38,7 @@ class Env(BaseModel):
             "MERCURY_SYNC_AUTH_SECRET": str,
             "MERCURY_SYNC_LOGS_DIRECTORY": str,
             "MERCURY_SYNC_REQUEST_TIMEOUT": str,
+            "MERCURY_SYNC_CONNECT_TIMEOUT": str,
             "MERCURY_SYNC_LOG_LEVEL": str,
             "MERCURY_SYNC_TASK_RUNNER_MAX_THREADS": int,
             "MERCURY_SYNC_MAX_WORKFLOWS": int,

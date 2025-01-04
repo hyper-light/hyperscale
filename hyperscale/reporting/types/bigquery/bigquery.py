@@ -6,7 +6,7 @@ from typing import List
 
 import psutil
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+
 from hyperscale.reporting.metric import MetricsSet, MetricType
 from hyperscale.reporting.system.system_metrics_set import SystemMetricsSet
 

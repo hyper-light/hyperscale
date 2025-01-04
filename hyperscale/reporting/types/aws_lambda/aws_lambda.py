@@ -8,7 +8,6 @@ from typing import Dict, List, Union
 
 import psutil
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 from hyperscale.reporting.metric import MetricsSet
 from hyperscale.reporting.types import ReporterTypes
 
@@ -60,9 +59,6 @@ class AWSLambda:
         self.reporter_type_name = self.reporter_type.name.capitalize()
         self.metadata_string: str = None
 
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
-
     async def connect(self):
         for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
             self._loop.add_signal_handler(
@@ -71,13 +67,6 @@ class AWSLambda:
                     signame, self._executor, self._loop
                 ),
             )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Opening session - {self.session_uuid}"
-        )
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Opening amd authorizing connection to AWS - Region: {self.region_name}"
-        )
 
         self._client = await self._loop.run_in_executor(
             self._executor,
@@ -90,14 +79,7 @@ class AWSLambda:
             ),
         )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Successfully opened connection to AWS - Region: {self.region_name}"
-        )
-
     async def submit_common(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Shared Metrics to Lambda - {self.shared_metrics_lambda_name}"
-        )
 
         await self._loop.run_in_executor(
             self._executor,
@@ -118,20 +100,9 @@ class AWSLambda:
             ),
         )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Shared Metrics to Lambda - {self.shared_metrics_lambda_name}"
-        )
-
     async def submit_metrics(self, metrics: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Metrics to Lambda - {self.metrics_lambda_name}"
-        )
 
         for metrics_set in metrics:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
             await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
@@ -146,15 +117,7 @@ class AWSLambda:
                 ),
             )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Metrics to Lambda - {self.metrics_lambda_name}"
-        )
-
     async def submit_custom(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Custom Metrics to Lambda - {self.metrics_lambda_name}"
-        )
-
         await self._loop.run_in_executor(
             self._executor,
             functools.partial(
@@ -177,20 +140,8 @@ class AWSLambda:
             ),
         )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Custom Metrics to Lambda - {self.metrics_lambda_name}"
-        )
-
     async def submit_errors(self, metrics: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Errors Metrics to Lambda - {self.error_metrics_lambda_name}"
-        )
-
         for metrics_set in metrics:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Errors Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
             await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
@@ -209,12 +160,6 @@ class AWSLambda:
                 ),
             )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Errors Metrics to Lambda - {self.error_metrics_lambda_name}"
-        )
-
     async def close(self):
         self._executor.shutdown(cancel_futures=True)
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Closing session - {self.session_uuid}"
-        )
+

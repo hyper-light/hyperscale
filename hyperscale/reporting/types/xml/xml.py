@@ -13,7 +13,7 @@ from xml.dom.minidom import parseString
 
 import psutil
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+
 from hyperscale.reporting.metric.metrics_set import MetricsSet
 from hyperscale.reporting.system.system_metrics_set import SystemMetricsSet
 

@@ -6,7 +6,7 @@ from typing import List
 
 import psutil
 
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
+
 from hyperscale.reporting.metric import MetricsSet
 from .honeycomb_config import HoneycombConfig
 

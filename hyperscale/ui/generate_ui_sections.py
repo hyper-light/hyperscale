@@ -37,10 +37,6 @@ def generate_ui_sections(
         ) for workflow_name, _ in workflow_configs
     ]
 
-    print([
-        component.name for component in text_components
-    ])
-
     text_components.insert(0, Text(
         f'run_message_display_initializing',
         TextConfig(

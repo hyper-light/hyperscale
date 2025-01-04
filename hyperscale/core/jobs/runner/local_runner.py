@@ -23,10 +23,12 @@ async def abort(
     manager: RemoteGraphManager,
     server: LocalServerPool,
     interface: HyperscaleInterface,
+    terminal_ui_enabled: bool = True
 ):
     
     try:
-        await interface.abort()
+        if terminal_ui_enabled:
+            await interface.abort()
 
     except Exception:
         pass
@@ -67,7 +69,7 @@ class LocalRunner:
             )
 
         if workers is None:
-            workers = max(psutil.cpu_count(logical=False) - 2 , 1)
+            workers = psutil.cpu_count(logical=False) 
 
         self._env = env
         
@@ -89,6 +91,7 @@ class LocalRunner:
         cert_path: str | None = None,
         key_path: str | None = None,
         timeout: int | float | str | None = None,
+        terminal_ui_enabled: bool = True
     ):
         loop = asyncio.get_event_loop()
         close_task = asyncio.current_task()
@@ -106,14 +109,15 @@ class LocalRunner:
                     abort(
                         self._remote_manger,
                         self._server_pool,
-                        self._interface
+                        self._interface,
+                        terminal_ui_enabled
                     )
                 ),
             )
 
-
-        self._interface.initialize(workflows)
-        await self._interface.run()
+        if terminal_ui_enabled:
+            self._interface.initialize(workflows)
+            await self._interface.run()
 
         try:
             if self._workers <= 1:
@@ -157,7 +161,9 @@ class LocalRunner:
                     workflows,
                 )
 
-                await self._interface.stop()
+                if terminal_ui_enabled:
+                    await self._interface.stop()
+
                 await self._remote_manger.shutdown_workers()
                 await self._remote_manger.close()
                 await self._server_pool.shutdown()
@@ -167,7 +173,8 @@ class LocalRunner:
         except Exception:
 
             try:
-                await self._interface.abort()
+                if terminal_ui_enabled:
+                    await self._interface.abort()
 
             except Exception:
                 pass
@@ -191,7 +198,8 @@ class LocalRunner:
         except asyncio.CancelledError:
 
             try:
-                await self._interface.abort()
+                if terminal_ui_enabled:
+                    await self._interface.abort()
 
             except Exception:
                 pass

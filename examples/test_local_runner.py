@@ -29,7 +29,7 @@ async def run():
         [Test()],
     )
 
-    runner.close()
+    # runner.close()
 
     return results
 
