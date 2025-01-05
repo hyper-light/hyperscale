@@ -944,14 +944,24 @@ class UDPProtocol(Generic[T, K]):
             )
 
     async def close(self) -> None:
-        self._stream = False
         self._running = False
-
-        close_task = asyncio.current_task()
 
         if self._transport:
             try:
-                self._transport.close()
+                self._transport.abort()
+
+            except Exception:
+                pass
+
+        if self.udp_socket:
+            try:
+                self.udp_socket.shutdown(socket.SHUT_RDWR)
+
+            except Exception:
+                pass
+
+            try:
+                self.udp_socket.close()
 
             except Exception:
                 pass
@@ -975,73 +985,9 @@ class UDPProtocol(Generic[T, K]):
 
             except asyncio.CancelledError:
                 pass
-
+        
         if self.tasks:
-            await self.tasks.shutdown()
-
-        for task in asyncio.all_tasks():
-            try:
-                if task != close_task and task.cancelled() is False:
-                    task.cancel()
-
-            except Exception:
-                pass
-
-            except asyncio.CancelledError:
-                pass
-
-        if self._run_future:
-            try:
-                self._run_future.set_result(None)
-
-            except asyncio.InvalidStateError:
-                pass
-
-            except asyncio.CancelledError:
-                pass
-
-    def stop(self):
-        if self._run_future:
-            try:
-                self._run_future.set_result(None)
-
-            except asyncio.InvalidStateError:
-                pass
-
-            except asyncio.CancelledError:
-                pass
-
-    def abort(self):
-        self._running = False
-
-        if self._transport:
-            try:
-                self._transport.close()
-
-            except Exception:
-                pass
-
-        if self._sleep_task:
-            try:
-                self._sleep_task.cancel()
-
-            except Exception:
-                pass
-
-            except asyncio.CancelledError:
-                pass
-
-        if self._cleanup_task:
-            try:
-                self._cleanup_task.cancel()
-
-            except Exception:
-                pass
-
-            except asyncio.CancelledError:
-                pass
-
-        self.tasks.abort()
+            self.tasks.abort()
 
         if self._run_future:
             try:
@@ -1064,3 +1010,86 @@ class UDPProtocol(Generic[T, K]):
 
             except asyncio.CancelledError:
                 pass
+
+        self._pending_responses.clear()
+
+    def stop(self):
+        if self._run_future:
+            try:
+                self._run_future.set_result(None)
+
+            except asyncio.InvalidStateError:
+                pass
+
+            except asyncio.CancelledError:
+                pass
+
+    def abort(self):
+        self._running = False
+
+        if self._transport:
+            try:
+                self._transport.abort()
+
+            except Exception:
+                pass
+
+        if self.udp_socket:
+            try:
+                self.udp_socket.shutdown(socket.SHUT_RDWR)
+
+            except Exception:
+                pass
+
+            try:
+                self.udp_socket.close()
+
+            except Exception:
+                pass
+
+        if self._sleep_task:
+            try:
+                self._sleep_task.cancel()
+
+            except Exception:
+                pass
+
+            except asyncio.CancelledError:
+                pass
+
+        if self._cleanup_task:
+            try:
+                self._cleanup_task.cancel()
+
+            except Exception:
+                pass
+
+            except asyncio.CancelledError:
+                pass
+        
+        if self.tasks:
+            self.tasks.abort()
+
+        if self._run_future:
+            try:
+                self._run_future.cancel()
+
+            except asyncio.InvalidStateError:
+                pass
+
+            except asyncio.CancelledError:
+                pass
+
+        close_task = asyncio.current_task()
+        for task in asyncio.all_tasks():
+            try:
+                if task != close_task and task.cancelled() is False:
+                    task.cancel()
+
+            except Exception:
+                pass
+
+            except asyncio.CancelledError:
+                pass
+
+        self._pending_responses.clear()

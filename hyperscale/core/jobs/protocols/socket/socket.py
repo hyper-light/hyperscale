@@ -8,7 +8,6 @@ def bind_tcp_socket(host: str, port: int) -> socket.socket:
         family = socket.AF_INET6
 
     sock = socket.socket(family, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     try:
         sock.bind((host, port))
@@ -24,7 +23,6 @@ def bind_tcp_socket(host: str, port: int) -> socket.socket:
 
 def bind_udp_socket(host: str, port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     try:
         sock.bind((host, port))

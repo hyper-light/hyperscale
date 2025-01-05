@@ -176,9 +176,6 @@ class LocalRunner:
                 return results
 
         except Exception:
-            import traceback
-            print(traceback.format_exc())
-
             try:
                 if terminal_ui_enabled:
                     await self._interface.abort()

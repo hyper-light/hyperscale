@@ -28,7 +28,7 @@ from .completion_counter import CompletionCounter
 StepStatsType = Literal[
     "total",
     "ok",
-    "failed",
+    "err",
 ]
 
 
@@ -160,7 +160,7 @@ class WorkflowRunner:
             hook: {
                 "total": 0,
                 "ok": 0,
-                "failed": 0
+                "err": 0
             } for hook in workflow_hooks
         }
 
@@ -189,7 +189,7 @@ class WorkflowRunner:
                     worklow_hook_stats[hook_name] = {
                         "total": stats["total"].value(),
                         "ok": stats["ok"].value(),
-                        "failed": stats["failed"].value(),
+                        "err": stats["err"].value(),
                     }
         
         except Exception:
@@ -533,7 +533,7 @@ class WorkflowRunner:
             self._workflow_step_stats[run_id][stats_key] = {
                 'total': CompletionCounter(),
                 'ok': CompletionCounter(),
-                'failed': CompletionCounter(),
+                'err': CompletionCounter(),
             }
 
         step_graph = networkx.DiGraph()
@@ -764,7 +764,7 @@ class WorkflowRunner:
 
                 except Exception as err:
                     self._failed_counts[run_id][workflow_name].increment()
-                    self._workflow_step_stats[run_id][(workflow_name, step_name)]["failed"].increment()
+                    self._workflow_step_stats[run_id][(workflow_name, step_name)]["err"].increment()
 
                     result = err
 

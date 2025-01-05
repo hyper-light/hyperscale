@@ -4,7 +4,7 @@ from .workflow_status import WorkflowStatus
 StepStatsType = Literal[
     "total",
     "ok",
-    "failed",
+    "err",
 ]
 
 class WorkflowStatusUpdate:

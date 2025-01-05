@@ -38,6 +38,7 @@ class HyperscaleInterface:
         self._active_workflows: list[str] = []
 
         self._component_names = [
+            'workflow_metadata',
             'run_progress',
             'run_message_display',
             'run_timer',

@@ -6,7 +6,7 @@ StepStatsType = Literal[
     "step",
     "total",
     "ok",
-    "failed"
+    "err"
 ]
 
 ExecutionStatsUpdate = dict[
@@ -99,7 +99,7 @@ async def update_workflow_execution_stats(
             {
                 "step": step,
                 "ok": stats["ok"],
-                "failed": stats["failed"],
+                "err": stats["err"],
                 "total": stats["total"]
             } for step, stats in execution_stats.items()
         ]

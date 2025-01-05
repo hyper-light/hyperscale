@@ -6,6 +6,7 @@ from hyperscale.ui.components.counter import Counter
 from hyperscale.ui.components.empty import Empty
 from hyperscale.ui.components.header import Header
 from hyperscale.ui.components.link import Link
+from hyperscale.ui.components.multiline_text import MultilineText
 from hyperscale.ui.components.progress_bar import ProgressBar
 from hyperscale.ui.components.scatter_plot import ScatterPlot
 from hyperscale.ui.components.spinner import Spinner
@@ -57,6 +58,7 @@ class Canvas:
             | Empty
             | Header
             | Link
+            | MultilineText
             | ProgressBar
             | ScatterPlot
             | Spinner 
@@ -162,6 +164,7 @@ class Canvas:
                 | Header 
                 | Text 
                 | Spinner 
+                | MultilineText
                 | Link 
                 | ProgressBar 
                 | ScatterPlot 

@@ -1,5 +1,7 @@
 import threading
 import uuid
+import importlib
+
 
 from hyperscale.core.engines.client import Client
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
@@ -10,7 +12,10 @@ class Workflow:
     duration = "1m"
 
     def __init__(self):
-        self.graph = __file__
+
+        module = importlib.import_module(self.__module__)
+        self.graph = module.__file__
+        
         self.name = self.__class__.__name__
 
         generator = SnowflakeGenerator(

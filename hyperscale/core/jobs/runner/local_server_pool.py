@@ -54,7 +54,7 @@ async def run_server(
         await server.close()
 
     except Exception:
-        pass
+        server.abort()
 
 def run_thread(
     leader_address: tuple[str, int],

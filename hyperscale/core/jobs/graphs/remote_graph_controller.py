@@ -62,7 +62,7 @@ NodeData = Dict[
 StepStatsType = Literal[
     "total",
     "ok",
-    "failed",
+    "err",
 ]
 
 
@@ -118,7 +118,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                         lambda: {
                             "total": 0,
                             "ok": 0,
-                            "failed": 0
+                            "err": 0
                         }
                     )
                 )
@@ -678,7 +678,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         step_stats: StepStatsUpdate = defaultdict(lambda: {
             "ok": 0,
             "total": 0,
-            "failed": 0,
+            "err": 0,
         })
 
         for _, stats_update in self._step_stats[run_id][workflow].items():
