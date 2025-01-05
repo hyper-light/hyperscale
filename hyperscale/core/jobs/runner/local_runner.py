@@ -11,7 +11,7 @@ from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph import Graph, Workflow
 from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
 from hyperscale.core.jobs.models import Env
-from hyperscale.core.jobs.protocols.socket import bind_tcp_socket
+from hyperscale.core.jobs.protocols.socket import bind_udp_socket
 from hyperscale.ui import HyperscaleInterface, InterfaceUpdatesController
 from hyperscale.ui.actions import update_active_workflow_message
 
@@ -77,7 +77,7 @@ class LocalRunner:
         self.host = host
         self.port = port
         self._workers = workers
-        self._worker_connect_timeout = TimeParser(env.MERCURY_SYNC_TCP_CONNECT_SECONDS).time
+        self._worker_connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_SECONDS).time
 
         updates = InterfaceUpdatesController()
         
@@ -176,6 +176,8 @@ class LocalRunner:
                 return results
 
         except Exception:
+            import traceback
+            print(traceback.format_exc())
 
             try:
                 if terminal_ui_enabled:
@@ -275,7 +277,7 @@ class LocalRunner:
 
             while testing_port:
                 try:
-                    worker_socket = bind_tcp_socket(self.host, port)
+                    worker_socket = bind_udp_socket(self.host, port)
                     worker_ips.append((self.host, port))
                     worker_sockets.append(worker_socket)
 

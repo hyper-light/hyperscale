@@ -41,8 +41,7 @@ async def run_server(
             key_path=key_path,
             worker_socket=worker_socket,
         )
-        await asyncio.sleep(1)
-
+        
         try:
 
             await server.connect_client(leader_address)
@@ -56,7 +55,6 @@ async def run_server(
 
     except Exception:
         pass
-
 
 def run_thread(
     leader_address: tuple[str, int],

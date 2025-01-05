@@ -33,7 +33,7 @@ from hyperscale.core.jobs.models import (
 )
 from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
-from hyperscale.core.jobs.protocols import TCPProtocol
+from hyperscale.core.jobs.protocols import UDPProtocol
 from hyperscale.core.results.workflow_types import WorkflowStats
 from hyperscale.core.snowflake import Snowflake
 from hyperscale.core.state import Context
@@ -72,7 +72,7 @@ StepStatsUpdate = Dict[
 ]
 
 
-class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
+class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
     def __init__(
         self,
         host: str,
@@ -83,7 +83,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         self._workflows = WorkflowRunner(env)
 
-        self._acknowledged_starts: set[int] = set()
+        self.acknowledged_starts: set[str] = set()
 
         self._results: NodeData[WorkflowResult] = defaultdict(lambda: defaultdict(dict))
         self._errors: NodeData[Exception] = defaultdict(lambda: defaultdict(dict))
@@ -149,7 +149,6 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
         worker_socket: socket | None = None,
         worker_server: asyncio.Server | None = None,
     ) -> None:
-        
         if self._leader_lock is None:
             self._leader_lock = asyncio.Lock()
 
@@ -241,7 +240,7 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
             await self._leader_lock.acquire()
 
-            acknowledged_starts_count = len(self._acknowledged_starts)
+            acknowledged_starts_count = len(self.acknowledged_starts)
 
             if (
                 acknowledged_starts_count
@@ -325,7 +324,9 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
     ):
         return await self.send(
             "receive_start_acknowledgement",
-            JobContext(None),
+            JobContext(
+                (self.host, self.port)
+            ),
             target_address=leader_address
         )
 
@@ -391,14 +392,16 @@ class RemoteGraphController(TCPProtocol[JobContext[Any], JobContext[Any]]):
     @receive()
     async def receive_start_acknowledgement(
         self,
-        shard_id: int,
-        _: JobContext[None]
+        _: int,
+        acknowledgement: JobContext[tuple[str, int]]
     ):
         await self._leader_lock.acquire()
-        snowflake = Snowflake.parse(shard_id)
-        node_id = snowflake.instance
 
-        self._acknowledged_starts.add(node_id)
+        host, port = acknowledgement.data
+
+        node_addr = f'{host}:{port}'
+
+        self.acknowledged_starts.add(node_addr)
 
         if self._leader_lock.locked():
             self._leader_lock.release()

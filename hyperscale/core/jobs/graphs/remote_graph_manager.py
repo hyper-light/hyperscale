@@ -144,6 +144,12 @@ class RemoteGraphManager:
 
         await self._controller.poll_for_start(self._threads)
 
+        await asyncio.gather(*[
+            self._controller.connect_client(
+                address
+            ) for address in workers
+        ])
+
         self._provisioner.setup(max_workers=len(self._controller.nodes))
 
     async def run_forever(self):

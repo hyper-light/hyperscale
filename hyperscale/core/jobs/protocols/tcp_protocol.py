@@ -96,6 +96,7 @@ class TCPProtocol(Generic[T, K]):
 
         self._request_timeout = TimeParser(env.MERCURY_SYNC_REQUEST_TIMEOUT).time
         self._connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_TIMEOUT).time
+        self._retry_interval = TimeParser(env.MERCURY_SYNC_RETRY_INTERVAL).time
 
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
         self._tcp_connect_retries = env.MERCURY_SYNC_CONNECT_RETRIES
@@ -158,13 +159,6 @@ class TCPProtocol(Generic[T, K]):
                     )
                 }
             )
-
-            try:
-                self._loop = asyncio.get_event_loop()
-
-            except Exception:
-                self._loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(self._loop)
 
             self._running = True
 
@@ -420,6 +414,9 @@ class TCPProtocol(Generic[T, K]):
                 except OSError:
                     pass
 
+                except asyncio.CancelledError:
+                    pass
+
                 await asyncio.sleep(1)
 
         except Exception:
@@ -547,23 +544,38 @@ class TCPProtocol(Generic[T, K]):
 
                 client_transport.write(compressed)
 
-                waiter = self._loop.create_future()
-                self._waiters[target].append(waiter)
+                while True:
+                    try:
+                        waiter = self._loop.create_future()
+                        self._waiters[target].append(waiter)
 
-                result: Tuple[str, int, Message[K]] = await asyncio.wait_for(
-                    waiter,
-                    timeout=self._request_timeout,
-                )
+                        result: Tuple[str, int, Message[K]] = await asyncio.wait_for(
+                            waiter,
+                            timeout=self._request_timeout,
+                        )
 
-                (_, shard_id, response) = result
+                        (_, shard_id, response) = result
 
-                if request_type == "connect":
-                    return (
-                        shard_id,
-                        response,
-                    )
+                        if request_type == "connect":
+                            return (
+                                shard_id,
+                                response,
+                            )
 
-                return (shard_id, response.data)
+                        return (shard_id, response.data)
+                    
+                    except (Exception, socket.error):
+                        client_transport.close()
+
+                        await self.connect_client(
+                            address,
+                            cert_path=self._client_cert_path,
+                            key_path=self._client_key_path,
+                        )
+
+                        client_transport = self._client_transports.get(address)
+
+                        await asyncio.sleep(self._retry_interval)
 
             except (Exception, socket.error) as err:
                 return (
