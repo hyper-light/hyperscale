@@ -1,5 +1,4 @@
-import sys
-from hyperscale.cli_rewrite.parser import CLI
+from hyperscale.commands.cli import CLI
 
 
 
