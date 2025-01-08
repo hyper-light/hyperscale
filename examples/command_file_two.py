@@ -6,7 +6,7 @@ from hyperscale.cli_rewrite.parser import CLI
 @CLI.group()
 async def group(
     test: str, 
-    skip: bool = None, 
+    skip: bool = None,
     bloop: float = 0,
 ):
     '''

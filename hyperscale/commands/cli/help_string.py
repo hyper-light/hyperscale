@@ -1,7 +1,5 @@
 import textwrap
 
-from typing import Callable, Any
-
 from .keyword_arg import KeywordArg
 from .positional_arg import PositionalArg
 
