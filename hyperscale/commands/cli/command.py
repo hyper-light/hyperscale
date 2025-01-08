@@ -5,8 +5,9 @@ import textwrap
 import sys
 
 from typing import Generic, TypeVar, Literal, Any, Callable
-from .inspect_wrapped import inspect_wrapped, assemble_exanded_args
-from .keyword_arg import KeywordArg, is_required_missing_keyword_arg
+from .context import Context
+from .inspect_wrapped import inspect_wrapped, assemble_exanded_args, is_context_arg
+from .keyword_arg import KeywordArg, is_required_missing_keyword_arg, is_defaultable
 from .positional_arg import PositionalArg
 
 T = TypeVar('T', bound=dict)
@@ -73,12 +74,16 @@ class Command(Generic[T]):
         if self._command_call:
             return self._command_call.__module__
 
-    async def run(self, args: list[str]) -> tuple[Any | None, list[str]]:
+    async def run(
+        self, 
+        args: list[str],
+        context: Context[str, Any],
+    ) -> tuple[Any | None, list[str]]:
         (
             positional_args, 
             keyword_args,
             errors
-        ) = self._find_args(args)
+        ) =  await self._find_args(args, context)
 
         if positional_args is None and keyword_args is None:
             loop = asyncio.get_event_loop()
@@ -120,47 +125,48 @@ class Command(Generic[T]):
             errors,
         )
 
-    def _find_args(self, args: list[str]):
+    async def _find_args(
+        self, 
+        args: list[str],
+        context: Context[str, Any]
+    ):
 
         (
             positional_args,
             keyword_args,
             errors,
-        ) = self._assembled_positional_and_keyword_args(args)
+        ) = await self._assembled_positional_and_keyword_args(args, context)
 
         if keyword_args.get('help'):
             return (
                 None,
                 None,
-                None,
-                None,
                 errors,
             )
-
+        
         if len(positional_args) < self.positional_args_count:
             errors.extend([
-                f'{self.positional_args[arg_name].name} argument is config.name not in keyword_args and flag == config.full_flagrequired' for arg_name in self.positional_args if arg_name not in positional_args
+                f'{self.positional_args[arg_name].name} argument is required' for arg_name in self.positional_args if arg_name not in positional_args
             ])
 
         missing_required_keyword_errors = [
-            f'{config.name} option is required'
+            f'{config.full_flag} option is required'
             for flag, config in self.keyword_args_map.items() 
             if is_required_missing_keyword_arg(
                 flag,
                 config,
                 keyword_args,
-            )
+            ) and Context not in config.value_type
         ]
 
         if len(missing_required_keyword_errors) > 0:
             errors.extend(missing_required_keyword_errors)
 
-        keyword_args.update({
-            config.name: config.parse(
-                config.default
-            ) 
+        keyword_args.update({ 
+            config.name: await config.to_default() 
+            if Context not in config.value_type else context
             for flag, config in self.keyword_args_map.items() 
-            if is_required_missing_keyword_arg(
+            if is_defaultable(
                 flag,
                 config,
                 keyword_args,
@@ -173,44 +179,68 @@ class Command(Generic[T]):
             errors,
         )
     
-    def _assembled_positional_and_keyword_args(
+    async def _assembled_positional_and_keyword_args(
         self,
         args: list[str],
+        context: Context[str, Any]
     ):
         positional_args: list[Any] = []
         keyword_args: dict[str, Any] = {}
-        consumed_idxs: list[int] = []
+        consumed_idxs: set[int] = set()
         positional_idx = 0
 
         errors: list[str] = []
 
         cli_args = assemble_exanded_args(args)
 
-        for idx, arg in enumerate(cli_args):
+        cli_args = [
+            arg for idx, arg in enumerate(cli_args) if is_context_arg(
+                arg,
+                idx,
+                self.keyword_args_map,
+                self.positional_args,
+            ) is False
+        ]
 
-            error: str | None = None
+        keyword_args_map = {
+            arg_name: config 
+            for arg_name, config in self.keyword_args_map.items()
+            if Context not in config.value_type
+        }  
         
+        positional_args_map: dict[str, PositionalArg] = {}
+
+        position_arg_idx = 0
+        for config in self.positional_args.values():
+            if Context not in config.value_type:
+                positional_args_map[position_arg_idx] = config
+                position_arg_idx += 1
+
+        for idx, arg in enumerate(cli_args):
+            error: str | None = None
+
             if (
-                keyword_arg := self.keyword_args_map.get(arg)
+                keyword_arg := keyword_args_map.get(arg)
             ):
-                consumed_idxs.append(idx)
+
                 (
                     value,
                     error,
                     consumed_idxs
-                ) = self._consume_keyword_value(
+                ) = await self._consume_keyword_value(
                     idx,
-                    cli_args,
+                    cli_args[idx + 1:],
                     keyword_arg,
                     consumed_idxs,
                 )
 
                 keyword_args[keyword_arg.name] = value
+                consumed_idxs.add(idx)
 
             elif (
-                positional_arg := self.positional_args.get(positional_idx)
+                positional_arg := positional_args_map.get(positional_idx)
             ) and idx not in consumed_idxs:
-                positional_args, error = self._consume_positional_value(
+                positional_args, error = await self._consume_positional_value(
                     arg,
                     positional_arg,
                     positional_args,
@@ -218,49 +248,64 @@ class Command(Generic[T]):
 
                 positional_idx += 1
 
-                consumed_idxs.append(idx)
-
-            elif idx not in consumed_idxs and error is None:
-                error = f'{arg} is not a recognized argument or command'
+                consumed_idxs.add(idx)
 
             if error:
                 errors.append(error)
+                return (
+                    positional_args,
+                    keyword_args,
+                    errors
+                )
 
+        context_indexes = [
+            arg.index for arg in self.positional_args.values() if Context in arg.value_type
+        ]
+
+        for index in context_indexes:
+            positional_args.insert(index, context)
+
+        context_keyword_args = [
+            arg.name for arg in self.keyword_args_map.values() if Context in arg.value_type
+        ]
+
+        for keyword_arg_name in context_keyword_args:
+            keyword_args[keyword_arg_name] = context
+            
         return (
             positional_args,
             keyword_args,
             errors
         )
     
-    def _consume_positional_value(
+    async def _consume_positional_value(
         self,
         arg: str,
         positional_arg: PositionalArg,
-        positional_args: list[Any]
+        positional_args: list[Any],
     ):
-        
-        if not isinstance(arg, positional_arg.value_type):
+        value = await positional_arg.parse(arg)
+
+        if isinstance(value, Exception):
             return (
                 positional_args,
                 f'{arg} is not a valid value {positional_arg.data_type} for argument {positional_arg.name}',
                 
             )
-        
-        positional_args.append(
-            positional_arg.parse(arg)
-        )
-        
+            
+        positional_args.append(value)
+            
         return (
             positional_args,
             None,
         )
 
-    def _consume_keyword_value(
+    async def _consume_keyword_value(
         self,
         current_idx: int,
         args: list[str], 
         keyword_arg: KeywordArg,
-        consumed_idxs: list[int],
+        consumed_idxs: set[int],
     ):
 
         if keyword_arg.arg_type == 'flag':
@@ -270,41 +315,49 @@ class Command(Generic[T]):
                 consumed_idxs,
             )
 
-        value_index = 0
+        value: Any | None = None
+        value_idx = 0
 
         for arg_idx, arg in enumerate(args):
-
             if arg.startswith('-'):
-                value_index += 1
-
-            elif isinstance(keyword_arg.parse(arg), Exception):
-                value_index += 1
-
-            elif arg_idx <= current_idx:
-                value_index += 1
-
-            else:
                 break
 
-        value_missing = value_index >= len(args)
-        value: Any | None = None
+            elif (
+                result := await keyword_arg.parse(arg)
+            ) and isinstance(
+                result, 
+                Exception,
+            ) is False:
+                value = result
+                value_idx = arg_idx + 1
+                break
+        
+        if value is None and keyword_arg.loads_from_envar:
+            value = await keyword_arg.parse()
 
-        if value_missing and keyword_arg.required:
+        if (
+            value is None or isinstance(value, Exception)
+        ) and keyword_arg.required:
             return (
                 None,
                 f'No valid value found for required option {keyword_arg.full_flag}',
                 consumed_idxs,
             ) 
 
-        elif value_missing and keyword_arg.required is False:
-            value = keyword_arg.default
+        elif (
+            value is None or isinstance(value, Exception)
+        ) and keyword_arg.required is False:
+            value = await keyword_arg.to_default()
 
-        else:
-            value = args[value_index]
-            consumed_idxs.append(value_index)
+
+        consumed_idx = current_idx + value_idx
+
+
+        if consumed_idx > current_idx:
+            consumed_idxs.add(consumed_idx)
         
         return (
-            keyword_arg.parse(value),
+            value,
             None,
             consumed_idxs,
         )

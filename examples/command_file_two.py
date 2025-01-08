@@ -1,34 +1,21 @@
-from hyperscale.commands.cli import CLI
+from hyperscale.commands.cli import CLI, Context, Env, Pattern
 
-
-
-@CLI.group()
-async def group(
-    test: str, 
-    skip: bool = None,
-    bloop: float = 0,
-):
-    '''
-    An example group
-
-    @param test An example param
-    @param skip Another example param
-    @param bloop Yet another example param
-    '''
-    print('Hello world!')
-
-
-@CLI.group()
-async def test(bop: bool = None):
-    '''
-    A test command.
-
-    @param bop A test param.
-    '''
-    print(bop, 'HI')
+async def get_workers():
+    return 2
 
 
 @CLI.command()
-async def test_again(message: int | float = None):
-    pass
+async def run(
+    script: str,
+    workers: int | Env[int] = get_workers,
+    context: Context[str, str] = None,
+    additional: Pattern[r'\w+'] = None,
+):
+    '''
+    Run the provided script with the specified number of workers.
+
+    @param script The script to run.
+    @param workers The number of workers to use.
+    '''
+    print(context['test'], script)
 

@@ -1,34 +1,50 @@
 import asyncio
 import sys
-from hyperscale.commands.cli import CLI
-from examples.command_file_two import group, test, test_again
+from hyperscale.commands.cli import CLI, Context, Env, Pattern
+from typing import Literal, ForwardRef
+
+async def get_workers():
+    return 2
 
 
-@CLI.root(group, test, test_again)
+@CLI.root()
 async def root(
-    test: str, 
-    skip: bool = None, 
-    bloop: float = None,
+    context: Context[str, str] = None,
+    envar_path: str = None
 ):
     '''
-    An example group
-
-    @param test An example param
-    @param skip Another example param
-    @param bloop Yet another example param
+    An example command program
     '''
-    print('Hello world!')
+    context['test'] = 'A'
+
+
+@CLI.group()
+async def setup(quiet: bool = False):
+    print('Is quiet? ', quiet)
+
+
+@setup.command()
+async def test(name: str):
+    print(name)
 
 
 @CLI.command()
-async def test(bop: bool = None):
+async def run(
+    script: str,
+    workers: int | Env[int] = get_workers,
+    context: Context[str, str] = None,
+    additional: Pattern[
+        Literal[r'^[0-9]+'], 
+        int
+    ] = None,
+):
     '''
-    A test command.
+    Run the provided script with the specified number of workers.
 
-    @param bop A test param.
+    @param script The script to run.
+    @param workers The number of workers to use.
     '''
-    print(bop, 'HI')
-
+    print(context['test'], script, workers, additional, type(additional))
 
 
 

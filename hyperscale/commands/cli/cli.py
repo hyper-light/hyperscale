@@ -2,6 +2,7 @@
 import sys
 from .inspect_wrapped import inspect_wrapped
 from .command import Command, create_command
+from .context import Context
 from .group import Group, create_group
 
 
@@ -21,7 +22,10 @@ class CLI:
         if args is None:
             args  = list(sys.argv)
 
-        await cls.entrypoint.run(args)
+
+        context = Context()
+
+        await cls.entrypoint.run(args, context)
 
     @classmethod
     def root(
@@ -75,7 +79,7 @@ class CLI:
             
         def wrap(command):  
             if cls.entrypoint.source:
-                cls.entrypoint.group(shortnames=shortnames)(command)
+                return cls.entrypoint.group(shortnames=shortnames)(command)
 
             else:
                 return create_group(

@@ -1,11 +1,33 @@
 from __future__ import annotations
 import inspect
 from typing import Any, Callable
+from .context import Context
 from .help_string import create_help_string
 from .keyword_arg import KeywordArg, KeywordArgType
 from .positional_arg import PositionalArg
 
 
+def is_context_arg(
+    arg: str,
+    idx: int,
+    keyword_args_map: dict[str, KeywordArg],
+    positional_args_map: dict[str, PositionalArg]
+):
+    
+    keyword_args_map: dict[str, KeywordArg] = {}
+    positional_args_map: dict[str, PositionalArg] = {}
+
+    if (
+        keyword_arg := keyword_args_map.get(arg)
+    ) and keyword_arg.is_context_arg:
+        return True
+    
+    elif (
+        positional_arg := positional_args_map.get(idx)
+    ) and positional_arg.is_context_arg:
+        return True
+    
+    return False
 
 def assemble_exanded_args(args: list[str]):
     cli_args: list[str] = []
@@ -55,6 +77,7 @@ def inspect_wrapped(
                     arg_name,
                     position_index,
                     arg_attrs.annotation,
+                    is_context_arg=Context == arg_attrs.annotation,
                 )
 
             position_index += 1
@@ -77,7 +100,8 @@ def inspect_wrapped(
                 short_name=shortnames.get(arg_name),
                 required=required,
                 default=arg_default,
-                arg_type=arg_type
+                arg_type=arg_type,
+                is_context_arg=Context == arg_attrs.annotation,
             )
 
             keyword_args_map[keyword_arg.full_flag] = keyword_arg
