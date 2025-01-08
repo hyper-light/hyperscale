@@ -285,6 +285,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         while polling:
             await asyncio.sleep(self._context_poll_rate)
 
+            await self._leader_lock.acquire()
+
             completions_count = len(self._completions[run_id][workflow_name])
             assigned_workers = self._run_workflow_expected_nodes[run_id][workflow_name]
 

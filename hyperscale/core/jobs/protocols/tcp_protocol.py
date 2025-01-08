@@ -216,6 +216,8 @@ class TCPProtocol(Generic[T, K]):
                 self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
+                await self._loop.run_in_executor(None, self.server_socket.sendall, '')
+
                 while True:
                     try:
                         await asyncio.to_thread(
@@ -355,10 +357,10 @@ class TCPProtocol(Generic[T, K]):
 
             while True:
                 try:
-                    
+                                                                                                                                                                                                                                                                                                                            
                     if worker_socket is None:
                         tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                         self._client_sockets[address] = tcp_socket
 
                         await asyncio.wait_for(
