@@ -17,3 +17,5 @@ dev.yaml
 .venv
 *.png
 *.json
+*.txt
+*.log

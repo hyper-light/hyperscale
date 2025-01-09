@@ -33,7 +33,21 @@ class HelpMessage(BaseModel):
         
         lines: list[str] = []
 
+        error_header = 'error'
+
         if error and styles and styles.has_error_styles():
+
+            error_header = await stylize(
+                error_header,
+                color=get_style(styles.header_color),
+                highlight=get_style(styles.header_highlight),
+                attrs=[
+                    get_style(attribute)
+                    for attribute in styles.header_attributes
+                ] if styles.header_highlight else None
+
+            )
+
             error = await stylize(
                 error,
                 color=get_style(styles.error_color),
@@ -47,7 +61,7 @@ class HelpMessage(BaseModel):
 
         if error:
             error_indentation = ' ' * max(indentation - 1, 0)
-            lines.append(f'{error_indentation}{error}')
+            lines.append(f'{error_indentation}{error_header}: {error}')
 
         lines.extend([
             await self.title.to_message(

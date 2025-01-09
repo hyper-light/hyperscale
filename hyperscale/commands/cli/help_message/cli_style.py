@@ -8,6 +8,9 @@ class CLIStyle(BaseModel):
     description_color: Colorizer | None = None
     description_highlight: HighlightColorizer | None = None
     description_attributes: List[Attributizer] | None = None
+    flag_description_color: Colorizer | None = None
+    flag_description_highlight: HighlightColorizer | None = None
+    flag_description_attributes: List[Attributizer] | None = None
     error_color: Colorizer | None = None
     error_highlight: HighlightColorizer | None = None
     error_attributes: List[Attributizer] | None = None
@@ -31,6 +34,15 @@ class CLIStyle(BaseModel):
 
     def to_mode(self):
         return TerminalMode.to_mode(self.terminal_mode)
+    
+    def has_flag_description_styles(self):
+        return (
+            self.flag_description_color is not None
+        ) or (
+            self.flag_description_highlight is not None
+        ) or (
+            self.flag_description_attributes is not None
+        )
     
     def has_subcommand_styles(self):
         return (

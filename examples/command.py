@@ -1,16 +1,25 @@
 import asyncio
 import sys
 from hyperscale.commands.cli import (
+    Chain,
     CLI, 
     Context, 
     Env, 
     Pattern, 
-    JsonFile,
-    CLIStyle
+    RawFile,
+    CLIStyle,
+    JsonData,
+    Operator,
+    Paths,
+    Map
 )
-from pydantic import BaseModel, StrictInt
+from pydantic import BaseModel, StrictInt, RootModel, StrictStr
 from typing import Literal
 from examples.command_file_two import output
+
+
+class UserList(RootModel):
+    root: list[StrictStr]
 
 
 class ConfigFile(BaseModel):
@@ -23,7 +32,8 @@ async def get_workers():
 @CLI.root(
     output,
     global_styles=CLIStyle(
-        error_color='blue_violet',
+        flag_description_color='white',
+        error_color='hot_pink_3',
         error_attributes=['italic'],
         flag_color='aquamarine_2',
         text_color='hot_pink_3',
@@ -60,7 +70,17 @@ async def run(
         Literal[r'^[0-9]+'], 
         int
     ] = None,
-    config: JsonFile[ConfigFile] = None,
+    config: Operator[
+        Map[
+            Paths,
+            RawFile[str], 
+            Pattern[
+                Literal[r"([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)"], 
+                list[str]
+            ]
+        ],
+        UserList
+    ] = None,
 ):
     '''
     Run the provided script with the specified number of workers.
@@ -68,7 +88,7 @@ async def run(
     @param script The script to run.
     @param workers The number of workers to use.
     '''
-    pass
+    print(config.data, type(config.data))
 
 
 

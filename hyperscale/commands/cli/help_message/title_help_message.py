@@ -1,3 +1,4 @@
+import asyncio
 from typing import List
 
 from pydantic import BaseModel, StrictStr, StrictInt
@@ -56,14 +57,21 @@ class TitleHelpMessage(BaseModel):
             styles,
         )
 
-        if self.options:
-
-            options_string = " ".join([
+        options = self.options
+        if options:
+            options = [
                 arg.to_flag() for arg in self.options
-            ])
+            ]
 
-        styled_options = await self._style_flag(
-            options_string,
+        else:
+            options = [
+                "None"
+            ]
+
+        styled_options = await self._style_flags(
+            [
+                arg.to_flag() for arg in self.options
+            ],
             styles,
         )
 
@@ -73,24 +81,43 @@ class TitleHelpMessage(BaseModel):
 
         return f'\n{indentation}{command_name} {styled_options}'
     
-    async def _style_flag(
+    async def _style_flags(
         self,
-        flag: str,
+        flags: list[str],
         styles: CLIStyle | None,
     ):
+        options_join_char = ", "
+
+        if styles and styles.has_text_styles():
+            options_join_char = await stylize(
+                options_join_char,
+                color=get_style(styles.text_color),
+                highlight=get_style(styles.text_highlight),
+                attrs=[
+                    get_style(attribute)
+                    for attribute in styles.text_attributes
+                ] if styles.text_attributes else None,
+                mode=styles.to_mode()
+            )
+
+
         if styles is None or styles.has_flag_styles() is False:
-            return flag
+            return options_join_char.join(flags)
         
-        return await stylize(
-            flag,
-            color=get_style(styles.flag_color),
-            highlight=get_style(styles.flag_highlight),
-            attrs=[
-                get_style(attribute)
-                for attribute in styles.flag_attributes
-            ] if styles.flag_attributes else None,
-            mode=styles.to_mode(),
-        )
+        styled_flags = await asyncio.gather(*[
+            stylize(
+                flag,
+                color=get_style(styles.flag_color),
+                highlight=get_style(styles.flag_highlight),
+                attrs=[
+                    get_style(attribute)
+                    for attribute in styles.flag_attributes
+                ] if styles.flag_attributes else None,
+                mode=styles.to_mode(),
+            ) for flag in flags
+        ])
+
+        return options_join_char.join(styled_flags)
 
     async def _style_text(
         self,

@@ -1,9 +1,22 @@
-from typing import Generic, TypeVar, get_args, get_origin
-from.context import Context
-from .env import Env
-from .pattern import Pattern
-from .raw_file import RawFile
-from .json_file import JsonFile
+from hyperscale.commands.cli.arg_types.data_types import (
+    Context,
+    Env,
+    JsonData,
+    JsonFile,
+    Paths,
+    Pattern,
+    RawFile
+)
+from hyperscale.commands.cli.arg_types.operators import Operator
+from typing import (
+    Literal, 
+    Generic, 
+    TypeVar, 
+    Any,
+    Callable,
+    get_args, 
+    get_origin,
+)
 
 
 T = TypeVar('T')
@@ -26,17 +39,40 @@ class PositionalArg(Generic[T]):
         self.is_envar: bool = False
 
         args = get_args(data_type)
-        complex_types = [
-            Pattern,
-            Env,
-            Context,
-            RawFile,
-            JsonFile,
-        ]
+        self._complex_types: dict[
+            Context
+            | Env
+            | JsonData
+            | JsonData
+            | Operator
+            | Paths
+            | Pattern
+            | RawFile,
+            Callable[
+                [str, type[Any]],
+                Context
+                | Env
+                | JsonData
+                | JsonData
+                | Operator
+                | Paths
+                | Pattern
+                | RawFile,
+            ]
+        ] = {
+            Context: lambda _, __: Context(),
+            Env: lambda envar, subtype: Env(envar, subtype),
+            JsonFile: lambda _, subtype: JsonFile(subtype),
+            JsonData: lambda _, subtype: JsonData(subtype),
+            Operator: lambda name, subtype: Operator(name, subtype),
+            Paths: lambda _, subtype: Paths(subtype),
+            Pattern: lambda _, subtype: Pattern(subtype),
+            RawFile: lambda _, subtype: RawFile(subtype),
+        }
         
         self._is_complex_type = get_origin(
             data_type,
-        ) in complex_types
+        ) in self._complex_types.keys()
 
         if len(args) > 0 and self._is_complex_type is False:
             self._value_type = args
@@ -84,33 +120,20 @@ class PositionalArg(Generic[T]):
 
         for subtype in self.value_type:
             try:
-                
-                if get_origin(subtype) == Env:
-                    environmental_variable = Env(
+                if complex_type_factory := self._complex_types.get(
+                    get_origin(subtype)
+                ):
+                    complex_type = complex_type_factory(
                         self.name,
-                        get_origin(subtype)
+                        subtype
                     )
 
-                    return await environmental_variable.parse()
+                    return await complex_type.parse(value)
                 
-                elif get_origin(subtype) == Pattern:
-                    pattern = Pattern(subtype)
-
-                    return await pattern.parse(value)
-                
-                elif get_origin(subtype) == RawFile:
-                    rawfile = RawFile(subtype)
-                    return await rawfile.parse(value)
-                
-                elif get_origin(subtype) == JsonFile:
-                    json_file = JsonFile(subtype)
-                    return await json_file.parse(value)
-
                 elif subtype == bytes:
                     return bytes(value, encoding='utf-8')
                 
-                else:
-                    return subtype(value)
+                return subtype(value)
             
             except Exception as e:
                 parse_error = e

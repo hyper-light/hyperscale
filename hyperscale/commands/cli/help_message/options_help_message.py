@@ -1,8 +1,10 @@
+import asyncio
 from typing import List
 
 from pydantic import BaseModel, StrictStr, StrictInt
 from hyperscale.commands.cli.arg_types import KeywordArg, Context
 from hyperscale.ui.styling import stylize, get_style
+from hyperscale.ui.styling.attributes import Attributizer
 
 from .cli_style import CLIStyle
 from .line_parsing import is_arg_descriptor
@@ -99,7 +101,19 @@ class OptionsHelpMessage(BaseModel):
         if descriptor is None:
             descriptor = arg.description
 
-        if styles and styles.has_description_styles():
+        if styles and styles.has_flag_description_styles():
+            descriptor = await stylize(
+                descriptor,
+                color=get_style(styles.flag_description_color),
+                highlight=get_style(styles.flag_description_highlight),
+                attrs=[
+                    get_style(attribute)
+                    for attribute in styles.flag_description_attributes
+                ] if styles.flag_description_attributes else None,
+                mode=styles.to_mode(),
+            )
+
+        elif styles and styles.has_description_styles():
             descriptor = await stylize(
                 descriptor,
                 color=get_style(styles.description_color),
@@ -169,7 +183,12 @@ class OptionsHelpMessage(BaseModel):
 
         full_flag = arg.full_flag
         short_flag = arg.short_flag
-        arg_type = 'flag' if arg.arg_type == 'flag' else arg.data_type
+        arg_types = ['flag'] if arg.arg_type == 'flag' else arg.data_type_list
+        arg_types_join_char = ', '
+
+        if len(arg_types) < 1:
+            arg_types = ["None"]
+
         if styles and styles.has_flag_styles():
 
             flag_attributes = [
@@ -191,19 +210,35 @@ class OptionsHelpMessage(BaseModel):
                 highlight=get_style(styles.flag_highlight),
                 attrs=flag_attributes,
                 mode=styles.to_mode(),
-            ) 
+            )
 
-            arg_type = await stylize(
-                arg_type,
-                color=get_style(styles.flag_color),
-                highlight=get_style(styles.flag_highlight),
-                attrs=flag_attributes,
+            arg_types = await asyncio.gather(*[
+                stylize(
+                    arg_type,
+                    color=get_style(styles.flag_color),
+                    highlight=get_style(styles.flag_highlight),
+                    attrs=flag_attributes,
+                    mode=styles.to_mode(),
+                ) for arg_type in arg_types
+            ])
+
+            arg_types_join_char = await stylize(
+                arg_types_join_char,
+                color=get_style(styles.text_color),
+                highlight=get_style(styles.text_highlight),
+                attrs=[
+                    get_style(attribute)
+                    for attribute in styles.text_attributes
+                ] if styles.text_attributes else None,
                 mode=styles.to_mode(),
             )
 
-        help_string = f'{full_flag}{separator_char}{short_flag}{colon_char} {left_brace}{arg_type}{right_brace}'
+        arg_types_string = arg_types_join_char.join(arg_types)
+
+        help_string = f'{full_flag}{separator_char}{short_flag}{colon_char} {left_brace}{arg_types_string}{right_brace}'
 
         if descriptor:
             help_string = f'{help_string} {descriptor}'
 
         return help_string
+    

@@ -11,6 +11,7 @@ from .arg_types import (
     KeywordArg, 
     is_required_missing_keyword_arg, 
     is_defaultable,
+    is_env_defaultable,
     PositionalArg,
 )
 from .help_message import HelpMessage, CLIStyle
@@ -166,6 +167,28 @@ class Command(Generic[T]):
                 f'{self.positional_args[arg_name].name} argument is required' for arg_name in self.positional_args if arg_name not in positional_args
             ])
 
+        keyword_args.update({ 
+            config.name: await config.to_default() 
+            if Context not in config.value_type else context
+            for flag, config in self.keyword_args_map.items() 
+            if is_defaultable(
+                flag,
+                config,
+                keyword_args,
+            )
+        })
+
+        keyword_args.update({ 
+            config.name: await config.parse() 
+            if Context not in config.value_type else context
+            for flag, config in self.keyword_args_map.items() 
+            if is_env_defaultable(
+                flag,
+                config,
+                keyword_args,
+            )
+        })
+
         missing_required_keyword_errors = [
             f'{config.full_flag} option is required'
             for flag, config in self.keyword_args_map.items() 
@@ -178,17 +201,6 @@ class Command(Generic[T]):
 
         if len(missing_required_keyword_errors) > 0:
             errors.extend(missing_required_keyword_errors)
-
-        keyword_args.update({ 
-            config.name: await config.to_default() 
-            if Context not in config.value_type else context
-            for flag, config in self.keyword_args_map.items() 
-            if is_defaultable(
-                flag,
-                config,
-                keyword_args,
-            )
-        })
 
         return (
             positional_args, 
@@ -351,17 +363,8 @@ class Command(Generic[T]):
         
         if value is None and keyword_arg.loads_from_envar:
             value = await keyword_arg.parse()
-
+            
         if (
-            value is None or isinstance(value, Exception)
-        ) and keyword_arg.required:
-            return (
-                None,
-                f'No valid value found for required option {keyword_arg.full_flag}',
-                consumed_idxs,
-            ) 
-
-        elif (
             value is None or isinstance(value, Exception)
         ) and keyword_arg.required is False:
             value = await keyword_arg.to_default()

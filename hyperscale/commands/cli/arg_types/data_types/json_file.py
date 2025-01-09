@@ -22,25 +22,29 @@ class JsonFile(Generic[T]):
 
         conversion_type: T = reduce_pattern_type(data_type)
 
-        self._data_type = [
-            conversion_type.__name__
-        ]
-
-        self._types = tuple([
-            conversion_type
-        ])
-
+        self._data_type = conversion_type.__name__ if hasattr(conversion_type, '__name__') else type(conversion_type).__name__
+        self._type = conversion_type
 
         self._loop = asyncio.get_event_loop()
 
     def __contains__(self, value: Any):
-        return type(value) in self._types
+        return type(value) in [self._type]
 
     @property
     def data_type(self):
         return ', '.join(self._data_type)
     
     async def parse(self, arg: str | None = None):
+        
+        result = await self._load_json_file(arg)
+        if isinstance(result, Exception):
+            return result
+        
+        self.data = result
+
+        return self
+    
+    async def _load_json_file(self, arg: str | None = None):
         try:
 
             if arg is None:
@@ -64,17 +68,13 @@ class JsonFile(Generic[T]):
 
             json_data: dict[str, Any] = json.loads(file_data)
 
-            for conversion_type in self._types:
-                if conversion_type == list:
-                    self.data = json_data
+            if self._type == list and isinstance(json_data, list):
+                return json_data
 
-                elif conversion_type == bytes:
-                    self.data = bytes(json_data, encoding='utf-8')
+            elif self._type == bytes:
+                return bytes(json_data, encoding='utf-8')
 
-                else:
-                    self.data = conversion_type(**json_data)
+            return self._type(**json_data)
 
-                return self
-            
         except Exception as e:
             return e
