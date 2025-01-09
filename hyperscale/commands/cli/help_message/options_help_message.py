@@ -2,6 +2,7 @@ from typing import List
 
 from pydantic import BaseModel, StrictStr, StrictInt
 from hyperscale.commands.cli.arg_types import KeywordArg, Context
+from hyperscale.ui.styling import stylize, get_style
 
 from .cli_style import CLIStyle
 from .line_parsing import is_arg_descriptor
@@ -17,7 +18,10 @@ class OptionsHelpMessage(BaseModel):
     class Config:
         arbitrary_types_allowed=True
 
-    def _map_doc_string_param_descriptors(self):
+    def _map_doc_string_param_descriptors(
+        self,
+        styles: CLIStyle | None = None
+    ):
         param_lines = [
             line.strip()
             for line in self.help_string.split('\n') 
@@ -41,20 +45,165 @@ class OptionsHelpMessage(BaseModel):
 
         return param_descriptors
     
-    async def to_message(self):
-        param_descriptors = self._map_doc_string_param_descriptors()
+    async def to_message(
+        self,
+        global_styles: CLIStyle | None = None,
+    ):
+        indentation = self.indentation
+        if global_styles.indentation:
+            indentation = global_styles.indentation
+        
+        styles = self.styling
+        if styles is None:
+            styles = global_styles
 
-        tabs = ' ' * self.indentation
+        param_descriptors = self._map_doc_string_param_descriptors(
+            styles=styles
+        )
+
+        tabs = ' ' * indentation
         join_char = f'\n{tabs}'
         
         arg_string = join_char.join([
-            arg.to_help_string(
-                descriptor=param_descriptors.get(arg.name)
+            await self._to_help_string(
+                arg,
+                descriptor=param_descriptors.get(arg.name),
+                styles=styles
+                
             ) for arg in self.options if Context not in arg.value_type
         ])
 
-        header_indentation = max(self.indentation - 1, 0)
+        header_indentation = max(indentation - 1, 0)
         header_indentation_tabs = f' ' * header_indentation
         header_join_char = f'\n{header_indentation_tabs}'
 
-        return f'{header_join_char}{self.header}:{join_char}{arg_string}'
+        header = self.header
+        if styles and styles.has_header_styles():
+            header = await stylize(
+                header,
+                color=get_style(styles.header_color),
+                highlight=get_style(styles.header_highlight),
+                attrs=get_style(styles.header_attributes),
+                mode=styles.to_mode(),
+            )
+
+        return f'{header_join_char}{header}:{join_char}{arg_string}'
+    
+    async def _to_help_string(
+        self,
+        arg: KeywordArg,
+        descriptor: str | None = None,
+        styles: CLIStyle | None = None,
+    ):
+        
+        if descriptor is None:
+            descriptor = arg.description
+
+        if styles and styles.has_description_styles():
+            descriptor = await stylize(
+                descriptor,
+                color=get_style(styles.description_color),
+                highlight=get_style(styles.description_highlight),
+                attrs=[
+                    get_style(attribute)
+                    for attribute in styles.description_attributes
+                ] if styles.description_attributes else None,
+                mode=styles.to_mode(),
+            )
+
+        elif styles and styles.has_text_styles():
+            descriptor = await stylize(
+                descriptor,
+                color=get_style(styles.text_color),
+                highlight=get_style(styles.text_highlight),
+                attrs=[
+                    get_style(attribute)
+                    for attribute in styles.text_attributes
+                ] if styles.text_attributes else None,
+                mode=styles.to_mode()
+            )
+
+        separator_char = "/"
+        colon_char = ":"
+        left_brace = "["
+        right_brace = "]"
+
+        if styles and styles.has_text_styles():
+
+            text_attributes = [
+                get_style(attribute)
+                for attribute in styles.text_attributes
+            ] if styles.text_attributes else None
+
+            separator_char = await stylize(
+                separator_char,
+                color=get_style(styles.text_color),
+                highlight=get_style(styles.text_highlight),
+                attrs=text_attributes,
+                mode=styles.to_mode(),
+            )
+            
+            colon_char = await stylize(
+                colon_char,
+                color=get_style(styles.text_color),
+                highlight=get_style(styles.text_highlight),
+                attrs=text_attributes,
+                mode=styles.to_mode(),
+            )
+
+            left_brace = await stylize(
+                left_brace,
+                color=get_style(styles.text_color),
+                highlight=get_style(styles.text_highlight),
+                attrs=text_attributes,
+                mode=styles.to_mode(),
+            )
+            
+            right_brace = await stylize(
+                right_brace,
+                color=get_style(styles.text_color),
+                highlight=get_style(styles.text_highlight),
+                attrs=text_attributes,
+                mode=styles.to_mode(),
+            )
+
+        full_flag = arg.full_flag
+        short_flag = arg.short_flag
+        arg_type = 'flag' if arg.arg_type == 'flag' else arg.data_type
+        if styles and styles.has_flag_styles():
+
+            flag_attributes = [
+                get_style(attribute)
+                for attribute in styles.flag_attributes
+            ] if styles.flag_attributes else None
+
+            full_flag = await stylize(
+                full_flag,
+                color=get_style(styles.flag_color),
+                highlight=get_style(styles.flag_highlight),
+                attrs=flag_attributes,
+                mode=styles.to_mode(),
+            )
+
+            short_flag = await stylize(
+                short_flag,
+                color=get_style(styles.flag_color),
+                highlight=get_style(styles.flag_highlight),
+                attrs=flag_attributes,
+                mode=styles.to_mode(),
+            ) 
+
+            arg_type = await stylize(
+                arg_type,
+                color=get_style(styles.flag_color),
+                highlight=get_style(styles.flag_highlight),
+                attrs=flag_attributes,
+                mode=styles.to_mode(),
+            )
+
+        help_string = f'{full_flag}{separator_char}{short_flag}{colon_char} {left_brace}{arg_type}{right_brace}'
+
+        if descriptor:
+            help_string = f'{help_string} {descriptor}'
+
+        return help_string

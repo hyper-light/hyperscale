@@ -1,5 +1,7 @@
+import textwrap
 from pydantic import BaseModel, StrictInt
 from hyperscale.commands.cli.arg_types import KeywordArg
+from hyperscale.ui.styling import stylize, get_style
 
 
 from .cli_style import CLIStyle
@@ -21,6 +23,9 @@ class HelpMessage(BaseModel):
         error: str | None = None,
         global_styles: CLIStyle | None = None
     ):
+        indentation = self.indentation
+        if global_styles.indentation:
+            indentation = global_styles.indentation
         
         styles = self.styling
         if styles is None:
@@ -28,43 +33,102 @@ class HelpMessage(BaseModel):
         
         lines: list[str] = []
 
+        if error and styles and styles.has_error_styles():
+            error = await stylize(
+                error,
+                color=get_style(styles.error_color),
+                highlight=get_style(styles.error_highlight),
+                attrs=[
+                    get_style(attribute)
+                    for attribute in styles.error_attributes
+                ] if styles.error_attributes else None,
+                mode=styles.to_mode(),
+            )
+
         if error:
-            lines.append(error)
+            error_indentation = ' ' * max(indentation - 1, 0)
+            lines.append(f'{error_indentation}{error}')
 
         lines.extend([
-            await self.title.to_message(),
-            await self.description.to_message()
+            await self.title.to_message(
+                global_styles=styles,
+            ),
+            await self.description.to_message(
+                global_styles=styles,
+            )
         ])
         
 
         if self.options:
             lines.append(
-                await self.options.to_message()
+                await self.options.to_message(
+                    global_styles=styles,
+                )
             )
 
-        if subcommands:
+        if subcommands and len(subcommands) > 0:
             lines.append(
-                await self._create_subcommands_description(subcommands)
+                await self._create_subcommands_description(
+                    subcommands,
+                    indentation,
+                    styles=styles
+                )
             )
 
-        return '\n'.join(lines)
+        header_lines = '\n'.join(lines)
+
+        global_indentation = max(indentation - 1, 0)
+
+        return textwrap.indent(
+            f'\n{header_lines}\n\n',
+            '\t' * global_indentation,
+        )
 
     async def _create_subcommands_description(
         self, 
         subcommands: list[str],
+        indentation: int,
+        styles: CLIStyle | None = None,
     ):
-        tabs = ' ' * self.indentation
+        tabs = ' ' * indentation
         join_char = f'\n{tabs}'
+
+        styled_subcommands: list[str] = []
+        if styles and styles.has_subcommand_styles():
+            for subcommand in styled_subcommands:
+                styled_subcommands.append(
+                    await stylize(
+                        subcommand,
+                        color=get_style(styles.subcommand_color),
+                        highlight=get_style(styles.subcommand_highlight),
+                        attrs=[
+                            get_style(attribute)
+                            for attribute in styles.subcommand_attributes
+                        ] if styles.subcommand_attributes else None
+                    )
+                )
+
+        else:
+            styled_subcommands = subcommands
 
         subcommands_string = join_char.join(subcommands)
 
-        header_indentation = max(self.indentation - 1, 0)
+        header_indentation = max(indentation - 1, 0)
         header_indentation_tabs = f' ' * header_indentation
-        header_join_char = f'\n{header_indentation_tabs}'
 
         header = 'commands'
+        if styles and styles.has_header_styles():
+            header = await stylize(
+                header,
+                color=get_style(styles.header_color),
+                highlight=get_style(styles.header_highlight),
+                attrs=[
+                    get_style(attribute)
+                    for attribute in styles.header_attributes
+                ] if styles.header_attributes else None
+            )
         
-        return f'{header_join_char}{header}:{join_char}{subcommands_string}'
+        return f'{header_indentation_tabs}{header}:{join_char}{subcommands_string}'
 
 
 def create_help_string(
@@ -101,5 +165,6 @@ def create_help_string(
             indentation=indentation,
             styling=styling,
         ),
+        indentation=indentation,
         styling=styling,
     )

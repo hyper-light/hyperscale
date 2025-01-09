@@ -6,9 +6,11 @@ from hyperscale.commands.cli import (
     Env, 
     Pattern, 
     JsonFile,
+    CLIStyle
 )
 from pydantic import BaseModel, StrictInt
 from typing import Literal
+from examples.command_file_two import output
 
 
 class ConfigFile(BaseModel):
@@ -18,7 +20,17 @@ async def get_workers():
     return 2
 
 
-@CLI.root()
+@CLI.root(
+    output,
+    global_styles=CLIStyle(
+        error_color='blue_violet',
+        error_attributes=['italic'],
+        flag_color='aquamarine_2',
+        text_color='hot_pink_3',
+        indentation=3,
+        terminal_mode='extended'
+    )
+)
 async def root(
     context: Context[str, str] = None,
     envar_path: str = None
@@ -31,12 +43,12 @@ async def root(
 
 @CLI.group()
 async def setup(quiet: bool = False):
-    print('Is quiet? ', quiet)
+    pass
 
 
 @setup.command()
 async def test(name: str):
-    print(name)
+    pass
 
 
 @CLI.command()
@@ -56,7 +68,7 @@ async def run(
     @param script The script to run.
     @param workers The number of workers to use.
     '''
-    print(context['test'], script, workers, additional.data + 1, config.data.workers)
+    pass
 
 
 

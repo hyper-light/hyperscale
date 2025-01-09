@@ -46,6 +46,10 @@ class CLI:
             if global_styles:
                 cls._global_styles = global_styles
 
+            indentation = 0
+            if global_styles:
+                indentation = global_styles.indentation
+
             (
                 positional_args_map, 
                 keyword_args_map, 
@@ -54,7 +58,7 @@ class CLI:
                 command_call,
                 styling=global_styles,
                 shortnames=shortnames,
-                indentation=3,
+                indentation=indentation,
             )
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
             cls._entrypoint.update_command(

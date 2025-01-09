@@ -111,24 +111,6 @@ class KeywordArg(Generic[T]):
         
         else:
             return self.default
-
-
-    def to_help_string(
-        self,
-        descriptor: str | None = None
-    ):
-        
-        if descriptor is None:
-            descriptor = self.description
-
-        arg_type = 'flag' if self.arg_type == 'flag' else self.data_type
-
-        help_string = f'{self.full_flag}/{self.short_flag}: [{arg_type}]'
-
-        if descriptor:
-            help_string = f'{help_string} {descriptor}'
-
-        return help_string
         
     def to_flag(self):
         return f'--{self.name}'

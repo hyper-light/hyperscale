@@ -27,6 +27,10 @@ def create_group(
     styling: CLIStyle | None = None,
     shortnames: dict[str, str] | None = None,
 ):
+    indentation = 0
+    if styling:
+        indentation = styling.indentation
+
     (
         positional_args_map, 
         keyword_args_map, 
@@ -35,7 +39,7 @@ def create_group(
         command_call,
         styling=styling,
         shortnames=shortnames,
-        indentation=3,
+        indentation=indentation,
     )
 
     return Group(
@@ -119,19 +123,11 @@ class Group(Generic[T]):
         args: list[str],
         context: Context[str, Any],
     ) -> tuple[Any | None, list[str]]:
+        
+        subcommands: list[str] | None = None
         if len(self.subgroups) > 0 or len(self.subcommands) > 0:
             subcommands = list(self.subgroups.keys())
             subcommands.extend(self.subcommands.keys())
-
-
-            help_message_lines = await self.help_message.to_lines(
-                subcommands=subcommands,
-                global_styles=self._global_styles,
-            )
-
-            self.help_message = '\n'.join([
-                help_message_lines
-            ])
 
         (
             positional_args, 
@@ -145,13 +141,14 @@ class Group(Generic[T]):
             loop = asyncio.get_event_loop()
 
             help_message_lines = await self.help_message.to_lines(
+                subcommands=subcommands,
                 global_styles=self._global_styles,
             )
 
             await loop.run_in_executor(
                 None,
                 sys.stdout.write,
-                textwrap.indent(f'{help_message_lines}\n\n', '\t')
+                help_message_lines,
             )
 
             return (
@@ -162,20 +159,17 @@ class Group(Generic[T]):
         elif len(errors) > 0:
 
             help_message_lines = await self.help_message.to_lines(
+                error=errors[0],
+                subcommands=subcommands,
                 global_styles=self._global_styles,
             )
-
-            help_message = '\n'.join([
-                errors[0],
-                help_message_lines,
-            ])
 
             loop = asyncio.get_event_loop()
 
             await loop.run_in_executor(
                 None,
                 sys.stdout.write,
-                textwrap.indent(f'{help_message}\n\n', '\t')
+                help_message_lines,
             )
 
             return (

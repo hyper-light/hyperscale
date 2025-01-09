@@ -66,7 +66,6 @@ class JsonFile(Generic[T]):
 
             for conversion_type in self._types:
                 if conversion_type == list:
-                    print(json_data)
                     self.data = json_data
 
                 elif conversion_type == bytes:

@@ -5,11 +5,8 @@ async def get_workers():
 
 
 @CLI.command()
-async def run(
-    script: str,
-    workers: int | Env[int] = get_workers,
+async def output(
     context: Context[str, str] = None,
-    additional: Pattern[r'\w+'] = None,
 ):
     '''
     Run the provided script with the specified number of workers.
@@ -17,5 +14,5 @@ async def run(
     @param script The script to run.
     @param workers The number of workers to use.
     '''
-    print(context['test'], script)
+    pass
 

@@ -29,6 +29,9 @@ def create_command(
     shortnames: dict[str, str] | None = None,
     
 ):
+    indentation = 0
+    if styling:
+        indentation = styling.indentation
     (
         positional_args_map, 
         keyword_args_map, 
@@ -37,7 +40,7 @@ def create_command(
         command_call,
         styling=styling,
         shortnames=shortnames,
-        indentation=3,
+        indentation=indentation,
     )
 
 
@@ -104,7 +107,7 @@ class Command(Generic[T]):
             await loop.run_in_executor(
                 None,
                 sys.stdout.write,
-                textwrap.indent(f'{help_message_lines}\n\n', '\t')
+                help_message_lines,
             )
 
             return (
@@ -115,20 +118,16 @@ class Command(Generic[T]):
         elif len(errors) > 0:
 
             help_message_lines = await self.help_message.to_lines(
+                error=errors[0],
                 global_styles=self._global_styles,
             )
-
-            help_message = '\n'.join([
-                errors[0],
-                help_message_lines,
-            ])
 
             loop = asyncio.get_event_loop()
 
             await loop.run_in_executor(
                 None,
                 sys.stdout.write,
-                textwrap.indent(f'{help_message}\n\n', '\t')
+                help_message_lines,
             )
 
             return (
