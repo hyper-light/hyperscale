@@ -284,7 +284,7 @@ class Command(Generic[T]):
                 return (
                     positional_args,
                     keyword_args,
-                    errors
+                    errors,
                 )
 
         context_indexes = [

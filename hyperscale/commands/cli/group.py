@@ -396,7 +396,9 @@ class Group(Generic[T]):
                 return (
                     positional_args,
                     keyword_args,
-                    errors
+                    subcommand,
+                    None,
+                    errors,
                 )
             
         offset = len(consumed_idxs)
