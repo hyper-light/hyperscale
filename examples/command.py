@@ -1,7 +1,18 @@
 import asyncio
 import sys
-from hyperscale.commands.cli import CLI, Context, Env, Pattern
-from typing import Literal, ForwardRef
+from hyperscale.commands.cli import (
+    CLI, 
+    Context, 
+    Env, 
+    Pattern, 
+    JsonFile,
+)
+from pydantic import BaseModel, StrictInt
+from typing import Literal
+
+
+class ConfigFile(BaseModel):
+    workers: StrictInt
 
 async def get_workers():
     return 2
@@ -15,7 +26,7 @@ async def root(
     '''
     An example command program
     '''
-    context['test'] = 'A'
+    context['test'] = 'An example context value.'
 
 
 @CLI.group()
@@ -37,6 +48,7 @@ async def run(
         Literal[r'^[0-9]+'], 
         int
     ] = None,
+    config: JsonFile[ConfigFile] = None,
 ):
     '''
     Run the provided script with the specified number of workers.
@@ -44,7 +56,7 @@ async def run(
     @param script The script to run.
     @param workers The number of workers to use.
     '''
-    print(context['test'], script, workers, additional, type(additional))
+    print(context['test'], script, workers, additional.data + 1, config.data.workers)
 
 
 

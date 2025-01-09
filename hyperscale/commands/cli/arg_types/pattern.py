@@ -2,24 +2,11 @@ from __future__ import annotations
 import asyncio
 import re
 from typing import Generic, TypeVar, Any, get_args
+from .reduce_pattern_type import reduce_pattern_type
 
 
 T = TypeVar('T')
 K = TypeVar('K')
-
-
-def reduce_pattern_type(pattern: Any):
-    if isinstance(pattern, tuple) and len(pattern) > 0:
-        for arg in pattern:
-            return reduce_pattern_type(arg)
-        
-    elif (
-        args := get_args(pattern)
-    ) and len(args) > 0:
-        return reduce_pattern_type(args)
-    
-    else:
-        return pattern
 
 
 class Pattern(Generic[T, K]):
@@ -30,6 +17,8 @@ class Pattern(Generic[T, K]):
     ):
 
         super().__init__()
+
+        self.data: K | None = None
 
         pattern_type, conversion_type = get_args(pattern)
         self._pattern = re.compile(reduce_pattern_type(pattern_type))
@@ -69,10 +58,14 @@ class Pattern(Generic[T, K]):
         for subtype in self._types:
             try:
                 if subtype == bytes:
-                    return bytes(value, encoding='utf-8')
+                    self.data = bytes(value, encoding='utf-8')
+
+                    return self
                 
                 else:
-                    return subtype(value)
+                    self.data = subtype(value)
+
+                    return self
             
             except Exception as e:
                 parse_error = e

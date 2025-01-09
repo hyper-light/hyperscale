@@ -1,24 +1,10 @@
 import asyncio
 import os
-from typing import Generic, TypeVar, get_args, Any
+from typing import Generic, TypeVar, Any
+from .reduce_pattern_type import reduce_pattern_type
 
 
 T = TypeVar('T')
-
-
-def reduce_pattern_type(pattern: Any):
-    if isinstance(pattern, tuple) and len(pattern) > 0:
-        for arg in pattern:
-            return reduce_pattern_type(arg)
-        
-    elif (
-        args := get_args(pattern)
-    ) and len(args) > 0:
-        return reduce_pattern_type(args)
-    
-    else:
-        return pattern
-
 
 
 class Env(Generic[T]):
@@ -30,6 +16,8 @@ class Env(Generic[T]):
     ):
         super().__init__()
         self._envar = envar
+
+        self.data: T | None = None
 
         data_type = reduce_pattern_type(data_type)
         self._types = tuple([
@@ -58,10 +46,14 @@ class Env(Generic[T]):
         for subtype in self._types:
             try:
                 if subtype == bytes:
-                    return bytes(value, encoding='utf-8')
+                    self.data = bytes(value, encoding='utf-8')
+
+                    return self
                 
                 else:
-                    return subtype(value)
+                    self.data = subtype(value)
+
+                    return self
             
             except Exception as e:
                 parse_error = e

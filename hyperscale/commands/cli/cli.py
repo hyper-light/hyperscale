@@ -1,17 +1,20 @@
 
 import sys
-from .inspect_wrapped import inspect_wrapped
+
+from .arg_types import Context
 from .command import Command, create_command
-from .context import Context
 from .group import Group, create_group
+from .help_message import CLIStyle
+from .inspect_wrapped import inspect_wrapped
 
 
 class CLI:
-    entrypoint = Group(
+    _entrypoint: Group = Group(
         None,
         None,
         ""
     )
+    _global_styles: CLIStyle | None = None
     
 
     @classmethod
@@ -25,12 +28,13 @@ class CLI:
 
         context = Context()
 
-        await cls.entrypoint.run(args, context)
+        await cls._entrypoint.run(args, context)
 
     @classmethod
     def root(
         cls,
         *commands: list[Group | Command],
+        global_styles: CLIStyle | None = None,
         shortnames: dict[str, str] | None = None,
     ):
 
@@ -39,30 +43,37 @@ class CLI:
 
         def wrap(command_call): 
 
+            if global_styles:
+                cls._global_styles = global_styles
+
             (
                 positional_args_map, 
                 keyword_args_map, 
                 help_message,
             ) = inspect_wrapped(
                 command_call,
+                styling=global_styles,
                 shortnames=shortnames,
                 indentation=3,
             )
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
-            cls.entrypoint.update_command(
+            cls._entrypoint.update_command(
                 command_call.__name__,
                 command_call,
                 help_message,
+                global_styles=global_styles,
                 positional_args=positional_args_map,
                 keyword_args_map=keyword_args_map,
             )
 
             for command in commands:
                 if isinstance(command, Group):
-                    cls.entrypoint.subgroups[command.group_name] = command
+                    command._global_styles = cls._global_styles
+                    cls._entrypoint.subgroups[command.group_name] = command
 
                 elif isinstance(command, Command):
-                    cls.entrypoint.subcommands[command.command_name] = command
+                    command._global_styles = cls._global_styles
+                    cls._entrypoint.subcommands[command.command_name] = command
                 
             return cls
 
@@ -71,6 +82,7 @@ class CLI:
     @classmethod 
     def group(
         cls,
+        styling: CLIStyle | None = None,
         shortnames: dict[str, str] | None = None,
     ):
 
@@ -78,12 +90,16 @@ class CLI:
             shortnames = {}
             
         def wrap(command):  
-            if cls.entrypoint.source:
-                return cls.entrypoint.group(shortnames=shortnames)(command)
+            if cls._entrypoint.source:
+                return cls._entrypoint.group(
+                    styling=styling,
+                    shortnames=shortnames,
+                )(command)
 
             else:
                 return create_group(
                     command,
+                    styling=styling,
                     shortnames=shortnames,
                 )
 
@@ -92,17 +108,22 @@ class CLI:
     @classmethod
     def command(
         cls,
+        styling: CLIStyle | None = None,
         shortnames: dict[str, str] | None = None,
     ):
         if shortnames is None:
             shortnames = {}
 
         def wrap(command):
-            if cls.entrypoint.source:
-                cls.entrypoint.command(shortnames=shortnames)(command)
+            if cls._entrypoint.source:
+                cls._entrypoint.command(
+                    styling=styling,
+                    shortnames=shortnames
+                )(command)
 
             return create_command(
                 command,
+                styling=styling,
                 shortnames=shortnames,
             )
         

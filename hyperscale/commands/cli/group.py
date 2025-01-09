@@ -6,12 +6,17 @@ import textwrap
 
 from typing import Generic, TypeVar, Any, Callable
 
+from .arg_types import (
+    Context,
+    KeywordArg, 
+    is_required_missing_keyword_arg, 
+    is_defaultable,
+    PositionalArg,
+)
 from .command import Command, create_command
-from .context import Context
-from .help_string import create_subcommands_description
+from .help_message import HelpMessage, CLIStyle
 from .inspect_wrapped import inspect_wrapped, assemble_exanded_args, is_context_arg
-from .keyword_arg import KeywordArg, is_required_missing_keyword_arg, is_defaultable
-from .positional_arg import PositionalArg
+
 
 T = TypeVar('T', bound=dict)
 K = TypeVar('K')
@@ -19,6 +24,7 @@ K = TypeVar('K')
 
 def create_group(
     command_call: Callable[..., Any],
+    styling: CLIStyle | None = None,
     shortnames: dict[str, str] | None = None,
 ):
     (
@@ -27,6 +33,7 @@ def create_group(
         help_message,
     ) = inspect_wrapped(
         command_call,
+        styling=styling,
         shortnames=shortnames,
         indentation=3,
     )
@@ -48,7 +55,7 @@ class Group(Generic[T]):
         self,
         command: str,
         callable: T,
-        help_message: str,
+        help_message: HelpMessage,
         positional_args: dict[str, PositionalArg] | None = None,
         keyword_args_map: dict[str, KeywordArg] | None = None,
     ):
@@ -69,6 +76,7 @@ class Group(Generic[T]):
 
         self.subgroups: dict[str, Group[Any]] = {}
         self.subcommands: dict[str, Command[Any]] = {}
+        self._global_styles: CLIStyle | None = None
 
         self.positional_args = positional_args
         self.keyword_args_map = keyword_args_map
@@ -79,10 +87,12 @@ class Group(Generic[T]):
         self,
         command: str,
         callable: T,
-        help_message: str,
+        help_message: HelpMessage,
+        global_styles: CLIStyle | None = None,
         positional_args: dict[str, PositionalArg] | None = None,
         keyword_args_map: dict[str, KeywordArg] | None = None,
-    ):       
+    ):
+        self._global_styles = global_styles       
         
         if positional_args is None:
             positional_args = {}
@@ -113,14 +123,14 @@ class Group(Generic[T]):
             subcommands = list(self.subgroups.keys())
             subcommands.extend(self.subcommands.keys())
 
-            subcommands_help_string = create_subcommands_description(
-                subcommands,
-                indentation=3
+
+            help_message_lines = await self.help_message.to_lines(
+                subcommands=subcommands,
+                global_styles=self._global_styles,
             )
 
             self.help_message = '\n'.join([
-                self.help_message,
-                subcommands_help_string
+                help_message_lines
             ])
 
         (
@@ -134,10 +144,14 @@ class Group(Generic[T]):
         if positional_args is None and keyword_args is None:
             loop = asyncio.get_event_loop()
 
+            help_message_lines = await self.help_message.to_lines(
+                global_styles=self._global_styles,
+            )
+
             await loop.run_in_executor(
                 None,
                 sys.stdout.write,
-                textwrap.indent(f'{self.help_message}\n\n', '\t')
+                textwrap.indent(f'{help_message_lines}\n\n', '\t')
             )
 
             return (
@@ -146,9 +160,14 @@ class Group(Generic[T]):
             )
 
         elif len(errors) > 0:
+
+            help_message_lines = await self.help_message.to_lines(
+                global_styles=self._global_styles,
+            )
+
             help_message = '\n'.join([
                 errors[0],
-                self.help_message,
+                help_message_lines,
             ])
 
             loop = asyncio.get_event_loop()
@@ -156,7 +175,7 @@ class Group(Generic[T]):
             await loop.run_in_executor(
                 None,
                 sys.stdout.write,
-                textwrap.indent(f'\n{help_message}\n\n', '\t')
+                textwrap.indent(f'{help_message}\n\n', '\t')
             )
 
             return (
@@ -181,6 +200,7 @@ class Group(Generic[T]):
 
     def group(
         self,
+        styling: CLIStyle | None = None,
         shortnames: dict[str, str] | None = None,
     ):
 
@@ -189,7 +209,13 @@ class Group(Generic[T]):
             
         def wrap(command):
             
-            group = create_group(command, shortnames=shortnames)
+            group = create_group(
+                command,
+                styling=styling, 
+                shortnames=shortnames
+            )
+
+            group._global_styles = self._global_styles
 
             self.subgroups[group.group_name] = group
             
@@ -199,6 +225,7 @@ class Group(Generic[T]):
     
     def command(
         self,
+        styling: CLIStyle | None = None,
         shortnames: dict[str, str] | None = None,
     ):
         
@@ -209,8 +236,11 @@ class Group(Generic[T]):
 
             cmd = create_command(
                 command_call,
+                styling=styling,
                 shortnames=shortnames,
             )
+
+            cmd._global_styles = self._global_styles
 
             self.subcommands[cmd.command_name] = cmd
 

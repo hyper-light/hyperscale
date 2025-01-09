@@ -1,10 +1,17 @@
 from __future__ import annotations
+
+import asyncio
 import inspect
+
 from typing import Any, Callable
-from .context import Context
-from .help_string import create_help_string
-from .keyword_arg import KeywordArg, KeywordArgType
-from .positional_arg import PositionalArg
+
+
+from .arg_types import (
+    Context,
+    KeywordArg, 
+    PositionalArg,
+)
+from .help_message import create_help_string
 
 
 def is_context_arg(
@@ -52,6 +59,7 @@ def assemble_exanded_args(args: list[str]):
 
 def inspect_wrapped(
     command_call: Callable[..., Any],
+    styling: CLIStyle | None = None,
     shortnames: dict[str, str] | None = None,
     indentation: int | None = None
 ):
@@ -120,11 +128,11 @@ def inspect_wrapped(
         help_arg.short_flag: help_arg,
     })
 
-
     help_message = create_help_string(
         command_call.__name__,
         command_call.__doc__,
         keyword_args_map=keyword_args_map,
+        styling=styling,
         indentation=indentation,
     )
     

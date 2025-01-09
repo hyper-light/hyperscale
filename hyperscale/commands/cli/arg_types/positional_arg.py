@@ -2,6 +2,8 @@ from typing import Generic, TypeVar, get_args, get_origin
 from.context import Context
 from .env import Env
 from .pattern import Pattern
+from .raw_file import RawFile
+from .json_file import JsonFile
 
 
 T = TypeVar('T')
@@ -24,7 +26,17 @@ class PositionalArg(Generic[T]):
         self.is_envar: bool = False
 
         args = get_args(data_type)
-        self._is_complex_type = get_origin(data_type) in [Pattern, Env, Context]
+        complex_types = [
+            Pattern,
+            Env,
+            Context,
+            RawFile,
+            JsonFile,
+        ]
+        
+        self._is_complex_type = get_origin(
+            data_type,
+        ) in complex_types
 
         if len(args) > 0 and self._is_complex_type is False:
             self._value_type = args
@@ -86,6 +98,13 @@ class PositionalArg(Generic[T]):
 
                     return await pattern.parse(value)
                 
+                elif get_origin(subtype) == RawFile:
+                    rawfile = RawFile(subtype)
+                    return await rawfile.parse(value)
+                
+                elif get_origin(subtype) == JsonFile:
+                    json_file = JsonFile(subtype)
+                    return await json_file.parse(value)
 
                 elif subtype == bytes:
                     return bytes(value, encoding='utf-8')

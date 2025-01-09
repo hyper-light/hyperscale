@@ -5,10 +5,16 @@ import textwrap
 import sys
 
 from typing import Generic, TypeVar, Literal, Any, Callable
-from .context import Context
+
+from .arg_types import (
+    Context,
+    KeywordArg, 
+    is_required_missing_keyword_arg, 
+    is_defaultable,
+    PositionalArg,
+)
+from .help_message import HelpMessage, CLIStyle
 from .inspect_wrapped import inspect_wrapped, assemble_exanded_args, is_context_arg
-from .keyword_arg import KeywordArg, is_required_missing_keyword_arg, is_defaultable
-from .positional_arg import PositionalArg
 
 T = TypeVar('T', bound=dict)
 K = TypeVar('K')
@@ -19,6 +25,7 @@ ArgType = Literal['positional', 'keyword']
 
 def create_command(
     command_call: Callable[..., Any],
+    styling: CLIStyle | None = None,
     shortnames: dict[str, str] | None = None,
     
 ):
@@ -28,6 +35,7 @@ def create_command(
         help_message,
     ) = inspect_wrapped(
         command_call,
+        styling=styling,
         shortnames=shortnames,
         indentation=3,
     )
@@ -48,7 +56,7 @@ class Command(Generic[T]):
         self,
         command: str,
         callable: T,
-        help_message: str,
+        help_message: HelpMessage,
         positional_args: dict[str, PositionalArg] | None = None,
         keyword_args_map: dict[str, KeywordArg] | None = None,
     ):
@@ -61,6 +69,7 @@ class Command(Generic[T]):
 
         self.command_name = command
         self._command_call: T = callable
+        self._global_styles: CLIStyle | None = None
 
         self.help_message = help_message
 
@@ -88,10 +97,14 @@ class Command(Generic[T]):
         if positional_args is None and keyword_args is None:
             loop = asyncio.get_event_loop()
 
+            help_message_lines = await self.help_message.to_lines(
+                global_styles=self._global_styles,
+            )
+
             await loop.run_in_executor(
                 None,
                 sys.stdout.write,
-                textwrap.indent(f'{self.help_message}\n\n', '\t')
+                textwrap.indent(f'{help_message_lines}\n\n', '\t')
             )
 
             return (
@@ -100,9 +113,14 @@ class Command(Generic[T]):
             )
 
         elif len(errors) > 0:
+
+            help_message_lines = await self.help_message.to_lines(
+                global_styles=self._global_styles,
+            )
+
             help_message = '\n'.join([
                 errors[0],
-                self.help_message,
+                help_message_lines,
             ])
 
             loop = asyncio.get_event_loop()
@@ -110,7 +128,7 @@ class Command(Generic[T]):
             await loop.run_in_executor(
                 None,
                 sys.stdout.write,
-                textwrap.indent(f'\n{help_message}\n\n', '\t')
+                textwrap.indent(f'{help_message}\n\n', '\t')
             )
 
             return (
