@@ -37,7 +37,13 @@ class HelpMessage(BaseModel):
         lines: list[str] = []
 
         if styles and styles.header:
-            header_text = await styles.header()
+            header_indentation = max(indentation - 1, 0)
+            header_text = textwrap.indent(
+                await styles.header(),
+                ' ' * header_indentation
+            )
+
+
             lines.append(f'{header_text}\n')
             
         error_header = 'error'
@@ -100,12 +106,7 @@ class HelpMessage(BaseModel):
 
         message_lines = '\n'.join(lines)
 
-        global_indentation = max(indentation - 1, 0)
-
-        return textwrap.indent(
-            f'\n{message_lines}\n\n',
-            ' ' * global_indentation,
-        )
+        return f'\033[2J\033[H\n{message_lines}\n\n'
 
     async def _create_subcommands_description(
         self, 

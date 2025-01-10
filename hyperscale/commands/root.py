@@ -65,9 +65,7 @@ async def create_header():
         header,
     ])
 
-    return await terminal.render_once(
-        horizontal_padding=4
-    )
+    return await terminal.render_once()
 
 
 @CLI.root(   
@@ -80,7 +78,7 @@ async def create_header():
         flag_color='aquamarine_2',
         text_color='hot_pink_3',
         subcommand_color='hot_pink_3',
-        indentation=4,
+        indentation=5,
         terminal_mode='extended'
     )
 )
