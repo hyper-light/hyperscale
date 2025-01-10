@@ -21,19 +21,24 @@ class Env(Generic[T]):
 
         self.data: T | None = None
 
-        data_type = reduce_pattern_type(data_type)
-        self._type = data_type
+        data_types = reduce_pattern_type(data_type)
+        self._types = data_types
 
-        self._data_type = data_type.__name__ if hasattr(data_type, '__name__') else type(data_type).__name__
+        self._data_types = [
+            conversion_type.__name__
+            if hasattr(conversion_type, '__name__') 
+            else type(conversion_type).__name__
+            for conversion_type in self._types
+        ]
 
         self._loop = asyncio.get_event_loop()
 
     def __contains__(self, value: Any):
-        return type(value) in [self._type]
+        return type(value) in [self._types]
 
     @property
     def data_type(self):
-        return self._data_type
+        return self._data_types
     
     async def parse(self, _: str | None = None):
         
@@ -48,16 +53,21 @@ class Env(Generic[T]):
     async def _load_envar(self):
 
         value = await self._load()
+        if isinstance(value, None):
+            return Exception(f'no envar matching {self._envar.upper()} found')
 
-        try:
-            if self._type == bytes:
-                return bytes(value, encoding='utf-8')
+        for conversion_type in self._types:
+            try:
+                if conversion_type == bytes:
+                    return bytes(value, encoding='utf-8')
+                
+                else:
+                    return conversion_type(value)
             
-            else:
-                return self._type(value)
-        
-        except Exception as e:
-            return e
+            except Exception:
+                pass
+
+        return Exception(f'could not parse {value} specified types')
 
     async def _load(self):
         value = await self._loop.run_in_executor(

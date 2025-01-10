@@ -18,19 +18,24 @@ class RawFile(Generic[T]):
 
         self.data: T | None = None
 
-        conversion_type: T = reduce_pattern_type(data_type)
-        self._data_type = conversion_type.__name__ if hasattr(conversion_type, '__name__') else type(conversion_type).__name__
+        conversion_types: list[T] = reduce_pattern_type(data_type)
+        self._data_types = [
+            conversion_type.__name__ 
+            if hasattr(conversion_type, '__name__') 
+            else type(conversion_type).__name__
+            for conversion_type in conversion_types
+        ]
 
-        self._type = conversion_type
+        self._types = conversion_types
 
         self._loop = asyncio.get_event_loop()
 
     def __contains__(self, value: Any):
-        return type(value) in [self._type]
+        return type(value) in self._types
 
     @property
     def data_type(self):
-        return self._data_type
+        return ', '.join(self._data_types)
     
 
     async def parse(self, arg: str | None = None) -> T | Exception:
@@ -49,6 +54,19 @@ class RawFile(Generic[T]):
     async def _read_file(self, arg: str | None = None):
                 
         try:
+
+            file_data = await self._load_file(arg)
+            if isinstance(file_data, Exception):
+                return file_data
+
+            return self._parse_type(file_data)
+            
+        except Exception as e:
+            return Exception(f'encountered unexpected error {str(e)} loading file {arg}')
+        
+    async def _load_file(self, arg: str):
+        try:
+
             file_handle: io.TextIOWrapper = await self._loop.run_in_executor(
                 None,
                 open,
@@ -65,17 +83,25 @@ class RawFile(Generic[T]):
                 file_handle.close
             )
 
-            return self._parse_type(file_data)
-            
+            return file_data
+
         except Exception as e:
-            return e
+            return Exception(f'encountered error {str(e)} opening file at {arg}')
         
     def _parse_type(self, file_data: str):
 
-        if self._type == bytes:
-            return bytes(file_data, encoding='utf-8')
+        for conversion_type in self._types:
+            try:
+                if conversion_type == bytes:
+                    return bytes(file_data, encoding='utf-8')
 
-        return self._type(file_data)
+                return conversion_type(file_data)
+            
+            except Exception:
+                pass
+
+        return Exception(f'could not parse {file_data} specified types')
+
     
 
         

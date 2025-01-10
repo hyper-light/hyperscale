@@ -31,7 +31,7 @@ class EmailsList(RootModel):
 async def run(
     matches: Operator[
         Map[
-            Paths,
+            Paths[Literal["*", "../"]],
             RawFile[str], 
             Pattern[
                 Literal[r"([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)"], 

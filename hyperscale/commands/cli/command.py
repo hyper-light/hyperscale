@@ -171,7 +171,7 @@ class Command(Generic[T]):
             config.name: await config.to_default() 
             if Context not in config.value_type else context
             for flag, config in self.keyword_args_map.items() 
-            if is_defaultable(
+            if is_defaulta_typeble(
                 flag,
                 config,
                 keyword_args,
@@ -318,7 +318,7 @@ class Command(Generic[T]):
         if isinstance(value, Exception):
             return (
                 positional_args,
-                f'{arg} is not a valid value {positional_arg.data_type} for argument {positional_arg.name}',
+                f'encountered error parsing {arg} - {str(value)}',
                 
             )
             
@@ -346,6 +346,7 @@ class Command(Generic[T]):
 
         value: Any | None = None
         value_idx = 0
+        last_error: Exception | None = None
 
         for arg_idx, arg in enumerate(args):
             if arg.startswith('-'):
@@ -353,18 +354,27 @@ class Command(Generic[T]):
 
             elif (
                 result := await keyword_arg.parse(arg)
-            ) and isinstance(
-                result, 
-                Exception,
-            ) is False:
-                value = result
+            ):
+                
+                value, last_error = self._return_value_and_error(result)
+
+            if value is not None:
                 value_idx = arg_idx + 1
                 break
         
         if value is None and keyword_arg.loads_from_envar:
             value = await keyword_arg.parse()
-            
+
         if (
+            value is None or isinstance(value, Exception)
+        ) and keyword_arg.required and last_error:
+            return (
+                None,
+                f'Encountered error parsing {keyword_arg.full_flag} - {str(last_error)}',
+                consumed_idxs,
+            ) 
+            
+        elif (
             value is None or isinstance(value, Exception)
         ) and keyword_arg.required is False:
             value = await keyword_arg.to_default()
@@ -381,3 +391,9 @@ class Command(Generic[T]):
             None,
             consumed_idxs,
         )
+    
+    def _return_value_and_error(self, value: Any | Exception):
+        if isinstance(value, Exception):
+            return None, value
+        
+        return value, None

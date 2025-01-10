@@ -20,10 +20,18 @@ class Pattern(Generic[T, K]):
 
         self.data: K | None = None
 
-        pattern_type, conversion_type = get_args(pattern)
-        self._pattern = re.compile(reduce_pattern_type(pattern_type))
+        pattern_types, conversion_type = get_args(pattern)
+        patterns = reduce_pattern_type(pattern_types)
 
-        self._data_type = conversion_type.__name__ if hasattr(conversion_type, '__name__') else type(conversion_type).__name__
+        self._patterns = [
+            re.compile(pattern) for pattern in patterns
+        ]
+
+        self._data_type = (
+            conversion_type.__name__ 
+            if hasattr(conversion_type, '__name__') 
+            else type(conversion_type).__name__
+        )
 
         self._type = conversion_type
 
@@ -50,27 +58,63 @@ class Pattern(Generic[T, K]):
     async def _try_match(self, arg: str):
 
         try:
+            
+            matches: list[str] = []
 
             if get_origin(self._type) == list:
 
                 args_type = get_args(self._type)
                 parse_type = args_type[0] if len(args_type) > 0 else None
 
-                return self._parse_match_all(
-                    re.findall(
-                        self._pattern, 
+
+                for pattern in self._patterns:
+                    matches.extend(
+                        self._parse_match_all(
+                            re.findall(
+                                pattern, 
+                                arg,
+                            ),
+                            parse_type=parse_type
+                        )
+                    )
+
+                return matches
+            
+            for pattern in self._patterns:
+                matches.append(
+                     self._match_pattern(
+                        pattern,
                         arg,
-                    ),
-                    parse_type=parse_type
+                    )
+
                 )
             
-            elif value := re.match(self._pattern, arg):
-                return self._parse_match(
-                    value.group(0)
-                )
+            results = [
+                match for match in matches if not isinstance(matches, Exception)
+            ]
+
+            errors = [
+                error for error in matches if isinstance(error, Exception)
+            ]
+
+            if len(results) < 1 and len(errors) > 0:
+                return errors[0]
+            
+            elif len(results) < 1 and len(errors) < 1:
+                return Exception('no matches found')
+            
+            return results
 
         except Exception as e:
-            return e
+            return Exception(f'encountered unexpected error {str(e)} parsing patterns')
+        
+    def _match_pattern(self, pattern: str, arg: str):
+        if value := re.match(pattern, arg):
+            return self._parse_match(
+                value.group(0)
+            )
+        
+        return Exception('no matches found')
     
     def _parse_match_all(
         self, 
@@ -89,7 +133,7 @@ class Pattern(Generic[T, K]):
                 results.append(result)
         
         if len(results) < 1:
-            return Exception('Err. - no matches found')
+            return Exception('no matches found')
         
         return results
     
@@ -109,8 +153,8 @@ class Pattern(Generic[T, K]):
             
             return parser(value)
         
-        except Exception as e:
-            return e
+        except Exception:
+            return Exception(f'could not parse {value} to {parse_type.__name__}')
 
         
 

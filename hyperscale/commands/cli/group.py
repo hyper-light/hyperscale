@@ -464,6 +464,7 @@ class Group(Generic[T]):
 
         value: Any | None = None
         value_idx = 0
+        last_error: Exception | None = None
 
         for arg_idx, arg in enumerate(args):
             if arg.startswith('-'):
@@ -471,11 +472,11 @@ class Group(Generic[T]):
 
             elif (
                 result := await keyword_arg.parse(arg)
-            ) and isinstance(
-                result, 
-                Exception,
-            ) is False:
-                value = result
+            ):
+                
+                value, last_error = self._return_value_and_error(result)
+
+            if value is not None:
                 value_idx = arg_idx + 1
                 break
         
@@ -484,10 +485,10 @@ class Group(Generic[T]):
 
         if (
             value is None or isinstance(value, Exception)
-        ) and keyword_arg.required:
+        ) and keyword_arg.required and last_error:
             return (
                 None,
-                f'No valid value found for required option {keyword_arg.full_flag}',
+                f'Encountered error parsing {keyword_arg.full_flag} - {str(last_error)}',
                 consumed_idxs,
             ) 
 
@@ -508,3 +509,9 @@ class Group(Generic[T]):
             None,
             consumed_idxs,
         )
+    
+    def _return_value_and_error(self, value: Any | Exception):
+        if isinstance(value, Exception):
+            return None, value
+        
+        return value, None
