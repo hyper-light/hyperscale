@@ -46,7 +46,12 @@ async def run(
 
     @param matches The pattern to match for.
     '''
-    print(matches.data.root)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None,
+        sys.stdout.write,
+        str(matches.data.root)
+    )
     
 
 asyncio.run(CLI.run(args=sys.argv[1:]))
