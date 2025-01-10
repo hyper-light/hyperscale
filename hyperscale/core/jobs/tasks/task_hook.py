@@ -92,7 +92,7 @@ class Task(Generic[T]):
         self._schedule_running = False
 
         try:
-            self._schedule.cancel()
+            self._schedule.set_result(None)
 
         except Exception:
             pass
@@ -176,7 +176,7 @@ class Task(Generic[T]):
 
             run = Run(run_id, self.call, timeout=timeout)
 
-            self._schedule = asyncio.create_task(
+            self._schedule = asyncio.ensure_future(
                 self._run_schedule(run, *args, **kwargs)
             )
 

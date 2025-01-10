@@ -276,6 +276,32 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         workflow_name: str,
         timeout: int,
     ):
+
+        try:
+            await asyncio.wait_for(
+                self._poll_for_completed(
+                    run_id,
+                    workflow_name,
+                ),
+                timeout=timeout,
+            )
+
+        except asyncio.TimeoutError:
+            pass
+        
+        if self._leader_lock.locked():
+            self._leader_lock.release()
+
+        return (
+            self._results[run_id][workflow_name],
+            self._node_context[run_id],
+        )
+    
+    async def _poll_for_completed(
+        self,
+        run_id: int,
+        workflow_name: str,
+    ):
         polling = True
 
         workflow_slug = workflow_name.lower()
@@ -291,7 +317,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             completions_count = len(self._completions[run_id][workflow_name])
             assigned_workers = self._run_workflow_expected_nodes[run_id][workflow_name]
 
-            if completions_count >= assigned_workers or elapsed > timeout:
+            if completions_count >= assigned_workers:
                 await update_active_workflow_message(
                     workflow_slug,
                     f'Running - {workflow_name} - {completions_count}/{assigned_workers} workers complete'
@@ -311,14 +337,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             if self._leader_lock.locked():
                 self._leader_lock.release()
-        
-        if self._leader_lock.locked():
-            self._leader_lock.release()
-
-        return (
-            self._results[run_id][workflow_name],
-            self._node_context[run_id],
-        )
     
     @send()
     async def acknowledge_start(
