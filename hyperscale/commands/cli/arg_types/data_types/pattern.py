@@ -90,7 +90,7 @@ class Pattern(Generic[T, K]):
                 )
             
             results = [
-                match for match in matches if not isinstance(matches, Exception)
+                match for match in matches if not isinstance(match, Exception)
             ]
 
             errors = [
