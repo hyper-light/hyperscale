@@ -64,12 +64,10 @@ class Table:
 
         self._updates: asyncio.Queue | None = None
         self._update_lock: asyncio.Lock | None = None
-        self._current_headers: list[str] = self._header_keys
 
         self.offset = 0
         self.header_offset = 0
         self._start: float | None = None
-        self._elapsed: float = 0
 
         self._assembler: TableAssembler | None = None
 
@@ -98,9 +96,9 @@ class Table:
 
         header_rotation_enabled = self._config.minimum_column_width is not None
         minimum_column_width = self._config.minimum_column_width if self._config.minimum_column_width else self._column_width
-        total_width = minimum_column_width * columns_count
+        minimum_total_width = minimum_column_width * columns_count
 
-        if header_rotation_enabled and max_width < total_width:
+        if header_rotation_enabled and max_width < minimum_total_width:
             max_headers = max(
                 int(math.floor(max_width/self._config.minimum_column_width)),
                 1
@@ -108,64 +106,52 @@ class Table:
 
             columns_count = min(max_headers, columns_count)
 
-            max_rotatable_headers = self._total_columns + self._fixed_headers_count
-
-            self._headers_rotate_count = int(max_rotatable_headers/columns_count) + 1
+            self._headers_rotate_count = max(columns_count - self._fixed_headers_count, 0)
 
             column_width = int(math.floor(max_width / columns_count))
 
             self._use_header_rotation = True
 
         table_size = column_width * columns_count
-
-        if table_size < max_width:
-            self._width_adjust = max_width - table_size
-
+        
+        self._width_adjust = max(max_width - table_size, 0)
         self._max_height = max_height
         self._max_width = max_width
-        
-        if self._assembler is None:
-            self._assembler = TableAssembler(
-                self._config.table_format,
-                column_width,
-                columns_count,
-                max_width,
-                cell_alignment=self._config.cell_alignment,
-                field_format_map={
-                    header: header_config.precision_format
-                    for header, header_config in self._config.headers.items()
-                    if header_config.precision_format is not None
-                },
-                field_default_map={
-                    header: header_config.default
-                    for header, header_config in self._config.headers.items()
-                },
-                header_color_map={
-                    header: header_config.header_color
-                    for header, header_config in self._config.headers.items()
-                    if header_config.header_color is not None
-                },
-                data_color_map={
-                    header: header_config.data_color
-                    for header, header_config in self._config.headers.items()
-                    if header_config.data_color is not None
-                },
-                border_color=self._config.border_color,
-                terminal_mode=self._mode,
-            )
-
-        else:
-            self._assembler.columns_size = column_width
-            self._assembler.columns_count = columns_count
-            self._assembler.max_width = max_width
-        
         self._columns_count = columns_count
         self._column_width = column_width
-
+        
+        self._assembler = TableAssembler(
+            self._config.table_format,
+            column_width,
+            columns_count,
+            max_width,
+            cell_alignment=self._config.cell_alignment,
+            field_format_map={
+                header: header_config.precision_format
+                for header, header_config in self._config.headers.items()
+                if header_config.precision_format is not None
+            },
+            field_default_map={
+                header: header_config.default
+                for header, header_config in self._config.headers.items()
+            },
+            header_color_map={
+                header: header_config.header_color
+                for header, header_config in self._config.headers.items()
+                if header_config.header_color is not None
+            },
+            data_color_map={
+                header: header_config.data_color
+                for header, header_config in self._config.headers.items()
+                if header_config.data_color is not None
+            },
+            border_color=self._config.border_color,
+            terminal_mode=self._mode,
+        )
+        
         self._last_rendered_frames.clear()
 
-        if self._start is None:
-            self._updates.put_nowait([])
+        self._start = time.monotonic()
 
     async def update(
         self,
@@ -186,6 +172,8 @@ class Table:
 
         rerender = False
 
+        elapsed = time.monotonic() - self._start
+
         if data and self._config.no_update_on_push and len(self._last_rendered_frames) > 0:
             self._last_state = data
 
@@ -196,23 +184,25 @@ class Table:
             self._last_state = data
             rerender = True
 
-        elif self._elapsed > self._config.pagination_refresh_rate:
+        elif len(self._last_rendered_frames) < 1:
+            table_lines = await self._rerender(self._last_state)
+            self._last_rendered_frames = table_lines
+
+        elif elapsed > self._config.pagination_refresh_rate:
             table_lines = await self._rerender(self._last_state)
             self._last_rendered_frames = table_lines
 
             self._start = time.monotonic()
             rerender = True
-
-        self._elapsed = time.monotonic() - self._start
     
         return self._last_rendered_frames, rerender
     
     async def _rerender(self, data: list[dict[str, Any]]):
 
-        current_headers = self._current_headers[:self._columns_count]
+        current_headers = list(self._header_keys[:self._columns_count])
         
         if self._use_header_rotation:
-            current_headers = self._cycle_headers()
+            current_headers = self._cycle_headers(current_headers)
 
         data = [
             [row.get(header) for header in current_headers]
@@ -228,11 +218,7 @@ class Table:
         )
 
         for idx, line in enumerate(table_lines):   
-            column_size = self._column_width * self._columns_count
-            difference = self._max_width - column_size
-
-            if difference > 0 and self._width_adjust > 0:
-                table_lines[idx] = line + self._width_adjust * " "
+            table_lines[idx] = line + self._width_adjust * " "
 
         return table_lines
 
@@ -247,10 +233,12 @@ class Table:
 
         if data_length < 1:
             return data
+        
+        elapsed = time.monotonic() - self._start
 
         if (
             data_length > adjusted_max_rows
-            and self._elapsed > self._config.pagination_refresh_rate
+            and elapsed > self._config.pagination_refresh_rate
         ):
             difference = data_length - adjusted_max_rows
             self.offset = (self.offset + 1) % (difference + 1)
@@ -261,11 +249,20 @@ class Table:
 
         return data
     
-    def _cycle_headers(self):
+    def _cycle_headers(
+        self,
+        current_headers: list[str]
+    ):
 
-        rotated_headers = self._current_headers
+        rotated_headers = current_headers
 
-        if self._elapsed >= self._config.pagination_refresh_rate:
+        table_size = self._column_width * self._total_columns
+
+        elapsed = time.monotonic() - self._start
+
+        if (
+            table_size > self._max_width and elapsed >= self._config.pagination_refresh_rate
+        ):
             self.header_offset = (self.header_offset + 1)%self._headers_rotate_count
 
             rotated_headers = [
@@ -276,6 +273,19 @@ class Table:
                 header for header in self._header_keys if self._config.headers[header].fixed is False
             ][self.header_offset:self._columns_count+self.header_offset - self._fixed_headers_count]
         
+            rotated_headers.extend(rotable_headers)
+
+        elif (
+            table_size > self._max_width
+        ):
+            rotated_headers = [
+                header for header in self._header_keys if self._config.headers[header].fixed
+            ]
+
+            rotable_headers = [
+                header for header in self._header_keys if self._config.headers[header].fixed is False
+            ][self.header_offset:self._columns_count+self.header_offset - self._fixed_headers_count]
+
             rotated_headers.extend(rotable_headers)
 
         return rotated_headers

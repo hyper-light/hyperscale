@@ -1,5 +1,5 @@
 import os
-from typing import Callable, Dict, Union
+from typing import Callable, Dict, Union, Literal
 
 import psutil
 from pydantic import BaseModel, StrictFloat, StrictInt, StrictStr
@@ -27,6 +27,8 @@ class Env(BaseModel):
     MERCURY_SYNC_MAX_RUNNING_WORKFLOWS: StrictInt = 1
     MERCURY_SYNC_MAX_PENDING_WORKFLOWS: StrictInt = 100
     MERCURY_SYNC_CONTEXT_POLL_RATE: StrictStr = "0.1s"
+    MERCURY_SYNC_SHUTDOWN_POLL_RATE: StrictStr = "0.1s"
+    MERCURY_SYNC_DUPLICATE_JOB_POLICY: Literal["reject", "replace"] = "reject"
 
     @classmethod
     def types_map(self) -> Dict[str, Callable[[str], PrimaryType]]:
@@ -47,4 +49,6 @@ class Env(BaseModel):
             "MERCURY_SYNC_TASK_RUNNER_MAX_THREADS": int,
             "MERCURY_SYNC_MAX_WORKFLOWS": int,
             "MERCURY_SYNC_CONTEXT_POLL_RATE": str,
+            "MERCURY_SYNC_SHUTDOWN_POLL_RATE": str,
+            "MERCURY_SYNC_DUPLICATE_JOB_POLICY": str
         }

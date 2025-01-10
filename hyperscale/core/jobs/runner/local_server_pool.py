@@ -1,21 +1,43 @@
 import asyncio
+import ctypes
 import functools
 import multiprocessing
 import signal
 import socket
 import warnings
 from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import active_children
+from multiprocessing import current_process
 from multiprocessing.context import SpawnContext
 from typing import Dict, List
 
-import psutil
 
 from hyperscale.core.jobs.graphs.remote_graph_controller import (
     RemoteGraphController,
 )
 from hyperscale.core.jobs.models import Env
 
+def set_process_name():
+    try:
+
+        libc = ctypes.CDLL('libc.so.6')
+        progname = ctypes.c_char_p.in_dll(libc, '__progname_full')  # refer to the source code of glibc
+
+        new_name = b'hyperscale'
+        # for `ps` command:
+        # Environment variables are already copied to the Python program zone.
+        # We can get environment variables by using `os.environ`,
+        # hence we can ignore both reallocation and movement.
+        libc.strcpy(progname, ctypes.c_char_p(new_name))
+        # for `top` command and `/proc/self/comm`:
+        buff = ctypes.create_string_buffer(len(new_name) + 1)
+        buff.value = new_name
+        libc.prctl(15, ctypes.byref(buff), 0, 0, 0)
+
+    except Exception:
+        pass
+
+    except OSError:
+        pass
 
 def abort_server(server: RemoteGraphController):
     try:
@@ -53,8 +75,17 @@ async def run_server(
         await server.run_forever()
         await server.close()
 
+        await server.wait_for_socket_shutdown()
     except Exception:
         server.abort()
+        await server.wait_for_socket_shutdown()
+
+    except KeyboardInterrupt:
+        server.abort()
+        await server.wait_for_socket_shutdown()
+    
+    await asyncio.sleep(1)
+
 
 def run_thread(
     leader_address: tuple[str, int],
@@ -111,6 +142,9 @@ def run_thread(
     except asyncio.CancelledError:
         abort_server(server)
 
+    except KeyboardInterrupt:
+        abort_server(server)
+
 
 class LocalServerPool:
     def __init__(
@@ -130,6 +164,7 @@ class LocalServerPool:
         self._executor = ProcessPoolExecutor(
             max_workers=self._pool_size,
             mp_context=self._context,
+            initializer=set_process_name
         )
 
         self._loop = asyncio.get_event_loop()
@@ -184,7 +219,16 @@ class LocalServerPool:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self._executor.shutdown()
+            
+            await self._loop.run_in_executor(
+                None,
+                functools.partial(
+                    self._executor.shutdown,
+                    wait=True,
+                    cancel_futures=True,
+                )
+            )
+
 
     def abort(self):
         try:
@@ -203,3 +247,5 @@ class LocalServerPool:
             warnings.simplefilter("ignore")
 
             self._executor.shutdown()
+
+   

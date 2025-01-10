@@ -274,6 +274,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         self,
         run_id: int,
         workflow_name: str,
+        timeout: int,
     ):
         polling = True
 
@@ -290,7 +291,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             completions_count = len(self._completions[run_id][workflow_name])
             assigned_workers = self._run_workflow_expected_nodes[run_id][workflow_name]
 
-            if completions_count >= assigned_workers:
+            if completions_count >= assigned_workers or elapsed > timeout:
                 await update_active_workflow_message(
                     workflow_slug,
                     f'Running - {workflow_name} - {completions_count}/{assigned_workers} workers complete'
@@ -427,7 +428,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         status = workflow_results.data.status
 
         await self._leader_lock.acquire()
-
         await asyncio.gather(
             *[
                 self._node_context[run_id].update(
@@ -562,6 +562,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         run_id: int,
         job: WorkflowJob,
     ):
+        
         (
             run_id,
             results,
@@ -709,6 +710,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 avg_memory_usage_mb=avg_mem_usage_mb,
             )
         )
+
     async def close(self) -> None:
         await super().close()
         await self._workflows.close()

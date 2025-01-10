@@ -97,6 +97,7 @@ class UDPProtocol(Generic[T, K]):
         self._request_timeout = TimeParser(env.MERCURY_SYNC_REQUEST_TIMEOUT).time
         self._connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_TIMEOUT).time
         self._retry_interval = TimeParser(env.MERCURY_SYNC_RETRY_INTERVAL).time
+        self._shutdown_poll_rate = TimeParser(env.MERCURY_SYNC_SHUTDOWN_POLL_RATE).time
         self._retries = env.MERCURY_SYNC_SEND_RETRIES
 
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
@@ -943,6 +944,17 @@ class UDPProtocol(Generic[T, K]):
                 message.service_port,
             )
 
+    async def wait_for_socket_shutdown(self):
+        await asyncio.sleep(self._shutdown_poll_rate)
+
+        while (
+            await self._loop.run_in_executor(
+                None,
+                self.udp_socket.fileno
+            ) > -1
+        ):
+            await asyncio.sleep(self._shutdown_poll_rate)
+            
     async def close(self) -> None:
         self._running = False
 

@@ -117,8 +117,8 @@ class LocalRunner:
                 ),
             )
 
+        self._interface.initialize(workflows)
         if terminal_ui_enabled:
-            self._interface.initialize(workflows)
             await self._interface.run()
 
         if timeout is None:
@@ -172,6 +172,14 @@ class LocalRunner:
                 await self._remote_manger.shutdown_workers()
                 await self._remote_manger.close()
                 await self._server_pool.shutdown()
+
+                for socket in worker_sockets:
+                    try:
+                        socket.close()
+                        await asyncio.sleep(0)
+
+                    except Exception:
+                        pass
 
                 return results
 
@@ -237,6 +245,33 @@ class LocalRunner:
 
                 except asyncio.CancelledError:
                     pass
+
+    async def abort(
+        self,
+        terminal_ui_enabled: bool = True,
+    ):
+        try:
+            if terminal_ui_enabled:
+                await self._interface.abort()
+
+        except Exception:
+            pass
+        except asyncio.CancelledError:
+            pass
+        
+        try:
+            self._remote_manger.abort()
+        except Exception:
+            pass
+        except asyncio.CancelledError:
+            pass
+
+        try:
+            self._server_pool.abort()
+        except Exception:
+            pass
+        except asyncio.CancelledError:
+            pass
 
     def close(self):
         child_processes = active_children()

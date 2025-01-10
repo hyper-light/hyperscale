@@ -54,16 +54,7 @@ class Text:
 
         self._last_frame = None
 
-        text = self._config.text
-        text_length = len(text)
-
-        if text_length > max_width:
-            text = text[:max_width]
-            text_length = max_width
-
-        self._text_width = text_length
         self._max_width = max_width
-        self._updates.put_nowait(text)
 
     
     async def update(self, text: str):

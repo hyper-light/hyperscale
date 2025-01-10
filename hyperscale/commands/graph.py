@@ -9,13 +9,14 @@ from .cli import CLI, ImportFile
 
 uvloop.install()
 
+
 async def get_default_workers():
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         None,
         functools.partial(
             psutil.cpu_count,
-            logical=False
+            logical=False,
         ),
     )
 
@@ -33,12 +34,12 @@ async def test(
     path: ImportFile[Workflow],
     server_port: int = 15454,
     workers: int = get_default_workers,
-    name: str = "default"
+    name: str = "default",
+    quiet: bool = False,
 ):
     '''
     Run the specified test file locally
     '''
-
     workflows = [
         workflow() for workflow in path.data.values()
     ]
@@ -49,11 +50,20 @@ async def test(
         workers=workers,
     )
 
-    await runner.run(
-        name,
-        workflows,
-    )
+    terminal_ui_enabled = quiet is False
 
+    try:
+        await runner.run(
+            name,
+            workflows,
+            terminal_ui_enabled=terminal_ui_enabled,
+        )
+
+    except Exception:
+        await runner.abort(
+            terminal_ui_enabled=terminal_ui_enabled,
+        )
+        
 
 @run.command()
 async def job(

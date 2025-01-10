@@ -88,6 +88,10 @@ class WorkflowRunner:
         self._threads = psutil.cpu_count(logical=False)
         self._workflows_sem: asyncio.Semaphore | None = None
         self._workflow_hooks: Dict[int, Dict[str, List[str]]] = defaultdict(dict)
+        self._duplicate_job_policy: Literal[
+            "reject",
+            "replace"
+        ] = env.MERCURY_SYNC_DUPLICATE_JOB_POLICY
 
         self._workflow_step_stats: Dict[
             int, 
@@ -118,6 +122,8 @@ class WorkflowRunner:
 
         if self._run_check_lock is None:
             self._run_check_lock = asyncio.Lock()
+
+        self._clear()
 
     @property
     def pending(self):
@@ -250,7 +256,7 @@ class WorkflowRunner:
                 WorkflowStatus.REJECTED,
             )
 
-        elif already_running:
+        elif already_running and self._duplicate_job_policy == 'reject':
             return (
                 run_id,
                 None,
@@ -881,6 +887,19 @@ class WorkflowRunner:
         )
 
         return context
+    
+    def _clear(self):
+        self._running_workflows.clear()
+        self._failed_counts.clear()
+        self._completed_counts.clear()
+        self._workflow_step_stats.clear()
+        self._workflow_hooks.clear()
+        self._pending.clear()
+
+        self._active.clear()
+        self._active_waiters.clear()
+        self._max_active.clear()
+
 
     async def close(self):
         for job in self._running_workflows.values():
@@ -896,6 +915,8 @@ class WorkflowRunner:
             await self._memory_monitor.stop_all_background_monitors()
         except Exception:
             pass
+
+        self._clear()
 
     def abort(self):
         for job in self._running_workflows.values():
@@ -917,3 +938,5 @@ class WorkflowRunner:
 
         except Exception:
             pass
+
+        self._clear()

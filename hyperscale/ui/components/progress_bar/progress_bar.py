@@ -105,7 +105,7 @@ class ProgressBar:
 
         self._last_ready_segments = await self._rerender_incomplete(0, 0)
 
-        if self._stylized_fail is None and (
+        if (
             isinstance(self._config.failed_color, str) or self._config.failed_color is None
         ) and (
             isinstance(self._config.failed_highlight, str) or self._config.failed_highlight is None
@@ -117,7 +117,7 @@ class ProgressBar:
                 mode=self._mode,
             )
 
-        if self._stylized_complete is None and (
+        if (
             isinstance(self._config.complete_color, str) or self._config.complete_color is None
         ) and (
             isinstance(self._config.complete_highlight, str) or self._config.complete_highlight is None
@@ -129,7 +129,7 @@ class ProgressBar:
                 mode=self._mode,
             )
 
-        if self._stylized_active is None and (
+        if (
             isinstance(self._config.active_color, str) or self._config.active_color is None
         ) and (
             isinstance(self._config.active_color, str) or self._config.active_highlight is None
@@ -145,8 +145,6 @@ class ProgressBar:
                         mode=self._mode,
                     )
                 )
-
-        self._updates.put_nowait(0)
 
     async def get_next_frame(self):
 

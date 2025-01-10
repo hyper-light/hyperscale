@@ -304,6 +304,7 @@ def generate_ui_sections(
                         headers={
                             "step": {
                                 "default": "N/A",
+                                "fixed": True,
                             },
                             "total": {
                                 "default": 0,

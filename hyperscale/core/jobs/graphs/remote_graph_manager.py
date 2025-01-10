@@ -308,6 +308,7 @@ class RemoteGraphManager:
         worker_results = await self._controller.poll_for_workflow_complete(
             run_id,
             workflow.name,
+            int(TimeParser(workflow.duration).time * 1.5)
         )
 
         
