@@ -83,8 +83,6 @@ async def run_server(
     except KeyboardInterrupt:
         server.abort()
         await server.wait_for_socket_shutdown()
-    
-    await asyncio.sleep(1)
 
 
 def run_thread(
