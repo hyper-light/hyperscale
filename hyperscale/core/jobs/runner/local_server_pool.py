@@ -75,14 +75,13 @@ async def run_server(
         await server.run_forever()
         await server.close()
 
-        await server.wait_for_socket_shutdown()
     except Exception:
         server.abort()
-        await server.wait_for_socket_shutdown()
 
     except KeyboardInterrupt:
         server.abort()
-        await server.wait_for_socket_shutdown()
+    
+    await server.wait_for_socket_shutdown()
 
 
 def run_thread(
