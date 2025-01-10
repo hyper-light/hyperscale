@@ -191,6 +191,32 @@ class Terminal:
             vertical_padding=self._vertical_padding,
         )
 
+    async def render_once(
+        self,
+        horizontal_padding: int = 0,
+        vertical_padding: int = 0,
+    ):
+        await self._initialize_canvas(
+            horizontal_padding=horizontal_padding,
+            vertical_padding=vertical_padding,
+        )
+
+        self._stop_run = asyncio.Event()
+        self._hide_run = asyncio.Event()
+
+        if self._stdout_lock is None:
+            self._stdout_lock = asyncio.Lock()
+
+        await self._stdout_lock.acquire()
+
+        frame = await self.canvas.render()
+
+        if self._stdout_lock.locked():
+            self._stdout_lock.release()
+
+        return frame
+
+
     async def render(
         self,
         horizontal_padding: int = 0,

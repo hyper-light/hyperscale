@@ -17,6 +17,7 @@ K = TypeVar('K')
 
 from hyperscale.commands.cli.arg_types.data_types import (
     Env,
+    ImportFile,
     JsonData,
     JsonFile,
     Paths,
@@ -43,28 +44,30 @@ class Map(Generic[*T]):
 
         self.data: Any | None = None
 
-
         self._complex_types: dict[
-            Pattern
-            | Env
-            | RawFile
+            Env
+            | ImportFile
             | JsonData
-            | JsonData,
+            | JsonData
+            | Pattern
+            | RawFile,
             Callable[
                 [str, type[Any]],
-                Pattern
-                | Env
-                | RawFile
+                Env
+                | ImportFile
                 | JsonData
                 | JsonData
+                | Pattern
+                | RawFile,
             ]
         ] = {
-            Paths: lambda _, subtype: Paths(subtype),
-            Pattern: lambda _, subtype: Pattern(subtype),
             Env: lambda envar, subtype: Env(envar, subtype),
-            RawFile: lambda _, subtype: RawFile(subtype),
+            ImportFile: lambda _, subtype: ImportFile(subtype),
             JsonFile: lambda _, subtype: JsonFile(subtype),
             JsonData: lambda _, subtype: JsonData(subtype),
+            Paths: lambda _, subtype: Paths(subtype),
+            Pattern: lambda _, subtype: Pattern(subtype),
+            RawFile: lambda _, subtype: RawFile(subtype),
         }
 
         self._loop = asyncio.get_event_loop()

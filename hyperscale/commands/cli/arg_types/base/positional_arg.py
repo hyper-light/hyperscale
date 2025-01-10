@@ -1,6 +1,7 @@
 from hyperscale.commands.cli.arg_types.data_types import (
     Context,
     Env,
+    ImportFile,
     JsonData,
     JsonFile,
     Paths,
@@ -42,6 +43,7 @@ class PositionalArg(Generic[T]):
         self._complex_types: dict[
             Context
             | Env
+            | ImportFile
             | JsonData
             | JsonData
             | Operator
@@ -52,6 +54,7 @@ class PositionalArg(Generic[T]):
                 [str, type[Any]],
                 Context
                 | Env
+                | ImportFile
                 | JsonData
                 | JsonData
                 | Operator
@@ -62,6 +65,7 @@ class PositionalArg(Generic[T]):
         ] = {
             Context: lambda _, __: Context(),
             Env: lambda envar, subtype: Env(envar, subtype),
+            ImportFile: lambda _, subtype: ImportFile(subtype),
             JsonFile: lambda _, subtype: JsonFile(subtype),
             JsonData: lambda _, subtype: JsonData(subtype),
             Operator: lambda name, subtype: Operator(name, subtype),
@@ -118,7 +122,7 @@ class PositionalArg(Generic[T]):
 
         parse_error: Exception | None = None
 
-        for subtype in self.value_type:
+        for subtype in self._value_type:
             try:
                 if complex_type_factory := self._complex_types.get(
                     get_origin(subtype)

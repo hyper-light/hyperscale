@@ -213,7 +213,7 @@ har = [
 Homepage = "https://github.com/hyper-light/hyperscale"
 
 [project.scripts]
-hyperscale = "hyperscale.cli:run"
+hyperscale = "hyperscale.commands.root:run"
 
 [tool.setuptools.packages]
 find = {}  # Scanning implicit namespaces is active by default

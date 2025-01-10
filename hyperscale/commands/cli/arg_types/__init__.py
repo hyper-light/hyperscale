@@ -5,6 +5,7 @@ from .base import is_required_missing_keyword_arg as is_required_missing_keyword
 from .base import PositionalArg as PositionalArg
 from .data_types import Context as Context
 from .data_types import Env as Env
+from .data_types import ImportFile as ImportFile
 from .data_types import JsonData as JsonData
 from .data_types import JsonFile as JsonFile
 from .data_types import Paths as Paths

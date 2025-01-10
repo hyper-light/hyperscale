@@ -21,21 +21,21 @@ class Test(Workflow):
         return await self.client.http.get(url)
 
 
-async def run():
-    runner = LocalRunner("127.0.0.1", 15454)
+# async def run():
+#     runner = LocalRunner("127.0.0.1", 15454)
 
-    results = await runner.run(
-        "test",
-        [Test()],
-    )
+#     results = await runner.run(
+#         "test",
+#         [Test()],
+#     )
 
-    # runner.close()
+#     # runner.close()
 
-    return results
+#     return results
 
 
-if __name__ == "__main__":
-    results = asyncio.run(run())
+# if __name__ == "__main__":
+#     results = asyncio.run(run())
 
-    with open('results.json', 'w+') as results_file:
-        json.dump(results, results_file, indent=4)
+#     with open('results.json', 'w+') as results_file:
+#         json.dump(results, results_file, indent=4)

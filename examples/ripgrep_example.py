@@ -7,7 +7,8 @@ from hyperscale.commands.cli import (
     CLIStyle,
     Operator,
     Paths,
-    Map
+    Map,
+    ImportFile
 )
 from pydantic import RootModel, StrictStr
 from typing import Literal
@@ -28,7 +29,7 @@ class EmailsList(RootModel):
         terminal_mode='extended'
     )
 )
-async def run(
+async def emailgrep(
     matches: Operator[
         Map[
             Paths[Literal["*", "../"]],

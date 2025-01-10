@@ -1,4 +1,5 @@
 
+import asyncio
 import sys
 
 from .arg_types import Context
@@ -28,7 +29,28 @@ class CLI:
 
         context = Context()
 
-        await cls._entrypoint.run(args, context)
+        if len(args) > 0:
+            return await cls._entrypoint.run(args, context)
+        
+        loop = asyncio.get_event_loop()
+
+        subcommands: list[str] | None = None
+        if len(cls._entrypoint.subgroups) > 0 or len(cls._entrypoint.subcommands) > 0:
+            subcommands = list(cls._entrypoint.subgroups.keys())
+            subcommands.extend(cls._entrypoint.subcommands.keys())
+        
+        help_message_lines = await cls._entrypoint.help_message.to_lines(
+            subcommands=subcommands,
+            global_styles=cls._global_styles,
+        )
+
+        await loop.run_in_executor(
+            None,
+            sys.stdout.write,
+            help_message_lines,
+        )
+    
+
 
     @classmethod
     def root(

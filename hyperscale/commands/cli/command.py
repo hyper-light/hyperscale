@@ -92,6 +92,7 @@ class Command(Generic[T]):
         args: list[str],
         context: Context[str, Any],
     ) -> tuple[Any | None, list[str]]:
+
         (
             positional_args, 
             keyword_args,
@@ -171,7 +172,7 @@ class Command(Generic[T]):
             config.name: await config.to_default() 
             if Context not in config.value_type else context
             for flag, config in self.keyword_args_map.items() 
-            if is_defaulta_typeble(
+            if is_defaultable(
                 flag,
                 config,
                 keyword_args,

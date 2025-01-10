@@ -79,7 +79,7 @@ class TitleHelpMessage(BaseModel):
 
         indentation = ' ' * max(indentation - 1, 0)
 
-        return f'\n{indentation}{command_name} {styled_options}'
+        return f'{indentation}{command_name} {styled_options}'
     
     async def _style_flags(
         self,

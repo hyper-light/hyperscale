@@ -2,6 +2,7 @@ import inspect
 from hyperscale.commands.cli.arg_types.data_types import (
     Context,
     Env,
+    ImportFile,
     JsonData,
     JsonFile,
     Paths,
@@ -59,6 +60,7 @@ class KeywordArg(Generic[T]):
         self._complex_types: dict[
             Context
             | Env
+            | ImportFile
             | JsonData
             | JsonData
             | Operator
@@ -69,6 +71,7 @@ class KeywordArg(Generic[T]):
                 [str, type[Any]],
                 Context
                 | Env
+                | ImportFile
                 | JsonData
                 | JsonData
                 | Operator
@@ -79,6 +82,7 @@ class KeywordArg(Generic[T]):
         ] = {
             Context: lambda _, __: Context(),
             Env: lambda envar, subtype: Env(envar, subtype),
+            ImportFile: lambda _, subtype: ImportFile(subtype),
             JsonFile: lambda _, subtype: JsonFile(subtype),
             JsonData: lambda _, subtype: JsonData(subtype),
             Operator: lambda name, subtype: Operator(name, subtype),

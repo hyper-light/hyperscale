@@ -129,6 +129,14 @@ class Group(Generic[T]):
             subcommands = list(self.subgroups.keys())
             subcommands.extend(self.subcommands.keys())
 
+        if len(args) < 1:
+            await self._print_group_help_message(subcommands)
+
+            return (
+                None,
+                []
+            )
+
         (
             positional_args, 
             keyword_args,
@@ -138,19 +146,9 @@ class Group(Generic[T]):
         ) = await self._find_args(args, context)
 
         if positional_args is None and keyword_args is None:
-            loop = asyncio.get_event_loop()
 
-            help_message_lines = await self.help_message.to_lines(
-                subcommands=subcommands,
-                global_styles=self._global_styles,
-            )
-
-            await loop.run_in_executor(
-                None,
-                sys.stdout.write,
-                help_message_lines,
-            )
-
+            await self._print_group_help_message(subcommands)
+            
             return (
                 None,
                 errors
@@ -176,10 +174,13 @@ class Group(Generic[T]):
                 None,
                 errors
             )
-
-        result = await self._command_call(*positional_args, **keyword_args)
+        
+        result: Any | None = None
+        if len(positional_args) > 0 or len(keyword_args) > 0:
+            result = await self._command_call(*positional_args, **keyword_args)
 
         if subcommand:
+            subcommand._global_styles = self._global_styles
             result, errors = await subcommand.run(subcommand_args, context)
 
         return (
@@ -209,8 +210,6 @@ class Group(Generic[T]):
                 shortnames=shortnames
             )
 
-            group._global_styles = self._global_styles
-
             self.subgroups[group.group_name] = group
             
             return group
@@ -234,13 +233,28 @@ class Group(Generic[T]):
                 shortnames=shortnames,
             )
 
-            cmd._global_styles = self._global_styles
-
             self.subcommands[cmd.command_name] = cmd
 
             return command_call
             
         return wrap
+    
+    async def _print_group_help_message(
+        self,
+        subcommands: list[str],
+    ):
+        loop = asyncio.get_event_loop()
+
+        help_message_lines = await self.help_message.to_lines(
+            subcommands=subcommands,
+            global_styles=self._global_styles,
+        )
+
+        await loop.run_in_executor(
+            None,
+            sys.stdout.write,
+            help_message_lines,
+        )
     
     async def _find_args(
         self, 
