@@ -121,7 +121,9 @@ class Task(Generic[T]):
                 del self._runs[run_id]
 
         if len(removed_runs) > 0:
-            await asyncio.gather(*[run.cancel() for run in removed_runs])
+            await asyncio.gather(*[
+                run.cancel() for run in removed_runs
+            ], return_exceptions=True)
 
     async def _execute_age_policy(self):
         removed_runs: List[Run] = []
@@ -132,7 +134,9 @@ class Task(Generic[T]):
                 del self._runs[run_id]
 
         if len(removed_runs) > 0:
-            await asyncio.gather(*[run.cancel() for run in removed_runs])
+            await asyncio.gather(*[
+                run.cancel() for run in removed_runs
+            ], return_exceptions=True)
 
     def run(
         self,

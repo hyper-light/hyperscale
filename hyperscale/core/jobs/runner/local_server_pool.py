@@ -142,6 +142,11 @@ def run_thread(
     except KeyboardInterrupt:
         abort_server(server)
 
+    try:
+        loop.close()
+
+    except Exception:
+        pass
 
 class LocalServerPool:
     def __init__(

@@ -30,7 +30,7 @@ class TaskRunner:
 
     def start_cleanup(self):
         self._run_cleanup = True
-        self._cleanup_task = asyncio.create_task(self._cleanup())
+        self._cleanup_task = asyncio.ensure_future(self._cleanup())
 
     def create_task_id(self):
         return self._snowflake_generator.generate()
@@ -99,10 +99,10 @@ class TaskRunner:
 
     async def shutdown(self):
         for task in self.tasks.values():
-            await task.shutdown()
+            task.abort()
 
         self._run_cleanup = False
-        await cancel(self._cleanup_task)
+        self._cleanup_task.set_result(None)
 
     def abort(self):
         for task in self.tasks.values():
@@ -111,7 +111,7 @@ class TaskRunner:
         self._run_cleanup = False
 
         try:
-            self._cleanup_task.cancel()
+            self._cleanup_task.set_result(None)
 
         except Exception:
             pass
