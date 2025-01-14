@@ -7,15 +7,11 @@ from typing import Any, TypeVar, Generic
 from .reduce_pattern_type import reduce_pattern_type
 
 
-T = TypeVar('T', bound=BaseModel)
+T = TypeVar("T", bound=BaseModel)
 
 
 class JsonData(Generic[T]):
-
-    def __init__(
-        self,
-        data_type: JsonData[T]
-    ):
+    def __init__(self, data_type: JsonData[T]):
         super().__init__()
 
         self.data: T | None = None
@@ -24,7 +20,7 @@ class JsonData(Generic[T]):
 
         self._data_types = [
             conversion_type.__name__
-            if hasattr(conversion_type, '__name__')
+            if hasattr(conversion_type, "__name__")
             else type(conversion_type).__name__
             for conversion_type in conversion_types
         ]
@@ -37,36 +33,31 @@ class JsonData(Generic[T]):
 
     @property
     def data_type(self):
-        return ', '.join(self._data_types)
-    
+        return ", ".join(self._data_types)
+
     async def parse(self, arg: str | list[str] | None = None):
-        
         result = await self._load_json(arg)
         if isinstance(result, Exception):
             return result
-        
+
         self.data = result
 
         return self
 
-    
     async def _load_json(self, arg: str):
-
         json_data: dict[str, Any] = json.loads(arg)
 
         for conversion_type in self._types:
             try:
-
-
                 if conversion_type == list and isinstance(json_data, list):
                     return json_data
 
                 elif conversion_type == bytes:
-                    return bytes(json_data, encoding='utf-8')
+                    return bytes(json_data, encoding="utf-8")
 
                 return conversion_type(**json_data)
-            
+
             except Exception:
                 pass
 
-        return Exception(f'could not parse {arg} specified types')
+        return Exception(f"could not parse {arg} specified types")

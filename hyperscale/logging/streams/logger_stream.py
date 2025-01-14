@@ -361,9 +361,9 @@ class LoggerStream:
     ):
         filename_path = pathlib.Path(filename)
 
-        assert (
-            filename_path.suffix == ".json"
-        ), "Err. - file must be JSON file for logs."
+        assert filename_path.suffix == ".json", (
+            "Err. - file must be JSON file for logs."
+        )
 
         if directory is None:
             directory: str = os.path.join(self._cwd, "logs")

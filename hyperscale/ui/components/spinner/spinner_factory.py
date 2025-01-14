@@ -1183,9 +1183,7 @@ class SpinnerFactory:
         )
 
         selected_spinner = dict(spinner)
-        selected_spinner["size"] = max([
-            len(frame) for frame in spinner['frames']
-        ])
+        selected_spinner["size"] = max([len(frame) for frame in spinner["frames"]])
 
         return SpinnerFramesSet(**selected_spinner)
 

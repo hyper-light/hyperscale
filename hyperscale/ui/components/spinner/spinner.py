@@ -14,6 +14,7 @@ from .spinner_config import SpinnerConfig
 from .spinner_factory import SpinnerFactory
 from .spinner_status import SpinnerStatus
 
+
 class Spinner:
     def __init__(
         self,
@@ -29,13 +30,15 @@ class Spinner:
 
         self._config = config
         self.subscriptions = subscriptions
-        
+
         # Spinner
         factory = SpinnerFactory()
         spinner = factory.get(config.spinner)
 
         self._spinner_size = spinner.size
-        self._frames = spinner.frames[::-1] if config.reverse_spinner_direction else spinner.frames
+        self._frames = (
+            spinner.frames[::-1] if config.reverse_spinner_direction else spinner.frames
+        )
         self._cycle = itertools.cycle(self._frames)
 
         self._last_frame: Optional[str] = None
@@ -59,13 +62,12 @@ class Spinner:
         pass
 
     async def fit(
-        self, 
+        self,
         max_width: int | None = None,
     ):
-        
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
-            
+
         remaining_size = max_width
 
         remaining_size -= self._spinner_size
@@ -80,7 +82,6 @@ class Spinner:
         self._max_width = max_width
 
     async def get_next_frame(self):
-
         if self._spinner_status == SpinnerStatus.READY:
             self._spinner_size = SpinnerStatus.ACTIVE
 
@@ -109,7 +110,6 @@ class Spinner:
 
         await self.fail()
 
-
     async def ok(self):
         await self._update_lock.acquire()
         self._spinner_status = SpinnerStatus.OK
@@ -122,28 +122,27 @@ class Spinner:
 
     async def _create_last_frame(self):
         """Stop spinner, compose last frame and 'freeze' it."""
-        
+
         if self._spinner_size == SpinnerStatus.FAILED:
             return await stylize(
                 self._config.fail_char,
                 color=get_style(self._config.fail_color),
                 highlight=get_style(self._config.fail_highlight),
-                attrs=[
-                    get_style(attr) for attr in self._config.fail_attrbutes
-                ] if self._config.fail_attrbutes else None,
+                attrs=[get_style(attr) for attr in self._config.fail_attrbutes]
+                if self._config.fail_attrbutes
+                else None,
                 mode=self._mode,
             )
-        
+
         return await stylize(
             self._config.ok_char,
             color=get_style(self._config.ok_color),
             highlight=get_style(self._config.ok_highlight),
-            attrs=[
-                get_style(attr) for attr in self._config.ok_attributes
-            ] if self._config.ok_attributes else None,
+            attrs=[get_style(attr) for attr in self._config.ok_attributes]
+            if self._config.ok_attributes
+            else None,
             mode=self._mode,
         )
-
 
     async def _create_next_spin_frame(self):
         # Compose output
@@ -153,8 +152,8 @@ class Spinner:
             spin_phase,
             color=get_style(self._config.color),
             highlight=get_style(self._config.highlight),
-            attrs=[
-                get_style(attr) for attr in self._config.attributes
-            ] if self._config.attributes else None,
+            attrs=[get_style(attr) for attr in self._config.attributes]
+            if self._config.attributes
+            else None,
             mode=self._mode,
         )

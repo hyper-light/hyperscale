@@ -73,7 +73,7 @@ SpinnerName = Literal[
     "christmas",
     "grenade",
     "point",
-    "layer" "betaWave",
+    "layerbetaWave",
     "fingerDance",
     "fistBump",
     "soccerHeader",

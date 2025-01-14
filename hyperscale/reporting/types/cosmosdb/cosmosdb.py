@@ -101,7 +101,7 @@ class CosmosDB:
         await self.logger.filesystem.aio["hyperscale.reporting"].info(
             f"{self.metadata_string} - Created or set Database - {self.database_name}"
         )
-        
+
     async def submit_common(self, metrics_sets: List[MetricsSet]):
         await self.logger.filesystem.aio["hyperscale.reporting"].info(
             f"{self.metadata_string} - Creating Shared Metrics container - {self.shared_metrics_container_name} with Partition Key /{self.metrics_partition_key} if not exists"

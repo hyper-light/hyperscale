@@ -85,7 +85,6 @@ class Counter:
             self._update_lock.release()
 
     async def get_next_frame(self):
-
         amount = await self._check_if_should_rerender()
         rerender = False
 
@@ -93,42 +92,43 @@ class Counter:
             frame = await self._rerender(amount)
             self._last_count_frame = [frame]
             rerender = True
-        
+
         elif self._last_count_frame is None:
             frame = await self._rerender(self._config.initial_amount)
             self._last_count_frame = [frame]
             rerender = True
-        
-        return self._last_count_frame, rerender
-        
-    async def _rerender(self, amount: int):
 
+        return self._last_count_frame, rerender
+
+    async def _rerender(self, amount: int):
         count = self._format_count(amount)
         remainder = self._max_width - len(count)
 
         stylized_count = await stylize(
             count,
             color=get_style(
-                self._config.color, 
+                self._config.color,
                 amount,
             ),
             highlight=get_style(
-                self._config.highlight, 
+                self._config.highlight,
                 amount,
             ),
             attrs=[
                 get_style(
                     attr,
                     amount,
-                ) for attr in self._config.attributes
-            ] if self._config.attributes else None,
+                )
+                for attr in self._config.attributes
+            ]
+            if self._config.attributes
+            else None,
             mode=TerminalMode.to_mode(self._mode),
         )
 
         return self._pad_count_horizontal(stylized_count, remainder)
 
     def _format_count(self, amount: int):
-
         amount = float(amount)
         selected_place_adjustment: int | None = None
         selected_place_unit: str | None = None
@@ -138,7 +138,6 @@ class Counter:
             key=lambda adjustment: adjustment[1],
             reverse=True,
         )
-
 
         for place_unit, adjustment in sorted_places:
             if amount / adjustment >= 1:
@@ -151,9 +150,7 @@ class Counter:
 
         full_count = str(amount)
         full_count_size = len(full_count)
-        count = f"%.{self._config.precision}g" % (
-            amount / selected_place_adjustment
-        )
+        count = f"%.{self._config.precision}g" % (amount / selected_place_adjustment)
 
         count_size = len(count)
 
@@ -188,18 +185,18 @@ class Counter:
                 count += "0"
 
         except Exception:
-            return ''
-        
+            return ""
+
         if self._unit:
-            count = f'{count} {self._unit}'
-        
+            count = f"{count} {self._unit}"
+
         return count
-    
+
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
         data: int | None = None
-        
+
         if self._updates.empty() is False:
             data = await self._updates.get()
 
@@ -207,25 +204,24 @@ class Counter:
             self._update_lock.release()
 
         return data
-    
+
     def _pad_count_horizontal(
         self,
         status_text: str,
         remainder: int,
     ):
-        
         match self._config.horizontal_alignment:
-            case 'left':
-                return status_text + (remainder * ' ')
-            
-            case 'center':
+            case "left":
+                return status_text + (remainder * " ")
+
+            case "center":
                 left_pad = math.ceil(remainder / 2)
                 right_pad = math.floor(remainder / 2)
 
                 return " " * left_pad + status_text + " " * right_pad
-            
-            case 'right':
-                return (remainder * ' ') + status_text
+
+            case "right":
+                return (remainder * " ") + status_text
 
     async def pause(self):
         pass

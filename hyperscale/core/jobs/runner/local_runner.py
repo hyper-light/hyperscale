@@ -24,9 +24,8 @@ async def abort(
     manager: RemoteGraphManager,
     server: LocalServerPool,
     interface: HyperscaleInterface,
-    terminal_ui_enabled: bool = True
+    terminal_ui_enabled: bool = True,
 ):
-    
     try:
         if terminal_ui_enabled:
             await interface.abort()
@@ -73,14 +72,14 @@ class LocalRunner:
             workers = psutil.cpu_count(logical=False)
 
         self._env = env
-        
+
         self.host = host
         self.port = port
         self._workers = workers
         self._worker_connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_SECONDS).time
 
         updates = InterfaceUpdatesController()
-        
+
         self._interface = HyperscaleInterface(updates)
         self._remote_manger = RemoteGraphManager(updates, self._workers)
         self._server_pool = LocalServerPool(self._workers)
@@ -93,13 +92,12 @@ class LocalRunner:
         cert_path: str | None = None,
         key_path: str | None = None,
         timeout: int | float | str | None = None,
-        terminal_ui_enabled: bool = True
+        terminal_ui_enabled: bool = True,
     ):
         loop = asyncio.get_event_loop()
         close_task = asyncio.current_task()
 
         for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-
             sig = getattr(
                 signal,
                 signame,
@@ -112,7 +110,7 @@ class LocalRunner:
                         self._remote_manger,
                         self._server_pool,
                         self._interface,
-                        terminal_ui_enabled
+                        terminal_ui_enabled,
                     )
                 ),
             )
@@ -130,10 +128,8 @@ class LocalRunner:
                 return await graph.run()
 
             else:
-
                 await update_active_workflow_message(
-                    'initializing',
-                    'Starting worker servers...'
+                    "initializing", "Starting worker servers..."
                 )
 
                 worker_sockets, worker_ips = await self._bin_and_check_socket_range()
@@ -192,7 +188,7 @@ class LocalRunner:
                 pass
             except asyncio.CancelledError:
                 pass
-            
+
             try:
                 self._remote_manger.abort()
             except Exception:
@@ -208,7 +204,6 @@ class LocalRunner:
                 pass
 
         except asyncio.CancelledError:
-
             try:
                 if terminal_ui_enabled:
                     await self._interface.abort()
@@ -258,7 +253,7 @@ class LocalRunner:
             pass
         except asyncio.CancelledError:
             pass
-        
+
         try:
             self._remote_manger.abort()
         except Exception:
@@ -320,6 +315,6 @@ class LocalRunner:
                     await asyncio.sleep(0.1)
 
         if len(worker_sockets) < self._workers:
-            raise Exception('Err. - Insufficient sockets binned.')
-        
+            raise Exception("Err. - Insufficient sockets binned.")
+
         return (worker_sockets, worker_ips)

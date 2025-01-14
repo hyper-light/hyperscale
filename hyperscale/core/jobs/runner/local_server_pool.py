@@ -16,13 +16,15 @@ from hyperscale.core.jobs.graphs.remote_graph_controller import (
 )
 from hyperscale.core.jobs.models import Env
 
+
 def set_process_name():
     try:
+        libc = ctypes.CDLL("libc.so.6")
+        progname = ctypes.c_char_p.in_dll(
+            libc, "__progname_full"
+        )  # refer to the source code of glibc
 
-        libc = ctypes.CDLL('libc.so.6')
-        progname = ctypes.c_char_p.in_dll(libc, '__progname_full')  # refer to the source code of glibc
-
-        new_name = b'hyperscale'
+        new_name = b"hyperscale"
         # for `ps` command:
         # Environment variables are already copied to the Python program zone.
         # We can get environment variables by using `os.environ`,
@@ -38,6 +40,7 @@ def set_process_name():
 
     except OSError:
         pass
+
 
 def abort_server(server: RemoteGraphController):
     try:
@@ -63,9 +66,8 @@ async def run_server(
             key_path=key_path,
             worker_socket=worker_socket,
         )
-        
-        try:
 
+        try:
             await server.connect_client(leader_address)
             await server.acknowledge_start(leader_address)
 
@@ -80,7 +82,7 @@ async def run_server(
 
     except KeyboardInterrupt:
         server.abort()
-    
+
     await server.wait_for_socket_shutdown()
 
 
@@ -148,12 +150,12 @@ def run_thread(
     except Exception:
         pass
 
+
 class LocalServerPool:
     def __init__(
         self,
         pool_size: int,
     ) -> None:
-
         self._pool_size = pool_size
         self._context: SpawnContext | None = None
         self._executor: ProcessPoolExecutor | None = None
@@ -166,7 +168,7 @@ class LocalServerPool:
         self._executor = ProcessPoolExecutor(
             max_workers=self._pool_size,
             mp_context=self._context,
-            initializer=set_process_name
+            initializer=set_process_name,
         )
 
         self._loop = asyncio.get_event_loop()
@@ -221,16 +223,15 @@ class LocalServerPool:
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            
+
             await self._loop.run_in_executor(
                 None,
                 functools.partial(
                     self._executor.shutdown,
                     wait=True,
                     cancel_futures=True,
-                )
+                ),
             )
-
 
     def abort(self):
         try:
@@ -249,5 +250,3 @@ class LocalServerPool:
             warnings.simplefilter("ignore")
 
             self._executor.shutdown()
-
-   

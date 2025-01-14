@@ -261,26 +261,26 @@ class QuicConnection:
             f"{SMALLEST_MAX_DATAGRAM_SIZE} bytes"
         )
         if configuration.is_client:
-            assert (
-                original_destination_connection_id is None
-            ), "Cannot set original_destination_connection_id for a client"
-            assert (
-                retry_source_connection_id is None
-            ), "Cannot set retry_source_connection_id for a client"
+            assert original_destination_connection_id is None, (
+                "Cannot set original_destination_connection_id for a client"
+            )
+            assert retry_source_connection_id is None, (
+                "Cannot set retry_source_connection_id for a client"
+            )
         else:
             assert token_handler is None, "Cannot set `token_handler` for a server"
-            assert (
-                configuration.token == b""
-            ), "Cannot set `configuration.token` for a server"
-            assert (
-                configuration.certificate is not None
-            ), "SSL certificate is required for a server"
-            assert (
-                configuration.private_key is not None
-            ), "SSL private key is required for a server"
-            assert (
-                original_destination_connection_id is not None
-            ), "original_destination_connection_id is required for a server"
+            assert configuration.token == b"", (
+                "Cannot set `configuration.token` for a server"
+            )
+            assert configuration.certificate is not None, (
+                "SSL certificate is required for a server"
+            )
+            assert configuration.private_key is not None, (
+                "SSL private key is required for a server"
+            )
+            assert original_destination_connection_id is not None, (
+                "original_destination_connection_id is required for a server"
+            )
 
         # configuration
         self._configuration = configuration
@@ -504,9 +504,9 @@ class QuicConnection:
         :param addr: The network address of the remote peer.
         :param now: The current time.
         """
-        assert (
-            self._is_client and not self._connect_called
-        ), "connect() can only be called for clients and a single time"
+        assert self._is_client and not self._connect_called, (
+            "connect() can only be called for clients and a single time"
+        )
         self._connect_called = True
 
         self._network_paths = [QuicNetworkPath(addr, is_validated=True)]
@@ -947,9 +947,9 @@ class QuicConnection:
 
             # server initialization
             if not self._is_client and self._state == QuicConnectionState.FIRSTFLIGHT:
-                assert (
-                    header.packet_type == PACKET_TYPE_INITIAL
-                ), "first packet must be INITIAL"
+                assert header.packet_type == PACKET_TYPE_INITIAL, (
+                    "first packet must be INITIAL"
+                )
                 crypto_frame_required = True
                 self._network_paths = [network_path]
                 self._version = QuicProtocolVersion(header.version)

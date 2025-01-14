@@ -63,7 +63,6 @@ class AWSTimestream:
         )
 
         try:
-
             await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
@@ -118,7 +117,6 @@ class AWSTimestream:
 
     async def submit_metrics(self, metrics: List[MetricsSet]):
         try:
-
             await self._loop.run_in_executor(
                 self._executor,
                 functools.partial(
@@ -136,7 +134,6 @@ class AWSTimestream:
 
         for metrics_set in metrics:
             for group_name, group in metrics_set.groups.items():
-
                 metric_result = {**group.stats, **group.custom}
 
                 for field, value in metric_result.items():
@@ -180,10 +177,8 @@ class AWSTimestream:
 
         records = []
 
-
         for metrics_set in metrics_sets:
             for custom_metric in metrics_set.custom_metrics.values():
-
                 timestream_record = AWSTimestreamRecord(
                     record_type="metric",
                     record_name=metrics_set.name,

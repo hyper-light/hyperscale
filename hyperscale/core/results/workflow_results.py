@@ -43,9 +43,7 @@ from hyperscale.reporting.results_types import (
     StatsResults,
     StatTypes,
     WorkflowStats,
-
 )
-
 
 
 class WorkflowResults:

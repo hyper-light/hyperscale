@@ -7,6 +7,7 @@ StepStatsType = Literal[
     "err",
 ]
 
+
 class WorkflowStatusUpdate:
     __slots__ = (
         "workflow",

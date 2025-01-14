@@ -8,24 +8,10 @@ from hyperscale.ui.components.progress_bar import (
     ProgressBar,
     ProgressBarConfig,
 )
-from hyperscale.ui.components.terminal import (
-    Terminal,
-    Section,
-    SectionConfig,
-    action
-)
-from hyperscale.ui.components.counter import (
-    Counter,
-    CounterConfig
-)
-from hyperscale.ui.components.total_rate import (
-    TotalRate,
-    TotalRateConfig
-)
-from hyperscale.ui.components.windowed_rate import (
-    WindowedRate,
-    WindowedRateConfig
-)
+from hyperscale.ui.components.terminal import Terminal, Section, SectionConfig, action
+from hyperscale.ui.components.counter import Counter, CounterConfig
+from hyperscale.ui.components.total_rate import TotalRate, TotalRateConfig
+from hyperscale.ui.components.windowed_rate import WindowedRate, WindowedRateConfig
 from hyperscale.ui.components.scatter_plot import (
     PlotConfig,
     ScatterPlot,
@@ -44,22 +30,22 @@ from hyperscale.ui.components.text import (
 )
 
 
-
 @action()
 async def add(count: int):
     next_count = count + 1
 
-    channel = 'add_to_total'
-    if count%2 == 1:
-        channel = 'add_to_total_two'
+    channel = "add_to_total"
+    if count % 2 == 1:
+        channel = "add_to_total_two"
 
-    if channel == 'add_to_total_two' and next_count > 30:
+    if channel == "add_to_total_two" and next_count > 30:
         next_count = 30
 
     return (
         channel,
         next_count,
     )
+
 
 @action()
 async def update_rate(data: list[tuple[int | float, float]]):
@@ -70,17 +56,19 @@ async def update_rate(data: list[tuple[int | float, float]]):
 async def update_timings(timings: list[tuple[int, int]]):
     return timings
 
+
 @action()
 async def update_table(stats: dict[str, dict[str, int]]):
-
     return [
         {
-            'step': step_name,
-            'complete': step.get('completed', 0),
-            'success':step.get('success', 0),
-            'failed': step.get('failed', 0)
-        } for step_name, step in stats.items()
+            "step": step_name,
+            "complete": step.get("completed", 0),
+            "success": step.get("success", 0),
+            "failed": step.get("failed", 0),
+        }
+        for step_name, step in stats.items()
     ]
+
 
 @action()
 async def update_timer():
@@ -88,14 +76,9 @@ async def update_timer():
 
 
 async def display():
-    
-
     sections = [
         Section(
-            SectionConfig(
-                height="xx-small", 
-                width="full"
-            ),
+            SectionConfig(height="xx-small", width="full"),
             components=[
                 Header(
                     "header",
@@ -111,9 +94,7 @@ async def display():
                                 lambda letter, _: "\n".join(
                                     [
                                         line[:-1] if idx == 2 else line
-                                        for idx, line in enumerate(
-                                            letter.split("\n")
-                                        )
+                                        for idx, line in enumerate(letter.split("\n"))
                                     ]
                                 )
                             ],
@@ -121,9 +102,7 @@ async def display():
                                 lambda letter, idx: "\n".join(
                                     [
                                         line[1:] if idx < 2 else line
-                                        for idx, line in enumerate(
-                                            letter.split("\n")
-                                        )
+                                        for idx, line in enumerate(letter.split("\n"))
                                     ]
                                 )
                                 if idx == 9
@@ -133,19 +112,19 @@ async def display():
                         color="aquamarine_2",
                         attributes=["bold"],
                         terminal_mode="extended",
-                    )
+                    ),
                 ),
-            ]
+            ],
         ),
         Section(
             SectionConfig(
-                width='small',
+                width="small",
                 height="smallest",
                 left_border="|",
                 top_border="-",
                 bottom_border="-",
                 max_height=3,
-                horizontal_alignment='center',
+                horizontal_alignment="center",
                 vertical_alignment="center",
             ),
             components=[
@@ -158,7 +137,7 @@ async def display():
                         complete_color="hot_pink_3",
                         terminal_mode="extended",
                     ),
-                    subscriptions=['add_to_total'],
+                    subscriptions=["add_to_total"],
                 ),
                 ProgressBar(
                     "progress_bar_two",
@@ -174,44 +153,44 @@ async def display():
         ),
         Section(
             SectionConfig(
-                width='large',
+                width="large",
                 height="xx-small",
                 left_border="|",
                 top_border="-",
                 right_border="|",
                 bottom_border="-",
                 max_height=3,
-                horizontal_alignment='center',
-                vertical_alignment='center',
+                horizontal_alignment="center",
+                vertical_alignment="center",
             ),
             components=[
                 Text(
-                    'text',
+                    "text",
                     TextConfig(
-                        text='Initializing...',
-                    )
+                        text="Initializing...",
+                    ),
                 )
             ],
         ),
         Section(
             SectionConfig(
-                width='small',
+                width="small",
                 height="xx-small",
                 left_border="|",
                 top_border="-",
                 bottom_border="-",
-                horizontal_alignment='center',
+                horizontal_alignment="center",
                 max_height=3,
             ),
             components=[
                 Timer(
-                    'timer',
+                    "timer",
                     TimerConfig(
-                        color='aquamarine_2',
-                        terminal_mode='extended',
-                        horizontal_alignment='center',
+                        color="aquamarine_2",
+                        terminal_mode="extended",
+                        horizontal_alignment="center",
                     ),
-                    subscriptions=['update_timer'],
+                    subscriptions=["update_timer"],
                 ),
             ],
         ),
@@ -225,16 +204,13 @@ async def display():
                 max_height=3,
                 left_padding=1,
                 right_padding=1,
-                horizontal_alignment='center',
+                horizontal_alignment="center",
             ),
             components=[
                 Counter(
-                    'counter',
-                    CounterConfig(
-                        unit='total actions',
-                        terminal_mode='extended'
-                    ),
-                    subscriptions=['add_to_total'],
+                    "counter",
+                    CounterConfig(unit="total actions", terminal_mode="extended"),
+                    subscriptions=["add_to_total"],
                 ),
             ],
         ),
@@ -247,16 +223,13 @@ async def display():
                 top_border="-",
                 bottom_border="-",
                 max_height=3,
-                horizontal_alignment='center',
+                horizontal_alignment="center",
             ),
             components=[
                 TotalRate(
-                    'total_rate',
-                    TotalRateConfig(
-                        unit='aps',
-                        terminal_mode='extended'
-                    ),
-                    subscriptions=['add_to_total'],
+                    "total_rate",
+                    TotalRateConfig(unit="aps", terminal_mode="extended"),
+                    subscriptions=["add_to_total"],
                 )
             ],
         ),
@@ -282,7 +255,7 @@ async def display():
                         point_char="dot",
                         terminal_mode="extended",
                     ),
-                    subscriptions=['update_timings'],
+                    subscriptions=["update_timings"],
                 )
             ],
         ),
@@ -303,10 +276,7 @@ async def display():
                     "table_test",
                     TableConfig(
                         headers={
-                            "step": {
-                                "default": "N/A",
-                                'fixed': True
-                            },
+                            "step": {"default": "N/A", "fixed": True},
                             "complete": {
                                 "default": 0,
                             },
@@ -314,13 +284,13 @@ async def display():
                                 "data_color": lambda value: "aquamarine_2"
                                 if value > 0
                                 else None,
-                                "default": 0
+                                "default": 0,
                             },
                             "failed": {
                                 "data_color": lambda value: "hot_pink_3"
                                 if value > 0
                                 else None,
-                                "default": 0
+                                "default": 0,
                             },
                         },
                         minimum_column_width=12,
@@ -329,7 +299,7 @@ async def display():
                         table_format="simple",
                         no_update_on_push=True,
                     ),
-                    subscriptions=['update_table'],
+                    subscriptions=["update_table"],
                 )
             ],
         ),
@@ -337,7 +307,7 @@ async def display():
 
     engine = Terminal(sections)
 
-    engine.add_channel('progress_bar_two', 'add_to_total_two')
+    engine.add_channel("progress_bar_two", "add_to_total_two")
 
     await engine.render(
         horizontal_padding=4,
@@ -350,16 +320,10 @@ async def display():
     start = time.monotonic()
 
     data = []
-    table_data = {
-        'http_get_login': {
-            'completed': 0,
-            'success': 0,
-            'failed': 0
-        }
-    }
+    table_data = {"http_get_login": {"completed": 0, "success": 0, "failed": 0}}
     samples = []
 
-    active_progress_bar = 'progress_bar_one'
+    active_progress_bar = "progress_bar_one"
 
     await update_timer()
 
@@ -371,19 +335,18 @@ async def display():
         if idx < 15:
             await update_table(table_data)
 
-
-        if idx%5 == 0 and idx > 0:
-            active_progress_bar = 'progress_bar_two' if active_progress_bar == 'progress_bar_one' else 'progress_bar_one'
+        if idx % 5 == 0 and idx > 0:
+            active_progress_bar = (
+                "progress_bar_two"
+                if active_progress_bar == "progress_bar_one"
+                else "progress_bar_one"
+            )
             await engine.set_component_active(active_progress_bar)
 
         samples.append((1, time.monotonic()))
 
+        await asyncio.gather(*[add(idx), update_timings(data)])
 
-        await asyncio.gather(*[
-            add(idx),
-            update_timings(data)
-        ])
-        
         elapsed = time.monotonic() - start
 
     await update_timer()

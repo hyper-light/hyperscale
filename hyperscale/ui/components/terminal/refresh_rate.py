@@ -3,11 +3,12 @@ from typing import Literal, Dict
 
 RefreshRateProfile = Literal["low", "medium", "high", "ultra"]
 
+
 class RefreshRate(Enum):
-    LOW=15
-    MEDIUM=30
-    HIGH=60
-    ULTRA=120
+    LOW = 15
+    MEDIUM = 30
+    HIGH = 60
+    ULTRA = 120
 
 
 class RefreshRateMap:
@@ -15,7 +16,7 @@ class RefreshRateMap:
         "low": RefreshRate.LOW,
         "medium": RefreshRate.MEDIUM,
         "high": RefreshRate.HIGH,
-        "ultra": RefreshRate.ULTRA
+        "ultra": RefreshRate.ULTRA,
     }
 
     @classmethod

@@ -26,7 +26,6 @@ class Text:
         self._max_width: int | None = None
         self._text_width = 0
 
-
         self._update_lock: asyncio.Lock | None = None
         self._updates: asyncio.Queue[str] | None = None
 
@@ -41,7 +40,7 @@ class Text:
     @property
     def size(self):
         return self._max_width
-    
+
     async def fit(
         self,
         max_width: int | None = None,
@@ -56,7 +55,6 @@ class Text:
 
         self._max_width = max_width
 
-    
     async def update(self, text: str):
         await self._update_lock.acquire()
         self._updates.put_nowait(text)
@@ -67,24 +65,24 @@ class Text:
     async def get_next_frame(self):
         text = await self._check_if_should_rerender()
         rerender = False
-        
+
         if text is not None:
             frame = await self._rerender(text)
             self._last_frame = [frame]
             rerender = True
-        
+
         elif self._last_frame is None:
             frame = await self._rerender(self._config.text)
             self._last_frame = [frame]
             rerender = True
-        
+
         return self._last_frame, rerender
 
     async def _rerender(self, text: str):
         remainder = self._max_width - len(text)
 
         text = await stylize(
-           text,
+            text,
             color=get_style(
                 self._config.color,
                 text,
@@ -97,46 +95,49 @@ class Text:
                 get_style(
                     attr,
                     text,
-                ) for attr in self._config.attributes
-            ] if self._config.attributes else None,
+                )
+                for attr in self._config.attributes
+            ]
+            if self._config.attributes
+            else None,
             mode=self._mode,
         )
 
         return self._pad_text_horizontal(text, remainder)
-    
+
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
         text: str | None = None
         if self._updates.empty() is False:
             text = await self._updates.get()
-        
+
         if self._update_lock.locked():
             self._update_lock.release()
 
         return text
-    
+
     def _pad_text_horizontal(
         self,
         status_text: str,
         remainder: int,
     ):
         match self._config.horizontal_alignment:
-            case 'left':
-                return status_text + (remainder * ' ')
-            
-            case 'center':
+            case "left":
+                return status_text + (remainder * " ")
+
+            case "center":
                 left_pad = math.ceil(remainder / 2)
                 right_pad = math.floor(remainder / 2)
 
                 return " " * left_pad + status_text + " " * right_pad
-            
-            case 'right':
-                return (remainder * ' ') + status_text
-        
+
+            case "right":
+                return (remainder * " ") + status_text
+
     async def pause(self):
         pass
-    
+
     async def resume(self):
         pass
 

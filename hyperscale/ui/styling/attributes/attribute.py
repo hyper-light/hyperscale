@@ -3,7 +3,9 @@ from __future__ import annotations
 from enum import Enum
 from typing import Dict, Literal
 
-AttributeName = Literal["bold", "dark", "italic", "underline", "blink", "reverse", "concealed"]
+AttributeName = Literal[
+    "bold", "dark", "italic", "underline", "blink", "reverse", "concealed"
+]
 
 
 class AttributeType(Enum):

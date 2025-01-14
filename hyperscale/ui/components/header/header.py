@@ -27,7 +27,7 @@ class Header:
 
         self._config = config
         self.subscriptions = subscriptions
-        
+
         self._word = Word(self._config.header_text)
 
         self._styled_header_lines: list[str] | None = None
@@ -50,7 +50,6 @@ class Header:
         max_width: int | None = None,
         max_height: int | None = None,
     ):
-        
         self._styled_header_lines = None
 
         self._formatted_word = self._word.to_ascii(
@@ -142,7 +141,6 @@ class Header:
         pass
 
     async def get_next_frame(self):
-
         if self._styled_header_lines is None:
             self._styled_header_lines = await self._render()
 
@@ -162,9 +160,9 @@ class Header:
                     line,
                     color=get_style(self._config.color),
                     highlight=get_style(self._config.highlight),
-                    attrs=[
-                        get_style(attr) for attr in self._config.attributes
-                    ] if self._config.attributes else None,
+                    attrs=[get_style(attr) for attr in self._config.attributes]
+                    if self._config.attributes
+                    else None,
                     mode=self._mode,
                 )
             )

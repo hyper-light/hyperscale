@@ -85,7 +85,7 @@ class Highlight:
     ):
         if mode == TerminalMode.EXTENDED:
             return cls.extended_names.get(highlight, default)
-        
+
         if default is None:
             default = 0
 
@@ -100,7 +100,7 @@ class Highlight:
     ):
         if mode == TerminalMode.EXTENDED:
             return cls.extended_types.get(mode, default)
-        
+
         if default is None:
             default = 0
 

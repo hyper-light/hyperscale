@@ -50,5 +50,5 @@ class Env(BaseModel):
             "MERCURY_SYNC_MAX_WORKFLOWS": int,
             "MERCURY_SYNC_CONTEXT_POLL_RATE": str,
             "MERCURY_SYNC_SHUTDOWN_POLL_RATE": str,
-            "MERCURY_SYNC_DUPLICATE_JOB_POLICY": str
+            "MERCURY_SYNC_DUPLICATE_JOB_POLICY": str,
         }

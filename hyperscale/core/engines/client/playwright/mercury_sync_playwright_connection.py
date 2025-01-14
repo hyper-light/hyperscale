@@ -128,14 +128,15 @@ class MercurySyncPlaywrightConnection:
             )
 
             abort_futures = [
-                asyncio.ensure_future(session.close(     
+                asyncio.ensure_future(
+                    session.close(
                         run_before_unload=command.run_before_unload,
                         reason=command.reason,
                         timeout=self.timeouts.request_timeout,
-                )) for session in self.sessions
+                    )
+                )
+                for session in self.sessions
             ]
 
             for abort_future in abort_futures:
                 abort_future.set_result(None)
-                
-

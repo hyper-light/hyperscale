@@ -15,7 +15,6 @@ def create_help_string(
     keyword_args_map: dict[str, KeywordArg] | None = None,
     styling: CLIStyle | None = None,
 ):
-    
     if indentation is None:
         indentation = 0
 
@@ -23,7 +22,11 @@ def create_help_string(
         help_string = "No description found..."
 
     sorted_arg_keys = sorted(keyword_args_map.keys())
-    options = [keyword_args_map[arg_name] for arg_name in sorted_arg_keys if arg_name == keyword_args_map[arg_name].full_flag]
+    options = [
+        keyword_args_map[arg_name]
+        for arg_name in sorted_arg_keys
+        if arg_name == keyword_args_map[arg_name].full_flag
+    ]
 
     return HelpMessage(
         title=TitleHelpMessage(

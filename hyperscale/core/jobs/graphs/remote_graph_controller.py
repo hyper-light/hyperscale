@@ -4,17 +4,7 @@ import statistics
 import time
 from collections import Counter, defaultdict
 from socket import socket
-from typing import (
-    Any,
-    Awaitable,
-    Callable,
-    Dict,
-    List,
-    Set,
-    Tuple,
-    TypeVar,
-    Literal
-)
+from typing import Any, Awaitable, Callable, Dict, List, Set, Tuple, TypeVar, Literal
 
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph import Workflow
@@ -66,10 +56,7 @@ StepStatsType = Literal[
 ]
 
 
-StepStatsUpdate = Dict[
-    str,
-    Dict[StepStatsType, int]
-]
+StepStatsUpdate = Dict[str, Dict[StepStatsType, int]]
 
 
 class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
@@ -111,15 +98,11 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             )
         )
 
-        self._step_stats: Dict[int, Dict[str, Dict[int, StepStatsUpdate]]] = defaultdict(
-            lambda: defaultdict(
+        self._step_stats: Dict[int, Dict[str, Dict[int, StepStatsUpdate]]] = (
+            defaultdict(
                 lambda: defaultdict(
                     lambda: defaultdict(
-                        lambda: {
-                            "total": 0,
-                            "ok": 0,
-                            "err": 0
-                        }
+                        lambda: defaultdict(lambda: {"total": 0, "ok": 0, "err": 0})
                     )
                 )
             )
@@ -225,11 +208,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 for idx in range(threads)
             ]
         )
-    
-    async def poll_for_start(
-        self,
-        workers: int
-    ):
+
+    async def poll_for_start(self, workers: int):
         polling = True
 
         start = time.monotonic()
@@ -242,13 +222,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             acknowledged_starts_count = len(self.acknowledged_starts)
 
-            if (
-                acknowledged_starts_count
-                >= workers
-            ):
+            if acknowledged_starts_count >= workers:
                 await update_active_workflow_message(
-                    'initializing',
-                    f'Starting - {acknowledged_starts_count}/{workers} - threads'
+                    "initializing",
+                    f"Starting - {acknowledged_starts_count}/{workers} - threads",
                 )
 
                 break
@@ -259,8 +236,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 start = time.monotonic()
 
                 await update_active_workflow_message(
-                    'initializing',
-                    f'Starting - {acknowledged_starts_count}/{workers} - threads'
+                    "initializing",
+                    f"Starting - {acknowledged_starts_count}/{workers} - threads",
                 )
 
             if self._leader_lock.locked():
@@ -269,14 +246,12 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         if self._leader_lock.locked():
             self._leader_lock.release()
 
-
     async def poll_for_workflow_complete(
         self,
         run_id: int,
         workflow_name: str,
         timeout: int,
     ):
-
         try:
             await asyncio.wait_for(
                 self._poll_for_completed(
@@ -288,7 +263,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
         except asyncio.TimeoutError:
             pass
-        
+
         if self._leader_lock.locked():
             self._leader_lock.release()
 
@@ -296,7 +271,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             self._results[run_id][workflow_name],
             self._node_context[run_id],
         )
-    
+
     async def _poll_for_completed(
         self,
         run_id: int,
@@ -320,7 +295,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             if completions_count >= assigned_workers:
                 await update_active_workflow_message(
                     workflow_slug,
-                    f'Running - {workflow_name} - {completions_count}/{assigned_workers} workers complete'
+                    f"Running - {workflow_name} - {completions_count}/{assigned_workers} workers complete",
                 )
 
                 break
@@ -332,12 +307,12 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
                 await update_active_workflow_message(
                     workflow_slug,
-                    f'Running - {workflow_name} - {completions_count}/{assigned_workers} workers complete'
+                    f"Running - {workflow_name} - {completions_count}/{assigned_workers} workers complete",
                 )
 
             if self._leader_lock.locked():
                 self._leader_lock.release()
-    
+
     @send()
     async def acknowledge_start(
         self,
@@ -345,10 +320,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
     ):
         return await self.send(
             "receive_start_acknowledgement",
-            JobContext(
-                (self.host, self.port)
-            ),
-            target_address=leader_address
+            JobContext((self.host, self.port)),
+            target_address=leader_address,
         )
 
     @send()
@@ -409,18 +382,16 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             ),
             node_id=node_id,
         )
-    
+
     @receive()
     async def receive_start_acknowledgement(
-        self,
-        _: int,
-        acknowledgement: JobContext[tuple[str, int]]
+        self, _: int, acknowledgement: JobContext[tuple[str, int]]
     ):
         await self._leader_lock.acquire()
 
         host, port = acknowledgement.data
 
-        node_addr = f'{host}:{port}'
+        node_addr = f"{host}:{port}"
 
         self.acknowledged_starts.add(node_addr)
 
@@ -518,8 +489,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
         return JobContext(
             WorkflowStatusUpdate(
-                workflow_name, 
-                WorkflowStatus.SUBMITTED, 
+                workflow_name,
+                WorkflowStatus.SUBMITTED,
                 node_id=node_id,
             ),
             run_id=context.run_id,
@@ -580,7 +551,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         run_id: int,
         job: WorkflowJob,
     ):
-        
         (
             run_id,
             results,
@@ -683,7 +653,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             [WorkflowStatusUpdate],
             Awaitable[None],
         ],
-    ):  
+    ):
         workflow_status = WorkflowStatus.SUBMITTED
 
         status_counts = Counter(self._statuses[run_id][workflow].values())
@@ -696,11 +666,13 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         completed_count = sum(self._completed_counts[run_id][workflow].values())
         failed_count = sum(self._failed_counts[run_id][workflow].values())
 
-        step_stats: StepStatsUpdate = defaultdict(lambda: {
-            "ok": 0,
-            "total": 0,
-            "err": 0,
-        })
+        step_stats: StepStatsUpdate = defaultdict(
+            lambda: {
+                "ok": 0,
+                "total": 0,
+                "err": 0,
+            }
+        )
 
         for _, stats_update in self._step_stats[run_id][workflow].items():
             for hook, stats_set in stats_update.items():

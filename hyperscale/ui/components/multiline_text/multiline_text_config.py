@@ -10,11 +10,7 @@ from hyperscale.ui.styling.colors import (
 from typing import List, Literal
 
 
-HorizontalAlignment = Literal[
-    "left",
-    "center",
-    "right"
-]
+HorizontalAlignment = Literal["left", "center", "right"]
 
 
 class MultilineTextConfig(BaseModel):
@@ -22,6 +18,6 @@ class MultilineTextConfig(BaseModel):
     color: Colorizer | None = None
     highlight: HighlightColorizer | None = None
     attributes: List[Attributizer] | None = None
-    horizontal_alignment: HorizontalAlignment = 'center'
+    horizontal_alignment: HorizontalAlignment = "center"
     pagination_refresh_rate: StrictInt | StrictFloat = 3
-    terminal_mode: TerminalDisplayMode = 'compatability'
+    terminal_mode: TerminalDisplayMode = "compatability"

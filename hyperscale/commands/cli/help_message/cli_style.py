@@ -4,6 +4,7 @@ from hyperscale.ui.styling.attributes import Attributizer
 from hyperscale.ui.styling.colors import Colorizer, HighlightColorizer
 from typing import List, Callable, Awaitable, Any
 
+
 class CLIStyle(BaseModel):
     header: Callable[..., Awaitable[List[str]]] | None = None
     description_color: Colorizer | None = None
@@ -31,82 +32,66 @@ class CLIStyle(BaseModel):
     text_highlight: HighlightColorizer | None = None
     text_attributes: List[Attributizer] | None = None
     indentation: StrictInt = 0
-    terminal_mode: TerminalDisplayMode = 'compatability'
+    terminal_mode: TerminalDisplayMode = "compatability"
 
     class Config:
         allow_arbitrary_types = True
 
     def to_mode(self):
         return TerminalMode.to_mode(self.terminal_mode)
-    
+
     def has_flag_description_styles(self):
         return (
-            self.flag_description_color is not None
-        ) or (
-            self.flag_description_highlight is not None
-        ) or (
-            self.flag_description_attributes is not None
+            (self.flag_description_color is not None)
+            or (self.flag_description_highlight is not None)
+            or (self.flag_description_attributes is not None)
         )
-    
+
     def has_subcommand_styles(self):
         return (
-            self.subcommand_color is not None
-        ) or (
-            self.subcommand_highlight is not None
-        ) or (
-            self.subcommand_attributes is not None
+            (self.subcommand_color is not None)
+            or (self.subcommand_highlight is not None)
+            or (self.subcommand_attributes is not None)
         )
 
     def has_text_styles(self):
         return (
-            self.text_color is not None
-        ) or (
-            self.text_highlight is not None
-        ) or (
-            self.text_attributes is not None
+            (self.text_color is not None)
+            or (self.text_highlight is not None)
+            or (self.text_attributes is not None)
         )
-    
+
     def has_description_styles(self):
         return (
-            self.description_color is not None
-        ) or (
-            self.description_highlight is not None
-        ) or (
-            self.description_attributes is not None
+            (self.description_color is not None)
+            or (self.description_highlight is not None)
+            or (self.description_attributes is not None)
         )
-    
+
     def has_header_styles(self):
         return (
-            self.header_color is not None
-        ) or (
-            self.header_highlight is not None
-        ) or (
-            self.header_attributes is not None
+            (self.header_color is not None)
+            or (self.header_highlight is not None)
+            or (self.header_attributes is not None)
         )
-    
+
     def has_flag_styles(self):
         return (
-            self.flag_color is not None
-        ) or (
-            self.flag_highlight is not None
-        ) or (
-            self.flag_attributes is not None
+            (self.flag_color is not None)
+            or (self.flag_highlight is not None)
+            or (self.flag_attributes is not None)
         )
-    
+
     def has_link_styles(self):
         return (
-            self.link_color is not None
-        ) or (
-            self.link_highlight is not None
-        ) or (
-            self.link_attributes is not None
+            (self.link_color is not None)
+            or (self.link_highlight is not None)
+            or (self.link_attributes is not None)
         )
-    
+
     def has_error_styles(self):
         return (
-            self.error_color is not None
-        ) or (
-            self.error_highlight is not None
-        ) or (
-            self.error_attributes is not None
+            (self.error_color is not None)
+            or (self.error_highlight is not None)
+            or (self.error_attributes is not None)
         )

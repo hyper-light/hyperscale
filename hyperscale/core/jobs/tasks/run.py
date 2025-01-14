@@ -106,7 +106,7 @@ class Run:
 
         except Exception:
             pass
-        
+
         self.status = RunStatus.CANCELLED
 
     def abort(self):

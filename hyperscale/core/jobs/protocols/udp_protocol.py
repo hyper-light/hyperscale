@@ -9,13 +9,13 @@ import signal
 import ssl
 from collections import defaultdict, deque
 from typing import (
-    Any, 
-    AsyncIterable, 
-    Coroutine, 
-    Deque, 
-    Dict, 
+    Any,
+    AsyncIterable,
+    Coroutine,
+    Deque,
+    Dict,
     Literal,
-    Tuple, 
+    Tuple,
     Union,
     TypeVar,
     Callable,
@@ -45,13 +45,7 @@ K = TypeVar("K")
 
 
 class UDPProtocol(Generic[T, K]):
-    def __init__(
-        self, 
-        host: str, 
-        port: int,
-        env: Env
-    ) -> None:
-        
+    def __init__(self, host: str, port: int, env: Env) -> None:
         self._node_id_base = uuid.uuid4().int >> 64
         self.node_id: int | None = None
 
@@ -114,7 +108,7 @@ class UDPProtocol(Generic[T, K]):
 
     def node_at(self, idx: int):
         return self.nodes[idx]
-    
+
     def __iter__(self):
         for node_id in self._node_host_map:
             yield node_id
@@ -129,7 +123,7 @@ class UDPProtocol(Generic[T, K]):
         address: tuple[str, int],
         cert_path: str | None = None,
         key_path: str | None = None,
-        worker_socket: socket.socket | None  = None,
+        worker_socket: socket.socket | None = None,
         worker_server: asyncio.DatagramTransport | None = None,
     ):
         if not self._abort_handle_created:
@@ -145,10 +139,10 @@ class UDPProtocol(Generic[T, K]):
             self._abort_handle_created = True
 
         if self._loop is None:
-                self._loop = asyncio.get_event_loop()
+            self._loop = asyncio.get_event_loop()
 
         if self._semaphore is None:
-                self._semaphore = asyncio.Semaphore(self._max_concurrency)
+            self._semaphore = asyncio.Semaphore(self._max_concurrency)
 
         if self.node_id is None:
             self.node_id = uuid.uuid4().int >> 64
@@ -167,12 +161,11 @@ class UDPProtocol(Generic[T, K]):
 
         if cert_path and key_path:
             self._udp_ssl_context = self._create_udp_ssl_context(
-                cert_path=cert_path, 
+                cert_path=cert_path,
                 key_path=key_path,
             )
-    
-        while True:
 
+        while True:
             if self._transport is None:
                 await self.start_server(
                     cert_path=cert_path,
@@ -189,7 +182,7 @@ class UDPProtocol(Generic[T, K]):
                         target_address=address,
                         request_type="connect",
                     ),
-                    timeout=self._connect_timeout
+                    timeout=self._connect_timeout,
                 )
 
                 shard_id, _ = result
@@ -202,7 +195,7 @@ class UDPProtocol(Generic[T, K]):
                 self._nodes.put_no_wait(instance)
 
                 return instance
-            
+
             except Exception:
                 pass
 
@@ -214,15 +207,13 @@ class UDPProtocol(Generic[T, K]):
 
             await asyncio.sleep(self._retry_interval)
 
-
     async def start_server(
         self,
         cert_path: str | None = None,
         key_path: str | None = None,
-        worker_socket: socket.socket | None  = None,
+        worker_socket: socket.socket | None = None,
         worker_server: asyncio.DatagramTransport | None = None,
     ) -> None:
-        
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
 
@@ -235,7 +226,7 @@ class UDPProtocol(Generic[T, K]):
                     ),
                     self.abort,
                 )
-            
+
             self._abort_handle_created = True
 
         self._events: Dict[str, Callable[[int, T], Awaitable[K]]] = {
@@ -322,7 +313,9 @@ class UDPProtocol(Generic[T, K]):
                     self.udp_socket = socket.socket(
                         socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
                     )
-                    self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    self.udp_socket.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
+                    )
                     self.udp_socket.bind((self.host, self.port))
 
                     self.udp_socket.setblocking(False)
@@ -336,8 +329,12 @@ class UDPProtocol(Generic[T, K]):
                 elif self.connected is False:
                     self._transport = worker_server
 
-                    address_info: Tuple[str, int] = self._transport.get_extra_info("sockname")
-                    self.udp_socket: socket.socket = self._transport.get_extra_info("socket")
+                    address_info: Tuple[str, int] = self._transport.get_extra_info(
+                        "sockname"
+                    )
+                    self.udp_socket: socket.socket = self._transport.get_extra_info(
+                        "socket"
+                    )
 
                     host, port = address_info
                     self.host = host
@@ -369,10 +366,10 @@ class UDPProtocol(Generic[T, K]):
                 pass
 
             await asyncio.sleep(self._retry_interval)
-        
 
     def _create_udp_ssl_context(
-        self, cert_path: str | None = None, 
+        self,
+        cert_path: str | None = None,
         key_path: str | None = None,
     ) -> ssl.SSLContext:
         if self._udp_cert_path is None:
@@ -456,7 +453,6 @@ class UDPProtocol(Generic[T, K]):
         self._transport.sendto(compressed, address)
 
         for _ in range(self._retries):
-
             try:
                 waiter = self._loop.create_future()
                 self._waiters[target].put_nowait(waiter)
@@ -475,7 +471,7 @@ class UDPProtocol(Generic[T, K]):
                     )
 
                 return (shard_id, response.data)
-            
+
             except Exception:
                 await asyncio.sleep(self._retry_interval)
 
@@ -486,12 +482,12 @@ class UDPProtocol(Generic[T, K]):
                 target,
                 service_host=self.host,
                 service_port=self.port,
-                error="Request timed out."
+                error="Request timed out.",
             ),
         )
 
     async def send_bytes(
-        self, 
+        self,
         target: str,
         data: bytes,
         target_address: Tuple[str, int] | None = None,
@@ -505,7 +501,7 @@ class UDPProtocol(Generic[T, K]):
 
         if address is None and target_address:
             address = target_address
-        
+
         encrypted_message = self._encryptor.encrypt(data)
         compressed = self._compressor.compress(encrypted_message)
 
@@ -513,7 +509,6 @@ class UDPProtocol(Generic[T, K]):
             self._transport.sendto(compressed, address)
 
             for _ in range(self._retries):
-
                 try:
                     waiter = self._loop.create_future()
                     self._waiters[target].put_nowait(waiter)
@@ -526,18 +521,15 @@ class UDPProtocol(Generic[T, K]):
                     (shard_id, response) = result
 
                     return (shard_id, response)
-                
+
                 except Exception:
                     await asyncio.sleep(self._retry_interval)
 
         except (Exception, socket.error):
-            return (
-                self.id_generator.generate(),
-                b"Request timed out."
-            )
+            return (self.id_generator.generate(), b"Request timed out.")
 
     async def stream(
-        self, 
+        self,
         target: str,
         data: T,
         node_id: int | None = None,
@@ -571,7 +563,6 @@ class UDPProtocol(Generic[T, K]):
             ),
             pickle.HIGHEST_PROTOCOL,
         )
-
 
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
@@ -620,11 +611,9 @@ class UDPProtocol(Generic[T, K]):
         )
 
     def read(self, data: bytes, addr: Tuple[str, int]) -> None:
-
         decompressed = b""
 
         try:
-
             decompressed = self._decompressor.decompress(data)
 
         except Exception as decompression_error:
@@ -644,7 +633,7 @@ class UDPProtocol(Generic[T, K]):
             )
 
             return
-        
+
         decrypted = decompressed
 
         try:
@@ -667,7 +656,7 @@ class UDPProtocol(Generic[T, K]):
             )
 
             return
-        
+
         result: Tuple[str, int, Message] = (None, None, None)
 
         try:
@@ -690,7 +679,7 @@ class UDPProtocol(Generic[T, K]):
             )
 
             return
-        
+
         message_type: str | None = None
         shard_id: int | None = None
         message: Message | None = None
@@ -720,8 +709,6 @@ class UDPProtocol(Generic[T, K]):
 
             return
 
-
-
         if message_type == "connect":
             self._pending_responses.append(
                 asyncio.create_task(
@@ -740,7 +727,7 @@ class UDPProtocol(Generic[T, K]):
                         shard_id,
                         message,
                         self._events.get(message.name)(
-                            shard_id, 
+                            shard_id,
                             message.data,
                         ),
                         addr,
@@ -754,17 +741,13 @@ class UDPProtocol(Generic[T, K]):
                     self._read_iterator(
                         message.name,
                         message,
-                        self._events.get(message.name)(
-                            shard_id, 
-                            message.data
-                        ),
+                        self._events.get(message.name)(shard_id, message.data),
                         addr,
                     )
                 )
             )
 
         else:
-
             self._pending_responses.append(
                 asyncio.create_task(
                     self._receive_response(
@@ -781,10 +764,10 @@ class UDPProtocol(Generic[T, K]):
     ):
         try:
             await self._add_node_from_shard_id(shard_id, message)
-        
+
             if message.name is None and bool(self._last_call):
                 message.name = self._last_call.pop()
-                
+
             event_waiter = self._waiters[message.name]
 
             if bool(event_waiter):
@@ -809,23 +792,25 @@ class UDPProtocol(Generic[T, K]):
         error: Message[None],
         addr: tuple[str, int],
     ):
-        item = cloudpickle.dumps((
-            "response",
-            self.id_generator.generate(),
-            error,
-        ), pickle.HIGHEST_PROTOCOL)
+        item = cloudpickle.dumps(
+            (
+                "response",
+                self.id_generator.generate(),
+                error,
+            ),
+            pickle.HIGHEST_PROTOCOL,
+        )
 
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
 
         self._transport.sendto(compressed, addr)
 
-
     async def _reset_connection(self):
         try:
             await self.close()
             await self.start_server(
-                cert_path=self._udp_cert_path, 
+                cert_path=self._udp_cert_path,
                 key_path=self._udp_key_path,
             )
 
@@ -860,14 +845,13 @@ class UDPProtocol(Generic[T, K]):
         self._transport.sendto(compressed, addr)
 
     async def _read(
-        self, 
-        shard_id:int,
-        message: Message[T], 
-        coroutine: Coroutine, 
+        self,
+        shard_id: int,
+        message: Message[T],
+        coroutine: Coroutine,
         addr: Tuple[str, int],
     ) -> Coroutine[Any, Any, None]:
         try:
-
             await self._add_node_from_shard_id(shard_id, message)
             response: K = await coroutine
 
@@ -896,13 +880,12 @@ class UDPProtocol(Generic[T, K]):
             # await self._reset_connection()
 
     async def _read_iterator(
-        self, 
+        self,
         shard_id: int,
-        message: Message[T], 
-        coroutine: AsyncIterable[K], 
+        message: Message[T],
+        coroutine: AsyncIterable[K],
         addr: Tuple[str, int],
     ) -> Coroutine[Any, Any, None]:
-        
         await self._add_node_from_shard_id(shard_id, message)
 
         async for response in coroutine:
@@ -930,11 +913,7 @@ class UDPProtocol(Generic[T, K]):
                 pass
                 # await self._reset_connection()
 
-    async def _add_node_from_shard_id(
-        self, 
-        shard_id: int,
-        message: Message[T | None]
-    ):
+    async def _add_node_from_shard_id(self, shard_id: int, message: Message[T | None]):
         snowflake = Snowflake.parse(shard_id)
         instance = snowflake.instance
         if (await self._nodes.exists(instance)) is False:
@@ -947,14 +926,9 @@ class UDPProtocol(Generic[T, K]):
     async def wait_for_socket_shutdown(self):
         await asyncio.sleep(self._shutdown_poll_rate)
 
-        while (
-            await self._loop.run_in_executor(
-                None,
-                self.udp_socket.fileno
-            ) > -1
-        ):
+        while await self._loop.run_in_executor(None, self.udp_socket.fileno) > -1:
             await asyncio.sleep(self._shutdown_poll_rate)
-            
+
     async def close(self) -> None:
         self._running = False
 
@@ -997,7 +971,7 @@ class UDPProtocol(Generic[T, K]):
 
             except asyncio.CancelledError:
                 pass
-        
+
         if self.tasks:
             self.tasks.abort()
 
@@ -1078,7 +1052,7 @@ class UDPProtocol(Generic[T, K]):
 
             except asyncio.CancelledError:
                 pass
-        
+
         if self.tasks:
             self.tasks.abort()
 

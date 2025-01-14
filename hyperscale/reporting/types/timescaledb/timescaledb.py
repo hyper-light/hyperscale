@@ -27,7 +27,6 @@ except Exception:
     class CreateTable:
         pass
 
-
     class UUID:
         pass
 

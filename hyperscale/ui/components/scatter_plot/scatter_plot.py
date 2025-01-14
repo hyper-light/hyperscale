@@ -17,7 +17,7 @@ CompletionRateSet = Tuple[str, List[Union[int, float]]]
 
 class ScatterPlot:
     def __init__(
-        self, 
+        self,
         name: str,
         config: PlotConfig,
         subscriptions: list[str] | None = None,
@@ -30,7 +30,7 @@ class ScatterPlot:
 
         self._config = config
         self.subscriptions = subscriptions
-        
+
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
         self._data: list[
@@ -78,7 +78,6 @@ class ScatterPlot:
         max_width: int | None = None,
         max_height: int | None = None,
     ):
-        
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
@@ -140,7 +139,9 @@ class ScatterPlot:
 
     async def update(
         self,
-        data: int | float | list[
+        data: int
+        | float
+        | list[
             tuple[
                 int | float,
                 int | float,
@@ -154,12 +155,9 @@ class ScatterPlot:
         self._update_lock.release()
 
     async def get_next_frame(self):
-       
-
         data = await self._check_if_should_rerender()
 
         if data:
-
             (
                 x_max,
                 y_max,
@@ -188,7 +186,7 @@ class ScatterPlot:
                 Y_label=self._config.y_axis_name,
                 lc=Color.by_name(
                     get_style(
-                        self._line_color, 
+                        self._line_color,
                         self._data,
                     ),
                     mode=self._mode,
@@ -207,13 +205,12 @@ class ScatterPlot:
             self._last_state = self._data
 
             return plot_lines, True
-        
+
         return self._last_rendered_frames, False
-    
+
     async def _check_if_should_rerender(self):
         if self._updates.empty() is False:
             return await self._updates.get()
-
 
     def _get_plot_length_adjustments(
         self,
@@ -252,13 +249,14 @@ class ScatterPlot:
         return length_adjustments
 
     def _generate_x_and_y_vals(
-        self, 
+        self,
         data: list[
             tuple[
                 int | float,
                 int | float,
             ]
-        ]):
+        ],
+    ):
         x_range = self._config.x_range
         if x_range and self._config.x_range_inclusive:
             x_vals = [idx for idx in range(self._config.x_range_start, x_range + 1)]

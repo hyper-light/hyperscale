@@ -88,20 +88,19 @@ class WorkflowRunner:
         self._threads = psutil.cpu_count(logical=False)
         self._workflows_sem: asyncio.Semaphore | None = None
         self._workflow_hooks: Dict[int, Dict[str, List[str]]] = defaultdict(dict)
-        self._duplicate_job_policy: Literal[
-            "reject",
-            "replace"
-        ] = env.MERCURY_SYNC_DUPLICATE_JOB_POLICY
+        self._duplicate_job_policy: Literal["reject", "replace"] = (
+            env.MERCURY_SYNC_DUPLICATE_JOB_POLICY
+        )
 
         self._workflow_step_stats: Dict[
-            int, 
+            int,
             Dict[
-                tuple[str, str], 
+                tuple[str, str],
                 Dict[
                     StepStatsType,
                     CompletionCounter,
-                ]
-            ]
+                ],
+            ],
         ] = defaultdict(dict)
 
         self._max_running_workflows = env.MERCURY_SYNC_MAX_RUNNING_WORKFLOWS
@@ -140,12 +139,7 @@ class WorkflowRunner:
         self,
         run_id: int,
         workflow: str,
-    ) -> Tuple[
-        WorkflowStatus,
-        int,
-        int,
-        Dict[str, Dict[StepStatsType, int]]
-    ]:
+    ) -> Tuple[WorkflowStatus, int, int, Dict[str, Dict[StepStatsType, int]]]:
         status = self.run_statuses.get(
             run_id,
             {},
@@ -156,18 +150,8 @@ class WorkflowRunner:
 
         workflow_hooks = self._workflow_hooks[run_id].get(workflow, [])
 
-        worklow_hook_stats: Dict[
-            str, 
-            Dict[
-                StepStatsType, 
-                int
-            ]
-        ] = {
-            hook: {
-                "total": 0,
-                "ok": 0,
-                "err": 0
-            } for hook in workflow_hooks
+        worklow_hook_stats: Dict[str, Dict[StepStatsType, int]] = {
+            hook: {"total": 0, "ok": 0, "err": 0} for hook in workflow_hooks
         }
 
         try:
@@ -189,15 +173,16 @@ class WorkflowRunner:
             pass
 
         try:
-
-            for (workflow_name, hook_name), stats in self._workflow_step_stats[run_id].items():
+            for (workflow_name, hook_name), stats in self._workflow_step_stats[
+                run_id
+            ].items():
                 if workflow_name == workflow:
                     worklow_hook_stats[hook_name] = {
                         "total": stats["total"].value(),
                         "ok": stats["ok"].value(),
                         "err": stats["err"].value(),
                     }
-        
+
         except Exception:
             pass
 
@@ -256,7 +241,7 @@ class WorkflowRunner:
                 WorkflowStatus.REJECTED,
             )
 
-        elif already_running and self._duplicate_job_policy == 'reject':
+        elif already_running and self._duplicate_job_policy == "reject":
             return (
                 run_id,
                 None,
@@ -537,9 +522,9 @@ class WorkflowRunner:
         for hook in hooks:
             stats_key = (workflow.name, hook)
             self._workflow_step_stats[run_id][stats_key] = {
-                'total': CompletionCounter(),
-                'ok': CompletionCounter(),
-                'err': CompletionCounter(),
+                "total": CompletionCounter(),
+                "ok": CompletionCounter(),
+                "err": CompletionCounter(),
             }
 
         step_graph = networkx.DiGraph()
@@ -762,15 +747,21 @@ class WorkflowRunner:
             for complete in completed:
                 step_name = complete.get_name()
 
-                self._workflow_step_stats[run_id][(workflow_name, step_name)]["total"].increment()
+                self._workflow_step_stats[run_id][(workflow_name, step_name)][
+                    "total"
+                ].increment()
 
                 try:
                     result = complete.result()
-                    self._workflow_step_stats[run_id][(workflow_name, step_name)]["ok"].increment()
+                    self._workflow_step_stats[run_id][(workflow_name, step_name)][
+                        "ok"
+                    ].increment()
 
                 except Exception as err:
                     self._failed_counts[run_id][workflow_name].increment()
-                    self._workflow_step_stats[run_id][(workflow_name, step_name)]["err"].increment()
+                    self._workflow_step_stats[run_id][(workflow_name, step_name)][
+                        "err"
+                    ].increment()
 
                     result = err
 
@@ -887,7 +878,7 @@ class WorkflowRunner:
         )
 
         return context
-    
+
     def _clear(self):
         self._running_workflows.clear()
         self._failed_counts.clear()
@@ -899,7 +890,6 @@ class WorkflowRunner:
         self._active.clear()
         self._active_waiters.clear()
         self._max_active.clear()
-
 
     async def close(self):
         for job in self._running_workflows.values():

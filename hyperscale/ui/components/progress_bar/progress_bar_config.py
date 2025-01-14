@@ -34,12 +34,11 @@ class ProgressBarConfig(BaseModel):
     terminal_mode: TerminalDisplayMode = "compatability"
 
     class Config:
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed = True
 
     def get_static_chars(self):
         complete_char = FillChar.by_name(self.complete, default=self.complete)
         failed_char = FillChar.by_name(self.failed, default=self.failed)
-
 
         incomplete_char = BackgroundChar.by_name(
             self.incomlpete, default=self.incomlpete
@@ -58,10 +57,9 @@ class ProgressBarConfig(BaseModel):
             incomplete_char,
             start_char,
         )
-    
+
     def get_active_spinner(self):
         factory = SpinnerFactory()
         spinner = factory.get(self.active)
 
         return spinner.frames
-

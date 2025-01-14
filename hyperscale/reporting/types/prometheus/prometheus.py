@@ -27,7 +27,6 @@ except Exception:
 
     class PrometheusConfig:
         pass
-    
 
     class CollectorRegistry:
         pass

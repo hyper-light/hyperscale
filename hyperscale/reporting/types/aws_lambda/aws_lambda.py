@@ -80,7 +80,6 @@ class AWSLambda:
         )
 
     async def submit_common(self, metrics_sets: List[MetricsSet]):
-
         await self._loop.run_in_executor(
             self._executor,
             functools.partial(
@@ -101,7 +100,6 @@ class AWSLambda:
         )
 
     async def submit_metrics(self, metrics: List[MetricsSet]):
-
         for metrics_set in metrics:
             await self._loop.run_in_executor(
                 self._executor,
@@ -162,4 +160,3 @@ class AWSLambda:
 
     async def close(self):
         self._executor.shutdown(cancel_futures=True)
-

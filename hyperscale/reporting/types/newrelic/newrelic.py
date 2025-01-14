@@ -26,8 +26,6 @@ except Exception:
     class newrelic:
         agent = object
 
-    
-
 
 class NewRelic:
     def __init__(self, config: NewRelicConfig) -> None:

@@ -12,12 +12,11 @@ class HyperscaleInterface:
         self,
         updates: InterfaceUpdatesController,
         config: HyperscaleInterfaceConfig | None = None,
-        padding: tuple[int, int] | None = None
+        padding: tuple[int, int] | None = None,
     ):
-        
         if config is None:
             config = HyperscaleInterfaceConfig()
-        
+
         if padding is None:
             padding = (4, 1)
 
@@ -30,7 +29,7 @@ class HyperscaleInterface:
         self._vertical_padding = vertical_padding
         self._updates = updates
 
-        self._active_workflow = 'initializing'
+        self._active_workflow = "initializing"
         self._active_workflows: list[str] = []
 
         self._terminal_task: asyncio.Task | None = None
@@ -38,15 +37,14 @@ class HyperscaleInterface:
         self._active_workflows: list[str] = []
 
         self._component_names = [
-            'workflow_metadata',
-            'run_progress',
-            'run_message_display',
-            'run_timer',
-            'executions_counter',
-            'total_executions',
-            'executions_over_time',
-            'execution_stats_table',
-
+            "workflow_metadata",
+            "run_progress",
+            "run_message_display",
+            "run_timer",
+            "executions_counter",
+            "total_executions",
+            "executions_over_time",
+            "execution_stats_table",
         ]
 
         self._current_active_idx: int = 0
@@ -61,9 +59,8 @@ class HyperscaleInterface:
         self._terminal = Terminal(sections)
 
     async def run(self):
-
         if self._terminal is None:
-            raise Exception('Err. - Terminal not initialized.')
+            raise Exception("Err. - Terminal not initialized.")
 
         if self._terminal_task is None:
             self._run_switch_loop = asyncio.Event()
@@ -77,57 +74,64 @@ class HyperscaleInterface:
             )
 
     async def _run(self):
-
         while not self._run_switch_loop.is_set():
-            await asyncio.gather(*[
-                self._terminal.set_component_active(
-                    f'{component_name}_{self._active_workflow}' 
-                ) for component_name in self._component_names
-            ])
-
-            active_workflows_update: list[str] | None = await self._updates.get_active_workflows(
-                self._config.update_interval
+            await asyncio.gather(
+                *[
+                    self._terminal.set_component_active(
+                        f"{component_name}_{self._active_workflow}"
+                    )
+                    for component_name in self._component_names
+                ]
             )
+
+            active_workflows_update: (
+                list[str] | None
+            ) = await self._updates.get_active_workflows(self._config.update_interval)
 
             if isinstance(active_workflows_update, list):
                 self._active_workflows = active_workflows_update
                 self._current_active_idx = 0
-                self._active_workflow = active_workflows_update[self._current_active_idx]
-
+                self._active_workflow = active_workflows_update[
+                    self._current_active_idx
+                ]
 
             elif len(self._active_workflows) > 0:
-                self._current_active_idx = (self._current_active_idx + 1)%len(self._active_workflows)
+                self._current_active_idx = (self._current_active_idx + 1) % len(
+                    self._active_workflows
+                )
                 self._active_workflow = self._active_workflows[self._current_active_idx]
 
     async def stop(self):
-
         if self._run_switch_loop.is_set() is False:
             self._run_switch_loop.set()
 
         self._updates.shutdown()
 
-        if self._updated_active_workflows and self._updated_active_workflows.is_set() is False:
+        if (
+            self._updated_active_workflows
+            and self._updated_active_workflows.is_set() is False
+        ):
             self._updated_active_workflows.set()
 
         if self._terminal:
             await self._terminal.stop()
             await self._terminal_task
-        
-    async def abort(self):
 
+    async def abort(self):
         if not self._run_switch_loop.is_set():
             self._run_switch_loop.set()
 
         try:
-
             self._updates.shutdown()
 
         except Exception:
             pass
-        
-        try:
 
-            if self._updated_active_workflows and self._updated_active_workflows.is_set() is False:
+        try:
+            if (
+                self._updated_active_workflows
+                and self._updated_active_workflows.is_set() is False
+            ):
                 self._updated_active_workflows.set()
 
         except Exception:
@@ -140,11 +144,10 @@ class HyperscaleInterface:
 
         if self._terminal_task is None:
             return
-    
+
         try:
             self._terminal_task.cancel()
             self._terminal_task.set_result(None)
 
         except Exception:
             pass
-    

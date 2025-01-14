@@ -27,7 +27,15 @@ import colorsys
 import sys
 
 
-def color(text, fg=None, bg=None, mode='names', no_color=False, force_color: bool=False, full_reset=True):  # noqa: C901 complex (12)
+def color(
+    text,
+    fg=None,
+    bg=None,
+    mode="names",
+    no_color=False,
+    force_color: bool = False,
+    full_reset=True,
+):  # noqa: C901 complex (12)
     """Surround `text` with control characters for coloring
 
     c.f. http://en.wikipedia.org/wiki/ANSI_escape_code
@@ -93,12 +101,12 @@ def color(text, fg=None, bg=None, mode='names', no_color=False, force_color: boo
     if force_color:
         return text
 
-    start = ''
-    if mode == 'names':
+    start = ""
+    if mode == "names":
         start = _names(fg, bg)
-    elif mode == 'byte':
+    elif mode == "byte":
         start = _byte(fg, bg)
-    elif mode == 'rgb':
+    elif mode == "rgb":
         if isinstance(fg, str):
             fg = _hex2rgb(fg)
         if isinstance(bg, str):
@@ -106,14 +114,16 @@ def color(text, fg=None, bg=None, mode='names', no_color=False, force_color: boo
 
         start = _rgb(fg, bg)
     else:
-        raise ValueError('Invalid mode "{}". Use one of "names", "byte" or "rgb".'.format(mode))
+        raise ValueError(
+            'Invalid mode "{}". Use one of "names", "byte" or "rgb".'.format(mode)
+        )
 
     assert start
     res = start + text
     if full_reset:
-        return res + '\x1b[0m'
+        return res + "\x1b[0m"
     else:
-        return res + '\x1b[39;49m'
+        return res + "\x1b[39;49m"
 
 
 def hsl(hue, saturation, lightness):
@@ -183,8 +193,8 @@ def _names(fg, bg):
     if not (bg is None or bg in _BACKGROUNDS):
         raise ValueError('Invalid color name bg = "{}"'.format(bg))
 
-    fg_ = _FOREGROUNDS.get(fg, '')
-    bg_ = _BACKGROUNDS.get(bg, '')
+    fg_ = _FOREGROUNDS.get(fg, "")
+    bg_ = _BACKGROUNDS.get(bg, "")
 
     return _join_codes(fg_, bg_)
 
@@ -195,16 +205,16 @@ def _byte(fg, bg):
     c.f. https://en.wikipedia.org/wiki/ANSI_escape_code#8-bit
     """
     if not (fg is None or (isinstance(fg, int) and 0 <= fg <= 255)):
-        raise ValueError('Invalid fg = {}. Allowed int in [0, 255].'.format(fg))
+        raise ValueError("Invalid fg = {}. Allowed int in [0, 255].".format(fg))
     if not (bg is None or (isinstance(bg, int) and 0 <= bg <= 255)):
-        raise ValueError('Invalid bg = {}. Allowed int in [0, 255].'.format(bg))
+        raise ValueError("Invalid bg = {}. Allowed int in [0, 255].".format(bg))
 
-    fg_ = ''
+    fg_ = ""
     if fg is not None:
-        fg_ = '38;5;' + str(fg)
-    bg_ = ''
+        fg_ = "38;5;" + str(fg)
+    bg_ = ""
     if bg is not None:
-        bg_ = '48;5;' + str(bg)
+        bg_ = "48;5;" + str(bg)
 
     return _join_codes(fg_, bg_)
 
@@ -212,14 +222,14 @@ def _byte(fg, bg):
 def _hex2rgb(h):
     """Transform rgb hex representation into rgb tuple of ints representation"""
     assert isinstance(h, str)
-    if h.lower().startswith('0x'):
+    if h.lower().startswith("0x"):
         h = h[2:]
     if len(h) == 3:
         return (int(h[0] * 2, base=16), int(h[1] * 2, base=16), int(h[2] * 2, base=16))
     if len(h) == 6:
         return (int(h[0:2], base=16), int(h[2:4], base=16), int(h[4:6], base=16))
 
-    raise ValueError('Invalid hex RGB value.')
+    raise ValueError("Invalid hex RGB value.")
 
 
 def _rgb(fg, bg):
@@ -227,80 +237,88 @@ def _rgb(fg, bg):
 
     c.f. https://en.wikipedia.org/wiki/ANSI_escape_code#24-bit
     """
-    if not (fg is None or (isinstance(fg, (list, tuple)) and len(fg) == 3) and all(0 <= f <= 255 for f in fg)):
-        raise ValueError('Foreground fg either None or 3-tuple: {}'.format(fg))
-    if not (bg is None or (isinstance(bg, (list, tuple)) and len(bg) == 3) and all(0 <= b <= 255 for b in bg)):
-        raise ValueError('Foreground fg either None or 3-tuple: {}'.format(bg))
+    if not (
+        fg is None
+        or (isinstance(fg, (list, tuple)) and len(fg) == 3)
+        and all(0 <= f <= 255 for f in fg)
+    ):
+        raise ValueError("Foreground fg either None or 3-tuple: {}".format(fg))
+    if not (
+        bg is None
+        or (isinstance(bg, (list, tuple)) and len(bg) == 3)
+        and all(0 <= b <= 255 for b in bg)
+    ):
+        raise ValueError("Foreground fg either None or 3-tuple: {}".format(bg))
 
-    fg_ = ''
+    fg_ = ""
     if fg is not None:
-        fg_ = '38;2;' + ';'.join(map(str, fg))
-    bg_ = ''
+        fg_ = "38;2;" + ";".join(map(str, fg))
+    bg_ = ""
     if bg is not None:
-        bg_ = '48;2;' + ';'.join(map(str, bg))
+        bg_ = "48;2;" + ";".join(map(str, bg))
 
     return _join_codes(fg_, bg_)
 
 
 def _join_codes(fg, bg):
     """Join `fg` and `bg` with ; and surround with correct esc sequence."""
-    colors = ';'.join(filter(lambda c: len(c) > 0, (fg, bg)))
+    colors = ";".join(filter(lambda c: len(c) > 0, (fg, bg)))
     if colors:
-        return '\x1b[' + colors + 'm'
+        return "\x1b[" + colors + "m"
 
-    return ''
+    return ""
 
 
 _BACKGROUNDS = {
-    'black': '40',
-    'red': '41',
-    'green': '42',
-    'yellow': '43',
-    'blue': '44',
-    'magenta': '45',
-    'cyan': '46',
-    'white': '47',
-    'bright_black': '100',
-    'bright_red': '101',
-    'bright_green': '102',
-    'bright_yellow': '103',
-    'bright_blue': '104',
-    'bright_magenta': '105',
-    'bright_cyan': '106',
-    'bright_white': '107',
-    'bright_black_old': '1;40',
-    'bright_red_old': '1;41',
-    'bright_green_old': '1;42',
-    'bright_yellow_old': '1;43',
-    'bright_blue_old': '1;44',
-    'bright_magenta_old': '1;45',
-    'bright_cyan_old': '1;46',
-    'bright_white_old': '1;47',
+    "black": "40",
+    "red": "41",
+    "green": "42",
+    "yellow": "43",
+    "blue": "44",
+    "magenta": "45",
+    "cyan": "46",
+    "white": "47",
+    "bright_black": "100",
+    "bright_red": "101",
+    "bright_green": "102",
+    "bright_yellow": "103",
+    "bright_blue": "104",
+    "bright_magenta": "105",
+    "bright_cyan": "106",
+    "bright_white": "107",
+    "bright_black_old": "1;40",
+    "bright_red_old": "1;41",
+    "bright_green_old": "1;42",
+    "bright_yellow_old": "1;43",
+    "bright_blue_old": "1;44",
+    "bright_magenta_old": "1;45",
+    "bright_cyan_old": "1;46",
+    "bright_white_old": "1;47",
 }
 
 _FOREGROUNDS = {
-    'black': '30',
-    'red': '31',
-    'green': '32',
-    'yellow': '33',
-    'blue': '34',
-    'magenta': '35',
-    'cyan': '36',
-    'white': '37',
-    'bright_black': '90',
-    'bright_red': '91',
-    'bright_green': '92',
-    'bright_yellow': '93',
-    'bright_blue': '94',
-    'bright_magenta': '95',
-    'bright_cyan': '96',
-    'bright_white': '97',
-    'bright_black_old': '1;30',
-    'bright_red_old': '1;31',
-    'bright_green_old': '1;32',
-    'bright_yellow_old': '1;33',
-    'bright_blue_old': '1;34',
-    'bright_magenta_old': '1;35',
-    'bright_cyan_old': '1;36',
-    'bright_white_old': '1;37',
+    "black": "30",
+    "red": "31",
+    "green": "32",
+    "yellow": "33",
+    "blue": "34",
+    "magenta": "35",
+    "cyan": "36",
+    "white": "37",
+    "bright_black": "90",
+    "bright_red": "91",
+    "bright_green": "92",
+    "bright_yellow": "93",
+    "bright_blue": "94",
+    "bright_magenta": "95",
+    "bright_cyan": "96",
+    "bright_white": "97",
+    "bright_black_old": "1;30",
+    "bright_red_old": "1;31",
+    "bright_green_old": "1;32",
+    "bright_yellow_old": "1;33",
+    "bright_blue_old": "1;34",
+    "bright_magenta_old": "1;35",
+    "bright_cyan_old": "1;36",
+    "bright_white_old": "1;37",
 }

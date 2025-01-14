@@ -38,10 +38,7 @@ Component = (
 )
 
 
-T = TypeVar(
-    'T', 
-    bound=list[Component]
-)
+T = TypeVar("T", bound=list[Component])
 
 
 class Section(Generic[T]):
@@ -50,16 +47,10 @@ class Section(Generic[T]):
         config: SectionConfig,
         components: T | None = None,
     ) -> None:
-        
         self._empty = False
-        
-        if components is None or (
-            isinstance(components, list)
-            and len(components) < 1
-        ):
-            components = [
-                Empty(str(uuid.uuid4()))
-            ]
+
+        if components is None or (isinstance(components, list) and len(components) < 1):
+            components = [Empty(str(uuid.uuid4()))]
 
             self._empty = True
 
@@ -69,7 +60,7 @@ class Section(Generic[T]):
         self.components: Dict[str, Component] = {
             component.name: component for component in components
         }
-    
+
         self._active_component = self.component_names[0]
         self.component = self.components[self._active_component]
 
@@ -92,7 +83,7 @@ class Section(Generic[T]):
             "x-small": 0.25,
             "small": 1 / 3,
             "medium": 0.5,
-            "large": 2 /3,
+            "large": 2 / 3,
             "x-large": 0.75,
             "xx-large": 0.85,
             "full": 1,
@@ -117,7 +108,7 @@ class Section(Generic[T]):
     @property
     def height(self):
         return self._actual_height
-    
+
     def set_active(self, component_name: str):
         if component := self.components.get(component_name):
             self._active_component = component_name
@@ -128,13 +119,11 @@ class Section(Generic[T]):
         canvas_width: int,
         canvans_height: int,
     ):
-        
         if self._last_render:
             self._last_render = None
-        
+
         width_scale = self._scale[self.config.width]
         self._actual_width = math.floor(width_scale * canvas_width)
-
 
         height_scale = self._scale[self.config.height]
         self._actual_height = math.floor(height_scale * canvans_height)
@@ -169,7 +158,6 @@ class Section(Generic[T]):
         self._inner_height = self._actual_height - vertical_padding
 
     async def create_blocks(self):
-
         if len(self._blocks) > 0:
             self._blocks.clear()
 
@@ -182,12 +170,15 @@ class Section(Generic[T]):
         if top_padding:
             self._blocks.extend(top_padding)
 
-
         if self.config.bottom_padding:
-            self._bottom_padding = await self._create_padding_row(self.config.bottom_padding)
+            self._bottom_padding = await self._create_padding_row(
+                self.config.bottom_padding
+            )
 
         if self.config.bottom_border:
-            self._bottom_border = await self._create_border_row(self.config.bottom_border)
+            self._bottom_border = await self._create_border_row(
+                self.config.bottom_border
+            )
 
         if self.config.left_border:
             self._left_border = await stylize(
@@ -209,34 +200,30 @@ class Section(Generic[T]):
         self._left_pad = " " * (self.config.left_padding + self._left_remainder_pad)
         self._right_pad = " " * (self.config.right_padding + self._right_remainder_pad)
 
-
     async def render(self):
         if self._empty is False:
             return await self._render_with_component()
-        
+
         elif self._last_render is None:
             render = await self._render_without_component()
             self._last_render = render
 
             return render
-        
+
         else:
             return self._last_render
-        
-    async def _fit_components(
-        self,
-        component_name: str | None = None
-    ):
-        
-        if component_name and (
-            component := self.components.get(component_name)
-        ):
+
+    async def _fit_components(self, component_name: str | None = None):
+        if component_name and (component := self.components.get(component_name)):
             await self._fit_component(component)
 
         else:
-            await asyncio.gather(*[
-                self._fit_component(component) for component in self.components.values()
-            ])
+            await asyncio.gather(
+                *[
+                    self._fit_component(component)
+                    for component in self.components.values()
+                ]
+            )
 
     async def _fit_component(
         self,
@@ -258,7 +245,7 @@ class Section(Generic[T]):
             case _:
                 await component.fit(self._inner_width)
 
-        remainder = self._inner_width - component.raw_size 
+        remainder = self._inner_width - component.raw_size
 
         (
             left_remainder_pad,
@@ -268,7 +255,6 @@ class Section(Generic[T]):
         self._left_remainder_pad = left_remainder_pad
         self._right_remainder_pad = right_remainder_pad
 
-        
     async def _create_border_row(
         self,
         border_char: str,
@@ -282,13 +268,10 @@ class Section(Generic[T]):
             mode=self._mode,
         )
 
-    async def _create_padding_row(
-        self,
-        padding_rows: int
-    ):
+    async def _create_padding_row(self, padding_rows: int):
         if padding_rows < 1:
             return None
-        
+
         padding_row: str = " "
 
         if self.config.left_border:
@@ -310,7 +293,7 @@ class Section(Generic[T]):
             padding_row += self.config.right_border
 
         return [padding_row for _ in range(padding_rows)]
-    
+
     def _set_horizontal_pad_remainder(
         self,
         remainder: int,
@@ -360,7 +343,7 @@ class Section(Generic[T]):
 
         if rerender is False and self._last_render:
             return self._last_render
-        
+
         rendered_lines = self._pad_frames_vertical(rendered_lines)
 
         for idx, line in enumerate(rendered_lines):
@@ -396,7 +379,6 @@ class Section(Generic[T]):
         bottom_remainder = int(math.floor(remainder / 2))
 
         adjusted_frames: list[str] = []
-        
 
         match self.config.vertical_alignment:
             case "top":
@@ -466,7 +448,7 @@ class Section(Generic[T]):
             )
 
         return fill_line
-    
+
     async def pause(self):
         if self._empty is False:
             await self.component.pause()

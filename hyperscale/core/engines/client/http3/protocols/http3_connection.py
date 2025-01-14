@@ -62,5 +62,5 @@ class HTTP3Connection:
 
             except Exception:
                 pass
-        
+
         self._connection_factory.close()

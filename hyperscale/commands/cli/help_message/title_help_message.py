@@ -10,7 +10,7 @@ from .cli_style import CLIStyle
 
 def is_arg_descriptor(line: str):
     stripped_line = line.strip()
-    return stripped_line.startswith('@param') or stripped_line.startswith(':param')
+    return stripped_line.startswith("@param") or stripped_line.startswith(":param")
 
 
 class TitleHelpMessage(BaseModel):
@@ -18,9 +18,9 @@ class TitleHelpMessage(BaseModel):
     indentation: StrictInt = 0
     options: List[KeywordArg] | None = None
     styling: CLIStyle | None = None
-    
+
     class Config:
-        arbitrary_types_allowed=True
+        arbitrary_types_allowed = True
 
     async def to_message(
         self,
@@ -29,7 +29,7 @@ class TitleHelpMessage(BaseModel):
         indentation = self.indentation
         if global_styles.indentation:
             indentation = global_styles.indentation
-        
+
         styles = self.styling
         if styles is None:
             styles = global_styles
@@ -44,13 +44,10 @@ class TitleHelpMessage(BaseModel):
                 attrs=get_style(styles.header_attributes),
                 mode=styles.to_mode(),
             )
-        
+
         options_string: str | None = str(None)
 
-        left_char = await self._style_text(
-            "[",
-            styles
-        )
+        left_char = await self._style_text("[", styles)
 
         right_char = await self._style_text(
             "]",
@@ -59,28 +56,22 @@ class TitleHelpMessage(BaseModel):
 
         options = self.options
         if options:
-            options = [
-                arg.to_flag() for arg in self.options
-            ]
+            options = [arg.to_flag() for arg in self.options]
 
         else:
-            options = [
-                "None"
-            ]
+            options = ["None"]
 
         styled_options = await self._style_flags(
-            [
-                arg.to_flag() for arg in self.options
-            ],
+            [arg.to_flag() for arg in self.options],
             styles,
         )
 
         styled_options = left_char + styled_options + right_char
 
-        indentation = ' ' * max(indentation - 1, 0)
+        indentation = " " * max(indentation - 1, 0)
 
-        return f'{indentation}{command_name} {styled_options}'
-    
+        return f"{indentation}{command_name} {styled_options}"
+
     async def _style_flags(
         self,
         flags: list[str],
@@ -93,29 +84,29 @@ class TitleHelpMessage(BaseModel):
                 options_join_char,
                 color=get_style(styles.text_color),
                 highlight=get_style(styles.text_highlight),
-                attrs=[
-                    get_style(attribute)
-                    for attribute in styles.text_attributes
-                ] if styles.text_attributes else None,
-                mode=styles.to_mode()
+                attrs=[get_style(attribute) for attribute in styles.text_attributes]
+                if styles.text_attributes
+                else None,
+                mode=styles.to_mode(),
             )
-
 
         if styles is None or styles.has_flag_styles() is False:
             return options_join_char.join(flags)
-        
-        styled_flags = await asyncio.gather(*[
-            stylize(
-                flag,
-                color=get_style(styles.flag_color),
-                highlight=get_style(styles.flag_highlight),
-                attrs=[
-                    get_style(attribute)
-                    for attribute in styles.flag_attributes
-                ] if styles.flag_attributes else None,
-                mode=styles.to_mode(),
-            ) for flag in flags
-        ])
+
+        styled_flags = await asyncio.gather(
+            *[
+                stylize(
+                    flag,
+                    color=get_style(styles.flag_color),
+                    highlight=get_style(styles.flag_highlight),
+                    attrs=[get_style(attribute) for attribute in styles.flag_attributes]
+                    if styles.flag_attributes
+                    else None,
+                    mode=styles.to_mode(),
+                )
+                for flag in flags
+            ]
+        )
 
         return options_join_char.join(styled_flags)
 
@@ -131,10 +122,8 @@ class TitleHelpMessage(BaseModel):
             text,
             color=get_style(styles.text_color),
             highlight=get_style(styles.text_highlight),
-            attrs=[
-                get_style(attribute)
-                for attribute in styles.text_attributes
-            ] if styles.text_attributes else None,
+            attrs=[get_style(attribute) for attribute in styles.text_attributes]
+            if styles.text_attributes
+            else None,
             mode=styles.to_mode(),
         )
-

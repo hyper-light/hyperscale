@@ -26,9 +26,8 @@ def bind_tcp_socket(host: str, port: int) -> socket.socket:
 
 
 def bind_udp_socket(host: str, port: int) -> socket.socket:
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    
+
     try:
         sock.bind((host, port))
         sock.setblocking(False)
@@ -36,6 +35,5 @@ def bind_udp_socket(host: str, port: int) -> socket.socket:
 
     except OSError:
         pass
-
 
     return sock

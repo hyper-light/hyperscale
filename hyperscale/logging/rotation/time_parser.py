@@ -16,10 +16,7 @@ class TimeParser:
         return float(
             timedelta(
                 **{
-                    self._units.get(
-                        m.group("unit").lower(), 
-                        "seconds"
-                    ): float(
+                    self._units.get(m.group("unit").lower(), "seconds"): float(
                         m.group("val")
                     )
                     for m in re.finditer(

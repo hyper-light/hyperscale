@@ -22,7 +22,6 @@ except Exception:
     class GraphiteConfig:
         pass
 
-
     class GraphieClient:
         pass
 

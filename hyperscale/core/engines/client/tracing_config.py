@@ -15,9 +15,7 @@ OpenTelemetryTracingConfig = Union[UrlFilter, RequestHook, ResponseHook, TraceSi
 
 
 def default_params_strip_filter(url: URL) -> str:
-    return url.parsed._replace(
-        query=None
-    ).geturl()
+    return url.parsed._replace(query=None).geturl()
 
 
 class TracingConfig:

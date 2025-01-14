@@ -1,12 +1,11 @@
 from typing import TypeVar, Generic
 
 
-K = TypeVar('K')
-V = TypeVar('V')
+K = TypeVar("K")
+V = TypeVar("V")
 
 
 class Context(Generic[K, V]):
-
     def __init__(self):
         self._context: dict[K, V] = {}
 

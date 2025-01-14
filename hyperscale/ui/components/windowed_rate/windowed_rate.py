@@ -39,7 +39,7 @@ class WindowedRate:
 
         self._max_width: int | None = None
         self._windowed_rate_width = 0
-        
+
         self._update_lock: asyncio.Lock | None = None
         self._updates: asyncio.Queue[Sample] | None = None
 
@@ -61,7 +61,6 @@ class WindowedRate:
         self,
         max_width: int | None = None,
     ):
-        
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
@@ -100,7 +99,6 @@ class WindowedRate:
         self._update_lock.release()
 
     async def get_next_frame(self):
-        
         if self._refresh_start is None:
             self._refresh_start = time.monotonic()
 
@@ -114,7 +112,7 @@ class WindowedRate:
 
             self._last_samples = samples
             rerender = True
-        
+
         elif self._refresh_elapsed > self._rate_as_seconds or self._last_frame is None:
             frame = await self._render(self._last_samples)
             self._last_frame = [frame]
@@ -122,50 +120,54 @@ class WindowedRate:
 
             self._refresh_start = time.monotonic()
             self._refresh_elapsed = 0
-        
+
         self._refresh_elapsed = time.monotonic() - self._refresh_start
 
         return self._last_frame, rerender
 
     async def _render(self, samples: List[Sample]):
-
         current_time = time.monotonic()
         window = current_time - self._rate_as_seconds
 
-        count = sum([
-            amount
-            for amount, timestamp in samples
-            if timestamp >= window and timestamp <= current_time
-        ])
+        count = sum(
+            [
+                amount
+                for amount, timestamp in samples
+                if timestamp >= window and timestamp <= current_time
+            ]
+        )
 
         rate = self._format_rate(count)
-        
+
         rate = rate + "/" + self._rate_period_string
 
         formatted_rate = await stylize(
             rate,
             color=get_style(
-                self._config.color, 
+                self._config.color,
                 count,
-                window, 
+                window,
             ),
             highlight=get_style(
                 self._config.highlight,
                 count,
-                window, 
+                window,
             ),
             attrs=[
                 get_style(
                     attr,
                     count,
-                    window, 
-                ) for attr in self._config.attributes
-            ] if self._config.attributes else None
+                    window,
+                )
+                for attr in self._config.attributes
+            ]
+            if self._config.attributes
+            else None,
         )
 
         return formatted_rate
 
-    def _format_rate(self, count : int):
+    def _format_rate(self, count: int):
         selected_place_adjustment: int | None = None
         selected_place_unit: str | None = None
 
@@ -222,17 +224,16 @@ class WindowedRate:
         else:
             rate += "0"
 
-        
         if self._unit:
             rate = f"{rate} {self._unit}"
-        
+
         return rate
-    
+
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
         data: List[Sample] | None = None
-        
+
         if self._updates.empty() is False:
             data = await self._updates.get()
 

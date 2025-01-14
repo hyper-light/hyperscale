@@ -23,10 +23,10 @@ async def get_default_workers():
 
 @CLI.group()
 async def run():
-    '''
+    """
     Commands for running tests either locally or
     against a remote (cloud) instance.
-    '''
+    """
 
 
 @run.command()
@@ -37,12 +37,10 @@ async def test(
     name: str = "default",
     quiet: bool = False,
 ):
-    '''
+    """
     Run the specified test file locally
-    '''
-    workflows = [
-        workflow() for workflow in path.data.values()
-    ]
+    """
+    workflows = [workflow() for workflow in path.data.values()]
 
     runner = LocalRunner(
         "127.0.0.1",
@@ -63,13 +61,11 @@ async def test(
         await runner.abort(
             terminal_ui_enabled=terminal_ui_enabled,
         )
-        
+
 
 @run.command()
-async def job(
-    job_name: str
-):
-    '''
+async def job(job_name: str):
+    """
     Run the specified job on the specified remote Hyperscale
     installation.
-    '''
+    """

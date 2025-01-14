@@ -162,7 +162,7 @@ class CSV:
             )
 
             await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+                f"{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {', '.join(headers)}"
             )
 
             await self._loop.run_in_executor(
@@ -170,7 +170,7 @@ class CSV:
             )
 
             await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+                f"{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {', '.join(headers)}"
             )
 
         for metrics_set in metrics_sets:
@@ -221,7 +221,7 @@ class CSV:
                 headers = [*metrics_set.fields, "group"]
 
                 await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+                    f"{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {', '.join(headers)}"
                 )
 
                 self._metrics_csv_writer = csv.DictWriter(
@@ -233,7 +233,7 @@ class CSV:
                 )
 
                 await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+                    f"{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {', '.join(headers)}"
                 )
 
             for group_name, group in metrics_set.groups.items():
@@ -289,7 +289,7 @@ class CSV:
             )
 
             await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+                f"{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {', '.join(headers)}"
             )
 
             await self._loop.run_in_executor(
@@ -297,7 +297,7 @@ class CSV:
             )
 
             await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(headers)}'
+                f"{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {', '.join(headers)}"
             )
 
         for metrics_set in metrics_sets:
@@ -349,7 +349,7 @@ class CSV:
 
         if self._errors_csv_writer is None:
             await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f'{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {", ".join(error_csv_headers)}'
+                f"{self.metadata_string} - Writing headers to file - {self.metrics_filepath} - {', '.join(error_csv_headers)}"
             )
             error_csv_writer = csv.DictWriter(errors_file, fieldnames=error_csv_headers)
 
@@ -358,7 +358,7 @@ class CSV:
             )
 
             await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f'{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {", ".join(error_csv_headers)}'
+                f"{self.metadata_string} - Wrote headers to file - {self.metrics_filepath} - {', '.join(error_csv_headers)}"
             )
 
         for metrics_set in metrics_sets:

@@ -11,7 +11,6 @@ from .total_rate_status import TotalRateStatus
 
 
 class TotalRate:
-    
     def __init__(
         self,
         name: str,
@@ -41,13 +40,15 @@ class TotalRate:
         self._places_map = {"t": 1e12, "b": 1e9, "m": 1e6, "k": 1e3}
 
         self._update_lock: asyncio.Lock | None = None
-        self._updates: asyncio.Queue[
-            tuple[
-                int | float | None,
-                TotalRateStatus,
+        self._updates: (
+            asyncio.Queue[
+                tuple[
+                    int | float | None,
+                    TotalRateStatus,
+                ]
             ]
-        ] | None = None
-
+            | None
+        ) = None
 
         self._last_frame: str | None = None
 
@@ -65,7 +66,6 @@ class TotalRate:
         self,
         max_width: int | None = None,
     ):
-
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
@@ -94,10 +94,7 @@ class TotalRate:
 
     async def update(
         self,
-        update: tuple[
-            int | float | None,
-            bool
-        ],
+        update: tuple[int | float | None, bool],
     ):
         await self._update_lock.acquire()
 
@@ -119,7 +116,6 @@ class TotalRate:
             self._update_lock.release()
 
     async def get_next_frame(self):
-        
         update = await self._check_if_should_rerender()
         rerender = False
 
@@ -128,8 +124,11 @@ class TotalRate:
         if self._status == TotalRateStatus.READY and status == TotalRateStatus.RUNNING:
             self._status = status
 
-        elif self._status == TotalRateStatus.RUNNING and status == TotalRateStatus.STOPPED:
-            self._status = status        
+        elif (
+            self._status == TotalRateStatus.RUNNING
+            and status == TotalRateStatus.STOPPED
+        ):
+            self._status = status
 
         if count is not None and self._status == TotalRateStatus.RUNNING:
             self._status = status
@@ -137,7 +136,7 @@ class TotalRate:
             frame = await self._rerender(count)
             self._last_frame = [frame]
             rerender = True
-        
+
         elif self._last_frame is None:
             frame = await self._rerender(0)
             self._last_frame = [frame]
@@ -146,7 +145,6 @@ class TotalRate:
         return self._last_frame, rerender
 
     async def _rerender(self, count: int | float):
-
         if self._start is None:
             self._start = time.monotonic()
 
@@ -159,22 +157,25 @@ class TotalRate:
         stylized_rate = await stylize(
             rate,
             color=get_style(
-                self._config.color, 
+                self._config.color,
                 count,
-                self._elapsed, 
+                self._elapsed,
             ),
             highlight=get_style(
                 self._config.highlight,
                 count,
-                self._elapsed, 
+                self._elapsed,
             ),
             attrs=[
                 get_style(
                     attr,
                     count,
-                    self._elapsed, 
-                ) for attr in self._config.attributes
-            ] if self._config.attributes else None
+                    self._elapsed,
+                )
+                for attr in self._config.attributes
+            ]
+            if self._config.attributes
+            else None,
         )
 
         return self._pad_rate_horizontal(stylized_rate, remainder)
@@ -239,39 +240,36 @@ class TotalRate:
             rate += "0"
 
         if self._unit:
-            rate = f'{rate} {self._unit}'
+            rate = f"{rate} {self._unit}"
 
         return rate
-    
+
     def _pad_rate_horizontal(
         self,
         status_text: str,
         remainder: int,
     ):
         match self._config.horizontal_alignment:
-            case 'left':
+            case "left":
                 return status_text + (remainder * " ")
-            
-            case 'center':
+
+            case "center":
                 left_pad = math.ceil(remainder / 2)
                 right_pad = math.floor(remainder / 2)
 
                 return " " * left_pad + status_text + " " * right_pad
-            
-            case 'right':
-                return (remainder * ' ') + status_text
-    
+
+            case "right":
+                return (remainder * " ") + status_text
+
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
         data: tuple[
             int | float | None,
             TotalRateStatus,
-        ] = (
-            None,
-            self._status
-        )
-        
+        ] = (None, self._status)
+
         if self._updates.empty() is False:
             data = await self._updates.get()
 

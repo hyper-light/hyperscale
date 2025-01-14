@@ -10,7 +10,6 @@ try:
 except Exception:
     from hyperscale.reporting.types.empty import Empty as StatsD
 
-
     class NetdataConfig:
         pass
 

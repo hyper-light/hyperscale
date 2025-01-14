@@ -18,5 +18,5 @@ class WindowedRateConfig(BaseModel):
     precision: StrictInt = 3
     rate_period: StrictInt | StrictFloat = 1
     rate_unit: Literal["s", "m", "h", "d"] = "s"
-    terminal_mode: TerminalDisplayMode = 'compatability'
+    terminal_mode: TerminalDisplayMode = "compatability"
     unit: StrictStr | None = None

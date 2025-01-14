@@ -68,7 +68,8 @@ MetricsSet = Dict[
 
 WorkflowStats = Dict[
     Literal["workflow", "stats", "results", "metrics", "checks", "elapsed", "rps"]
-    | Literal["run_id"] | None,
+    | Literal["run_id"]
+    | None,
     int
     | str
     | float
@@ -83,7 +84,6 @@ WorkflowContextResult = Dict[str, Any | Exception]
 
 
 WorkflowResultsSet = WorkflowStats | WorkflowContextResult
-
 
 
 RunResults = Dict[

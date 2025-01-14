@@ -32,13 +32,8 @@ class DataReceived(BaseEvent):
         if self.data:
             decoded_data = binascii.hexlify(self.data[:20]).decode("ascii")
 
-        return (
-            "<DataReceived stream_id:%s, "
-            "flow_controlled_length:%s, "
-            "data:%s>"
-            % (
-                self.stream_id,
-                self.flow_controlled_length,
-                decoded_data,
-            )
+        return "<DataReceived stream_id:%s, flow_controlled_length:%s, data:%s>" % (
+            self.stream_id,
+            self.flow_controlled_length,
+            decoded_data,
         )

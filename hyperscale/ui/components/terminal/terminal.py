@@ -28,8 +28,8 @@ SignalHandlers = Callable[[int], Any] | int | None
 Notification = Callable[[], Awaitable[None]]
 
 
-K = TypeVar('K')
-T = TypeVar('T', bound=ActionData)
+K = TypeVar("K")
+T = TypeVar("T", bound=ActionData)
 
 
 async def handle_resize(engine: Terminal):
@@ -69,12 +69,10 @@ async def handle_resize(engine: Terminal):
                 height=height,
             )
 
-
         await engine.resume()
 
     except Exception:
         pass
-
 
 
 class Terminal:
@@ -94,7 +92,7 @@ class Terminal:
 
         if config and config.override_refresh_rate is None:
             refresh_rate = RefreshRateMap.to_refresh_rate(config.refresh_profile).value
-        
+
         elif config and config.override_refresh_rate:
             refresh_rate = config.override_refresh_rate
 
@@ -115,26 +113,25 @@ class Terminal:
         # custom handlers set by ``sigmap`` at the cleanup phase.
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
 
-
         components: dict[str, tuple[list[str], Action[ActionData, ActionData]]] = {}
 
         for action, default_channel in self._actions:
-
             if default_channel is None:
                 default_channel = action.__name__
 
-
-            components.update({
-                component.name: (
-                    component.subscriptions,
-                    component.update
-                ) for section in sections for component in section.components.values()
-            })
+            components.update(
+                {
+                    component.name: (component.subscriptions, component.update)
+                    for section in sections
+                    for component in section.components.values()
+                }
+            )
 
             subscriptions = [
-                section.component.update 
+                section.component.update
                 for section in sections
-                if section.has_component and default_channel in section.component.subscriptions
+                if section.has_component
+                and default_channel in section.component.subscriptions
             ]
 
             if len(subscriptions) > 0:
@@ -146,7 +143,7 @@ class Terminal:
 
     @classmethod
     def wrap_action(
-        cls, 
+        cls,
         func: Action[K, T],
         default_channel: str | None = None,
     ):
@@ -156,9 +153,8 @@ class Terminal:
             cls._updates,
             default_channel=default_channel,
         )
-    
-    async def set_component_active(self, component_name: str):
 
+    async def set_component_active(self, component_name: str):
         if self._stdout_lock is None:
             self._stdout_lock = asyncio.Lock()
 
@@ -169,7 +165,7 @@ class Terminal:
 
         if self._stdout_lock.locked():
             self._stdout_lock.release()
-    
+
     def add_channel(
         self,
         component_name: str,
@@ -216,14 +212,12 @@ class Terminal:
 
         return frame
 
-
     async def render(
         self,
         horizontal_padding: int = 0,
         vertical_padding: int = 0,
     ):
         if self._run_engine is None:
-
             await self._initialize_canvas(
                 horizontal_padding=horizontal_padding,
                 vertical_padding=vertical_padding,
@@ -264,7 +258,6 @@ class Terminal:
         if height is None:
             height = terminal_size.lines - 5 - self._vertical_padding
 
-
         await self.canvas.initialize(
             width=width,
             height=height,
@@ -294,12 +287,10 @@ class Terminal:
             await self._show_cursor()
 
     async def _execute_render_loop(self):
-
         await self._clear_terminal(force=True)
 
         while not self._stop_run.is_set():
             try:
-
                 await self._stdout_lock.acquire()
 
                 frame = await self.canvas.render()
@@ -349,7 +340,7 @@ class Terminal:
                 sys.stdout.write,
                 "\033[3J\033[H",
             )
-        
+
     async def pause(self):
         await self.canvas.pause()
 
@@ -454,7 +445,7 @@ class Terminal:
             self._stdout_lock.release()
 
         await self._stdout_lock.acquire()
-        
+
         frame = await self.canvas.render()
 
         frame = f"\033[3J\033[H{frame}"

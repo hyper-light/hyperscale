@@ -930,12 +930,10 @@ class TableAssembler:
         headers: list[str],
         data: list[list[Any]],
     ) -> list[str]:
-        
-
         headers_count = len(headers)
         if headers_count < self.columns_count:
             self.columns_count = headers_count
-            self.columns_size = math.floor(self.max_width/self.columns_count)
+            self.columns_size = math.floor(self.max_width / self.columns_count)
 
         lines: list[str] = []
 
@@ -1110,7 +1108,6 @@ class TableAssembler:
         headers: list[str],
         row: list[Any],
     ) -> str | None:
-
         data_cells = await asyncio.gather(
             *[
                 self._create_cell(
@@ -1180,7 +1177,6 @@ class TableAssembler:
         header_key: str | None = None,
         color_map: HeaderColorMap | DataColorMap | None = None,
     ):
-        
         if data is None:
             data = self._field_default_map.get(header_key)
 
@@ -1438,11 +1434,9 @@ class TableAssembler:
         colorizer = color_map.get(color_key)
         if colorizer is None:
             return data
-        
+
         return await stylize(
-            data,
-            color=get_style(colorizer, raw_value),
-            mode=self._terminal_mode
+            data, color=get_style(colorizer, raw_value), mode=self._terminal_mode
         )
 
     def _calculate_start_border_length(self, charset: TableBorderCharset):

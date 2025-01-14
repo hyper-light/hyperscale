@@ -35,9 +35,7 @@ from .wrap_metric import wrap_metric
 class Hook:
     def __init__(
         self,
-        call: Callable[
-            ..., Awaitable[Any] | Awaitable[CallResult]
-        ],
+        call: Callable[..., Awaitable[Any] | Awaitable[CallResult]],
         dependencies: List[str],
         timeouts: Optional[Timeouts] = None,
         tags: Optional[List[str]] = None,

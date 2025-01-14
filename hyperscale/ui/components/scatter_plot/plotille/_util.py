@@ -45,7 +45,9 @@ def roundeven(x):
 
 def _numpy_to_native(x):
     # cf. https://numpy.org/doc/stable/reference/generated/numpy.ndarray.item.html
-    if ("<class 'numpy." in str(type(x)) or "<type 'numpy." in str(type(x))) and callable(x.item):
+    if (
+        "<class 'numpy." in str(type(x)) or "<type 'numpy." in str(type(x))
+    ) and callable(x.item):
         return x.item()
     return x
 
@@ -84,7 +86,7 @@ def hist(X, bins):
     y = [0] * bins
     for x in X:
         x_ = _numpy_to_native(x)
-        delta = (x_ - xmin)
+        delta = x_ - xmin
         if isinstance(delta, timedelta):
             delta = delta.total_seconds()
         x_idx = min(bins - 1, int(delta // xwidth))
@@ -98,13 +100,14 @@ def hist(X, bins):
 
 class _UTC(tzinfo):
     """UTC"""
+
     _ZERO = timedelta(0)
 
     def utcoffset(self, dt):
         return self._ZERO
 
     def tzname(self, dt):
-        return 'UTC'
+        return "UTC"
 
     def dst(self, dt):
         return self._ZERO

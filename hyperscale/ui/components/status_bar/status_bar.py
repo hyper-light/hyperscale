@@ -21,7 +21,7 @@ class StatusBar:
 
         self._config = config
         self.subscriptions = subscriptions
-        
+
         self._default_status = config.default_status
 
         status_styling_map = self._config.status_styles
@@ -48,7 +48,6 @@ class StatusBar:
         return self._max_width
 
     async def fit(self, max_width: int | None = None):
-
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
@@ -75,12 +74,12 @@ class StatusBar:
             frame = await self._rerender(status)
             self._last_frame = frame
             rerender = True
-        
+
         elif self._last_frame is None:
             frame = await self._rerender(self._default_status)
             self._last_frame = frame
             rerender = True
-        
+
         return [self._last_frame], rerender
 
     async def _rerender(self, status: str):
@@ -110,7 +109,8 @@ class StatusBar:
                     get_style(
                         attr,
                         status,
-                    ) for attr in status_styles.get("attrs", [])
+                    )
+                    for attr in status_styles.get("attrs", [])
                 ],
                 mode=self._mode,
             )
@@ -132,14 +132,13 @@ class StatusBar:
         if self._update_lock.locked():
             self._update_lock.release()
 
-    
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
         status: str | None = None
         if self._updates.empty() is False:
             status = await self._updates.get()
-        
+
         self._update_lock.release()
 
         return status

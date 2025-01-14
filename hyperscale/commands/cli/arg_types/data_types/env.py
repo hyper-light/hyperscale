@@ -6,12 +6,11 @@ from typing import Generic, TypeVar, Any
 from .reduce_pattern_type import reduce_pattern_type
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class Env(Generic[T]):
-    
-    def  __init__(
+    def __init__(
         self,
         envar: str,
         data_type: Env[T],
@@ -26,7 +25,7 @@ class Env(Generic[T]):
 
         self._data_types = [
             conversion_type.__name__
-            if hasattr(conversion_type, '__name__') 
+            if hasattr(conversion_type, "__name__")
             else type(conversion_type).__name__
             for conversion_type in self._types
         ]
@@ -39,35 +38,33 @@ class Env(Generic[T]):
     @property
     def data_type(self):
         return self._data_types
-    
+
     async def parse(self, _: str | None = None):
-        
         result = await self._load_envar()
         if isinstance(result, Exception):
             return result
-        
+
         self.data = result
 
         return self
-    
-    async def _load_envar(self):
 
+    async def _load_envar(self):
         value = await self._load()
         if isinstance(value, None):
-            return Exception(f'no envar matching {self._envar.upper()} found')
+            return Exception(f"no envar matching {self._envar.upper()} found")
 
         for conversion_type in self._types:
             try:
                 if conversion_type == bytes:
-                    return bytes(value, encoding='utf-8')
-                
+                    return bytes(value, encoding="utf-8")
+
                 else:
                     return conversion_type(value)
-            
+
             except Exception:
                 pass
 
-        return Exception(f'could not parse {value} specified types')
+        return Exception(f"could not parse {value} specified types")
 
     async def _load(self):
         value = await self._loop.run_in_executor(

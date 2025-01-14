@@ -2,8 +2,7 @@ from enum import Enum
 
 
 class ProgressBarStatus(Enum):
-    ACTIVE="ACTIVE"
-    FAILED="FAILED"
-    COMPLETE="COMPLETE"
-    READY="READY"
-    
+    ACTIVE = "ACTIVE"
+    FAILED = "FAILED"
+    COMPLETE = "COMPLETE"
+    READY = "READY"

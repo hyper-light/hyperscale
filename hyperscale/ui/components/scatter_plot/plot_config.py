@@ -7,9 +7,7 @@ from pydantic import (
 )
 
 from hyperscale.ui.config.mode import TerminalDisplayMode
-from hyperscale.ui.styling.colors import (
-    Colorizer
-)
+from hyperscale.ui.styling.colors import Colorizer
 
 from .point_char import PointCharName
 

@@ -31,8 +31,16 @@ from ._input_formatter import InputFormatter
 from ._util import hist as compute_hist
 
 
-def hist_aggregated(counts, bins, width=80, log_scale=False, linesep='\n',
-                    lc=None, bg=None, color_mode='names'):
+def hist_aggregated(
+    counts,
+    bins,
+    width=80,
+    log_scale=False,
+    linesep="\n",
+    lc=None,
+    bg=None,
+    color_mode="names",
+):
     """
     Create histogram for aggregated data.
 
@@ -51,6 +59,7 @@ def hist_aggregated(counts, bins, width=80, log_scale=False, linesep='\n',
     Returns:
         str: histogram over `X` from left to right.
     """
+
     def _scale(a):
         if log_scale and a > 0:
             return log(a)
@@ -65,22 +74,39 @@ def hist_aggregated(counts, bins, width=80, log_scale=False, linesep='\n',
 
     bins_count = len(h)
 
-    canvas = ['        bucket       | {} {}'.format('_' * width, 'Total Counts')]
-    lasts = ['', '⠂', '⠆', '⠇', '⡇', '⡗', '⡷', '⡿']
+    canvas = ["        bucket       | {} {}".format("_" * width, "Total Counts")]
+    lasts = ["", "⠂", "⠆", "⠇", "⡇", "⡗", "⡷", "⡿"]
     for i in range(bins_count):
         hight = int(width * 8 * _scale(h[i]) / h_max)
-        canvas += ['[{}, {}) | {} {}'.format(
-            ipf.fmt(b[i], delta=delta, chars=8, left=True),
-            ipf.fmt(b[i + 1], delta=delta, chars=8, left=False),
-            color('⣿' * (hight // 8) + lasts[hight % 8], fg=lc, bg=bg, mode=color_mode)
-            + color('\u2800' * (width - (hight // 8) + int(hight % 8 == 0)), bg=bg, mode=color_mode),
-            h[i])]
-    canvas += ['‾' * (2 * 8 + 2 + 3 + width + 12)]
+        canvas += [
+            "[{}, {}) | {} {}".format(
+                ipf.fmt(b[i], delta=delta, chars=8, left=True),
+                ipf.fmt(b[i + 1], delta=delta, chars=8, left=False),
+                color(
+                    "⣿" * (hight // 8) + lasts[hight % 8], fg=lc, bg=bg, mode=color_mode
+                )
+                + color(
+                    "\u2800" * (width - (hight // 8) + int(hight % 8 == 0)),
+                    bg=bg,
+                    mode=color_mode,
+                ),
+                h[i],
+            )
+        ]
+    canvas += ["‾" * (2 * 8 + 2 + 3 + width + 12)]
     return linesep.join(canvas)
 
 
-def hist(X, bins=40, width=80, log_scale=False, linesep='\n',
-         lc=None, bg=None, color_mode='names'):
+def hist(
+    X,
+    bins=40,
+    width=80,
+    log_scale=False,
+    linesep="\n",
+    lc=None,
+    bg=None,
+    color_mode="names",
+):
     """Create histogram over `X` from left to right
 
     The values on the left are the center of the bucket, i.e. `(bin[i] + bin[i+1]) / 2`.
@@ -101,13 +127,34 @@ def hist(X, bins=40, width=80, log_scale=False, linesep='\n',
         str: histogram over `X` from left to right.
     """
     counts, bins = compute_hist(X, bins)
-    return hist_aggregated(counts=counts, bins=bins, width=width, log_scale=log_scale,
-                           linesep=linesep, lc=lc, bg=bg, color_mode=color_mode)
+    return hist_aggregated(
+        counts=counts,
+        bins=bins,
+        width=width,
+        log_scale=log_scale,
+        linesep=linesep,
+        lc=lc,
+        bg=bg,
+        color_mode=color_mode,
+    )
 
 
-def histogram(X, bins=160, width=80, height=40, X_label='X', Y_label='Counts', linesep='\n',
-              x_min=None, x_max=None, y_min=None, y_max=None,
-              lc=None, bg=None, color_mode='names'):
+def histogram(
+    X,
+    bins=160,
+    width=80,
+    height=40,
+    X_label="X",
+    Y_label="Counts",
+    linesep="\n",
+    x_min=None,
+    x_max=None,
+    y_min=None,
+    y_max=None,
+    lc=None,
+    bg=None,
+    color_mode="names",
+):
     """Create histogram over `X`
 
     In contrast to `hist`, this is the more `usual` histogram from bottom
@@ -156,10 +203,24 @@ def histogram(X, bins=160, width=80, height=40, X_label='X', Y_label='Counts', l
     return fig.show()
 
 
-def scatter(X, Y, width=80, height=40, X_label='X', Y_label='Y', linesep='\n',
-            x_min=None, x_max=None, y_min=None, y_max=None,
-            lc=None, bg=None, color_mode='names', origin=True,
-            marker=None):
+def scatter(
+    X,
+    Y,
+    width=80,
+    height=40,
+    X_label="X",
+    Y_label="Y",
+    linesep="\n",
+    x_min=None,
+    x_max=None,
+    y_min=None,
+    y_max=None,
+    lc=None,
+    bg=None,
+    color_mode="names",
+    origin=True,
+    marker=None,
+):
     """Create scatter plot with X , Y values
 
     Basically plotting without interpolation:
@@ -185,14 +246,46 @@ def scatter(X, Y, width=80, height=40, X_label='X', Y_label='Y', linesep='\n',
     Returns:
         str: scatter plot over `X`, `Y`.
     """
-    return plot(X, Y, width, height, X_label, Y_label, linesep, None,
-                x_min, x_max, y_min, y_max, lc, bg, color_mode, origin, marker)
+    return plot(
+        X,
+        Y,
+        width,
+        height,
+        X_label,
+        Y_label,
+        linesep,
+        None,
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+        lc,
+        bg,
+        color_mode,
+        origin,
+        marker,
+    )
 
 
-def plot(X, Y, width=80, height=40, X_label='X', Y_label='Y', linesep='\n', interp='linear',
-         x_min=None, x_max=None, y_min=None, y_max=None,
-         lc=None, bg=None, color_mode='names', origin=True,
-         marker=None):
+def plot(
+    X,
+    Y,
+    width=80,
+    height=40,
+    X_label="X",
+    Y_label="Y",
+    linesep="\n",
+    interp="linear",
+    x_min=None,
+    x_max=None,
+    y_min=None,
+    y_max=None,
+    lc=None,
+    bg=None,
+    color_mode="names",
+    origin=True,
+    marker=None,
+):
     """Create plot with X , Y values and linear interpolation between points
 
     Parameters:

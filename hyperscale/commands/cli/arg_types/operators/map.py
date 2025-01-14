@@ -1,18 +1,10 @@
 from __future__ import annotations
 import asyncio
-from typing import (
-    Generic, 
-    TypeVarTuple, 
-    Any, 
-    get_args, 
-    get_origin, 
-    TypeVar,
-    Callable
-)
+from typing import Generic, TypeVarTuple, Any, get_args, get_origin, TypeVar, Callable
 
 
-T = TypeVarTuple('T')
-K = TypeVar('K')
+T = TypeVarTuple("T")
+K = TypeVar("K")
 
 
 from hyperscale.commands.cli.arg_types.data_types import (
@@ -27,39 +19,30 @@ from hyperscale.commands.cli.arg_types.data_types import (
 
 
 class Map(Generic[*T]):
-
     def __init__(
         self,
         name: str,
         data_type: Map[tuple[*T]],
     ):
-        super().__init__()    
+        super().__init__()
 
         self.name = name
-        self._types: tuple[*T] =  get_args(data_type)
+        self._types: tuple[*T] = get_args(data_type)
 
         self._data_type = [
-            subtype_type.__name__ for subtype_type in self._types if hasattr(data_type, '__name__')
+            subtype_type.__name__
+            for subtype_type in self._types
+            if hasattr(data_type, "__name__")
         ]
 
         self.data: Any | None = None
 
         self._complex_types: dict[
-            Env
-            | ImportFile
-            | JsonData
-            | JsonData
-            | Pattern
-            | RawFile,
+            Env | ImportFile | JsonData | JsonData | Pattern | RawFile,
             Callable[
                 [str, type[Any]],
-                Env
-                | ImportFile
-                | JsonData
-                | JsonData
-                | Pattern
-                | RawFile,
-            ]
+                Env | ImportFile | JsonData | JsonData | Pattern | RawFile,
+            ],
         ] = {
             Env: lambda envar, subtype: Env(envar, subtype),
             ImportFile: lambda _, subtype: ImportFile(subtype),
@@ -77,39 +60,29 @@ class Map(Generic[*T]):
 
     @property
     def data_type(self):
-        return ', '.join(self._data_type)
-    
-    async def parse(self, arg: str | None = None):
+        return ", ".join(self._data_type)
 
-        result: Any  | Exception | str = [arg]
+    async def parse(self, arg: str | None = None):
+        result: Any | Exception | str = [arg]
         errs: list[Exception] = []
 
         for subtype in self._types:
+            if complex_type_factory := self._complex_types.get(get_origin(subtype)):
+                complex_type = complex_type_factory(self.name, subtype)
 
-            if complex_type_factory := self._complex_types.get(
-                get_origin(subtype)
-            ):
-                complex_type = complex_type_factory(
-                    self.name,
-                    subtype
+                errs = await asyncio.gather(
+                    *[complex_type.parse(item) for item in result]
                 )
-
-                errs = await asyncio.gather(*[
-                    complex_type.parse(item) for item in result
-                ])
 
                 result = complex_type.data
                 if not isinstance(result, list):
                     result = [result]
 
-            errs = [
-                err for err in errs if isinstance(err, Exception)
-            ]
+            errs = [err for err in errs if isinstance(err, Exception)]
 
             if len(errs) > 0:
                 return errs[0]
-        
-            
+
         self.data = result
 
         return self

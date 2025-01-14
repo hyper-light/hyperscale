@@ -739,7 +739,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
         ]
 
         return encoded_headers[0]
-    
+
     def close(self):
         for connection in self._connections:
             connection.close()

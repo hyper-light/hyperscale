@@ -25,7 +25,7 @@ class Table:
 
         self._config = config
         self.subscriptions = subscriptions
-        
+
         self._mode = TerminalMode.to_mode(self._config.terminal_mode)
         self._header_keys = list(config.headers.keys())
 
@@ -35,24 +35,19 @@ class Table:
         self._column_width = 0
         self._total_columns = len(self._header_keys)
         self._columns_count = self._total_columns
-        
+
         self._fixed_header_positions = [
-            (idx, header) for     
-            idx, (
-                header, header_config
-            ) in enumerate(config.headers.items()) if header_config.fixed
+            (idx, header)
+            for idx, (header, header_config) in enumerate(config.headers.items())
+            if header_config.fixed
         ]
 
         self._header_rotable_status = [
-            (
-                header_name,
-                header.fixed
-            )  for header_name, header in config.headers.items()
+            (header_name, header.fixed)
+            for header_name, header in config.headers.items()
         ]
 
-        self._fixed_headers = [
-            header for _, header in self._fixed_header_positions
-        ]
+        self._fixed_headers = [header for _, header in self._fixed_header_positions]
 
         self._headers_rotate_count: int = 1
         self._fixed_headers_count = len(self._fixed_headers)
@@ -84,7 +79,6 @@ class Table:
         max_width: int | None = None,
         max_height: int | None = None,
     ):
-        
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
@@ -95,31 +89,36 @@ class Table:
         column_width = int(math.floor(max_width / columns_count))
 
         header_rotation_enabled = self._config.minimum_column_width is not None
-        minimum_column_width = self._config.minimum_column_width if self._config.minimum_column_width else self._column_width
+        minimum_column_width = (
+            self._config.minimum_column_width
+            if self._config.minimum_column_width
+            else self._column_width
+        )
         minimum_total_width = minimum_column_width * columns_count
 
         if header_rotation_enabled and max_width < minimum_total_width:
             max_headers = max(
-                int(math.floor(max_width/self._config.minimum_column_width)),
-                1
+                int(math.floor(max_width / self._config.minimum_column_width)), 1
             )
 
             columns_count = min(max_headers, columns_count)
 
-            self._headers_rotate_count = max(columns_count - self._fixed_headers_count, 0)
+            self._headers_rotate_count = max(
+                columns_count - self._fixed_headers_count, 0
+            )
 
             column_width = int(math.floor(max_width / columns_count))
 
             self._use_header_rotation = True
 
         table_size = column_width * columns_count
-        
+
         self._width_adjust = max(max_width - table_size, 0)
         self._max_height = max_height
         self._max_width = max_width
         self._columns_count = columns_count
         self._column_width = column_width
-        
+
         self._assembler = TableAssembler(
             self._config.table_format,
             column_width,
@@ -148,7 +147,7 @@ class Table:
             border_color=self._config.border_color,
             terminal_mode=self._mode,
         )
-        
+
         self._last_rendered_frames.clear()
 
         self._start = time.monotonic()
@@ -163,7 +162,7 @@ class Table:
 
         if self._update_lock.locked():
             self._update_lock.release()
-        
+
     async def get_next_frame(self):
         if self._start is None:
             self._start = time.monotonic()
@@ -174,7 +173,11 @@ class Table:
 
         elapsed = time.monotonic() - self._start
 
-        if data and self._config.no_update_on_push and len(self._last_rendered_frames) > 0:
+        if (
+            data
+            and self._config.no_update_on_push
+            and len(self._last_rendered_frames) > 0
+        ):
             self._last_state = data
 
         elif data:
@@ -194,20 +197,16 @@ class Table:
 
             self._start = time.monotonic()
             rerender = True
-    
-        return self._last_rendered_frames, rerender
-    
-    async def _rerender(self, data: list[dict[str, Any]]):
 
-        current_headers = list(self._header_keys[:self._columns_count])
-        
+        return self._last_rendered_frames, rerender
+
+    async def _rerender(self, data: list[dict[str, Any]]):
+        current_headers = list(self._header_keys[: self._columns_count])
+
         if self._use_header_rotation:
             current_headers = self._cycle_headers(current_headers)
 
-        data = [
-            [row.get(header) for header in current_headers]
-            for row in data
-        ]
+        data = [[row.get(header) for header in current_headers] for row in data]
 
         height_adjustment = self._assembler.calculate_height_offset(data)
         data_rows = self._cycle_data_rows(data, height_adjustment)
@@ -217,7 +216,7 @@ class Table:
             data_rows,
         )
 
-        for idx, line in enumerate(table_lines):   
+        for idx, line in enumerate(table_lines):
             table_lines[idx] = line + self._width_adjust * " "
 
         return table_lines
@@ -227,13 +226,12 @@ class Table:
         data: list[list[Any]],
         height_adjustment: int,
     ):
-
         data_length = len(data)
         adjusted_max_rows = max(self._max_height - height_adjustment, 1)
 
         if data_length < 1:
             return data
-        
+
         elapsed = time.monotonic() - self._start
 
         if (
@@ -248,12 +246,8 @@ class Table:
             data = data[self.offset : adjusted_max_rows + self.offset]
 
         return data
-    
-    def _cycle_headers(
-        self,
-        current_headers: list[str]
-    ):
 
+    def _cycle_headers(self, current_headers: list[str]):
         rotated_headers = current_headers
 
         table_size = self._column_width * self._total_columns
@@ -261,40 +255,55 @@ class Table:
         elapsed = time.monotonic() - self._start
 
         if (
-            table_size > self._max_width and elapsed >= self._config.pagination_refresh_rate
+            table_size > self._max_width
+            and elapsed >= self._config.pagination_refresh_rate
         ):
-            self.header_offset = (self.header_offset + 1)%self._headers_rotate_count
+            self.header_offset = (self.header_offset + 1) % self._headers_rotate_count
 
             rotated_headers = [
-                header for header in self._header_keys if self._config.headers[header].fixed
+                header
+                for header in self._header_keys
+                if self._config.headers[header].fixed
             ]
 
             rotable_headers = [
-                header for header in self._header_keys if self._config.headers[header].fixed is False
-            ][self.header_offset:self._columns_count+self.header_offset - self._fixed_headers_count]
-        
+                header
+                for header in self._header_keys
+                if self._config.headers[header].fixed is False
+            ][
+                self.header_offset : self._columns_count
+                + self.header_offset
+                - self._fixed_headers_count
+            ]
+
             rotated_headers.extend(rotable_headers)
 
-        elif (
-            table_size > self._max_width
-        ):
+        elif table_size > self._max_width:
             rotated_headers = [
-                header for header in self._header_keys if self._config.headers[header].fixed
+                header
+                for header in self._header_keys
+                if self._config.headers[header].fixed
             ]
 
             rotable_headers = [
-                header for header in self._header_keys if self._config.headers[header].fixed is False
-            ][self.header_offset:self._columns_count+self.header_offset - self._fixed_headers_count]
+                header
+                for header in self._header_keys
+                if self._config.headers[header].fixed is False
+            ][
+                self.header_offset : self._columns_count
+                + self.header_offset
+                - self._fixed_headers_count
+            ]
 
             rotated_headers.extend(rotable_headers)
 
         return rotated_headers
-    
+
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
         data: list[dict[str, Any]] | None = None
-        
+
         if self._updates.empty() is False:
             data: list[dict[str, Any]] = await self._updates.get()
 

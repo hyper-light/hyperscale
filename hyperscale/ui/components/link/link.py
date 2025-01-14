@@ -20,7 +20,7 @@ URLTextPair = Dict[
 class Link:
     def __init__(
         self,
-        name: str, 
+        name: str,
         config: LinkConfig,
         subscriptions: list[str] | None = None,
     ) -> None:
@@ -51,13 +51,12 @@ class Link:
 
     @property
     def size(self):
-        return self._max_width  
+        return self._max_width
 
     async def fit(
         self,
         max_width: int | None = None,
     ):
-        
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
@@ -68,10 +67,12 @@ class Link:
 
         self._max_width = max_width
 
-        self._updates.put_nowait({
-            "url": self._config.link_url,
-            "text": self._config.link_text,
-        })
+        self._updates.put_nowait(
+            {
+                "url": self._config.link_url,
+                "text": self._config.link_text,
+            }
+        )
 
     async def update(
         self,
@@ -83,7 +84,6 @@ class Link:
         self._update_lock.release()
 
     async def get_next_frame(self):
-
         (link, text) = await self._check_if_should_rerender()
         rerender = False
 
@@ -95,7 +95,7 @@ class Link:
 
             self._last_frame = [frame]
             rerender = True
-        
+
         elif self._last_frame is None:
             frame = await self._rerender(
                 self._config.link_url,
@@ -104,21 +104,20 @@ class Link:
 
             self._last_frame = [frame]
             rerender = True
-        
+
         return self._last_frame, rerender
 
     async def _rerender(
-        self, 
-        link: LinkValidator | None, 
+        self,
+        link: LinkValidator | None,
         text: str,
     ):
-
         link_text = text[: self._max_width]
 
         styled_link_text = await stylize(
             link_text,
             color=get_style(
-                self._config.color, 
+                self._config.color,
                 link,
                 text,
             ),
@@ -132,8 +131,11 @@ class Link:
                     attr,
                     link,
                     text,
-                ) for attr in self._config.attributes
-            ] if self._config.attributes else None,
+                )
+                for attr in self._config.attributes
+            ]
+            if self._config.attributes
+            else None,
             mode=self._mode,
         )
 
@@ -141,13 +143,13 @@ class Link:
             return styled_link_text
 
         return self._link_fmt_str % (str(link.url), styled_link_text)
-    
+
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
         link: LinkValidator | None = None
         text: str | None = None
-        
+
         if self._updates.empty() is False:
             update: URLTextPair = await self._updates.get()
 
@@ -157,13 +159,9 @@ class Link:
             if update_text := update.get("text"):
                 text = update_text
 
-
         self._update_lock.release()
 
-        return (
-            link,
-            text
-        )
+        return (link, text)
 
     async def pause(self):
         pass

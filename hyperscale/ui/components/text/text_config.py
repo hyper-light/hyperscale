@@ -10,17 +10,13 @@ from hyperscale.ui.styling.colors import (
 from typing import List, Literal
 
 
-HorizontalAlignment = Literal[
-    "left",
-    "center",
-    "right"
-]
+HorizontalAlignment = Literal["left", "center", "right"]
 
 
 class TextConfig(BaseModel):
-    text: StrictStr 
+    text: StrictStr
     color: Colorizer | None = None
     highlight: HighlightColorizer | None = None
     attributes: List[Attributizer] | None = None
-    horizontal_alignment: HorizontalAlignment = 'center'
-    terminal_mode: TerminalDisplayMode = 'compatability'
+    horizontal_alignment: HorizontalAlignment = "center"
+    terminal_mode: TerminalDisplayMode = "compatability"

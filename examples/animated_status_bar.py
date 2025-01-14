@@ -2,33 +2,30 @@ import asyncio
 import time
 from hyperscale.ui.components.animated_status_bar import (
     AnimatedStatusBar,
-    AnimatedStatusBarConfig
+    AnimatedStatusBarConfig,
 )
 
 
 async def run():
     bar = AnimatedStatusBar(
-        'test',
+        "test",
         AnimatedStatusBarConfig(
-            default_status='ready',
+            default_status="ready",
             animations={
-                'ready': {
-                    'animations': ['stripe', 'highlight', 'color'],
-                    'direction': 'bounce',
-                    'primary_color': 'black',
-                    'primary_highlight': 'aquamarine_2',
-                    'secondary_color': 'black',
+                "ready": {
+                    "animations": ["stripe", "highlight", "color"],
+                    "direction": "bounce",
+                    "primary_color": "black",
+                    "primary_highlight": "aquamarine_2",
+                    "secondary_color": "black",
                 },
-                'success': {
-                    'primary_highlight': 'sky_blue_2'
-                },
-                'failed': {
-                    'primary_highlight': 'light_red'
-                }
+                "success": {"primary_highlight": "sky_blue_2"},
+                "failed": {"primary_highlight": "light_red"},
             },
             horizontal_padding=2,
-            terminal_mode='extended'
-    ))
+            terminal_mode="extended",
+        ),
+    )
 
     print("\033[?25l")
 
@@ -41,9 +38,9 @@ async def run():
 
     while elapsed < 60:
         frame, _ = await bar.get_next_frame()
-        
+
         await asyncio.sleep(0.06)
-        print('\033[3J\033[H\n' + frame.pop())
+        print("\033[3J\033[H\n" + frame.pop())
         elapsed = time.monotonic() - start
 
     print("\033[?25h")

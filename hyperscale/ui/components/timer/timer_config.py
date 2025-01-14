@@ -17,5 +17,5 @@ class TimerConfig(BaseModel):
     attributes: List[Attributizer] | None = None
     color: Colorizer | None = None
     highlight: HighlightColorizer | None = None
-    horizontal_alignment: HorizontalAlignment = 'left'
-    terminal_mode: TerminalDisplayMode = 'compatability'
+    horizontal_alignment: HorizontalAlignment = "left"
+    terminal_mode: TerminalDisplayMode = "compatability"

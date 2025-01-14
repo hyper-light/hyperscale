@@ -27,83 +27,87 @@ WorkflowConfig = list[
             "duration_seconds",
             "duration_string",
             "vus",
-            "graph_name"
+            "graph_name",
         ],
-        str | int
-    ] 
+        str | int,
+    ]
 ]
 
 
 def generate_ui_sections(
     workflows: List[Workflow],
 ):
-    
     workflow_configs: WorkflowConfig = [
         {
-            'workflow_name': workflow.name.lower(),
+            "workflow_name": workflow.name.lower(),
             "workflow_title": workflow.name,
-            'duration_seconds': TimeParser(workflow.duration).time,
-            'duration_string': workflow.duration,
-            'vus': workflow.vus,
-            'graph_name': pathlib.Path(workflow.graph).name
-        } for workflow in workflows
+            "duration_seconds": TimeParser(workflow.duration).time,
+            "duration_string": workflow.duration,
+            "vus": workflow.vus,
+            "graph_name": pathlib.Path(workflow.graph).name,
+        }
+        for workflow in workflows
     ]
 
     text_components = [
         Text(
-            f'run_message_display_{config['workflow_name']}',
+            f"run_message_display_{config['workflow_name']}",
             TextConfig(
-                text='Initializing...',
+                text="Initializing...",
             ),
-            subscriptions=[f'update_run_message_{config['workflow_name']}']
-        ) for config in workflow_configs
+            subscriptions=[f"update_run_message_{config['workflow_name']}"],
+        )
+        for config in workflow_configs
     ]
 
-    text_components.insert(0, Text(
-        f'run_message_display_initializing',
-        TextConfig(
-            text='Initializing...',
+    text_components.insert(
+        0,
+        Text(
+            f"run_message_display_initializing",
+            TextConfig(
+                text="Initializing...",
+            ),
+            subscriptions=[f"update_run_message_initializing"],
         ),
-        subscriptions=[f'update_run_message_initializing']
-    ))
+    )
 
     multiline_text_components = [
         MultilineText(
             "workflow_metadata_initialize",
             MultilineTextConfig(
-                text=['Gathering test config.'],
-                horizontal_alignment='right',
-                color='hot_pink_3',
-                terminal_mode='extended',
+                text=["Gathering test config."],
+                horizontal_alignment="right",
+                color="hot_pink_3",
+                terminal_mode="extended",
             ),
-            subscriptions=['update_workflow_metadata']
+            subscriptions=["update_workflow_metadata"],
         )
     ]
 
-    multiline_text_components.extend([
-        MultilineText(
-            f"workflow_metadata_{config['workflow_name']}",
-            MultilineTextConfig(
-                text=[
-                    f'File: {config['graph_name']}',
-                    f'Workflow: {config['workflow_title']}',
-                    f'Duration: {config["duration_string"]}',
-                    f'VUs: {config['vus']}'
-                ],
-                horizontal_alignment='right',
-                color='hot_pink_3',
-                terminal_mode='extended',
-            ),
-            subscriptions=['update_workflow_metadata']
-        ) for config in workflow_configs
-    ])
+    multiline_text_components.extend(
+        [
+            MultilineText(
+                f"workflow_metadata_{config['workflow_name']}",
+                MultilineTextConfig(
+                    text=[
+                        f"File: {config['graph_name']}",
+                        f"Workflow: {config['workflow_title']}",
+                        f"Duration: {config['duration_string']}",
+                        f"VUs: {config['vus']}",
+                    ],
+                    horizontal_alignment="right",
+                    color="hot_pink_3",
+                    terminal_mode="extended",
+                ),
+                subscriptions=["update_workflow_metadata"],
+            )
+            for config in workflow_configs
+        ]
+    )
 
     return [
         Section(
-            SectionConfig(
-                height="xx-small", 
-                width="large"
-            ),
+            SectionConfig(height="xx-small", width="large"),
             components=[
                 Header(
                     "header",
@@ -119,9 +123,7 @@ def generate_ui_sections(
                                 lambda letter, _: "\n".join(
                                     [
                                         line[:-1] if idx == 2 else line
-                                        for idx, line in enumerate(
-                                            letter.split("\n")
-                                        )
+                                        for idx, line in enumerate(letter.split("\n"))
                                     ]
                                 )
                             ],
@@ -129,9 +131,7 @@ def generate_ui_sections(
                                 lambda letter, idx: "\n".join(
                                     [
                                         line[1:] if idx < 2 else line
-                                        for idx, line in enumerate(
-                                            letter.split("\n")
-                                        )
+                                        for idx, line in enumerate(letter.split("\n"))
                                     ]
                                 )
                                 if idx == 9
@@ -141,27 +141,25 @@ def generate_ui_sections(
                         color="aquamarine_2",
                         attributes=["bold"],
                         terminal_mode="extended",
-                    )
+                    ),
                 ),
             ],
         ),
         Section(
             SectionConfig(
-                height='xx-small',
-                width='small',
-                vertical_alignment='center'
+                height="xx-small", width="small", vertical_alignment="center"
             ),
-            components=multiline_text_components
+            components=multiline_text_components,
         ),
         Section(
             SectionConfig(
-                width='small',
+                width="small",
                 height="smallest",
                 left_border="|",
                 top_border="-",
                 bottom_border="-",
                 max_height=3,
-                horizontal_alignment='center',
+                horizontal_alignment="center",
                 vertical_alignment="center",
             ),
             components=[
@@ -174,45 +172,49 @@ def generate_ui_sections(
                         complete_color="hot_pink_3",
                         terminal_mode="extended",
                     ),
-                    subscriptions=[f'update_run_progress_seconds_{config['workflow_name']}'],
-                ) for config in workflow_configs
+                    subscriptions=[
+                        f"update_run_progress_seconds_{config['workflow_name']}"
+                    ],
+                )
+                for config in workflow_configs
             ],
         ),
         Section(
             SectionConfig(
-                width='large',
+                width="large",
                 height="xx-small",
                 left_border="|",
                 top_border="-",
                 right_border="|",
                 bottom_border="-",
                 max_height=3,
-                horizontal_alignment='center',
-                vertical_alignment='center',
+                horizontal_alignment="center",
+                vertical_alignment="center",
             ),
             components=text_components,
         ),
         Section(
             SectionConfig(
-                width='small',
+                width="small",
                 height="xx-small",
                 left_border="|",
                 top_border="-",
                 bottom_border="-",
-                horizontal_alignment='center',
+                horizontal_alignment="center",
                 max_height=3,
             ),
             components=[
                 Timer(
-                    f'run_timer_{config['workflow_name']}',
+                    f"run_timer_{config['workflow_name']}",
                     TimerConfig(
-                        color='aquamarine_2',
-                        terminal_mode='extended',
-                        horizontal_alignment='center',
+                        color="aquamarine_2",
+                        terminal_mode="extended",
+                        horizontal_alignment="center",
                     ),
-                    subscriptions=[f'update_run_timer_{config['workflow_name']}']
-                ) for config in workflow_configs
-            ]
+                    subscriptions=[f"update_run_timer_{config['workflow_name']}"],
+                )
+                for config in workflow_configs
+            ],
         ),
         Section(
             SectionConfig(
@@ -224,18 +226,18 @@ def generate_ui_sections(
                 max_height=3,
                 left_padding=1,
                 right_padding=1,
-                horizontal_alignment='center',
+                horizontal_alignment="center",
             ),
             components=[
                 Counter(
-                    f'executions_counter_{config["workflow_name"]}',
-                    CounterConfig(
-                        unit='total actions',
-                        terminal_mode='extended'
-                    ),
-                    subscriptions=[f'update_total_executions_{config["workflow_name"]}']
-                ) for config in workflow_configs
-            ]
+                    f"executions_counter_{config['workflow_name']}",
+                    CounterConfig(unit="total actions", terminal_mode="extended"),
+                    subscriptions=[
+                        f"update_total_executions_{config['workflow_name']}"
+                    ],
+                )
+                for config in workflow_configs
+            ],
         ),
         Section(
             SectionConfig(
@@ -246,18 +248,18 @@ def generate_ui_sections(
                 top_border="-",
                 bottom_border="-",
                 max_height=3,
-                horizontal_alignment='center',
+                horizontal_alignment="center",
             ),
             components=[
                 TotalRate(
-                    f'total_executions_{config["workflow_name"]}',
-                    TotalRateConfig(
-                        unit='aps',
-                        terminal_mode='extended'
-                    ),
-                    subscriptions=[f'update_total_executions_rate_{config["workflow_name"]}'],
-                ) for config in workflow_configs
-            ]
+                    f"total_executions_{config['workflow_name']}",
+                    TotalRateConfig(unit="aps", terminal_mode="extended"),
+                    subscriptions=[
+                        f"update_total_executions_rate_{config['workflow_name']}"
+                    ],
+                )
+                for config in workflow_configs
+            ],
         ),
         Section(
             SectionConfig(
@@ -281,9 +283,10 @@ def generate_ui_sections(
                         point_char="dot",
                         terminal_mode="extended",
                     ),
-                    subscriptions=[f'update_execution_rates_{config["workflow_name"]}'],
-                ) for config in workflow_configs
-            ]
+                    subscriptions=[f"update_execution_rates_{config['workflow_name']}"],
+                )
+                for config in workflow_configs
+            ],
         ),
         Section(
             SectionConfig(
@@ -313,13 +316,13 @@ def generate_ui_sections(
                                 "data_color": lambda value: "aquamarine_2"
                                 if value > 0
                                 else None,
-                                "default": 0
+                                "default": 0,
                             },
                             "err": {
                                 "data_color": lambda value: "hot_pink_3"
                                 if value > 0
                                 else None,
-                                "default": 0
+                                "default": 0,
                             },
                         },
                         minimum_column_width=8,
@@ -327,8 +330,9 @@ def generate_ui_sections(
                         terminal_mode="extended",
                         table_format="simple",
                     ),
-                    subscriptions=[f'update_execution_stats_{config["workflow_name"]}'],
-                ) for config in workflow_configs
-            ]
+                    subscriptions=[f"update_execution_stats_{config['workflow_name']}"],
+                )
+                for config in workflow_configs
+            ],
         ),
     ]

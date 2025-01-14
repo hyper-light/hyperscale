@@ -37,7 +37,7 @@ from hyperscale.ui.actions import (
     update_workflow_execution_stats,
 )
 from hyperscale.reporting.results_types import (
-    RunResults, 
+    RunResults,
     WorkflowResultsSet,
     WorkflowContextResult,
     WorkflowStats,
@@ -72,13 +72,14 @@ class RemoteGraphManager:
         updates: InterfaceUpdatesController,
         workers: int,
     ) -> None:
-
         self._updates = updates
         self._workers: List[Tuple[str, int]] | None = None
 
         self._workflows: Dict[str, Workflow] = {}
         self._workflow_timers: Dict[str, float] = {}
-        self._workflow_completion_rates: Dict[str, List[Tuple[float, int]]] = defaultdict(list)
+        self._workflow_completion_rates: Dict[str, List[Tuple[float, int]]] = (
+            defaultdict(list)
+        )
         self._workflow_last_elapsed: Dict[str, float] = {}
 
         self._threads = workers
@@ -144,11 +145,9 @@ class RemoteGraphManager:
 
         await self._controller.poll_for_start(self._threads)
 
-        await asyncio.gather(*[
-            self._controller.connect_client(
-                address
-            ) for address in workers
-        ])
+        await asyncio.gather(
+            *[self._controller.connect_client(address) for address in workers]
+        )
 
         self._provisioner.setup(max_workers=len(self._controller.nodes))
 
@@ -171,10 +170,13 @@ class RemoteGraphManager:
         for workflow_set in workflow_traversal_order:
             provisioned_batch, workflow_vus = self._provision(workflow_set)
 
-            self._updates.update_active_workflows([
-                workflow_name.lower() for group in provisioned_batch
-                for workflow_name, _, _ in group
-            ])
+            self._updates.update_active_workflows(
+                [
+                    workflow_name.lower()
+                    for group in provisioned_batch
+                    for workflow_name, _, _ in group
+                ]
+            )
 
             results = await asyncio.gather(
                 *[
@@ -264,7 +266,6 @@ class RemoteGraphManager:
         if is_test_workflow is False:
             threads = len(self._controller.nodes)
 
-
         await self._provisioner.acquire(threads)
 
         state_actions = self._setup_state_actions(workflow)
@@ -285,14 +286,14 @@ class RemoteGraphManager:
 
         workflow_slug = workflow.name.lower()
 
-        await asyncio.gather(*[
-            update_active_workflow_message(
-                workflow_slug,
-                f'Starting - {workflow.name}'
-            ),
-            update_workflow_run_timer(workflow_slug, True)
-
-        ])
+        await asyncio.gather(
+            *[
+                update_active_workflow_message(
+                    workflow_slug, f"Starting - {workflow.name}"
+                ),
+                update_workflow_run_timer(workflow_slug, True),
+            ]
+        )
 
         self._workflow_timers[workflow.name] = time.monotonic()
 
@@ -306,23 +307,15 @@ class RemoteGraphManager:
         )
 
         worker_results = await self._controller.poll_for_workflow_complete(
-            run_id,
-            workflow.name,
-            int(TimeParser(workflow.duration).time * 1.5)
+            run_id, workflow.name, int(TimeParser(workflow.duration).time * 1.5)
         )
 
-        
         await update_workflow_run_timer(workflow_slug, False)
         await update_active_workflow_message(
-            workflow_slug,
-            f'Processing results - {workflow.name}'
+            workflow_slug, f"Processing results - {workflow.name}"
         )
 
-        await update_workflow_executions_total_rate(
-            workflow_slug,
-            None,
-            False
-        )
+        await update_workflow_executions_total_rate(workflow_slug, None, False)
 
         results, run_context = worker_results
 
@@ -344,7 +337,7 @@ class RemoteGraphManager:
 
         else:
             _, execution_result = list(results.values()).pop()
-        
+
         updated_context = await self._provide_context(
             workflow.name,
             state_actions,
@@ -360,8 +353,7 @@ class RemoteGraphManager:
         await asyncio.sleep(1)
 
         await update_active_workflow_message(
-            workflow_slug,
-            f'Complete - {workflow.name}'
+            workflow_slug, f"Complete - {workflow.name}"
         )
 
         await asyncio.sleep(1)
@@ -416,60 +408,51 @@ class RemoteGraphManager:
         )
 
         return context[workflow]
-    
+
     async def get_workflow_update(self, workflow: str) -> WorkflowStatusUpdate | None:
         if self._graph_updates[workflow].empty() is False:
             return await self._graph_updates[workflow].get()
 
     async def _update(self, update: WorkflowStatusUpdate):
-
         if update:
-
             workflow_slug = update.workflow.lower()
 
             elapsed = time.monotonic() - self._workflow_timers[update.workflow]
             completed_count = update.completed_count
 
-            await asyncio.gather(*[
-                update_workflow_executions_counter(
-                    workflow_slug,
-                    completed_count,
-                ),
-                update_workflow_executions_total_rate(
-                    workflow_slug,
-                    completed_count,
-                    True
-                ),
-                update_workflow_progress_seconds(
-                    workflow_slug,
-                    elapsed
-                ),
-            ])
+            await asyncio.gather(
+                *[
+                    update_workflow_executions_counter(
+                        workflow_slug,
+                        completed_count,
+                    ),
+                    update_workflow_executions_total_rate(
+                        workflow_slug, completed_count, True
+                    ),
+                    update_workflow_progress_seconds(workflow_slug, elapsed),
+                ]
+            )
 
             if self._workflow_last_elapsed.get(update.workflow) is None:
                 self._workflow_last_elapsed[update.workflow] = time.monotonic()
 
-            last_sampled = time.monotonic() - self._workflow_last_elapsed[update.workflow]
+            last_sampled = (
+                time.monotonic() - self._workflow_last_elapsed[update.workflow]
+            )
 
             if last_sampled > 1:
-
-                self._workflow_completion_rates[update.workflow].append((
-                    int(elapsed),
-                    int(completed_count/elapsed)
-                ))
+                self._workflow_completion_rates[update.workflow].append(
+                    (int(elapsed), int(completed_count / elapsed))
+                )
 
                 await update_workflow_executions_rates(
-                    workflow_slug,
-                    self._workflow_completion_rates[update.workflow]
+                    workflow_slug, self._workflow_completion_rates[update.workflow]
                 )
 
-                await update_workflow_execution_stats(
-                    workflow_slug,
-                    update.step_stats
-                )
+                await update_workflow_execution_stats(workflow_slug, update.step_stats)
 
                 self._workflow_last_elapsed[update.workflow] = time.monotonic()
-        
+
             self._graph_updates[update.workflow].put_nowait(update)
 
     def _provision(

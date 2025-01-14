@@ -18,10 +18,7 @@ from .section import Section
 
 
 class Canvas:
-    def __init__(
-        self,
-        sections: List[Section]
-    ) -> None:
+    def __init__(self, sections: List[Section]) -> None:
         self.width = 0
         self.height = 0
         self._max_width = 0
@@ -47,30 +44,31 @@ class Canvas:
     @property
     def size(self):
         return self._total_size
-    
+
     def get_section(self, component_name: str) -> Section | None:
         for section in self._sections:
             if component_name in section.component_names:
                 return section
-    
-    def get_component(self, component_name: str) -> (
-            Counter
-            | Empty
-            | Header
-            | Link
-            | MultilineText
-            | ProgressBar
-            | ScatterPlot
-            | Spinner 
-            | Text
-            | TotalRate
-            | WindowedRate
-            | None
+
+    def get_component(
+        self, component_name: str
+    ) -> (
+        Counter
+        | Empty
+        | Header
+        | Link
+        | MultilineText
+        | ProgressBar
+        | ScatterPlot
+        | Spinner
+        | Text
+        | TotalRate
+        | WindowedRate
+        | None
     ):
         for section in self._sections:
             if component_name in section.component_names:
                 return section.components.get(component_name)
-
 
     async def initialize(
         self,
@@ -88,9 +86,9 @@ class Canvas:
         self.width = width
         self.height = height
 
-        await asyncio.gather(*[
-            section.resize(width, height) for section in self._sections
-        ])
+        await asyncio.gather(
+            *[section.resize(width, height) for section in self._sections]
+        )
 
         section_rows: list[list[Section]] = []
         section_row: list[Section] = []
@@ -100,11 +98,11 @@ class Canvas:
 
         for section in self._sections:
             remainder = self.width - row_width
-            if section.config.width == 'auto' and remainder > 0:
+            if section.config.width == "auto" and remainder > 0:
                 await section.resize(
-                        remainder,
-                        height,
-                    )
+                    remainder,
+                    height,
+                )
 
             row_width += section.width
 
@@ -128,12 +126,14 @@ class Canvas:
             row_height = max([section.height for section in row])
 
             await asyncio.gather(*[section.fit_height(row_height) for section in row])
-            
+
         await asyncio.gather(*[section.create_blocks() for section in self._sections])
 
         self._section_rows = section_rows
-        
-        total_line_width = sum([self._horizontal_padding, self.width, self._horizontal_padding])
+
+        total_line_width = sum(
+            [self._horizontal_padding, self.width, self._horizontal_padding]
+        )
 
         self._top_pad.clear()
         for _ in range(self._vertical_padding):
@@ -141,50 +141,54 @@ class Canvas:
             self._top_pad.append(padding_line)
 
         self._bottom_pad.clear()
-        self._bottom_pad.extend([" " * total_line_width + "\r" for _ in range(self._vertical_padding)])
+        self._bottom_pad.extend(
+            [" " * total_line_width + "\r" for _ in range(self._vertical_padding)]
+        )
 
     async def replace(
         self,
         components: List[
-            Counter 
-            | Header 
-            | Text 
-            | Spinner 
-            | Link 
-            | ProgressBar 
+            Counter
+            | Header
+            | Text
+            | Spinner
+            | Link
+            | ProgressBar
             | ScatterPlot
-            | TotalRate 
-            | WindowedRate 
-        ]
+            | TotalRate
+            | WindowedRate
+        ],
     ):
         replacements: list[
             tuple[
                 Section,
-                Counter 
-                | Header 
-                | Text 
-                | Spinner 
+                Counter
+                | Header
+                | Text
+                | Spinner
                 | MultilineText
-                | Link 
-                | ProgressBar 
-                | ScatterPlot 
-                | TotalRate 
-                | WindowedRate 
+                | Link
+                | ProgressBar
+                | ScatterPlot
+                | TotalRate
+                | WindowedRate,
             ]
         ] = []
 
         for component in components:
             if section := self.get_section(component.name):
-                replacements.append((
-                    section,
-                    component,
-                ))
-        
+                replacements.append(
+                    (
+                        section,
+                        component,
+                    )
+                )
+
         if len(replacements) > 0:
-            await asyncio.gather(*[
-                section.replace(component) for section, component in replacements
-            ])
-        
+            await asyncio.gather(
+                *[section.replace(component) for section, component in replacements]
+            )
+
     async def render(self):
         section_row_sets: list[list[str]] = []
         for section_row in self._section_rows:
@@ -203,11 +207,16 @@ class Canvas:
             section_row_sets.append(row_lines)
 
         rows: list[str] = list(self._top_pad)
-        rows.extend([
-            " " * self._horizontal_padding + row + " " * self._horizontal_padding + "\r" 
-            for section_row_set in section_row_sets 
-            for row in section_row_set
-        ])
+        rows.extend(
+            [
+                " " * self._horizontal_padding
+                + row
+                + " " * self._horizontal_padding
+                + "\r"
+                for section_row_set in section_row_sets
+                for row in section_row_set
+            ]
+        )
 
         rows.extend(self._bottom_pad)
 

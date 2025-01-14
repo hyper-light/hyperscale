@@ -47,7 +47,6 @@ class ProgressBar:
 
         self._bar_status = ProgressBarStatus.READY
 
-
         self._mode = TerminalMode.to_mode(config.terminal_mode)
 
         self._last_completed: int = 0
@@ -80,7 +79,6 @@ class ProgressBar:
         self,
         max_width: int | None = None,
     ):
-        
         if self._update_lock is None:
             self._update_lock = asyncio.Lock()
 
@@ -106,9 +104,11 @@ class ProgressBar:
         self._last_ready_segments = await self._rerender_incomplete(0, 0)
 
         if (
-            isinstance(self._config.failed_color, str) or self._config.failed_color is None
+            isinstance(self._config.failed_color, str)
+            or self._config.failed_color is None
         ) and (
-            isinstance(self._config.failed_highlight, str) or self._config.failed_highlight is None
+            isinstance(self._config.failed_highlight, str)
+            or self._config.failed_highlight is None
         ):
             self._stylized_fail = await stylize(
                 self._failed,
@@ -118,9 +118,11 @@ class ProgressBar:
             )
 
         if (
-            isinstance(self._config.complete_color, str) or self._config.complete_color is None
+            isinstance(self._config.complete_color, str)
+            or self._config.complete_color is None
         ) and (
-            isinstance(self._config.complete_highlight, str) or self._config.complete_highlight is None
+            isinstance(self._config.complete_highlight, str)
+            or self._config.complete_highlight is None
         ):
             self._stylized_complete = await stylize(
                 "".join([self._complete for _ in range(self._bar_width)]),
@@ -130,9 +132,11 @@ class ProgressBar:
             )
 
         if (
-            isinstance(self._config.active_color, str) or self._config.active_color is None
+            isinstance(self._config.active_color, str)
+            or self._config.active_color is None
         ) and (
-            isinstance(self._config.active_color, str) or self._config.active_highlight is None
+            isinstance(self._config.active_color, str)
+            or self._config.active_highlight is None
         ):
             self._stylized_active = []
 
@@ -147,7 +151,6 @@ class ProgressBar:
                 )
 
     async def get_next_frame(self):
-
         if self._bar_status == ProgressBarStatus.READY:
             self._bar_status == ProgressBarStatus.ACTIVE
 
@@ -210,8 +213,6 @@ class ProgressBar:
         self._update_lock.release()
 
     async def _create_last_bar(self):
-
-
         completed = await self._check_if_should_rerender()
         if completed is None:
             completed = self._last_completed
@@ -227,10 +228,7 @@ class ProgressBar:
             segments.append(self._stylized_start_border)
 
         if self._bar_status == ProgressBarStatus.FAILED:
-
-            segments.extend(
-                await self._rerender_completed(active_idx, completed)
-            )
+            segments.extend(await self._rerender_completed(active_idx, completed))
 
             segments.append(
                 await stylize(
@@ -238,12 +236,12 @@ class ProgressBar:
                     color=get_style(self._config.failed_color, completed),
                     highlight=get_style(self._config.failed_highlight, completed),
                     mode=self._mode,
-                ) if self._stylized_fail is None else self._stylized_fail
+                )
+                if self._stylized_fail is None
+                else self._stylized_fail
             )
 
-            segments.extend(
-                await self._rerender_incomplete(active_idx, completed)
-            )
+            segments.extend(await self._rerender_incomplete(active_idx, completed))
 
         else:
             segments.append(
@@ -252,7 +250,9 @@ class ProgressBar:
                     color=get_style(self._config.complete_color, completed),
                     highlight=get_style(self._config.complete_highlight, completed),
                     mode=self._mode,
-                ) if self._stylized_complete is None else self._stylized_complete
+                )
+                if self._stylized_complete is None
+                else self._stylized_complete
             )
 
         if self._end and self._stylized_end_border is None:
@@ -264,13 +264,11 @@ class ProgressBar:
         return "".join(segments)
 
     async def _create_bar(self):
-
         completed = await self._check_if_should_rerender()
 
         active_idx = 0
         if completed:
             active_idx = self._completed_to_active_idx(completed)
-    
 
         segments: list[str] = []
 
@@ -281,7 +279,9 @@ class ProgressBar:
             segments.append(self._stylized_start_border)
 
         if completed is not None:
-            self._last_completed_segments = await self._rerender_completed(active_idx, completed)
+            self._last_completed_segments = await self._rerender_completed(
+                active_idx, completed
+            )
 
         segments.extend(self._last_completed_segments)
 
@@ -291,13 +291,17 @@ class ProgressBar:
                 color=get_style(self._config.active_color, completed),
                 highlight=get_style(self._config.active_highlight, completed),
                 mode=self._mode,
-            ) if self._stylized_active is None else self._stylized_active[self._next_spinner_frame]
+            )
+            if self._stylized_active is None
+            else self._stylized_active[self._next_spinner_frame]
         )
 
         self._next_spinner_frame = (self._next_spinner_frame + 1) % len(self._active)
 
         if completed is not None:
-            self._last_ready_segments = await self._rerender_incomplete(active_idx, completed)
+            self._last_ready_segments = await self._rerender_incomplete(
+                active_idx, completed
+            )
             self._last_completed = completed
 
         segments.extend(self._last_ready_segments)
@@ -308,11 +312,10 @@ class ProgressBar:
         if self._end:
             segments.append(self._stylized_end_border)
 
-
         return "".join(segments)
-    
+
     async def _rerender_completed(
-        self, 
+        self,
         active_idx: int,
         completed: int,
     ):
@@ -322,24 +325,19 @@ class ProgressBar:
             highlight=get_style(self._config.complete_highlight, completed),
             mode=self._mode,
         )
-    
+
     async def _rerender_incomplete(
-        self, 
+        self,
         active_idx: int,
         completed: int,
     ):
         return await stylize(
-            "".join(
-                [
-                    self._incomplete
-                    for _ in range(active_idx + 1, self._bar_width)
-                ]
-            ),
+            "".join([self._incomplete for _ in range(active_idx + 1, self._bar_width)]),
             color=get_style(self._config.incomplete_color, completed),
             highlight=get_style(self._config.incomplete_highlight, completed),
             mode=self._mode,
         )
-    
+
     async def _render_start_border(self, completed: int):
         return await stylize(
             self._start,
@@ -347,7 +345,7 @@ class ProgressBar:
             highlight=get_style(self._config.border_highlight, completed),
             mode=self._mode,
         )
-    
+
     async def _render_end_border(self, completed: int):
         return await stylize(
             self._end,
@@ -355,18 +353,18 @@ class ProgressBar:
             highlight=get_style(self._config.border_color, completed),
             mode=self._mode,
         )
-    
+
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()
 
         amount: int | float | None = None
         if self._updates.empty() is False:
             amount = await self._updates.get()
-        
+
         self._update_lock.release()
 
         return amount
-        
+
     def _completed_to_active_idx(self, completed: int | float) -> int:
         active_idx = math.floor(completed * (self._bar_width / self._total))
 

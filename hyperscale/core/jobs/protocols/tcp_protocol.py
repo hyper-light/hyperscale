@@ -216,7 +216,7 @@ class TCPProtocol(Generic[T, K]):
                 self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-                await self._loop.run_in_executor(None, self.server_socket.sendall, '')
+                await self._loop.run_in_executor(None, self.server_socket.sendall, "")
 
                 while True:
                     try:
@@ -314,10 +314,9 @@ class TCPProtocol(Generic[T, K]):
         key_path: Optional[str] = None,
         worker_socket: Optional[socket.socket] = None,
     ) -> int | None:
-        
         if self._loop is None:
-                self._loop = asyncio.get_event_loop()
-        
+            self._loop = asyncio.get_event_loop()
+
         if not self._abort_handle_created:
             for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 self._loop.add_signal_handler(
@@ -351,13 +350,12 @@ class TCPProtocol(Generic[T, K]):
 
             if cert_path and key_path:
                 self._client_ssl_context = self._create_client_ssl_context(
-                    cert_path=cert_path, 
+                    cert_path=cert_path,
                     key_path=key_path,
                 )
 
             while True:
                 try:
-                                                                                                                                                                                                                                                                                                                            
                     if worker_socket is None:
                         tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -367,7 +365,7 @@ class TCPProtocol(Generic[T, K]):
                             self._loop.run_in_executor(
                                 None, tcp_socket.connect, address
                             ),
-                            timeout=self._connect_timeout
+                            timeout=self._connect_timeout,
                         )
 
                         tcp_socket.setblocking(False)
@@ -381,7 +379,7 @@ class TCPProtocol(Generic[T, K]):
                             sock=tcp_socket,
                             ssl=self._client_ssl_context,
                         ),
-                        timeout=self._connect_timeout
+                        timeout=self._connect_timeout,
                     )
 
                     self._client_transports[address] = client_transport
@@ -393,7 +391,7 @@ class TCPProtocol(Generic[T, K]):
                             target_address=address,
                             request_type="connect",
                         ),
-                        timeout=self._connect_timeout
+                        timeout=self._connect_timeout,
                     )
 
                     shard_id, _ = result
@@ -426,7 +424,7 @@ class TCPProtocol(Generic[T, K]):
 
         except asyncio.CancelledError:
             pass
-        
+
         if self._connect_lock.locked():
             self._connect_lock.release()
 
@@ -565,7 +563,7 @@ class TCPProtocol(Generic[T, K]):
                             )
 
                         return (shard_id, response.data)
-                    
+
                     except (Exception, socket.error):
                         client_transport.close()
 
@@ -730,7 +728,6 @@ class TCPProtocol(Generic[T, K]):
     ) -> None:
         decompressed = b""
         try:
-
             decompressed = self._decompressor.decompress(data)
 
         except Exception as decompression_error:
@@ -1041,7 +1038,6 @@ class TCPProtocol(Generic[T, K]):
 
             except asyncio.CancelledError:
                 pass
-
 
     def stop(self):
         if self._run_future:

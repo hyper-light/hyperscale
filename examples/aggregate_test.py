@@ -9,7 +9,7 @@ from hyperscale.testing import URL, HTTPResponse
 
 class Test(Workflow):
     vus = 1000
-    threads=12
+    threads = 12
     duration = "1m"
 
     @step()
