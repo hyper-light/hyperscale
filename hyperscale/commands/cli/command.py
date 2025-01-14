@@ -12,6 +12,7 @@ from .arg_types import (
     is_required_missing_keyword_arg,
     is_defaultable,
     is_env_defaultable,
+    is_unsupported_keyword_arg,
     PositionalArg,
 )
 from .help_message import HelpMessage, CLIStyle
@@ -254,6 +255,11 @@ class Command(Generic[T]):
                 keyword_args[keyword_arg.name] = value
                 consumed_idxs.add(idx)
 
+            elif is_unsupported_keyword_arg(arg, keyword_args_map):
+                errors.append(
+                    Exception(f'unsupported option {arg}')
+                )
+
             elif (
                 positional_arg := positional_args_map.get(positional_idx)
             ) and idx not in consumed_idxs:
@@ -348,26 +354,20 @@ class Command(Generic[T]):
         if value is None and keyword_arg.loads_from_envar:
             value = await keyword_arg.parse()
 
-        if (
-            (value is None or isinstance(value, Exception))
-            and keyword_arg.required
-            and last_error
-        ):
-            return (
-                None,
-                f"Encountered error parsing {keyword_arg.full_flag} - {str(last_error)}",
-                consumed_idxs,
-            )
-
-        elif (
-            value is None or isinstance(value, Exception)
-        ) and keyword_arg.required is False:
+        elif value is None and keyword_arg.required is False:
             value = await keyword_arg.to_default()
 
         consumed_idx = current_idx + value_idx
 
         if consumed_idx > current_idx:
             consumed_idxs.add(consumed_idx)
+
+        elif value is None and isinstance(last_error, Exception):
+            return (
+                None,
+                last_error,
+                consumed_idxs,
+            )
 
         return (
             value,

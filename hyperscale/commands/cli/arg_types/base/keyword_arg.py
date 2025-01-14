@@ -1,5 +1,6 @@
 import inspect
 from hyperscale.commands.cli.arg_types.data_types import (
+    AssertSet,
     Context,
     Env,
     ImportFile,
@@ -54,7 +55,8 @@ class KeywordArg(Generic[T]):
 
         args = get_args(data_type)
         self._complex_types: dict[
-            Context
+            AssertSet
+            | Context
             | Env
             | ImportFile
             | JsonData
@@ -65,7 +67,8 @@ class KeywordArg(Generic[T]):
             | RawFile,
             Callable[
                 [str, type[Any]],
-                Context
+                AssertSet
+                | Context
                 | Env
                 | ImportFile
                 | JsonData
@@ -76,6 +79,7 @@ class KeywordArg(Generic[T]):
                 | RawFile,
             ],
         ] = {
+            AssertSet: lambda name, subtype: AssertSet(name, subtype),
             Context: lambda _, __: Context(),
             Env: lambda envar, subtype: Env(envar, subtype),
             ImportFile: lambda _, subtype: ImportFile(subtype),
@@ -220,3 +224,9 @@ def is_env_defaultable(
         return False
 
     return keyword_arg.loads_from_envar
+
+
+def is_unsupported_keyword_arg(arg: str, keyword_args: dict[str, KeywordArg]):
+    return (
+        arg.startswith('--') or arg.startswith('-')
+    ) and arg.replace('-', '') not in keyword_args

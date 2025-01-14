@@ -11,6 +11,8 @@ from .arg_types import (
     KeywordArg,
     is_required_missing_keyword_arg,
     is_defaultable,
+    is_env_defaultable,
+    is_unsupported_keyword_arg,
     PositionalArg,
 )
 from .command import Command, create_command
@@ -282,9 +284,6 @@ class Group(Generic[T]):
             and Context not in config.value_type
         ]
 
-        if len(missing_required_keyword_errors) > 0:
-            errors.extend(missing_required_keyword_errors)
-
         keyword_args.update(
             {
                 config.name: await config.to_default()
@@ -298,6 +297,34 @@ class Group(Generic[T]):
                 )
             }
         )
+
+        keyword_args.update(
+            {
+                config.name: await config.parse()
+                if Context not in config.value_type
+                else context
+                for flag, config in self.keyword_args_map.items()
+                if is_env_defaultable(
+                    flag,
+                    config,
+                    keyword_args,
+                )
+            }
+        )
+
+        missing_required_keyword_errors = [
+            f"{config.full_flag} option is required"
+            for flag, config in self.keyword_args_map.items()
+            if is_required_missing_keyword_arg(
+                flag,
+                config,
+                keyword_args,
+            )
+            and Context not in config.value_type
+        ]
+
+        if len(missing_required_keyword_errors) > 0:
+            errors.extend(missing_required_keyword_errors)
 
         return (
             positional_args,
@@ -370,6 +397,11 @@ class Group(Generic[T]):
                 consumed_idxs.add(idx)
 
                 break
+
+            elif is_unsupported_keyword_arg(arg, keyword_args_map):
+                errors.append(
+                    Exception(f'unsupported option {arg}')
+                )
 
             elif (
                 positional_arg := self.positional_args.get(positional_idx)
@@ -475,26 +507,20 @@ class Group(Generic[T]):
         if value is None and keyword_arg.loads_from_envar:
             value = await keyword_arg.parse()
 
-        if (
-            (value is None or isinstance(value, Exception))
-            and keyword_arg.required
-            and last_error
-        ):
-            return (
-                None,
-                f"Encountered error parsing {keyword_arg.full_flag} - {str(last_error)}",
-                consumed_idxs,
-            )
-
-        elif (
-            value is None or isinstance(value, Exception)
-        ) and keyword_arg.required is False:
+        elif value is None and keyword_arg.required is False:
             value = await keyword_arg.to_default()
 
         consumed_idx = current_idx + value_idx
 
         if consumed_idx > current_idx:
             consumed_idxs.add(consumed_idx)
+
+        elif value is None and isinstance(last_error, Exception):
+            return (
+                None,
+                last_error,
+                consumed_idxs,
+            )
 
         return (
             value,

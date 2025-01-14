@@ -1,7 +1,6 @@
 from __future__ import annotations
 import asyncio
 import importlib.util
-import inspect
 import pathlib
 import sys
 import importlib
@@ -14,7 +13,11 @@ T = TypeVar("T")
 
 
 class ImportFile(Generic[T]):
-    def __init__(self, data_type: ImportFile[T]):
+
+    def __init__(
+        self, 
+        data_type: ImportFile[T],
+    ):
         super().__init__()
         self.data: dict[str, T] | None = None
 
@@ -49,13 +52,11 @@ class ImportFile(Generic[T]):
     async def _import_file_objects(self, arg: str | None):
         try:
             if arg is None:
-                return Exception("no argumen passed for filepath")
+                return Exception("no argument passed for filepath")
 
-            loop = asyncio.get_event_loop()
+            path = await self._loop.run_in_executor(None, pathlib.Path, arg)
 
-            path = await loop.run_in_executor(None, pathlib.Path, arg)
-
-            resolved_path = await loop.run_in_executor(None, path.resolve)
+            resolved_path = await self._loop.run_in_executor(None, path.resolve)
 
             package_dir = resolved_path.parent
             package_dir_path = str(package_dir)
@@ -64,7 +65,7 @@ class ImportFile(Generic[T]):
             package = ntpath.basename(path)
             package_slug = package.split(".")[0]
 
-            spec = await loop.run_in_executor(
+            spec = await self._loop.run_in_executor(
                 None,
                 importlib.util.spec_from_file_location,
                 f"{package_dir_module}.{package_slug}",
@@ -72,11 +73,11 @@ class ImportFile(Generic[T]):
             )
 
             if arg not in sys.path:
-                await loop.run_in_executor(
+                await self._loop.run_in_executor(
                     None, sys.path.append, str(package_dir.parent)
                 )
 
-            module = await loop.run_in_executor(
+            module = await self._loop.run_in_executor(
                 None,
                 importlib.util.module_from_spec,
                 spec,
@@ -84,7 +85,7 @@ class ImportFile(Generic[T]):
 
             sys.modules[module.__name__] = module
 
-            await loop.run_in_executor(
+            await self._loop.run_in_executor(
                 None,
                 spec.loader.exec_module,
                 module,
@@ -93,10 +94,6 @@ class ImportFile(Generic[T]):
             imported_types: dict[str, T] = {}
 
             for conversion_type in self._types:
-                object_type = conversion_type
-                if hasattr(conversion_type, "__name__") is False:
-                    object_type = type(conversion_type)
-
                 discovered = list(
                     {
                         cls.__name__: cls for cls in conversion_type.__subclasses__()
@@ -109,5 +106,5 @@ class ImportFile(Generic[T]):
 
         except Exception as e:
             return Exception(
-                f"encountered error {str(e)} importing objects from file {arg}"
+                f"could not import objects from file {arg}"
             )

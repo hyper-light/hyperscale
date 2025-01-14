@@ -1,4 +1,5 @@
 from hyperscale.commands.cli.arg_types.data_types import (
+    AssertSet,
     Context,
     Env,
     ImportFile,
@@ -40,7 +41,8 @@ class PositionalArg(Generic[T]):
 
         args = get_args(data_type)
         self._complex_types: dict[
-            Context
+            AssertSet
+            | Context
             | Env
             | ImportFile
             | JsonData
@@ -51,7 +53,8 @@ class PositionalArg(Generic[T]):
             | RawFile,
             Callable[
                 [str, type[Any]],
-                Context
+                AssertSet
+                | Context
                 | Env
                 | ImportFile
                 | JsonData
@@ -62,6 +65,7 @@ class PositionalArg(Generic[T]):
                 | RawFile,
             ],
         ] = {
+            AssertSet: lambda name, subtype: AssertSet(name, subtype),
             Context: lambda _, __: Context(),
             Env: lambda envar, subtype: Env(envar, subtype),
             ImportFile: lambda _, subtype: ImportFile(subtype),

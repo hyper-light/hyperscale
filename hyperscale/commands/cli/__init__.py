@@ -1,4 +1,5 @@
 from .cli import CLI as CLI
+from .arg_types import AssertSet as AssertSet
 from .arg_types import Chain as Chain
 from .arg_types import Context as Context
 from .arg_types import Env as Env

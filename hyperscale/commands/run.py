@@ -3,9 +3,17 @@ import functools
 import psutil
 import uvloop
 
+from typing import Literal
+
 from hyperscale.core.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow
-from .cli import CLI, ImportFile
+from .cli import (
+    CLI, 
+    ImportFile, 
+    JsonFile,
+    AssertSet,
+)
+from .hyperscale_config import HyperscaleConfig
 
 uvloop.install()
 
@@ -20,18 +28,23 @@ async def get_default_workers():
         ),
     )
 
-
-@CLI.group()
-async def run():
-    """
-    Commands for running tests either locally or
-    against a remote (cloud) instance.
-    """
+def get_default_config():
+    return HyperscaleConfig()
 
 
-@run.command()
-async def test(
+
+@CLI.command()
+async def run(
     path: ImportFile[Workflow],
+    config: JsonFile[HyperscaleConfig]=get_default_config,
+    log_level: AssertSet[
+        Literal[
+            "debug",
+            "info",
+            "warn",
+            "error",
+        ]
+    ] = "info",
     server_port: int = 15454,
     workers: int = get_default_workers,
     name: str = "default",
@@ -50,22 +63,16 @@ async def test(
 
     terminal_ui_enabled = quiet is False
 
-    try:
-        await runner.run(
-            name,
-            workflows,
-            terminal_ui_enabled=terminal_ui_enabled,
-        )
+    print(type(config), log_level)
 
-    except Exception:
-        await runner.abort(
-            terminal_ui_enabled=terminal_ui_enabled,
-        )
+    # try:
+    #     await runner.run(
+    #         name,
+    #         workflows,
+    #         terminal_ui_enabled=terminal_ui_enabled,
+    #     )
 
-
-@run.command()
-async def job(job_name: str):
-    """
-    Run the specified job on the specified remote Hyperscale
-    installation.
-    """
+    # except Exception:
+    #     await runner.abort(
+    #         terminal_ui_enabled=terminal_ui_enabled,
+    #     )

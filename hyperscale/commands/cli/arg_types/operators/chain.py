@@ -8,6 +8,7 @@ K = TypeVar("K")
 
 
 from hyperscale.commands.cli.arg_types.data_types import (
+    AssertSet,
     Env,
     ImportFile,
     JsonData,
@@ -38,12 +39,25 @@ class Chain(Generic[*T]):
         self.data: Any | None = None
 
         self._complex_types: dict[
-            Env | ImportFile | JsonData | JsonData | Pattern | RawFile,
+            AssertSet
+            | Env
+            | ImportFile
+            | JsonData
+            | JsonData
+            | Pattern
+            | RawFile,
             Callable[
                 [str, type[Any]],
-                Env | ImportFile | JsonData | JsonData | Pattern | RawFile,
+                AssertSet
+                | Env
+                | ImportFile
+                | JsonData
+                | JsonData
+                | Pattern
+                | RawFile,
             ],
         ] = {
+            AssertSet: lambda name, subtype: AssertSet(name, subtype),
             Env: lambda envar, subtype: Env(envar, subtype),
             ImportFile: lambda _, subtype: ImportFile(subtype),
             JsonFile: lambda _, subtype: JsonFile(subtype),
