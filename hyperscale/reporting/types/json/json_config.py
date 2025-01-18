@@ -1,15 +1,14 @@
 import os
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictBool
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class JSONConfig(BaseModel):
-    events_filepath: str = os.path.join(os.getcwd(), "events.json")
-    metrics_filepath: str = os.path.join(os.getcwd(), "metrics.json")
-    experiments_filepath: str = os.path.join(os.getcwd(), "experiments.json")
-    streams_filepath: str = os.path.join(os.getcwd(), "streams.json")
-    system_metrics_filepath: str = os.path.join(os.getcwd(), "system_metrics.json")
-    overwrite: bool = True
+    workflow_results_filepath: StrictStr = os.path.join(os.getcwd(), "workflow_results.json")
+    step_results_filepath: StrictStr = os.path.join(os.getcwd(), "step_results.json")
     reporter_type: ReporterTypes = ReporterTypes.JSON
+
+    class Config:
+        arbitrary_types_allowed = True

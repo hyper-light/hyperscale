@@ -1,24 +1,22 @@
 from ssl import SSLContext
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictInt
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class CassandraConfig(BaseModel):
-    hosts: List[str] = ["127.0.0.1"]
-    port: int = 9042
-    username: Optional[str] = None
-    password: Optional[str] = None
-    keyspace: str = "hyperscale"
-    events_table: str = "events"
-    metrics_table: str = "metrics"
-    streams_table: str = "streams"
-    experiments_table: str = "experiments"
-    system_metrics_table: str = "system_metrics"
-    replication_strategy: str = "SimpleStrategy"
-    replication: int = 3
+    hosts: List[StrictStr] = ["127.0.0.1"]
+    port: StrictInt = 9042
+    username: StrictStr | None = None
+    password: StrictStr | None = None
+    keyspace: StrictStr = "hyperscale"
+    workflow_results_table_name: StrictStr = 'hyperscale_workflow_results'
+    step_results_table_name: StrictStr = 'hyperscale_step_results'
+    system_metrics_table: StrictStr = "system_metrics"
+    replication_strategy: StrictStr = "SimpleStrategy"
+    replication: StrictInt = 3
     ssl: Optional[SSLContext] = None
     reporter_type: ReporterTypes = ReporterTypes.Cassandra
 

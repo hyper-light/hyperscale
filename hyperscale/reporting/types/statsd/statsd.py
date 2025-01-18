@@ -1,9 +1,13 @@
 import re
 import uuid
-from typing import Dict, List
+from typing import Literal, Dict, Callable
 
-
-from hyperscale.reporting.metric import MetricsSet, MetricType
+from hyperscale.core.results.workflow_types import MetricType
+from hyperscale.reporting.types.common import (
+    ReporterTypes,
+    WorkflowMetricSet,
+    StepMetricSet
+)
 
 from .statsd_config import StatsDConfig
 
@@ -18,6 +22,13 @@ except Exception:
     class StatsdClient:
         pass
 
+StatsDMetricType = Literal[
+    "increment",
+    "gauge",
+    "timing",
+    "count",
+    "sets",
+]
 
 class StatsD:
     def __init__(self, config: StatsDConfig) -> None:
@@ -26,21 +37,24 @@ class StatsD:
 
         self.connection = StatsdClient(host=self.host, port=self.port)
 
-        self.types_map = {
-            "total": "count",
-            "succeeded": "count",
-            "failed": "count",
-            "actions_per_second": "gauge",
-            "median": "gauge",
-            "mean": "gauge",
-            "variance": "gauge",
-            "stdev": "gauge",
-            "minimum": "gauge",
-            "maximum": "gauge",
-            "quantiles": "gauge",
+        self._types_map: Dict[
+            MetricType,
+            StatsDMetricType,
+        ] = {
+            "COUNT": "count",
+            "DISTRIBUTION": "gauge",
+            "RATE": "gauge",
+            "TIMING": "timer",
+            "SAMPLE": "gauge",
         }
 
-        self._update_map = {
+        self._update_map : Dict[
+            StatsDMetricType,
+            Callable[
+                [str, int | float],
+                None
+            ]
+        ] = {
             "count": self.connection.counter,
             "gauge": self.connection.gauge,
             "increment": self.connection.increment,
@@ -54,140 +68,47 @@ class StatsD:
             "timer": self.connection.timer,
         }
 
-        self.stat_type_map = {
-            MetricType.COUNT: "count",
-            MetricType.DISTRIBUTION: "gauge",
-            MetricType.RATE: "gauge",
-            MetricType.SAMPLE: "gauge",
-        }
-
         self.session_uuid = str(uuid.uuid4())
+        self.reporter_type = ReporterTypes.StatsD
+        self.reporter_type_name = self.reporter_type.name.capitalize()
         self.metadata_string: str = None
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
 
         self.statsd_type = "StatsD"
 
     async def connect(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Connecting to {self.statsd_type} at - {self.host}:{self.port}"
-        )
         await self.connection.connect()
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Connected to {self.statsd_type} at - {self.host}:{self.port}"
-        )
 
-    async def submit_common(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Shared Metrics to {self.statsd_type}"
-        )
+    async def submit_workflow_results(self, workflow_results: WorkflowMetricSet):
+        for result in workflow_results:
 
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            metric_name = result.get('metric_name')
+            metric_workflow = result.get('metric_workflow')
+            metric_value = result.get('metric_value')
+
+            metric_type = result.get('metric_type')
+            statsd_type = self._types_map.get(metric_type)
+
+            self._update_map.get(statsd_type)(
+                f'{metric_workflow}_{metric_name}',
+                metric_value,
             )
 
-            for field, value in metrics_set.common_stats.items():
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Shared Metric - {metrics_set.name}:common:{field}"
-                )
+    async def submit_step_results(self, step_results: StepMetricSet):
+        for result in step_results:
 
-                update_type = self.types_map.get(field)
-                update_function = self._update_map.get(update_type)
+            metric_name = result.get('metric_name')
+            metric_workflow = result.get('metric_workflow')
+            metric_step = result.get('metric_step')
+            metric_value = result.get('metric_value')
 
-                update_function(f"{metrics_set.name}_common_{field}", value)
+            metric_type = result.get('metric_type')
+            statsd_type = self._types_map.get(metric_type)
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Shared Metrics to {self.statsd_type}"
-        )
-
-    async def submit_metrics(self, metrics: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Metrics to {self.statsd_type}"
-        )
-
-        for metrics_set in metrics:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            self._update_map.get(statsd_type)(
+                f'{metric_workflow}_{metric_step}_{metric_name}',
+                metric_value,
             )
-
-            for group_name, group in metrics_set.groups.items():
-                metric_record = {**group.stats, **group.custom}
-                metric_types = {**self.types_map, **group.custom_schemas}
-
-                for metric_field, metric_value in metric_record.items():
-                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                        f"{self.metadata_string} - Submitting Metric - {metrics_set.name}:{group_name}:{metric_field}"
-                    )
-
-                    update_type = metric_types.get(metric_field)
-                    update_function = self._update_map.get(update_type)
-
-                    update_function(
-                        f"{metrics_set.name}_{group_name}_{metric_field}", metric_value
-                    )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Metrics to {self.statsd_type}"
-        )
-
-    async def submit_custom(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Custom Metrics to {self.statsd_type}"
-        )
-
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Custom Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
-            for custom_metric_name, custom_metric in metrics_set.custom_metrics.items():
-                metric_type = self.stat_type_map.get(custom_metric.metric_type, "gauge")
-
-                update_function = self._update_map.get(metric_type)
-                update_function(
-                    f"{metrics_set.name}_{custom_metric_name}",
-                    custom_metric.metric_value,
-                )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Custom Metrics to {self.statsd_type}"
-        )
-
-    async def submit_errors(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Error Metrics to {self.statsd_type}"
-        )
-
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Error Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
-            for error in metrics_set.errors:
-                error_message = re.sub(
-                    "[^0-9a-zA-Z]+", "_", error.get("message").lower()
-                )
-
-                update_function = self._update_map.get("count")
-                update_function(
-                    f"{metrics_set.name}_errors_{error_message}", error.get("count")
-                )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Error Metrics to {self.statsd_type}"
-        )
 
     async def close(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Closing session - {self.session_uuid}"
-        )
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Closing connection to {self.statsd_type} at - {self.host}:{self.port}"
-        )
         await self.connection.close()
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Closed connection to {self.statsd_type} at - {self.host}:{self.port}"
-        )

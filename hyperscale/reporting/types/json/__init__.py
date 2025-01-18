@@ -1,2 +1,2 @@
-from .json import JSON
-from .json_config import JSONConfig
+from .json import JSON as JSON
+from .json_config import JSONConfig as JSONConfig

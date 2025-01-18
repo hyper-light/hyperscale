@@ -1,17 +1,14 @@
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class AWSLambdaConfig(BaseModel):
-    aws_access_key_id: str
-    aws_secret_access_key: str
-    region_name: str
-    events_lambda: str = "hyperscale_events"
-    metrics_lambda: str = "hyperscale_metrics"
-    system_metrics_lambda: str = "hyperscale_system_metrics"
-    experiments_lambda: Optional[str]
-    streams_lambda: Optional[str]
+    aws_access_key_id: StrictStr
+    aws_secret_access_key: StrictStr
+    region_name: StrictStr
+    workflow_results_lambda_name: StrictStr | None = None
+    step_results_lambda_name: StrictStr | None = None
     reporter_type: ReporterTypes = ReporterTypes.AWSLambda

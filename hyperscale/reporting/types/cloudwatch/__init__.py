@@ -1,2 +1,2 @@
-from .cloudwatch import Cloudwatch
-from .cloudwatch_config import CloudwatchConfig
+from .cloudwatch import Cloudwatch as Cloudwatch
+from .cloudwatch_config import CloudwatchConfig as CloudwatchConfig

@@ -1,360 +1,151 @@
+import asyncio
+import functools
 import uuid
-from typing import Dict, List
 
-
-from hyperscale.reporting.metric import MetricsSet, MetricType
+from hyperscale.reporting.types.common import (
+    ReporterTypes,
+    WorkflowMetricSet,
+    StepMetricSet
+)
 
 from .sqlite_config import SQLiteConfig
 
 try:
     import sqlalchemy
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.schema import CreateTable
+    from sqlalchemy_utils import database_exists, create_database
+    from sqlalchemy.ext.asyncio.engine import AsyncEngine, create_async_engine
 
     has_connector = True
 
 except Exception:
     has_connector = False
-    sqlalchemy = object
 
-    class CreateTable:
+    class AsyncEngine:
         pass
 
-    class OperationalError:
+    def database_exists(db: str):
+        return False
+    
+    def create_database(db: str):
+        return None
+
+    async def create_async_engine(uri: str, echo: bool = False):
         pass
 
-    async def create_async_engine(*args, **kwargs):
+    class sqlalchemy:
         pass
+
 
 
 class SQLite:
     def __init__(self, config: SQLiteConfig) -> None:
-        self.path = f"sqlite+aiosqlite:///{config.path}"
-        self.events_table_name = config.events_table
-        self.metrics_table_name = config.metrics_table
+        self.database_path = config.database_path
+        self._workflow_results_table_name = config.workflow_results_table_name
+        self._step_results_database_name = config.step_results_table_name
 
-        self.experiments_table_name = config.experiments_table
-        self.streams_table_name = config.streams_table
-        self.variants_table_name = f"{config.experiments_table}_variants"
-        self.mutations_table_name = f"{config.experiments_table}_mutations"
+        self._metadata = sqlalchemy.MetaData()
 
-        self.shared_metrics_table_name = f"{config.metrics_table}_shared"
-        self.errors_table_name = f"{config.metrics_table}_errors"
-        self.custom_metrics_table_name = f"{config.metrics_table}_custom"
+        self._engine: AsyncEngine = None
 
-        self.session_system_metrics_table_name = (
-            f"{config.system_metrics_table}_session"
+        self._workflow_results_table = sqlalchemy.Table(
+            self._workflow_results_table_name,
+            self._metadata,
+            sqlalchemy.Column(
+                "id",
+                sqlalchemy.INTEGER,
+                primary_key=True,
+                autoincrement=True,
+            ),
+            sqlalchemy.Column("metric_name", sqlalchemy.TEXT),
+            sqlalchemy.Column("metric_workflow", sqlalchemy.TEXT),
+            sqlalchemy.Column("metric_type", sqlalchemy.TEXT),
+            sqlalchemy.Column("metric_group", sqlalchemy.TEXT),
+            sqlalchemy.Column("metric_value", sqlalchemy.REAL),
         )
-        self.stage_system_metrics_table_name = f"{config.system_metrics_table}_stage"
 
-        self.metadata = sqlalchemy.MetaData()
-
-        self.database = None
-        self._engine = None
-
-        self._events_table = None
-        self._metrics_table = None
-        self._streams_table = None
-
-        self._experiments_table = None
-        self._variants_table = None
-        self._mutations_table = None
-
-        self._shared_metrics_table = None
-        self._custom_metrics_table = None
-        self._errors_table = None
-
-        self._session_system_metrics_table = None
-        self._stage_system_metrics_table = None
-
-        self.metric_types_map = {
-            MetricType.COUNT: lambda field_name: sqlalchemy.Column(
-                field_name, sqlalchemy.BIGINT
+        self._step_results_table = sqlalchemy.Table(
+            self._workflow_results_table_name,
+            self._metadata,
+            sqlalchemy.Column(
+                "id",
+                sqlalchemy.INTEGER,
+                primary_key=True,
+                autoincrement=True,
             ),
-            MetricType.DISTRIBUTION: lambda field_name: sqlalchemy.Column(
-                field_name, sqlalchemy.FLOAT
-            ),
-            MetricType.SAMPLE: lambda field_name: sqlalchemy.Column(
-                field_name, sqlalchemy.FLOAT
-            ),
-            MetricType.RATE: lambda field_name: sqlalchemy.Column(
-                field_name, sqlalchemy.FLOAT
-            ),
-        }
+            sqlalchemy.Column("metric_name", sqlalchemy.TEXT),
+            sqlalchemy.Column("metric_workflow", sqlalchemy.TEXT),
+            sqlalchemy.Column("metric_type", sqlalchemy.TEXT),
+            sqlalchemy.Column("metric_step", sqlalchemy.TEXT),
+            sqlalchemy.Column("metric_group", sqlalchemy.TEXT),
+            sqlalchemy.Column("metric_value", sqlalchemy.REAL),
+        )
 
         self.session_uuid = str(uuid.uuid4())
+        self._loop = asyncio.get_event_loop()
+        self.reporter_type = ReporterTypes.SQLite
+        self.reporter_type_name = self.reporter_type.name.capitalize()
         self.metadata_string: str = None
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
+        self.sql_type = 'SQLite'
 
     async def connect(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Connecting to SQLite at - {self.path} - Database: {self.database}"
-        )
-        self._engine = create_async_engine(self.path)
+        connection_uri = f"sqlite+aiosqlite:///{self.database_path}"
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Connected to SQLite at - {self.path} - Database: {self.database}"
+        self._engine: AsyncEngine = await create_async_engine(
+            connection_uri,
+            echo=False,
         )
 
-    async def submit_common(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Shared Metrics to Table - {self.shared_metrics_table_name}"
-        )
-
-        async with self._engine.begin() as connection:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Shared Metrics to Table - {self.shared_metrics_table_name} - Initiating transaction"
+        if not await self._loop.run_in_executor(
+            None,
+            database_exists,
+            connection_uri,
+        ):
+            await self._loop.run_in_executor(
+                None,
+                functools.partial(
+                    create_database,
+                    connection_uri,
+                )
             )
 
-            if self._shared_metrics_table is None:
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Creating Shared Metrics table - {self.shared_metrics_table_name} - if not exists"
-                )
+        try:
+            async with self._engine.connect() as connection:
+                await connection.run_sync(self._metadata.create_all)   
 
-                stage_metrics_table = sqlalchemy.Table(
-                    self.shared_metrics_table_name,
-                    self.metadata,
-                    sqlalchemy.Column("id", sqlalchemy.INTEGER, primary_key=True),
-                    sqlalchemy.Column("name", sqlalchemy.TEXT),
-                    sqlalchemy.Column("stage", sqlalchemy.TEXT),
-                    sqlalchemy.Column("group", sqlalchemy.TEXT),
-                    sqlalchemy.Column("total", sqlalchemy.INTEGER),
-                    sqlalchemy.Column("succeeded", sqlalchemy.INTEGER),
-                    sqlalchemy.Column("failed", sqlalchemy.INTEGER),
-                    sqlalchemy.Column("actions_per_second", sqlalchemy.REAL),
-                )
+        except Exception:
+            pass    
 
-                await connection.execute(
-                    CreateTable(stage_metrics_table, if_not_exists=True)
-                )
-                self._shared_metrics_table = stage_metrics_table
-
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Created or set Shared Metrics table - {self.shared_metrics_table_name}"
-                )
-
-            for metrics_set in metrics_sets:
-                await connection.execute(
-                    self._shared_metrics_table.insert(
-                        values={
-                            "name": metrics_set.name,
-                            "stage": metrics_set.stage,
-                            "group": "common",
-                            **metrics_set.common_stats,
-                        }
-                    )
-                )
-
-            await connection.commit()
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Shared Metrics to Table - {self.shared_metrics_table_name} - Transaction committed"
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Shared Metrics to Table - {self.shared_metrics_table_name}"
-        )
-
-    async def submit_metrics(self, metrics: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Metrics to Table - {self.metrics_table_name}"
-        )
-
-        async with self._engine.begin() as connection:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Metrics to Table - {self.metrics_table_name} - Initiating transaction"
-            )
-
-            for metrics_set in metrics:
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-                )
-
-                if self._metrics_table is None:
-                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                        f"{self.metadata_string} - Creating Metrics table - {self.metrics_table_name} - if not exists"
-                    )
-
-                    metrics_table = sqlalchemy.Table(
-                        self.metrics_table_name,
-                        self.metadata,
-                        sqlalchemy.Column("id", sqlalchemy.INTEGER, primary_key=True),
-                        sqlalchemy.Column("name", sqlalchemy.TEXT),
-                        sqlalchemy.Column("stage", sqlalchemy.TEXT),
-                        sqlalchemy.Column("group", sqlalchemy.TEXT),
-                        sqlalchemy.Column("median", sqlalchemy.REAL),
-                        sqlalchemy.Column("mean", sqlalchemy.REAL),
-                        sqlalchemy.Column("variance", sqlalchemy.REAL),
-                        sqlalchemy.Column("stdev", sqlalchemy.REAL),
-                        sqlalchemy.Column("minimum", sqlalchemy.REAL),
-                        sqlalchemy.Column("maximum", sqlalchemy.REAL),
-                    )
-
-                    for quantile in metrics_set.quantiles:
-                        metrics_table.append_column(
-                            sqlalchemy.Column(f"{quantile}", sqlalchemy.REAL)
-                        )
-
-                    for (
-                        custom_field_name,
-                        sql_alchemy_type,
-                    ) in metrics_set.custom_schemas:
-                        metrics_table.append_column(custom_field_name, sql_alchemy_type)
-
-                    await connection.execute(
-                        CreateTable(metrics_table, if_not_exists=True)
-                    )
-                    self._metrics_table = metrics_table
-
-                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                        f"{self.metadata_string} - Created or set Metrics table - {self.metrics_table_name}"
-                    )
-
-                for group_name, group in metrics_set.groups.items():
-                    await connection.execute(
-                        self._metrics_table.insert(
-                            values={**group.record, "group": group_name}
-                        )
-                    )
-
-            await connection.commit()
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Metrics to Table - {self.metrics_table_name} - Transaction committed"
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Metrics to Table - {self.metrics_table_name}"
-        )
-
-    async def submit_custom(self, metrics_sets: List[MetricsSet]):
-        async with self._engine.begin() as connection:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Custom Metrics - Initiating transaction"
-            )
-
-            if self._custom_metrics_table is None:
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Creating Custom Metrics table - {self.custom_metrics_table_name} - if not exists"
-                )
-
-                custom_metrics_table = sqlalchemy.Table(
-                    self.custom_metrics_table_name,
-                    self.metadata,
-                    sqlalchemy.Column("id", sqlalchemy.INTEGER, primary_key=True),
-                    sqlalchemy.Column("name", sqlalchemy.TEXT),
-                    sqlalchemy.Column("stage", sqlalchemy.TEXT),
-                    sqlalchemy.Column("group", sqlalchemy.TEXT),
-                )
-
-                for metrics_set in metrics_sets:
-                    for (
-                        custom_metric_name,
-                        custom_metric,
-                    ) in metrics_set.custom_metrics.items():
-                        custom_metrics_table.append_column(
-                            self.metric_types_map.get(
-                                custom_metric.metric_type,
-                                lambda field_name: sqlalchemy.Column(
-                                    field_name, sqlalchemy.FLOAT
-                                ),
-                            )(custom_metric_name)
-                        )
-
-                await connection.execute(
-                    CreateTable(custom_metrics_table, if_not_exists=True)
-                )
-                self._custom_metrics_table = custom_metrics_table
-
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Created or set Custom Metrics table - {self.custom_metrics_table_name}"
-                )
-
-            for metrics_set in metrics_sets:
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Custom Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-                )
-
-                await connection.execute(
-                    self._custom_metrics_table.insert(
-                        values={
-                            "name": metrics_set.name,
-                            "stage": metrics_set.stage,
-                            "group": "custom",
-                            **{
-                                custom_metric_name: custom_metric.metric_value
-                                for custom_metric_name, custom_metric in metrics_set.custom_metrics.items()
-                            },
-                        }
-                    )
-                )
-
-            await connection.commit()
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitte Cudstom Metrics - Transaction committed"
-            )
-
-    async def submit_errors(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Error Metrics to Table - {self.errors_table_name}"
-        )
-
-        async with self._engine.begin() as connection:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Error Metrics to Table - {self.errors_table_name} - Initiating transaction"
-            )
-
-            for metrics_set in metrics_sets:
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Error Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-                )
-
-                if self._errors_table is None:
-                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                        f"{self.metadata_string} - Creating Error Metrics table - {self.errors_table_name} - if not exists"
-                    )
-
-                    metrics_errors_table = sqlalchemy.Table(
-                        self.errors_table_name,
-                        self.metadata,
-                        sqlalchemy.Column("id", sqlalchemy.INTEGER, primary_key=True),
-                        sqlalchemy.Column("name", sqlalchemy.TEXT),
-                        sqlalchemy.Column("stage", sqlalchemy.TEXT),
-                        sqlalchemy.Column("error_message", sqlalchemy.TEXT),
-                        sqlalchemy.Column("error_count", sqlalchemy.INTEGER),
-                    )
-
-                    await connection.execute(
-                        CreateTable(metrics_errors_table, if_not_exists=True)
-                    )
-
-                    self._errors_table = metrics_errors_table
-                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                        f"{self.metadata_string} - Created or set Error Metrics table - {self.errors_table_name}"
-                    )
-
-                for error in metrics_set.errors:
-                    await connection.execute(
-                        self._errors_table.insert(
+    async def submit_workflow_results(self, workflow_results: WorkflowMetricSet):
+        async with self._engine.connect() as connection:
+            async with connection.begin() as transaction:
+                await asyncio.gather(*[
+                    connection.execute(
+                        self._workflow_results_table.insert(
                             values={
-                                "name": metrics_set.name,
-                                "stage": metrics_set.stage,
-                                "error_message": error.get("message"),
-                                "error_count": error.get("count"),
+                                **result,
+                                'metric_value': float(result.get('metric_value', 0))
                             }
                         )
-                    )
+                    ) for result in workflow_results
+                ])
 
-            await connection.commit()
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Error Metrics to Table - {self.errors_table_name} - Transaction committed"
-            )
+                await transaction.commit()
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Error Metrics to Table - {self.errors_table_name}"
-        )
+    async def submit_step_results(self, step_results: StepMetricSet):
+        async with self._engine.connect() as connection:
+            async with connection.begin() as transaction:
+                await asyncio.gather(*[
+                    connection.execute(
+                        self._step_results_table.insert(
+                            values={
+                                **result,
+                                'metric_value': float(result.get('metric_value', 0))
+                            }
+                        )
+                    ) for result in step_results
+                ])
+
+                await transaction.commit()
 
     async def close(self):
         await self._engine.dispose()
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Closing session - {self.session_uuid}"
-        )

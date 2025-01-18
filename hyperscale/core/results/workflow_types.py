@@ -42,7 +42,7 @@ CheckSet = Dict[
     str | FailedResults | ContextResults,
 ]
 
-MetricType = Literal["COUNT", "DISTRIBUTION", "SAMPLE", "RATE"]
+MetricType = Literal["COUNT", "DISTRIBUTION", "SAMPLE", "RATE", "TIMING"]
 
 CountMetric = Dict[Literal["count"], int]
 

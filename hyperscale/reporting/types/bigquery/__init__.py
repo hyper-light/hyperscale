@@ -1,2 +1,2 @@
-from .bigquery import BigQuery
-from .bigquery_config import BigQueryConfig
+from .bigquery import BigQuery as BigQuery
+from .bigquery_config import BigQueryConfig as BigQueryConfig

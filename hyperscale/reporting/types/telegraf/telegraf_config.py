@@ -1,9 +1,9 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictInt
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class TelegrafConfig(BaseModel):
-    host: str = "localhost"
-    port: int = 8094
+    host: StrictStr = "localhost"
+    port: StrictInt = 8094
     reporter_type: ReporterTypes = ReporterTypes.Telegraf

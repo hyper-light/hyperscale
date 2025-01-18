@@ -1,12 +1,12 @@
-from typing import Dict
-
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictInt
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class StatsDConfig(BaseModel):
-    host: str = "localhost"
-    port: int = 8125
-    custom_fields: Dict[str, str] = {}
+    host: StrictStr = "localhost"
+    port: StrictInt = 8125
     reporter_type: ReporterTypes = ReporterTypes.StatsD
+
+    class Config:
+        arbitrary_types_allowed = True

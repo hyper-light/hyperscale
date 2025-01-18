@@ -1,2 +1,2 @@
-from .telegraf_statsd import TelegrafStatsD
-from .teleraf_statsd_config import TelegrafStatsDConfig
+from .telegraf_statsd import TelegrafStatsD as TelegrafStatsD
+from .teleraf_statsd_config import TelegrafStatsDConfig as TelegrafStatsDConfig

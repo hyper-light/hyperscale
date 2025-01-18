@@ -1,4 +1,7 @@
 from enum import Enum
+import uuid
+from hyperscale.core.results.workflow_types import MetricType
+from typing import Literal, Dict, List
 
 
 class ReporterTypes(Enum):
@@ -33,3 +36,33 @@ class ReporterTypes(Enum):
     TelegrafStatsD = "telegraf_statsd"
     TimescaleDB = "timescaledb"
     XML = "xml"
+
+
+
+WorkflowMetric = Dict[
+    Literal[
+        "metric_workflow",
+        "metric_type",
+        "metric_group",
+        "metric_name",
+        "metric_value"
+    ],
+    str | MetricType | int | float
+]
+
+
+StepMetric = Dict[
+    Literal[
+        "metric_workflow",
+        "metric_step",
+        "metric_type",
+        "metric_group",
+        "metric_name",
+        "metric_value"
+    ],
+    str | MetricType | int | float
+]
+
+
+WorkflowMetricSet = List[WorkflowMetric]
+StepMetricSet = List[StepMetric]

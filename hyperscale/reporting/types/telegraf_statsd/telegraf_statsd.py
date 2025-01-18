@@ -1,8 +1,10 @@
 import uuid
-from typing import List
+from typing import Dict, Literal, Callable
 
 
-from hyperscale.reporting.metric import MetricType
+from hyperscale.core.results.workflow_types import MetricType
+from hyperscale.reporting.types.common import ReporterTypes
+
 
 try:
     from aio_statsd import TelegrafStatsdClient
@@ -17,7 +19,8 @@ except Exception:
     from hyperscale.reporting.types.empty import Empty as StatsD
 
     class TelegrafStatsDConfig:
-        pass
+        host: str = ""
+        port: int = 0
 
     class TelegrafStatsdClient:
         pass
@@ -25,25 +28,38 @@ except Exception:
     has_connector = False
 
 
+TelegrafStatsDMetricType = Literal[
+    "increment",
+    "histogram",
+    "gauge",
+    "timer",
+    "distribution",
+]
+
+
 class TelegrafStatsD(StatsD):
     def __init__(self, config: TelegrafStatsDConfig) -> None:
         super().__init__(config)
-        self.connection = TelegrafStatsdClient(host=self.host, port=self.port)
+        self.connection = TelegrafStatsdClient(host=config.host, port=config.port)
 
-        self.types_map = {
-            "total": "increment",
-            "succeeded": "increment",
-            "failed": "increment",
-            "median": "gauge",
-            "mean": "gauge",
-            "variance": "gauge",
-            "stdev": "gauge",
-            "minimum": "gauge",
-            "maximum": "gauge",
-            "quantiles": "gauge",
+        self._types_map: Dict[
+            MetricType,
+            TelegrafStatsD,
+        ] = {
+            "COUNT": "increment",
+            "DISTRIBUTION": "distribution",
+            "RATE": "gauge",
+            "TIMING": "timer",
+            "SAMPLE": "gauge",
         }
 
-        self._update_map = {
+        self._update_map: Dict[
+            TelegrafStatsDMetricType,
+            Callable[
+                [str, int],
+                None,
+            ]
+        ] = {
             "count": lambda: NotImplementedError(
                 "TelegrafStatsD does not support counts."
             ),
@@ -57,16 +73,9 @@ class TelegrafStatsD(StatsD):
             "timer": self.connection.timer,
         }
 
-        self.stat_type_map = {
-            MetricType.COUNT: "increment",
-            MetricType.DISTRIBUTION: "gauge",
-            MetricType.RATE: "gauge",
-            MetricType.SAMPLE: "gauge",
-        }
-
         self.session_uuid = str(uuid.uuid4())
+        self.reporter_type = ReporterTypes.TelegrafStatsD
+        self.reporter_type_name = self.reporter_type.name.capitalize()
         self.metadata_string: str = None
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
 
         self.statsd_type = "TelegrafStatsD"

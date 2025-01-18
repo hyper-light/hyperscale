@@ -1,2 +1,2 @@
-from .dogstatsd import DogStatsD
-from .dogstatsd_config import DogStatsDConfig
+from .dogstatsd import DogStatsD as DogStatsD
+from .dogstatsd_config import DogStatsDConfig as DogStatsDConfig

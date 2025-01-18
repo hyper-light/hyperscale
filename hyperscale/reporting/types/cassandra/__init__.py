@@ -1,2 +1,2 @@
-from .cassandra import Cassandra
-from .cassandra_config import CassandraConfig
+from .cassandra import Cassandra as Cassandra
+from .cassandra_config import CassandraConfig as CassandraConfig

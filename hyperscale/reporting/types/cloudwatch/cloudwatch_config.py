@@ -1,6 +1,6 @@
 from typing import List
 
-from pydantic import BaseModel, conlist
+from pydantic import BaseModel, conlist, StrictStr, StrictInt
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
@@ -11,18 +11,18 @@ class _CloudwatchTarget(BaseModel):
 
 
 class CloudwatchConfig(BaseModel):
-    aws_access_key_id: str
-    aws_secret_access_key: str
-    region_name: str
-    iam_role_arn: str
-    schedule_rate: str = None
-    events_rule: str = "hyperscale-events"
-    metrics_rule: str = "hyperscale-metrics"
-    experiments_rule: str = "hyperscale-experiments"
-    streams_rule: str = "hyperscale-streams"
-    system_metrics_rule: str = "system_metrics"
+    aws_access_key_id: StrictStr
+    aws_secret_access_key: StrictStr
+    region_name: StrictStr
+    iam_role_arn: StrictStr
+    schedule_rate: StrictStr | None = None
+    workflow_results_rule_name: StrictStr = "hyperscale-workflow-results"
+    step_results_rule_name: StrictStr = "hyperscale-step-results"
     cloudwatch_targets: conlist(_CloudwatchTarget, min_length=1)
-    aws_resource_arns: List[str] = []
-    cloudwatch_source: str = "hyperscale"
-    submit_timeout: int = 60
+    aws_resource_arns: List[StrictStr] = []
+    cloudwatch_source: StrictStr = "hyperscale"
+    submit_timeout: StrictInt = 60
     reporter_type: ReporterTypes = ReporterTypes.Cloudwatch
+
+    class Config:
+        arbitrary_types_allowed = True

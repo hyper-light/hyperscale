@@ -43,7 +43,7 @@ class AssertSet(Generic[T]):
             return Exception('no argument passed')
         
         try:
-            assert arg in self._types, f'no supported value found for {self.name} - please pass one of {self.data_type}'
+            assert arg in self._types, f'{arg} is not a supported value for {self.name} - please pass one of {self.data_type}'
 
             self.data = arg
 

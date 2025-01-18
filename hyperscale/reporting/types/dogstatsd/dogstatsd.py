@@ -1,8 +1,9 @@
 import uuid
-from typing import List
+from typing import Dict, Literal, Callable
 
 
-from hyperscale.reporting.metric import MetricsSet, MetricType
+from hyperscale.core.results.workflow_types import MetricType
+from hyperscale.reporting.types.common import ReporterTypes
 
 try:
     from aio_statsd import DogStatsdClient
@@ -25,6 +26,15 @@ except Exception:
         pass
 
 
+DogStatsDMetricType = Literal[
+    "increment",
+    "histogram",
+    "gauge",
+    "timer",
+    "distribution",
+]
+
+
 class DogStatsD(StatsD):
     def __init__(self, config: DogStatsDConfig) -> None:
         super(DogStatsD, self).__init__(config)
@@ -34,28 +44,25 @@ class DogStatsD(StatsD):
 
         self.connection = DogStatsdClient(host=self.host, port=self.port)
 
-        self.types_map = {
-            "total": "increment",
-            "succeeded": "increment",
-            "failed": "increment",
-            "actions_per_second": "histogram",
-            "median": "gauge",
-            "mean": "gauge",
-            "variance": "gauge",
-            "stdev": "gauge",
-            "minimum": "gauge",
-            "maximum": "gauge",
-            "quantiles": "gauge",
+        self._types_map: Dict[
+            MetricType,
+            DogStatsDMetricType,
+        ] = {
+            "COUNT": "increment",
+            "DISTRIBUTION": "distribution",
+            "RATE": "gauge",
+            "TIMING": "timer",
+            "SAMPLE": "gauge",
         }
 
-        self.stat_type_map = {
-            MetricType.COUNT: "count",
-            MetricType.DISTRIBUTION: "histogram",
-            MetricType.RATE: "gauge",
-            MetricType.SAMPLE: "gauge",
-        }
 
-        self._update_map = {
+        self._update_map: Dict[
+            DogStatsDMetricType,
+            Callable[
+                [str, int],
+                None,
+            ]
+        ] = {
             "count": lambda: NotImplementedError("DogStatsD does not support counts."),
             "gauge": self.connection.gauge,
             "sets": lambda: NotImplementedError("DogStatsD does not support sets."),
@@ -66,31 +73,8 @@ class DogStatsD(StatsD):
         }
 
         self.session_uuid = str(uuid.uuid4())
+        self.reporter_type = ReporterTypes.DogStatsD
+        self.reporter_type_name = self.reporter_type.name.capitalize()
         self.metadata_string: str = None
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
 
         self.statsd_type = "StatsD"
-
-    async def submit_metrics(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Custom Metrics to {self.statsd_type}"
-        )
-
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Custom Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
-            for custom_metric_name, custom_metric in metrics_set.custom_metrics.items():
-                metric_type = self.stat_type_map.get(custom_metric.metric_type, "gauge")
-
-                update_function = self._update_map.get(metric_type)
-                update_function(
-                    f"{metrics_set.name}_{custom_metric_name}",
-                    custom_metric.metric_value,
-                )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Custom Metrics to {self.statsd_type}"
-        )

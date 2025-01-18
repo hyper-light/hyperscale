@@ -63,16 +63,14 @@ async def run(
 
     terminal_ui_enabled = quiet is False
 
-    print(type(config), log_level)
+    try:
+        await runner.run(
+            name,
+            workflows,
+            terminal_ui_enabled=terminal_ui_enabled,
+        )
 
-    # try:
-    #     await runner.run(
-    #         name,
-    #         workflows,
-    #         terminal_ui_enabled=terminal_ui_enabled,
-    #     )
-
-    # except Exception:
-    #     await runner.abort(
-    #         terminal_ui_enabled=terminal_ui_enabled,
-    #     )
+    except Exception:
+        await runner.abort(
+            terminal_ui_enabled=terminal_ui_enabled,
+        )

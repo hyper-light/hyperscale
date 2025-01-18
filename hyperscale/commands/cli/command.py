@@ -342,32 +342,31 @@ class Command(Generic[T]):
 
         for arg_idx, arg in enumerate(args):
             if arg.startswith("-"):
-                break
-
-            elif result := await keyword_arg.parse(arg):
-                value, last_error = self._return_value_and_error(result)
-
-            if value is not None:
                 value_idx = arg_idx + 1
+            
+            else:
                 break
+
+        result = await keyword_arg.parse(args[value_idx])
+        value, last_error = self._return_value_and_error(result)
 
         if value is None and keyword_arg.loads_from_envar:
-            value = await keyword_arg.parse()
+            result = await keyword_arg.parse()
+            value, last_error = self._return_value_and_error(result)
+
+        if value is None and isinstance(last_error, Exception):
+            return (
+                value,
+                last_error,
+                consumed_idxs,
+            )
 
         elif value is None and keyword_arg.required is False:
             value = await keyword_arg.to_default()
 
-        consumed_idx = current_idx + value_idx
+        consumed_idx = current_idx + value_idx + 1
 
-        if consumed_idx > current_idx:
-            consumed_idxs.add(consumed_idx)
-
-        elif value is None and isinstance(last_error, Exception):
-            return (
-                None,
-                last_error,
-                consumed_idxs,
-            )
+        consumed_idxs.add(consumed_idx)
 
         return (
             value,

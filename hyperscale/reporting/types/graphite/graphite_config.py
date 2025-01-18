@@ -1,12 +1,12 @@
-from typing import Dict
-
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictInt
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class GraphiteConfig(BaseModel):
-    host: str = "localhost"
-    port: int = 2003
-    custom_fields: Dict[str, str] = {}
+    host: StrictStr = "localhost"
+    port: StrictInt = 2003
     reporter_type: ReporterTypes = ReporterTypes.Graphite
+
+    class Config:
+        arbitrary_types_allowed = True

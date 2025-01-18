@@ -1,2 +1,2 @@
-from .statsd import StatsD
-from .statsd_config import StatsDConfig
+from .statsd import StatsD as StatsD
+from .statsd_config import StatsDConfig as StatsDConfig

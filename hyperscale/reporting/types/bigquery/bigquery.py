@@ -1,14 +1,13 @@
 import asyncio
 import functools
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from typing import List
-
-import psutil
 
 
-from hyperscale.reporting.metric import MetricsSet, MetricType
-from hyperscale.reporting.system.system_metrics_set import SystemMetricsSet
+from hyperscale.reporting.types.common import (
+    ReporterTypes,
+    WorkflowMetricSet,
+    StepMetricSet
+)
 
 from .bigquery_config import BigQueryConfig
 
@@ -27,377 +26,125 @@ class BigQuery:
         self.service_account_json_path = config.service_account_json_path
         self.project_name = config.project_name
         self.dataset_name = config.dataset_name
+        self.dataset_location = config.dataset_location
         self.retry_timeout = config.retry_timeout
 
-        self.events_table_name = config.events_table
-
-        self.metrics_table_name = config.metrics_table
-        self.shared_metrics_table_name = f"{self.metrics_table_name}_shared"
-        self.custom_metrics_table_name = f"{self.metrics_table_name}_custom"
-
-        self.stream_metrics_table_name = config.streams_table
-
-        self.errors_table_name = f"{self.metrics_table_name}_errors"
-        self.experiments_table_name = config.experiments_table
-        self.variants_table_name = f"{self.experiments_table_name}_variants"
-        self.mutations_table_name = f"{self.experiments_table_name}_mutations"
-
-        self.session_system_metrics_table_name = (
-            f"{config.system_metrics_table}_session"
-        )
-        self.stage_system_metrics_table_name = f"{config.system_metrics_table}_stage"
+        self.workflow_results_table_name = config.workflow_results_table_name
+        self.step_results_table_name = config.step_results_table_name
 
         self.session_uuid = str(uuid.uuid4())
         self.metadata_string: str = None
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
 
-        self._executor = ThreadPoolExecutor(max_workers=psutil.cpu_count(logical=False))
         self.credentials = None
         self.client = None
 
-        self._events_table = None
-        self._streams_table = None
-        self._errors_table = None
-        self._metrics_table = None
-
-        self._experiments_table = None
-        self._variants_table = None
-        self._mutations_table = None
-
-        self._session_system_metrics_table = None
-        self._stage_system_metrics_table = None
-
-        self._custom_metrics_table = None
-        self._shared_metrics_table = None
+        self._workflow_results_table = None
+        self._step_results_table = None
 
         self._loop = asyncio.get_event_loop()
+        self.reporter_type = ReporterTypes.BigQuery
+        self.reporter_type_name = self.reporter_type.name.capitalize()
+        self.metadata_string: str = None
 
     async def connect(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Opening amd authorizing connection to Google Cloud - Loading account config from - {self.service_account_json_path}"
-        )
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Opening session - {self.session_uuid}"
-        )
 
         self.client = bigquery.Client.from_service_account_json(
             self.service_account_json_path
         )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Opened connection to Google Cloud - Loaded account config from - {self.service_account_json_path}"
+        
+        dataset = bigquery.Dataset(f'{self.project_name}_{self.dataset_name}')
+        dataset.location = self.dataset_location
+        dataset = self.client.create_dataset(
+            dataset,
+            exists_ok=True,
+            timeout=self.retry_timeout,
         )
 
-    async def submit_common(self, metrics_sets: List[MetricsSet]):
-        if self.shared_metrics_table_name is None:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Creating table - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.shared_metrics_table_name} - if not exists"
-            )
+    async def submit_workflow_results(self, workflow_results: WorkflowMetricSet):
+        if self._workflow_results_table is None:
 
             table_schema = [
-                bigquery.SchemaField("name", "STRING", mode="REQUIRED"),
-                bigquery.SchemaField("stage", "STRING", mode="REQUIRED"),
-                bigquery.SchemaField("group", "STRING", mode="REQUIRED"),
-                bigquery.SchemaField("total", "INTEGER", mode="REQUIRED"),
-                bigquery.SchemaField("succeeded", "INTEGER", mode="REQUIRED"),
-                bigquery.SchemaField("failed", "INTEGER", mode="REQUIRED"),
-                bigquery.SchemaField("actions_per_second", "FLOAT64", mode="REQUIRED"),
+                bigquery.SchemaField("metric_name", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("metric_workflow", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("metric_group", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("metric_type", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("metric_name", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("metric_value", "INTEGER", mode="REQUIRED"),
             ]
 
             table_reference = bigquery.TableReference(
                 bigquery.DatasetReference(self.project_name, self.dataset_name),
-                self.shared_metrics_table_name,
+                self.workflow_results_table_name,
             )
 
-            shared_metrics_table = bigquery.Table(table_reference, schema=table_schema)
+            workflow_results_table = bigquery.Table(table_reference, schema=table_schema)
 
             await self._loop.run_in_executor(
-                self._executor,
+                None,
                 functools.partial(
-                    self.client.create_table, shared_metrics_table, exists_ok=True
+                    self.client.create_table, 
+                    workflow_results_table, 
+                    exists_ok=True,
                 ),
             )
 
-            self._shared_metrics_table = shared_metrics_table
-
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Created table - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.shared_metrics_table_name} - if not exists"
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Shared Metrics - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.shared_metrics_table_name} - if not exists"
-        )
-
-        rows = []
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-            rows.append(
-                {
-                    "name": metrics_set.name,
-                    "stage": metrics_set.stage,
-                    "group": "common",
-                    **metrics_set.common_stats,
-                }
-            )
+            self._workflow_results_table = workflow_results_table
 
         await self._loop.run_in_executor(
-            self._executor,
+            None,
             functools.partial(
                 self.client.insert_rows_json,
-                self._shared_metrics_table,
-                rows,
+                self._workflow_results_table,
+                workflow_results,
                 retry=bigquery.DEFAULT_RETRY.with_predicate(
                     lambda exc: exc is not None
                 ).with_deadline(self.retry_timeout),
             ),
         )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Shared Metrics - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.shared_metrics_table_name} - if not exists"
-        )
+    async def submit_step_results(self, step_results: StepMetricSet):
 
-    async def submit_metrics(self, metrics: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Metrics - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.metrics_table_name} - if not exists"
-        )
-
-        rows = []
-        for metrics_set in metrics:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
-            if self._metrics_table is None:
-                await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                    f"{self.metadata_string} - Creating table - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.metrics_table_name} - if not exists"
-                )
-
-                table_schema = [
-                    bigquery.SchemaField("name", "STRING", mode="REQUIRED"),
-                    bigquery.SchemaField("stage", "STRING", mode="REQUIRED"),
-                    bigquery.SchemaField("group", "STRING", mode="REQUIRED"),
-                    bigquery.SchemaField("median", "FLOAT64", mode="REQUIRED"),
-                    bigquery.SchemaField("mean", "FLOAT64", mode="REQUIRED"),
-                    bigquery.SchemaField("variance", "FLOAT64", mode="REQUIRED"),
-                    bigquery.SchemaField("stdev", "FLOAT64", mode="REQUIRED"),
-                    bigquery.SchemaField("minimum", "FLOAT64", mode="REQUIRED"),
-                    bigquery.SchemaField("maximum", "FLOAT64", mode="REQUIRED"),
-                ]
-
-                for quantile in metrics_set.quantiles:
-                    table_schema.append(bigquery.SchemaField(f"{quantile}", "FLOAT64"))
-
-                for (
-                    custom_field_name,
-                    bigquery_schema_field,
-                ) in metrics_set.custom_schemas.items():
-                    table_schema.append(custom_field_name, bigquery_schema_field)
-
-                table_reference = bigquery.TableReference(
-                    bigquery.DatasetReference(self.project_name, self.dataset_name),
-                    self.metrics_table_name,
-                )
-
-                metrics_table = bigquery.Table(table_reference, schema=table_schema)
-
-                await self._loop.run_in_executor(
-                    self._executor,
-                    functools.partial(
-                        self.client.create_table, metrics_table, exists_ok=True
-                    ),
-                )
-
-                self._metrics_table = metrics_table
-
-                await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                    f"{self.metadata_string} - Created table - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.metrics_table_name} - if not exists"
-                )
-
-            for group_name, group in metrics_set.groups.items():
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Metrics Set - {group_name}:{group.metrics_group_id}"
-                )
-                rows.append({"group": group_name, **group.record})
-
-        await self._loop.run_in_executor(
-            self._executor,
-            functools.partial(
-                self.client.insert_rows_json,
-                self._metrics_table,
-                rows,
-                retry=bigquery.DEFAULT_RETRY.with_predicate(
-                    lambda exc: exc is not None
-                ).with_deadline(self.retry_timeout),
-            ),
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Metrics - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.metrics_table_name} - if not exists"
-        )
-
-    async def submit_custom(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Custom Metrics - Project: {self.project_name} - Dataset: {self.dataset_name}"
-        )
-
-        if self._custom_metrics_table is None:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Creating table - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.custom_metrics_table_name} - if not exists"
-            )
+        if self._step_results_table is None:
 
             table_schema = [
-                bigquery.SchemaField("name", "STRING", mode="REQUIRED"),
-                bigquery.SchemaField("stage", "STRING", mode="REQUIRED"),
-                bigquery.SchemaField("group", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("metric_name", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("metric_workflow", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("metric_step", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("metric_group", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("metric_type", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("metric_name", "INTEGER", mode="REQUIRED"),
+                bigquery.SchemaField("metric_value", "INTEGER", mode="REQUIRED"),
             ]
-
-            for metrics_set in metrics_sets:
-                for custom_metric in metrics_set.custom_metrics.values():
-                    if custom_metric.metric_type == MetricType.COUNT:
-                        table_schema.append(
-                            bigquery.SchemaField(
-                                custom_metric.metric_name, "INTEGER", mode="REQUIRED"
-                            )
-                        )
-
-                    else:
-                        table_schema.append(
-                            bigquery.SchemaField(
-                                custom_metric.metric_name, "FLOAT64", mode="REQUIRED"
-                            )
-                        )
 
             table_reference = bigquery.TableReference(
                 bigquery.DatasetReference(self.project_name, self.dataset_name),
-                self._custom_metrics_table_name,
+                self.step_results_table_name,
             )
 
-            custom_metrics_table = bigquery.Table(table_reference, schema=table_schema)
+            step_results_table = bigquery.Table(table_reference, schema=table_schema)
 
             await self._loop.run_in_executor(
-                self._executor,
+                None,
                 functools.partial(
-                    self.client.create_table, custom_metrics_table, exists_ok=True
+                    self.client.create_table, 
+                    step_results_table, 
+                    exists_ok=True,
                 ),
             )
 
-            self._custom_metrics_table = custom_metrics_table
-
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Created table - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.custom_metrics_table_name} - if not exists"
-            )
-
-        rows = []
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Custom Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
-            rows.append(
-                {
-                    "name": metrics_set.name,
-                    "stage": metrics_set.stage,
-                    "group": "custom",
-                    **{
-                        custom_metric.metric_name: custom_metric.metric_value
-                        for custom_metric in metrics_set.custom_metrics.values()
-                    },
-                }
-            )
+            self._step_results_table = step_results_table
 
         await self._loop.run_in_executor(
-            self._executor,
+            None,
             functools.partial(
                 self.client.insert_rows_json,
-                self._custom_metrics_table,
-                rows,
+                self._step_results_table,
+                step_results,
                 retry=bigquery.DEFAULT_RETRY.with_predicate(
                     lambda exc: exc is not None
                 ).with_deadline(self.retry_timeout),
             ),
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Custom Metrics - Project: {self.project_name} - Dataset: {self.dataset_name}"
-        )
-
-    async def submit_errors(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Errors Metrics Set - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.errors_table_name} - if not exists"
-        )
-
-        rows = []
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Errors Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
-            if self._errors_table is None:
-                await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                    f"{self.metadata_string} - Creating table - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.errors_table_name} - if not exists"
-                )
-
-                table_schema = [
-                    bigquery.SchemaField("name", "STRING", mode="REQUIRED"),
-                    bigquery.SchemaField("stage", "STRING", mode="REQUIRED"),
-                    bigquery.SchemaField("error_message", "STRING", mode="REQUIRED"),
-                    bigquery.SchemaField("error_count", "INTEGER", mode="REQUIRED"),
-                ]
-
-                table_reference = bigquery.TableReference(
-                    bigquery.DatasetReference(self.project_name, self.dataset_name),
-                    self.errors_table_name,
-                )
-
-                errors_table = bigquery.Table(table_reference, schema=table_schema)
-
-                await self._loop.run_in_executor(
-                    self._executor,
-                    functools.partial(
-                        self.client.create_table, errors_table, exists_ok=True
-                    ),
-                )
-
-                self._errors_table = errors_table
-
-                await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                    f"{self.metadata_string} - Created table - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.errors_table_name} - if not exists"
-                )
-
-            rows.extend(
-                [
-                    {
-                        "name": metrics_set.name,
-                        "stage": metrics_set.stage,
-                        "error_message": error.get("message"),
-                        "error_count": error.get("count"),
-                    }
-                    for error in metrics_set.errors
-                ]
-            )
-
-        await self._loop.run_in_executor(
-            self._executor,
-            functools.partial(
-                self.client.insert_rows_json,
-                self._errors_table,
-                rows,
-                retry=bigquery.DEFAULT_RETRY.with_predicate(
-                    lambda exc: exc is not None
-                ).with_deadline(self.retry_timeout),
-            ),
-        )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Errors Metrics - Project: {self.project_name} - Dataset: {self.dataset_name} - Table: {self.errors_table_name} - if not exists"
         )
 
     async def close(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Closing session - {self.session_uuid}"
-        )
-
-        await self._loop.run_in_executor(self._executor, self.client.close)
+        await self._loop.run_in_executor(None, self.client.close)

@@ -1,18 +1,16 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictInt
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class PostgresConfig(BaseModel):
-    host: str = "localhost"
-    database: str
-    username: str
-    password: str
-    events_table: str = "events"
-    metrics_table: str = "metrics"
-    experiments_table: str = "experiments"
-    streams_table: str = "streams"
-    system_metrics_table: str = "system_metrics"
+    host: StrictStr = "localhost"
+    port: StrictInt = 5432
+    database: StrictStr = 'hyperscale'
+    username: StrictStr
+    password: StrictStr
+    worfklow_results_table_name: StrictStr = 'hyperscale_workflow_results'
+    step_results_table_name: StrictStr = 'hyperscale_step_results'
     reporter_type: ReporterTypes = ReporterTypes.Postgres
 
     class Config:

@@ -3,7 +3,14 @@ from __future__ import annotations
 import os
 import threading
 import uuid
-from typing import Any, Dict, List, TypeVar, Union
+from hyperscale.core.results.workflow_types import (
+    WorkflowStats, 
+    ResultSet, 
+    MetricsSet, 
+    CheckSet,
+    CountResults
+)
+from typing import List, TypeVar, Union
 
 
 from .types import (
@@ -180,24 +187,149 @@ class Reporter:
 
         await self.selected_reporter.connect()
 
-    async def submit_common(self, metrics: List[Any]):
-        await self.selected_reporter.submit_common(metrics)
+    async def submit_workflow_results(self, results: WorkflowStats):
 
-    async def submit_events(self, events: List[Any]):
-        await self.selected_reporter.submit_events(events)
+        workflow_stats: CountResults = results.get('stats')
 
-    async def submit_metrics(self, metrics: List[Any]):
-        await self.selected_reporter.submit_metrics(metrics)
+        workflow_results = [
+            {
+                "metric_workflow": results.get('workflow'),
+                "metric_type": "COUNT",
+                "metric_group": "workflow",
+                "metric_name": count_name,
+                "metric_value": count_value,
 
-    async def submit_custom(self, metrics: List[Any]):
-        await self.selected_reporter.submit_custom(metrics)
+            } for count_name, count_value in workflow_stats.items()
+        ]
 
-    async def submit_errors(self, metrics: List[Any]):
-        await self.selected_reporter.submit_errors(metrics)
+        workflow_results.append({
+                "metric_workflow": results.get('workflow'),
+                "metric_type": "RATE",
+                "metric_group": "workflow",
+                "metric_name": "rps",
+                "metric_value": results.get('rps')
+        })
 
-    async def submit_system_metrics(self, metrics: List[Any]):
-        await self.selected_reporter.submit_session_system_metrics(metrics)
-        await self.selected_reporter.submit_stage_system_metrics(metrics)
+        workflow_results.append({
+                "metric_workflow": results.get('workflow'),
+                "metric_type": "TIMING",
+                "metric_group": "workflow",
+                "metric_name": "elapsed",
+                "metric_value": results.get('elapsed')
+
+        })
+
+        await self.selected_reporter.submit_workflow_results(workflow_results)
+
+    async def submit_step_results(self, results: WorkflowStats):
+
+        results_set: List[ResultSet] = results.get('results', [])
+
+        step_results = [
+            {
+                "metric_workflow": results_metrics.get('workflow'),
+                "metric_step": results_metrics.get("step"),
+                "metric_type": results_metrics.get("metric_type"),
+                "metric_group": timing_name,
+                "metric_name": metric_name,
+                "metric_value": metric_value
+            }
+            for results_metrics in results_set
+            for timing_name, timing_metrics in results_metrics.get(
+                'timings', {}
+            ).items()
+            for metric_name, metric_value in timing_metrics.items()
+        ]
+
+        step_results.extend([
+            {
+                "metric_workflow": results_metrics.get('workflow'),
+                "metric_step": results_metrics.get("step"),
+                "metric_type": results_metrics.get("metric_type"),
+                "metric_group": "counts",
+                "metric_name": count_name,
+                "metric_value": count_metric,
+            }
+            for results_metrics in results_set
+            for count_name, count_metric in results_metrics.get(
+                'counts',
+                {}
+            )
+        ])
+
+
+        metrics_set: List[MetricsSet] = results.get('metrics', [])
+
+        step_results.extend([
+            {
+                "metric_workflow": metrics.get('workflow'),
+                "metric_step": metrics.get("step"),
+                "metric_type": metrics.get("metric_type"),
+                "metric_group": "custom",
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+            } for metrics in metrics_set
+            for metric_name, metric_value in metrics.get(
+                'stats',
+                {}
+            ).items()
+        ])
+
+        step_results.extend([
+            {
+                "metric_workflow": metrics.get('workflow'),
+                "metric_step": metrics.get("step"),
+                "metric_metric_type": metrics.get("metric_type"),
+                "metric_group": "counts",
+                "metric_name": f'status_{status_count_name}',
+                "metric_value": status_count,
+                
+
+            } 
+            for metrics in results_set
+            for status_count_name, status_count in metrics.get(
+                'counts',
+                {}
+            ).get(
+                'statuses'
+            ).items()
+        ])
+
+        check_set: List[CheckSet] = results.get('checks', [])
+
+        step_results.extend([
+            {
+                "metric_workflow": check_metrics.get('workflow'),
+                "metric_step": check_metrics.get("step"),
+                "metric_type": check_metrics.get("metric_type"),
+                "metric_group": "counts",
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+            } for check_metrics in check_set
+            for metric_name, metric_value in check_metrics.get(
+                "counts",
+                {}
+            ).items()
+        ])
+
+        step_results.extend([
+            {
+                "metric_workflow": check_metrics.get('workflow'),
+                "metric_step": check_metrics.get("step"),
+                "metric_type": check_metrics.get("metric_type"),
+                "metric_group": "counts",
+                "metric_name": context_metric.get('context'),
+                "metric_value": context_metric.get('count'),
+            } for check_metrics in check_set
+            for context_metric in check_metrics.get(
+                "contexts",
+                {}
+            )
+
+        ])
+        
+
+        await self.selected_reporter.submit_step_results(step_results)
 
     async def close(self):
         await self.selected_reporter.close()

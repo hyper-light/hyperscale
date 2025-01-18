@@ -1,21 +1,18 @@
 from typing import Dict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictInt
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class AWSTimestreamConfig(BaseModel):
-    aws_access_key_id: str
-    aws_secret_access_key: str
-    region_name: str
-    database_name: str
-    events_table: str = "events"
-    metrics_table: str = "metrics"
-    experiments_table: str = "experiments"
-    streams_table: str = "streams"
-    system_metrics_table: str = "system_metrics"
-    retention_options: Dict[str, int] = {
+    aws_access_key_id: StrictStr
+    aws_secret_access_key: StrictStr
+    region_name: StrictStr
+    database_name: StrictStr = 'hyperscale'
+    workflow_results_table_name: StrictStr = 'hyperscale_workflow_results'
+    step_results_table_name: StrictStr = 'hyperscale_step_results'
+    retention_options: Dict[StrictStr, StrictInt] = {
         "MemoryStoreRetentionPeriodInHours": 1,
         "MagneticStoreRetentionPeriodInDays": 365,
     }
