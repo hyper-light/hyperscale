@@ -5,7 +5,8 @@ from hyperscale.reporting.types.common.types import ReporterTypes
 
 class HoneycombConfig(BaseModel):
     api_key: StrictStr
-    dataset: StrictStr = 'hyperscale'
+    workflow_results_dataset_name: StrictStr = 'hyperscale_workflow_results'
+    step_results_dataset_name: StrictStr = 'hyperscale_step_results'
     reporter_type: ReporterTypes = ReporterTypes.Honeycomb
 
     class Config:
