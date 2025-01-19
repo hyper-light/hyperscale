@@ -5,11 +5,13 @@ import importlib
 
 from hyperscale.core.engines.client import Client
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
+from hyperscale.reporting.reporter import ReporterConfig, JSONConfig
 
 
 class Workflow:
     vus = 1000
     duration = "1m"
+    reporting_config: ReporterConfig | None = None
 
     def __init__(self):
         module = importlib.import_module(self.__module__)
@@ -24,3 +26,6 @@ class Workflow:
         self.id = generator.generate()
 
         self.client = Client()
+
+        if self.reporting_config is None:
+            self.reporting_config = JSONConfig()

@@ -29,6 +29,7 @@ from .models.metric import (
     DISTRIBUTION,
     RATE,
     SAMPLE,
+    TIMING,
     Metric,
 )
 from hyperscale.reporting.results_types import (
@@ -120,7 +121,10 @@ class WorkflowResults:
             match hook_type:
                 case HookType.TEST:
                     test_results = self._process_timings_set(
-                        workflow, step, hook.engine_type, step_results
+                        workflow, 
+                        step, 
+                        hook.engine_type,
+                        step_results,
                     )
 
                     workflow_stats["results"].append(test_results)
@@ -251,6 +255,19 @@ class WorkflowResults:
                 "stats": {
                     "rate": sum(values) / elapsed,
                 },
+                "tags": tags,
+            }
+        
+        elif metric_type == TIMING:
+            stats = self._calculate_stats(metrics)
+            stats.update(
+                self._calculate_quantiles(metrics)
+            )
+            return {
+                "workflow": workflow,
+                "step": step_name,
+                "metric_type": "TIMING",
+                "stats": stats,
                 "tags": tags,
             }
 
@@ -531,6 +548,11 @@ class WorkflowResults:
         elif metric_type == RATE:
             return {
                 "rate": sum([metric["stats"]["rate"] for metric in metrics]),
+            }
+        
+        elif metric_type == TIMING:
+            return {
+                "timing": statistics.median(metrics["stats"]["timing"]) for metric in metrics
             }
 
         else:

@@ -10,7 +10,7 @@ from hyperscale.core.results.workflow_types import (
     CheckSet,
     CountResults,
 )
-from typing import List, TypeVar, Union
+from typing import List, TypeVar, Generic
 
 from .common import (
     ReporterTypes as ReporterTypes,
@@ -64,43 +64,44 @@ from .timescaledb import (
 from .xml import XML as XML, XMLConfig as XMLConfig
 
 
-ReporterType = TypeVar(
-    "ReporterType",
-    AWSLambdaConfig,
-    AWSTimestreamConfig,
-    BigQueryConfig,
-    BigTableConfig,
-    CassandraConfig,
-    CloudwatchConfig,
-    CosmosDBConfig,
-    CSVConfig,
-    DatadogConfig,
-    DogStatsDConfig,
-    GoogleCloudStorageConfig,
-    GraphiteConfig,
-    HoneycombConfig,
-    InfluxDBConfig,
-    JSONConfig,
-    KafkaConfig,
-    MongoDBConfig,
-    MySQLConfig,
-    NetdataConfig,
-    NewRelicConfig,
-    PostgresConfig,
-    PrometheusConfig,
-    RedisConfig,
-    S3Config,
-    SnowflakeConfig,
-    SQLiteConfig,
-    StatsDConfig,
-    TelegrafConfig,
-    TelegrafStatsDConfig,
-    TimescaleDBConfig,
-    XMLConfig,
+ReporterConfig = (
+    AWSLambdaConfig
+    | AWSTimestreamConfig
+    | BigQueryConfig
+    | BigTableConfig
+    | CassandraConfig
+    | CloudwatchConfig
+    | CosmosDBConfig
+    | CSVConfig
+    | DatadogConfig
+    | DogStatsDConfig
+    | GoogleCloudStorageConfig
+    | GraphiteConfig
+    | HoneycombConfig
+    | InfluxDBConfig
+    | JSONConfig
+    | KafkaConfig
+    | MongoDBConfig
+    | MySQLConfig
+    | NetdataConfig
+    | NewRelicConfig
+    | PostgresConfig
+    | PrometheusConfig
+    | RedisConfig
+    | S3Config
+    | SnowflakeConfig
+    | SQLiteConfig
+    | StatsDConfig
+    | TelegrafConfig
+    | TelegrafStatsDConfig
+    | TimescaleDBConfig
+    | XMLConfig
 )
 
+T = TypeVar("T")
 
-class Reporter:
+
+class Reporter(Generic[T]):
     reporters = {
         ReporterTypes.AWSLambda: lambda config: AWSLambda(config),
         ReporterTypes.AWSTimestream: lambda config: AWSTimestream(config),
@@ -135,29 +136,16 @@ class Reporter:
         ReporterTypes.XML: lambda config: XML(config),
     }
 
-    def __init__(self, reporter_config: Union[ReporterType]) -> None:
+    def __init__(self, reporter_config: T) -> None:
         self.reporter_id = str(uuid.uuid4())
 
-        self.graph_name: str = None
-        self.graph_id: str = None
-        self.stage_name: str = None
-        self.stage_id: str = None
         self.metadata_string: str = None
         self.thread_id = threading.current_thread().ident
         self.process_id = os.getpid()
 
-        if reporter_config is None:
-            reporter_config = JSONConfig()
-
-        self.reporter_type = reporter_config.reporter_type
-
-        if isinstance(self.reporter_type, ReporterTypes):
-            self.reporter_type_name = self.reporter_type.name.capitalize()
-
-        elif isinstance(self.reporter_type, str):
-            self.reporter_type_name = self.reporter_type.capitalize()
-
-        self.reporter_config = reporter_config
+        self.reporter_config: T = reporter_config
+        self.reporter_type = self.reporter_config.reporter_type
+        self.reporter_type_name = self.reporter_type.name.capitalize()
 
         selected_reporter = self.reporters.get(self.reporter_type)
         if selected_reporter is None:
@@ -167,7 +155,6 @@ class Reporter:
             self.selected_reporter = selected_reporter(reporter_config)
 
     async def connect(self):
-        self.metadata_string = f"Graph - {self.graph_name}:{self.graph_id} - thread:{self.thread_id} - process:{self.process_id} - Stage: {self.stage_name}:{self.stage_id} - Reporter: {self.reporter_type_name}:{self.reporter_id} - "
         self.selected_reporter.metadata_string = self.metadata_string
 
         await self.selected_reporter.connect()
@@ -215,7 +202,7 @@ class Reporter:
             {
                 "metric_workflow": results_metrics.get("workflow"),
                 "metric_step": results_metrics.get("step"),
-                "metric_type": results_metrics.get("metric_type"),
+                "metric_type": "DISTRIBUTION" if "quantile" in metric_name else "TIMING",
                 "metric_group": timing_name,
                 "metric_name": metric_name,
                 "metric_value": metric_value,
@@ -232,13 +219,16 @@ class Reporter:
                 {
                     "metric_workflow": results_metrics.get("workflow"),
                     "metric_step": results_metrics.get("step"),
-                    "metric_type": results_metrics.get("metric_type"),
+                    "metric_type": "COUNT",
                     "metric_group": "counts",
                     "metric_name": count_name,
                     "metric_value": count_metric,
                 }
                 for results_metrics in results_set
-                for count_name, count_metric in results_metrics.get("counts", {})
+                for count_name, count_metric in results_metrics.get(
+                    "counts", 
+                    {},
+                ).items()
             ]
         )
 
@@ -249,7 +239,9 @@ class Reporter:
                 {
                     "metric_workflow": metrics.get("workflow"),
                     "metric_step": metrics.get("step"),
-                    "metric_type": metrics.get("metric_type"),
+                    "metric_type": "DISTRIBUTION" if "quantile" in metric_name else metrics.get(
+                        "metric_type"
+                    ),
                     "metric_group": "custom",
                     "metric_name": metric_name,
                     "metric_value": metric_value,
@@ -264,7 +256,7 @@ class Reporter:
                 {
                     "metric_workflow": metrics.get("workflow"),
                     "metric_step": metrics.get("step"),
-                    "metric_metric_type": metrics.get("metric_type"),
+                    "metric_type": "COUNT",
                     "metric_group": "counts",
                     "metric_name": f"status_{status_count_name}",
                     "metric_value": status_count,
@@ -283,13 +275,14 @@ class Reporter:
                 {
                     "metric_workflow": check_metrics.get("workflow"),
                     "metric_step": check_metrics.get("step"),
-                    "metric_type": check_metrics.get("metric_type"),
+                    "metric_type": "COUNT",
                     "metric_group": "counts",
                     "metric_name": metric_name,
                     "metric_value": metric_value,
                 }
                 for check_metrics in check_set
-                for metric_name, metric_value in check_metrics.get("counts", {}).items()
+                for metric_name, metric_value in check_metrics.get("counts", {}).items() 
+                if metric_name in ["succeeded", "failed", "executed"]
             ]
         )
 
@@ -298,7 +291,7 @@ class Reporter:
                 {
                     "metric_workflow": check_metrics.get("workflow"),
                     "metric_step": check_metrics.get("step"),
-                    "metric_type": check_metrics.get("metric_type"),
+                    "metric_type": "COUNT",
                     "metric_group": "counts",
                     "metric_name": context_metric.get("context"),
                     "metric_value": context_metric.get("count"),

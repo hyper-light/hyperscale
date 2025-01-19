@@ -8,11 +8,12 @@ from typing import (
 
 QuantileSet = Dict[str, int | float]
 StatTypes = Literal["max", "min", "mean", "med", "stdev", "var", "mad"]
+CountTypes = Literal["succeeded", "failed", "executed"]
 
 StatusCounts = Dict[int, int]
 StatsResults = Dict[StatTypes, int | float] | QuantileSet
 CountResults = Dict[
-    Literal["succeeded", "failed", "executed"] | Optional[Literal["statuses"]],
+    CountTypes | Optional[Literal["statuses"]],
     int | Optional[StatusCounts],
 ]
 

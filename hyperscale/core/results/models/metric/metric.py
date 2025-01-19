@@ -8,6 +8,7 @@ from .metric_types import (
     DISTRIBUTION,
     RATE,
     SAMPLE,
+    TIMING,
 )
 
 T = TypeVarTuple("T")
@@ -25,7 +26,7 @@ class Metric(Generic[*T]):
     def __init__(
         self,
         value: int | float | Metric,
-        metric_type: COUNT | DISTRIBUTION | SAMPLE | RATE,
+        metric_type: COUNT | DISTRIBUTION | RATE | SAMPLE| TIMING,
         precision: Optional[int] = None,
         tags: Optional[List[str]] = None,
     ) -> None:

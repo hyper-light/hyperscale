@@ -117,30 +117,32 @@ class XML:
             step_results_file.write,
             step_results_xml.toprettyxml(),
         )
-
+        
     async def _get_filepath(self, filepath: str):
         filename_offset = 0
+        base_path = await self._loop.run_in_executor(
+            None,
+            pathlib.Path,
+            filepath,
+        )
+
+        base_file_stem = base_path.stem
+        parent_dir = base_path.parent
 
         while await self._loop.run_in_executor(
             None,
             os.path.exists,
             filepath,
         ):
-            path = await self._loop.run_in_executor(
-                None,
-                pathlib.Path,
-                filepath,
-            )
-            parent_dir = path.parent
-
-            filename = path.stem
-
             filename_offset += 1
 
-            next_filename = f"{filename}_{filename_offset}.json"
+            next_filename = f"{base_file_stem}_{filename_offset}.json"
 
             filepath = await self._loop.run_in_executor(
-                None, os.path.join, parent_dir, next_filename
+                None, 
+                os.path.join,
+                  parent_dir, 
+                  next_filename
             )
 
         return filepath

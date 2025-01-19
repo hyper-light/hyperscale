@@ -42,9 +42,8 @@ from hyperscale.reporting.results_types import (
     WorkflowContextResult,
     WorkflowStats,
 )
-
+from hyperscale.reporting.reporter import Reporter
 from .remote_graph_controller import RemoteGraphController
-from .workflow_runner import cancel_pending
 
 
 NodeResults = Tuple[
@@ -349,6 +348,15 @@ class RemoteGraphManager:
             run_id,
             updated_context,
         )
+
+        reporter = Reporter(workflow.reporting_config)
+
+        await reporter.connect()
+
+        await reporter.submit_workflow_results(execution_result)
+        await reporter.submit_step_results(execution_result)
+
+        await reporter.close()
 
         await asyncio.sleep(1)
 
