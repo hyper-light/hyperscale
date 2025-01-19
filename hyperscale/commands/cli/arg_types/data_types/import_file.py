@@ -13,9 +13,8 @@ T = TypeVar("T")
 
 
 class ImportFile(Generic[T]):
-
     def __init__(
-        self, 
+        self,
         data_type: ImportFile[T],
     ):
         super().__init__()
@@ -105,6 +104,4 @@ class ImportFile(Generic[T]):
             return imported_types
 
         except Exception as e:
-            return Exception(
-                f"could not import objects from file {arg}"
-            )
+            return Exception(f"could not import objects from file {arg}")

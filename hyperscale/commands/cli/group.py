@@ -399,9 +399,7 @@ class Group(Generic[T]):
                 break
 
             elif is_unsupported_keyword_arg(arg, keyword_args_map):
-                errors.append(
-                    Exception(f'unsupported option {arg}')
-                )
+                errors.append(Exception(f"unsupported option {arg}"))
 
             elif (
                 positional_arg := self.positional_args.get(positional_idx)
@@ -496,7 +494,7 @@ class Group(Generic[T]):
         for arg_idx, arg in enumerate(args):
             if arg.startswith("-"):
                 value_idx = arg_idx + 1
-            
+
             else:
                 break
 

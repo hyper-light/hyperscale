@@ -8,8 +8,8 @@ from typing import Literal
 from hyperscale.core.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow
 from .cli import (
-    CLI, 
-    ImportFile, 
+    CLI,
+    ImportFile,
     JsonFile,
     AssertSet,
 )

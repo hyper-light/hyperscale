@@ -8,8 +8,8 @@ from typing import Literal
 from hyperscale.core.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow
 from .cli import (
-    CLI, 
-    ImportFile, 
+    CLI,
+    ImportFile,
     JsonFile,
     AssertSet,
 )
@@ -28,15 +28,15 @@ async def get_default_workers():
         ),
     )
 
+
 def get_default_config():
     return HyperscaleConfig()
-
 
 
 @CLI.command()
 async def run(
     path: ImportFile[Workflow],
-    config: JsonFile[HyperscaleConfig]=get_default_config,
+    config: JsonFile[HyperscaleConfig] = get_default_config,
     log_level: AssertSet[
         Literal[
             "debug",

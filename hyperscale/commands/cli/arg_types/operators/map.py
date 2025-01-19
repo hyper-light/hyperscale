@@ -39,22 +39,10 @@ class Map(Generic[*T]):
         self.data: Any | None = None
 
         self._complex_types: dict[
-            AssertSet
-            | Env
-            | ImportFile
-            | JsonData
-            | JsonData
-            | Pattern
-            | RawFile,
+            AssertSet | Env | ImportFile | JsonData | JsonData | Pattern | RawFile,
             Callable[
                 [str, type[Any]],
-                AssertSet
-                | Env
-                | ImportFile
-                | JsonData
-                | JsonData
-                | Pattern
-                | RawFile,
+                AssertSet | Env | ImportFile | JsonData | JsonData | Pattern | RawFile,
             ],
         ] = {
             AssertSet: lambda name, subtype: AssertSet(name, subtype),

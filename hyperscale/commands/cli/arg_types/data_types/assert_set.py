@@ -4,16 +4,11 @@ from typing import TypeVar, Generic, Any
 from .reduce_pattern_type import reduce_pattern_type
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 class AssertSet(Generic[T]):
-
-    def __init__(
-        self,
-        name: str,
-        data_type: AssertSet[T]
-    ):
+    def __init__(self, name: str, data_type: AssertSet[T]):
         super().__init__()
         self.name = name
         self.data: T | None = None
@@ -36,14 +31,15 @@ class AssertSet(Generic[T]):
     @property
     def data_type(self):
         return ", ".join(self._data_types)
-    
-    async def parse(self, arg: str | None = None):
 
+    async def parse(self, arg: str | None = None):
         if arg is None:
-            return Exception('no argument passed')
-        
+            return Exception("no argument passed")
+
         try:
-            assert arg in self._types, f'{arg} is not a supported value for {self.name} - please pass one of {self.data_type}'
+            assert arg in self._types, (
+                f"{arg} is not a supported value for {self.name} - please pass one of {self.data_type}"
+            )
 
             self.data = arg
 
@@ -51,4 +47,3 @@ class AssertSet(Generic[T]):
 
         except Exception as e:
             return e
-        

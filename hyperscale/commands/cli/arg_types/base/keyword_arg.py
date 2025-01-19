@@ -227,6 +227,6 @@ def is_env_defaultable(
 
 
 def is_unsupported_keyword_arg(arg: str, keyword_args: dict[str, KeywordArg]):
-    return (
-        arg.startswith('--') or arg.startswith('-')
-    ) and arg.replace('-', '') not in keyword_args
+    return (arg.startswith("--") or arg.startswith("-")) and arg.replace(
+        "-", ""
+    ) not in keyword_args

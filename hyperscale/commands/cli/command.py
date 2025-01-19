@@ -256,9 +256,7 @@ class Command(Generic[T]):
                 consumed_idxs.add(idx)
 
             elif is_unsupported_keyword_arg(arg, keyword_args_map):
-                errors.append(
-                    Exception(f'unsupported option {arg}')
-                )
+                errors.append(Exception(f"unsupported option {arg}"))
 
             elif (
                 positional_arg := positional_args_map.get(positional_idx)
@@ -343,7 +341,7 @@ class Command(Generic[T]):
         for arg_idx, arg in enumerate(args):
             if arg.startswith("-"):
                 value_idx = arg_idx + 1
-            
+
             else:
                 break
 
