@@ -1,24 +1,21 @@
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictInt
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class SnowflakeConfig(BaseModel):
-    username: str
-    password: str
-    organization_id: str
-    account_id: str
-    private_key: Optional[str]
-    warehouse: str
-    database: str
-    database_schema: str = "PUBLIC"
-    events_table: str = "events"
-    metrics_table: str = "metrics"
-    experiments_table: str = "experiments"
-    streams_table: str = "streams"
-    system_metrics_table: str = "system_metrics"
+    username: StrictStr
+    password: StrictStr
+    organization_id: StrictStr
+    account_id: StrictStr
+    private_key: StrictStr | None = None
+    warehouse: StrictStr
+    database: StrictStr = 'hyperscale'
+    database_schema: StrictStr = "PUBLIC"
+    workflow_results_table_name: StrictStr = 'hyperscale_workflow_results'
+    step_results_table_name: StrictStr = 'hyperscale_step_results'
     connect_timeout: int = 30
     reporter_type: ReporterTypes = ReporterTypes.Snowflake
 

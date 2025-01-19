@@ -1,13 +1,14 @@
 import uuid
-from typing import Dict, List
-
-
-from hyperscale.reporting.metric import MetricsSet
+from hyperscale.reporting.types.common import (
+    ReporterTypes,
+    WorkflowMetricSet,
+    StepMetricSet
+)
 
 from .influxdb_config import InfluxDBConfig
 
 try:
-    from influxdb_client import Point
+    from influxdb_client import Point, WriteApi
     from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
 
     has_connector = True
@@ -15,6 +16,9 @@ try:
 except Exception:
     Point = None
     has_connector = False
+
+    class WriteApi:
+        pass
 
     class Point:
         pass
@@ -26,43 +30,28 @@ except Exception:
 class InfluxDB:
     def __init__(self, config: InfluxDBConfig) -> None:
         self.host = config.host
+        self.port = config.port
         self.token = config.token
         self.protocol = "https" if config.secure else "http"
+
         self.organization = config.organization
         self.connect_timeout = config.connect_timeout
 
-        self.events_bucket_name = config.events_bucket
-        self.metrics_bucket_name = config.metrics_bucket
-        self.streams_bucket_name = config.streams_bucket
-        self.shared_metrics_bucket_name = f"{config.metrics_bucket}_shared"
+        self._workflow_results_bucket_name = config.workflow_results_bucket_name
+        self._step_results_bucket_name = config.step_results_bucket_name
 
-        self.experiments_bucket_name = config.experiments_bucket
-        self.variants_bucket_name = f"{config.experiments_bucket}_variants"
-        self.mutations_bucket_name = f"{config.experiments_bucket}_mutations"
-
-        self.errors_bucket_name = f"{config.metrics_bucket}_errors"
-        self.custom_bucket_name = f"{config.metrics_bucket}_custom"
-
-        self.session_system_metrics_bucket_name = (
-            f"{config.system_metrics_bucket}_session"
-        )
-        self.stage_system_metrics_bucket_name = f"{config.system_metrics_bucket}_stage"
-
-        self.client = None
-        self.write_api = None
+        self.client: InfluxDBClientAsync = None
+        self.write_api: WriteApi = None
 
         self.session_uuid = str(uuid.uuid4())
+        self.reporter_type = ReporterTypes.InfluxDB
+        self.reporter_type_name = self.reporter_type.name.capitalize()
         self.metadata_string: str = None
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
 
     async def connect(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Connecting to InfluxDB at - {self.protocol}://{self.host} - for Organization - {self.organization}"
-        )
 
         self.client = InfluxDBClientAsync(
-            f"{self.protocol}://{self.host}",
+            f"{self.protocol}://{self.host}:{self.port}",
             token=self.token,
             org=self.organization,
             timeout=self.connect_timeout,
@@ -70,155 +59,51 @@ class InfluxDB:
 
         self.write_api = self.client.write_api()
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Connected to InfluxDB at - {self.protocol}://{self.host} - for Organization - {self.organization}"
-        )
-
-    async def submit_common(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Shared Metrics to Bucket - {self.shared_metrics_bucket_name}"
-        )
+    async def submit_workflow_results(
+        self,
+        workflow_results: WorkflowMetricSet,
+    ):
 
         points = []
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
+        for result in workflow_results:
 
-            point = Point(metrics_set.name)
+            metric_workflow = result.get('metric_workflow')
+            metric_name = result.get('metric_name')
 
-            for tag in metrics_set.tags:
-                point.tag(tag.name, tag.value)
+            point = Point(f'{metric_workflow}_{metric_name}')
 
-            metric_record = {
-                "name": metrics_set.name,
-                "stage": metrics_set.stage,
-                **metrics_set.common_stats,
-            }
-
-            for field, value in metric_record.items():
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Shared Metric - {metrics_set.name}:common:{field}"
-                )
+            for field, value in result.items():
                 point.field(field, value)
 
             points.append(point)
 
         await self.write_api.write(
-            bucket=self.shared_metrics_bucket_name, record=points
+            bucket=self._workflow_results_bucket_name, 
+            record=points,
         )
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Shared Metrics to Bucket - {self.shared_metrics_bucket_name}"
-        )
-
-    async def submit_metrics(self, metrics: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Metrics to Bucket - {self.metrics_bucket_name}"
-        )
-
+    async def submit_metrics(
+        self,
+        step_results: StepMetricSet
+    ):
         points = []
-        for metrics_set in metrics:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
+        for result in step_results:
 
-            for group_name, group in metrics_set.groups.items():
-                point = Point(metrics_set.name)
+            metric_workflow = result.get('metric_workflow')
+            metric_step = result.get('metric_step')
+            metric_name = result.get('metric_name')
 
-                for tag in metrics_set.tags:
-                    point.tag(tag.name, tag.value)
+            point = Point(f'{metric_workflow}_{metric_step}_{metric_name}')
 
-                metric_record = {**group.stats, **group.custom, "group": group_name}
-
-                for field, value in metric_record.items():
-                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                        f"{self.metadata_string} - Submitting Shared Metric - {metrics_set.name}:{group_name}:{field}"
-                    )
-                    point.field(field, value)
-
-                points.append(point)
-
-        await self.write_api.write(bucket=self.metrics_bucket_name, record=points)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Metrics to Bucket - {self.metrics_bucket_name}"
-        )
-
-    async def submit_custom(self, metrics_sets: List[MetricsSet]):
-        points = []
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
-            for custom_metric_name, custom_metric in metrics_set.custom_metrics.items():
-                point = Point(f"{metrics_set.name}_{custom_metric_name}")
-
-                for tag in metrics_set.tags:
-                    point.tag(tag.name, tag.value)
-
-                metric_record = {
-                    "name": metrics_set.name,
-                    "stage": metrics_set.stage,
-                    "group": "custom",
-                    custom_metric_name: custom_metric.metric_value,
-                }
-
-                for field, value in metric_record.items():
-                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                        f"{self.metadata_string} - Submitting Shared Metric - {metrics_set.name}:custom:{field}"
-                    )
-                    point.field(field, value)
-
-                points.append(point)
-
-        for point in points:
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Submitting Custom Metrics to Bucket - {self.custom_bucket_name}_metrics"
-            )
-            await self.write_api.write(bucket=self.custom_bucket_name, record=points)
-
-            await self.logger.filesystem.aio["hyperscale.reporting"].info(
-                f"{self.metadata_string} - Submitted Custom Metrics to Bucket - {self.custom_bucket_name}_metrics"
-            )
-
-    async def submit_errors(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Errors Metrics to Bucket - {self.errors_bucket_name}"
-        )
-
-        points = []
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Errors Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
-            for error in metrics_set.errors:
-                point = Point(f"{metrics_set.name}_errors")
-                point.field(error.get("message"), error.get("count"))
+            for field, value in result.items():
+                point.field(field, value)
 
             points.append(point)
 
-        await self.write_api.write(bucket=self.errors_bucket_name, record=points)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Errors Metrics to Bucket - {self.errors_bucket_name}"
+        await self.write_api.write(
+            bucket=self._workflow_results_bucket_name, 
+            record=points,
         )
 
     async def close(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Closing session - {self.session_uuid}"
-        )
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Closing connectiion to InfluxDB at - {self.protocol}://{self.host} - for Organization - {self.organization}"
-        )
-
         await self.client.close()
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Session Closed - {self.session_uuid}"
-        )
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Closed connectiion to InfluxDB at - {self.protocol}://{self.host} - for Organization - {self.organization}"
-        )

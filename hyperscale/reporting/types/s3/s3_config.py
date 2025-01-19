@@ -1,16 +1,16 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class S3Config(BaseModel):
-    aws_access_key_id: str
-    aws_secret_access_key: str
-    region_name: str
-    buckets_namespace: str
-    events_bucket: str = "events"
-    metrics_bucket: str = "metrics"
-    experiments_bucket: str = "experiments"
-    streams_bucket: str = "streams"
-    system_metrics_bucket: str = "system_metrics"
+    aws_access_key_id: StrictStr
+    aws_secret_access_key: StrictStr
+    region_name: StrictStr
+    buckets_namespace: StrictStr = 'hyperscale'
+    workflow_results_bucket_name: StrictStr = 'hyperscale_workflow_results'
+    step_results_bucket_name: StrictStr = 'hyperscale_step_results'
     reporter_type: ReporterTypes = ReporterTypes.S3
+
+    class Config:
+        arbitrary_types_allowed = True

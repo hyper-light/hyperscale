@@ -121,7 +121,9 @@ class JSON:
                 os.path.join,
                 parent_dir,
                 next_filename
-            )  
+            ) 
+
+        return filepath 
 
     async def close(self):
         pass

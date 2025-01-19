@@ -1,4 +1,3 @@
-import re
 import uuid
 from typing import Literal, Dict, Callable
 
@@ -77,7 +76,6 @@ class StatsD:
 
     async def connect(self):
         await self.connection.connect()
-
 
     async def submit_workflow_results(self, workflow_results: WorkflowMetricSet):
         for result in workflow_results:

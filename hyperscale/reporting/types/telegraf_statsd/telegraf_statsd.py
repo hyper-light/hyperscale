@@ -3,7 +3,11 @@ from typing import Dict, Literal, Callable
 
 
 from hyperscale.core.results.workflow_types import MetricType
-from hyperscale.reporting.types.common import ReporterTypes
+from hyperscale.reporting.types.common import (
+    ReporterTypes,
+    WorkflowMetricSet,
+    StepMetricSet
+)
 
 
 try:
@@ -79,3 +83,41 @@ class TelegrafStatsD(StatsD):
         self.metadata_string: str = None
 
         self.statsd_type = "TelegrafStatsD"
+
+    async def connect(self):
+        await self.connection.connect()
+
+
+    async def submit_workflow_results(self, workflow_results: WorkflowMetricSet):
+        for result in workflow_results:
+
+            metric_name = result.get('metric_name')
+            metric_workflow = result.get('metric_workflow')
+            metric_value = result.get('metric_value')
+
+            metric_type = result.get('metric_type')
+            statsd_type = self._types_map.get(metric_type)
+
+            self._update_map.get(statsd_type)(
+                f'{metric_workflow}_{metric_name}',
+                metric_value,
+            )
+
+    async def submit_step_results(self, step_results: StepMetricSet):
+        for result in step_results:
+
+            metric_name = result.get('metric_name')
+            metric_workflow = result.get('metric_workflow')
+            metric_step = result.get('metric_step')
+            metric_value = result.get('metric_value')
+
+            metric_type = result.get('metric_type')
+            statsd_type = self._types_map.get(metric_type)
+
+            self._update_map.get(statsd_type)(
+                f'{metric_workflow}_{metric_step}_{metric_name}',
+                metric_value,
+            )
+
+    async def close(self):
+        await self.connection.close()

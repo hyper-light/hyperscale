@@ -1,27 +1,21 @@
 import asyncio
 import functools
-import re
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List
 
-import psutil
-
-
-from hyperscale.reporting.metric import MetricsSet
+from hyperscale.reporting.types.common import (
+    ReporterTypes,
+    WorkflowMetricSet,
+    StepMetricSet
+)
+from .newrelic_config import NewRelicConfig
 
 try:
-    import newrelic.agent
 
-    from .newrelic_config import NewRelicConfig
 
     has_connector = True
 
 except Exception:
     has_connector = False
-
-    class NewRelicConfig:
-        pass
 
     class newrelic:
         agent = object
@@ -35,22 +29,18 @@ class NewRelic:
         self.shutdown_timeout = config.shutdown_timeout or 60
         self.newrelic_application_name = config.newrelic_application_name
 
-        self._executor = ThreadPoolExecutor(max_workers=psutil.cpu_count(logical=False))
         self.client = None
         self._loop = asyncio.get_event_loop()
 
         self.session_uuid = str(uuid.uuid4())
+        self.reporter_type = ReporterTypes.NewRelic
+        self.reporter_type_name = self.reporter_type.name.capitalize()
         self.metadata_string: str = None
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
 
     async def connect(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Connecting to NewRelic - Using config at path - {self.config_path} - Environment - {self.environment}"
-        )
 
         await self._loop.run_in_executor(
-            self._executor,
+            None,
             functools.partial(
                 newrelic.agent.initialize,
                 config_file=self.config_path,
@@ -59,7 +49,7 @@ class NewRelic:
         )
 
         self.client = await self._loop.run_in_executor(
-            self._executor,
+            None,
             functools.partial(
                 newrelic.agent.register_application,
                 name=self.newrelic_application_name,
@@ -67,137 +57,38 @@ class NewRelic:
             ),
         )
 
-        await asyncio.sleep(1)
+    async def submit_workflow_results(self, workflow_results: WorkflowMetricSet):
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Connected to NewRelic - Using config at path - {self.config_path} - Environment - {self.environment}"
-        )
+        for result in workflow_results:
 
-    async def submit_common(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Shared Metrics to NewRelic"
-        )
+            metric_workflow = result.get('metric_workflow')
+            metric_name = result.get('metric_name')
 
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Shared Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            await self._loop.run_in_executor(
+                None,
+                functools.partial(
+                    self.client.record_custom_metric,
+                    f"{metric_workflow}_{metric_name}",
+                    result.get('metric_value'),
+                ),
             )
 
-            for field, value in metrics_set.common_stats.items():
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Shared Metric - {metrics_set.name}:common:{field}"
-                )
-                await self._loop.run_in_executor(
-                    self._executor,
-                    functools.partial(
-                        self.client.record_custom_metric,
-                        f"{metrics_set.name}_{field}",
-                        value,
-                    ),
-                )
+    async def submit_step_results(self, step_results: StepMetricSet):
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Shared Metrics to NewRelic"
-        )
+        for result in step_results:
 
-    async def submit_metrics(self, metrics: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Metrics to NewRelic"
-        )
+            metric_workflow = result.get('metric_workflow')
+            metric_step = result.get('metric_step')
+            metric_name = result.get('metric_name')
 
-        for metrics_set in metrics:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
+            await self._loop.run_in_executor(
+                None,
+                functools.partial(
+                    self.client.record_custom_metric,
+                    f"{metric_workflow}_{metric_step}_{metric_name}",
+                    result.get('metric_value'),
+                ),
             )
-
-            for group_name, group in metrics_set.groups.items():
-                for field, value in group.stats.items():
-                    await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                        f"{self.metadata_string} - Submitting Metric - {metrics_set.name}:{group_name}:{field}"
-                    )
-                    await self._loop.run_in_executor(
-                        self._executor,
-                        functools.partial(
-                            self.client.record_custom_metric,
-                            f"{metrics_set.name}_{group_name}_{field}",
-                            value,
-                        ),
-                    )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Metrics to NewRelic"
-        )
-
-    async def submit_custom(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Custom Metrics to NewRelic"
-        )
-
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Custom Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
-            for custom_metric_name, custom_metric in metrics_set.custom_metrics.items():
-                await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                    f"{self.metadata_string} - Submitting Custom Metric - {metrics_set.name}:custom:{custom_metric_name}"
-                )
-                await self._loop.run_in_executor(
-                    self._executor,
-                    functools.partial(
-                        self.client.record_custom_metric,
-                        f"{metrics_set.name}_custom_{custom_metric_name}",
-                        custom_metric.metric_value,
-                    ),
-                )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Custom Metrics to NewRelic"
-        )
-
-    async def submit_errors(self, metrics_sets: List[MetricsSet]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting Error Metrics to NewRelic"
-        )
-
-        for metrics_set in metrics_sets:
-            await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-                f"{self.metadata_string} - Submitting Custom Metrics Set - {metrics_set.name}:{metrics_set.metrics_set_id}"
-            )
-
-            for error in metrics_set.errors:
-                error_message = re.sub(
-                    "[^0-9a-zA-Z]+", "_", error.get("message").lower()
-                )
-
-                error_message_metric_name = f"{metrics_set.name}_errors_{error_message}"
-
-                await self._loop.run_in_executor(
-                    self._executor,
-                    functools.partial(
-                        self.client.record_custom_metric,
-                        error_message_metric_name,
-                        error.get("count"),
-                    ),
-                )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted Error Metrics to NewRelic"
-        )
 
     async def close(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Closing session - {self.session_uuid}"
-        )
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Closing connectiion to NewRelic"
-        )
-
-        await self._loop.run_in_executor(self._executor, self.client.shutdown)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].debug(
-            f"{self.metadata_string} - Session Closed - {self.session_uuid}"
-        )
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Closed connectiion to NewRelic"
-        )
+        await self._loop.run_in_executor(None, self.client.shutdown)

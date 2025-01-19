@@ -1,9 +1,12 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictInt
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class NetdataConfig(BaseModel):
-    host: str = "localhost"
-    port: int = 8125
+    host: StrictStr = "localhost"
+    port: StrictInt = 8125
     reporter_type: ReporterTypes = ReporterTypes.Netdata
+
+    class Config:
+        arbitrary_types_allowed = True

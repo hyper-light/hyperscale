@@ -1,20 +1,24 @@
-from typing import Optional
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictInt, StrictBool
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
+RedisChannelType = Literal['channel', 'pipeline']
+
+
 class RedisConfig(BaseModel):
-    host: str = "localhost:6379"
-    username: Optional[str]
-    password: Optional[str]
-    database: int = 0
-    events_channel: str = "events"
-    metrics_channel: str = "metrics"
-    experiments_channel: str = "experiments"
-    streams_channel: str = "streams"
-    system_metrics_channel: str = "system_metrics"
-    channel_type: str = "pipeline"
-    secure: bool = False
+    host: StrictStr = "localhost"
+    port: StrictInt = 6379
+    username: StrictStr | None = None
+    password: StrictStr | None = None
+    database: StrictInt = 0
+    workflow_results_channel_name: StrictStr = 'hyperscale_workflow_results'
+    step_results_channel_name: StrictStr = 'hyperscale_step_results'
+    channel_type: RedisChannelType = "pipeline"
+    secure: StrictBool = False
     reporter_type: ReporterTypes = ReporterTypes.Redis
+
+    class Config:
+        arbitrary_types_allowed = True

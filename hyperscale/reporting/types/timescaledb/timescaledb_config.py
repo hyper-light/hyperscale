@@ -1,18 +1,15 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class TimescaleDBConfig(BaseModel):
-    host: str = "localhost"
-    database: str
-    username: str
-    password: str
-    events_table: str = "events"
-    metrics_table: str = "metrics"
-    experiments_table: str = "experiments"
-    streams_table: str = "streams"
-    system_metrics_table: str = "system_metrics"
+    host: StrictStr = "localhost"
+    database: StrictStr = 'hyperscale'
+    username: StrictStr
+    password: StrictStr
+    workflow_results_table_name: StrictStr = 'hyperscale_workflow_results'
+    step_results_table_name: StrictStr = 'hyperscale_step_results'
     reporter_type: ReporterTypes = ReporterTypes.TimescaleDB
 
     class Config:

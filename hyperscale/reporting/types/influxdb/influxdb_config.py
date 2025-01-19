@@ -1,17 +1,18 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr, StrictInt, StrictBool
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class InfluxDBConfig(BaseModel):
-    host: str = "localhost:8086"
-    token: str
-    organization: str = "hyperscale"
-    connect_timeout: int = 10000
-    events_bucket: str = "events"
-    metrics_bucket: str = "metrics"
-    experiments_bucket: str = "experiments"
-    streams_bucket: str = "streams"
-    system_metrics_bucket: str = "system_metrics"
-    secure: bool = False
+    host: StrictStr = "localhost"
+    port: StrictInt = 8086
+    token: StrictStr
+    organization: StrictStr
+    connect_timeout: StrictInt = 10000
+    workflow_results_bucket_name: StrictStr = 'hyperscale_workflow_results'
+    step_results_bucket_name: StrictStr = 'hyperscale_step_results'
+    secure: StrictBool = False
     reporter_type: ReporterTypes = ReporterTypes.InfluxDB
+
+    class Config:
+        arbitrary_types_allowed = True

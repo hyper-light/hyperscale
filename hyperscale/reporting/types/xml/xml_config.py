@@ -1,15 +1,14 @@
 import os
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictStr
 
 from hyperscale.reporting.types.common.types import ReporterTypes
 
 
 class XMLConfig(BaseModel):
-    events_filepath: str = os.path.join(os.getcwd(), "events.xml")
-    metrics_filepath: str = os.path.join(os.getcwd(), "metrics.xml")
-    experiments_filepath: str = os.path.join(os.getcwd(), "experiments.xml")
-    streams_filepath: str = os.path.join(os.getcwd(), "streams.xml")
-    system_metrics_filepath: str = os.path.join(os.getcwd(), "system_metrics.xml")
-    overwrite: bool = True
+    workflow_results_filepath: StrictStr = os.path.join(os.getcwd(), "workflow_results.xml")
+    step_results_filepath: StrictStr = os.path.join(os.getcwd(), "step_results.xml")
     reporter_type: ReporterTypes = ReporterTypes.XML
+
+    class Config:
+        arbitrary_types_allowed = True
