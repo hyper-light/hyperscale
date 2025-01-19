@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import uuid
-from hyperscale.core.results.workflow_types import (
+from .common.results_types import (
     WorkflowStats,
     ResultSet,
     MetricsSet,

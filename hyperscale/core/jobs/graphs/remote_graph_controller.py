@@ -24,10 +24,10 @@ from hyperscale.core.jobs.models import (
 from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.jobs.protocols import UDPProtocol
-from hyperscale.core.results.workflow_types import WorkflowStats
 from hyperscale.core.snowflake import Snowflake
 from hyperscale.core.state import Context
 from hyperscale.ui.actions import update_active_workflow_message
+from hyperscale.reporting.common.results_types import WorkflowStats
 
 from .workflow_runner import WorkflowRunner
 

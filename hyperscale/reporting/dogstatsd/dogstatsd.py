@@ -7,7 +7,7 @@ from hyperscale.reporting.common import (
     StepMetricSet,
 )
 
-from hyperscale.core.results.workflow_types import MetricType
+from hyperscale.reporting.common.results_types import MetricType
 
 try:
     from aio_statsd import DogStatsdClient

@@ -18,14 +18,14 @@ import psutil
 from hyperscale.core.engines.client import TimeParser
 from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.hooks import Hook, HookType
-from hyperscale.core.results.workflow_results import WorkflowResults
-from hyperscale.core.results.workflow_types import WorkflowStats
 from hyperscale.core.state import (
     Context,
     ContextHook,
     StateAction,
 )
 from hyperscale.core.testing.models.base import OptimizedArg
+from hyperscale.reporting.results import Results
+from hyperscale.reporting.common.results_types import WorkflowStats
 
 from .dependent_workflow import DependentWorkflow
 from .workflow import Workflow
@@ -387,7 +387,7 @@ class Graph:
             if _guard_result(result) is not None
         ]
 
-        workflow_results = WorkflowResults(hooks)
+        workflow_results = Results(hooks)
 
         processed_results = workflow_results.process(
             workflow_name,

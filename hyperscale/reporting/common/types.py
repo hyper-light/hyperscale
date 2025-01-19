@@ -1,6 +1,6 @@
 from enum import Enum
 import uuid
-from hyperscale.core.results.workflow_types import MetricType
+from hyperscale.reporting.common.results_types import MetricType
 from typing import Literal, Dict, List
 
 

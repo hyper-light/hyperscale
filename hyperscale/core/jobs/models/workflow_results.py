@@ -1,8 +1,8 @@
 from typing import Any, Dict
 
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
-from hyperscale.core.results.workflow_types import WorkflowStats
 from hyperscale.core.state.workflow_context import WorkflowContext
+from hyperscale.reporting.common.results_types import WorkflowStats
 
 
 class WorkflowResults:

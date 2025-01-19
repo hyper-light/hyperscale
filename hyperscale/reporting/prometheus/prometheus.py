@@ -2,12 +2,12 @@ import asyncio
 import functools
 import uuid
 from typing import Dict, Literal
-from hyperscale.core.results.workflow_types import MetricType
 from hyperscale.reporting.common import (
     ReporterTypes,
     WorkflowMetricSet,
     StepMetricSet,
 )
+from hyperscale.reporting.common.results_types import MetricType
 
 from .prometheus_config import PrometheusConfig
 

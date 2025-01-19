@@ -18,7 +18,7 @@ from hyperscale.core.engines.client.shared.models import (
     RequestType,
 )
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
-from hyperscale.core.results.models.metric import (
+from hyperscale.reporting.models.metric import (
     COUNT,
     DISTRIBUTION,
     RATE,

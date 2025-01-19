@@ -2,7 +2,7 @@ import uuid
 from collections import defaultdict
 from typing import Dict
 
-from hyperscale.core.results.workflow_types import MetricType
+from hyperscale.reporting.common.results_types import MetricType
 from hyperscale.reporting.common import (
     ReporterTypes,
     WorkflowMetricSet,

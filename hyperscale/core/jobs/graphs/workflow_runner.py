@@ -16,11 +16,11 @@ from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.monitoring import CPUMonitor, MemoryMonitor
-from hyperscale.core.results.workflow_results import WorkflowResults
-from hyperscale.core.results.workflow_types import WorkflowStats
 from hyperscale.core.state import Context, ContextHook, StateAction
 from hyperscale.core.state.workflow_context import WorkflowContext
 from hyperscale.core.testing.models.base import OptimizedArg
+from hyperscale.reporting.results import Results
+from hyperscale.reporting.common.results_types import WorkflowStats
 
 from .completion_counter import CompletionCounter
 
@@ -664,7 +664,7 @@ class WorkflowRunner:
             if guard_result(result) is not None
         ]
 
-        workflow_results = WorkflowResults(hooks)
+        workflow_results = Results(hooks)
 
         processed_results = workflow_results.process(
             workflow_name,

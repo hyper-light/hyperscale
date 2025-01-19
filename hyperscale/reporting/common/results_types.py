@@ -3,8 +3,8 @@ from typing import (
     Dict,
     List,
     Literal,
-    Optional,
 )
+
 
 QuantileSet = Dict[str, int | float]
 StatTypes = Literal["max", "min", "mean", "med", "stdev", "var", "mad"]
@@ -13,8 +13,8 @@ CountTypes = Literal["succeeded", "failed", "executed"]
 StatusCounts = Dict[int, int]
 StatsResults = Dict[StatTypes, int | float] | QuantileSet
 CountResults = Dict[
-    CountTypes | Optional[Literal["statuses"]],
-    int | Optional[StatusCounts],
+    CountTypes | Literal["statuses"],
+    int | StatusCounts | None,
 ]
 
 
@@ -72,7 +72,7 @@ MetricsSet = Dict[
 
 WorkflowStats = Dict[
     Literal["workflow", "stats", "results", "metrics", "checks", "elapsed", "rps"]
-    | Optional[Literal["run_id"]],
+    | Literal["run_id"],
     int
     | str
     | float
@@ -84,3 +84,19 @@ WorkflowStats = Dict[
 
 
 WorkflowContextResult = Dict[str, Any | Exception]
+
+
+WorkflowResultsSet = WorkflowStats | WorkflowContextResult
+
+
+RunResults = Dict[
+    Literal[
+        "workflow",
+        "results",
+    ],
+    str
+    | Dict[
+        str,
+        WorkflowStats | WorkflowContextResult,
+    ],
+]

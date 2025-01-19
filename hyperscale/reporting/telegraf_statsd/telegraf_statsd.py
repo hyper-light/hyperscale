@@ -2,12 +2,12 @@ import uuid
 from typing import Dict, Literal, Callable
 
 
-from hyperscale.core.results.workflow_types import MetricType
 from hyperscale.reporting.common import (
     ReporterTypes,
     WorkflowMetricSet,
     StepMetricSet,
 )
+from hyperscale.reporting.common.results_types import MetricType
 
 
 try:

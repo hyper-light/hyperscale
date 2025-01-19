@@ -20,7 +20,7 @@ from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models import InstanceRoleType, WorkflowStatusUpdate
 from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.jobs.workers import Provisioner, StagePriority
-from hyperscale.core.results.workflow_results import WorkflowResults
+from hyperscale.reporting.results import Results
 from hyperscale.core.state import (
     Context,
     ContextHook,
@@ -36,7 +36,7 @@ from hyperscale.ui.actions import (
     update_workflow_executions_rates,
     update_workflow_execution_stats,
 )
-from hyperscale.reporting.results_types import (
+from hyperscale.reporting.common.results_types import (
     RunResults,
     WorkflowResultsSet,
     WorkflowContextResult,
@@ -319,7 +319,7 @@ class RemoteGraphManager:
         results, run_context = worker_results
 
         if is_test_workflow and len(results) > 1:
-            workflow_results = WorkflowResults()
+            workflow_results = Results(hooks)
             execution_result = workflow_results.merge_results(
                 [result_set for _, result_set in results.values()],
                 run_id=run_id,

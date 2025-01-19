@@ -32,7 +32,7 @@ from .models.metric import (
     TIMING,
     Metric,
 )
-from hyperscale.reporting.results_types import (
+from hyperscale.reporting.common.results_types import (
     CheckSet,
     ContextCount,
     CountResults,
@@ -47,7 +47,7 @@ from hyperscale.reporting.results_types import (
 )
 
 
-class WorkflowResults:
+class Results:
     def __init__(
         self,
         hooks: Dict[str, Hook] | None = None,

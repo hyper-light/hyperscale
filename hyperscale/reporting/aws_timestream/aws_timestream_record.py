@@ -1,8 +1,5 @@
 import time
-from hyperscale.core.results.workflow_types import MetricType
-from numpy import float32, float64, int16, int32, int64
-from typing import Any
-from datetime import datetime
+from hyperscale.reporting.common.results_types import MetricType
 
 
 class AWSTimestreamRecord:
