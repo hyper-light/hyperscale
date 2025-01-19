@@ -1,19 +1,24 @@
-import asyncio
-import json
 import uvloop
 
 uvloop.install()
 
-from hyperscale.core.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow, step
 from hyperscale.testing import URL, HTTPResponse
-from hyperscale.reporting import JSONConfig
+from hyperscale.reporting import JSONConfig, CSVConfig
+
+
+@staticmethod
+async def reporting_options():
+    return [
+        JSONConfig(),
+        CSVConfig(),
+    ]
 
 
 class Test(Workflow):
     vus = 4000
     duration = "1m"
-    reporting_config=JSONConfig()
+    reporting=reporting_options
 
     @step()
     async def login(

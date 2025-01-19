@@ -1,17 +1,27 @@
 import threading
 import uuid
 import importlib
-
+from typing import List, Callable, Awaitable
 
 from hyperscale.core.engines.client import Client
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 from hyperscale.reporting.reporter import ReporterConfig, JSONConfig
 
 
+ReporterConfigs = (
+    ReporterConfig
+    | List[ReporterConfig]
+    | Callable[[], ReporterConfig]
+    | Callable[[], List[ReporterConfig]]
+    | Callable[[], Awaitable[ReporterConfig]]
+    | Callable[[], Awaitable[List[ReporterConfig]]]
+)
+
+
 class Workflow:
     vus = 1000
     duration = "1m"
-    reporting_config: ReporterConfig | None = None
+    reporting: ReporterConfigs| None = None
 
     def __init__(self):
         module = importlib.import_module(self.__module__)
@@ -27,5 +37,5 @@ class Workflow:
 
         self.client = Client()
 
-        if self.reporting_config is None:
-            self.reporting_config = JSONConfig()
+        if self.reporting is None:
+            self.reporting = JSONConfig()

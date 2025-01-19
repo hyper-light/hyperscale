@@ -8,10 +8,11 @@ from typing import List
 import psutil
 
 from hyperscale.core.engines.client.time_parser import TimeParser
-from hyperscale.core.graph import Graph, Workflow
+from hyperscale.core.graph import Workflow
 from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
 from hyperscale.core.jobs.models import Env
 from hyperscale.core.jobs.protocols.socket import bind_udp_socket
+from hyperscale.logging import LogLevelName, LogLevel, Logger
 from hyperscale.ui import HyperscaleInterface, InterfaceUpdatesController
 from hyperscale.ui.actions import update_active_workflow_message
 
@@ -58,6 +59,7 @@ class LocalRunner:
         self,
         host: str,
         port: int,
+        log_level: LogLevelName,
         env: Env | None = None,
         workers: int | None = None,
     ) -> None:
@@ -77,12 +79,14 @@ class LocalRunner:
         self.port = port
         self._workers = workers
         self._worker_connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_SECONDS).time
+        self._log_level = log_level
 
         updates = InterfaceUpdatesController()
 
         self._interface = HyperscaleInterface(updates)
         self._remote_manger = RemoteGraphManager(updates, self._workers)
         self._server_pool = LocalServerPool(self._workers)
+        self._logger = Logger()
         self._pool_task: asyncio.Task | None = None
 
     async def run(
@@ -123,63 +127,61 @@ class LocalRunner:
             timeout = self._worker_connect_timeout
 
         try:
-            if self._workers <= 1:
-                graph = Graph(test_name, workflows)
-                return await graph.run()
+            await update_active_workflow_message(
+                "initializing",
+                "Starting worker servers...",
+            )
 
-            else:
-                await update_active_workflow_message(
-                    "initializing", "Starting worker servers..."
-                )
+            worker_sockets, worker_ips = await self._bin_and_check_socket_range()
 
-                worker_sockets, worker_ips = await self._bin_and_check_socket_range()
+            self._server_pool.setup()
 
-                self._server_pool.setup()
+            await self._remote_manger.start(
+                self.host,
+                self.port,
+                self._env,
+                cert_path=cert_path,
+                key_path=key_path,
+            )
 
-                await self._remote_manger.start(
-                    self.host,
-                    self.port,
-                    self._env,
-                    cert_path=cert_path,
-                    key_path=key_path,
-                )
+            self._server_pool.run_pool(
+                (self.host, self.port),
+                worker_sockets,
+                self._env,
+                cert_path=cert_path,
+                key_path=key_path,
+            )
 
-                self._server_pool.run_pool(
-                    (self.host, self.port),
-                    worker_sockets,
-                    self._env,
-                    cert_path=cert_path,
-                    key_path=key_path,
-                )
+            await self._remote_manger.connect_to_workers(
+                worker_ips,
+                timeout=timeout,
+            )
 
-                await self._remote_manger.connect_to_workers(
-                    worker_ips,
-                    timeout=timeout,
-                )
+            results = await self._remote_manger.execute_graph(
+                test_name,
+                workflows,
+            )
 
-                results = await self._remote_manger.execute_graph(
-                    test_name,
-                    workflows,
-                )
+            if terminal_ui_enabled:
+                await self._interface.stop()
 
-                if terminal_ui_enabled:
-                    await self._interface.stop()
+            await self._remote_manger.shutdown_workers()
+            await self._remote_manger.close()
+            await self._server_pool.shutdown()
 
-                await self._remote_manger.shutdown_workers()
-                await self._remote_manger.close()
-                await self._server_pool.shutdown()
+            for socket in worker_sockets:
+                try:
+                    socket.close()
+                    await asyncio.sleep(0)
 
-                for socket in worker_sockets:
-                    try:
-                        socket.close()
-                        await asyncio.sleep(0)
+                except Exception:
+                    pass
 
-                    except Exception:
-                        pass
-
-                return results
+            return results
 
         except Exception:
+            import traceback
+            print(traceback.format_exc())
             try:
                 if terminal_ui_enabled:
                     await self._interface.abort()

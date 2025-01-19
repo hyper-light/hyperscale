@@ -13,6 +13,7 @@ from .cli import (
     JsonFile,
     AssertSet,
 )
+from hyperscale.logging import LogLevelName
 from .hyperscale_config import HyperscaleConfig
 
 uvloop.install()
@@ -37,14 +38,7 @@ def get_default_config():
 async def run(
     path: ImportFile[Workflow],
     config: JsonFile[HyperscaleConfig] = get_default_config,
-    log_level: AssertSet[
-        Literal[
-            "debug",
-            "info",
-            "warn",
-            "error",
-        ]
-    ] = "info",
+    log_level: AssertSet[LogLevelName] = "info",
     server_port: int = 15454,
     workers: int = get_default_workers,
     name: str = "default",
@@ -58,6 +52,7 @@ async def run(
     runner = LocalRunner(
         "127.0.0.1",
         server_port,
+        log_level,
         workers=workers,
     )
 

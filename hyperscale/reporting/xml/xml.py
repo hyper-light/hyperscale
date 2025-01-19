@@ -54,7 +54,7 @@ class XML:
         pass
 
     async def submit_workflow_results(self, workflow_results: WorkflowMetricSet):
-        filepath = self._get_filepath(self._workflow_results_filepath)
+        filepath = await self._get_filepath(self._workflow_results_filepath)
 
         workflow_results_file = await self._loop.run_in_executor(
             None,
@@ -65,28 +65,37 @@ class XML:
             ),
         )
 
-        workflow_records: Dict[str, WorkflowMetric] = {}
+        try:
+            workflow_records: Dict[str, WorkflowMetric] = {}
 
-        for result in workflow_results:
-            metric_workflow = result.get("metric_workflow")
-            metric_name = result.get("metric_name")
+            for result in workflow_results:
+                metric_workflow = result.get("metric_workflow")
+                metric_name = result.get("metric_name")
 
-            record_key = f"{metric_workflow}_{metric_name}"
+                record_key = f"{metric_workflow}_{metric_name}"
 
-            workflow_records[record_key] = result
+                workflow_records[record_key] = result
 
-        workflow_results_xml = dicttoxml(workflow_records, custom_root="system")
+            workflow_results_xml = dicttoxml(workflow_records, custom_root="system")
 
-        workflow_results_xml = parseString(workflow_results_xml)
+            workflow_results_xml = parseString(workflow_results_xml)
+
+            await self._loop.run_in_executor(
+                None,
+                workflow_results_file.write,
+                workflow_results_xml.toprettyxml(),
+            )
+
+        except Exception:
+            pass
 
         await self._loop.run_in_executor(
             None,
-            workflow_results_file.write,
-            workflow_results_xml.toprettyxml(),
+            workflow_results_file.close
         )
 
     async def submit_step_results(self, step_results: StepMetricSet):
-        filepath = self._get_filepath(self._step_results_filepath)
+        filepath = await self._get_filepath(self._step_results_filepath)
 
         step_results_file = await self._loop.run_in_executor(
             None,
@@ -97,25 +106,34 @@ class XML:
             ),
         )
 
-        step_records: Dict[str, StepMetric] = {}
+        try:
+            step_records: Dict[str, StepMetric] = {}
 
-        for result in step_results:
-            metric_workflow = result.get("metric_workflow")
-            metric_step = result.get("metric_step")
-            metric_name = result.get("metric_name")
+            for result in step_results:
+                metric_workflow = result.get("metric_workflow")
+                metric_step = result.get("metric_step")
+                metric_name = result.get("metric_name")
 
-            record_key = f"{metric_workflow}_{metric_step}_{metric_name}"
+                record_key = f"{metric_workflow}_{metric_step}_{metric_name}"
 
-            step_records[record_key] = result
+                step_records[record_key] = result
 
-        step_results_xml = dicttoxml(step_records, custom_root="system")
+            step_results_xml = dicttoxml(step_records, custom_root="system")
 
-        step_results_xml = parseString(step_results_xml)
+            step_results_xml = parseString(step_results_xml)
+
+            await self._loop.run_in_executor(
+                None,
+                step_results_file.write,
+                step_results_xml.toprettyxml(),
+            )
+
+        except Exception:
+            pass
 
         await self._loop.run_in_executor(
             None,
-            step_results_file.write,
-            step_results_xml.toprettyxml(),
+            step_results_file.close
         )
         
     async def _get_filepath(self, filepath: str):
@@ -136,7 +154,7 @@ class XML:
         ):
             filename_offset += 1
 
-            next_filename = f"{base_file_stem}_{filename_offset}.json"
+            next_filename = f"{base_file_stem}_{filename_offset}.xml"
 
             filepath = await self._loop.run_in_executor(
                 None, 

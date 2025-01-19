@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import inspect
 import time
 
@@ -42,7 +43,8 @@ from hyperscale.reporting.common.results_types import (
     WorkflowContextResult,
     WorkflowStats,
 )
-from hyperscale.reporting.reporter import Reporter
+from hyperscale.reporting.reporter import Reporter, ReporterConfig
+from hyperscale.reporting.reporter import ReporterConfig, JSONConfig
 from .remote_graph_controller import RemoteGraphController
 
 
@@ -105,6 +107,7 @@ class RemoteGraphManager:
         ] = []
 
         self._workflow_configs: Dict[str, Dict[str, Any]] = {}
+        self._loop = asyncio.get_event_loop()
 
     async def start(
         self,
@@ -349,14 +352,65 @@ class RemoteGraphManager:
             updated_context,
         )
 
-        reporter = Reporter(workflow.reporting_config)
+        reporting = workflow.reporting 
 
-        await reporter.connect()
+        configs: list[ReporterConfig] = []
 
-        await reporter.submit_workflow_results(execution_result)
-        await reporter.submit_step_results(execution_result)
+        if inspect.isawaitable(reporting) or inspect.iscoroutinefunction(reporting):
+            configs = await reporting()
 
-        await reporter.close()
+        elif inspect.isfunction(reporting):
+            configs = await self._loop.run_in_executor(
+                None,
+                reporting,
+            )
+
+        else:
+            configs = reporting
+
+        if isinstance(configs, list) is False:
+            configs = [configs]
+        
+        reporters = [
+            Reporter(config) for config in configs
+        ]
+
+
+        await asyncio.sleep(1)
+
+        selected_reporters = ', '.join([
+            config.reporter_type.name for config in configs
+        ])
+
+        await update_active_workflow_message(
+            workflow_slug, 
+            f"Submitting results via - {selected_reporters}"
+        )
+
+        try:
+
+            await asyncio.gather(*[
+                reporter.connect() for reporter in reporters
+            ])
+
+            await asyncio.gather(*[
+                reporter.submit_workflow_results(execution_result) for reporter in reporters
+            ])
+            await asyncio.gather(*[
+                reporter.submit_step_results(execution_result) for reporter in reporters
+            ])
+
+            await asyncio.gather(*[
+                reporter.close() for reporter in reporters
+            ])
+
+        except Exception:
+            import traceback
+            print(traceback.format_exc())
+            await asyncio.gather(*[
+                reporter.close() for reporter in reporters
+            ], return_exceptions=True)
+
 
         await asyncio.sleep(1)
 

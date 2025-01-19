@@ -53,7 +53,7 @@ class CSV:
         self,
         workflow_results: WorkflowMetricSet,
     ):
-        filepath = self._get_filepath(self._workflow_results_filepath)
+        filepath = await self._get_filepath(self._workflow_results_filepath)
 
         workflow_results_file = await self._loop.run_in_executor(
             None,
@@ -64,22 +64,25 @@ class CSV:
             ),
         )
 
-        workflow_results_csv_writer = csv.DictWriter(
-            workflow_results_file,
-            fieldnames=self._workflow_results_csv_headers,
-        )
+        try:
+            workflow_results_csv_writer = csv.DictWriter(
+                workflow_results_file,
+                fieldnames=self._workflow_results_csv_headers,
+            )
 
-        await self._loop.run_in_executor(
-            None,
-            workflow_results_csv_writer.writeheader,
-        )
-
-        for result in workflow_results:
             await self._loop.run_in_executor(
                 None,
-                workflow_results_csv_writer.writerow,
-                result,
+                workflow_results_csv_writer.writeheader,
             )
+            
+            await self._loop.run_in_executor(
+                None,
+                workflow_results_csv_writer.writerows,
+                workflow_results,
+            )
+
+        except Exception:
+            pass
 
         await self._loop.run_in_executor(None, workflow_results_file.close)
 
@@ -87,7 +90,7 @@ class CSV:
         self,
         step_results: StepMetricSet,
     ):
-        filepath = self._get_filepath(self._step_results_filepath)
+        filepath = await self._get_filepath(self._step_results_filepath)
 
         step_results_file = await self._loop.run_in_executor(
             None,
@@ -98,22 +101,25 @@ class CSV:
             ),
         )
 
-        step_results_csv_writer = csv.DictWriter(
-            step_results_file,
-            fieldnames=self._step_results_csv_headers,
-        )
+        try:
+            step_results_csv_writer = csv.DictWriter(
+                step_results_file,
+                fieldnames=self._step_results_csv_headers,
+            )
 
-        await self._loop.run_in_executor(
-            None,
-            step_results_csv_writer.writeheader,
-        )
-
-        for result in step_results:
             await self._loop.run_in_executor(
                 None,
-                step_results_csv_writer.writerow,
-                result,
+                step_results_csv_writer.writeheader,
             )
+
+            await self._loop.run_in_executor(
+                None,
+                step_results_csv_writer.writerows,
+                step_results,
+            )
+
+        except Exception:
+            pass
 
         await self._loop.run_in_executor(None, step_results_file.close)
 
@@ -135,7 +141,7 @@ class CSV:
         ):
             filename_offset += 1
 
-            next_filename = f"{base_file_stem}_{filename_offset}.json"
+            next_filename = f"{base_file_stem}_{filename_offset}.csv"
 
             filepath = await self._loop.run_in_executor(
                 None, 
