@@ -149,13 +149,23 @@ class KeywordArg(Generic[T]):
 
     async def to_default(self):
         if self.default_is_awaitable:
-            return await self.default()
+            default_value = await self.default()
 
         elif self.default_is_callable:
-            return self.default()
+            default_value = self.default()
 
         else:
-            return self.default
+            default_value = self.default
+
+        for subtype in self._value_type:
+            if complex_type_factory := self._complex_types.get(get_origin(subtype)):
+                complex_type = complex_type_factory(self.name, subtype)
+
+                complex_type.data = default_value
+
+                return complex_type
+            
+        return default_value
 
     def to_flag(self):
         return f"--{self.name}"

@@ -9,7 +9,7 @@ from .retention_policy import (
 )
 
 
-T = TypeVar("T")
+T = TypeVar('T')
 
 
 class LoggerContext:
@@ -45,10 +45,11 @@ class LoggerContext:
                 self.filename,
                 directory=self.directory,
                 is_default=True,
-                rotation_schedule=self.retention_policy,
+                retention_policy=self.retention_policy,
             )
 
         if self.retention_policy and self.filename is None:
+
             filename = "logs.json"
             directory = os.path.join(self.stream._cwd, "logs")
             logfile_path = os.path.join(directory, filename)

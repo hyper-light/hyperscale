@@ -29,4 +29,3 @@ class LogLevel(Enum):
         }
 
         return levels_map.get(level_name.upper())
-

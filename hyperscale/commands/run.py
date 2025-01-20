@@ -3,7 +3,6 @@ import functools
 import psutil
 import uvloop
 
-from typing import Literal
 
 from hyperscale.core.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow
@@ -39,7 +38,6 @@ async def run(
     path: ImportFile[Workflow],
     config: JsonFile[HyperscaleConfig] = get_default_config,
     log_level: AssertSet[LogLevelName] = "info",
-    server_port: int = 15454,
     workers: int = get_default_workers,
     name: str = "default",
     quiet: bool = False,
@@ -51,7 +49,7 @@ async def run(
 
     runner = LocalRunner(
         "127.0.0.1",
-        server_port,
+        config.data.server_port,
         log_level,
         workers=workers,
     )

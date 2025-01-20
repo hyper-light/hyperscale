@@ -33,23 +33,28 @@ from .retention_policy import (
 )
 from .stream_type import StreamType
 
-T = TypeVar("T", bound=Entry)
+T = TypeVar('T', bound=Entry)
 
 
 def patch_transport_close(
-    transport: asyncio.Transport,
+    transport: asyncio.Transport, 
     loop: asyncio.AbstractEventLoop,
 ):
+
     def close(*args, **kwargs):
-        if loop.is_closed() is False:
+        try:
+
             transport.close()
+
+        except Exception:
+            pass
 
     return close
 
 
 class LoggerStream:
     def __init__(
-        self,
+        self, 
         name: str | None = None,
         template: str | None = None,
         filename: str | None = None,
@@ -83,7 +88,7 @@ class LoggerStream:
         self._default_logfile_path: str | None = None
 
         self._retention_policies: Dict[str, RetentionPolicy] = {}
-
+        
         self._config = LoggingConfig()
         self._initialized: bool = False
         self._consumer: LogConsumer | None = None
@@ -99,7 +104,9 @@ class LoggerStream:
         return self._provider.subscriptions_count > 0
 
     async def initialize(self) -> asyncio.StreamWriter:
+
         async with self._init_lock:
+            
             if self._initialized:
                 return
 
@@ -145,6 +152,7 @@ class LoggerStream:
                     lambda: LoggerProtocol(), self._stderr
                 )
 
+
                 transport.close = patch_transport_close(transport, self._loop)
 
                 self._stream_writers[StreamType.STDERR] = asyncio.StreamWriter(
@@ -153,7 +161,7 @@ class LoggerStream:
                     None,
                     self._loop,
                 )
-
+        
             self._initialized = True
 
     async def open_file(
@@ -177,6 +185,7 @@ class LoggerStream:
         self._file_locks[logfile_path].release()
 
         if retention_policy and self._retention_policies.get(logfile_path) is None:
+
             policy = RetentionPolicy(retention_policy)
             policy.parse()
 
@@ -186,7 +195,7 @@ class LoggerStream:
             self._default_logfile_path = logfile_path
 
     def _open_file(
-        self,
+        self, 
         logfile_path: str,
     ):
         resolved_path = pathlib.Path(logfile_path).absolute().resolve()
@@ -201,7 +210,11 @@ class LoggerStream:
 
         self._files[logfile_path] = open(path, "ab+")
 
-    async def _rotate(self, logfile_path: str, retention_policy: RetentionPolicy):
+    async def _rotate(
+        self,
+        logfile_path: str,
+        retention_policy: RetentionPolicy
+    ):
         await self._file_locks[logfile_path].acquire()
         await asyncio.to_thread(
             self._rotate_logfile,
@@ -252,29 +265,23 @@ class LoggerStream:
         current_timestamp = current_time.timestamp()
 
         created_time = logfile_metadata.get(
-            logfile_path,
+            logfile_path, 
             current_timestamp,
         )
 
         archived_filename = f"{resolved_path.stem}_{current_timestamp}_archived.zst"
         logfile_data = b""
-
-        if (
-            retention_policy.matches_policy(
-                {
-                    "file_age": (
-                        current_time
-                        - datetime.datetime.fromtimestamp(created_time, datetime.UTC)
-                    ).seconds,
-                    "file_size": os.path.getsize(logfile_path),
-                    "logfile_path": resolved_path,
-                }
-            )
-            is False
-        ):
+        
+        if retention_policy.matches_policy({
+            "file_age": (
+                current_time - datetime.datetime.fromtimestamp(created_time, datetime.UTC)
+            ).seconds,
+            "file_size": os.path.getsize(logfile_path),
+            "logfile_path": resolved_path
+        }) is False:
             self._files[logfile_path].close()
 
-            with open(logfile_path, "rb") as logfile:
+            with open(logfile_path, 'rb') as logfile:
                 logfile_data = logfile.read()
 
         if len(logfile_data) > 0:
@@ -284,7 +291,9 @@ class LoggerStream:
             )
 
             with open(archive_path, "wb") as archived_file:
-                archived_file.write(self._compressor.compress(logfile_data))
+                archived_file.write(
+                    self._compressor.compress(logfile_data)
+                )
 
             self._files[logfile_path] = open(path, "wb+")
             created_time = current_timestamp
@@ -293,26 +302,28 @@ class LoggerStream:
 
         self._update_logfile_metadata(logfile_path, logfile_metadata)
 
-    async def close(self, shutdown_subscribed: bool = False):
-        self._consumer.stop()
 
+    async def close(
+        self, 
+        shutdown_subscribed: bool = False
+    ):
+
+        self._consumer.stop()
+        
         if shutdown_subscribed:
             await self._provider.signal_shutdown()
 
-        if (
-            self._consumer.status
-            in [
-                ConsumerStatus.RUNNING,
-                ConsumerStatus.CLOSING,
-            ]
-            and self._consumer.pending
-        ):
+        if self._consumer.status in  [
+            ConsumerStatus.RUNNING,
+            ConsumerStatus.CLOSING,
+        ] and self._consumer.pending:
             await self._consumer.wait_for_pending()
 
+            
         await asyncio.gather(
             *[self._close_file(logfile_path) for logfile_path in self._files]
         )
-
+        
         await asyncio.gather(
             *[writer.drain() for writer in self._stream_writers.values()]
         )
@@ -321,7 +332,9 @@ class LoggerStream:
 
     def abort(self):
         for logfile_path in self._files:
-            if (logfile := self._files.get(logfile_path)) and logfile.closed is False:
+            if (
+                logfile := self._files.get(logfile_path)
+            ) and logfile.closed is False:
                 logfile.close()
 
         self._stderr.flush()
@@ -351,7 +364,9 @@ class LoggerStream:
             file_lock.release()
 
     def _close_file_at_path(self, logfile_path: str):
-        if (logfile := self._files.get(logfile_path)) and logfile.closed is False:
+        if (
+            logfile := self._files.get(logfile_path)
+        ) and logfile.closed is False:
             logfile.close()
 
     def _to_logfile_path(
@@ -361,9 +376,9 @@ class LoggerStream:
     ):
         filename_path = pathlib.Path(filename)
 
-        assert filename_path.suffix == ".json", (
-            "Err. - file must be JSON file for logs."
-        )
+        assert (
+            filename_path.suffix == ".json"
+        ), "Err. - file must be JSON file for logs."
 
         if directory is None:
             directory: str = os.path.join(self._cwd, "logs")
@@ -378,25 +393,22 @@ class LoggerStream:
         template: str | None = None,
         path: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
-        filter: Callable[[T], bool] | None = None,
-    ):
+        filter: Callable[[T], bool] | None=None,
+):
         filename: str | None = None
         directory: str | None = None
 
+
         if path:
             logfile_path = pathlib.Path(path)
-            is_logfile = len(logfile_path.suffix) > 0
+            is_logfile = len(logfile_path.suffix) > 0 
 
             filename = logfile_path.name if is_logfile else None
-            directory = (
-                str(logfile_path.parent.absolute())
-                if is_logfile
-                else str(logfile_path.absolute())
-            )
+            directory = str(logfile_path.parent.absolute()) if is_logfile else str(logfile_path.absolute())
 
         if template is None:
             template = self._default_template
-
+        
         if filename is None:
             filename = self._default_logfile
 
@@ -426,8 +438,9 @@ class LoggerStream:
         self,
         entry_or_log: T | Log[T],
         template: str | None = None,
-        filter: Callable[[T], bool] | None = None,
+        filter: Callable[[T], bool] | None=None,
     ):
+
         entry: Entry = None
         if isinstance(entry_or_log, Log):
             entry = entry_or_log.entry
@@ -448,7 +461,7 @@ class LoggerStream:
 
         if self._config.enabled(self._name, entry.level) is False:
             return
-
+    
         if filter and filter(entry) is False:
             return
 
@@ -485,12 +498,12 @@ class LoggerStream:
                 ).encode()
                 + b"\n"
             )
-
+            
             await stream_writer.drain()
 
         except Exception as err:
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
-
+            
             if self._stderr.closed is False:
                 await asyncio.to_thread(
                     self._stderr.write,
@@ -502,21 +515,20 @@ class LoggerStream:
                             "line_number": line_number,
                             "error": str(err),
                             "thread_id": threading.get_native_id(),
-                            "timestamp": datetime.datetime.now(
-                                datetime.UTC
-                            ).isoformat(),
+                            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
                         },
                     ),
                 )
 
     async def _log_to_file(
         self,
-        entry_or_log: T | Log[T],
+        entry_or_log: T  | Log[T],
         filename: str | None = None,
         directory: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
-        filter: Callable[[T], bool] | None = None,
+        filter: Callable[[T], bool] | None=None,
     ):
+        
         entry: Entry = None
         if isinstance(entry_or_log, Log):
             entry = entry_or_log.entry
@@ -527,9 +539,9 @@ class LoggerStream:
         if self._config.enabled(self._name, entry.level) is False:
             return
 
-        if filter and filter(entry) is False:
+        if filter and  filter(entry) is False:
             return
-
+        
         if self._cwd is None:
             self._cwd = await asyncio.to_thread(os.getcwd)
 
@@ -576,7 +588,7 @@ class LoggerStream:
                 entry=entry,
                 filename=log_file,
                 function_name=function_name,
-                line_number=line_number,
+                line_number=line_number
             )
 
         try:
@@ -606,9 +618,7 @@ class LoggerStream:
                             "line_number": line_number,
                             "error": str(err),
                             "thread_id": threading.get_native_id(),
-                            "timestamp": datetime.datetime.now(
-                                datetime.UTC
-                            ).isoformat(),
+                            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
                         },
                     ),
                 )
@@ -618,7 +628,12 @@ class LoggerStream:
         entry: Entry,
         logfile_path: str,
     ):
-        if (logfile := self._files.get(logfile_path)) and (logfile.closed is False):
+        if (
+            logfile := self._files.get(logfile_path)
+        ) and (
+            logfile.closed is False
+        ):
+            
             logfile.write(msgspec.json.encode(entry) + b"\n")
 
     def _find_caller(self):
@@ -634,16 +649,23 @@ class LoggerStream:
             frame.f_lineno,
             code.co_name,
         )
-
-    async def get(self, filter: Callable[[T], bool] | None = None):
-        async for log in self._consumer.iter_logs(filter=filter):
+    
+    async def get(
+        self,
+        filter: Callable[[T], bool] | None = None
+    ):
+        async for log in self._consumer.iter_logs(
+            filter=filter
+        ):
             yield log
-
+    
     async def put(
         self,
         entry: T | Log[T],
     ):
+        
         if not isinstance(entry, Log):
+
             frame = sys._getframe(1)
             code = frame.f_code
             entry = Log(
@@ -652,7 +674,7 @@ class LoggerStream:
                 function_name=code.co_name,
                 line_number=frame.f_lineno,
                 thread_id=threading.get_native_id(),
-                timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
+                timestamp=datetime.datetime.now(datetime.UTC).isoformat()
             )
 
         await self._provider.put(entry)

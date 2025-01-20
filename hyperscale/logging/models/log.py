@@ -5,7 +5,7 @@ from typing import Generic, TypeVar
 from .entry import Entry
 
 
-T = TypeVar("T")
+T = TypeVar('T')
 
 
 class Log(msgspec.Struct, Generic[T], kw_only=True):

@@ -1,6 +1,0 @@
-metric_workflow,metric_type,metric_group,metric_name,metric_value
-Test,COUNT,workflow,succeeded,1739710
-Test,COUNT,workflow,failed,1944
-Test,COUNT,workflow,executed,1741654
-Test,RATE,workflow,rps,28485.46576320454
-Test,TIMING,workflow,elapsed,61.14184737150208
