@@ -21,7 +21,7 @@ ReporterConfigs = (
 class Workflow:
     vus = 1000
     duration = "1m"
-    reporting: ReporterConfigs| None = None
+    reporting: ReporterConfigs | None = None
 
     def __init__(self):
         module = importlib.import_module(self.__module__)
