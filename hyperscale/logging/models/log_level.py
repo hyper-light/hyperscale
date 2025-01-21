@@ -3,29 +3,34 @@ from enum import Enum
 from typing import Literal
 
 LogLevelName = Literal[
+    'trace',
     'debug',
     'info',
     'warn',
     'error',
     'critical',
+    'fatal'
 ]
 
 class LogLevel(Enum):
-    NOTSET = "NOTSET"
+    TRACE = "TRACE"
     DEBUG = "DEBUG"
     INFO = "INFO"
     WARN = "WARN"
     ERROR = "ERROR"
     CRITICAL = "CRITICAL"
+    FATAL = 'FATAL'
 
-    def to_level(self, level_name: LogLevelName) -> LogLevel:
+    @classmethod
+    def to_level(cls, level_name: LogLevelName) -> LogLevel:
         levels_map = {
-            LogLevel.NOTSET.value: LogLevel.NOTSET,
+            LogLevel.TRACE.value: LogLevel.TRACE,
             LogLevel.DEBUG.value: LogLevel.DEBUG,
             LogLevel.INFO.value: LogLevel.INFO,
             LogLevel.WARN.value: LogLevel.WARN,
             LogLevel.ERROR.value: LogLevel.ERROR,
             LogLevel.CRITICAL.value: LogLevel.CRITICAL,
+            LogLevel.FATAL.value: LogLevel.FATAL
         }
 
         return levels_map.get(level_name.upper())

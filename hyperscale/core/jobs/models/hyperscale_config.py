@@ -16,7 +16,11 @@ class HyperscaleConfig(BaseModel):
         if isinstance(logs_directory_path, str):
             logs_directory_path = pathlib.Path(config.logs_directory)
 
+        logs_directory_path = logs_directory_path.absolute().resolve()
+
         if not logs_directory_path.exists():
             logs_directory_path.mkdir()
+
+        config.logs_directory = str(logs_directory_path)
  
         return config

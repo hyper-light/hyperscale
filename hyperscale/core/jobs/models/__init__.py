@@ -1,4 +1,5 @@
 from .env import Env as Env
+from .hyperscale_config import HyperscaleConfig as HyperscaleConfig
 from .instance_role_type import InstanceRoleType as InstanceRoleType
 from .job_context import JobContext as JobContext
 from .message import Message as Message

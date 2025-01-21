@@ -20,6 +20,7 @@ class LoggerContext:
         filename: str | None = None,
         directory: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
+        nested: bool = False
     ) -> None:
         self.name = name
         self.template = template
@@ -33,6 +34,7 @@ class LoggerContext:
             directory=directory,
             retention_policy=retention_policy,
         )
+        self.nested = nested
 
     async def __aenter__(self):
         await self.stream.initialize()
@@ -62,4 +64,5 @@ class LoggerContext:
         return self.stream
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        pass
+        if self.nested is False:
+            await self.stream.close(shutdown_subscribed=self.stream.has_active_subscriptions)

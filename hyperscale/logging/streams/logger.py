@@ -65,6 +65,7 @@ class Logger:
         template: str | None = None,
         path: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
+        nested: bool = False,
     ):
         if name is None:
             name = 'default'
@@ -87,6 +88,7 @@ class Logger:
                 filename=filename,
                 directory=directory,
                 retention_policy=retention_policy,
+                nested=nested,
             )
 
         else:
@@ -95,7 +97,8 @@ class Logger:
             self._contexts[name].filename = filename if filename else self._contexts[name].filename
             self._contexts[name].directory = directory if directory else self._contexts[name].directory
             self._contexts[name].retention_policy = retention_policy if retention_policy else self._contexts[name].retention_policy
-
+            self._contexts[name].nested = nested
+            
         return self._contexts[name]
     
     async def subscribe(
@@ -154,7 +157,7 @@ class Logger:
         frame = sys._getframe(1)
         code = frame.f_code
 
-        async with self.context(name=name) as ctx:
+        async with self.context(name=name, nested=True) as ctx:
             await ctx.log(
                 Log(
                     entry=entry,
@@ -181,7 +184,7 @@ class Logger:
         frame = sys._getframe(1)
         code = frame.f_code
 
-        async with self.context(name=name) as ctx:
+        async with self.context(name=name, nested=True) as ctx:
             await asyncio.gather(*[
                 ctx.put(
                     Log(
@@ -206,7 +209,7 @@ class Logger:
         frame = sys._getframe(1)
         code = frame.f_code
         
-        async with self.context(name=name) as ctx:
+        async with self.context(name=name, nested=True) as ctx:
             await ctx.put(
                 Log(
                     entry=entry,
@@ -249,7 +252,7 @@ class Logger:
         name: str,
         filter: Callable[[T], bool] | None = None,
     ):
-        async with self._contexts[name] as ctx:
+        async with self.context(name=name, nested=True) as ctx:
             async for log in ctx.get(
                 filter=filter
             ):

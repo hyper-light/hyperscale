@@ -11,8 +11,6 @@ from .run import run
 
 
 async def create_header():
-    loop = asyncio.get_event_loop()
-
     header = Section(
         SectionConfig(height="smallest", width="large", max_height=3),
         components=[

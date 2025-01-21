@@ -13,7 +13,7 @@ from .cli import (
     JsonFile,
     AssertSet,
 )
-from .hyperscale_config import HyperscaleConfig
+from hyperscale.core.jobs.models import HyperscaleConfig
 
 uvloop.install()
 

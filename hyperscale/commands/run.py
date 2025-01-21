@@ -12,8 +12,8 @@ from .cli import (
     JsonFile,
     AssertSet,
 )
-from hyperscale.logging import LogLevelName
-from .hyperscale_config import HyperscaleConfig
+from hyperscale.logging import LogLevelName, LoggingConfig
+from hyperscale.core.jobs.models import HyperscaleConfig
 
 uvloop.install()
 
@@ -47,10 +47,16 @@ async def run(
     """
     workflows = [workflow() for workflow in path.data.values()]
 
+    logging_config = LoggingConfig()
+    logging_config.update(
+        log_directory=config.data.logs_directory,
+        log_level=log_level.data,
+        log_output='stderr',
+    )
+
     runner = LocalRunner(
         "127.0.0.1",
         config.data.server_port,
-        log_level,
         workers=workers,
     )
 
