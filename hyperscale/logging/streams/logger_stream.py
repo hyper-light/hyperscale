@@ -1,25 +1,26 @@
 import asyncio
 import datetime
 import io
+import functools
 import os
 import pathlib
 import sys
 import threading
 import uuid
-from contextlib import redirect_stderr, redirect_stdout
 from collections import defaultdict
 from typing import (
     Callable,
     Dict,
     List,
     TypeVar,
+    Any,
 )
 
 import msgspec
 import zstandard
 
 from hyperscale.logging.config.logging_config import LoggingConfig
-from hyperscale.logging.models import Entry, Log
+from hyperscale.logging.models import Entry, Log, LogLevel
 from hyperscale.logging.queue import (
     ConsumerStatus,
     LogConsumer,
@@ -61,6 +62,13 @@ class LoggerStream:
         filename: str | None = None,
         directory: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,
     ) -> None:
         if name is None:
             name = "default"
@@ -75,8 +83,6 @@ class LoggerStream:
             self._default_retention_policy = RetentionPolicy(retention_policy)
             self._default_retention_policy.parse()
 
-        self._stdout: io.TextIO | None = None
-        self._stderr: io.TextIO | None = None
         self._init_lock = asyncio.Lock()
         self._stream_writers: Dict[StreamType, asyncio.StreamWriter] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -99,6 +105,25 @@ class LoggerStream:
         self._stderr: io.TextIOBase | None = None
         self._stdout: io.TextIOBase | None = None
         self._transports: List[asyncio.Transport] = []
+        
+        self._models: Dict[str, Callable[..., Entry]] = {}
+
+        for name, config in models.items():
+            model, defaults = config
+
+            self._models[name] = (
+                model,
+                defaults
+            )
+
+        self._models.update({
+            'default': (
+                Entry,
+                {
+                    'level': LogLevel.INFO
+                }
+            )
+        })
 
     @property
     def has_active_subscriptions(self):
@@ -399,6 +424,32 @@ class LoggerStream:
 
         return logfile_path
     
+    async def log_prepared_batch(
+        self,
+        model_messages: dict[str, list[str]],
+        template: str | None = None,
+        path: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
+        filter: Callable[[T], bool] | None=None,
+    ):
+        entries = [
+            self._to_entry(
+                message,
+                name,
+            ) for name, messages in model_messages.items() for message in messages
+        ]
+
+        if len (entries) > 0:
+            await asyncio.gather(*[
+                self.log(
+                    entry,
+                    template=template,
+                    path=path,
+                    retention_policy=retention_policy,
+                    filter=filter,
+                ) for entry in entries
+            ], return_exceptions=True)
+    
     async def batch(
         self,
         entries: list[T],
@@ -417,6 +468,25 @@ class LoggerStream:
                     filter=filter,
                 ) for entry in entries
             ], return_exceptions=True)
+
+    async def log_prepared(
+        self,
+        message: str,
+        name: str='default',
+        template: str | None = None,
+        path: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
+        filter: Callable[[T], bool] | None=None,
+    ):
+        entry = self._to_entry(message, name)
+
+        await self.log(
+            entry,
+            template=template,
+            path=path,
+            retention_policy=retention_policy,
+            filter=filter,
+        )
 
     async def log(
         self,
@@ -464,6 +534,21 @@ class LoggerStream:
                 template=template,
                 filter=filter,
             )
+
+    def _to_entry(
+        self,
+        message: str,
+        name: str,
+    ):
+        model, defaults = self._models.get(
+            name,
+            self._models.get('default')
+        )
+
+        return model(
+            message=message,
+            **defaults
+        )
 
     async def _log(
         self,

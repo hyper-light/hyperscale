@@ -405,8 +405,6 @@ class RemoteGraphManager:
             ])
 
         except Exception:
-            import traceback
-            print(traceback.format_exc())
             await asyncio.gather(*[
                 reporter.close() for reporter in reporters
             ], return_exceptions=True)

@@ -21,3 +21,4 @@ dev.yaml
 *.log
 *.csv
 *.xml
+.ruff_cache/

@@ -69,7 +69,8 @@ async def run(
             terminal_ui_enabled=terminal_ui_enabled,
         )
 
-    except Exception:
+    except Exception as e:
         await runner.abort(
+            error=e,
             terminal_ui_enabled=terminal_ui_enabled,
         )

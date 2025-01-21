@@ -104,34 +104,49 @@ class LocalRunner:
         timeout: int | float | str | None = None,
         terminal_ui_enabled: bool = True,
     ):
-        
+                
         workflow_names = [
             workflow.name for workflow in workflows
         ]
 
-        async with self._logger.context(
+        default_config = {   
+            "runner_type": self._runner_type,
+            "workflows": workflow_names,
+            "workers": self._workers,
+            "test": test_name,
+        }
+
+        self._logger.configure(
             path='hyperscale.main.log.json',
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
-        ) as ctx:
+            models={
+                'trace': (
+                    TestTrace,
+                    default_config
+                ),
+                'debug': (
+                    TestDebug,
+                    default_config
+                ),
+                'info': (
+                    TestInfo,
+                    default_config
+                ),
+                'fatal': (
+                    TestFatal,
+                    default_config
+                ),
+            }
+        )
+
+        async with self._logger.context() as ctx:
             
-            await ctx.log(TestInfo(
-                message=f'Starting {test_name} test with {self._workers} workers',
-                runner_type=self._runner_type,
-                workflows=workflow_names,
-                workers=self._workers,
-                test=test_name,
-            ))
+            await ctx.log_prepared(f'Starting {test_name} test with {self._workers} workers', name='info')
 
             loop = asyncio.get_event_loop()
             close_task = asyncio.current_task()
 
-            await ctx.log(TestTrace(
-                message=f'Setting interrupt handlers for SIGINT, SIGTERM, SIG_IGN for test {test_name}',
-                runner_type=self._runner_type,
-                workflows=workflow_names,
-                workers=self._workers,
-                test=test_name,
-            ))
+            await ctx.log_prepared(f'Setting interrupt handlers for SIGINT, SIGTERM, SIG_IGN for test {test_name}', name='trace')
 
             for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
                 sig = getattr(
@@ -151,34 +166,15 @@ class LocalRunner:
                     ),
                 )
 
-            await ctx.log(TestTrace(
-                message=f'Initializing UI for test {test_name}',
-                runner_type=self._runner_type,
-                workflows=workflow_names,
-                workers=self._workers,
-                test=test_name
-            ))
+            await ctx.log_prepared(f'Initializing UI for test {test_name}', name='trace')
 
             self._interface.initialize(workflows)
             if terminal_ui_enabled:
-                await ctx.log(TestDebug(
-                    message=f'Hyperscale Terminal UI is enabled for test {test_name}',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name
-                ))
-
+                await ctx.log_prepared(f'Hyperscale Terminal UI is enabled for test {test_name}', name='debug')
                 await self._interface.run()
 
             else:
-                await ctx.log(TestDebug(
-                    message=f'Hyperscale Terminal UI is disabled for test {test_name}',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name,
-                ))
+                await ctx.log_prepared(f'Hyperscale Terminal UI is disabled for test {test_name}', name='debug')
 
             if timeout is None:
                 timeout = self._worker_connect_timeout
@@ -194,14 +190,7 @@ class LocalRunner:
                     workflow_names,
                 )
 
-                await ctx.log(TestInfo(
-                    message=f'Initializing worker servers on runner type {self._runner_type} for test {test_name}',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name
-                ))
-
+                await ctx.log_prepared(f'Initializing worker servers on runner type {self._runner_type} for test {test_name}', name='info')
                 self._server_pool.setup()
 
                 await self._remote_manger.start(
@@ -225,273 +214,118 @@ class LocalRunner:
                     timeout=timeout,
                 )
 
-                await ctx.batch([
-                    TestInfo(
-                        message=f'Successfully connected to {self._workers} workers on runner type {self._runner_type} for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ),
-                    TestInfo(
-                        message=f'Beginning run for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    )
-                ])
+                await ctx.log_prepared_batch({
+                    'info': [
+                        f'Successfully connected to {self._workers} workers on runner type {self._runner_type} for test {test_name}',
+                        f'Beginning run for test {test_name}'
+                    ]
+                })
 
                 results = await self._remote_manger.execute_graph(
                     test_name,
                     workflows,
                 )
 
-                await ctx.log(TestInfo(
-                    message=f'Completed execution of test {test_name} on runner type {self._runner_type} - shutting down',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name
-                ))
+                await ctx.log_prepared(f'Completed execution of test {test_name} on runner type {self._runner_type} - shutting down', name='info')
 
                 if terminal_ui_enabled:
-
-                    await ctx.log(TestDebug(
-                        message=f'Stopping Hyperscale Terminal UI for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
+                    await ctx.log_prepared(f'Stopping Hyperscale Terminal UI for test {test_name}', name='debug')
 
                     await self._interface.stop()
 
-                    await ctx.log(TestTrace(
-                        message=f'Stopped Hyperscale Terminal UI for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
-                
-                await ctx.log(TestDebug(
-                    message=f'Stopping Hyperscale Remote Manager for test {test_name}',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name
-                ))
+                    await ctx.log_prepared(f'Stopped Hyperscale Terminal UI for test {test_name}', name='trace')
+
+                await ctx.log_prepared(f'Stopping Hyperscale Remote Manager for test {test_name}', name='debug')
 
                 await self._remote_manger.shutdown_workers()
                 await self._remote_manger.close()
 
-                await ctx.log(TestDebug(
-                    message=f'Stopping Hyperscale Server Pool for test {test_name}',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name
-                ))
-
+                await ctx.log_prepared(f'Stopping Hyperscale Server Pool for test {test_name}', name='debug')
 
                 await self._server_pool.shutdown()
 
-                await ctx.log(TestTrace(
-                    message=f'Closing {len(worker_sockets)} sockets for test {test_name}',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name
-                ))
-
+                await ctx.log_prepared(f'Closing {len(worker_sockets)} sockets for test {test_name}', name='trace')
                 for socket in worker_sockets:
                     host, port = socket.getsockname()
-                    await ctx.log(TestTrace(
-                        message=f'Closing worker socket on {host}:{port} for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
-                    
+                    await ctx.log_prepared(f'Closing worker socket on {host}:{port} for test {test_name}', name='trace')
+
                     try:
                         socket.close()
                         await asyncio.sleep(0)
 
                     except Exception:
                         pass
+                    
+                    await ctx.log_prepared(f'Worker socket on {host}:{port} closed for test {test_name}', name='trace')
 
-                    await ctx.log(TestTrace(
-                        message=f'Worker socket on {host}:{port} closed for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
-
-
-                await ctx.log(TestInfo(
-                    message=f'Exiting test {test_name}',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name,
-                ))
-
+                await ctx.log_prepared(f'Exiting test {test_name}', name='info')
+ 
                 return results
 
             except Exception as e:
-
-                await ctx.log(TestFatal(
-                    message=f'Encountered fatal exception {str(e)} while running test {test_name} - aborting',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name,
-                ))
+                await ctx.log_prepared(f'Encountered fatal exception {str(e)} while running test {test_name} - aborting', name='fatal')
 
                 try:
                     if terminal_ui_enabled:
-                        await ctx.log(TestDebug(
-                            message=f'Aborting Hyperscale Terminal UI for test {test_name}',
-                            runner_type=self._runner_type,
-                            workflows=workflow_names,
-                            workers=self._workers,
-                            test=test_name
-                        ))
-
+                        await ctx.log_prepared(f'Aborting Hyperscale Terminal UI for test {test_name}', name='debug')
                         await self._interface.abort()
 
                 except Exception as e:
-                    await ctx.log(TestTrace(
-                        message=f'Encountered error {str(e)} aborting Hyperscale Terminal UI for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
+                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Terminal UI for test {test_name}', name='trace')
 
                 except asyncio.CancelledError:
                     pass
 
                 try:
-                    await ctx.log(TestDebug(
-                        message=f'Aborting Hyperscale Remote Manager for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
-
+                    await ctx.log_prepared(f'Aborting Hyperscale Remote Manager for test {test_name}', name='debug')
                     self._remote_manger.abort()
+
                 except Exception as e:
-                    await ctx.log(TestTrace(
-                        message=f'Encountered error {str(e)} aborting Hyperscale Remote Manager for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
+                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Remote Manager for test {test_name}', name='trace')
 
                 except asyncio.CancelledError:
                     pass
 
                 try:
-                    await ctx.log(TestDebug(
-                        message=f'Aborting Hyperscale Server Pool for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
-
+                    await ctx.log_prepared(f'Aborting Hyperscale Server Pool for test {test_name}', name='debug')
                     self._server_pool.abort()
-                except Exception:
-                    await ctx.log(TestDebug(
-                        message=f'Encountered error {str(e)} aborting Hyperscale Server Pool for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
 
+                except Exception:
+                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Server Pool for test {test_name}', name='trace')
+ 
                 except asyncio.CancelledError:
                     pass
 
             except asyncio.CancelledError:
-                await ctx.log(TestFatal(
-                    message=f'Encountered interrupt while running test {test_name} - aborting',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name,
-                ))
+                await ctx.log_prepared(f'Encountered interrupt while running test {test_name} - aborting', name='fatal')
 
                 try:
                     if terminal_ui_enabled:
-                        await ctx.log(TestDebug(
-                            message=f'Aborting Hyperscale Terminal UI for test {test_name}',
-                            runner_type=self._runner_type,
-                            workflows=workflow_names,
-                            workers=self._workers,
-                            test=test_name
-                        ))
-
+                        await ctx.log_prepared(f'Aborting Hyperscale Terminal UI for test {test_name}', name='debug')
                         await self._interface.abort()
 
                 except Exception as e:
-                    await ctx.log(TestTrace(
-                        message=f'Encountered error {str(e)} aborting Hyperscale Terminal UI for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
+                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Terminal UI for test {test_name}', name='trace')
 
                 except asyncio.CancelledError:
                     pass
 
                 try:
-                    await ctx.log(TestDebug(
-                        message=f'Aborting Hyperscale Remote Manager for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
-
+                    await ctx.log_prepared(f'Aborting Hyperscale Remote Manager for test {test_name}', name='debug')
                     self._remote_manger.abort()
+
                 except Exception as e:
-                    await ctx.log(TestTrace(
-                        message=f'Encountered error {str(e)} aborting Hyperscale Remote Manager for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
+                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Remote Manager for test {test_name}', name='trace')
 
                 except asyncio.CancelledError:
                     pass
 
                 try:
-                    await ctx.log(TestDebug(
-                        message=f'Aborting Hyperscale Server Pool for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
-
+                    await ctx.log_prepared(f'Aborting Hyperscale Server Pool for test {test_name}', name='debug')
                     self._server_pool.abort()
+
                 except Exception:
-                    await ctx.log(TestDebug(
-                        message=f'Encountered error {str(e)} aborting Hyperscale Server Pool for test {test_name}',
-                        runner_type=self._runner_type,
-                        workflows=workflow_names,
-                        workers=self._workers,
-                        test=test_name
-                    ))
+                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Server Pool for test {test_name}', name='trace')
 
                 except asyncio.CancelledError:
                     pass
@@ -511,30 +345,46 @@ class LocalRunner:
 
     async def abort(
         self,
+        error: Exception | None = None,
         terminal_ui_enabled: bool = True,
     ):
-        try:
-            if terminal_ui_enabled:
-                await self._interface.abort()
+        async with self._logger.context(nested=True) as ctx:
 
-        except Exception:
-            pass
-        except asyncio.CancelledError:
-            pass
+            if error is None:
+                await ctx.log_prepared(f'Runner type {self._runner_type} received a call to abort and is now aborting all running tests', name='fatal')
 
-        try:
-            self._remote_manger.abort()
-        except Exception:
-            pass
-        except asyncio.CancelledError:
-            pass
+            else:
+                await ctx.log_prepared(f'Runner type {self._runner_type} encountered exception {str(e)} is now aborting all running tests', name='fatal')
 
-        try:
-            self._server_pool.abort()
-        except Exception:
-            pass
-        except asyncio.CancelledError:
-            pass
+            try:
+                if terminal_ui_enabled:
+                    await ctx.log_prepared('Aborting Hyperscale Terminal UI', name='debug')
+                    await self._interface.abort()
+
+            except Exception as e:
+                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Terminal UI', name='trace')
+
+            except asyncio.CancelledError:
+                pass
+
+            try:
+                self._remote_manger.abort()
+                await ctx.log_prepared('Aborting Hyperscale Remote Manager', name='debug')
+
+            except Exception as e:
+                await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Remote Manager', name='trace')
+                
+            except asyncio.CancelledError:
+                pass
+
+            try:
+                await ctx.log_prepared('Aborting Hyperscale Server Pool', name='debug')
+                self._server_pool.abort()
+            except Exception as e:
+                await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Server Pool', name='debug')
+                
+            except asyncio.CancelledError:
+                pass
 
     def close(self):
         child_processes = active_children()
@@ -572,25 +422,12 @@ class LocalRunner:
         worker_ips: List[tuple[str, int]] = []
 
         async with self._logger.context(nested=True) as ctx:
-
-            await ctx.log(TestDebug(
-                message=f'Provisioning {self._workers} worker sockets for test {test_name}',
-                runner_type=self._runner_type,
-                workflows=workflow_names,
-                workers=self._workers,
-                test=test_name
-            ))
+            await ctx.log_prepared(f'Provisioning {self._workers} worker sockets for test {test_name}', name='debug')
 
             for port in worker_port_range:
                 testing_port = True
 
-                await ctx.log(TestTrace(
-                    message=f'Provisioning worker socket on port {port} for test {test_name}',
-                    runner_type=self._runner_type,
-                    workflows=workflow_names,
-                    workers=self._workers,
-                    test=test_name
-                ))
+                await ctx.log_prepared(f'Provisioning worker socket on port {port} for test {test_name}', name='trace')
 
                 while testing_port:
                     try:
@@ -598,13 +435,7 @@ class LocalRunner:
                         worker_ips.append((self.host, port))
                         worker_sockets.append(worker_socket)
 
-                        await ctx.log(TestTrace(
-                            message=f'Successfully provisioned worker socket on port {port} for test {test_name}',
-                            runner_type=self._runner_type,
-                            workflows=workflow_names,
-                            workers=self._workers,
-                            test=test_name,
-                        ))
+                        await ctx.log_prepared(f'Successfully provisioned worker socket on port {port} for test {test_name}', name='trace')
 
                         testing_port = False
 
@@ -612,26 +443,13 @@ class LocalRunner:
                         previous_port = port
                         port += self._workers + 1
 
-                        await ctx.log(TestTrace(
-                            message=f'Failed to provision worker socket on port {previous_port} as socket is busy - re-attempting on port {port} for test {test_name}',
-                            runner_type=self._runner_type,
-                            workflows=workflow_names,
-                            workers=self._workers,
-                            test=test_name,
-                        ))
+                        await ctx.log_prepared(f'Failed to provision worker socket on port {previous_port} as socket is busy - re-attempting on port {port} for test {test_name}', name='trace')
 
                         await asyncio.sleep(0.1)
 
             if len(worker_sockets) < self._workers:
                 raise Exception("Err. - Insufficient sockets binned.")
             
-
-            await ctx.log(TestDebug(
-                message=f'Provisioned {self._workers} worker sockets for test {test_name}',
-                runner_type=self._runner_type,
-                workflows=workflow_names,
-                workers=self._workers,
-                test=test_name
-            ))
+            await ctx.log_prepared(f'Provisioned {self._workers} worker sockets for test {test_name}', name='debug')
 
         return (worker_sockets, worker_ips)

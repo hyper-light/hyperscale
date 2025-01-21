@@ -1,7 +1,7 @@
 import asyncio
 import os
 
-from typing import TypeVar
+from typing import TypeVar, Any
 from .logger_stream import LoggerStream
 from .retention_policy import (
     RetentionPolicy,
@@ -20,7 +20,11 @@ class LoggerContext:
         filename: str | None = None,
         directory: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
-        nested: bool = False
+        nested: bool = False,
+        models: dict[
+            type[T],
+            dict[str, Any],
+        ] | None = None,
     ) -> None:
         self.name = name
         self.template = template
@@ -33,6 +37,7 @@ class LoggerContext:
             filename=filename,
             directory=directory,
             retention_policy=retention_policy,
+            models=models,
         )
         self.nested = nested
 

@@ -9,6 +9,7 @@ from typing import (
     Callable,
     Dict,
     TypeVar,
+    Any
 )
 
 from hyperscale.logging.models import Entry, Log
@@ -37,6 +38,13 @@ class Logger:
         template: str | None = None,
         path: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,
     ):
         if name is None:
             name = 'default'
@@ -57,6 +65,7 @@ class Logger:
             filename=filename,
             directory=directory,
             retention_policy=retention_policy,
+            models=models,
         )
 
     def context(
@@ -66,6 +75,13 @@ class Logger:
         path: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
         nested: bool = False,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,
     ):
         if name is None:
             name = 'default'
@@ -89,6 +105,7 @@ class Logger:
                 directory=directory,
                 retention_policy=retention_policy,
                 nested=nested,
+                models=models,
             )
 
         else:
@@ -108,6 +125,13 @@ class Logger:
         template: str | None = None,
         path: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,
     ):
         filename: str | None = None
         directory: str | None = None
@@ -128,7 +152,8 @@ class Logger:
                 template=template,
                 filename=filename,
                 directory=directory,
-                retention_policy=retention_policy
+                retention_policy=retention_policy,
+                models=models,
             )
 
             await self._contexts[name].stream.initialize()
@@ -150,6 +175,13 @@ class Logger:
         path: str | None = None,
         retention_policy: RetentionPolicyConfig | None = None,
         filter: Callable[[T], bool] | None = None,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,
     ):
         if name is None:
             name = 'default'
@@ -157,7 +189,11 @@ class Logger:
         frame = sys._getframe(1)
         code = frame.f_code
 
-        async with self.context(name=name, nested=True) as ctx:
+        async with self.context(
+            name=name,
+            nested=True,
+            models=models,
+        ) as ctx:
             await ctx.log(
                 Log(
                     entry=entry,
@@ -177,6 +213,13 @@ class Logger:
         self,
         *entries: T | Log[T],
         name: str | None = None,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,
     ):
         if name is None:
             name = 'default'
@@ -184,7 +227,11 @@ class Logger:
         frame = sys._getframe(1)
         code = frame.f_code
 
-        async with self.context(name=name, nested=True) as ctx:
+        async with self.context(
+            name=name,
+            nested=True,
+            models=models,
+        ) as ctx:
             await asyncio.gather(*[
                 ctx.put(
                     Log(
@@ -202,6 +249,13 @@ class Logger:
         self,
         entry: T | Log[T],
         name: str | None = None,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,
     ):
         if name is None:
             name = 'default'
@@ -209,7 +263,11 @@ class Logger:
         frame = sys._getframe(1)
         code = frame.f_code
         
-        async with self.context(name=name, nested=True) as ctx:
+        async with self.context(
+            name=name,
+            nested=True,
+            models=models,
+        ) as ctx:
             await ctx.put(
                 Log(
                     entry=entry,
@@ -225,6 +283,13 @@ class Logger:
         self, 
         name: str | None = None,
         filter: Callable[[T], bool] | None = None,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,
     ):
 
         if name is None:
@@ -244,6 +309,7 @@ class Logger:
             self._watch(
                 name,
                 filter=filter,
+                models=models,
             )
         )
 
@@ -251,8 +317,19 @@ class Logger:
         self, 
         name: str,
         filter: Callable[[T], bool] | None = None,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,
     ):
-        async with self.context(name=name, nested=True) as ctx:
+        async with self.context(
+            name=name,
+            nested=True,
+            models=models,
+        ) as ctx:
             async for log in ctx.get(
                 filter=filter
             ):
