@@ -117,6 +117,7 @@ class LocalRunner:
         }
 
         self._logger.configure(
+            name='local_runner',
             path='hyperscale.main.log.json',
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
@@ -139,7 +140,7 @@ class LocalRunner:
             }
         )
 
-        async with self._logger.context() as ctx:
+        async with self._logger.context(name='local_runner') as ctx:
             
             await ctx.log_prepared(f'Starting {test_name} test with {self._workers} workers', name='info')
 
@@ -276,6 +277,9 @@ class LocalRunner:
                 except asyncio.CancelledError:
                     pass
 
+                import traceback
+                print(traceback.format_exc())
+                
                 try:
                     await ctx.log_prepared(f'Aborting Hyperscale Remote Manager for test {test_name}', name='debug')
                     self._remote_manger.abort()
@@ -348,7 +352,10 @@ class LocalRunner:
         error: Exception | None = None,
         terminal_ui_enabled: bool = True,
     ):
-        async with self._logger.context(nested=True) as ctx:
+        async with self._logger.context(
+            name='local_runner',
+            nested=True,
+        ) as ctx:
 
             if error is None:
                 await ctx.log_prepared(f'Runner type {self._runner_type} received a call to abort and is now aborting all running tests', name='fatal')
@@ -421,7 +428,10 @@ class LocalRunner:
         worker_sockets: List[socket.socket] = []
         worker_ips: List[tuple[str, int]] = []
 
-        async with self._logger.context(nested=True) as ctx:
+        async with self._logger.context(
+            name='local_runner',
+            nested=True,
+        ) as ctx:
             await ctx.log_prepared(f'Provisioning {self._workers} worker sockets for test {test_name}', name='debug')
 
             for port in worker_port_range:

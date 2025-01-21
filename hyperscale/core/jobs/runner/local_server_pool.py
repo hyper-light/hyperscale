@@ -6,7 +6,6 @@ import signal
 import socket
 import warnings
 from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import current_process
 from multiprocessing.context import SpawnContext
 from typing import Dict, List
 

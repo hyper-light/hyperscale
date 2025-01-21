@@ -108,6 +108,9 @@ class LoggerStream:
         
         self._models: Dict[str, Callable[..., Entry]] = {}
 
+        if models is None:
+            models = {}
+
         for name, config in models.items():
             model, defaults = config
 
@@ -154,10 +157,46 @@ class LoggerStream:
                 self._provider = LogProvider()
 
             if self._stdout is None:
-                self._stdout = sys.stdout
+                stdout_fileno = await self._loop.run_in_executor(
+                    None,
+                    sys.stderr.fileno
+                )
+
+                stdout_dup = await self._loop.run_in_executor(
+                    None,
+                    os.dup,
+                    stdout_fileno,
+                )
+
+                self._stdout = await self._loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        os.fdopen,
+                        stdout_dup,
+                        mode=sys.stdout.mode
+                    )
+                )
 
             if self._stderr is None:
-                self._stderr = sys.stderr
+                stderr_fileno = await self._loop.run_in_executor(
+                    None,
+                    sys.stderr.fileno
+                )
+
+                stderr_dup = await self._loop.run_in_executor(
+                    None,
+                    os.dup,
+                    stderr_fileno,
+                )
+
+                self._stderr = await self._loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        os.fdopen,
+                        stderr_dup,
+                        mode=sys.stderr.mode
+                    )
+                )
 
             if self._stream_writers.get(StreamType.STDOUT) is None:
                 transport, protocol = await self._loop.connect_write_pipe(

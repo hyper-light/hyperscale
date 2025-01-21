@@ -1,5 +1,4 @@
 import asyncio
-import functools
 import inspect
 import time
 
@@ -8,7 +7,6 @@ from typing import (
     Any,
     Dict,
     List,
-    Literal,
     Tuple,
 )
 
@@ -27,6 +25,9 @@ from hyperscale.core.state import (
     ContextHook,
     StateAction,
 )
+from hyperscale.logging import Logger
+from hyperscale.reporting.reporter import Reporter, ReporterConfig
+from hyperscale.reporting.reporter import ReporterConfig
 from hyperscale.ui import InterfaceUpdatesController
 from hyperscale.ui.actions import (
     update_workflow_run_timer,
@@ -43,8 +44,6 @@ from hyperscale.reporting.common.results_types import (
     WorkflowContextResult,
     WorkflowStats,
 )
-from hyperscale.reporting.reporter import Reporter, ReporterConfig
-from hyperscale.reporting.reporter import ReporterConfig, JSONConfig
 from .remote_graph_controller import RemoteGraphController
 
 
@@ -108,6 +107,7 @@ class RemoteGraphManager:
 
         self._workflow_configs: Dict[str, Dict[str, Any]] = {}
         self._loop = asyncio.get_event_loop()
+        self._logger = Logger()
 
     async def start(
         self,
@@ -117,41 +117,47 @@ class RemoteGraphManager:
         cert_path: str | None = None,
         key_path: str | None = None,
     ):
-        if self._controller is None:
-            self._controller = RemoteGraphController(
-                host,
-                port,
-                env,
+        async with self._logger.context(
+            name='remote_graph_manager'
+        ) as ctx:
+            if self._controller is None:
+                self._controller = RemoteGraphController(
+                    host,
+                    port,
+                    env,
+                )
+
+            if self._provisioner is None:
+                self._provisioner = Provisioner()
+
+            await self._controller.start_server(
+                cert_path=cert_path,
+                key_path=key_path,
             )
-
-        if self._provisioner is None:
-            self._provisioner = Provisioner()
-
-        await self._controller.start_server(
-            cert_path=cert_path,
-            key_path=key_path,
-        )
 
     async def connect_to_workers(
         self,
         workers: List[Tuple[str, int]],
         timeout: int | float | str | None = None,
     ):
-        if isinstance(timeout, str):
-            timeout = TimeParser(timeout).time
+        async with self._logger.context(
+            name='remote_graph_manager'
+        ) as ctx:
+            if isinstance(timeout, str):
+                timeout = TimeParser(timeout).time
 
-        elif timeout is None:
-            timeout = self._controller._request_timeout
+            elif timeout is None:
+                timeout = self._controller._request_timeout
 
-        self._workers = workers
+            self._workers = workers
 
-        await self._controller.poll_for_start(self._threads)
+            await self._controller.poll_for_start(self._threads)
 
-        await asyncio.gather(
-            *[self._controller.connect_client(address) for address in workers]
-        )
+            await asyncio.gather(
+                *[self._controller.connect_client(address) for address in workers]
+            )
 
-        self._provisioner.setup(max_workers=len(self._controller.nodes))
+            self._provisioner.setup(max_workers=len(self._controller.nodes))
 
     async def run_forever(self):
         await self._controller.run_forever()
