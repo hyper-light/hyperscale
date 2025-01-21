@@ -13,7 +13,6 @@ from hyperscale.core.engines.types import (
     MercuryWebsocketClient,
 )
 from hyperscale.core.engines.types.common.base_action import BaseAction
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
 
 
 class ActionsStore:
@@ -26,8 +25,8 @@ class ActionsStore:
         self.waiter = None
         self.setup_call = None
         self.metadata_string: str = None
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
+        # self.logger = HyperscaleLogger()
+        # self.logger.initialize()
 
     def set_waiter(self, stage: str):
         if self._loop is None:
@@ -37,15 +36,11 @@ class ActionsStore:
         self.current_stage = stage
 
     async def wait_for_ready(self, setup_call):
-        await self.logger.filesystem.aio["hyperscale.core"].debug(
-            f"{self.metadata_string} - Action Store waiting for Action or Task to notify store it is ready"
-        )
+        # await self.logger.filesystem.aio['hyperscale.core'].debug(f'{self.metadata_string} - Action Store waiting for Action or Task to notify store it is ready')
         self.setup_call = setup_call
         await self.waiter
 
-        await self.logger.filesystem.aio["hyperscale.core"].debug(
-            f"{self.metadata_string} - Action Store was notified and is exiting suspension"
-        )
+        # await self.logger.filesystem.aio['hyperscale.core'].debug(f'{self.metadata_string} - Action Store was notified and is exiting suspension')
 
     def store(self, request: str, action: Any, session: Any):
         self.actions[self.current_stage][request] = action

@@ -1,35 +1,28 @@
-import asyncio
 import uvloop
+
 uvloop.install()
 
-from hyperscale.core_rewrite.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow, step
 from hyperscale.testing import URL, HTTPResponse
+from hyperscale.reporting import JSONConfig, CSVConfig
+
+
+@staticmethod
+async def reporting_options():
+    return [
+        JSONConfig(),
+        CSVConfig(),
+    ]
 
 
 class Test(Workflow):
-    vus = 16000
+    vus = 4000
     duration = "1m"
+    reporting=reporting_options
 
     @step()
-    async def login(self, url: URL = "https://httpbin.org/get") -> HTTPResponse:
+    async def login(
+        self,
+        url: URL = "https://httpbin.org/get",
+    ) -> HTTPResponse:
         return await self.client.http.get(url)
-
-
-async def run():
-    runner = LocalRunner(
-        "0.0.0.0",
-        15454,
-        workers=16
-    )
-
-    results = await runner.run(
-        "test",
-        [Test()],
-    )
-
-    print(results)
-
-
-if __name__ == "__main__":
-    asyncio.run(run())

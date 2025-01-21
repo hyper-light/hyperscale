@@ -16,3 +16,9 @@ kube_config
 dev.yaml
 .venv
 *.png
+*.json
+*.txt
+*.log
+*.csv
+*.xml
+.ruff_cache/

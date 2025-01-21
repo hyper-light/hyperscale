@@ -1,15 +1,15 @@
 import asyncio
 import pprint
 
-from hyperscale.core_rewrite.graph import Graph
-from hyperscale.core_rewrite.results.workflow_results import WorkflowResults
+from hyperscale.core.graph import Graph
+from hyperscale.core.results.workflow_results import WorkflowResults
 from hyperscale.graph import Workflow, step
 from hyperscale.testing import URL, HTTPResponse
 
 
 class Test(Workflow):
     vus = 1000
-    threads=12
+    threads = 12
     duration = "1m"
 
     @step()

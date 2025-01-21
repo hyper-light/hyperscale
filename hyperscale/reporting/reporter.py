@@ -3,121 +3,105 @@ from __future__ import annotations
 import os
 import threading
 import uuid
-from typing import Any, Dict, List, TypeVar, Union
-
-from hyperscale.core.personas.streaming.stream_analytics import StreamAnalytics
-from hyperscale.logging.hyperscale_logger import HyperscaleLogger
-from hyperscale.plugins.types.reporter.reporter_config import ReporterConfig
-
-from .experiment.experiment_metrics_set import ExperimentMetricsSet
-from .experiment.experiment_metrics_set_types import MutationSummary, VariantSummary
-from .experiment.experiments_collection import (
-    ExperimentMetricsCollection,
-    ExperimentMetricsCollectionSet,
+from .common.results_types import (
+    WorkflowStats,
+    ResultSet,
+    MetricsSet,
+    CheckSet,
+    CountResults,
 )
-from .types import (
-    CSV,
-    JSON,
-    S3,
-    XML,
-    AWSLambda,
-    AWSLambdaConfig,
-    AWSTimestream,
-    AWSTimestreamConfig,
-    BigQuery,
-    BigQueryConfig,
-    BigTable,
-    BigTableConfig,
-    Cassandra,
-    CassandraConfig,
-    Cloudwatch,
-    CloudwatchConfig,
-    CosmosDB,
-    CosmosDBConfig,
-    CSVConfig,
-    Datadog,
-    DatadogConfig,
-    DogStatsD,
-    DogStatsDConfig,
-    GoogleCloudStorage,
-    GoogleCloudStorageConfig,
-    Graphite,
-    GraphiteConfig,
-    Honeycomb,
-    HoneycombConfig,
-    InfluxDB,
-    InfluxDBConfig,
-    JSONConfig,
-    Kafka,
-    KafkaConfig,
-    MongoDB,
-    MongoDBConfig,
-    MySQL,
-    MySQLConfig,
-    Netdata,
-    NetdataConfig,
-    NewRelic,
-    NewRelicConfig,
-    Postgres,
-    PostgresConfig,
-    Prometheus,
-    PrometheusConfig,
-    Redis,
-    RedisConfig,
-    ReporterTypes,
-    S3Config,
-    Snowflake,
-    SnowflakeConfig,
-    SQLite,
-    SQLiteConfig,
-    StatsD,
-    StatsDConfig,
-    Telegraf,
-    TelegrafConfig,
-    TelegrafStatsD,
-    TelegrafStatsDConfig,
-    TimescaleDB,
-    TimescaleDBConfig,
-    XMLConfig,
-)
+from typing import List, TypeVar, Generic
 
-ReporterType = TypeVar(
-    "ReporterType",
-    AWSLambdaConfig,
-    AWSTimestreamConfig,
-    BigQueryConfig,
-    BigTableConfig,
-    CassandraConfig,
-    CloudwatchConfig,
-    CosmosDBConfig,
-    CSVConfig,
-    DatadogConfig,
-    DogStatsDConfig,
-    GoogleCloudStorageConfig,
-    GraphiteConfig,
-    HoneycombConfig,
-    InfluxDBConfig,
-    JSONConfig,
-    KafkaConfig,
-    MongoDBConfig,
-    MySQLConfig,
-    NetdataConfig,
-    NewRelicConfig,
-    PostgresConfig,
-    PrometheusConfig,
-    RedisConfig,
-    S3Config,
-    SnowflakeConfig,
-    SQLiteConfig,
-    StatsDConfig,
-    TelegrafConfig,
-    TelegrafStatsDConfig,
-    TimescaleDBConfig,
-    XMLConfig,
+from .common import (
+    ReporterTypes as ReporterTypes,
+    StepMetricSet as StepMetricSet,
+    StepMetricSet as StepMetricSet,
+    WorkflowMetric as WorkflowMetric,
+    WorkflowMetricSet as WorkflowMetricSet,
+)
+from .aws_lambda import AWSLambda as AWSLambda, AWSLambdaConfig as AWSLambdaConfig
+from .aws_timestream import (
+    AWSTimestream as AWSTimestream,
+    AWSTimestreamConfig as AWSTimestreamConfig,
+)
+from .bigquery import BigQuery as BigQuery, BigQueryConfig as BigQueryConfig
+from .bigtable import BigTable as BigTable, BigTableConfig as BigTableConfig
+from .cassandra import Cassandra as Cassandra, CassandraConfig as CassandraConfig
+from .cloudwatch import Cloudwatch as Cloudwatch, CloudwatchConfig as CloudwatchConfig
+from .cosmosdb import CosmosDB as CosmosDB, CosmosDBConfig as CosmosDBConfig
+from .csv import CSV as CSV, CSVConfig as CSVConfig
+from .datadog import Datadog as Datadog, DatadogConfig as DatadogConfig
+from .dogstatsd import DogStatsD as DogStatsD, DogStatsDConfig as DogStatsDConfig
+from .google_cloud_storage import (
+    GoogleCloudStorage as GoogleCloudStorage,
+    GoogleCloudStorageConfig as GoogleCloudStorageConfig,
+)
+from .graphite import Graphite as Graphite, GraphiteConfig as GraphiteConfig
+from .honeycomb import Honeycomb as Honeycomb, HoneycombConfig as HoneycombConfig
+from .influxdb import InfluxDB as InfluxDB, InfluxDBConfig as InfluxDBConfig
+from .json import JSON as JSON, JSONConfig as JSONConfig
+from .kafka import Kafka as Kafka, KafkaConfig as KafkaConfig
+from .mongodb import MongoDB as MongoDB, MongoDBConfig as MongoDBConfig
+from .mysql import MySQL as MySQL, MySQLConfig as MySQLConfig
+from .netdata import Netdata as Netdata, NetdataConfig as NetdataConfig
+from .newrelic import NewRelic as NewRelic, NewRelicConfig as NewRelicConfig
+from .postgres import Postgres as Postgres, PostgresConfig as PostgresConfig
+from .prometheus import Prometheus as Prometheus, PrometheusConfig as PrometheusConfig
+from .redis import Redis as Redis, RedisConfig as RedisConfig
+from .s3 import S3 as S3, S3Config as S3Config
+from .snowflake import Snowflake as Snowflake, SnowflakeConfig as SnowflakeConfig
+from .sqlite import SQLite as SQLite, SQLiteConfig as SQLiteConfig
+from .statsd import StatsD as StatsD, StatsDConfig as StatsDConfig
+from .telegraf import Telegraf as Telegraf, TelegrafConfig as TelegrafConfig
+from .telegraf_statsd import (
+    TelegrafStatsD as TelegrafStatsD,
+    TelegrafStatsDConfig as TelegrafStatsDConfig,
+)
+from .timescaledb import (
+    TimescaleDB as TimescaleDB,
+    TimescaleDBConfig as TimescaleDBConfig,
+)
+from .xml import XML as XML, XMLConfig as XMLConfig
+
+
+ReporterConfig = (
+    AWSLambdaConfig
+    | AWSTimestreamConfig
+    | BigQueryConfig
+    | BigTableConfig
+    | CassandraConfig
+    | CloudwatchConfig
+    | CosmosDBConfig
+    | CSVConfig
+    | DatadogConfig
+    | DogStatsDConfig
+    | GoogleCloudStorageConfig
+    | GraphiteConfig
+    | HoneycombConfig
+    | InfluxDBConfig
+    | JSONConfig
+    | KafkaConfig
+    | MongoDBConfig
+    | MySQLConfig
+    | NetdataConfig
+    | NewRelicConfig
+    | PostgresConfig
+    | PrometheusConfig
+    | RedisConfig
+    | S3Config
+    | SnowflakeConfig
+    | SQLiteConfig
+    | StatsDConfig
+    | TelegrafConfig
+    | TelegrafStatsDConfig
+    | TimescaleDBConfig
+    | XMLConfig
 )
 
+T = TypeVar("T")
 
-class Reporter:
+
+class Reporter(Generic[T]):
     reporters = {
         ReporterTypes.AWSLambda: lambda config: AWSLambda(config),
         ReporterTypes.AWSTimestream: lambda config: AWSTimestream(config),
@@ -152,31 +136,16 @@ class Reporter:
         ReporterTypes.XML: lambda config: XML(config),
     }
 
-    def __init__(self, reporter_config: Union[ReporterConfig, ReporterType]) -> None:
+    def __init__(self, reporter_config: T) -> None:
         self.reporter_id = str(uuid.uuid4())
-        self.logger = HyperscaleLogger()
-        self.logger.initialize()
 
-        self.graph_name: str = None
-        self.graph_id: str = None
-        self.stage_name: str = None
-        self.stage_id: str = None
         self.metadata_string: str = None
         self.thread_id = threading.current_thread().ident
         self.process_id = os.getpid()
 
-        if reporter_config is None:
-            reporter_config = JSONConfig()
-
-        self.reporter_type = reporter_config.reporter_type
-
-        if isinstance(self.reporter_type, ReporterTypes):
-            self.reporter_type_name = self.reporter_type.name.capitalize()
-
-        elif isinstance(self.reporter_type, str):
-            self.reporter_type_name = self.reporter_type.capitalize()
-
-        self.reporter_config = reporter_config
+        self.reporter_config: T = reporter_config
+        self.reporter_type = self.reporter_config.reporter_type
+        self.reporter_type_name = self.reporter_type.name.capitalize()
 
         selected_reporter = self.reporters.get(self.reporter_type)
         if selected_reporter is None:
@@ -186,157 +155,153 @@ class Reporter:
             self.selected_reporter = selected_reporter(reporter_config)
 
     async def connect(self):
-        self.metadata_string = f"Graph - {self.graph_name}:{self.graph_id} - thread:{self.thread_id} - process:{self.process_id} - Stage: {self.stage_name}:{self.stage_id} - Reporter: {self.reporter_type_name}:{self.reporter_id} - "
         self.selected_reporter.metadata_string = self.metadata_string
 
-        await self.logger.filesystem.aio.create_logfile("hyperscale.reporting.log")
-        self.logger.filesystem.create_filelogger("hyperscale.reporting.log")
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Connecting"
-        )
         await self.selected_reporter.connect()
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Connected"
-        )
+    async def submit_workflow_results(self, results: WorkflowStats):
+        workflow_stats: CountResults = results.get("stats")
 
-    async def submit_experiments(
-        self, experiment_metrics_sets: List[ExperimentMetricsSet]
-    ):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting {len(experiment_metrics_sets)} experiments"
-        )
-
-        experiment_metrics: List[ExperimentMetricsCollection] = [
-            experiment.split_experiments_metrics()
-            for experiment in experiment_metrics_sets
+        workflow_results = [
+            {
+                "metric_workflow": results.get("workflow"),
+                "metric_type": "COUNT",
+                "metric_group": "workflow",
+                "metric_name": count_name,
+                "metric_value": count_value,
+            }
+            for count_name, count_value in workflow_stats.items()
         ]
 
-        experiments: List[Dict[str, str]] = [
-            metrics_collection.experiment for metrics_collection in experiment_metrics
+        workflow_results.append(
+            {
+                "metric_workflow": results.get("workflow"),
+                "metric_type": "RATE",
+                "metric_group": "workflow",
+                "metric_name": "rps",
+                "metric_value": results.get("rps"),
+            }
+        )
+
+        workflow_results.append(
+            {
+                "metric_workflow": results.get("workflow"),
+                "metric_type": "TIMING",
+                "metric_group": "workflow",
+                "metric_name": "elapsed",
+                "metric_value": results.get("elapsed"),
+            }
+        )
+
+        await self.selected_reporter.submit_workflow_results(workflow_results)
+
+    async def submit_step_results(self, results: WorkflowStats):
+        results_set: List[ResultSet] = results.get("results", [])
+
+        step_results = [
+            {
+                "metric_workflow": results_metrics.get("workflow"),
+                "metric_step": results_metrics.get("step"),
+                "metric_type": "DISTRIBUTION" if "quantile" in metric_name else "TIMING",
+                "metric_group": timing_name,
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+            }
+            for results_metrics in results_set
+            for timing_name, timing_metrics in results_metrics.get(
+                "timings", {}
+            ).items()
+            for metric_name, metric_value in timing_metrics.items()
         ]
 
-        variants: List[Dict[str, str]] = []
-        variants_summaries: List[VariantSummary] = []
-        for metrics_collection in experiment_metrics:
-            variants.extend(metrics_collection.variants)
-            variants_summaries.extend(metrics_collection.variant_summaries)
-
-        mutations: List[MutationSummary] = []
-        mutations_summaries: List[MutationSummary] = []
-        for metrics_collection in experiment_metrics:
-            mutations.extend(metrics_collection.mutations)
-            mutations_summaries.extend(metrics_collection.mutation_summaries)
-
-        experiment_metrics_collection_set = ExperimentMetricsCollectionSet(
-            experiments_metrics_fields=ExperimentMetricsSet.experiments_fields(),
-            variants_metrics_fields=ExperimentMetricsSet.variants_fields(),
-            mutations_metrics_fields=ExperimentMetricsSet.mutations_fields(),
-            experiments=experiments,
-            variants=variants,
-            mutations=mutations,
-            experiment_summaries=[
-                experiment.experiments_summary for experiment in experiment_metrics_sets
-            ],
-            variant_summaries=variants_summaries,
-            mutation_summaries=mutations_summaries,
+        step_results.extend(
+            [
+                {
+                    "metric_workflow": results_metrics.get("workflow"),
+                    "metric_step": results_metrics.get("step"),
+                    "metric_type": "COUNT",
+                    "metric_group": "counts",
+                    "metric_name": count_name,
+                    "metric_value": count_metric,
+                }
+                for results_metrics in results_set
+                for count_name, count_metric in results_metrics.get(
+                    "counts", 
+                    {},
+                ).items()
+            ]
         )
 
-        await self.selected_reporter.submit_experiments(
-            experiment_metrics_collection_set
+        metrics_set: List[MetricsSet] = results.get("metrics", [])
+
+        step_results.extend(
+            [
+                {
+                    "metric_workflow": metrics.get("workflow"),
+                    "metric_step": metrics.get("step"),
+                    "metric_type": "DISTRIBUTION" if "quantile" in metric_name else metrics.get(
+                        "metric_type"
+                    ),
+                    "metric_group": "custom",
+                    "metric_name": metric_name,
+                    "metric_value": metric_value,
+                }
+                for metrics in metrics_set
+                for metric_name, metric_value in metrics.get("stats", {}).items()
+            ]
         )
 
-        await self.selected_reporter.submit_variants(experiment_metrics_collection_set)
-
-        if len(mutations) > 0:
-            await self.selected_reporter.submit_mutations(
-                experiment_metrics_collection_set
-            )
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted {len(experiments)} experiments"
+        step_results.extend(
+            [
+                {
+                    "metric_workflow": metrics.get("workflow"),
+                    "metric_step": metrics.get("step"),
+                    "metric_type": "COUNT",
+                    "metric_group": "counts",
+                    "metric_name": f"status_{status_count_name}",
+                    "metric_value": status_count,
+                }
+                for metrics in results_set
+                for status_count_name, status_count in metrics.get("counts", {})
+                .get("statuses")
+                .items()
+            ]
         )
 
-    async def submit_streams(self, stream_metrics: Dict[str, List[StreamAnalytics]]):
-        streams_count = len(stream_metrics)
+        check_set: List[CheckSet] = results.get("checks", [])
 
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting {streams_count} streams"
-        )
-        await self.selected_reporter.submit_streams(stream_metrics)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted {streams_count} streams"
-        )
-
-    async def submit_common(self, metrics: List[Any]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting {len(metrics)} shared metrics"
-        )
-        await self.selected_reporter.submit_common(metrics)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted {len(metrics)} shared metrics"
+        step_results.extend(
+            [
+                {
+                    "metric_workflow": check_metrics.get("workflow"),
+                    "metric_step": check_metrics.get("step"),
+                    "metric_type": "COUNT",
+                    "metric_group": "counts",
+                    "metric_name": metric_name,
+                    "metric_value": metric_value,
+                }
+                for check_metrics in check_set
+                for metric_name, metric_value in check_metrics.get("counts", {}).items() 
+                if metric_name in ["succeeded", "failed", "executed"]
+            ]
         )
 
-    async def submit_events(self, events: List[Any]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting {len(events)} events"
-        )
-        await self.selected_reporter.submit_events(events)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted {len(events)} events"
-        )
-
-    async def submit_metrics(self, metrics: List[Any]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting {len(metrics)} metrics"
-        )
-        await self.selected_reporter.submit_metrics(metrics)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted {len(metrics)} metrics"
+        step_results.extend(
+            [
+                {
+                    "metric_workflow": check_metrics.get("workflow"),
+                    "metric_step": check_metrics.get("step"),
+                    "metric_type": "COUNT",
+                    "metric_group": "counts",
+                    "metric_name": context_metric.get("context"),
+                    "metric_value": context_metric.get("count"),
+                }
+                for check_metrics in check_set
+                for context_metric in check_metrics.get("contexts", {})
+            ]
         )
 
-    async def submit_custom(self, metrics: List[Any]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting {len(metrics)} custom metrics"
-        )
-        await self.selected_reporter.submit_custom(metrics)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted {len(metrics)} custom metrics"
-        )
-
-    async def submit_errors(self, metrics: List[Any]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting {len(metrics)} errors"
-        )
-        await self.selected_reporter.submit_errors(metrics)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted {len(metrics)} errors"
-        )
-
-    async def submit_system_metrics(self, metrics: List[Any]):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitting {len(metrics)} system metrics sets"
-        )
-        await self.selected_reporter.submit_session_system_metrics(metrics)
-        await self.selected_reporter.submit_stage_system_metrics(metrics)
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Submitted {len(metrics)} system metrics sets"
-        )
+        await self.selected_reporter.submit_step_results(step_results)
 
     async def close(self):
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Closing"
-        )
         await self.selected_reporter.close()
-
-        await self.logger.filesystem.aio["hyperscale.reporting"].info(
-            f"{self.metadata_string} - Closed"
-        )

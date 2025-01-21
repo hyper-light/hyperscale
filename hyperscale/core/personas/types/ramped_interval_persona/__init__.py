@@ -1,1 +1,0 @@
-from .ramped_interval_persona import RampedIntervalPersona

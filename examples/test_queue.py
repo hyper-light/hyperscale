@@ -2,7 +2,7 @@ import asyncio
 import random
 import time
 
-from hyperscale.core_rewrite.jobs.data_structures import LockedSet
+from hyperscale.core.jobs.data_structures import LockedSet
 
 
 async def add(idx: int, locked: LockedSet):

@@ -6,18 +6,14 @@ pytz
 tzlocal
 eventlet
 psutil
-yaspin
-fastapi
 dill
-scipy
 art
+scipy
 scikit-learn
 uvloop
 tdigest
 pydantic
 GitPython
-tabulate
-plotille
 python3-dtls
 zstandard
 cryptography
@@ -29,3 +25,4 @@ graphql-core
 cloudpickle
 orjson
 msgspec
+plotille

@@ -11,7 +11,7 @@ class TimeParser:
             "d": "days",
             "w": "weeks",
         }
-        self.time = int(
+        self.time = float(
             timedelta(
                 **{
                     self.UNITS.get(m.group("unit").lower(), "seconds"): float(

@@ -1,80 +1,65 @@
-import datetime
-import os
-import signal
-from typing import Any, Coroutine, Dict, List
+import contextvars
+from typing import List, Literal
 
-from aiologger.levels import LogLevel
-from yaspin.spinners import Spinners
+from hyperscale.logging.models import LogLevel, LogLevelName
+from .log_level_map import LogLevelMap
+from .stream_type import StreamType
 
-from hyperscale.logging.logger_types.handers.async_file_handler import RolloverInterval
-from hyperscale.logging.logger_types.logger_types import LoggerTypes
-from hyperscale.logging.spinner import ProgressText
+
+LogOutput = Literal['stdout', 'stderr']
+
+_global_log_level = contextvars.ContextVar("_global_log_level", default=LogLevel.INFO)
+_global_disabled_loggers = contextvars.ContextVar("_global_disabled_loggers", default=[])
+_global_level_map = contextvars.ContextVar("_global_level_map", default=LogLevelMap())
+_global_log_output_type = contextvars.ContextVar("_global_log_level_type", default=StreamType.STDOUT)
+_global_logging_directory = contextvars.ContextVar("_global_logging_directory")
 
 
 class LoggingConfig:
-    logger_name: str = None
-    logger_type: LoggerTypes = LoggerTypes.CONSOLE
-    logfiles_directory: str = f"{os.getcwd()}/logs"
-    log_level: LogLevel = LogLevel.INFO
-    logger_enabled: bool = None
-    filesystem_rotation_interval_type: RolloverInterval = RolloverInterval.DAYS
-    filesystem_rotation_interval: int = 1
-    filesystem_backup_count: int = 1
-    filesystem_rotation_time: datetime.time = None
-    spinner_type: Spinners = Spinners.bouncingBar
-    spinner_color: str = "cyan"
-    spinner_on_color: str = None
-    spinner_attrs: List[str] = ["bold"]
-    spinner_reversal: bool = False
-    spinner_side: str = "left"
-    spinner_sigmap: Dict[signal.Signals, Coroutine] = None
-    spinner_has_timer: bool = False
-    spinner_enabled: bool = True
-    spinner_display: ProgressText = None
+    def __init__(self) -> None:
+        self._log_level: contextvars.ContextVar[LogLevel] = _global_log_level
+        self._log_output_type: contextvars.ContextVar[StreamType] = _global_log_output_type
+        self._log_directory: contextvars.ContextVar[str | None] = _global_logging_directory
 
-    def from_dict(self, config: Dict[str, Any]):
-        for config_value_name, config_value in config.items():
-            if hasattr(self, config_value_name):
-                setattr(self, config_value_name, config_value)
+        self._disabled_loggers: contextvars.ContextVar[List[str]] = (
+            _global_disabled_loggers
+        )
+        self._level_map = _global_level_map.get()
 
-    @property
-    def filesystem_logger(self):
-        return {
-            "logger_name": self.logger_name,
-            "logger_type": self.logger_type,
-            "logfiles_directory": self.logfiles_directory,
-            "log_level": self.log_level,
-            "logger_enabled": self.logger_enabled,
-            "rotation_interval_type": self.filesystem_rotation_interval_type,
-            "rotation_interval": self.filesystem_rotation_interval,
-            "backup_count": self.filesystem_backup_count,
-            "rotation_time": self.filesystem_rotation_time,
-        }
+    def update(
+        self, 
+        log_directory: str | None = None,
+        log_level: LogLevelName | None = None,
+        log_output: LogOutput | None = None,
+    ):
+        if log_directory:
+            self._log_directory.set(log_directory)
+
+        if log_level:
+            self._log_level.set(
+                LogLevel.to_level(log_level)
+            )
+
+        if log_output:
+            self._log_output_type.set(
+                StreamType.STDOUT if log_output == 'stdout' else StreamType.STDERR
+            )
+
+    def enabled(self, logger_name: str, log_level: LogLevel) -> bool:
+        disabled_loggers = self._disabled_loggers.get()
+        current_log_level = self._log_level.get()
+        return logger_name not in disabled_loggers and (
+            self._level_map[log_level] >= self._level_map[current_log_level]
+        )
 
     @property
-    def cli_logger(self):
-        return {
-            "logger_name": self.logger_name,
-            "logger_type": self.logger_type,
-            "log_level": self.log_level,
-            "logger_enabled": self.logger_enabled,
-        }
+    def level(self):
+        return self._log_level.get()
 
     @property
-    def spinner(self):
-        return {
-            "logger_name": self.logger_name,
-            "logger_type": self.logger_type,
-            "log_level": self.log_level,
-            "logger_enabled": self.logger_enabled,
-            "spinner": self.spinner_type,
-            "color": self.spinner_color,
-            "on_color": self.spinner_on_color,
-            "attrs": self.spinner_attrs,
-            "reversal": self.spinner_reversal,
-            "side": self.spinner_side,
-            "sigmap": self.spinner_sigmap,
-            "timer": self.spinner_has_timer,
-            "enabled": self.spinner_enabled,
-            "text": self.spinner_display,
-        }
+    def output(self):
+        return self._log_output_type.get()
+    
+    @property
+    def directory(self):
+        return self._log_directory.get()

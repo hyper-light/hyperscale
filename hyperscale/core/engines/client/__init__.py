@@ -1,3 +1,3 @@
-from .client import Client
-from .tracing_config import TracingConfig
-from .time_parser import TimeParser
+from .client import Client as Client
+from .time_parser import TimeParser as TimeParser
+from .tracing_config import TracingConfig as TracingConfig

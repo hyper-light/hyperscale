@@ -16,7 +16,7 @@ class PluginsStore(Generic[Unpack[T]]):
         self._config: Config = None
         self.actions = ActionsStore(metadata_string)
         self.next_name: str = None
-        self.intercept: bool = False
+        self.suspend: bool = False
         self.metadata_string: str = metadata_string
         self.clients = {}
         self.mutations: Dict[str, Mutation] = {}
@@ -32,7 +32,7 @@ class PluginsStore(Generic[Unpack[T]]):
 
         custom_plugin.metadata_string = self.metadata_string
         custom_plugin.next_name = self.next_name
-        custom_plugin.intercept = self.intercept
+        custom_plugin.suspend = self.suspend
 
         self._plugins[plugin_name] = custom_plugin
         self.clients[plugin_name] = custom_plugin

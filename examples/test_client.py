@@ -1,6 +1,6 @@
 import asyncio
 
-from hyperscale.core_rewrite.jobs import Env, RemoteGraphManager
+from hyperscale.core.jobs import Env, RemoteGraphManager
 from hyperscale.graph import Provide, Use, Workflow, depends, state, step
 from hyperscale.testing import URL, HTTP2Response
 

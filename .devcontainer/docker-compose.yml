@@ -4,7 +4,7 @@ services:
   hyperscale:
       build:
         context: ..
-        dockerfile: ./.devcontainer/dockerfile
+        dockerfile: ./.devcontainer/Dockerfile
         ssh:
           - default=${SSH_AUTH_SOCK}
       environment:
@@ -13,9 +13,10 @@ services:
         - ..:/workspace
         - ../.git:/workspace/.git
         - ../.devcontainer:/workspace/.devcontainer
-        - ~/.aws:/home/datavant/.aws
-        - ~/.ssh:/home/datavant/.ssh
-        - ~/.git:/home/datavant/.git
+        - ${HOME}/.aws:/root/.aws
+        - ${HOME}/.ssh:/root/.ssh
+        - ${HOME}/.git:/root/.git
+        - /run/snapd.socket:/run/snapd.socket
       ports:
         - 5003:5003
       stdin_open: true
