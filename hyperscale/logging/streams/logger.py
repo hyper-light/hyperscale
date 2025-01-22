@@ -32,6 +32,44 @@ class Logger:
 
         return self._contexts[name]
     
+    def get_stream(
+        self,
+        name: str | None = None,
+        template: str | None = None,
+        path: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
+        models: dict[
+            str,
+            tuple[
+                type[T],
+                dict[str, Any],
+            ]
+        ] | None = None,           
+    ):
+        if name is None:
+            name = 'default'
+
+        filename: str | None = None
+        directory: str | None = None
+
+        if path:
+            logfile_path = pathlib.Path(path)
+            is_logfile = len(logfile_path.suffix) > 0 
+
+            filename = logfile_path.name if is_logfile else None
+            directory = str(logfile_path.parent.absolute()) if is_logfile else str(logfile_path.absolute())
+
+        self._contexts[name] = LoggerContext(
+            name=name,
+            template=template,
+            filename=filename,
+            directory=directory,
+            retention_policy=retention_policy,
+            models=models,
+        )
+
+        return self._contexts[name].stream
+    
     def configure(
         self,
         name: str | None = None,

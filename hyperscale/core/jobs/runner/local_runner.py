@@ -192,7 +192,7 @@ class LocalRunner:
                 )
 
                 await ctx.log_prepared(f'Initializing worker servers on runner type {self._runner_type} for test {test_name}', name='info')
-                self._server_pool.setup()
+                await self._server_pool.setup()
 
                 await self._remote_manger.start(
                     self.host,
@@ -202,7 +202,7 @@ class LocalRunner:
                     key_path=key_path,
                 )
 
-                self._server_pool.run_pool(
+                await self._server_pool.run_pool(
                     (self.host, self.port),
                     worker_sockets,
                     self._env,
@@ -277,9 +277,6 @@ class LocalRunner:
                 except asyncio.CancelledError:
                     pass
 
-                import traceback
-                print(traceback.format_exc())
-                
                 try:
                     await ctx.log_prepared(f'Aborting Hyperscale Remote Manager for test {test_name}', name='debug')
                     self._remote_manger.abort()

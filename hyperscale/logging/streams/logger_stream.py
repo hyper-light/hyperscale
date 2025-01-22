@@ -107,6 +107,7 @@ class LoggerStream:
         self._transports: List[asyncio.Transport] = []
         
         self._models: Dict[str, Callable[..., Entry]] = {}
+        self._queue: asyncio.Queue[asyncio.Future] = asyncio.Queue()
 
         if models is None:
             models = {}
@@ -157,46 +158,10 @@ class LoggerStream:
                 self._provider = LogProvider()
 
             if self._stdout is None:
-                stdout_fileno = await self._loop.run_in_executor(
-                    None,
-                    sys.stderr.fileno
-                )
-
-                stdout_dup = await self._loop.run_in_executor(
-                    None,
-                    os.dup,
-                    stdout_fileno,
-                )
-
-                self._stdout = await self._loop.run_in_executor(
-                    None,
-                    functools.partial(
-                        os.fdopen,
-                        stdout_dup,
-                        mode=sys.stdout.mode
-                    )
-                )
+                self._stdout = await self._dup_stdout()
 
             if self._stderr is None:
-                stderr_fileno = await self._loop.run_in_executor(
-                    None,
-                    sys.stderr.fileno
-                )
-
-                stderr_dup = await self._loop.run_in_executor(
-                    None,
-                    os.dup,
-                    stderr_fileno,
-                )
-
-                self._stderr = await self._loop.run_in_executor(
-                    None,
-                    functools.partial(
-                        os.fdopen,
-                        stderr_dup,
-                        mode=sys.stderr.mode
-                    )
-                )
+                self._stderr = await self._dup_stderr()
 
             if self._stream_writers.get(StreamType.STDOUT) is None:
                 transport, protocol = await self._loop.connect_write_pipe(
@@ -392,7 +357,10 @@ class LoggerStream:
         ] and self._consumer.pending:
             await self._consumer.wait_for_pending()
 
-            
+        while not self._queue.empty():
+            task = self._queue.get_nowait()
+            await task
+  
         await asyncio.gather(
             *[self._close_file(logfile_path) for logfile_path in self._files]
         )
@@ -414,6 +382,10 @@ class LoggerStream:
         self._stdout.flush()
 
         self._consumer.abort()
+
+        while not self._queue.empty():
+            task = self._queue.get_nowait()
+            task.set_result(None)
 
     async def close_file(
         self,
@@ -462,6 +434,70 @@ class LoggerStream:
         logfile_path: str = os.path.join(directory, filename_path)
 
         return logfile_path
+    
+    async def _dup_stdout(self):
+
+        stdout_fileno = await self._loop.run_in_executor(
+            None,
+            sys.stderr.fileno
+        )
+
+        stdout_dup = await self._loop.run_in_executor(
+            None,
+            os.dup,
+            stdout_fileno,
+        )
+
+        return await self._loop.run_in_executor(
+            None,
+            functools.partial(
+                os.fdopen,
+                stdout_dup,
+                mode=sys.stdout.mode
+            )
+        )
+
+    async def _dup_stderr(self):
+
+        stderr_fileno = await self._loop.run_in_executor(
+            None,
+            sys.stderr.fileno
+        )
+
+        stderr_dup = await self._loop.run_in_executor(
+            None,
+            os.dup,
+            stderr_fileno,
+        )
+
+        return await self._loop.run_in_executor(
+            None,
+            functools.partial(
+                os.fdopen,
+                stderr_dup,
+                mode=sys.stderr.mode
+            )
+        )
+    
+    def schedule(
+        self,
+        entry: T,
+        template: str | None = None,
+        path: str | None = None,
+        retention_policy: RetentionPolicyConfig | None = None,
+        filter: Callable[[T], bool] | None=None,
+    ):
+        self._queue.put_nowait(
+            asyncio.ensure_future(
+                self.log(
+                    entry,
+                    template=template,
+                    path=path,
+                    retention_policy=retention_policy,
+                    filter=filter,
+                )
+            )
+        )
     
     async def log_prepared_batch(
         self,
@@ -628,6 +664,12 @@ class LoggerStream:
         else:
             log_file, line_number, function_name = self._find_caller()
 
+        if self._stdout is None or self._stdout.closed:
+            self._stdout = await self._dup_stdout()
+
+        if self._stderr is None or self._stderr.closed:
+            self._stderr = await self._dup_stderr()
+
         try:
             stream_writer.write(
                 entry.to_template(
@@ -703,7 +745,7 @@ class LoggerStream:
             directory = os.path.join(self._cwd, "logs")
             logfile_path = os.path.join(directory, filename)
 
-        if self._files.get(logfile_path) is None:
+        if self._files.get(logfile_path) is None or self._files[logfile_path].closed:
             await self.open_file(
                 filename,
                 directory=directory,

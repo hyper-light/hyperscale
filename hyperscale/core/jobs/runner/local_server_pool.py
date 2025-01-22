@@ -14,6 +14,7 @@ from hyperscale.core.jobs.graphs.remote_graph_controller import (
     RemoteGraphController,
 )
 from hyperscale.core.jobs.models import Env
+from hyperscale.logging import Logger, Entry, LogLevel
 
 
 def set_process_name():
@@ -161,8 +162,9 @@ class LocalServerPool:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pool_task: asyncio.Task | None = None
         self._run_future: asyncio.Future | None = None
+        self._logger = Logger()
 
-    def setup(self):
+    async def setup(self):
         self._context = multiprocessing.get_context("spawn")
         self._executor = ProcessPoolExecutor(
             max_workers=self._pool_size,
@@ -170,18 +172,34 @@ class LocalServerPool:
             initializer=set_process_name,
         )
 
-        self._loop = asyncio.get_event_loop()
+        async with self._logger.context(
+            name='local_server_pool',
+            path='hyperscale.main.log.json',
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+        ) as ctx:
+            
+            await ctx.log(Entry(
+                message='Creating interrupt handlers for local server pool',
+                level=LogLevel.TRACE,
+            ))
 
-        for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-            self._loop.add_signal_handler(
-                getattr(
-                    signal,
-                    signame,
-                ),
-                self.abort,
-            )
+            self._loop = asyncio.get_event_loop()
 
-    def run_pool(
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
+                self._loop.add_signal_handler(
+                    getattr(
+                        signal,
+                        signame,
+                    ),
+                    self.abort,
+                )
+
+            await ctx.log(Entry(
+                message='Created interrupt handlers for local server pool',
+                level=LogLevel.TRACE,
+            ))
+
+    async def run_pool(
         self,
         leader_address: tuple[str, int],
         sockets: List[socket.socket],
@@ -189,48 +207,78 @@ class LocalServerPool:
         cert_path: str | None = None,
         key_path: str | None = None,
     ):
-        self._pool_task = asyncio.gather(
-            *[
-                self._loop.run_in_executor(
-                    self._executor,
-                    functools.partial(
-                        run_thread,
-                        leader_address,
-                        socket,
-                        env.model_dump(),
-                        cert_path=cert_path,
-                        key_path=key_path,
-                    ),
-                )
-                for socket in sockets
-            ],
-            return_exceptions=True,
-        )
+        async with self._logger.context(
+            name='local_server_pool',
+            path='hyperscale.main.log.json',
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+        ) as ctx:
+            
+            leader_host, leader_port = leader_address
+            
+            await ctx.log(Entry(
+                message=f'Creating server pool with {self._pool_size} workers and leader at {leader_host}:{leader_port}',
+                level=LogLevel.DEBUG
+            ))
+
+            self._pool_task = asyncio.gather(
+                *[
+                    self._loop.run_in_executor(
+                        self._executor,
+                        functools.partial(
+                            run_thread,
+                            leader_address,
+                            socket,
+                            env.model_dump(),
+                            cert_path=cert_path,
+                            key_path=key_path,
+                        ),
+                    )
+                    for socket in sockets
+                ],
+                return_exceptions=True,
+            )
 
     async def shutdown(self):
-        try:
-            self._pool_task.set_result(None)
 
-        except Exception:
-            pass
+        async with self._logger.context(
+            name='local_server_pool',
+            path='hyperscale.main.log.json',
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+        ) as ctx:
+            
+            await ctx.log(Entry(
+                message='Server pool received shutdown request',
+                level=LogLevel.DEBUG
+            ))
 
-        except asyncio.CancelledError:
-            pass
+            try:
+                self._pool_task.set_result(None)
 
-        except asyncio.InvalidStateError:
-            pass
+            except Exception:
+                pass
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+            except asyncio.CancelledError:
+                pass
 
-            await self._loop.run_in_executor(
-                None,
-                functools.partial(
-                    self._executor.shutdown,
-                    wait=True,
-                    cancel_futures=True,
-                ),
-            )
+            except asyncio.InvalidStateError:
+                pass
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+
+                await self._loop.run_in_executor(
+                    None,
+                    functools.partial(
+                        self._executor.shutdown,
+                        wait=True,
+                        cancel_futures=True,
+                    ),
+                )
+
+            await ctx.log(Entry(
+                message='Server pool successfully shutdown',
+                level=LogLevel.DEBUG,
+            ))
 
     def abort(self):
         try:

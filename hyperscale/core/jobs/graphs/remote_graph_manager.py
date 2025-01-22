@@ -25,7 +25,16 @@ from hyperscale.core.state import (
     ContextHook,
     StateAction,
 )
-from hyperscale.logging import Logger
+from hyperscale.logging import Logger, Entry, LogLevel
+from hyperscale.logging.hyperscale_logging_models import (
+    GraphDebug, 
+    RemoteManagerInfo,
+    WorkflowTrace,
+    WorkflowDebug,
+    WorkflowInfo,
+    WorkflowError,
+    WorkflowFatal,
+)
 from hyperscale.reporting.reporter import Reporter, ReporterConfig
 from hyperscale.reporting.reporter import ReporterConfig
 from hyperscale.ui import InterfaceUpdatesController
@@ -118,8 +127,17 @@ class RemoteGraphManager:
         key_path: str | None = None,
     ):
         async with self._logger.context(
-            name='remote_graph_manager'
+            name='remote_graph_manager',
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}"
         ) as ctx:
+            
+            await ctx.log(RemoteManagerInfo(
+                message=f'Remote Graph Manager starting leader on port {host}:{port}',
+                host=host,
+                port=port,
+                with_ssl=cert_path is not None and key_path is not None
+            ))
+
             if self._controller is None:
                 self._controller = RemoteGraphController(
                     host,
@@ -141,8 +159,15 @@ class RemoteGraphManager:
         timeout: int | float | str | None = None,
     ):
         async with self._logger.context(
-            name='remote_graph_manager'
+            name='remote_graph_manager',
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}"
         ) as ctx:
+            
+            await ctx.log(Entry(
+                message=f'Remote Graph Manager connecting to {workers} workers with timeout of {timeout} seconds',
+                level=LogLevel.DEBUG
+            ))
+            
             if isinstance(timeout, str):
                 timeout = TimeParser(timeout).time
 
@@ -159,6 +184,11 @@ class RemoteGraphManager:
 
             self._provisioner.setup(max_workers=len(self._controller.nodes))
 
+            await ctx.log(Entry(
+                message=f'Remote Graph Manager successfully connected to {workers} workers',
+                level=LogLevel.DEBUG
+            ))
+
     async def run_forever(self):
         await self._controller.run_forever()
 
@@ -167,43 +197,100 @@ class RemoteGraphManager:
         test_name: str,
         workflows: List[Workflow | DependentWorkflow],
     ) -> RunResults:
-        run_id = self._controller.id_generator.generate()
+        
+        self._logger.configure(
+            name='graph_logger',
+            path='hyperscale.main.log.json',
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+            models={
+                'debug': (
+                    GraphDebug,
+                    {   
+                        "workflows": [
+                            workflow.name for workflow in workflows
+                        ],
+                        "workers": self._workers,
+                        "graph": test_name,
+                    }
+                ),
+            }
+        )
+        
+        async with self._logger.context(
+            name='graph_logger'
+        ) as ctx:
+        
+            run_id = self._controller.id_generator.generate()
 
-        self._controller.create_run_contexts(run_id)
+            await ctx.log_prepared(
+                message=f'Graph {test_name} assigned run id {run_id}',
+                name='debug'
+            )
 
-        workflow_traversal_order = self._create_workflow_graph(workflows)
+            self._controller.create_run_contexts(run_id)
 
-        workflow_results: Dict[str, List[WorkflowResultsSet]] = defaultdict(list)
+            workflow_traversal_order = self._create_workflow_graph(workflows)
 
-        for workflow_set in workflow_traversal_order:
-            provisioned_batch, workflow_vus = self._provision(workflow_set)
+            workflow_results: Dict[str, List[WorkflowResultsSet]] = defaultdict(list)
 
-            self._updates.update_active_workflows(
-                [
-                    workflow_name.lower()
+            for workflow_set in workflow_traversal_order:
+                provisioned_batch, workflow_vus = self._provision(workflow_set)
+
+                batch_workflows = [
+                    workflow_name
                     for group in provisioned_batch
                     for workflow_name, _, _ in group
                 ]
+
+                workflow_names = ', '.join(batch_workflows)
+
+                await ctx.log(GraphDebug(
+                    message=f'Graph {test_name} executing workflows {workflow_names}',
+                    workflows=batch_workflows,
+                    workers=self._threads,
+                    graph=test_name,
+                    level=LogLevel.DEBUG,
+                ))
+
+                self._updates.update_active_workflows(
+                    [
+                        workflow_name.lower()
+                        for group in provisioned_batch
+                        for workflow_name, _, _ in group
+                    ]
+                )
+
+                results = await asyncio.gather(
+                    *[
+                        self._run_workflow(
+                            run_id,
+                            workflow_set[workflow_name],
+                            threads,
+                            workflow_vus[workflow_name],
+                        )
+                        for group in provisioned_batch
+                        for workflow_name, _, threads in group
+                    ]
+                )
+
+                await ctx.log(GraphDebug(
+                    message=f'Graph {test_name} completed workflows {workflow_names}',
+                    workflows=batch_workflows,
+                    workers=self._threads,
+                    graph=test_name,
+                    level=LogLevel.DEBUG,
+                ))
+
+                workflow_results.update(
+                    {workflow_name: results for workflow_name, results in results}
+                )
+
+            await ctx.log_prepared(
+                message=f'Graph {test_name} completed execution',
+                name='debug'
             )
 
-            results = await asyncio.gather(
-                *[
-                    self._run_workflow(
-                        run_id,
-                        workflow_set[workflow_name],
-                        threads,
-                        workflow_vus[workflow_name],
-                    )
-                    for group in provisioned_batch
-                    for workflow_name, _, threads in group
-                ]
-            )
-
-            workflow_results.update(
-                {workflow_name: results for workflow_name, results in results}
-            )
-
-        return {"test": test_name, "results": workflow_results}
+            return {"test": test_name, "results": workflow_results}
 
     def _create_workflow_graph(self, workflows: List[Workflow | DependentWorkflow]):
         workflow_graph = networkx.DiGraph()
@@ -258,175 +345,313 @@ class RemoteGraphManager:
         threads: int,
         workflow_vus: List[int],
     ) -> Tuple[str, WorkflowStats | WorkflowContextResult]:
-        hooks: Dict[str, Hook] = {
-            name: hook
-            for name, hook in inspect.getmembers(
-                workflow,
-                predicate=lambda member: isinstance(member, Hook),
-            )
-        }
-
-        is_test_workflow = (
-            len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST])
-            > 0
-        )
-
-        if is_test_workflow is False:
-            threads = len(self._controller.nodes)
-
-        await self._provisioner.acquire(threads)
-
-        state_actions = self._setup_state_actions(workflow)
-
-        context = self._controller.assign_context(
-            run_id,
-            workflow.name,
-            threads,
-        )
-
-        loaded_context = await self._use_context(
-            workflow.name,
-            state_actions,
-            context,
-        )
-
-        # ## Send batched requests
-
-        workflow_slug = workflow.name.lower()
-
-        await asyncio.gather(
-            *[
-                update_active_workflow_message(
-                    workflow_slug, f"Starting - {workflow.name}"
-                ),
-                update_workflow_run_timer(workflow_slug, True),
-            ]
-        )
-
-        self._workflow_timers[workflow.name] = time.monotonic()
-
-        await self._controller.submit_workflow_to_workers(
-            run_id,
-            workflow,
-            loaded_context,
-            threads,
-            workflow_vus,
-            self._update,
-        )
-
-        worker_results = await self._controller.poll_for_workflow_complete(
-            run_id, workflow.name, int(TimeParser(workflow.duration).time * 1.5)
-        )
-
-        await update_workflow_run_timer(workflow_slug, False)
-        await update_active_workflow_message(
-            workflow_slug, f"Processing results - {workflow.name}"
-        )
-
-        await update_workflow_executions_total_rate(workflow_slug, None, False)
-
-        results, run_context = worker_results
-
-        if is_test_workflow and len(results) > 1:
-            workflow_results = Results(hooks)
-            execution_result = workflow_results.merge_results(
-                [result_set for _, result_set in results.values()],
-                run_id=run_id,
-            )
-
-        elif is_test_workflow is False and len(results) > 1:
-            _, execution_result = list(
-                sorted(
-                    results.values(),
-                    key=lambda result: result[0],
-                    reverse=True,
-                )
-            ).pop()
-
-        else:
-            _, execution_result = list(results.values()).pop()
-
-        updated_context = await self._provide_context(
-            workflow.name,
-            state_actions,
-            run_context,
-            execution_result,
-        )
-
-        await self._controller.update_context(
-            run_id,
-            updated_context,
-        )
-
-        reporting = workflow.reporting 
-
-        configs: list[ReporterConfig] = []
-
-        if inspect.isawaitable(reporting) or inspect.iscoroutinefunction(reporting):
-            configs = await reporting()
-
-        elif inspect.isfunction(reporting):
-            configs = await self._loop.run_in_executor(
-                None,
-                reporting,
-            )
-
-        else:
-            configs = reporting
-
-        if isinstance(configs, list) is False:
-            configs = [configs]
         
-        reporters = [
-            Reporter(config) for config in configs
-        ]
-
-
-        await asyncio.sleep(1)
-
-        selected_reporters = ', '.join([
-            config.reporter_type.name for config in configs
-        ])
-
-        await update_active_workflow_message(
-            workflow_slug, 
-            f"Submitting results via - {selected_reporters}"
+        default_config = {   
+            "workflow": workflow.name,
+            "run_id": run_id,
+            "workers": self._threads,
+            "workflow_vus": workflow.vus,
+            "duration": workflow.duration,
+        }
+        
+        self._logger.configure(
+            name='workflow_logger',
+            path='hyperscale.main.log.json',
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+            models={
+                'trace': (
+                    WorkflowTrace,
+                    default_config
+                ),
+                'debug': (
+                    WorkflowDebug,
+                    default_config,
+                ),
+                'info': (
+                    WorkflowInfo,
+                    default_config,
+                ),
+                'error': (
+                    WorkflowError,
+                    default_config,
+                ),
+                'fatal': (
+                    WorkflowFatal,
+                    default_config,
+                )
+            }
         )
 
-        try:
+        async with self._logger.context(
+            name='workflow_logger'
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Running workflow {workflow.name} with {workflow.vus} on {self._threads} workers for {workflow.duration}',
+                name='info'
+            )
 
-            await asyncio.gather(*[
-                reporter.connect() for reporter in reporters
+            hooks: Dict[str, Hook] = {
+                name: hook
+                for name, hook in inspect.getmembers(
+                    workflow,
+                    predicate=lambda member: isinstance(member, Hook),
+                )
+            }
+
+            hook_names = ', '.join(hooks.keys())
+
+            await ctx.log_prepared(
+                message=f'Found actions {hook_names} on Workflow {workflow.name}',
+                name='debug'
+            )
+
+            is_test_workflow = (
+                len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST])
+                > 0
+            )
+
+            await ctx.log_prepared(
+                message=f'Found test actions on Workflow {workflow.name}' if is_test_workflow else f'No test actions found on Workflow {workflow.name}',
+                name='trace',
+            )
+
+            if is_test_workflow is False:
+                threads = len(self._controller.nodes)
+
+                await ctx.log_prepared(
+                    message=f'Non-test Workflow {workflow.name} now using {self._threads} workers',
+                    name='trace'
+                )
+
+            await ctx.log_prepared(
+                message=f'Workflow {workflow.name} waiting for {threads} workers to be available',
+                name='trace'
+            )
+
+            await self._provisioner.acquire(threads)
+
+
+            await ctx.log_prepared(
+                message=f'Workflow {workflow.name} successfully assigned {threads} workers',
+                name='trace'
+            )
+
+            state_actions = self._setup_state_actions(workflow)
+
+            if len(state_actions) > 0:
+                state_action_names = ', '.join(state_actions.keys())
+
+                await ctx.log_prepared(
+                    message=f'Found state actions {state_action_names} on Workflow {workflow.name}',
+                    name='debug'
+                )
+
+            await ctx.log_prepared(
+                message=f'Assigning context to workflow {workflow.name}',
+                name='trace'
+            )
+
+            context = self._controller.assign_context(
+                run_id,
+                workflow.name,
+                threads,
+            )
+
+            loaded_context = await self._use_context(
+                workflow.name,
+                state_actions,
+                context,
+            )
+
+            # ## Send batched requests
+
+            workflow_slug = workflow.name.lower()
+
+            await asyncio.gather(
+                *[
+                    update_active_workflow_message(
+                        workflow_slug, f"Starting - {workflow.name}"
+                    ),
+                    update_workflow_run_timer(workflow_slug, True),
+                ]
+            )
+
+            await ctx.log_prepared(
+                message=f'Submitting Workflow {workflow.name} with run id {run_id}',
+                name='trace'
+            )
+
+            self._workflow_timers[workflow.name] = time.monotonic()
+
+            await self._controller.submit_workflow_to_workers(
+                run_id,
+                workflow,
+                loaded_context,
+                threads,
+                workflow_vus,
+                self._update,
+            )
+
+            await ctx.log_prepared(
+                message=f'Submitted Workflow {workflow.name} with run id {run_id}',
+                name='trace'
+            )
+
+            await ctx.log_prepared(
+                message=f'Workflow {workflow.name} run {run_id} waiting for {threads} workers to signal completion',
+                name='info'
+            )
+
+            worker_results = await self._controller.poll_for_workflow_complete(
+                run_id, workflow.name, int(TimeParser(workflow.duration).time * 1.5)
+            )
+
+            await ctx.log_prepared(
+                message=f'Workflow {workflow.name} run {run_id} completed run',
+                name='info'
+            )
+
+            await update_workflow_run_timer(workflow_slug, False)
+            await update_active_workflow_message(
+                workflow_slug, f"Processing results - {workflow.name}"
+            )
+
+            await update_workflow_executions_total_rate(workflow_slug, None, False)
+
+            results, run_context = worker_results
+
+            await ctx.log_prepared(
+                message=f'Processing {len(results)} results sets for Workflow {workflow.name} run {run_id}',
+                name='debug'
+            )
+
+            if is_test_workflow and len(results) > 1:
+
+                await ctx.log_prepared(
+                    message=f'Merging {len(results)} test results sets for Workflow {workflow.name} run {run_id}',
+                    name='trace',
+                )
+
+                workflow_results = Results(hooks)
+                execution_result = workflow_results.merge_results(
+                    [result_set for _, result_set in results.values()],
+                    run_id=run_id,
+                )
+
+            elif is_test_workflow is False and len(results) > 1:     
+                _, execution_result = list(
+                    sorted(
+                        results.values(),
+                        key=lambda result: result[0],
+                        reverse=True,
+                    )
+                ).pop()
+
+            else:
+                _, execution_result = list(results.values()).pop()
+
+            await ctx.log_prepared(
+                message=f'Updating context for {workflow.name} run {run_id}',
+                name='trace'
+            )
+
+            updated_context = await self._provide_context(
+                workflow.name,
+                state_actions,
+                run_context,
+                execution_result,
+            )
+
+            await self._controller.update_context(
+                run_id,
+                updated_context,
+            )
+
+
+            await ctx.log_prepared(
+                message=f'Submitting results to reporters for Workflow {workflow.name} run {run_id}',
+                name='trace',
+            )
+
+            reporting = workflow.reporting 
+
+            configs: list[ReporterConfig] = []
+
+            if inspect.isawaitable(reporting) or inspect.iscoroutinefunction(reporting):
+                configs = await reporting()
+
+            elif inspect.isfunction(reporting):
+                configs = await self._loop.run_in_executor(
+                    None,
+                    reporting,
+                )
+
+            else:
+                configs = reporting
+
+            if isinstance(configs, list) is False:
+                configs = [configs]
+            
+            reporters = [
+                Reporter(config) for config in configs
+            ]
+            await asyncio.sleep(1)
+
+            selected_reporters = ', '.join([
+                config.reporter_type.name for config in configs
             ])
 
-            await asyncio.gather(*[
-                reporter.submit_workflow_results(execution_result) for reporter in reporters
-            ])
-            await asyncio.gather(*[
-                reporter.submit_step_results(execution_result) for reporter in reporters
-            ])
 
-            await asyncio.gather(*[
-                reporter.close() for reporter in reporters
-            ])
+            await ctx.log_prepared(
+                message=f'Submitting results to reporters {selected_reporters} for Workflow {workflow.name} run {run_id}',
+                name='info'
+            )
 
-        except Exception:
-            await asyncio.gather(*[
-                reporter.close() for reporter in reporters
-            ], return_exceptions=True)
+            await update_active_workflow_message(
+                workflow_slug, 
+                f"Submitting results via - {selected_reporters}"
+            )
+
+            try:
+
+                await asyncio.gather(*[
+                    reporter.connect() for reporter in reporters
+                ])
+
+                await asyncio.gather(*[
+                    reporter.submit_workflow_results(execution_result) for reporter in reporters
+                ])
+                await asyncio.gather(*[
+                    reporter.submit_step_results(execution_result) for reporter in reporters
+                ])
+
+                await asyncio.gather(*[
+                    reporter.close() for reporter in reporters
+                ])
+
+            except Exception:
+                await asyncio.gather(*[
+                    reporter.close() for reporter in reporters
+                ], return_exceptions=True)
 
 
-        await asyncio.sleep(1)
+            await asyncio.sleep(1)
 
-        await update_active_workflow_message(
-            workflow_slug, f"Complete - {workflow.name}"
-        )
+            await update_active_workflow_message(
+                workflow_slug, f"Complete - {workflow.name}"
+            )
 
-        await asyncio.sleep(1)
+            await asyncio.sleep(1)
 
-        self._provisioner.release(threads)
+            await ctx.log_prepared(
+                message=f'Workflow {workflow.name} run {run_id} complete - releasing workers from pool',
+                name='debug'
+            )
 
-        return (workflow.name, execution_result)
+            self._provisioner.release(threads)
+
+            return (workflow.name, execution_result)
 
     def _setup_state_actions(self, workflow: Workflow) -> Dict[str, ContextHook]:
         state_actions: Dict[str, ContextHook] = {
