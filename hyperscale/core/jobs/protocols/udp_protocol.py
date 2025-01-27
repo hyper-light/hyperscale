@@ -1093,6 +1093,9 @@ class UDPProtocol(Generic[T, K]):
         self._pending_responses.clear()
 
     def stop(self):
+
+        self._running = False
+        
         if self._run_future:
             try:
                 self._run_future.set_result(None)

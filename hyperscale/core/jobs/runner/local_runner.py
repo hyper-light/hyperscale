@@ -242,7 +242,6 @@ class LocalRunner:
                 await self._remote_manger.close()
 
                 await ctx.log_prepared(f'Stopping Hyperscale Server Pool for test {test_name}', name='debug')
-
                 await self._server_pool.shutdown()
 
                 await ctx.log_prepared(f'Closing {len(worker_sockets)} sockets for test {test_name}', name='trace')
@@ -404,6 +403,20 @@ class LocalRunner:
 
             except Exception:
                 pass
+
+        current = await loop.run_in_executor(
+            None,
+            current_process
+        )
+
+        try:
+            await loop.run_in_executor(
+                None,
+                current.kill
+            )
+
+        except Exception:
+            pass
 
     async def _bin_and_check_socket_range(
         self,

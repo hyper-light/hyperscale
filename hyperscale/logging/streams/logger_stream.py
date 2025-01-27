@@ -208,12 +208,16 @@ class LoggerStream:
         retention_policy: RetentionPolicyConfig | None = None,
     ):
         if self._cwd is None:
-            self._cwd = await asyncio.to_thread(os.getcwd)
+            self._cwd = await self._loop.run_in_executor(
+                None,
+                os.getcwd,
+            )
 
         logfile_path = self._to_logfile_path(filename, directory=directory)
         await self._file_locks[logfile_path].acquire()
 
-        await asyncio.to_thread(
+        await self._loop.run_in_executor(
+            None,
             self._open_file,
             logfile_path,
         )
@@ -252,7 +256,8 @@ class LoggerStream:
         retention_policy: RetentionPolicy
     ):
         await self._file_locks[logfile_path].acquire()
-        await asyncio.to_thread(
+        await self._loop.run_in_executor(
+            None,
             self._rotate_logfile,
             retention_policy,
             logfile_path,
@@ -404,7 +409,10 @@ class LoggerStream:
         directory: str | None = None,
     ):
         if self._cwd is None:
-            self._cwd = await asyncio.to_thread(os.getcwd)
+            self._cwd = await self._loop.run_in_executor(
+                None,
+                os.getcwd
+            )
 
         logfile_path = self._to_logfile_path(filename, directory=directory)
         await self._close_file(logfile_path)
@@ -412,7 +420,8 @@ class LoggerStream:
     async def _close_file(self, logfile_path: str):
         if file_lock := self._file_locks.get(logfile_path):
             await file_lock.acquire()
-            await asyncio.to_thread(
+            await self._loop.run_in_executor(
+                None,
                 self._close_file_at_path,
                 logfile_path,
             )
@@ -699,7 +708,8 @@ class LoggerStream:
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
             
             if self._stderr.closed is False:
-                await asyncio.to_thread(
+                await self._loop.run_in_executor(
+                    None,
                     self._stderr.write,
                     entry.to_template(
                         error_template,
@@ -737,7 +747,10 @@ class LoggerStream:
             return
         
         if self._cwd is None:
-            self._cwd = await asyncio.to_thread(os.getcwd)
+            self._cwd = await self._loop.run_in_executor(
+                None,
+                os.getcwd,
+            )
 
         if filename and directory:
             logfile_path = self._to_logfile_path(
@@ -788,7 +801,8 @@ class LoggerStream:
         try:
             await self._file_locks[logfile_path].acquire()
 
-            await asyncio.to_thread(
+            await self._loop.run_in_executor(
+                None,
                 self._write_to_file,
                 log,
                 logfile_path,
@@ -803,7 +817,8 @@ class LoggerStream:
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
 
             if self._stderr.closed is False:
-                await asyncio.to_thread(
+                await self._loop.run_in_executor(
+                    None,
                     self._stderr.write,
                     entry.to_template(
                         error_template,
@@ -831,6 +846,7 @@ class LoggerStream:
             ):
                 
                 logfile.write(msgspec.json.encode(log) + b"\n")
+                logfile.flush()
 
         except Exception:
             pass

@@ -220,7 +220,8 @@ class TCPProtocol(Generic[T, K]):
 
                 while True:
                     try:
-                        await asyncio.to_thread(
+                        await self._loop.run_in_executor(
+                            None,
                             self.server_socket.bind,
                             (self.host, self.port),
                         )

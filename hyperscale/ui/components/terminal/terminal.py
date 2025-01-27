@@ -295,7 +295,7 @@ class Terminal:
 
                 frame = await self.canvas.render()
 
-                frame = f"\033[3J\033[H{frame}"
+                frame = f"\033[3J\033[H{frame}\n"
                 await self._loop.run_in_executor(None, sys.stdout.write, frame)
 
                 if self._stdout_lock.locked():
@@ -448,7 +448,7 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        frame = f"\033[3J\033[H{frame}"
+        frame = f"\033[3J\033[H{frame}\n"
 
         await self._loop.run_in_executor(None, sys.stdout.write, frame)
 

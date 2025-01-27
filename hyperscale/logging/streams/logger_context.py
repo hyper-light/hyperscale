@@ -45,7 +45,11 @@ class LoggerContext:
         await self.stream.initialize()
 
         if self.stream._cwd is None:
-            self.stream._cwd = await asyncio.to_thread(os.getcwd)
+            loop = asyncio.get_event_loop()
+            self.stream._cwd = await loop.run_in_executor(
+                None,
+                os.getcwd,
+            )
 
         if self.filename:
             await self.stream.open_file(

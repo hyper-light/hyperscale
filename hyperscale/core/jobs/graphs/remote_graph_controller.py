@@ -643,7 +643,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 name='info',
             )
 
-            self.stop()
+        self.stop()
 
     @receive()
     async def start_workflow(

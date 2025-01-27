@@ -135,7 +135,8 @@ class BaseMonitor:
     ):
         try:
             while self._running_monitors[run_id].get(workflow_name):
-                await asyncio.to_thread(
+                await self._loop.run_in_executor(
+                    None,
                     self.update_monitor,
                     run_id,
                     workflow_name,

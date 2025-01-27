@@ -74,3 +74,6 @@ async def run(
             error=e,
             terminal_ui_enabled=terminal_ui_enabled,
         )
+
+
+    await runner.close()
