@@ -19,6 +19,14 @@ from hyperscale.core.monitoring import CPUMonitor, MemoryMonitor
 from hyperscale.core.state import Context, ContextHook, StateAction
 from hyperscale.core.state.workflow_context import WorkflowContext
 from hyperscale.core.testing.models.base import OptimizedArg
+from hyperscale.logging import Logger, Entry, LogLevel
+from hyperscale.logging.hyperscale_logging_models import (
+    RunTrace,
+    RunDebug,
+    RunInfo,
+    RunError,
+    RunFatal,
+)
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.common.results_types import WorkflowStats
 
@@ -76,7 +84,14 @@ def guard_result(result: asyncio.Task):
 
 
 class WorkflowRunner:
-    def __init__(self, env: Env) -> None:
+    def __init__(
+        self, 
+        env: Env,
+        worker_id: int,
+        node_id: int,
+    ) -> None:
+        self._worker_id = worker_id
+        self._node_id = node_id
         self.run_statuses: Dict[int, Dict[str, WorkflowStatus]] = defaultdict(dict)
 
         self._active: Dict[int, Dict[str, int]] = defaultdict(dict)
@@ -114,6 +129,7 @@ class WorkflowRunner:
 
         self._cpu_monitor = CPUMonitor(env)
         self._memory_monitor = MemoryMonitor(env)
+        self._logger = Logger()
 
     def setup(self):
         if self._workflows_sem is None:
@@ -227,117 +243,218 @@ class WorkflowRunner:
         Exception | None,
         WorkflowStatus,
     ]:
-        await self._run_check_lock.acquire()
-        already_running = (
-            self.run_statuses[run_id].get(workflow.name) == WorkflowStatus.RUNNING
+
+        default_config = {   
+            "node_id": self._node_id,
+            "workflow": workflow.name,
+            "run_id": run_id,
+            "workflow_vus": workflow.vus,
+            "duration": workflow.duration,
+        }
+
+        workflow_slug = workflow.name.lower()
+        
+        self._logger.configure(
+            name=f'{workflow_slug}_{run_id}_logger',
+            path=f'hyperscale.worker.{self._worker_id}.log.json',
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+            models={
+                'trace': (
+                    RunTrace,
+                    default_config
+                ),
+                'debug': (
+                    RunDebug,
+                    default_config,
+                ),
+                'info': (
+                    RunInfo,
+                    default_config,
+                ),
+                'error': (
+                    RunError,
+                    default_config,
+                ),
+                'fatal': (
+                    RunFatal,
+                    default_config,
+                )
+            }
         )
 
-        if self.pending >= self._max_pending_workflows:
-            return (
-                run_id,
-                None,
-                None,
-                Exception("Err. - Run rejected. Too many pending workflows."),
-                WorkflowStatus.REJECTED,
+        async with self._logger.context(
+            name=f'{workflow_slug}_{run_id}_logger',
+        ) as ctx:
+            
+            await self._run_check_lock.acquire()
+            
+            await ctx.log_prepared(
+                message=f'Run {run_id} of Workflow {workflow.name} entering pre-pnding execution check',
+                name='info',
             )
 
-        elif already_running and self._duplicate_job_policy == "reject":
-            return (
-                run_id,
-                None,
-                None,
-                Exception("Err. - Run rejected. Already running."),
-                WorkflowStatus.REJECTED,
+            already_running = (
+                self.run_statuses[run_id].get(workflow.name) == WorkflowStatus.RUNNING
             )
 
-        self._run_check_lock.release()
+            if self.pending >= self._max_pending_workflows:
 
-        self.run_statuses[run_id][workflow.name] = WorkflowStatus.PENDING
-
-        async with self._workflows_sem:
-            workflow_name = workflow.name
-
-            await self._cpu_monitor.start_background_monitor(run_id, workflow_name)
-            await self._memory_monitor.start_background_monitor(run_id, workflow_name)
-
-            self.run_statuses[run_id][workflow_name] = WorkflowStatus.CREATED
-
-            context = Context()
-
-            await asyncio.gather(
-                *[
-                    context.update(workflow_name, hook_name, value)
-                    for hook_name, value in workflow_context.items()
-                ]
-            )
-
-            self.run_statuses[run_id][workflow.name] = WorkflowStatus.RUNNING
-
-            self._running_workflows[run_id][workflow.name] = workflow
-
-            try:
-                (results, updated_context) = await self._run_workflow(
-                    run_id,
-                    workflow,
-                    context,
-                    vus,
+                await ctx.log_prepared(
+                    message=f'Run {run_id} of Workflow {workflow.name} failed to start due to exceeded max pending workflow limit of {self._max_pending_workflows}',
+                    name='error',
                 )
+
+                return (
+                    run_id,
+                    None,
+                    None,
+                    Exception("Err. - Run rejected. Too many pending workflows."),
+                    WorkflowStatus.REJECTED,
+                )
+
+            elif already_running and self._duplicate_job_policy == "reject":
+
+                await ctx.log_prepared(
+                    message=f'Run {run_id} of Workflow {workflow.name} failed to start due to workflow already being in running stats with duplicate job policy of REJECT',
+                    name='error',
+                )
+
+                return (
+                    run_id,
+                    None,
+                    None,
+                    Exception("Err. - Run rejected. Already running."),
+                    WorkflowStatus.REJECTED,
+                )
+            
+            await ctx.log_prepared(
+                message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.PENDING.name} state',
+                name='info',
+            )
+
+            self._run_check_lock.release()
+
+            self.run_statuses[run_id][workflow.name] = WorkflowStatus.PENDING
+
+            async with self._workflows_sem:
+                workflow_name = workflow.name
+
+                await ctx.log_prepared(
+                    message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.CREATED.name} state',
+                    name='info',
+                )
+
+                await self._cpu_monitor.start_background_monitor(run_id, workflow_name)
+                await self._memory_monitor.start_background_monitor(run_id, workflow_name)
+
+                self.run_statuses[run_id][workflow_name] = WorkflowStatus.CREATED
+
+                context = Context()
 
                 await asyncio.gather(
                     *[
                         context.update(workflow_name, hook_name, value)
-                        for workflow_name, hook_context in updated_context.iter_workflow_contexts()
-                        for hook_name, value in hook_context.items()
+                        for hook_name, value in workflow_context.items()
                     ]
                 )
 
-                workflow_name = workflow.name
-
-                del self._active[run_id][workflow_name]
-                del self._active_waiters[run_id][workflow_name]
-                del self._max_active[run_id][workflow_name]
-                del self._pending[run_id][workflow_name]
-                del self._running_workflows[run_id][workflow.name]
-
-                self.run_statuses[run_id][workflow_name] = WorkflowStatus.COMPLETED
-
-                await self._cpu_monitor.stop_background_monitor(
-                    run_id,
-                    workflow_name,
-                )
-                await self._memory_monitor.stop_background_monitor(
-                    run_id,
-                    workflow_name,
+                await ctx.log_prepared(
+                    message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.RUNNING.name} state',
+                    name='info',
                 )
 
-                return (
-                    run_id,
-                    results,
-                    updated_context[workflow_name],
-                    None,
-                    WorkflowStatus.COMPLETED,
-                )
+                self.run_statuses[run_id][workflow.name] = WorkflowStatus.RUNNING
 
-            except Exception as err:
-                self.run_statuses[run_id][workflow.name] = WorkflowStatus.FAILED
-                del self._running_workflows[run_id][workflow.name]
+                self._running_workflows[run_id][workflow.name] = workflow
 
-                await self._cpu_monitor.stop_background_monitor(
-                    run_id,
-                    workflow_name,
-                )
-                await self._memory_monitor.stop_background_monitor(
-                    run_id,
-                    workflow_name,
-                )
+                try:
+                    (results, updated_context) = await self._run_workflow(
+                        run_id,
+                        workflow,
+                        context,
+                        vus,
+                    )
 
-                return (
-                    run_id,
-                    None,
-                    context[workflow_name],
-                    err,
-                    WorkflowStatus.FAILED,
-                )
+                    await ctx.log_prepared(
+                        message=f'Run {run_id} of Workflow {workflow.name} successfully halted run',
+                        name='info',
+                    )
+
+                    await asyncio.gather(
+                        *[
+                            context.update(workflow_name, hook_name, value)
+                            for workflow_name, hook_context in updated_context.iter_workflow_contexts()
+                            for hook_name, value in hook_context.items()
+                        ]
+                    )
+
+                    workflow_name = workflow.name
+
+                    await ctx.log_prepared(
+                        message=f'Run {run_id} of Workflow {workflow.name} clearing run context',
+                        name='info',
+                    )
+
+                    del self._active[run_id][workflow_name]
+                    del self._active_waiters[run_id][workflow_name]
+                    del self._max_active[run_id][workflow_name]
+                    del self._pending[run_id][workflow_name]
+                    del self._running_workflows[run_id][workflow.name]
+
+                    await ctx.log_prepared(
+                        message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.COMPLETED.name} state',
+                        name='info',
+                    )
+
+                    self.run_statuses[run_id][workflow_name] = WorkflowStatus.COMPLETED
+
+                    await self._cpu_monitor.stop_background_monitor(
+                        run_id,
+                        workflow_name,
+                    )
+                    await self._memory_monitor.stop_background_monitor(
+                        run_id,
+                        workflow_name,
+                    )
+
+                    return (
+                        run_id,
+                        results,
+                        updated_context[workflow_name],
+                        None,
+                        WorkflowStatus.COMPLETED,
+                    )
+
+                except Exception as err:
+
+                    await ctx.log_prepared(
+                        message=f'Run {run_id} of Workflow {workflow.name} encountered error {str(err)}',
+                        name='error',
+                    )
+
+                    self.run_statuses[run_id][workflow.name] = WorkflowStatus.FAILED
+                    del self._running_workflows[run_id][workflow.name]
+                    del self._active[run_id][workflow_name]
+                    del self._active_waiters[run_id][workflow_name]
+                    del self._max_active[run_id][workflow_name]
+                    del self._pending[run_id][workflow_name]
+
+                    await self._cpu_monitor.stop_background_monitor(
+                        run_id,
+                        workflow_name,
+                    )
+                    await self._memory_monitor.stop_background_monitor(
+                        run_id,
+                        workflow_name,
+                    )
+
+                    return (
+                        run_id,
+                        None,
+                        context[workflow_name],
+                        err,
+                        WorkflowStatus.FAILED,
+                        )
 
     async def _run_workflow(
         self,
@@ -353,57 +470,91 @@ class WorkflowRunner:
         ],
         Context,
     ]:
-        state_actions = self._setup_state_actions(workflow)
-        context = await self._use_context(
-            workflow.name,
-            state_actions,
-            context,
-        )
+        
+        workflow_slug = workflow.name.lower()
 
-        (
-            workflow,
-            hooks,
-            traversal_order,
-            config,
-        ) = await self._setup(
-            run_id,
-            workflow,
-            context,
-            vus,
-        )
+        async with self._logger.context(
+            name=f'{workflow_slug}_{run_id}_logger',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Run {run_id} of Workflow {workflow.name} setting actions and context',
+                name='debug'
+            )
+            
+            state_actions = self._setup_state_actions(workflow)
+            context = await self._use_context(
+                workflow.name,
+                state_actions,
+                context,
+            )
 
-        is_test_workflow = (
-            len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST])
-            > 0
-        )
+            await ctx.log_prepared(
+                message=f'Run {run_id} of Workflow {workflow.name} creating traversal order and optimizations',
+                name='debug'
+            )
 
-        if is_test_workflow:
-            results = await self._execute_test_workflow(
-                run_id,
+            (
                 workflow,
-                traversal_order,
                 hooks,
-                context,
+                traversal_order,
                 config,
-            )
-
-        else:
-            results = await self._execute_non_test_workflow(
+            ) = await self._setup(
                 run_id,
                 workflow,
-                traversal_order,
                 context,
-                config,
+                vus,
             )
 
-        context = await self._provide_context(
-            workflow.name,
-            state_actions,
-            context,
-            results,
-        )
+            is_test_workflow = (
+                len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST])
+                > 0
+            )
 
-        return (results, context)
+            if is_test_workflow:
+                await ctx.log_prepared(
+                    message=f'Run {run_id} of test Workflow {workflow.name} beginning execution',
+                    name='debug'
+                )
+
+                results = await self._execute_test_workflow(
+                    run_id,
+                    workflow,
+                    traversal_order,
+                    hooks,
+                    context,
+                    config,
+                )
+
+            else:
+
+                await ctx.log_prepared(
+                    message=f'Run {run_id} of non test Workflow {workflow.name} beginning execution',
+                    name='debug'
+                )
+
+                results = await self._execute_non_test_workflow(
+                    run_id,
+                    workflow,
+                    traversal_order,
+                    context,
+                    config,
+                )
+
+            
+            await ctx.log_prepared(
+                message=f'Run {run_id} of Workflow {workflow.name} completed execution and updated context',
+                name='debug'
+            )
+
+            context = await self._provide_context(
+                workflow.name,
+                state_actions,
+                context,
+                results,
+            )
+
+            return (results, context)
 
     def _setup_state_actions(self, workflow: Workflow) -> Dict[str, ContextHook]:
         state_actions: Dict[str, ContextHook] = {
@@ -469,135 +620,146 @@ class WorkflowRunner:
         ],
         Dict[str, Any],
     ]:
-        self._active[run_id][workflow.name] = 0
-        self._completed_counts[run_id][workflow.name] = CompletionCounter()
-        self._failed_counts[run_id][workflow.name] = CompletionCounter()
+        workflow_slug = workflow.name.lower()
+        async with self._logger.context(
+            name=f'{workflow_slug}_{run_id}_logger',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Run {run_id} of Workflow {workflow.name} executing for {workflow.duration} with {vus} VUs and timeout of {workflow.timeout}',
+                name='debug',
+            )
 
-        config = {
-            "vus": 1000,
-            "duration": "1m",
-            "threads": self._threads,
-            "connect_retries": 3,
-            "workflow_timeout": "5m",
-        }
+            self._active[run_id][workflow.name] = 0
+            self._completed_counts[run_id][workflow.name] = CompletionCounter()
+            self._failed_counts[run_id][workflow.name] = CompletionCounter()
 
-        config.update(
-            {
+            config = {
+                "vus": 1000,
+                "duration": "1m",
+                "threads": self._threads,
+                "connect_retries": 3,
+                "workflow_timeout": workflow.timeout,
+            }
+
+            config.update(
+                {
+                    name: value
+                    for name, value in inspect.getmembers(workflow)
+                    if config.get(name)
+                }
+            )
+
+            config["vus"] = vus
+            config["workflow_timeout"] = TimeParser(config["workflow_timeout"]).time
+            config["duration"] = TimeParser(config["duration"]).time
+
+            threads = config.get("threads")
+
+            self._max_active[run_id][workflow.name] = math.ceil(
+                (vus * (psutil.cpu_count(logical=False) ** 2)) / threads
+            )
+
+            for client in workflow.client:
+                setup_client(
+                    client,
+                    config.get("vus"),
+                    pages=config.get("pages", 1),
+                    cert_path=config.get("cert_path"),
+                    key_path=config.get("key_path"),
+                    reset_connections=config.get("reset_connections"),
+                )
+
+            hooks: Dict[str, Hook] = {
+                name: hook
+                for name, hook in inspect.getmembers(
+                    workflow,
+                    predicate=lambda member: isinstance(member, Hook),
+                )
+            }
+
+            self._workflow_hooks[run_id][workflow] = list(hooks.keys())
+            
+            step_graph = networkx.DiGraph()
+            sources = []
+
+            workflow_context = context[workflow.name]
+            optimized_context_args = {
                 name: value
-                for name, value in inspect.getmembers(workflow)
-                if config.get(name)
+                for name, value in workflow_context.items()
+                if isinstance(value, OptimizedArg)
             }
-        )
 
-        config["vus"] = vus
-        config["workflow_timeout"] = TimeParser(config["workflow_timeout"]).time
-        config["duration"] = TimeParser(config["duration"]).time
+            for hook in hooks.values():
+                await ctx.log_prepared(
+                    message=f'Run {run_id} of Workflow {workflow.name} setting up action {hook.name}',
+                    name='debug',
+                )
+                
+                stats_key = (workflow.name, hook.name)
+                self._workflow_step_stats[run_id][stats_key] = {
+                    "total": CompletionCounter(),
+                    "ok": CompletionCounter(),
+                    "err": CompletionCounter(),
+                }
 
-        threads = config.get("threads")
+                step_graph.add_node(hook.name)
 
-        self._max_active[run_id][workflow.name] = math.ceil(
-            (vus * (psutil.cpu_count(logical=False) ** 2)) / threads
-        )
+                hook.call = hook.call.__get__(workflow, workflow.__class__)
+                setattr(workflow, hook.name, hook.call)
 
-        for client in workflow.client:
-            setup_client(
-                client,
-                config.get("vus"),
-                pages=config.get("pages", 1),
-                cert_path=config.get("cert_path"),
-                key_path=config.get("key_path"),
-                reset_connections=config.get("reset_connections"),
-            )
+                if hook.hook_type == HookType.TEST:
+                    hook.optimized_args.update(
+                        {
+                            name: value
+                            for name, value in optimized_context_args.items()
+                            if name in hook.kwarg_names
+                        }
+                    )
 
-        hooks: Dict[str, Hook] = {
-            name: hook
-            for name, hook in inspect.getmembers(
+                if len(hook.optimized_args) > 0 and hook.hook_type == HookType.TEST:
+                    for arg in hook.optimized_args.values():
+                        arg.call_name = hook.name
+
+                    await asyncio.gather(
+                        *[
+                            guard_optimize_call(
+                                arg.optimize(hook.engine_type),
+                            )
+                            for arg in hook.optimized_args.values()
+                        ]
+                    )
+
+                    await asyncio.gather(
+                        *[
+                            guard_optimize_call(
+                                workflow.client[hook.engine_type]._optimize(arg),
+                            )
+                            for arg in hook.optimized_args.values()
+                        ]
+                    )
+
+                if len(hook.dependencies) == 0:
+                    sources.append(hook.name)
+
+                for dependency in hook.dependencies:
+                    step_graph.add_edge(dependency, hook.name)
+
+            traversal_order: List[Dict[str, Hook]] = []
+
+            for traversal_layer in networkx.bfs_layers(step_graph, sources):
+                traversal_order.append(
+                    {hook_name: hooks.get(hook_name) for hook_name in traversal_layer}
+                )
+
+            self._active_waiters[run_id][workflow.name] = None
+
+            return (
                 workflow,
-                predicate=lambda member: isinstance(member, Hook),
+                hooks,
+                traversal_order,
+                config,
             )
-        }
-
-        self._workflow_hooks[run_id][workflow] = list(hooks.keys())
-
-        for hook in hooks:
-            stats_key = (workflow.name, hook)
-            self._workflow_step_stats[run_id][stats_key] = {
-                "total": CompletionCounter(),
-                "ok": CompletionCounter(),
-                "err": CompletionCounter(),
-            }
-
-        step_graph = networkx.DiGraph()
-
-        for hook in hooks.values():
-            step_graph.add_node(hook.name)
-
-            hook.call = hook.call.__get__(workflow, workflow.__class__)
-            setattr(workflow, hook.name, hook.call)
-
-        sources = []
-
-        workflow_context = context[workflow.name]
-        optimized_context_args = {
-            name: value
-            for name, value in workflow_context.items()
-            if isinstance(value, OptimizedArg)
-        }
-
-        for hook in hooks.values():
-            if hook.hook_type == HookType.TEST:
-                hook.optimized_args.update(
-                    {
-                        name: value
-                        for name, value in optimized_context_args.items()
-                        if name in hook.kwarg_names
-                    }
-                )
-
-        for hook in hooks.values():
-            if len(hook.optimized_args) > 0 and hook.hook_type == HookType.TEST:
-                for arg in hook.optimized_args.values():
-                    arg.call_name = hook.name
-
-                await asyncio.gather(
-                    *[
-                        guard_optimize_call(
-                            arg.optimize(hook.engine_type),
-                        )
-                        for arg in hook.optimized_args.values()
-                    ]
-                )
-
-                await asyncio.gather(
-                    *[
-                        guard_optimize_call(
-                            workflow.client[hook.engine_type]._optimize(arg),
-                        )
-                        for arg in hook.optimized_args.values()
-                    ]
-                )
-
-            if len(hook.dependencies) == 0:
-                sources.append(hook.name)
-
-            for dependency in hook.dependencies:
-                step_graph.add_edge(dependency, hook.name)
-
-        traversal_order: List[Dict[str, Hook]] = []
-
-        for traversal_layer in networkx.bfs_layers(step_graph, sources):
-            traversal_order.append(
-                {hook_name: hooks.get(hook_name) for hook_name in traversal_layer}
-            )
-
-        self._active_waiters[run_id][workflow.name] = None
-
-        return (
-            workflow,
-            hooks,
-            traversal_order,
-            config,
-        )
 
     async def _execute_test_workflow(
         self,
@@ -892,23 +1054,36 @@ class WorkflowRunner:
         self._max_active.clear()
 
     async def close(self):
-        for job in self._running_workflows.values():
-            for workflow in job.values():
-                workflow.client.close()
+        async with self._logger.context(
+            name='workflow_manager',
+            path=f'hyperscale.worker.{self._worker_id}.log.json',
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}"
+        ) as ctx:
+            
+            await ctx.log(Entry(
+                message=f'Closing Workflow Runner at {self._node_id}',
+                level=LogLevel.INFO
+            ))
+            
+            for job in self._running_workflows.values():
+                for workflow in job.values():
+                    workflow.client.close()
 
-        try:
-            await self._cpu_monitor.stop_all_background_monitors()
-        except Exception:
-            pass
+            try:
+                await self._cpu_monitor.stop_all_background_monitors()
+            except Exception:
+                pass
 
-        try:
-            await self._memory_monitor.stop_all_background_monitors()
-        except Exception:
-            pass
+            try:
+                await self._memory_monitor.stop_all_background_monitors()
+            except Exception:
+                pass
 
-        self._clear()
+            self._clear()
 
     def abort(self):
+        self._logger.abort()
+        
         for job in self._running_workflows.values():
             for workflow in job.values():
                 try:

@@ -118,7 +118,7 @@ class LocalRunner:
 
         self._logger.configure(
             name='local_runner',
-            path='hyperscale.main.log.json',
+            path='hyperscale.leader.log.json',
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
                 'trace': (
@@ -351,7 +351,6 @@ class LocalRunner:
     ):
         async with self._logger.context(
             name='local_runner',
-            nested=True,
         ) as ctx:
 
             if error is None:
@@ -390,19 +389,18 @@ class LocalRunner:
             except asyncio.CancelledError:
                 pass
 
-    def close(self):
-        child_processes = active_children()
+    async def close(self):
+        loop = asyncio.get_event_loop()
+        child_processes = await loop.run_in_executor(
+            None,
+            active_children
+        )
         for child in child_processes:
             try:
-                child.kill()
-
-            except Exception:
-                pass
-
-        process = current_process()
-        if process:
-            try:
-                process.kill()
+                await loop.run_in_executor(
+                    None,
+                    child.kill
+                )
 
             except Exception:
                 pass
@@ -427,7 +425,6 @@ class LocalRunner:
 
         async with self._logger.context(
             name='local_runner',
-            nested=True,
         ) as ctx:
             await ctx.log_prepared(f'Provisioning {self._workers} worker sockets for test {test_name}', name='debug')
 

@@ -34,6 +34,14 @@ from hyperscale.core.jobs.models import Env, Message
 
 from hyperscale.core.snowflake import Snowflake
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
+from hyperscale.logging import Logger, Entry, LogLevel
+from hyperscale.logging.hyperscale_logging_models import (
+    ControllerTrace,
+    ControllerDebug,
+    ControllerInfo,
+    ControllerError,
+    ControllerFatal,
+)
 from .encryption import AESGCMFernet
 from .udp_socket_protocol import UDPSocketProtocol
 
@@ -45,9 +53,16 @@ K = TypeVar("K")
 
 
 class UDPProtocol(Generic[T, K]):
-    def __init__(self, host: str, port: int, env: Env) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        env: Env,
+    ) -> None:
         self._node_id_base = uuid.uuid4().int >> 64
         self.node_id: int | None = None
+
+        self._logger = Logger()
 
         self.id_generator: SnowflakeGenerator | None = None
 
@@ -120,6 +135,7 @@ class UDPProtocol(Generic[T, K]):
 
     async def connect_client(
         self,
+        logfile: str,
         address: tuple[str, int],
         cert_path: str | None = None,
         key_path: str | None = None,
@@ -165,7 +181,10 @@ class UDPProtocol(Generic[T, K]):
                 key_path=key_path,
             )
 
-        while True:
+        run_start = True
+        instance_id: int | None = None
+
+        while run_start:
             if self._transport is None:
                 await self.start_server(
                     cert_path=cert_path,
@@ -189,12 +208,12 @@ class UDPProtocol(Generic[T, K]):
 
                 snowflake = Snowflake.parse(shard_id)
 
-                instance = snowflake.instance
+                instance_id = snowflake.instance
 
-                self._node_host_map[instance] = address
-                self._nodes.put_no_wait(instance)
+                self._node_host_map[instance_id] = address
+                self._nodes.put_no_wait(instance_id)
 
-                return instance
+                run_start = False
 
             except Exception:
                 pass
@@ -206,9 +225,46 @@ class UDPProtocol(Generic[T, K]):
                 pass
 
             await asyncio.sleep(self._retry_interval)
+        
+        default_config = {
+            "node_id": self._node_id_base,
+            "node_host": self.host,
+            "node_port": self.port,
+        }
+
+        self._logger.configure(
+            name=f'graph_client_{self._node_id_base}',
+            path=logfile,
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+            models={
+                'trace': (
+                    ControllerTrace,
+                    default_config
+                ),
+                'debug': (
+                    ControllerDebug,
+                    default_config,
+                ),
+                'info': (
+                    ControllerInfo,
+                    default_config,
+                ),
+                'error': (
+                    ControllerError,
+                    default_config,
+                ),
+                'fatal': (
+                    ControllerFatal,
+                    default_config,
+                )
+            }
+        )
+
+        return instance_id
 
     async def start_server(
         self,
+        logfile: str,
         cert_path: str | None = None,
         key_path: str | None = None,
         worker_socket: socket.socket | None = None,
@@ -307,7 +363,9 @@ class UDPProtocol(Generic[T, K]):
                 cert_path=cert_path, key_path=key_path
             )
 
-        while True:
+        run_start = True
+
+        while run_start:
             try:
                 if self.connected is False and worker_socket is None:
                     self.udp_socket = socket.socket(
@@ -354,7 +412,7 @@ class UDPProtocol(Generic[T, K]):
 
                     self._cleanup_task = self._loop.create_task(self._cleanup())
 
-                    return
+                    run_start = False
 
             except Exception:
                 pass
@@ -366,6 +424,40 @@ class UDPProtocol(Generic[T, K]):
                 pass
 
             await asyncio.sleep(self._retry_interval)
+
+        default_config = {
+            "node_id": self._node_id_base,
+            "node_host": self.host,
+            "node_port": self.port,
+        }
+
+        self._logger.configure(
+            name=f'graph_server_{self._node_id_base}',
+            path=logfile,
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+            models={
+                'trace': (
+                    ControllerTrace,
+                    default_config
+                ),
+                'debug': (
+                    ControllerDebug,
+                    default_config,
+                ),
+                'info': (
+                    ControllerInfo,
+                    default_config,
+                ),
+                'error': (
+                    ControllerError,
+                    default_config,
+                ),
+                'fatal': (
+                    ControllerFatal,
+                    default_config,
+                )
+            }
+        )
 
     def _create_udp_ssl_context(
         self,
@@ -930,6 +1022,7 @@ class UDPProtocol(Generic[T, K]):
             await asyncio.sleep(self._shutdown_poll_rate)
 
     async def close(self) -> None:
+
         self._running = False
 
         if self._transport:
@@ -1079,3 +1172,10 @@ class UDPProtocol(Generic[T, K]):
                 pass
 
         self._pending_responses.clear()
+        
+        try:
+            self._logger.abort()
+
+        except Exception:
+            pass
+

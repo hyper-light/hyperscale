@@ -2,6 +2,7 @@ import asyncio
 import ctypes
 import functools
 import multiprocessing
+import os
 import signal
 import socket
 import warnings
@@ -14,7 +15,13 @@ from hyperscale.core.jobs.graphs.remote_graph_controller import (
     RemoteGraphController,
 )
 from hyperscale.core.jobs.models import Env
-from hyperscale.logging import Logger, Entry, LogLevel
+from hyperscale.logging import (
+    Logger,
+    Entry,
+    LogLevel, 
+    LoggingConfig,
+    LogLevelName
+)
 
 
 def set_process_name():
@@ -87,65 +94,80 @@ async def run_server(
 
 
 def run_thread(
+    worker_idx: int,
     leader_address: tuple[str, int],
     socket: socket.socket,
     worker_env: Dict[str, str | int | float | bool | None],
+    logs_directory: str,
+    log_level: LogLevelName = 'info',
     cert_path: str | None = None,
     key_path: str | None = None,
 ):
+    
     try:
-        import uvloop
+        from hyperscale.logging import LoggingConfig
+        try:
+            import uvloop
 
-        uvloop.install()
+            uvloop.install()
 
-    except ImportError:
-        pass
+        except ImportError:
+            pass
 
-    import asyncio
+        import asyncio
 
-    try:
-        loop = asyncio.get_event_loop()
-    except Exception:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    host, port = socket.getsockname()
-
-    env = Env(**worker_env)
-
-    server = RemoteGraphController(host, port, env)
-
-    for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-        loop.add_signal_handler(
-            getattr(
-                signal,
-                signame,
-            ),
-            lambda signame=signame: server.abort(),
+        logging_config = LoggingConfig()
+        logging_config.update(
+            log_directory=logs_directory,
+            log_level=log_level,
+            log_output='stderr',
         )
 
-    try:
-        loop.run_until_complete(
-            run_server(
-                leader_address,
-                server,
-                socket,
-                cert_path=cert_path,
-                key_path=key_path,
+        try:
+            loop = asyncio.get_event_loop()
+        except Exception:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        host, port = socket.getsockname()
+
+        env = Env(**worker_env)
+
+        server = RemoteGraphController(
+            worker_idx + 1,
+            host,
+            port,
+            env,
+        )
+
+        for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
+            loop.add_signal_handler(
+                getattr(
+                    signal,
+                    signame,
+                ),
+                lambda signame=signame: server.abort(),
             )
-        )
 
-    except Exception:
-        abort_server(server)
+        try:
+            loop.run_until_complete(
+                run_server(
+                    leader_address,
+                    server,
+                    socket,
+                    cert_path=cert_path,
+                    key_path=key_path,
+                )
+            )
 
-    except asyncio.CancelledError:
-        abort_server(server)
+        except Exception:
+            abort_server(server)
 
-    except KeyboardInterrupt:
-        abort_server(server)
+        except asyncio.CancelledError:
+            abort_server(server)
 
-    try:
-        loop.close()
+        except KeyboardInterrupt:
+            abort_server(server)
 
     except Exception:
         pass
@@ -174,7 +196,7 @@ class LocalServerPool:
 
         async with self._logger.context(
             name='local_server_pool',
-            path='hyperscale.main.log.json',
+            path='hyperscale.leader.log.json',
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
         ) as ctx:
             
@@ -209,7 +231,7 @@ class LocalServerPool:
     ):
         async with self._logger.context(
             name='local_server_pool',
-            path='hyperscale.main.log.json',
+            path='hyperscale.leader.log.json',
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
         ) as ctx:
             
@@ -220,20 +242,25 @@ class LocalServerPool:
                 level=LogLevel.DEBUG
             ))
 
+            config = LoggingConfig()
+
             self._pool_task = asyncio.gather(
                 *[
                     self._loop.run_in_executor(
                         self._executor,
                         functools.partial(
                             run_thread,
+                            idx,
                             leader_address,
                             socket,
                             env.model_dump(),
+                            config.directory,
+                            log_level=config.level.name.lower(),
                             cert_path=cert_path,
                             key_path=key_path,
                         ),
                     )
-                    for socket in sockets
+                    for idx, socket in enumerate(sockets)
                 ],
                 return_exceptions=True,
             )
@@ -242,7 +269,7 @@ class LocalServerPool:
 
         async with self._logger.context(
             name='local_server_pool',
-            path='hyperscale.main.log.json',
+            path='hyperscale.leader.log.json',
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
         ) as ctx:
             

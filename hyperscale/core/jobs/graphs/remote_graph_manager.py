@@ -128,6 +128,7 @@ class RemoteGraphManager:
     ):
         async with self._logger.context(
             name='remote_graph_manager',
+            path='hyperscale.leader.log.json',
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}"
         ) as ctx:
             
@@ -140,6 +141,7 @@ class RemoteGraphManager:
 
             if self._controller is None:
                 self._controller = RemoteGraphController(
+                    None,
                     host,
                     port,
                     env,
@@ -160,6 +162,7 @@ class RemoteGraphManager:
     ):
         async with self._logger.context(
             name='remote_graph_manager',
+            path='hyperscale.leader.log.json',
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}"
         ) as ctx:
             
@@ -198,9 +201,11 @@ class RemoteGraphManager:
         workflows: List[Workflow | DependentWorkflow],
     ) -> RunResults:
         
+        graph_slug = test_name.lower()
+        
         self._logger.configure(
-            name='graph_logger',
-            path='hyperscale.main.log.json',
+            name=f'{graph_slug}_logger',
+            path='hyperscale.leader.log.json',
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
                 'debug': (
@@ -215,13 +220,13 @@ class RemoteGraphManager:
                 ),
             }
         )
+
+        run_id = self._controller.id_generator.generate()
         
         async with self._logger.context(
-            name='graph_logger'
+            name=f'{graph_slug}_logger'
         ) as ctx:
         
-            run_id = self._controller.id_generator.generate()
-
             await ctx.log_prepared(
                 message=f'Graph {test_name} assigned run id {run_id}',
                 name='debug'
@@ -353,10 +358,12 @@ class RemoteGraphManager:
             "workflow_vus": workflow.vus,
             "duration": workflow.duration,
         }
+
+        workflow_slug = workflow.name.lower()
         
         self._logger.configure(
-            name='workflow_logger',
-            path='hyperscale.main.log.json',
+            name=f'{workflow_slug}_logger',
+            path='hyperscale.leader.log.json',
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
                 'trace': (
@@ -383,7 +390,7 @@ class RemoteGraphManager:
         )
 
         async with self._logger.context(
-            name='workflow_logger'
+            name=f'{workflow_slug}_logger',
         ) as ctx:
             
             await ctx.log_prepared(
@@ -704,47 +711,60 @@ class RemoteGraphManager:
         if self._graph_updates[workflow].empty() is False:
             return await self._graph_updates[workflow].get()
 
-    async def _update(self, update: WorkflowStatusUpdate):
+    async def _update(
+        self,
+        update: WorkflowStatusUpdate,
+    ):
         if update:
+
             workflow_slug = update.workflow.lower()
 
-            elapsed = time.monotonic() - self._workflow_timers[update.workflow]
-            completed_count = update.completed_count
+            async with self._logger.context(
+                name=f'{workflow_slug}_logger',
+            ) as ctx:
 
-            await asyncio.gather(
-                *[
-                    update_workflow_executions_counter(
-                        workflow_slug,
-                        completed_count,
-                    ),
-                    update_workflow_executions_total_rate(
-                        workflow_slug, completed_count, True
-                    ),
-                    update_workflow_progress_seconds(workflow_slug, elapsed),
-                ]
-            )
-
-            if self._workflow_last_elapsed.get(update.workflow) is None:
-                self._workflow_last_elapsed[update.workflow] = time.monotonic()
-
-            last_sampled = (
-                time.monotonic() - self._workflow_last_elapsed[update.workflow]
-            )
-
-            if last_sampled > 1:
-                self._workflow_completion_rates[update.workflow].append(
-                    (int(elapsed), int(completed_count / elapsed))
+                await ctx.log_prepared(
+                    message=f'Workflow {update.workflow} submitting stats update',
+                    name='trace',
                 )
 
-                await update_workflow_executions_rates(
-                    workflow_slug, self._workflow_completion_rates[update.workflow]
+                elapsed = time.monotonic() - self._workflow_timers[update.workflow]
+                completed_count = update.completed_count
+
+                await asyncio.gather(
+                    *[
+                        update_workflow_executions_counter(
+                            workflow_slug,
+                            completed_count,
+                        ),
+                        update_workflow_executions_total_rate(
+                            workflow_slug, completed_count, True
+                        ),
+                        update_workflow_progress_seconds(workflow_slug, elapsed),
+                    ]
                 )
 
-                await update_workflow_execution_stats(workflow_slug, update.step_stats)
+                if self._workflow_last_elapsed.get(update.workflow) is None:
+                    self._workflow_last_elapsed[update.workflow] = time.monotonic()
 
-                self._workflow_last_elapsed[update.workflow] = time.monotonic()
+                last_sampled = (
+                    time.monotonic() - self._workflow_last_elapsed[update.workflow]
+                )
 
-            self._graph_updates[update.workflow].put_nowait(update)
+                if last_sampled > 1:
+                    self._workflow_completion_rates[update.workflow].append(
+                        (int(elapsed), int(completed_count / elapsed))
+                    )
+
+                    await update_workflow_executions_rates(
+                        workflow_slug, self._workflow_completion_rates[update.workflow]
+                    )
+
+                    await update_workflow_execution_stats(workflow_slug, update.step_stats)
+
+                    self._workflow_last_elapsed[update.workflow] = time.monotonic()
+
+                self._graph_updates[update.workflow].put_nowait(update)
 
     def _provision(
         self,
@@ -837,47 +857,69 @@ class RemoteGraphManager:
         context: Context,
         results: Dict[str, Any],
     ):
-        provide_actions = [
-            action
-            for action in state_actions.values()
-            if action.action_type == StateAction.PROVIDE
-        ]
+        
+        workflow_slug = workflow.lower()
+        async with self._logger.context(
+            name=f'{workflow_slug}_logger',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Workflow {workflow} updating context',
+                name='debug',
+            )
 
-        if len(provide_actions) < 1:
+            provide_actions = [
+                action
+                for action in state_actions.values()
+                if action.action_type == StateAction.PROVIDE
+            ]
+
+            if len(provide_actions) < 1:
+                return context
+
+            hook_targets: Dict[str, Hook] = {}
+            for hook in provide_actions:
+                hook.context_args = {
+                    name: value for name, value in context[workflow].items()
+                }
+
+                hook.context_args.update(results)
+
+                hook_targets[hook.name] = hook.workflows
+
+            context_results = await asyncio.gather(
+                *[hook.call(**hook.context_args) for hook in provide_actions]
+            )
+
+            await asyncio.gather(
+                *[
+                    context[target].set(hook_name, result)
+                    for hook_name, result in context_results
+                    for target in hook_targets[hook_name]
+                ]
+            )
+
             return context
 
-        hook_targets: Dict[str, Hook] = {}
-        for hook in provide_actions:
-            hook.context_args = {
-                name: value for name, value in context[workflow].items()
-            }
-
-            hook.context_args.update(results)
-
-            hook_targets[hook.name] = hook.workflows
-
-        context_results = await asyncio.gather(
-            *[hook.call(**hook.context_args) for hook in provide_actions]
-        )
-
-        await asyncio.gather(
-            *[
-                context[target].set(hook_name, result)
-                for hook_name, result in context_results
-                for target in hook_targets[hook_name]
-            ]
-        )
-
-        return context
-
     async def shutdown_workers(self):
-        await self._controller.submit_stop_request()
+        async with self._logger.context(
+            name='remote_graph_manager',
+            path='hyperscale.leader.log.json',
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}"
+        ) as ctx:
+            await ctx.log(Entry(
+                message=f'Receivied shutdown request - stopping {self._threads} workers',
+                level=LogLevel.INFO
+            ))
+
+            await self._controller.submit_stop_request()
 
     async def close(self):
         await self._controller.close()
 
     def abort(self):
         try:
+            self._logger.abort()
             self._controller.abort()
 
         except Exception:

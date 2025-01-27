@@ -21,6 +21,7 @@ ReporterConfigs = (
 class Workflow:
     vus = 1000
     duration = "1m"
+    timeout = "5m"
     reporting: ReporterConfigs | None = None
 
     def __init__(self):

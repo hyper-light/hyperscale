@@ -26,6 +26,15 @@ from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.jobs.protocols import UDPProtocol
 from hyperscale.core.snowflake import Snowflake
 from hyperscale.core.state import Context
+from hyperscale.logging import Logger, Entry, LogLevel
+from hyperscale.logging.hyperscale_logging_models import (
+    RunTrace,
+    RunDebug,
+    RunInfo,
+    RunError,
+    RunFatal,
+    StatusUpdate
+)
 from hyperscale.ui.actions import update_active_workflow_message
 from hyperscale.reporting.common.results_types import WorkflowStats
 
@@ -62,15 +71,25 @@ StepStatsUpdate = Dict[str, Dict[StepStatsType, int]]
 class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
     def __init__(
         self,
+        worker_idx: int | None,
         host: str,
         port: int,
         env: Env,
     ) -> None:
         super().__init__(host, port, env)
 
-        self._workflows = WorkflowRunner(env)
+        self._workflows = WorkflowRunner(
+            env,
+            worker_idx,
+            self._node_id_base,
+        )
 
         self.acknowledged_starts: set[str] = set()
+        self._worker_id = worker_idx
+
+        self._logfile = f'hyperscale.worker.{self._worker_id}.log.json'
+        if worker_idx is None:
+            self._logfile = 'hyperscale.leader.log.json'
 
         self._results: NodeData[WorkflowResult] = defaultdict(lambda: defaultdict(dict))
         self._errors: NodeData[Exception] = defaultdict(lambda: defaultdict(dict))
@@ -136,12 +155,16 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             self._leader_lock = asyncio.Lock()
 
         self._workflows.setup()
-        return await super().start_server(
+
+        await super().start_server(
+            self._logfile,
             cert_path=cert_path,
             key_path=key_path,
             worker_socket=worker_socket,
             worker_server=worker_server,
         )
+
+   
 
     async def connect_client(
         self,
@@ -153,6 +176,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         self._workflows.setup()
 
         await super().connect_client(
+            self._logfile,
             address,
             cert_path,
             key_path,
@@ -177,7 +201,16 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         run_id: int,
         context: Context,
     ):
-        await self._node_context[run_id].copy(context)
+        async with self._logger.context(
+            name=f'graph_server_{self._node_id_base}',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Updating context for run {run_id}',
+                name='debug',
+            )
+
+            await self._node_context[run_id].copy(context)
 
     async def submit_workflow_to_workers(
         self,
@@ -187,64 +220,124 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         threads: int,
         workflow_vus: List[int],
         update_callback: Callable[[int, WorkflowStatus], Awaitable[None]],
-    ):
+    ):    
         task_id = self.id_generator.generate()
-        self.tasks.run(
-            "get_latest_completed",
-            run_id,
-            workflow.name,
-            update_callback,
-            run_id=task_id,
+        default_config = {   
+            "node_id": self._node_id_base,
+            "workflow": workflow.name,
+            "run_id": run_id,
+            "workflow_vus": workflow.vus,
+            "duration": workflow.duration,
+        }
+
+        self._logger.configure(
+            name=f'workflow_run_{run_id}',
+            path=self._logfile,
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+            models={
+                'trace': (
+                    RunTrace,
+                    default_config
+                ),
+                'debug': (
+                    RunDebug,
+                    default_config,
+                ),
+                'info': (
+                    RunInfo,
+                    default_config,
+                ),
+                'error': (
+                    RunError,
+                    default_config,
+                ),
+                'fatal': (
+                    RunFatal,
+                    default_config,
+                )
+            }
         )
 
-        return await asyncio.gather(
-            *[
-                self.submit(
-                    run_id,
-                    workflow,
-                    workflow_vus[idx],
-                    context,
-                )
-                for idx in range(threads)
-            ]
-        )
+        async with self._logger.context(
+            name=f'workflow_run_{run_id}',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Submitting run {run_id} for workflow {workflow.name} with {threads} threads and {workflow.vus} VUs for {workflow.duration}',
+                name='info',
+            )
+
+            self.tasks.run(
+                "get_latest_completed",
+                run_id,
+                workflow.name,
+                update_callback,
+                run_id=task_id,
+            )
+
+            return await asyncio.gather(
+                *[
+                    self.submit(
+                        run_id,
+                        workflow,
+                        workflow_vus[idx],
+                        context,
+                    )
+                    for idx in range(threads)
+                ]
+            )
 
     async def poll_for_start(self, workers: int):
-        polling = True
+        async with self._logger.context(
+            name=f'graph_server_{self._node_id_base}',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} polling for {workers} workers',
+                name='info',
+            )
 
-        start = time.monotonic()
-        elapsed = 0
+            polling = True
 
-        while polling:
-            await asyncio.sleep(self._context_poll_rate)
+            start = time.monotonic()
+            elapsed = 0
 
-            await self._leader_lock.acquire()
+            while polling:
+                await asyncio.sleep(self._context_poll_rate)
 
-            acknowledged_starts_count = len(self.acknowledged_starts)
+                await self._leader_lock.acquire()
 
-            if acknowledged_starts_count >= workers:
-                await update_active_workflow_message(
-                    "initializing",
-                    f"Starting - {acknowledged_starts_count}/{workers} - threads",
-                )
+                acknowledged_starts_count = len(self.acknowledged_starts)
 
-                break
+                if acknowledged_starts_count >= workers:
 
-            elapsed = time.monotonic() - start
+                    await ctx.log_prepared(
+                        message=f'Node {self._node_id_base} at {self.host}:{self.port} successfully registered {workers} workers',
+                        name='info',
+                    )
 
-            if elapsed > 1:
-                start = time.monotonic()
+                    await update_active_workflow_message(
+                        "initializing",
+                        f"Starting - {acknowledged_starts_count}/{workers} - threads",
+                    )
 
-                await update_active_workflow_message(
-                    "initializing",
-                    f"Starting - {acknowledged_starts_count}/{workers} - threads",
-                )
+                    break
+
+                elapsed = time.monotonic() - start
+
+                if elapsed > 1:
+                    start = time.monotonic()
+
+                    await update_active_workflow_message(
+                        "initializing",
+                        f"Starting - {acknowledged_starts_count}/{workers} - threads",
+                    )
+
+                if self._leader_lock.locked():
+                    self._leader_lock.release()
 
             if self._leader_lock.locked():
                 self._leader_lock.release()
-
-        if self._leader_lock.locked():
-            self._leader_lock.release()
 
     async def poll_for_workflow_complete(
         self,
@@ -252,25 +345,42 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         workflow_name: str,
         timeout: int,
     ):
-        try:
-            await asyncio.wait_for(
-                self._poll_for_completed(
-                    run_id,
-                    workflow_name,
-                ),
-                timeout=timeout,
+        async with self._logger.context(
+            name=f'workflow_run_{run_id}',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} waiting for {timeout} seconds for Workflow {workflow_name} to complete',
+                name='info'
             )
 
-        except asyncio.TimeoutError:
-            pass
+            try:
+                await asyncio.wait_for(
+                    self._poll_for_completed(
+                        run_id,
+                        workflow_name,
+                    ),
+                    timeout=timeout,
+                )
 
-        if self._leader_lock.locked():
-            self._leader_lock.release()
+                await ctx.log_prepared(
+                    message=f'Node {self._node_id_base} at {self.host}:{self.port} successfully registered completion of Workflow {workflow_name}',
+                    name='info'
+                )
 
-        return (
-            self._results[run_id][workflow_name],
-            self._node_context[run_id],
-        )
+            except asyncio.TimeoutError:
+                await ctx.log_prepared(
+                    message=f'Node {self._node_id_base} at {self.host}:{self.port} timed out waiting for Workflow {workflow_name} to complete',
+                    name='error'
+                )
+
+            if self._leader_lock.locked():
+                self._leader_lock.release()
+
+            return (
+                self._results[run_id][workflow_name],
+                self._node_context[run_id],
+            )
 
     async def _poll_for_completed(
         self,
@@ -318,11 +428,22 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         self,
         leader_address: tuple[str, int],
     ):
-        return await self.send(
-            "receive_start_acknowledgement",
-            JobContext((self.host, self.port)),
-            target_address=leader_address,
-        )
+        async with self._logger.context(
+            name=f'graph_client_{self._node_id_base}',
+        ) as ctx:
+            
+            start_host, start_port = leader_address
+            
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} submitted acknowledgement for connection request from node {start_host}:{start_port}',
+                name='info',
+            )
+
+            return await self.send(
+                "receive_start_acknowledgement",
+                JobContext((self.host, self.port)),
+                target_address=leader_address,
+            )
 
     @send()
     async def submit(
@@ -332,40 +453,63 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         vus: int,
         context: Context,
     ) -> Response[JobContext[WorkflowStatusUpdate]]:
-        response: Response[JobContext[WorkflowStatusUpdate]] = await self.send(
-            "start_workflow",
-            JobContext(
-                WorkflowJob(
-                    workflow,
-                    context,
-                    vus,
+        async with self._logger.context(
+            name=f'workflow_run_{run_id}',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Workflow {workflow.name} run {run_id} submitting from node {self._node_id_base} at {self.host}:{self.port} to worker',
+                name='debug',
+            )
+                
+            response: Response[JobContext[WorkflowStatusUpdate]] = await self.send(
+                "start_workflow",
+                JobContext(
+                    WorkflowJob(
+                        workflow,
+                        context,
+                        vus,
+                    ),
+                    run_id=run_id,
                 ),
-                run_id=run_id,
-            ),
-        )
-
-        (shard_id, workflow_status) = response
-
-        if workflow_status.data:
-            status = workflow_status.data.status
-            workflow_name = workflow_status.data.workflow
-            run_id = workflow_status.run_id
-
-            snowflake = Snowflake.parse(shard_id)
-            node_id = snowflake.instance
-
-            self._statuses[run_id][workflow_name][node_id] = (
-                WorkflowStatus.map_value_to_status(status)
             )
 
-        return response
+            (shard_id, workflow_status) = response
+
+            if workflow_status.data:
+                status = workflow_status.data.status
+                workflow_name = workflow_status.data.workflow
+                run_id = workflow_status.run_id
+
+                snowflake = Snowflake.parse(shard_id)
+                node_id = snowflake.instance
+
+                self._statuses[run_id][workflow_name][node_id] = (
+                    WorkflowStatus.map_value_to_status(status)
+                )
+
+                await ctx.log_prepared(
+                    message=f'Workflow {workflow.name} run {run_id} submitted from node {self._node_id_base} at {self.host}:{self.port} to node {node_id} with status {status}',
+                    name='debug',
+                )
+
+            return response
 
     @send()
     async def submit_stop_request(self):
-        return await self.broadcast(
-            "process_stop_request",
-            JobContext(None),
-        )
+        async with self._logger.context(
+            name=f'graph_server_{self._node_id_base}'
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} submitting request for {len(self._node_host_map)} nodes to stop',
+                name='info',
+            )
+
+            return await self.broadcast(
+                "process_stop_request",
+                JobContext(None),
+            )
 
     @send()
     async def push_results(
@@ -374,29 +518,47 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         results: WorkflowResults,
         run_id: int,
     ) -> Response[JobContext[ReceivedReceipt]]:
-        return await self.send(
-            "process_results",
-            JobContext(
-                results,
-                run_id=run_id,
-            ),
-            node_id=node_id,
-        )
+        
+        async with self._logger.context(
+            name=f'workflow_run_{run_id}',
+        ) as ctx:
+            await ctx.log_prepared(
+                message=f'Workflow {results.workflow} run {run_id} pushing results to Node {node_id}',
+                name='debug',
+            )
+
+            return await self.send(
+                "process_results",
+                JobContext(
+                    results,
+                    run_id=run_id,
+                ),
+                node_id=node_id,
+            )
 
     @receive()
     async def receive_start_acknowledgement(
-        self, _: int, acknowledgement: JobContext[tuple[str, int]]
+        self, _: int,
+        acknowledgement: JobContext[tuple[str, int]],
     ):
-        await self._leader_lock.acquire()
+        async with self._logger.context(
+            name=f'graph_server_{self._node_id_base}'
+        ) as ctx:
+        
+            await self._leader_lock.acquire()
 
-        host, port = acknowledgement.data
+            host, port = acknowledgement.data
 
-        node_addr = f"{host}:{port}"
+            node_addr = f"{host}:{port}"
 
-        self.acknowledged_starts.add(node_addr)
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} received start acknowledgment from Node at {host}:{port}'
+            )
 
-        if self._leader_lock.locked():
-            self._leader_lock.release()
+            self.acknowledged_starts.add(node_addr)
+
+            if self._leader_lock.locked():
+                self._leader_lock.release()
 
     @receive()
     async def process_results(
@@ -404,51 +566,66 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         shard_id: int,
         workflow_results: JobContext[WorkflowResults],
     ) -> JobContext[ReceivedReceipt]:
-        snowflake = Snowflake.parse(shard_id)
-        node_id = snowflake.instance
-        timestamp = snowflake.timestamp
+        
+        async with self._logger.context(
+            name=f'workflow_run_{workflow_results.run_id}',
+        ) as ctx:
+            
+            snowflake = Snowflake.parse(shard_id)
+            node_id = snowflake.instance
+            timestamp = snowflake.timestamp
 
-        run_id = workflow_results.run_id
-        workflow_name = workflow_results.data.workflow
+            run_id = workflow_results.run_id
+            workflow_name = workflow_results.data.workflow
 
-        results = workflow_results.data.results
-        workflow_context = workflow_results.data.context
-        error = workflow_results.data.error
-        status = workflow_results.data.status
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} received results for Workflow {workflow_name} run {run_id} from Node {node_id}',
+                name='info',
+            )
 
-        await self._leader_lock.acquire()
-        await asyncio.gather(
-            *[
-                self._node_context[run_id].update(
+            results = workflow_results.data.results
+            workflow_context = workflow_results.data.context
+            error = workflow_results.data.error
+            status = workflow_results.data.status
+
+            await self._leader_lock.acquire()
+            await asyncio.gather(
+                *[
+                    self._node_context[run_id].update(
+                        workflow_name,
+                        key,
+                        value,
+                        timestamp=timestamp,
+                    )
+                    for _ in self.nodes
+                    for key, value in workflow_context.items()
+                ]
+            )
+
+            self._results[run_id][workflow_name][node_id] = (
+                timestamp,
+                results,
+            )
+            self._statuses[run_id][workflow_name][node_id] = status
+            self._errors[run_id][workflow_name][node_id] = Exception(error)
+
+            self._completions[run_id][workflow_name].add(node_id)
+
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} successfull registered completion for Workflow {workflow_name} run {run_id} from Node {node_id}',
+                name='info',
+            )
+
+            if self._leader_lock.locked():
+                self._leader_lock.release()
+
+            return JobContext(
+                ReceivedReceipt(
                     workflow_name,
-                    key,
-                    value,
-                    timestamp=timestamp,
-                )
-                for _ in self.nodes
-                for key, value in workflow_context.items()
-            ]
-        )
-
-        self._results[run_id][workflow_name][node_id] = (
-            timestamp,
-            results,
-        )
-        self._statuses[run_id][workflow_name][node_id] = status
-        self._errors[run_id][workflow_name][node_id] = Exception(error)
-
-        self._completions[run_id][workflow_name].add(node_id)
-
-        if self._leader_lock.locked():
-            self._leader_lock.release()
-
-        return JobContext(
-            ReceivedReceipt(
-                workflow_name,
-                node_id,
-            ),
-            run_id=run_id,
-        )
+                    node_id,
+                ),
+                run_id=run_id,
+            )
 
     @receive()
     async def process_stop_request(
@@ -456,7 +633,17 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         _: int,
         stop_request: JobContext[None],
     ) -> JobContext[None]:
-        self.stop()
+        
+        async with self._logger.context(
+            name=f'graph_server_{self._node_id_base}'
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} received remote stop request and is shutting down',
+                name='info',
+            )
+
+            self.stop()
 
     @receive()
     async def start_workflow(
@@ -464,6 +651,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         shard_id: int,
         context: JobContext[WorkflowJob],
     ) -> JobContext[WorkflowStatusUpdate]:
+        
         task_id = self.tasks.create_task_id()
 
         snowflake = Snowflake.parse(shard_id)
@@ -471,30 +659,81 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
         workflow_name = context.data.workflow.name
 
-        self.tasks.run(
-            "run_workflow",
-            node_id,
-            context.run_id,
-            context.data,
-            run_id=task_id,
+        default_config = {   
+            "node_id": self._node_id_base,
+            "workflow": context.data.workflow.name,
+            "run_id": context.run_id,
+            "workflow_vus": context.data.workflow.vus,
+            "duration": context.data.workflow.duration,
+        }
+
+        self._logger.configure(
+            name=f'workflow_run_{context.run_id}',
+            path=self._logfile,
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+            models={
+                'trace': (
+                    RunTrace,
+                    default_config
+                ),
+                'debug': (
+                    RunDebug,
+                    default_config,
+                ),
+                'info': (
+                    RunInfo,
+                    default_config,
+                ),
+                'error': (
+                    RunError,
+                    default_config,
+                ),
+                'fatal': (
+                    RunFatal,
+                    default_config,
+                )
+            }
         )
 
-        self.tasks.run(
-            "push_workflow_status_update",
-            node_id,
-            context.run_id,
-            context.data,
-            run_id=task_id,
-        )
+        async with self._logger.context(
+            name=f'workflow_run_{context.run_id}',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Submitting workflow {context.data.workflow.name} run {context.run_id} to Workflow Runner',
+                name='info',
+            )
 
-        return JobContext(
-            WorkflowStatusUpdate(
-                workflow_name,
-                WorkflowStatus.SUBMITTED,
-                node_id=node_id,
-            ),
-            run_id=context.run_id,
-        )
+            self.tasks.run(
+                "run_workflow",
+                node_id,
+                context.run_id,
+                context.data,
+                run_id=task_id,
+            )
+
+            await ctx.log_prepared(
+                message=f'Workflow {context.data.workflow.name} run {context.run_id} starting status update task',
+                name='info',
+            )
+
+
+            self.tasks.run(
+                "push_workflow_status_update",
+                node_id,
+                context.run_id,
+                context.data,
+                run_id=task_id,
+            )
+
+            return JobContext(
+                WorkflowStatusUpdate(
+                    workflow_name,
+                    WorkflowStatus.SUBMITTED,
+                    node_id=node_id,
+                ),
+                run_id=context.run_id,
+            )
 
     @receive()
     async def receive_status_update(
@@ -510,7 +749,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         status = update.data.status
         completed_count = update.data.completed_count
         failed_count = update.data.failed_count
-
+        
         step_stats = update.data.step_stats
 
         avg_cpu_usage = update.data.avg_cpu_usage
@@ -551,33 +790,42 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         run_id: int,
         job: WorkflowJob,
     ):
-        (
-            run_id,
-            results,
-            context,
-            error,
-            status,
-        ) = await self._workflows.run(
-            run_id,
-            job.workflow,
-            job.context,
-            job.vus,
-        )
-
-        if context is None:
-            context = job.context
-
-        await self.push_results(
-            node_id,
-            WorkflowResults(
-                job.workflow.name,
+        async with self._logger.context(
+            name=f'workflow_run_{run_id}',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Workflow {job.workflow.name} starting run {run_id} via task on Node {self._node_id_base} at {self.host}:{self.port}',
+                name='trace'
+            )
+                
+            (
+                run_id,
                 results,
                 context,
                 error,
                 status,
-            ),
-            run_id,
-        )
+            ) = await self._workflows.run(
+                run_id,
+                job.workflow,
+                job.context,
+                job.vus,
+            )
+
+            if context is None:
+                context = job.context
+
+            await self.push_results(
+                node_id,
+                WorkflowResults(
+                    job.workflow.name,
+                    results,
+                    context,
+                    error,
+                    status,
+                ),
+                run_id,
+            )
 
     @task(
         keep=int(
@@ -654,6 +902,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             Awaitable[None],
         ],
     ):
+
         workflow_status = WorkflowStatus.SUBMITTED
 
         status_counts = Counter(self._statuses[run_id][workflow].values())

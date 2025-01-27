@@ -157,11 +157,8 @@ class LoggerStream:
             if self._provider is None:
                 self._provider = LogProvider()
 
-            if self._stdout is None:
-                self._stdout = await self._dup_stdout()
-
-            if self._stderr is None:
-                self._stderr = await self._dup_stderr()
+            self._stdout = await self._dup_stdout()
+            self._stderr = await self._dup_stderr()
 
             if self._stream_writers.get(StreamType.STDOUT) is None:
                 transport, protocol = await self._loop.connect_write_pipe(
@@ -376,10 +373,24 @@ class LoggerStream:
             if (
                 logfile := self._files.get(logfile_path)
             ) and logfile.closed is False:
-                logfile.close()
+                try:
+                    logfile.close()
 
-        self._stderr.flush()
-        self._stdout.flush()
+                except Exception:
+                    pass
+
+        try:
+            self._stderr.close()
+
+        except Exception:
+            pass
+
+        try:
+
+            self._stdout.close()
+
+        except Exception:
+            pass
 
         self._consumer.abort()
 
@@ -664,11 +675,8 @@ class LoggerStream:
         else:
             log_file, line_number, function_name = self._find_caller()
 
-        if self._stdout is None or self._stdout.closed:
-            self._stdout = await self._dup_stdout()
-
-        if self._stderr is None or self._stderr.closed:
-            self._stderr = await self._dup_stderr()
+        self._stdout = await self._dup_stdout()
+        self._stderr = await self._dup_stderr()
 
         try:
             stream_writer.write(
@@ -823,8 +831,6 @@ class LoggerStream:
             ):
                 
                 logfile.write(msgspec.json.encode(log) + b"\n")
-                logfile.flush()
-
 
         except Exception:
             pass

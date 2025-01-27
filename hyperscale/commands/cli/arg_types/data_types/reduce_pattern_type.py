@@ -27,6 +27,4 @@ def reduce_pattern_type(pattern: Any):
         )
 
     except Exception:
-        import traceback
-
-        print(traceback.format_exc())
+        pass

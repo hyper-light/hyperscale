@@ -30,6 +30,15 @@ def bind_udp_socket(host: str, port: int) -> socket.socket:
 
     try:
         sock.bind((host, port))
+        sock.close()
+
+    except Exception:
+        pass
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    
+    try:
+        sock.bind((host, port))
         sock.setblocking(False)
         sock.set_inheritable(True)
 

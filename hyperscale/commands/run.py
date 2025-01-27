@@ -37,7 +37,7 @@ def get_default_config():
 async def run(
     path: ImportFile[Workflow],
     config: JsonFile[HyperscaleConfig] = get_default_config,
-    log_level: AssertSet[LogLevelName] = "info",
+    log_level: AssertSet[LogLevelName] = "fatal",
     workers: int = get_default_workers,
     name: str = "default",
     quiet: bool = False,
