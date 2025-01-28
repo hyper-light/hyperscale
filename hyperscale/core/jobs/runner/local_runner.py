@@ -1,8 +1,9 @@
 import asyncio
 import os
-import signal
 import socket
-from multiprocessing import active_children, allow_connection_pickling, current_process
+from multiprocessing import (
+    ProcessError,
+)
 from typing import List
 
 import psutil
@@ -19,13 +20,11 @@ from hyperscale.logging.hyperscale_logging_models import (
     TestDebug,
     TestTrace
 )
+from hyperscale.reporting.common.results_types import RunResults
 from hyperscale.ui import HyperscaleInterface, InterfaceUpdatesController
 from hyperscale.ui.actions import update_active_workflow_message
 
 from .local_server_pool import LocalServerPool
-
-
-allow_connection_pickling()
 
 
 async def abort(
@@ -144,29 +143,9 @@ class LocalRunner:
             
             await ctx.log_prepared(f'Starting {test_name} test with {self._workers} workers', name='info')
 
-            loop = asyncio.get_event_loop()
             close_task = asyncio.current_task()
 
             await ctx.log_prepared(f'Setting interrupt handlers for SIGINT, SIGTERM, SIG_IGN for test {test_name}', name='trace')
-
-            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-                sig = getattr(
-                    signal,
-                    signame,
-                )
-
-                loop.add_signal_handler(
-                    sig,
-                    lambda signame=signame: asyncio.create_task(
-                        abort(
-                            self._remote_manger,
-                            self._server_pool,
-                            self._interface,
-                            terminal_ui_enabled,
-                        )
-                    ),
-                )
-
             await ctx.log_prepared(f'Initializing UI for test {test_name}', name='trace')
 
             self._interface.initialize(workflows)
@@ -186,10 +165,7 @@ class LocalRunner:
                     "Starting worker servers...",
                 )
 
-                worker_sockets, worker_ips = await self._bin_and_check_socket_range(
-                    test_name,
-                    workflow_names,
-                )
+                worker_ips = self._bin_and_check_socket_range()
 
                 await ctx.log_prepared(f'Initializing worker servers on runner type {self._runner_type} for test {test_name}', name='info')
                 await self._server_pool.setup()
@@ -204,7 +180,7 @@ class LocalRunner:
 
                 await self._server_pool.run_pool(
                     (self.host, self.port),
-                    worker_sockets,
+                    worker_ips,
                     self._env,
                     cert_path=cert_path,
                     key_path=key_path,
@@ -228,7 +204,7 @@ class LocalRunner:
                 )
 
                 await ctx.log_prepared(f'Completed execution of test {test_name} on runner type {self._runner_type} - shutting down', name='info')
-
+                
                 if terminal_ui_enabled:
                     await ctx.log_prepared(f'Stopping Hyperscale Terminal UI for test {test_name}', name='debug')
 
@@ -244,25 +220,11 @@ class LocalRunner:
                 await ctx.log_prepared(f'Stopping Hyperscale Server Pool for test {test_name}', name='debug')
                 await self._server_pool.shutdown()
 
-                await ctx.log_prepared(f'Closing {len(worker_sockets)} sockets for test {test_name}', name='trace')
-                for socket in worker_sockets:
-                    host, port = socket.getsockname()
-                    await ctx.log_prepared(f'Closing worker socket on {host}:{port} for test {test_name}', name='trace')
-
-                    try:
-                        socket.close()
-                        await asyncio.sleep(0)
-
-                    except Exception:
-                        pass
-                    
-                    await ctx.log_prepared(f'Worker socket on {host}:{port} closed for test {test_name}', name='trace')
-
                 await ctx.log_prepared(f'Exiting test {test_name}', name='info')
  
                 return results
 
-            except Exception as e:
+            except (Exception, KeyboardInterrupt, ProcessError) as e:
                 await ctx.log_prepared(f'Encountered fatal exception {str(e)} while running test {test_name} - aborting', name='fatal')
 
                 try:
@@ -388,85 +350,16 @@ class LocalRunner:
             except asyncio.CancelledError:
                 pass
 
-    async def close(self):
-        loop = asyncio.get_event_loop()
-        child_processes = await loop.run_in_executor(
-            None,
-            active_children
-        )
-        for child in child_processes:
-            try:
-                await loop.run_in_executor(
-                    None,
-                    child.kill
-                )
-
-            except Exception:
-                pass
-
-        current = await loop.run_in_executor(
-            None,
-            current_process
-        )
-
-        try:
-            await loop.run_in_executor(
-                None,
-                current.kill
-            )
-
-        except Exception:
-            pass
-
-    async def _bin_and_check_socket_range(
-        self,
-        test_name: str,
-        workflow_names: list[str]
-    ):
+    def _bin_and_check_socket_range(self):
         base_worker_port = self.port + 2
-        worker_port_range = [
-            port
+        return [
+            (
+                self.host,
+                port,
+            )
             for port in range(
                 base_worker_port,
                 base_worker_port + (self._workers * 2),
                 2,
             )
         ]
-
-        worker_sockets: List[socket.socket] = []
-        worker_ips: List[tuple[str, int]] = []
-
-        async with self._logger.context(
-            name='local_runner',
-        ) as ctx:
-            await ctx.log_prepared(f'Provisioning {self._workers} worker sockets for test {test_name}', name='debug')
-
-            for port in worker_port_range:
-                testing_port = True
-
-                await ctx.log_prepared(f'Provisioning worker socket on port {port} for test {test_name}', name='trace')
-
-                while testing_port:
-                    try:
-                        worker_socket = bind_udp_socket(self.host, port)
-                        worker_ips.append((self.host, port))
-                        worker_sockets.append(worker_socket)
-
-                        await ctx.log_prepared(f'Successfully provisioned worker socket on port {port} for test {test_name}', name='trace')
-
-                        testing_port = False
-
-                    except OSError:
-                        previous_port = port
-                        port += self._workers + 1
-
-                        await ctx.log_prepared(f'Failed to provision worker socket on port {previous_port} as socket is busy - re-attempting on port {port} for test {test_name}', name='trace')
-
-                        await asyncio.sleep(0.1)
-
-            if len(worker_sockets) < self._workers:
-                raise Exception("Err. - Insufficient sockets binned.")
-            
-            await ctx.log_prepared(f'Provisioned {self._workers} worker sockets for test {test_name}', name='debug')
-
-        return (worker_sockets, worker_ips)

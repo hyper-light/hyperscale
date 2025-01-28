@@ -76,11 +76,11 @@ async def run(
             terminal_ui_enabled=terminal_ui_enabled,
         )
 
+    except asyncio.CancelledError:
+        return
+
     except Exception as e:
         await runner.abort(
             error=e,
             terminal_ui_enabled=terminal_ui_enabled,
         )
-
-
-    await runner.close()

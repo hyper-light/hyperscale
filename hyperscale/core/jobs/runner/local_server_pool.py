@@ -2,7 +2,6 @@ import asyncio
 import ctypes
 import functools
 import multiprocessing
-import os
 import signal
 import socket
 import warnings
@@ -49,21 +48,9 @@ def set_process_name():
         pass
 
 
-def abort_server(server: RemoteGraphController):
-    try:
-        server.abort()
-
-    except Exception:
-        pass
-
-    except asyncio.CancelledError:
-        pass
-
-
 async def run_server(
     leader_address: tuple[str, int],
     server: RemoteGraphController,
-    worker_socket: socket.socket,
     cert_path: str | None = None,
     key_path: str | None = None,
 ):
@@ -71,7 +58,6 @@ async def run_server(
         await server.start_server(
             cert_path=cert_path,
             key_path=key_path,
-            worker_socket=worker_socket,
         )
 
         try:
@@ -84,19 +70,21 @@ async def run_server(
         await server.run_forever()
         await server.close()
 
-    except Exception:
-        server.abort()
+    except (
+        Exception, 
+        asyncio.CancelledError, 
+        KeyboardInterrupt,
+        multiprocessing.ProcessError,
+        OSError
+    ):
+        await server.close()
 
-    except KeyboardInterrupt:
-        server.abort()
-
-    await server.wait_for_socket_shutdown()
 
 
 def run_thread(
     worker_idx: int,
     leader_address: tuple[str, int],
-    socket: socket.socket,
+    worker_ip: tuple[str, int],
     worker_env: Dict[str, str | int | float | bool | None],
     logs_directory: str,
     log_level: LogLevelName = 'info',
@@ -129,7 +117,7 @@ def run_thread(
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-        host, port = socket.getsockname()
+        host, port = worker_ip
 
         env = Env(**worker_env)
 
@@ -140,38 +128,22 @@ def run_thread(
             env,
         )
 
-        for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-            loop.add_signal_handler(
-                getattr(
-                    signal,
-                    signame,
-                ),
-                lambda signame=signame: server.abort(),
+        loop.run_until_complete(
+            run_server(
+                leader_address,
+                server,
+                cert_path=cert_path,
+                key_path=key_path,
             )
+        )
 
-        try:
-            loop.run_until_complete(
-                run_server(
-                    leader_address,
-                    server,
-                    socket,
-                    cert_path=cert_path,
-                    key_path=key_path,
-                )
-            )
-
-        except Exception:
-            abort_server(server)
-
-        except asyncio.CancelledError:
-            abort_server(server)
-
-        except KeyboardInterrupt:
-            abort_server(server)
-
-    except Exception:
+    except (
+        Exception,
+        OSError,
+        multiprocessing.ProcessError,
+        asyncio.CancelledError
+    ):
         pass
-
 
 class LocalServerPool:
     def __init__(
@@ -224,7 +196,7 @@ class LocalServerPool:
     async def run_pool(
         self,
         leader_address: tuple[str, int],
-        sockets: List[socket.socket],
+        worker_ips: List[tuple[str, int]],
         env: Env,
         cert_path: str | None = None,
         key_path: str | None = None,
@@ -252,7 +224,7 @@ class LocalServerPool:
                             run_thread,
                             idx,
                             leader_address,
-                            socket,
+                            worker_ip,
                             env.model_dump(),
                             config.directory,
                             log_level=config.level.name.lower(),
@@ -260,7 +232,7 @@ class LocalServerPool:
                             key_path=key_path,
                         ),
                     )
-                    for idx, socket in enumerate(sockets)
+                    for idx, worker_ip in enumerate(worker_ips)
                 ],
                 return_exceptions=True,
             )

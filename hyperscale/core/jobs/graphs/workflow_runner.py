@@ -332,6 +332,15 @@ class WorkflowRunner:
                     WorkflowStatus.REJECTED,
                 )
             
+            elif already_running and self._duplicate_job_policy == "replace":
+
+                del self._active[run_id][workflow_name]
+                del self._active_waiters[run_id][workflow_name]
+                del self._max_active[run_id][workflow_name]
+                del self._pending[run_id][workflow_name]
+                del self._running_workflows[run_id][workflow.name]
+                
+            
             await ctx.log_prepared(
                 message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.PENDING.name} state',
                 name='info',
@@ -400,12 +409,17 @@ class WorkflowRunner:
                         name='info',
                     )
 
-                    del self._active[run_id][workflow_name]
-                    del self._active_waiters[run_id][workflow_name]
-                    del self._max_active[run_id][workflow_name]
-                    del self._pending[run_id][workflow_name]
-                    del self._running_workflows[run_id][workflow.name]
+                    try:
+                        del self._active[run_id][workflow_name]
+                        del self._active_waiters[run_id][workflow_name]
+                        del self._max_active[run_id][workflow_name]
+                        del self._pending[run_id][workflow_name]
+                        del self._running_workflows[run_id][workflow.name]
 
+                    except Exception:
+                        pass
+
+               
                     await ctx.log_prepared(
                         message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.COMPLETED.name} state',
                         name='info',

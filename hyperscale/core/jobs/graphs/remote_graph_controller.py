@@ -546,7 +546,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
     @receive()
     async def receive_start_acknowledgement(
-        self, _: int,
+        self,
+        shard_id: int,
         acknowledgement: JobContext[tuple[str, int]],
     ):
         async with self._logger.context(
@@ -554,6 +555,9 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         ) as ctx:
         
             await self._leader_lock.acquire()
+
+            snowflake = Snowflake.parse(shard_id)
+            node_id = snowflake.instance
 
             host, port = acknowledgement.data
 

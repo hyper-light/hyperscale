@@ -81,4 +81,8 @@ async def hyperscale():
 
 
 def run():
-    asyncio.run(CLI.run(args=sys.argv[1:]))
+    try:
+        asyncio.run(CLI.run(args=sys.argv[1:]))
+
+    except KeyboardInterrupt:
+        pass

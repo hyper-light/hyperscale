@@ -520,6 +520,17 @@ class RemoteGraphManager:
                 workflow_timeout,
             )
 
+            results, run_context = worker_results
+
+            if results is None and run_context is None:
+                await ctx.log_prepared(
+                    message=f'Workflow {workflow.name} exceeded timeout of {workflow_timeout} seconds',
+                    name='fatal'
+                )
+
+                raise Exception(f'Workflow {workflow.name} exceeded timeout of {workflow_timeout} seconds')
+
+
             await ctx.log_prepared(
                 message=f'Workflow {workflow.name} run {run_id} completed run',
                 name='info'
@@ -532,18 +543,6 @@ class RemoteGraphManager:
 
             await update_workflow_executions_total_rate(workflow_slug, None, False)
 
-            results, run_context = worker_results
-
-            if results is None and run_context is None:
-                await ctx.log_prepared(
-                    message=f'Workflow {workflow.name} exceeded timeout of {workflow_timeout} seconds',
-                    name='fatal'
-                )
-
-                return (
-                    workflow.name, 
-                    None,
-                )
 
             await ctx.log_prepared(
                 message=f'Processing {len(results)} results sets for Workflow {workflow.name} run {run_id}',

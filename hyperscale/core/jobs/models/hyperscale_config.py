@@ -6,7 +6,7 @@ from pydantic import BaseModel, model_validator, StrictInt, DirectoryPath
 
 class HyperscaleConfig(BaseModel):
     logs_directory: DirectoryPath = 'logs/'
-    server_port: StrictInt = 15454
+    server_port: StrictInt = 8790
 
     @model_validator(mode='after')
     @classmethod

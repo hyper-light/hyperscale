@@ -1,6 +1,8 @@
 from __future__ import annotations
 import inspect
+import psutil
 import uuid
+import functools
 import asyncio
 import cloudpickle
 import pickle
@@ -368,12 +370,14 @@ class UDPProtocol(Generic[T, K]):
         while run_start:
             try:
                 if self.connected is False and worker_socket is None:
+
                     self.udp_socket = socket.socket(
                         socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
                     )
                     self.udp_socket.setsockopt(
                         socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
                     )
+
                     self.udp_socket.bind((self.host, self.port))
 
                     self.udp_socket.setblocking(False)
@@ -414,13 +418,12 @@ class UDPProtocol(Generic[T, K]):
 
                     run_start = False
 
-            except Exception:
-                pass
-
-            except OSError:
-                pass
-
-            except asyncio.CancelledError:
+            except (
+                Exception,
+                asyncio.CancelledError,
+                socket.error,
+                OSError
+            ):
                 pass
 
             await asyncio.sleep(self._retry_interval)
@@ -1003,7 +1006,6 @@ class UDPProtocol(Generic[T, K]):
 
             except Exception:
                 pass
-                # await self._reset_connection()
 
     async def _add_node_from_shard_id(self, shard_id: int, message: Message[T | None]):
         snowflake = Snowflake.parse(shard_id)
@@ -1018,7 +1020,7 @@ class UDPProtocol(Generic[T, K]):
     async def wait_for_socket_shutdown(self):
         await asyncio.sleep(self._shutdown_poll_rate)
 
-        while await self._loop.run_in_executor(None, self.udp_socket.fileno) > -1:
+        while await self._loop.run_in_executor(None, self.udp_socket.fileno) != -1:
             await asyncio.sleep(self._shutdown_poll_rate)
 
     async def close(self) -> None:
@@ -1046,17 +1048,7 @@ class UDPProtocol(Generic[T, K]):
                 )
 
             if self.udp_socket:
-                try:
-                    self.udp_socket.shutdown(socket.SHUT_RDWR)
-
-                except Exception:
-                    pass
-
-                try:
-                    self.udp_socket.close()
-
-                except Exception:
-                    pass
+                self.udp_socket.close()
 
                 await ctx.log_prepared(
                     message=f'Node {self._node_id_base} at {self.host}:{self.port} server socket closed',
@@ -1115,18 +1107,6 @@ class UDPProtocol(Generic[T, K]):
                     message=f'Node {self._node_id_base} at {self.host}:{self.port} run task completed',
                     name='debug',
                 )
-
-            close_task = asyncio.current_task()
-            for task in asyncio.all_tasks():
-                try:
-                    if task != close_task and task.cancelled() is False:
-                        task.cancel()
-
-                except Exception:
-                    pass
-
-                except asyncio.CancelledError:
-                    pass
 
             await ctx.log_prepared(
                 message=f'Node {self._node_id_base} at {self.host}:{self.port} task cleanup complete',

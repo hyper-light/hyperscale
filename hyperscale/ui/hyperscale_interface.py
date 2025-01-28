@@ -115,7 +115,8 @@ class HyperscaleInterface:
 
         if self._terminal:
             await self._terminal.stop()
-            await self._terminal_task
+            self._terminal_task.cancel()
+            await asyncio.sleep(0)
 
     async def abort(self):
         if not self._run_switch_loop.is_set():
@@ -147,7 +148,6 @@ class HyperscaleInterface:
 
         try:
             self._terminal_task.cancel()
-            self._terminal_task.set_result(None)
 
         except Exception:
             pass

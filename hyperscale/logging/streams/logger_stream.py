@@ -225,7 +225,10 @@ class LoggerStream:
             logfile_path,
         )
 
-        self._file_locks[logfile_path].release()
+        file_lock = self._file_locks[logfile_path]
+
+        if file_lock.locked():
+            file_lock.release()
 
         if retention_policy and self._retention_policies.get(logfile_path) is None:
 
@@ -266,7 +269,10 @@ class LoggerStream:
             logfile_path,
         )
 
-        self._file_locks[logfile_path].release()
+        file_lock = self._file_locks[logfile_path]
+
+        if file_lock.locked():
+            file_lock.release()
 
     def _get_logfile_metadata(self, logfile_path: str) -> Dict[str, float]:
         resolved_path = pathlib.Path(logfile_path)
@@ -387,19 +393,6 @@ class LoggerStream:
                 except Exception:
                     pass
 
-        try:
-            self._stderr.close()
-
-        except Exception:
-            pass
-
-        try:
-
-            self._stdout.close()
-
-        except Exception:
-            pass
-
         self._consumer.abort()
 
         while not self._queue.empty():
@@ -422,6 +415,10 @@ class LoggerStream:
 
     async def _close_file(self, logfile_path: str):
         if file_lock := self._file_locks.get(logfile_path):
+
+            if file_lock.locked():
+                file_lock.release()
+
             await file_lock.acquire()
             await self._loop.run_in_executor(
                 None,
@@ -429,7 +426,8 @@ class LoggerStream:
                 logfile_path,
             )
 
-            file_lock.release()
+            if file_lock.locked():
+                file_lock.release()
 
     def _close_file_at_path(self, logfile_path: str):
         if (
@@ -805,7 +803,9 @@ class LoggerStream:
             )
 
         try:
-            await self._file_locks[logfile_path].acquire()
+
+            file_lock = self._file_locks[logfile_path]
+            await file_lock.acquire()
 
             await self._loop.run_in_executor(
                 None,
@@ -814,12 +814,17 @@ class LoggerStream:
                 logfile_path,
             )
 
-            self._file_locks[logfile_path].release()
+            if file_lock.locked():
+                file_lock.release()
 
             await asyncio.sleep(0)
 
         except Exception as err:
-            self._file_locks[logfile_path].release()
+            file_lock = self._file_locks[logfile_path]
+            
+            if file_lock.locked():
+                file_lock.release()
+
             error_template = "{timestamp} - {level} - {thread_id}.{filename}:{function_name}.{line_number} - {error}"
 
             if self._stderr.closed is False:

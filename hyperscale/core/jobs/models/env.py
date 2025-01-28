@@ -28,7 +28,7 @@ class Env(BaseModel):
     MERCURY_SYNC_MAX_PENDING_WORKFLOWS: StrictInt = 100
     MERCURY_SYNC_CONTEXT_POLL_RATE: StrictStr = "0.1s"
     MERCURY_SYNC_SHUTDOWN_POLL_RATE: StrictStr = "0.1s"
-    MERCURY_SYNC_DUPLICATE_JOB_POLICY: Literal["reject", "replace"] = "reject"
+    MERCURY_SYNC_DUPLICATE_JOB_POLICY: Literal["reject", "replace"] = "replace"
 
     @classmethod
     def types_map(self) -> Dict[str, Callable[[str], PrimaryType]]:
