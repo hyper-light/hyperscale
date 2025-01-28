@@ -368,6 +368,14 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     name='info'
                 )
 
+                if self._leader_lock.locked():
+                    self._leader_lock.release()
+
+                return (
+                    self._results[run_id][workflow_name],
+                    self._node_context[run_id],
+                )
+
             except asyncio.TimeoutError:
                 await ctx.log_prepared(
                     message=f'Node {self._node_id_base} at {self.host}:{self.port} timed out waiting for Workflow {workflow_name} to complete',
@@ -376,10 +384,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             if self._leader_lock.locked():
                 self._leader_lock.release()
-
+                
             return (
-                self._results[run_id][workflow_name],
-                self._node_context[run_id],
+                None,
+                None,
             )
 
     async def _poll_for_completed(

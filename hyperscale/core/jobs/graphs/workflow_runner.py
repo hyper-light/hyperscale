@@ -91,6 +91,11 @@ class WorkflowRunner:
         node_id: int,
     ) -> None:
         self._worker_id = worker_id
+
+        self._logfile = f'hyperscale.worker.{self._worker_id}.log.json'
+        if worker_id is None:
+            self._logfile = 'hyperscale.leader.log.json'
+
         self._node_id = node_id
         self.run_statuses: Dict[int, Dict[str, WorkflowStatus]] = defaultdict(dict)
 
@@ -256,7 +261,7 @@ class WorkflowRunner:
         
         self._logger.configure(
             name=f'{workflow_slug}_{run_id}_logger',
-            path=f'hyperscale.worker.{self._worker_id}.log.json',
+            path=self._logfile,
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
                 'trace': (
@@ -454,7 +459,7 @@ class WorkflowRunner:
                         context[workflow_name],
                         err,
                         WorkflowStatus.FAILED,
-                        )
+                    )
 
     async def _run_workflow(
         self,
@@ -634,13 +639,28 @@ class WorkflowRunner:
             self._completed_counts[run_id][workflow.name] = CompletionCounter()
             self._failed_counts[run_id][workflow.name] = CompletionCounter()
 
+            hooks: Dict[str, Hook] = {
+                name: hook
+                for name, hook in inspect.getmembers(
+                    workflow,
+                    predicate=lambda member: isinstance(member, Hook),
+                )
+            }
+
             config = {
                 "vus": 1000,
                 "duration": "1m",
                 "threads": self._threads,
                 "connect_retries": 3,
-                "workflow_timeout": workflow.timeout,
             }
+
+            engines_count = len(set([
+                hook.engine_type.name for hook in hooks.values() if hook.hook_type == HookType.TEST
+            ]))
+
+            vus_per_engine = math.ceil(
+                vus/max(engines_count, 1)
+            )
 
             config.update(
                 {
@@ -650,8 +670,7 @@ class WorkflowRunner:
                 }
             )
 
-            config["vus"] = vus
-            config["workflow_timeout"] = TimeParser(config["workflow_timeout"]).time
+            config["vus"] = vus_per_engine
             config["duration"] = TimeParser(config["duration"]).time
 
             threads = config.get("threads")
@@ -669,14 +688,6 @@ class WorkflowRunner:
                     key_path=config.get("key_path"),
                     reset_connections=config.get("reset_connections"),
                 )
-
-            hooks: Dict[str, Hook] = {
-                name: hook
-                for name, hook in inspect.getmembers(
-                    workflow,
-                    predicate=lambda member: isinstance(member, Hook),
-                )
-            }
 
             self._workflow_hooks[run_id][workflow] = list(hooks.keys())
             
@@ -847,14 +858,16 @@ class WorkflowRunner:
         workflow_name = workflow.name
         workflow_context = context[workflow_name].dict()
 
+        workflow_duration = config.get(
+            "duration",
+            TimeParser("1m").time,
+        )
+
         execution_results: List[asyncio.Task] = await self._spawn_vu(
             run_id,
             workflow_name,
             traversal_order,
-            config.get(
-                "workflow_timeout",
-                TimeParser("5m").time,
-            ),
+            workflow_duration,
             workflow_context,
         )
 
@@ -1056,7 +1069,7 @@ class WorkflowRunner:
     async def close(self):
         async with self._logger.context(
             name='workflow_manager',
-            path=f'hyperscale.worker.{self._worker_id}.log.json',
+            path=self._logfile,
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}"
         ) as ctx:
             

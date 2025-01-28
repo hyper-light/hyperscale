@@ -157,8 +157,11 @@ class LoggerStream:
             if self._provider is None:
                 self._provider = LogProvider()
 
-            self._stdout = await self._dup_stdout()
-            self._stderr = await self._dup_stderr()
+            if self._stdout is None or self._stdout.closed:
+                self._stdout = await self._dup_stdout()
+
+            if self._stderr is None or self._stderr.closed:
+                self._stderr = await self._dup_stderr()
 
             if self._stream_writers.get(StreamType.STDOUT) is None:
                 transport, protocol = await self._loop.connect_write_pipe(
@@ -684,9 +687,12 @@ class LoggerStream:
         else:
             log_file, line_number, function_name = self._find_caller()
 
-        self._stdout = await self._dup_stdout()
-        self._stderr = await self._dup_stderr()
+        if self._stdout is None or self._stdout.closed:
+            self._stdout = await self._dup_stdout()
 
+        if self._stderr is None or self._stderr.closed:
+            self._stderr = await self._dup_stderr()
+            
         try:
             stream_writer.write(
                 entry.to_template(

@@ -510,8 +510,14 @@ class RemoteGraphManager:
                 name='info'
             )
 
+            workflow_timeout = int(
+                TimeParser(workflow.duration).time + TimeParser(workflow.timeout).time,
+            )
+
             worker_results = await self._controller.poll_for_workflow_complete(
-                run_id, workflow.name, int(TimeParser(workflow.duration).time * 1.5)
+                run_id,
+                workflow.name, 
+                workflow_timeout,
             )
 
             await ctx.log_prepared(
@@ -527,6 +533,17 @@ class RemoteGraphManager:
             await update_workflow_executions_total_rate(workflow_slug, None, False)
 
             results, run_context = worker_results
+
+            if results is None and run_context is None:
+                await ctx.log_prepared(
+                    message=f'Workflow {workflow.name} exceeded timeout of {workflow_timeout} seconds',
+                    name='fatal'
+                )
+
+                return (
+                    workflow.name, 
+                    None,
+                )
 
             await ctx.log_prepared(
                 message=f'Processing {len(results)} results sets for Workflow {workflow.name} run {run_id}',

@@ -44,6 +44,13 @@ async def run(
 ):
     """
     Run the specified test file locally
+
+    @param path The path to the test file to run
+    @param config A path to a valid .hyperscale.json config file
+    @param log_level The log level to use for log files
+    @param workers The number of parallel threads/processes to use
+    @param name The name of the test
+    @param quiet If specified, all GUI output will be disabled
     """
     workflows = [workflow() for workflow in path.data.values()]
 
