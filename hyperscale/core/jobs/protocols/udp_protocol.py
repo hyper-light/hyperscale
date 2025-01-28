@@ -1023,79 +1023,122 @@ class UDPProtocol(Generic[T, K]):
 
     async def close(self) -> None:
 
-        self._running = False
+        async with self._logger.context(
+            name=f'graph_server_{self._node_id_base}'
+        ) as ctx:
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} shutting down',
+                name='info',
+            )
 
-        if self._transport:
-            try:
-                self._transport.abort()
+            self._running = False
 
-            except Exception:
-                pass
+            if self._transport:
+                try:
+                    self._transport.abort()
 
-        if self.udp_socket:
-            try:
-                self.udp_socket.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
 
-            except Exception:
-                pass
+                await ctx.log_prepared(
+                    message=f'Node {self._node_id_base} at {self.host}:{self.port} server transport closed',
+                    name='debug',
+                )
 
-            try:
-                self.udp_socket.close()
+            if self.udp_socket:
+                try:
+                    self.udp_socket.shutdown(socket.SHUT_RDWR)
 
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-        if self._sleep_task:
-            try:
-                self._sleep_task.cancel()
+                try:
+                    self.udp_socket.close()
 
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-            except asyncio.CancelledError:
-                pass
+                await ctx.log_prepared(
+                    message=f'Node {self._node_id_base} at {self.host}:{self.port} server socket closed',
+                    name='debug',
+                )
 
-        if self._cleanup_task:
-            try:
-                self._cleanup_task.cancel()
+            if self._sleep_task:
+                try:
+                    self._sleep_task.cancel()
 
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-            except asyncio.CancelledError:
-                pass
+                except asyncio.CancelledError:
+                    pass
 
-        if self.tasks:
-            self.tasks.abort()
+                await ctx.log_prepared(
+                    message=f'Node {self._node_id_base} at {self.host}:{self.port} sleep task cancelled closed',
+                    name='debug',
+                )
 
-        if self._run_future:
-            try:
-                self._run_future.cancel()
+            if self._cleanup_task:
+                try:
+                    self._cleanup_task.cancel()
 
-            except asyncio.InvalidStateError:
-                pass
+                except Exception:
+                    pass
 
-            except asyncio.CancelledError:
-                pass
+                except asyncio.CancelledError:
+                    pass
 
-        close_task = asyncio.current_task()
-        for task in asyncio.all_tasks():
-            try:
-                if task != close_task and task.cancelled() is False:
-                    task.cancel()
+                await ctx.log_prepared(
+                    message=f'Node {self._node_id_base} at {self.host}:{self.port} cleanup task closed',
+                    name='debug',
+                )
 
-            except Exception:
-                pass
+            if self.tasks:
+                self.tasks.abort()
 
-            except asyncio.CancelledError:
-                pass
+                await ctx.log_prepared(
+                    message=f'Node {self._node_id_base} at {self.host}:{self.port} task runner closed',
+                    name='debug',
+                )
+
+            if self._run_future and not self._run_future.done():
+                try:
+                    self._run_future.set_result(None)
+
+                except asyncio.InvalidStateError:
+                    pass
+
+                except asyncio.CancelledError:
+                    pass
+
+                await ctx.log_prepared(
+                    message=f'Node {self._node_id_base} at {self.host}:{self.port} run task completed',
+                    name='debug',
+                )
+
+            close_task = asyncio.current_task()
+            for task in asyncio.all_tasks():
+                try:
+                    if task != close_task and task.cancelled() is False:
+                        task.cancel()
+
+                except Exception:
+                    pass
+
+                except asyncio.CancelledError:
+                    pass
+
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} task cleanup complete',
+                name='debug',
+            )
 
         self._pending_responses.clear()
 
     def stop(self):
 
         self._running = False
-        
+
         if self._run_future:
             try:
                 self._run_future.set_result(None)

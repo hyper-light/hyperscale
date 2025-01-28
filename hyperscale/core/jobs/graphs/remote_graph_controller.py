@@ -643,7 +643,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 name='info',
             )
 
-        self.stop()
+            self.stop()
 
     @receive()
     async def start_workflow(
@@ -749,34 +749,54 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         status = update.data.status
         completed_count = update.data.completed_count
         failed_count = update.data.failed_count
+
+        async with self._logger.context(
+            name=f'workflow_run_{run_id}',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} received status update from Node {node_id} for Workflow {workflow} run {run_id}',
+                name='debug',
+            )
         
-        step_stats = update.data.step_stats
+            step_stats = update.data.step_stats
 
-        avg_cpu_usage = update.data.avg_cpu_usage
-        avg_memory_usage_mb = update.data.avg_memory_usage_mb
+            avg_cpu_usage = update.data.avg_cpu_usage
+            avg_memory_usage_mb = update.data.avg_memory_usage_mb
 
-        self._statuses[run_id][workflow][node_id] = WorkflowStatus.map_value_to_status(
-            status
-        )
+            self._statuses[run_id][workflow][node_id] = WorkflowStatus.map_value_to_status(
+                status
+            )
 
-        await self._completion_write_lock[run_id][workflow][node_id].acquire()
+            await self._completion_write_lock[run_id][workflow][node_id].acquire()
 
-        self._completed_counts[run_id][workflow][node_id] = completed_count
-        self._failed_counts[run_id][workflow][node_id] = failed_count
-        self._step_stats[run_id][workflow][node_id] = step_stats
+            await ctx.log(StatusUpdate(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} updating running stats for Workflow {workflow} run {run_id}',
+                node_id=node_id,
+                node_host=self.host,
+                node_port=self.port,
+                completed_count=completed_count,
+                failed_count=failed_count,
+                avg_cpu=avg_cpu_usage,
+                avg_mem_mb=avg_memory_usage_mb,
+            ))
 
-        self._cpu_usage_stats[run_id][workflow][node_id] = avg_cpu_usage
-        self._memory_usage_stats[run_id][workflow][node_id] = avg_memory_usage_mb
+            self._completed_counts[run_id][workflow][node_id] = completed_count
+            self._failed_counts[run_id][workflow][node_id] = failed_count
+            self._step_stats[run_id][workflow][node_id] = step_stats
 
-        self._completion_write_lock[run_id][workflow][node_id].release()
+            self._cpu_usage_stats[run_id][workflow][node_id] = avg_cpu_usage
+            self._memory_usage_stats[run_id][workflow][node_id] = avg_memory_usage_mb
 
-        return JobContext(
-            ReceivedReceipt(
-                workflow,
-                node_id,
-            ),
-            run_id=run_id,
-        )
+            self._completion_write_lock[run_id][workflow][node_id].release()
+
+            return JobContext(
+                ReceivedReceipt(
+                    workflow,
+                    node_id,
+                ),
+                run_id=run_id,
+            )
 
     @task(
         keep=int(
@@ -845,44 +865,53 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
     ):
         workflow_name = job.workflow.name
 
-        (
-            status,
-            completed_count,
-            failed_count,
-            step_stats,
-        ) = self._workflows.get_running_workflow_stats(
-            run_id,
-            workflow_name,
-        )
+        async with self._logger.context(
+            name=f'workflow_run_{run_id}',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} submitting stat updates for Workflow {workflow_name} run {run_id} to Node {node_id}',
+                name='debug',
+            )
 
-        avg_cpu_usage, avg_mem_usage = self._workflows.get_system_stats(
-            run_id,
-            workflow_name,
-        )
+            (
+                status,
+                completed_count,
+                failed_count,
+                step_stats,
+            ) = self._workflows.get_running_workflow_stats(
+                run_id,
+                workflow_name,
+            )
 
-        if status in [
-            WorkflowStatus.COMPLETED,
-            WorkflowStatus.REJECTED,
-            WorkflowStatus.FAILED,
-        ]:
-            self.tasks.stop("push_workflow_status_update")
+            avg_cpu_usage, avg_mem_usage = self._workflows.get_system_stats(
+                run_id,
+                workflow_name,
+            )
 
-        await self.broadcast(
-            "receive_status_update",
-            JobContext(
-                WorkflowStatusUpdate(
-                    workflow_name,
-                    status,
-                    node_id=node_id,
-                    completed_count=completed_count,
-                    failed_count=failed_count,
-                    step_stats=step_stats,
-                    avg_cpu_usage=avg_cpu_usage,
-                    avg_memory_usage_mb=avg_mem_usage,
+            if status in [
+                WorkflowStatus.COMPLETED,
+                WorkflowStatus.REJECTED,
+                WorkflowStatus.FAILED,
+            ]:
+                self.tasks.stop("push_workflow_status_update")
+
+            await self.broadcast(
+                "receive_status_update",
+                JobContext(
+                    WorkflowStatusUpdate(
+                        workflow_name,
+                        status,
+                        node_id=node_id,
+                        completed_count=completed_count,
+                        failed_count=failed_count,
+                        step_stats=step_stats,
+                        avg_cpu_usage=avg_cpu_usage,
+                        avg_memory_usage_mb=avg_mem_usage,
+                    ),
+                    run_id=run_id,
                 ),
-                run_id=run_id,
-            ),
-        )
+            )
 
     @task(
         keep=int(
@@ -902,53 +931,62 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             Awaitable[None],
         ],
     ):
-
-        workflow_status = WorkflowStatus.SUBMITTED
-
-        status_counts = Counter(self._statuses[run_id][workflow].values())
-        for status, count in status_counts.items():
-            if count == self._run_workflow_expected_nodes[run_id][workflow]:
-                workflow_status = status
-
-                break
-
-        completed_count = sum(self._completed_counts[run_id][workflow].values())
-        failed_count = sum(self._failed_counts[run_id][workflow].values())
-
-        step_stats: StepStatsUpdate = defaultdict(
-            lambda: {
-                "ok": 0,
-                "total": 0,
-                "err": 0,
-            }
-        )
-
-        for _, stats_update in self._step_stats[run_id][workflow].items():
-            for hook, stats_set in stats_update.items():
-                for stats_type, stat in stats_set.items():
-                    step_stats[hook][stats_type] += stat
-
-        cpu_usage_stats = self._cpu_usage_stats[run_id][workflow].values()
-        avg_cpu_usage = 0
-        if len(cpu_usage_stats) > 0:
-            avg_cpu_usage = statistics.mean(cpu_usage_stats)
-
-        memory_usage_stats = self._memory_usage_stats[run_id][workflow].values()
-        avg_mem_usage_mb = 0
-        if len(memory_usage_stats) > 0:
-            avg_mem_usage_mb = statistics.mean(memory_usage_stats)
-
-        await update_callback(
-            WorkflowStatusUpdate(
-                workflow,
-                workflow_status,
-                completed_count=completed_count,
-                failed_count=failed_count,
-                step_stats=step_stats,
-                avg_cpu_usage=avg_cpu_usage,
-                avg_memory_usage_mb=avg_mem_usage_mb,
+        
+        async with self._logger.context(
+            name=f'workflow_run_{run_id}',
+        ) as ctx:
+            
+            await ctx.log_prepared(
+                message=f'Node {self._node_id_base} at {self.host}:{self.port} updating running stats for Workflow {workflow} run {run_id}',
+                name='debug',
             )
-        )
+
+            workflow_status = WorkflowStatus.SUBMITTED
+
+            status_counts = Counter(self._statuses[run_id][workflow].values())
+            for status, count in status_counts.items():
+                if count == self._run_workflow_expected_nodes[run_id][workflow]:
+                    workflow_status = status
+
+                    break
+
+            completed_count = sum(self._completed_counts[run_id][workflow].values())
+            failed_count = sum(self._failed_counts[run_id][workflow].values())
+
+            step_stats: StepStatsUpdate = defaultdict(
+                lambda: {
+                    "ok": 0,
+                    "total": 0,
+                    "err": 0,
+                }
+            )
+
+            for _, stats_update in self._step_stats[run_id][workflow].items():
+                for hook, stats_set in stats_update.items():
+                    for stats_type, stat in stats_set.items():
+                        step_stats[hook][stats_type] += stat
+
+            cpu_usage_stats = self._cpu_usage_stats[run_id][workflow].values()
+            avg_cpu_usage = 0
+            if len(cpu_usage_stats) > 0:
+                avg_cpu_usage = statistics.mean(cpu_usage_stats)
+
+            memory_usage_stats = self._memory_usage_stats[run_id][workflow].values()
+            avg_mem_usage_mb = 0
+            if len(memory_usage_stats) > 0:
+                avg_mem_usage_mb = statistics.mean(memory_usage_stats)
+
+            await update_callback(
+                WorkflowStatusUpdate(
+                    workflow,
+                    workflow_status,
+                    completed_count=completed_count,
+                    failed_count=failed_count,
+                    step_stats=step_stats,
+                    avg_cpu_usage=avg_cpu_usage,
+                    avg_memory_usage_mb=avg_mem_usage_mb,
+                )
+            )
 
     async def close(self) -> None:
         await super().close()
