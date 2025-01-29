@@ -7,6 +7,7 @@ from .cli import (
     CLI,
     CLIStyle,
 )
+from .new import new
 from .run import run
 
 
@@ -61,6 +62,7 @@ async def create_header():
 
 
 @CLI.root(
+    new,
     run,
     global_styles=CLIStyle(
         header=create_header,
