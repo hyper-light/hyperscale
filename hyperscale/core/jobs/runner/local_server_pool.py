@@ -6,6 +6,7 @@ import signal
 import socket
 import warnings
 from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import set_start_method, Process
 from multiprocessing.context import SpawnContext
 from typing import Dict, List
 
@@ -21,6 +22,9 @@ from hyperscale.logging import (
     LoggingConfig,
     LogLevelName
 )
+
+
+set_start_method('spawn', force=True)
 
 
 def set_process_name():
@@ -164,6 +168,7 @@ class LocalServerPool:
             max_workers=self._pool_size,
             mp_context=self._context,
             initializer=set_process_name,
+            max_tasks_per_child=1
         )
 
         async with self._logger.context(
@@ -272,7 +277,7 @@ class LocalServerPool:
                     None,
                     functools.partial(
                         self._executor.shutdown,
-                        wait=wait,
+                        wait=True,
                         cancel_futures=True,
                     ),
                 )
@@ -298,4 +303,6 @@ class LocalServerPool:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
-            self._executor.shutdown()
+            self._executor.shutdown(
+                cancel_futures=True
+            )

@@ -265,7 +265,7 @@ class LocalRunner:
                     await ctx.log_prepared(f'Aborting Hyperscale Server Pool for test {test_name}', name='debug')
                     await self._server_pool.shutdown(wait=False)
 
-                except Exception:
+                except Exception as e:
                     await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Server Pool for test {test_name}', name='trace')
  
                 except asyncio.CancelledError:
@@ -319,7 +319,7 @@ class LocalRunner:
                 pass
 
     def _bin_and_check_socket_range(self):
-        base_worker_port = self.port + 2
+        base_worker_port = self.port + self._workers
         return [
             (
                 self.host,
@@ -327,7 +327,7 @@ class LocalRunner:
             )
             for port in range(
                 base_worker_port,
-                base_worker_port + (self._workers * 2),
-                2,
+                base_worker_port + (self._workers ** 2),
+                self._workers,
             )
         ]
