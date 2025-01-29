@@ -480,7 +480,8 @@ class RemoteGraphManager:
                 await asyncio.gather(
                     *[
                         update_active_workflow_message(
-                            workflow_slug, f"Starting - {workflow.name}"
+                            workflow_slug, 
+                            f"Starting - {workflow.name}"
                         ),
                         update_workflow_run_timer(workflow_slug, True),
                     ]

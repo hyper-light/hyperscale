@@ -3,8 +3,9 @@ from hyperscale.testing import URL, HTTPResponse
 
 
 class Test(Workflow):
-    vus = 8000
+    vus = 1000
     duration = "1m"
+    interval = "1s"
 
     @step()
     async def login(

@@ -19,9 +19,10 @@ ReporterConfigs = (
 
 
 class Workflow:
-    vus = 1000
-    duration = "1m"
-    timeout = "30s"
+    vus: int = 1000
+    duration: str = "1m"
+    timeout: str = "30s"
+    interval: str | None = None
     reporting: ReporterConfigs | None = None
 
     def __init__(self):
@@ -41,7 +42,6 @@ class Workflow:
 
         if self.reporting is None:
             self.reporting = JSONConfig()
-
         
         if isinstance(self.timeout, str) is False:
             self.timeout = '30s'

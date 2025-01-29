@@ -453,7 +453,6 @@ class WorkflowRunner:
                     )
 
                 except Exception as err:
-
                     await ctx.log_prepared(
                         message=f'Run {run_id} of Workflow {workflow.name} encountered error {str(err)}',
                         name='error',
@@ -668,6 +667,7 @@ class WorkflowRunner:
                 "duration": "1m",
                 "threads": self._threads,
                 "connect_retries": 3,
+                "interval": workflow.interval
             }
 
             engines_count = len(set([
@@ -688,6 +688,11 @@ class WorkflowRunner:
 
             config["vus"] = vus_per_engine
             config["duration"] = TimeParser(config["duration"]).time
+
+            if (
+                interval := config.get("interval")
+            ) and interval is not None:
+                config["interval"] = TimeParser(interval).time
 
             threads = config.get("threads")
 
@@ -805,26 +810,50 @@ class WorkflowRunner:
 
         start = time.monotonic()
 
-        completed, pending = await asyncio.wait(
-            [
-                loop.create_task(
-                    self._spawn_vu(
+        if config.get('interval') is None:
+            completed, pending = await asyncio.wait(
+                [
+                    loop.create_task(
+                        self._spawn_vu(
+                            run_id,
+                            workflow_name,
+                            traversal_order,
+                            remaining,
+                            workflow_context,
+                        ),
+                        name=workflow.name,
+                    )
+                    async for remaining in self._generate(
                         run_id,
                         workflow_name,
-                        traversal_order,
-                        remaining,
-                        workflow_context,
-                    ),
-                    name=workflow.name,
-                )
-                async for remaining in self._generate(
-                    run_id,
-                    workflow_name,
-                    config,
-                )
-            ],
-            timeout=1,
-        )
+                        config,
+                    )
+                ],
+                timeout=1,
+            )
+
+        else:
+
+            completed, pending = await asyncio.wait(
+                [
+                    loop.create_task(
+                        self._spawn_vu(
+                            run_id,
+                            workflow_name,
+                            traversal_order,
+                            remaining,
+                            workflow_context,
+                        ),
+                        name=workflow.name,
+                    )
+                    async for remaining in self._generate_constant(
+                        run_id,
+                        workflow_name,
+                        config,
+                    )
+                ],
+                timeout=1,
+            )
 
         elapsed = time.monotonic() - start
 
@@ -1007,6 +1036,71 @@ class WorkflowRunner:
                 yield remaining
 
                 await asyncio.sleep(0)
+
+                if (
+                    self._active[run_id][workflow_name]
+                    > self._max_active[run_id][workflow_name]
+                    and self._active_waiters[run_id][workflow_name] is None
+                ):
+                    self._active_waiters[run_id][workflow_name] = (
+                        asyncio.get_event_loop().create_future()
+                    )
+
+                    try:
+                        await asyncio.wait_for(
+                            self._active_waiters[run_id][workflow_name],
+                            timeout=remaining,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+
+                elif self._cpu_monitor.check_lock(
+                    self._cpu_monitor.get_moving_median,
+                    run_id,
+                    workflow_name,
+                ):
+                    await self._cpu_monitor.lock(
+                        run_id,
+                        workflow_name,
+                    )
+
+            except Exception:
+                pass
+
+            elapsed = time.monotonic() - start
+
+        await self._cpu_monitor.stop_background_monitor(
+            run_id,
+            workflow_name,
+        )
+    
+    async def _generate_constant(
+        self,
+        run_id: int,
+        workflow_name: str,
+        config: Dict[str, Any],
+    ) -> AsyncGenerator[float, None]:
+        duration = config.get("duration")
+        vus = config.get('vus')
+        interval = config.get('interval')
+
+        elapsed = 0
+        generated = 0
+
+        start = time.monotonic()
+        while elapsed < duration:
+            try:
+                remaining = duration - elapsed
+
+                yield remaining
+
+                generated += 1
+
+                await asyncio.sleep(0)
+
+                if generated >= vus:
+                    await asyncio.sleep(interval)
+                    generated = 0
 
                 if (
                     self._active[run_id][workflow_name]
