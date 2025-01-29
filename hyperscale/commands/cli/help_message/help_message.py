@@ -95,7 +95,7 @@ class HelpMessage(BaseModel):
 
         message_lines = "\n".join(lines)
 
-        return f"\033[2J\033[H\n{message_lines}\n\n"
+        return f"\033[2J\033[H\n\n{message_lines}\n\n"
 
     async def _create_subcommands_description(
         self,
