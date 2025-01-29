@@ -118,6 +118,7 @@ class UDPProtocol(Generic[T, K]):
         self._nodes: LockedSet[int] | None = None
         self._abort_handle_created: bool = None
         self._connect_lock: asyncio.Lock | None = None
+        self._shutdown_task: asyncio.Future | None = None
 
     @property
     def nodes(self):
@@ -1033,6 +1034,8 @@ class UDPProtocol(Generic[T, K]):
                 name='info',
             )
 
+            await self._shutdown_task
+
             self._running = False
 
             if self._transport:
@@ -1116,6 +1119,14 @@ class UDPProtocol(Generic[T, K]):
         self._pending_responses.clear()
 
     def stop(self):
+        self._shutdown_task = asyncio.ensure_future(
+            self._shutdown()
+        )
+
+    async def _shutdown(self):
+
+        for response in self._pending_responses:
+            await response
 
         self._running = False
 

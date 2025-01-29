@@ -931,6 +931,7 @@ class RemoteGraphManager:
             await self._controller.submit_stop_request()
 
     async def close(self):
+        self._controller.stop()
         await self._controller.close()
 
     def abort(self):

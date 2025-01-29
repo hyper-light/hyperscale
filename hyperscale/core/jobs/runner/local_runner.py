@@ -258,6 +258,9 @@ class LocalRunner:
                 except asyncio.CancelledError:
                     pass
 
+                import traceback
+                print(traceback.format_exc())
+
             except asyncio.CancelledError:
                 await ctx.log_prepared(f'Encountered interrupt while running test {test_name} - aborting', name='fatal')
 
@@ -292,18 +295,8 @@ class LocalRunner:
                 except asyncio.CancelledError:
                     pass
 
-
-                close_task = asyncio.current_task()
-                for task in asyncio.all_tasks():
-                    try:
-                        if task != close_task and task.cancelled() is False:
-                            task.cancel()
-
-                    except Exception:
-                        pass
-
-                    except asyncio.CancelledError:
-                        pass
+                import traceback
+                print(traceback.format_exc())
 
     async def abort(
         self,

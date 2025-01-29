@@ -825,44 +825,38 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         async with self._logger.context(
             name=f'workflow_run_{run_id}',
         ) as ctx:
-            
-            try:
-                await ctx.log_prepared(
-                    message=f'Workflow {job.workflow.name} starting run {run_id} via task on Node {self._node_id_base} at {self.host}:{self.port}',
-                    name='trace'
-                )
-                    
-                (
-                    run_id,
+            await ctx.log_prepared(
+                message=f'Workflow {job.workflow.name} starting run {run_id} via task on Node {self._node_id_base} at {self.host}:{self.port}',
+                name='trace'
+            )
+                
+            (
+                run_id,
+                results,
+                context,
+                error,
+                status,
+            ) = await self._workflows.run(
+                run_id,
+                job.workflow,
+                job.context,
+                job.vus,
+            )
+
+            if context is None:
+                context = job.context
+
+            await self.push_results(
+                node_id,
+                WorkflowResults(
+                    job.workflow.name,
                     results,
                     context,
                     error,
                     status,
-                ) = await self._workflows.run(
-                    run_id,
-                    job.workflow,
-                    job.context,
-                    job.vus,
-                )
-
-                if context is None:
-                    context = job.context
-
-                await self.push_results(
-                    node_id,
-                    WorkflowResults(
-                        job.workflow.name,
-                        results,
-                        context,
-                        error,
-                        status,
-                    ),
-                    run_id,
-                )
-            except Exception:
-                import traceback
-                print(traceback.format_exc())
-
+                ),
+                run_id,
+            )
     @task(
         keep=int(
             os.getenv("HYPERSCALE_MAX_JOBS", 10),
