@@ -224,7 +224,12 @@ class LocalRunner:
  
                 return results
 
-            except (Exception, KeyboardInterrupt, ProcessError) as e:
+            except (
+                Exception, 
+                KeyboardInterrupt, 
+                ProcessError, 
+                asyncio.TimeoutError,
+            ) as e:
                 await ctx.log_prepared(f'Encountered fatal exception {str(e)} while running test {test_name} - aborting', name='fatal')
 
                 try:
@@ -258,7 +263,9 @@ class LocalRunner:
                 except asyncio.CancelledError:
                     pass
 
-            except asyncio.CancelledError:
+                exit(1)
+
+            except asyncio.CancelledError as e:
                 await ctx.log_prepared(f'Encountered interrupt while running test {test_name} - aborting', name='fatal')
 
                 try:

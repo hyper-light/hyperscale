@@ -1143,6 +1143,15 @@ class UDPProtocol(Generic[T, K]):
     def abort(self):
         self._running = False
 
+
+        for pending in self._pending_responses:
+            try:
+                pending.cancel()
+
+            except Exception:
+                pass
+
+
         if self._transport:
             try:
                 self._transport.abort()
@@ -1188,7 +1197,7 @@ class UDPProtocol(Generic[T, K]):
 
         if self._run_future:
             try:
-                self._run_future.set_result(None)
+                self._run_future.cancel()
 
             except asyncio.InvalidStateError:
                 pass
