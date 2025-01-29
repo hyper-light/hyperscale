@@ -1188,7 +1188,7 @@ class UDPProtocol(Generic[T, K]):
 
         if self._run_future:
             try:
-                self._run_future.cancel()
+                self._run_future.set_result(None)
 
             except asyncio.InvalidStateError:
                 pass
