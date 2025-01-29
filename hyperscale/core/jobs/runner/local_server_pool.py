@@ -6,6 +6,7 @@ import signal
 import socket
 import warnings
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import set_start_method, Process
 from multiprocessing.context import SpawnContext
 from typing import Dict, List
@@ -79,7 +80,9 @@ async def run_server(
         asyncio.CancelledError, 
         KeyboardInterrupt,
         multiprocessing.ProcessError,
-        OSError
+        OSError,
+        asyncio.InvalidStateError,
+        BrokenProcessPool,
     ):
         await server.close()
 
@@ -145,7 +148,8 @@ def run_thread(
         Exception,
         OSError,
         multiprocessing.ProcessError,
-        asyncio.CancelledError
+        asyncio.CancelledError,
+        asyncio.InvalidStateError,
     ):
         pass
 
@@ -212,35 +216,42 @@ class LocalServerPool:
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
         ) as ctx:
             
-            leader_host, leader_port = leader_address
+            try:
+                leader_host, leader_port = leader_address
             
-            await ctx.log(Entry(
-                message=f'Creating server pool with {self._pool_size} workers and leader at {leader_host}:{leader_port}',
-                level=LogLevel.DEBUG
-            ))
+                await ctx.log(Entry(
+                    message=f'Creating server pool with {self._pool_size} workers and leader at {leader_host}:{leader_port}',
+                    level=LogLevel.DEBUG
+                ))
 
-            config = LoggingConfig()
+                config = LoggingConfig()
 
-            self._pool_task = asyncio.gather(
-                *[
-                    self._loop.run_in_executor(
-                        self._executor,
-                        functools.partial(
-                            run_thread,
-                            idx,
-                            leader_address,
-                            worker_ip,
-                            env.model_dump(),
-                            config.directory,
-                            log_level=config.level.name.lower(),
-                            cert_path=cert_path,
-                            key_path=key_path,
-                        ),
-                    )
-                    for idx, worker_ip in enumerate(worker_ips)
-                ],
-                return_exceptions=True,
-            )
+                self._pool_task = asyncio.gather(
+                    *[
+                        self._loop.run_in_executor(
+                            self._executor,
+                            functools.partial(
+                                run_thread,
+                                idx,
+                                leader_address,
+                                worker_ip,
+                                env.model_dump(),
+                                config.directory,
+                                log_level=config.level.name.lower(),
+                                cert_path=cert_path,
+                                key_path=key_path,
+                            ),
+                        )
+                        for idx, worker_ip in enumerate(worker_ips)
+                    ],
+                    return_exceptions=True,
+                )
+
+            except (
+                Exception,
+                KeyboardInterrupt
+            ):
+                pass
 
     async def shutdown(
         self,
@@ -270,17 +281,37 @@ class LocalServerPool:
             except asyncio.InvalidStateError:
                 pass
 
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
 
-                await self._loop.run_in_executor(
-                    None,
-                    functools.partial(
-                        self._executor.shutdown,
-                        wait=True,
-                        cancel_futures=True,
-                    ),
-                )
+                    await self._loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            self._executor.shutdown,
+                            wait=wait,
+                            cancel_futures=True,
+                        ),
+                    )
+
+            except (
+                Exception,
+                KeyboardInterrupt,
+                asyncio.CancelledError,
+                asyncio.InvalidStateError,
+            ):
+                
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+
+                    await self._loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            self._executor.shutdown,
+                            wait=False,
+                            cancel_futures=True,
+                        ),
+                    )
 
             await ctx.log(Entry(
                 message='Server pool successfully shutdown',
@@ -300,9 +331,20 @@ class LocalServerPool:
         except asyncio.InvalidStateError:
             pass
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
 
-            self._executor.shutdown(
-                cancel_futures=True
-            )
+                self._executor.shutdown(
+                    wait=True,
+                    cancel_futures=True
+                )
+
+        except Exception:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+
+                self._executor.shutdown(
+                    wait=False,
+                    cancel_futures=True
+                )

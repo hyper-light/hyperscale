@@ -1,5 +1,6 @@
 import asyncio
 import os
+from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import (
     ProcessError,
 )
@@ -84,10 +85,10 @@ class LocalRunner:
         self._workers = workers
         self._worker_connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_SECONDS).time
 
-        updates = InterfaceUpdatesController()
+        self._updates = InterfaceUpdatesController()
 
-        self._interface = HyperscaleInterface(updates)
-        self._remote_manger = RemoteGraphManager(updates, self._workers)
+        self._interface = HyperscaleInterface(self._updates)
+        self._remote_manger = RemoteGraphManager(self._updates, self._workers)
         self._server_pool = LocalServerPool(self._workers)
         self._logger = Logger()
         self._pool_task: asyncio.Task | None = None
@@ -229,7 +230,9 @@ class LocalRunner:
                 ProcessError, 
                 asyncio.TimeoutError,
                 asyncio.CancelledError,
+                BrokenProcessPool,
             ) as e:
+
                 
                 if isinstance(e, asyncio.CancelledError):
                     await ctx.log_prepared(f'Encountered interrupt while running test {test_name} - aborting', name='fatal')
@@ -248,7 +251,15 @@ class LocalRunner:
                 except asyncio.CancelledError:
                     pass
                 
-                if not isinstance(e, (KeyboardInterrupt, ProcessError, asyncio.CancelledError)):
+                if not isinstance(
+                    e, 
+                    (
+                        KeyboardInterrupt,
+                        ProcessError,
+                        asyncio.CancelledError,
+                        BrokenProcessPool,
+                    ),
+                ):
                     await self._remote_manger.shutdown_workers()
 
                 try:
@@ -263,7 +274,7 @@ class LocalRunner:
                 
                 try:
                     await ctx.log_prepared(f'Aborting Hyperscale Server Pool for test {test_name}', name='debug')
-                    await self._server_pool.shutdown(wait=False)
+                    await self._server_pool.shutdown()
 
                 except Exception as e:
                     await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Server Pool for test {test_name}', name='trace')

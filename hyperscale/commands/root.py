@@ -86,5 +86,9 @@ def run():
     try:
         asyncio.run(CLI.run(args=sys.argv[1:]))
 
-    except KeyboardInterrupt:
+    except (
+        KeyboardInterrupt,
+        asyncio.CancelledError,
+        asyncio.InvalidStateError
+    ):
         pass

@@ -76,9 +76,12 @@ async def run(
             terminal_ui_enabled=terminal_ui_enabled,
         )
 
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc())
+    except (
+        Exception,
+        KeyboardInterrupt,
+        asyncio.CancelledError,
+        asyncio.InvalidStateError,
+    ) as e:
         await runner.abort(
             error=e,
             terminal_ui_enabled=terminal_ui_enabled,

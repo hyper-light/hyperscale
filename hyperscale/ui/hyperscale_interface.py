@@ -58,6 +58,10 @@ class HyperscaleInterface:
         sections: list[Section] = generate_ui_sections(workflows)
         self._terminal = Terminal(sections)
 
+    def reset_active(self):
+        self._active_workflow = 'initializing'
+        self._current_active_idx = 0
+
     async def run(self):
         if self._terminal is None:
             raise Exception("Err. - Terminal not initialized.")

@@ -73,7 +73,7 @@ def generate_ui_sections(
 
     multiline_text_components = [
         MultilineText(
-            "workflow_metadata_initialize",
+            "workflow_metadata_initializing",
             MultilineTextConfig(
                 text=["Gathering test config."],
                 horizontal_alignment="right",

@@ -371,7 +371,7 @@ class LoggerStream:
         while not self._queue.empty():
             task = self._queue.get_nowait()
             await task
-  
+
         await asyncio.gather(
             *[self._close_file(logfile_path) for logfile_path in self._files]
         )
