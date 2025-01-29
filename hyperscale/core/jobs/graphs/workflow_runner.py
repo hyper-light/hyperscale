@@ -102,6 +102,7 @@ class WorkflowRunner:
         self._active: Dict[int, Dict[str, int]] = defaultdict(dict)
         self._active_waiters: Dict[int, Dict[str, asyncio.Future]] = defaultdict(dict)
         self._max_active: Dict[int, Dict[str, int]] = defaultdict(dict)
+        self._run_tasks: Dict[int, Dict[str, asyncio.Future]] = defaultdict(dict)
         self._pending: Dict[int, Dict[str, List[asyncio.Task]]] = defaultdict(
             lambda: defaultdict(list)
         )
@@ -334,11 +335,24 @@ class WorkflowRunner:
             
             elif already_running and self._duplicate_job_policy == "replace":
 
-                del self._active[run_id][workflow_name]
-                del self._active_waiters[run_id][workflow_name]
-                del self._max_active[run_id][workflow_name]
-                del self._pending[run_id][workflow_name]
-                del self._running_workflows[run_id][workflow.name]
+                workflow_name = workflow.name
+
+                self._active[run_id][workflow_name] = 0
+
+                if self._run_tasks[run_id].get(workflow_name):
+                    self._run_tasks[run_id][workflow_name].cancel()
+                    await asyncio.sleep(0)
+
+                if self._active_waiters[run_id].get(workflow_name):
+                    del self._active_waiters[run_id][workflow_name]
+
+                if self._max_active[run_id][workflow_name]:
+                    del self._max_active[run_id][workflow_name]
+
+                self._pending[run_id][workflow_name].clear()
+                
+                if self._running_workflows[run_id].get(workflow.name):
+                    del self._running_workflows[run_id][workflow.name]
                 
             
             await ctx.log_prepared(
@@ -382,12 +396,17 @@ class WorkflowRunner:
                 self._running_workflows[run_id][workflow.name] = workflow
 
                 try:
-                    (results, updated_context) = await self._run_workflow(
-                        run_id,
-                        workflow,
-                        context,
-                        vus,
+
+                    self._run_tasks[run_id][workflow_name] = asyncio.ensure_future(
+                        self._run_workflow(
+                            run_id,
+                            workflow,
+                            context,
+                            vus,
+                        )
                     )
+
+                    (results, updated_context) = await self._run_tasks[run_id][workflow_name]
 
                     await ctx.log_prepared(
                         message=f'Run {run_id} of Workflow {workflow.name} successfully halted run',
@@ -409,17 +428,6 @@ class WorkflowRunner:
                         name='info',
                     )
 
-                    try:
-                        del self._active[run_id][workflow_name]
-                        del self._active_waiters[run_id][workflow_name]
-                        del self._max_active[run_id][workflow_name]
-                        del self._pending[run_id][workflow_name]
-                        del self._running_workflows[run_id][workflow.name]
-
-                    except Exception:
-                        pass
-
-               
                     await ctx.log_prepared(
                         message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.COMPLETED.name} state',
                         name='info',
@@ -452,12 +460,6 @@ class WorkflowRunner:
                     )
 
                     self.run_statuses[run_id][workflow.name] = WorkflowStatus.FAILED
-                    del self._running_workflows[run_id][workflow.name]
-                    del self._active[run_id][workflow_name]
-                    del self._active_waiters[run_id][workflow_name]
-                    del self._max_active[run_id][workflow_name]
-                    del self._pending[run_id][workflow_name]
-
                     await self._cpu_monitor.stop_background_monitor(
                         run_id,
                         workflow_name,
@@ -1097,6 +1099,7 @@ class WorkflowRunner:
                     workflow.client.close()
 
             try:
+                
                 await self._cpu_monitor.stop_all_background_monitors()
             except Exception:
                 pass
@@ -1105,8 +1108,6 @@ class WorkflowRunner:
                 await self._memory_monitor.stop_all_background_monitors()
             except Exception:
                 pass
-
-            self._clear()
 
     def abort(self):
         self._logger.abort()
@@ -1130,5 +1131,3 @@ class WorkflowRunner:
 
         except Exception:
             pass
-
-        self._clear()
