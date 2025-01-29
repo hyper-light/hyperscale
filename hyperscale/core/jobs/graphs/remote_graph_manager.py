@@ -349,7 +349,7 @@ class RemoteGraphManager:
         workflow: Workflow,
         threads: int,
         workflow_vus: List[int],
-    ) -> Tuple[str, WorkflowStats | WorkflowContextResult]:
+    ) -> Tuple[str, WorkflowStats | WorkflowContextResult | Exception]:
         
         default_config = {   
             "workflow": workflow.name,
@@ -520,9 +520,9 @@ class RemoteGraphManager:
                 workflow_timeout,
             )
 
-            results, run_context = worker_results
+            results, run_context, timeout_error = worker_results
 
-            if results is None and run_context is None:
+            if timeout_error:
                 await ctx.log_prepared(
                     message=f'Workflow {workflow.name} exceeded timeout of {workflow_timeout} seconds',
                     name='fatal'
@@ -532,9 +532,6 @@ class RemoteGraphManager:
                     workflow_slug, 
                     f"Timeout - {workflow.name}"
                 )
-
-                raise Exception(f'Workflow {workflow.name} exceeded timeout of {workflow_timeout} seconds')
-
 
             await ctx.log_prepared(
                 message=f'Workflow {workflow.name} run {run_id} completed run',

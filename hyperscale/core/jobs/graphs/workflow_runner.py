@@ -831,13 +831,25 @@ class WorkflowRunner:
         await asyncio.gather(*completed)
         await asyncio.gather(
             *[
-                asyncio.create_task(cancel_pending(pend))
+                asyncio.create_task(
+                    asyncio.wait_for(
+                        cancel_pending(pend),
+                        timeout=1
+                    ),
+                )
                 for pend in self._pending[run_id][workflow.name]
-            ]
+            ],
+            return_exceptions=True
         )
 
         await asyncio.gather(
-            *[asyncio.create_task(cancel_pending(pend)) for pend in pending]
+            *[asyncio.create_task(
+                asyncio.wait_for(
+                    cancel_pending(pend),
+                    timeout=1
+                )
+            ) for pend in pending],
+            return_exceptions=True
         )
 
         workflow_results_set: Dict[str, List[Any]] = {

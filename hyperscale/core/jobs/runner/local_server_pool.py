@@ -237,7 +237,10 @@ class LocalServerPool:
                 return_exceptions=True,
             )
 
-    async def shutdown(self):
+    async def shutdown(
+        self,
+        wait: bool = True
+    ):
 
         async with self._logger.context(
             name='local_server_pool',
@@ -269,7 +272,7 @@ class LocalServerPool:
                     None,
                     functools.partial(
                         self._executor.shutdown,
-                        wait=True,
+                        wait=wait,
                         cancel_futures=True,
                     ),
                 )
