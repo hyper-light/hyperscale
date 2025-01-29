@@ -528,6 +528,11 @@ class RemoteGraphManager:
                     name='fatal'
                 )
 
+                await update_active_workflow_message(
+                    workflow_slug, 
+                    f"Timeout - {workflow.name}"
+                )
+
                 raise Exception(f'Workflow {workflow.name} exceeded timeout of {workflow_timeout} seconds')
 
 
@@ -538,7 +543,8 @@ class RemoteGraphManager:
 
             await update_workflow_run_timer(workflow_slug, False)
             await update_active_workflow_message(
-                workflow_slug, f"Processing results - {workflow.name}"
+                workflow_slug, 
+                f"Processing results - {workflow.name}"
             )
 
             await update_workflow_executions_total_rate(workflow_slug, None, False)
