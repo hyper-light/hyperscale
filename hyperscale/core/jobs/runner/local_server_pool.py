@@ -83,8 +83,34 @@ async def run_server(
         OSError,
         asyncio.InvalidStateError,
         BrokenProcessPool,
+        AssertionError,
     ):
         await server.close()
+
+    current_task = asyncio.current_task()
+
+    tasks = asyncio.all_tasks()
+    for task in tasks:
+        if task != current_task:
+            try:
+                task.cancel()
+
+            except (
+                Exception,
+                asyncio.InvalidStateError,
+                asyncio.CancelledError,
+                asyncio.TimeoutError,
+                AssertionError,
+            ):
+                pass
+
+    try:
+        await asyncio.gather(*[
+            task for task in tasks if task != current_task
+        ], return_exceptions=True)
+
+    except Exception:
+        pass
 
 
 
@@ -143,6 +169,7 @@ def run_thread(
                 key_path=key_path,
             )
         )
+
 
     except (
         Exception,

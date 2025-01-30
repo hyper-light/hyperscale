@@ -73,6 +73,9 @@ async def cancel_pending(pend: asyncio.Task):
 
     except asyncio.InvalidStateError as invalid_state:
         return invalid_state
+    
+    except Exception:
+        pass
 
 
 def guard_result(result: asyncio.Task):
@@ -103,6 +106,9 @@ class WorkflowRunner:
         self._active_waiters: Dict[int, Dict[str, asyncio.Future]] = defaultdict(dict)
         self._max_active: Dict[int, Dict[str, int]] = defaultdict(dict)
         self._run_tasks: Dict[int, Dict[str, asyncio.Future]] = defaultdict(dict)
+        self._failed: Dict[int, Dict[str, List[asyncio.Task]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
         self._pending: Dict[int, Dict[str, List[asyncio.Task]]] = defaultdict(
             lambda: defaultdict(list)
         )
@@ -857,14 +863,11 @@ class WorkflowRunner:
 
         elapsed = time.monotonic() - start
 
-        await asyncio.gather(*completed)
+        await asyncio.gather(*completed, return_exceptions=True)
         await asyncio.gather(
             *[
                 asyncio.create_task(
-                    asyncio.wait_for(
-                        cancel_pending(pend),
-                        timeout=1
-                    ),
+                    cancel_pending(pend),
                 )
                 for pend in self._pending[run_id][workflow.name]
             ],
@@ -873,13 +876,16 @@ class WorkflowRunner:
 
         await asyncio.gather(
             *[asyncio.create_task(
-                asyncio.wait_for(
-                    cancel_pending(pend),
-                    timeout=1
-                )
+                cancel_pending(pend),
             ) for pend in pending],
             return_exceptions=True
         )
+
+        if len(self._failed[run_id][workflow_name]) > 0:
+            await asyncio.gather(
+                self._failed[run_id][workflow_name],
+                return_exceptions=True,
+            )
 
         workflow_results_set: Dict[str, List[Any]] = {
             hook_name: [] for hook_name in hooks
@@ -982,20 +988,29 @@ class WorkflowRunner:
                 self._workflow_step_stats[run_id][(workflow_name, step_name)][
                     "total"
                 ].increment()
-
+                
                 try:
                     result = complete.result()
                     self._workflow_step_stats[run_id][(workflow_name, step_name)][
                         "ok"
                     ].increment()
 
-                except Exception as err:
+                except (
+                    Exception,
+                    AssertionError,
+                    asyncio.TimeoutError,
+                    asyncio.CancelledError,
+                    asyncio.InvalidStateError,
+                    asyncio.IncompleteReadError,
+                ) as err:
                     self._failed_counts[run_id][workflow_name].increment()
                     self._workflow_step_stats[run_id][(workflow_name, step_name)][
                         "err"
                     ].increment()
 
                     result = err
+
+                    self._failed[run_id][workflow_name].append(complete)
 
                 context[step_name] = result
                 self._completed_counts[run_id][workflow_name].increment()
