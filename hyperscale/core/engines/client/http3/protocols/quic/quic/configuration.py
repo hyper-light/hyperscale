@@ -3,7 +3,7 @@ from os import PathLike
 from re import split
 from typing import Any, List, Optional, TextIO, Union
 
-from ..tls import (
+from hyperscale.core.engines.client.http3.protocols.quic.tls import (
     CipherSuite,
     SessionTicket,
     load_pem_private_key,

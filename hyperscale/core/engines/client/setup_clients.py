@@ -147,7 +147,7 @@ def setup_client(
 
         client._semaphore = asyncio.Semaphore(vus)
 
-    elif isinstance(client, HTTP3Connection):
+    elif isinstance(client, MercurySyncHTTP3Connection):
         client.reset_connections = reset_connections
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -166,7 +166,7 @@ def setup_client(
         client._semaphore = asyncio.Semaphore(vus)
         client._max_pages = pages
 
-    elif isinstance(client, UDPConnection):
+    elif isinstance(client, MercurySyncUDPConnection):
         if cert_path is None:
             cert_path = client._cert_path
 

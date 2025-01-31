@@ -4,6 +4,7 @@ from typing import (
     Literal,
     Optional,
     Tuple,
+    Any
 )
 
 import orjson
@@ -37,8 +38,18 @@ class GraphQLRequest(BaseModel):
     cookies: Optional[List[HTTPCookie]] = None
     headers: Dict[str, str] = {}
     data: (
-        Dict[Literal["query"], str]
-        | Dict[Literal["query", "operation_name", "variables"], str]
+        Dict[
+            Literal["query"], 
+            str,
+        ]
+        | Dict[
+            Literal["query", "operation_name"],
+            str,
+        ]
+        | Dict[
+            Literal["query", "operation_name", "variables"], 
+            str | dict[str, Any],
+        ]
     )
     redirects: StrictInt = 3
 

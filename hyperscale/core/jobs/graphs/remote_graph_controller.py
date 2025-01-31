@@ -870,7 +870,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     WorkflowResults(
                         job.workflow.name,
                         None,
-                        Context(),
+                        job.context,
                         err,
                         WorkflowStatus.FAILED
                     )

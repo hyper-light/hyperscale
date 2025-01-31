@@ -20,8 +20,8 @@ from typing import (
 )
 
 import pylsqpack
-from aioquic.buffer import UINT_VAR_MAX_SIZE, Buffer, BufferReadError, encode_uint_var
-from aioquic.h3.events import (
+from .quic.buffer import UINT_VAR_MAX_SIZE, Buffer, BufferReadError, encode_uint_var
+from .quic.h3.events import (
     DatagramReceived,
     DataReceived,
     H3Event,
@@ -30,12 +30,12 @@ from aioquic.h3.events import (
     PushPromiseReceived,
     WebTransportStreamDataReceived,
 )
-from aioquic.quic.connection import (
+from .quic.quic.connection import (
     NetworkAddress,
     QuicConnection,
     stream_is_unidirectional,
 )
-from aioquic.quic.events import (
+from .quic.quic.events import (
     ConnectionIdIssued,
     ConnectionIdRetired,
     ConnectionTerminated,
@@ -294,6 +294,9 @@ class QuicStreamAdapter(asyncio.Transport):
         self.protocol.quic.send_stream_data(self.stream_id, b"", end_stream=True)
         self.protocol._transmit_soon()
 
+def custom_exception_handler(*args):
+    pass
+
 
 class QuicProtocol(asyncio.DatagramProtocol):
     __slots__ = (
@@ -349,6 +352,9 @@ class QuicProtocol(asyncio.DatagramProtocol):
         loop: asyncio.AbstractEventLoop = None,
     ):
         self.loop = loop
+
+
+        loop.set_exception_handler(custom_exception_handler)
 
         self._request_waiter: Dict[int, asyncio.Future[Deque[H3Event]]] = {}
         self._closed = asyncio.Event()

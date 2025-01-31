@@ -16,6 +16,8 @@ class SettingsAcknowledged(BaseEvent):
         #: :class:`ChangedSetting <h2.settings.ChangedSetting>`, representing
         #: the changed settings.
         self.changed_settings = {}
+        self.flow_controlled_length = None
+        self.data = None
 
     def __repr__(self):
         return "<SettingsAcknowledged changed_settings:{%s}>" % (

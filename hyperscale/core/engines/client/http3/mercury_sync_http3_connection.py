@@ -16,6 +16,7 @@ from urllib.parse import (
     ParseResult,
     urlencode,
     urlparse,
+    urljoin,
 )
 
 import orjson
@@ -51,6 +52,7 @@ from hyperscale.core.testing.models import (
 
 from .models.http3 import HTTP3Response
 from .protocols import HTTP3Connection
+from .protocols.quic.quic.packet_builder import QuicPacketBuilderStop
 
 A = TypeVar("A")
 R = TypeVar("R")
@@ -512,9 +514,21 @@ class MercurySyncHTTP3Connection:
         )
 
         if redirect:
-            location = result.headers.get("location")
+            location = result.headers.get(b"location").decode()
 
             upgrade_ssl = False
+
+            if "http" not in location and "https" not in location:
+                parsed_url: ParseResult = urlparse(url)
+
+                if parsed_url.params:
+                    location += parsed_url.params
+
+                location = urljoin(
+                    f'{parsed_url.scheme}://{parsed_url.hostname}',
+                    location
+                )
+
             if "https" in location and "https" not in url:
                 upgrade_ssl = True
 
@@ -535,7 +549,7 @@ class MercurySyncHTTP3Connection:
                 if redirect is False:
                     break
 
-                location = result.headers.get("location")
+                location = result.headers.get(b"location").decode()
 
                 upgrade_ssl = False
                 if "https" in location and "https" not in url:
@@ -713,6 +727,12 @@ class MercurySyncHTTP3Connection:
 
             status = int(headers.get(b":status", b"400"))
 
+            cookies: Union[HTTPCookies, None] = None
+            cookies_data: Union[bytes, None] = headers.get(b"set-cookie")
+            if cookies_data:
+                cookies = HTTPCookies()
+                cookies.update(cookies_data)
+            
             if status >= 300 and status < 400:
                 timings["read_end"] = time.monotonic()
                 self._connections.append(connection)
@@ -733,12 +753,6 @@ class MercurySyncHTTP3Connection:
                     True,
                     timings,
                 )
-
-            cookies: Union[HTTPCookies, None] = None
-            cookies_data: Union[bytes, None] = headers.get(b"set-cookie")
-            if cookies_data:
-                cookies = HTTPCookies()
-                cookies.update(cookies_data)
 
             self._connections.append(connection)
 
@@ -849,14 +863,10 @@ class MercurySyncHTTP3Connection:
             for address, ip_info in url:
                 try:
                     await connection.make_connection(
-                        url.hostname,
                         address,
                         url.port,
                         ip_info,
-                        ssl=self._client_ssl_context
-                        if url.is_ssl or ssl_redirect_url
-                        else None,
-                        ssl_upgrade=ssl_redirect_url is not None,
+                        server_name=url.hostname,
                     )
 
                     url.address = address
@@ -874,14 +884,10 @@ class MercurySyncHTTP3Connection:
         else:
             try:
                 await connection.make_connection(
-                    url.hostname,
                     url.address,
                     url.port,
                     url.socket_config,
-                    ssl=self._client_ssl_context
-                    if url.is_ssl or ssl_redirect_url
-                    else None,
-                    ssl_upgrade=ssl_redirect_url is not None,
+                    server_name=url.hostname,
                 )
 
             except Exception as err:

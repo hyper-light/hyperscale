@@ -31,12 +31,13 @@ class HTTP3Connection:
         if (
             self.connected is False
             or self.dns_address != dns_address
-            or self.reset_connection
+            or self.reset_connections
         ):
             try:
                 self.protocol = await asyncio.wait_for(
                     self._connection_factory.create_http3(
-                        socket_config=socket_config, server_name=server_name
+                        socket_config=socket_config, 
+                        server_name=server_name
                     ),
                     timeout=timeout,
                 )

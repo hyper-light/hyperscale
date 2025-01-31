@@ -18,6 +18,7 @@ from urllib.parse import (
     ParseResult,
     urlencode,
     urlparse,
+    urljoin,
 )
 
 import orjson
@@ -547,6 +548,17 @@ class MercurySyncHTTP2Connection:
         if redirect:
             location = result.headers.get("location")
 
+            if "http" not in location and "https" not in location:
+                parsed_url: ParseResult = urlparse(url)
+
+                if parsed_url.params:
+                    location += parsed_url.params
+
+                location = urljoin(
+                    f'{parsed_url.scheme}://{parsed_url.hostname}',
+                    location
+                )
+
             upgrade_ssl = False
             if "https" in location and "https" not in url:
                 upgrade_ssl = True
@@ -712,16 +724,21 @@ class MercurySyncHTTP2Connection:
                 timeout=self.timeouts.read_timeout,
             )
 
+            if error:
+                raise error
+
+            cookies: Union[HTTPCookies, None] = None
+
+            cookies_data: Union[str, None] = headers.get("set-cookie")
+            if cookies_data:
+                cookies = HTTPCookies()
+                cookies.update(cookies_data.encode())
+
             if status >= 300 and status < 400:
                 timings["read_end"] = time.monotonic()
 
-                self._connections.append(
-                    HTTP2Connection(
-                        stream_id=randrange(1, 2**20 + 2, 2),
-                        reset_connections=self._reset_connections,
-                    )
-                )
-                self._pipes.append(HTTP2Pipe(self._concurrency))
+                self._connections.append(connection)
+                self._pipes.append(pipe)
 
                 return (
                     HTTP2Response(
@@ -737,15 +754,6 @@ class MercurySyncHTTP2Connection:
                     True,
                     timings,
                 )
-
-            if error:
-                raise error
-
-            cookies: Union[HTTPCookies, None] = None
-            cookies_data: Union[bytes, None] = headers.get("set-cookie")
-            if cookies_data:
-                cookies = HTTPCookies()
-                cookies.update(cookies_data)
 
             self._connections.append(connection)
             self._pipes.append(pipe)

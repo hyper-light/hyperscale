@@ -18,6 +18,7 @@ from urllib.parse import (
     ParseResult,
     urlencode,
     urlparse,
+    urljoin
 )
 
 import orjson
@@ -522,7 +523,21 @@ class MercurySyncHTTPConnection:
         if redirect:
             location = result.headers.get(b"location").decode()
 
+            redirects_taken = 1
+
             upgrade_ssl = False
+
+            if "http" not in location and "https" not in location:
+                parsed_url: ParseResult = urlparse(url)
+
+                if parsed_url.params:
+                    location += parsed_url.params
+
+                location = urljoin(
+                    f'{parsed_url.scheme}://{parsed_url.hostname}',
+                    location
+                )
+
             if "https" in location and "https" not in url:
                 upgrade_ssl = True
 
@@ -548,6 +563,10 @@ class MercurySyncHTTPConnection:
                 upgrade_ssl = False
                 if "https" in location and "https" not in url:
                     upgrade_ssl = True
+
+                redirects_taken += 1
+
+            result.redirects = redirects_taken
 
         timings["request_end"] = time.monotonic()
         result.timings.update(timings)
@@ -641,6 +660,8 @@ class MercurySyncHTTPConnection:
                         url=URLMetadata(
                             host=url.hostname,
                             path=url.path,
+                            params=url.params,
+                            query=url.query,
                         ),
                         method=method,
                         status=400,
@@ -693,32 +714,14 @@ class MercurySyncHTTPConnection:
             response_code = await asyncio.wait_for(
                 connection.reader.readline(), timeout=self.timeouts.read_timeout
             )
-
-            headers: Dict[bytes, bytes] = await asyncio.wait_for(
-                connection.read_headers(), timeout=self.timeouts.read_timeout
-            )
-
+            
             status_string: List[bytes] = response_code.split()
             status = int(status_string[1])
 
-            if status >= 300 and status < 400:
-                timings["read_end"] = time.monotonic()
-                self._connections.append(connection)
-
-                return (
-                    HTTPResponse(
-                        url=URLMetadata(
-                            host=url.hostname,
-                            path=url.path,
-                        ),
-                        method=method,
-                        status=status,
-                        headers=headers,
-                        timings=timings,
-                    ),
-                    True,
-                    timings,
-                )
+            headers: Dict[bytes, bytes] = await asyncio.wait_for(
+                connection.read_headers(),
+                timeout=self.timeouts.read_timeout,
+            )
 
             content_length = headers.get(b"content-length")
             transfer_encoding = headers.get(b"transfer-encoding")
@@ -728,10 +731,14 @@ class MercurySyncHTTPConnection:
             if cookies_data:
                 cookies = HTTPCookies()
                 cookies.update(cookies_data)
+                
+
 
             # We require Content-Length or Transfer-Encoding headers to read a
             # request body, otherwise it's anyone's guess as to how big the body
             # is, and we ain't playing that game.
+
+            body = b''
 
             if content_length:
                 body = await asyncio.wait_for(
@@ -771,11 +778,37 @@ class MercurySyncHTTPConnection:
 
             self._connections.append(connection)
 
+            if status >= 300 and status < 400:
+                timings["read_end"] = time.monotonic()
+                self._connections.append(connection)
+
+                return (
+                    HTTPResponse(
+                        url=URLMetadata(
+                            host=url.hostname,
+                            path=url.path,
+                            params=url.params,
+                            query=url.query,
+                        ),
+                        method=method,
+                        status=status,
+                        headers=headers,
+                        timings=timings,
+                    ),
+                    True,
+                    timings,
+                )
+
             timings["read_end"] = time.monotonic()
 
             return (
                 HTTPResponse(
-                    url=URLMetadata(host=url.hostname, path=url.path),
+                    url=URLMetadata(
+                        host=url.hostname,
+                        path=url.path,
+                        params=url.params,
+                        query=url.query,
+                    ),
                     cookies=cookies,
                     method=method,
                     status=status,
@@ -807,6 +840,8 @@ class MercurySyncHTTPConnection:
                     url=URLMetadata(
                         host=request_url.hostname,
                         path=request_url.path,
+                        params=request_url.params,
+                        query=request_url.query,
                     ),
                     method=method,
                     status=400,
@@ -850,7 +885,9 @@ class MercurySyncHTTPConnection:
         dns_lock = self._dns_lock[parsed_url.hostname]
         dns_waiter = self._dns_waiters[parsed_url.hostname]
 
-        do_dns_lookup = (url is None or ssl_redirect_url) and has_optimized_url is False
+        do_dns_lookup = (
+            url is None or ssl_redirect_url
+        ) and has_optimized_url is False
 
         if do_dns_lookup and dns_lock.locked() is False:
             await dns_lock.acquire()

@@ -24,16 +24,21 @@ class Test(Workflow):
         headers: Headers = {
             "content-type": "application/json"
         },
-        data: Data = {
-            "name": "ada",
-        },
+        login: HTTPResponse = None,
     ) -> HTTPResponse:
         response = await self.client.http.post(
             url,
             headers=headers,
-            data=data,
+            data={
+                "name": "ada",
+                "status": login.status,
+            },
         )
         assert response.status is not None, "Err. - incomplete request"
         assert response.status >= 200 and response.status < 300, "Err. - requested failed"
+        
+        data = response.json()
 
+        assert isinstance(data, dict), "Err. - no data found"
+        
         return response

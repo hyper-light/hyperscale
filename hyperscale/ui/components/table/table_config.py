@@ -31,6 +31,7 @@ class TableConfig(BaseModel):
         StrictStr,
         HeaderOptions,
     ]
+    header_alignment: CellAlignment = "CENTER"
     cell_alignment: CellAlignment = "CENTER"
     minimum_column_width: StrictInt | None = None
     border_color: ColorName | ExtendedColorName | None = None

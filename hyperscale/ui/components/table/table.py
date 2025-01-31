@@ -124,6 +124,7 @@ class Table:
             column_width,
             columns_count,
             max_width,
+            header_alignment=self._config.header_alignment,
             cell_alignment=self._config.cell_alignment,
             field_format_map={
                 header: header_config.precision_format

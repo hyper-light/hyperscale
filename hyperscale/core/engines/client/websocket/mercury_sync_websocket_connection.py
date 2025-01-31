@@ -92,7 +92,6 @@ class MercurySyncWebsocketConnection:
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
         headers: Optional[Dict[str, str] | Headers] = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
-        data: Optional[str | Dict[str, Any] | List[Any] | BaseModel | Data] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
     ):
@@ -106,7 +105,6 @@ class MercurySyncWebsocketConnection:
                         auth=auth,
                         headers=headers,
                         params=params,
-                        data=data,
                         redirects=redirects,
                     ),
                     timeout=timeout,

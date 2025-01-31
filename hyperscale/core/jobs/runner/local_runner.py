@@ -143,8 +143,6 @@ class LocalRunner:
             
             await ctx.log_prepared(f'Starting {test_name} test with {self._workers} workers', name='info')
 
-            close_task = asyncio.current_task()
-
             await ctx.log_prepared(f'Setting interrupt handlers for SIGINT, SIGTERM, SIG_IGN for test {test_name}', name='trace')
             await ctx.log_prepared(f'Initializing UI for test {test_name}', name='trace')
 

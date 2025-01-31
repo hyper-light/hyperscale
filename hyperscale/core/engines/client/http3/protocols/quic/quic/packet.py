@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from ..buffer import Buffer
+from hyperscale.core.engines.client.http3.protocols.quic.buffer import Buffer
 from .rangeset import RangeSet
 
 PACKET_LONG_HEADER = 0x80

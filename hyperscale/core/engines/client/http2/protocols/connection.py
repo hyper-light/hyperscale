@@ -74,7 +74,7 @@ class HTTP2Connection:
     def empty(self):
         return not self.stream.reader._buffer
 
-    def read(self):
+    def read(self, limit: int = _DEFAULT_LIMIT):
         return self.stream.reader.read(n=_DEFAULT_LIMIT)
 
     def readexactly(self, n_bytes: int):

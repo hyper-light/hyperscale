@@ -50,7 +50,8 @@ class HTTPResponse(CallResult):
             ],
             float | None,
         ]
-    ] = None
+    ] = None,
+    redirects: int = 0
 
     @classmethod
     def response_type(cls):
@@ -70,6 +71,34 @@ class HTTPResponse(CallResult):
 
     def to_model(self, model: Type[T]) -> T:
         return model(**orjson.loads(self.content))
+    
+    @property
+    def params(self):
+
+        params: list[tuple[str, str]] = []
+
+        if len(self.url.params) > 0:
+            params.extend([
+                tuple(param.split(
+                    '=',
+                    maxsplit=1,
+                )) for param in self.url.params.split('&')
+            ])
+
+        if len(self.url.query) > 0:
+            params.extend([
+                tuple(param.split(
+                    '=',
+                    maxsplit=1,
+                )) for param in self.url.query.split('&')
+            ])
+
+        return params
+
+    @property
+    def reason(self) -> str | None:
+        if self.headers:
+            return self.headers.get("reason")
 
     @property
     def data(self, model: Optional[Type[T]] = None):

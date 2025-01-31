@@ -1253,7 +1253,6 @@ class Context:
         cafile: Optional[str] = None,
         capath: Optional[str] = None,
         cipher_suites: Optional[List[CipherSuite]] = None,
-        logger: Optional[Union[logging.Logger, logging.LoggerAdapter]] = None,
         max_early_data: Optional[int] = None,
         server_name: Optional[str] = None,
         verify_mode: Optional[int] = None,
@@ -1331,7 +1330,6 @@ class Context:
         self._session_resumed = False
         self._enc_key: Optional[bytes] = None
         self._dec_key: Optional[bytes] = None
-        self.__logger = logger
 
         self._ec_private_key: Optional[ec.EllipticCurvePrivateKey] = None
         self._x25519_private_key: Optional[x25519.X25519PrivateKey] = None
@@ -2150,8 +2148,6 @@ class Context:
         ]
 
     def _set_state(self, state: State) -> None:
-        if self.__logger:
-            self.__logger.debug("TLS %s -> %s", self.state, state)
         self.state = state
 
     def _signature_algorithms_for_private_key(self) -> List[SignatureAlgorithm]:

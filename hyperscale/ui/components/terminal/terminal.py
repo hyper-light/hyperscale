@@ -69,8 +69,14 @@ async def handle_resize(engine: Terminal):
                 height=height,
             )
 
+        if len(engine._updates.triggers) > 0:
+            await asyncio.gather(*[
+                engine._updates.rerender_last(trigger) for trigger in engine._updates.triggers.values()
+            ])
+
         await engine.resume()
 
+  
     except Exception:
         pass
 
@@ -473,5 +479,6 @@ class Terminal:
 
     def _register_signal_handlers(self):
         self._loop.add_signal_handler(
-            signal.SIGWINCH, lambda: asyncio.create_task(handle_resize(self))
+            signal.SIGWINCH,
+            lambda: asyncio.create_task(handle_resize(self))
         )

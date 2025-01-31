@@ -2,8 +2,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from ..buffer import Buffer, size_uint_var
-from ..tls import Epoch
+from hyperscale.core.engines.client.http3.protocols.quic.buffer import Buffer, size_uint_var
+from hyperscale.core.engines.client.http3.protocols.quic.tls import Epoch
 from .crypto import CryptoPair
 from .logger import QuicLoggerTrace
 from .packet import (
@@ -169,7 +169,7 @@ class QuicPacketBuilder:
             frame_type not in NON_IN_FLIGHT_FRAME_TYPES
             and self.remaining_flight_space < capacity
         ):
-            raise QuicPacketBuilderStop
+            raise QuicPacketBuilderStop()
 
         self._buffer.push_uint_var(frame_type)
         if frame_type not in NON_ACK_ELICITING_FRAME_TYPES:
@@ -226,7 +226,7 @@ class QuicPacketBuilder:
 
         # check we have enough space
         if packet_start + header_size >= self._buffer_capacity:
-            raise QuicPacketBuilderStop
+            raise QuicPacketBuilderStop()
 
         # determine ack epoch
         if packet_type == PACKET_TYPE_INITIAL:

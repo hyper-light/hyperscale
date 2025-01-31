@@ -2,6 +2,8 @@ from .connection_terminated_event import ConnectionTerminated
 from .data_received_event import DataReceived
 from .headers_sent_event import HeadersSent
 from .informational_respose_received_event import InformationalResponseReceived
+from .ping_ack_received import PingAckReceived
+from .ping_received import PingReceived
 from .remote_settings_changed_event import RemoteSettingsChanged
 from .request_received_event import RequestReceived
 from .request_sent_event import RequestSent

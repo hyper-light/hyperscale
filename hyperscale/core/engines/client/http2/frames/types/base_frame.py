@@ -317,8 +317,13 @@ class Frame:
 
         elif self.type == 0x04:
             # SETTINGS
-            for setting, value in self.settings.items():
-                body += _STRUCT_HL.pack(setting & 0xFF, value)
+            body = b"".join([
+                _STRUCT_HL.pack(
+                    setting & 0xFF, 
+                    value,
+                )
+                for setting, value in self.settings.items()
+            ])
 
         elif self.type == 0x08:
             # WINDOW UPDATE

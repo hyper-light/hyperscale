@@ -1,18 +1,28 @@
 import asyncio
 from typing import Any, Callable, Dict, Optional, Text, Tuple, Union, cast
 
-from ..quic import events
-from ..quic.connection import NetworkAddress, QuicConnection
+from hyperscale.core.engines.client.http3.protocols.quic.quic import events
+from hyperscale.core.engines.client.http3.protocols.quic.quic.connection import NetworkAddress, QuicConnection
 
 QuicConnectionIdHandler = Callable[[bytes], None]
 QuicStreamHandler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], None]
 
+def custom_exception_handler(*args):
+    return args
+
 
 class QuicConnectionProtocol(asyncio.DatagramProtocol):
     def __init__(
-        self, quic: QuicConnection, stream_handler: Optional[QuicStreamHandler] = None
+        self, 
+        quic: QuicConnection, 
+        stream_handler: Optional[QuicStreamHandler] = None,
+        loop: asyncio.AbstractEventLoop | None = None
     ):
-        loop = asyncio.get_event_loop()
+        if loop is None:
+            loop = asyncio.get_event_loop()
+            loop.set_exception_handler(
+                custom_exception_handler
+            )
 
         self._closed = asyncio.Event()
         self._connected = False

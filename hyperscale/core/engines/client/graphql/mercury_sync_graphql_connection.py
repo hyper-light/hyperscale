@@ -14,6 +14,7 @@ from urllib.parse import (
     ParseResult,
     urlencode,
     urlparse,
+    urljoin,
 )
 
 import orjson
@@ -293,8 +294,19 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
 
         if redirect:
             location = result.headers.get(b"location").decode()
-
             upgrade_ssl = False
+
+            if "http" not in location and "https" not in location:
+                parsed_url: ParseResult = urlparse(url)
+
+                if parsed_url.params:
+                    location += parsed_url.params
+
+                location = urljoin(
+                    f'{parsed_url.scheme}://{parsed_url.hostname}',
+                    location
+                )
+
             if "https" in location and "https" not in url:
                 upgrade_ssl = True
 
@@ -707,7 +719,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         header_items += f"Content-Length: {size}{NEW_LINE}"
 
         if method == "POST":
-            header_items += f"Content-Type: application/json{NEW_LINE}"
+            header_items += f"Content-Type: application/graphql-response+json{NEW_LINE}"
 
         if isinstance(cookies, Cookies):
             header_items += cookies.optimized

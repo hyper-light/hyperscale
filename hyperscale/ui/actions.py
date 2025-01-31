@@ -62,7 +62,14 @@ async def update_workflow_executions_rates(
 
 @action()
 async def update_workflow_execution_stats(
-    workflow: str, execution_stats: dict[str, dict[StepStatsType, int]]
+    workflow: str, 
+    execution_stats: dict[
+        str, 
+        dict[
+            StepStatsType,
+            int
+        ]
+    ],
 ) -> tuple[str, list[ExecutionStatsUpdate]]:
     return (
         f"update_execution_stats_{workflow}",

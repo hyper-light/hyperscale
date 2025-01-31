@@ -60,6 +60,7 @@ class TableAssembler:
         column_size: int,
         columns_count: int,
         max_width: int,
+        header_alignment: CellAlignment = "LEFT",
         cell_alignment: CellAlignment = "LEFT",
         field_format_map: Dict[str, str] | None = None,
         field_default_map: Dict[str, Any] | None = None,
@@ -70,6 +71,7 @@ class TableAssembler:
     ):
         self._border_type = border_type
         self._cell_alignment_map = CellAlignmentMap()
+        self._header_alignment = self._cell_alignment_map.by_name(header_alignment)
         self._cell_alignment = self._cell_alignment_map.by_name(cell_alignment)
         self.columns_size = column_size
         self.columns_count = columns_count
@@ -1096,6 +1098,7 @@ class TableAssembler:
                     ),
                     header_key=header,
                     color_map=self._header_color_map,
+                    is_header=True,
                 )
                 for idx, header in enumerate(headers[: self.columns_count])
             ]
@@ -1176,6 +1179,7 @@ class TableAssembler:
         position_type: CharsetPositionType,
         header_key: str | None = None,
         color_map: HeaderColorMap | DataColorMap | None = None,
+        is_header: bool = False,
     ):
         if data is None:
             data = self._field_default_map.get(header_key)
@@ -1195,6 +1199,7 @@ class TableAssembler:
         ) = self._calculate_padding(
             data_length,
             border_length,
+            is_header=is_header,
         )
 
         if adjusted_data_length > 0:
@@ -1323,6 +1328,7 @@ class TableAssembler:
         self,
         header_length: int,
         border_length: int,
+        is_header: bool = False,
     ):
         padding_total = self.columns_size - header_length - border_length
         adjusted_header_length = 0
@@ -1336,7 +1342,11 @@ class TableAssembler:
         padding_left = 0
         padding_right = 0
 
-        match self._cell_alignment:
+        alignment = self._cell_alignment
+        if is_header:
+            alignment = self._header_alignment
+
+        match alignment:
             case CellAlignmentType.LEFT:
                 padding_right = padding_total
 

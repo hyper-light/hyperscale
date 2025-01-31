@@ -3,9 +3,9 @@ import socket
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Callable, Optional, cast
 
-from ..quic.configuration import QuicConfiguration
-from ..quic.connection import QuicConnection, QuicTokenHandler
-from ..tls import SessionTicketHandler
+from hyperscale.core.engines.client.http3.protocols.quic.quic.configuration import QuicConfiguration
+from hyperscale.core.engines.client.http3.protocols.quic.quic.connection import QuicConnection, QuicTokenHandler
+from hyperscale.core.engines.client.http3.protocols.quic.tls import SessionTicketHandler
 from .protocol import QuicConnectionProtocol, QuicStreamHandler
 
 __all__ = ["connect"]
@@ -23,6 +23,7 @@ async def connect(
     token_handler: Optional[QuicTokenHandler] = None,
     wait_connected: bool = True,
     local_port: int = 0,
+    loop: asyncio.AbstractEventLoop | None = None
 ) -> AsyncGenerator[QuicConnectionProtocol, None]:
     """
     Connect to a QUIC server at the given `host` and `port`.
@@ -46,7 +47,8 @@ async def connect(
       and a :class:`asyncio.StreamWriter`.
     * ``local_port`` is the UDP port number that this client wants to bind.
     """
-    loop = asyncio.get_event_loop()
+    if loop is None:
+        loop = asyncio.get_event_loop()
     local_host = "::"
 
     # lookup remote address
@@ -78,10 +80,14 @@ async def connect(
             sock.close()
     # connect
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: create_protocol(connection, stream_handler=stream_handler),
+        lambda: QuicConnectionProtocol(
+            connection, 
+            stream_handler=stream_handler,
+            loop=loop,
+        ),
         sock=sock,
     )
-    protocol = cast(QuicConnectionProtocol, protocol)
+    # protocol = cast(QuicConnectionProtocol, protocol)
     try:
         protocol.connect(addr)
         if wait_connected:

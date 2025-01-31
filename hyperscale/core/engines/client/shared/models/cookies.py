@@ -50,15 +50,15 @@ class Cookies:
 
             for cookie in self._split:
                 if len(cookie) == 1:
-                    cookie_name = cookie[0]
+                    cookie_name = cookie[0].strip()
                     self._parsed[cookie_name] = cookie_name
 
                 elif len(cookie) == 2:
                     cookie_name, cookie_value = cookie
-                    self._parsed[cookie_name] = map_cookie_value(cookie_value)
+                    self._parsed[cookie_name.strip()] = map_cookie_value(cookie_value.strip())
 
                 else:
-                    cookie_name = cookie[0]
+                    cookie_name = cookie[0].strip()
                     self._parsed[cookie_name] = map_cookie_value(b"=".join(cookie[1:]))
 
         return self._parsed

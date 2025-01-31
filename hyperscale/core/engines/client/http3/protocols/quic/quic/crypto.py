@@ -1,8 +1,8 @@
 import binascii
 from typing import Callable, Optional, Tuple
 
-from .._crypto import AEAD, CryptoError, HeaderProtection
-from ..tls import CipherSuite, cipher_suite_hash, hkdf_expand_label, hkdf_extract
+from aioquic._crypto import AEAD, CryptoError, HeaderProtection
+from hyperscale.core.engines.client.http3.protocols.quic.tls import CipherSuite, cipher_suite_hash, hkdf_expand_label, hkdf_extract
 from .packet import decode_packet_number, is_draft_version, is_long_header
 
 CIPHER_SUITES = {

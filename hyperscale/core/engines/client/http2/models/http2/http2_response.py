@@ -49,6 +49,7 @@ class HTTP2Response(CallResult):
             float | None,
         ]
     ] = None
+    redirects: int = 0
 
     @classmethod
     def response_type(cls):
@@ -56,6 +57,29 @@ class HTTP2Response(CallResult):
 
     def check_success(self) -> bool:
         return self.status and self.status >= 200 and self.status < 300
+        
+    @property
+    def params(self):
+
+        params: list[tuple[str, str]] = []
+
+        if self.url.params and len(self.url.params) > 0:
+            params.extend([
+                tuple(param.split(
+                    '=',
+                    maxsplit=1,
+                )) for param in self.url.params.split('&')
+            ])
+
+        if self.url.query and len(self.url.query) > 0:
+            params.extend([
+                tuple(param.split(
+                    '=',
+                    maxsplit=1,
+                )) for param in self.url.query.split('&')
+            ])
+
+        return params
 
     @property
     def content_type(self):
@@ -71,7 +95,8 @@ class HTTP2Response(CallResult):
 
     @property
     def reason(self) -> Union[str, None]:
-        return self.headers.get(b"reason")
+        if self.headers:
+            return self.headers.get(b"reason")
 
     @property
     def size(self):

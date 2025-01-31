@@ -16,6 +16,10 @@ from .events import (
     DataReceived,
     StreamReset,
     WindowUpdated,
+    PingReceived,
+    PingAckReceived,
+    SettingsAcknowledged,
+    RemoteSettingsChanged,
 )
 from .fast_hpack import Decoder, Encoder
 from .frames.types.base_frame import Frame
@@ -54,9 +58,8 @@ class HTTP2Pipe:
         self.local_settings = Settings(
             client=True,
             initial_values={
-                SettingCodes.ENABLE_PUSH: 0,
                 SettingCodes.MAX_CONCURRENT_STREAMS: concurrency,
-                SettingCodes.MAX_HEADER_LIST_SIZE: 65535,
+                SettingCodes.MAX_HEADER_LIST_SIZE: 2**16,
             },
         )
         self.remote_settings = Settings(client=False)
@@ -99,7 +102,11 @@ class HTTP2Pipe:
 
             self._inbound_flow_control_window_manager.window_opened(window_increment)
 
-            connection.write(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            settings_frame = Frame(0, 0x04)
+            for setting, value in self.local_settings.items():
+                settings_frame.settings[setting] = value
+
+            connection.write(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + settings_frame.serialize())
             self._init_sent = True
 
             self.outbound_flow_control_window = self.remote_settings.initial_window_size
@@ -118,6 +125,7 @@ class HTTP2Pipe:
         connection.stream.outbound = WindowManager(
             self.remote_settings.initial_window_size
         )
+
         connection.stream.max_inbound_frame_size = self.local_settings.max_frame_size
         connection.stream.max_outbound_frame_size = self.remote_settings.max_frame_size
         connection.stream.current_outbound_window_size = (
@@ -149,7 +157,7 @@ class HTTP2Pipe:
             data = b""
 
             try:
-                data = await connection.read()
+                data = await connection.read(limit=65536 * 1024)
 
             except Exception as err:
                 return (400, headers_dict, body_data, err)
@@ -165,6 +173,7 @@ class HTTP2Pipe:
             write_data = bytearray()
             frames = None
             stream_events: List[Frame] = []
+
 
             for frame in connection.stream.frame_buffer:
                 try:
@@ -220,7 +229,7 @@ class HTTP2Pipe:
                     elif frame.type == 0x01:
                         # HEADERS
                         headers: List[Tuple[bytes, bytes]] = {}
-
+                        
                         try:
                             headers = self._decoder.decode(frame.data, raw=True)
 
@@ -260,89 +269,86 @@ class HTTP2Pipe:
 
                         if "ACK" in frame.flags:
                             changes = self.local_settings.acknowledge()
+                            if SettingCodes.INITIAL_WINDOW_SIZE in changes:
+                                setting = changes[SettingCodes.INITIAL_WINDOW_SIZE]
+                                delta = setting.new_value - (setting.original_Value or 0)
 
-                            initial_window_size_change = changes.get(
-                                SettingCodes.INITIAL_WINDOW_SIZE
-                            )
-                            max_header_list_size_change = changes.get(
-                                SettingCodes.MAX_HEADER_LIST_SIZE
-                            )
-                            max_frame_size_change = changes.get(
-                                SettingCodes.MAX_FRAME_SIZE
-                            )
-                            header_table_size_change = changes.get(
-                                SettingCodes.HEADER_TABLE_SIZE
-                            )
+                                new_max_size = connection.stream.inbound.max_window_size + delta
+                                connection.stream.inbound.window_opened(delta)
+                                connection.stream.inbound.max_window_size = new_max_size
+                   
 
-                            if initial_window_size_change is not None:
-                                window_delta = (
-                                    initial_window_size_change.new_value
-                                    - initial_window_size_change.original_value
-                                )
+                            if SettingCodes.MAX_HEADER_LIST_SIZE in changes:
+                                setting = changes[SettingCodes.MAX_HEADER_LIST_SIZE]
+                                self._decoder.max_header_list_size = setting.new_value
 
-                                new_max_window_size = (
-                                    connection.stream.inbound.max_window_size
-                                    + window_delta
-                                )
-                                connection.stream.inbound.window_opened(window_delta)
-                                connection.stream.inbound.max_window_size = (
-                                    new_max_window_size
-                                )
+                            if SettingCodes.MAX_FRAME_SIZE in changes:
+                                setting = changes[SettingCodes.MAX_FRAME_SIZE]
+                                self.max_inbound_frame_size = setting.new_value
 
-                            if max_header_list_size_change is not None:
-                                self._decoder.max_header_list_size = (
-                                    max_header_list_size_change.new_value
-                                )
-
-                            if max_frame_size_change is not None:
-                                self.max_outbound_frame_size = (
-                                    max_frame_size_change.new_value
-                                )
-
-                            if header_table_size_change:
+                            if SettingCodes.HEADER_TABLE_SIZE in changes:
+                                setting = changes[SettingCodes.HEADER_TABLE_SIZE]
                                 # This is safe across all hpack versions: some versions just won't
                                 # respect it.
-                                self._decoder.max_allowed_table_size = (
-                                    header_table_size_change.new_value
-                                )
+                                self._decoder.max_allowed_table_size = setting.new_value
 
-                        # Add the new settings.
-                        self.remote_settings.update(frame.settings)
 
-                        changes = self.remote_settings.acknowledge()
-                        initial_window_size_change = changes.get(
-                            SettingCodes.INITIAL_WINDOW_SIZE
-                        )
-                        header_table_size_change = changes.get(
-                            SettingCodes.HEADER_TABLE_SIZE
-                        )
-                        max_frame_size_change = changes.get(SettingCodes.MAX_FRAME_SIZE)
+                            ack_event = SettingsAcknowledged()
+                            ack_event.changed_settings = changes
+                            stream_events.append(ack_event)
 
-                        if initial_window_size_change:
-                            connection.stream.current_outbound_window_size = (
-                                self._guard_increment_window(
+                        else:
+                            self.remote_settings.update(frame.settings)
+                            stream_events.append(
+                                RemoteSettingsChanged(
+                                    self.remote_settings, 
+                                    frame.settings,
+                                ),
+                            )
+
+                            changes = self.remote_settings.acknowledge()
+
+                            if SettingCodes.INITIAL_WINDOW_SIZE in changes:
+                                setting = changes[SettingCodes.INITIAL_WINDOW_SIZE]
+
+                                delta = setting.new_value - (setting.original_value or 0)
+
+                                connection.stream.current_outbound_window_size = self._guard_increment_window(
                                     connection.stream.current_outbound_window_size,
-                                    initial_window_size_change.new_value
-                                    - initial_window_size_change.original_value,
+                                    delta,
                                 )
-                            )
 
-                        # HEADER_TABLE_SIZE changes by the remote part affect our encoder: cf.
-                        # RFC 7540 Section 6.5.2.
-                        if header_table_size_change:
-                            self._encoder.header_table_size = (
-                                header_table_size_change.new_value
-                            )
+                            # HEADER_TABLE_SIZE changes by the remote part affect our encoder: cf.
+                            # RFC 7540 Section 6.5.2.
+                            if SettingCodes.HEADER_TABLE_SIZE in changes:
+                                setting = changes[SettingCodes.HEADER_TABLE_SIZE]
+                                self._encoder.header_table_size = setting.new_value
 
-                        if max_frame_size_change:
-                            self.max_outbound_frame_size = (
-                                max_frame_size_change.new_value
-                            )
+                            if SettingCodes.MAX_FRAME_SIZE in changes:
+                                setting = changes[SettingCodes.MAX_FRAME_SIZE]
+                                connection.stream.max_outbound_frame_size = setting.new_value
 
-                        frame = Frame(0, 0x04)
-                        frame.flags.add("ACK")
+                            settings_frame = Frame(0, 0x04, flags=['ACK'])
+                            settings_frame.flags.add("ACK")
 
-                        frames = [frame]
+                            frames = [settings_frame]
+
+                    elif frame.type == 0x06:
+                        # PING
+                        
+                        if "ACK" in frame.flags:
+                            event = PingAckReceived()
+
+                        else:
+                            event = PingReceived()
+                            ping_frame = Frame(0, 0x06)
+                            ping_frame.flags.add("ACK")
+                            ping_frame.opaque_data = frame.opaque_data
+                            frames.append(ping_frame)
+
+                        event.data = frame.opaque_data
+                        stream_events.append(event)
+
 
                     elif frame.type == 0x08:
                         # WINDOW UPDATE
@@ -360,9 +366,10 @@ class HTTP2Pipe:
                                 event.delta = increment
 
                                 try:
-                                    self.outbound_flow_control_window = (
+                                    connection.stream.current_outbound_window_size = (
                                         self._guard_increment_window(
-                                            self.outbound_flow_control_window, increment
+                                            connection.stream.current_outbound_window_size,
+                                            increment
                                         )
                                     )
                                 except StreamError:
@@ -387,7 +394,8 @@ class HTTP2Pipe:
                         else:
                             self.outbound_flow_control_window = (
                                 self._guard_increment_window(
-                                    self.outbound_flow_control_window, increment
+                                    self.outbound_flow_control_window,
+                                    increment,
                                 )
                             )
                             # FIXME: Should we split this into one event per active stream?

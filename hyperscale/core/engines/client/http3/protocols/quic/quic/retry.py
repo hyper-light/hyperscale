@@ -4,8 +4,8 @@ from typing import Tuple
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from ..buffer import Buffer
-from ..tls import pull_opaque, push_opaque
+from hyperscale.core.engines.client.http3.protocols.quic.buffer import Buffer
+from hyperscale.core.engines.client.http3.protocols.quic.tls import pull_opaque, push_opaque
 from .connection import NetworkAddress
 
 

@@ -5,18 +5,10 @@ import pathlib
 import sys
 import uvloop
 
-
-from hyperscale.core.jobs.runner.local_runner import LocalRunner
-from hyperscale.graph import Workflow
 from hyperscale.ui.components.header import Header, HeaderConfig
 from hyperscale.ui.components.text import Text, TextConfig
 from hyperscale.ui.components.terminal import Section, SectionConfig
 from hyperscale.ui.components.terminal import Terminal
-from .cli import (
-    CLI,
-    CLIStyle,
-)
-from hyperscale.core.jobs.models import HyperscaleConfig
 from .cli import CLI
 from .workflow import test
 
@@ -151,6 +143,12 @@ async def new(
     path: str,
     overwrite: bool = False,
 ):
+    '''
+    Create a new test at the provided path
+
+    @param path The path to create the test file at
+    @param overwrite If specified, if a file exists at the provided path it will be overwritten
+    '''
     loop = asyncio.get_event_loop()
 
     test_path = await loop.run_in_executor(

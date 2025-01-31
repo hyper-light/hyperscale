@@ -32,8 +32,6 @@ class RemoteSettingsChanged(BaseEvent):
         #: :class:`ChangedSetting <h2.settings.ChangedSetting>`, representing
         #: the changed settings.
         self.changed_settings: dict[int, ChangedSetting] = {}
-        self.flow_controlled_length = None
-        self.data: bytes | None = None
 
         for setting, new_value in new_settings.items():
 

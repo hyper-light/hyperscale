@@ -53,7 +53,7 @@ class Mutation(OptimizedArg, Generic[T]):
 
         self.optimized: Optional[bytes] = None
         self.content_length: Optional[int] = None
-        self.content_type = "application/json"
+        self.content_type = "application/graphql-response+json"
 
     async def optimize(self):
         if self.optimized is not None:

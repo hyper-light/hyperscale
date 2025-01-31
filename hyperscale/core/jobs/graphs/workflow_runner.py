@@ -877,13 +877,13 @@ class WorkflowRunner:
         await asyncio.gather(
             *[asyncio.create_task(
                 cancel_pending(pend),
-            ) for pend in pending],
+            ) for pend in pending],self._failed[run_id][workflow_name],
             return_exceptions=True
         )
 
         if len(self._failed[run_id][workflow_name]) > 0:
             await asyncio.gather(
-                self._failed[run_id][workflow_name],
+                *self._failed[run_id][workflow_name],
                 return_exceptions=True,
             )
 
@@ -1011,7 +1011,7 @@ class WorkflowRunner:
                     result = err
 
                     self._failed[run_id][workflow_name].append(complete)
-
+                
                 context[step_name] = result
                 self._completed_counts[run_id][workflow_name].increment()
 

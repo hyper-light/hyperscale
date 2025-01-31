@@ -8,6 +8,7 @@ from .cli import (
     CLIStyle,
 )
 from .new import new
+from .ping import ping
 from .run import run
 
 
@@ -63,6 +64,7 @@ async def create_header():
 
 @CLI.root(
     new,
+    ping,
     run,
     global_styles=CLIStyle(
         header=create_header,
