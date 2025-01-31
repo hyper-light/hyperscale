@@ -45,7 +45,6 @@ async def make_websocket_request(
         method,
     )
 
-
     try:
         match method:
             case "send":
