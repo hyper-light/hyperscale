@@ -215,19 +215,18 @@ class LocalRunner:
                 await self._remote_manger.shutdown_workers()
                 await self._remote_manger.close()
 
-                if results.get('timeouts') and len(results.get('timeouts')) > 0:
-                    loop = asyncio.get_event_loop()
-                    children = await loop.run_in_executor(
-                        None,
-                        active_children
-                    )
+                loop = asyncio.get_event_loop()
+                children = await loop.run_in_executor(
+                    None,
+                    active_children
+                )
 
-                    await asyncio.gather(*[
-                        loop.run_in_executor(
-                            None,
-                            child.terminate
-                        ) for child in children
-                    ])
+                await asyncio.gather(*[
+                    loop.run_in_executor(
+                        None,
+                        child.terminate
+                    ) for child in children
+                ])
 
                 await ctx.log_prepared(f'Stopping Hyperscale Server Pool for test {test_name}', name='debug')
                 await self._server_pool.shutdown()
