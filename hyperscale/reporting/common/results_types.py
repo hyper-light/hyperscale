@@ -88,15 +88,18 @@ WorkflowContextResult = Dict[str, Any | Exception]
 
 WorkflowResultsSet = WorkflowStats | WorkflowContextResult
 
+TimeoutSet = Dict[str, Exception]
+
 
 RunResults = Dict[
     Literal[
         "workflow",
         "results",
+        "timeouts",
     ],
     str
     | Dict[
         str,
         WorkflowStats | WorkflowContextResult,
-    ],
+    ] | TimeoutSet,
 ]

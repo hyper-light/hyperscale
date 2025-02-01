@@ -238,6 +238,8 @@ class RemoteGraphManager:
 
             workflow_results: Dict[str, List[WorkflowResultsSet]] = defaultdict(list)
 
+            timeouts: dict[str, Exception] = {}
+
             for workflow_set in workflow_traversal_order:
                 provisioned_batch, workflow_vus = self._provision(workflow_set)
 
@@ -287,15 +289,18 @@ class RemoteGraphManager:
                 ))
 
                 workflow_results.update(
-                    {workflow_name: results for workflow_name, results in results}
+                    {workflow_name: results for workflow_name, results, timeout_error in results if timeout_error is None}
                 )
 
+                for workflow_name, _, timeout_error in results:
+                    timeouts[workflow_name] = timeout_error
+         
             await ctx.log_prepared(
                 message=f'Graph {test_name} completed execution',
                 name='debug'
             )
 
-            return {"test": test_name, "results": workflow_results}
+            return {"test": test_name, "results": workflow_results, 'timeouts': timeouts}
 
     def _create_workflow_graph(self, workflows: List[Workflow | DependentWorkflow]):
         workflow_graph = networkx.DiGraph()
@@ -349,7 +354,7 @@ class RemoteGraphManager:
         workflow: Workflow,
         threads: int,
         workflow_vus: List[int],
-    ) -> Tuple[str, WorkflowStats | WorkflowContextResult | Exception]:
+    ) -> Tuple[str, WorkflowStats | WorkflowContextResult, Exception | None]:
         
         workflow_slug = workflow.name.lower()
         
@@ -680,7 +685,7 @@ class RemoteGraphManager:
 
                 self._provisioner.release(threads)
 
-                return (workflow.name, execution_result)
+                return (workflow.name, execution_result, timeout_error)
             
         except (
             KeyboardInterrupt,
