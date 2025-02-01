@@ -78,6 +78,9 @@ class HyperscaleInterface:
             )
 
     async def _run(self):
+
+        start = time.monotonic()
+
         while not self._run_switch_loop.is_set():
             await asyncio.gather(
                 *[
@@ -88,9 +91,14 @@ class HyperscaleInterface:
                 ]
             )
 
-            active_workflows_update: (
-                list[str] | None
-            ) = await self._updates.get_active_workflows(self._config.update_interval)
+            active_workflows_update: list[str] | None = None
+
+            elapsed = time.monotonic() - start
+
+            if self._active_workflow == 'initializing':
+                active_workflows_update: (
+                    list[str] | None
+                ) = await self._updates.get_active_workflows(self._config.update_interval)
 
             if isinstance(active_workflows_update, list):
                 self._active_workflows = active_workflows_update
@@ -100,10 +108,14 @@ class HyperscaleInterface:
                 ]
 
             elif len(self._active_workflows) > 0:
+                self._active_workflow = self._active_workflows[self._current_active_idx]
+
+            
+            if not isinstance(active_workflows_update, list) and elapsed > self._config.update_interval:
                 self._current_active_idx = (self._current_active_idx + 1) % len(
                     self._active_workflows
                 )
-                self._active_workflow = self._active_workflows[self._current_active_idx]
+                start = time.monotonic()
 
     async def stop(self):
         if self._run_switch_loop.is_set() is False:

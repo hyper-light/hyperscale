@@ -220,7 +220,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         threads: int,
         workflow_vus: List[int],
         update_callback: Callable[[int, WorkflowStatus], Awaitable[None]],
-    ):    
+    ):   
         task_id = self.id_generator.generate()
         default_config = {   
             "node_id": self._node_id_base,
@@ -925,7 +925,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             ]:
                 self.tasks.stop("push_workflow_status_update")
 
-            await self.broadcast(
+            await self.send(
                 "receive_status_update",
                 JobContext(
                     WorkflowStatusUpdate(
@@ -940,6 +940,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     ),
                     run_id=run_id,
                 ),
+                node_id=node_id,
             )
 
     @task(
@@ -960,7 +961,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             Awaitable[None],
         ],
     ):
-        
         async with self._logger.context(
             name=f'workflow_run_{run_id}',
         ) as ctx:
@@ -1016,7 +1016,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     avg_memory_usage_mb=avg_mem_usage_mb,
                 )
             )
-
+            
     async def close(self) -> None:
         await super().close()
         await self._workflows.close()

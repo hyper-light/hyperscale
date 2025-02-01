@@ -1,9 +1,10 @@
-from hyperscale.graph import Workflow, step
-from hyperscale.testing import URL, HTTPResponse, Data, Headers
+from hyperscale.graph import Workflow, step, depends
+from hyperscale.testing import URL, HTTPResponse
+
 
 
 class Test(Workflow):
-    vus = 1000
+    vus = 4000
     duration = "1m"
 
     @step()
@@ -11,34 +12,21 @@ class Test(Workflow):
         self,
         url: URL = "https://httpbin.org/get",
     ) -> HTTPResponse:
-        response = await self.client.http.get(url)
-        assert response.status is not None, "Err. - incomplete request"
-        assert response.status >= 200 and response.status < 300, "Err. - requested failed"
-
-        return response
-
-    @step('login')
-    async def new_user(
-        self,
-        url: URL = "https://httpbin.org/post",
-        headers: Headers = {
-            "content-type": "application/json"
-        },
-        login: HTTPResponse = None,
-    ) -> HTTPResponse:
-        response = await self.client.http.post(
+        return await self.client.http.get(
             url,
-            headers=headers,
-            data={
-                "name": "ada",
-                "status": login.status,
-            },
         )
-        assert response.status is not None, "Err. - incomplete request"
-        assert response.status >= 200 and response.status < 300, "Err. - requested failed"
-        
-        data = response.json()
+    
 
-        assert isinstance(data, dict), "Err. - no data found"
-        
-        return response
+class TestSecond(Workflow):
+    vus = 4000
+    duration = "1m"
+
+    @step()
+    async def login(
+        self,
+        url: URL = "https://httpbin.org/get",
+    ) -> HTTPResponse:
+        return await self.client.http.get(
+            url,
+        )
+    

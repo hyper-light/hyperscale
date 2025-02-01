@@ -71,6 +71,7 @@ async def update_workflow_execution_stats(
         ]
     ],
 ) -> tuple[str, list[ExecutionStatsUpdate]]:
+    
     return (
         f"update_execution_stats_{workflow}",
         [

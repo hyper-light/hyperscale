@@ -358,7 +358,7 @@ class RemoteGraphManager:
             default_config = {   
                 "workflow": workflow.name,
                 "run_id": run_id,
-                "workers": self._threads,
+                "workers": threads,
                 "workflow_vus": workflow.vus,
                 "duration": workflow.duration,
             }

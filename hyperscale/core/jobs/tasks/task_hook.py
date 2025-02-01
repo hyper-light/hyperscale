@@ -1,4 +1,5 @@
 import asyncio
+from collections import defaultdict
 import time
 from typing import (
     Callable,
@@ -35,8 +36,8 @@ class Task(Generic[T]):
 
         self.call = task
         self._runs: Dict[int, Run] = {}
-        self._schedule: Optional[asyncio.Task] = None
-        self._schedule_running: bool = False
+        self._schedules: Dict[int, asyncio.Task] = {}
+        self._schedule_running_statuses: Dict[int, bool] = defaultdict(lambda: False)
 
         self._snowflake_generator = snowflake_generator
 
@@ -76,8 +77,11 @@ class Task(Generic[T]):
             await run.cancel()
 
     async def cancel_schedule(self):
-        self._schedule_running = False
-        await cancel(self._schedule)
+        for run_id in self._schedule_running_statuses:
+            self._schedule_running_statuses[run_id] = False
+        await asyncio.gather(*[
+            cancel(scheduled) for scheduled in self._schedules.values()
+        ])
 
     async def shutdown(self):
         for run in self._runs.values():
@@ -89,13 +93,13 @@ class Task(Generic[T]):
         for run in self._runs.values():
             run.abort()
 
-        self._schedule_running = False
+            self._schedule_running_statuses[run.run_id] = False
 
-        try:
-            self._schedule.set_result(None)
+            try:
+                self._schedules[run.run_id].set_result(None)
 
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     async def cleanup(self):
         match self.keep_policy:
@@ -160,7 +164,8 @@ class Task(Generic[T]):
         return run
 
     def stop(self):
-        self._schedule_running = False
+        for run_id in self._schedule_running_statuses:
+            self._schedule_running_statuses[run_id] = False
 
     def run_schedule(
         self,
@@ -175,12 +180,11 @@ class Task(Generic[T]):
         if timeout is None:
             timeout = self.timeout
 
-        if self._schedule is None and self._schedule_running is False:
-            self._schedule_running = True
-
+        if self._schedules.get(run_id) is None and self._schedule_running_statuses[run_id] is False:
+            self._schedule_running_statuses[run_id] = True
             run = Run(run_id, self.call, timeout=timeout)
 
-            self._schedule = asyncio.ensure_future(
+            self._schedules[run_id] = asyncio.ensure_future(
                 self._run_schedule(run, *args, **kwargs)
             )
 
@@ -192,7 +196,7 @@ class Task(Generic[T]):
         self._runs[run.run_id] = run
 
         if self.repeat == "ALWAYS":
-            while self._schedule_running:
+            while self._schedule_running_statuses[run.run_id]:
                 run.execute(*args, **kwargs)
 
                 await asyncio.sleep(self.schedule)
@@ -203,10 +207,11 @@ class Task(Generic[T]):
                 )
 
                 self._runs[run.run_id] = run
+                self._schedule_running_statuses[run.run_id] = True
 
         elif isinstance(self.repeat, int):
             for _ in range(self.repeat):
-                if self._schedule_running is False:
+                if self._schedule_running_statuses[run.run_id] is False:
                     await run.cancel()
                     break
 
@@ -220,6 +225,7 @@ class Task(Generic[T]):
                 )
 
                 self._runs[run.run_id] = run
+                self._schedule_running_statuses[run.run_id] = True
 
     async def _run(self, run: Run, *args, **kwargs):
         run.update_status(RunStatus.PENDING)

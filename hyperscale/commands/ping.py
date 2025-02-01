@@ -1,4 +1,5 @@
 import json
+from ipaddress import IPv4Address, IPv6Address
 from typing import Literal, Any
 from hyperscale.core.engines.client.time_parser import TimeParser
 from .requests import (
@@ -46,6 +47,31 @@ def load_data(data: str | None):
     
     except Exception:
         return data
+    
+def is_missing_http_prefix(url: str):
+
+    address = url.split(':', maxsplit=1)
+    host: str | None = None
+    
+    if len(address) == 2:
+        host, _ = address
+
+    elif len(address) == 1:
+        host = address[0]
+
+    if url.startswith("http://") or url.startswith('https://'):
+        return False
+    
+    elif isinstance(
+        host,
+        IPv4Address
+    ) or isinstance(
+        host,
+        IPv6Address
+    ):
+        return False
+    
+    return True
 
 
 @CLI.command(
@@ -112,6 +138,9 @@ async def ping(
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
     '''
+
+    if client.data in ['http', 'http2', 'http3', 'graphql', 'graphqlh2'] and is_missing_http_prefix(url):
+        url = f'http://{url}'
 
     if lookup:
         return await lookup_url(
