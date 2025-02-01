@@ -216,7 +216,6 @@ def create_lookup_ui(
                     border_color="aquamarine_2",
                     terminal_mode="extended",
                     table_format="simple",
-                    cell_alignment="LEFT",
                 ),
                 subscriptions=["update_socket_info"],
             )
