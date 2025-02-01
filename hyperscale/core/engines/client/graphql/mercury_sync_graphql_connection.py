@@ -590,8 +590,11 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
 
-            elif isinstance(request_url, URL):
+            elif isinstance(request_url, URL) and request_url.optimized:
                 request_url: ParseResult = request_url.optimized.parsed
+
+            elif isinstance(request_url, URL):
+                request_url: ParseResult = urlparse(request_url.data)
 
             timings["read_end"] = time.monotonic()
 

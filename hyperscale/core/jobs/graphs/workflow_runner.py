@@ -755,7 +755,7 @@ class WorkflowRunner:
                         }
                     )
 
-                if len(hook.optimized_args) > 0 and hook.hook_type == HookType.TEST:
+                if len(hook.optimized_args) > 0:
                     for arg in hook.optimized_args.values():
                         arg.call_name = hook.name
 
@@ -871,13 +871,6 @@ class WorkflowRunner:
                 )
                 for pend in self._pending[run_id][workflow.name]
             ],
-            return_exceptions=True
-        )
-
-        await asyncio.gather(
-            *[asyncio.create_task(
-                cancel_pending(pend),
-            ) for pend in pending],self._failed[run_id][workflow_name],
             return_exceptions=True
         )
 
@@ -1214,6 +1207,31 @@ class WorkflowRunner:
                 message=f'Closing Workflow Runner at {self._node_id}',
                 level=LogLevel.INFO
             ))
+
+            await asyncio.gather(
+            *[
+                    asyncio.create_task(
+                        cancel_pending(pend),
+                    )
+                    for run_id in self._pending 
+                    for workflow_name in self._pending[run_id] 
+                    for pend in self._pending[run_id][workflow_name]
+                ],
+                return_exceptions=True
+            )
+
+            await asyncio.gather(
+                *[
+                    asyncio.create_task(
+                        cancel_pending(pend),
+                    )
+                    for run_id in self._pending 
+                    for workflow_name in self._pending[run_id] 
+                    for pend in self._pending[run_id][workflow_name]
+                ],
+                return_exceptions=True
+            )
+
             
             for job in self._running_workflows.values():
                 for workflow in job.values():
@@ -1232,6 +1250,56 @@ class WorkflowRunner:
 
     def abort(self):
         self._logger.abort()
+
+
+        for run_id in self._pending:
+            for workflow_name in self._pending[run_id]:
+                for pend in self._pending[run_id][workflow_name]:
+                    try:
+                        pend.exception()
+
+                    except (
+                        asyncio.CancelledError,
+                        asyncio.InvalidStateError,
+                        Exception
+                    ):
+                        pass
+
+                    try:
+                        pend.cancel()
+
+                    except (
+                        asyncio.CancelledError,
+                        asyncio.InvalidStateError,
+                        Exception
+                    ):
+                        pass
+
+
+
+        for run_id in self._failed:
+            for workflow_name in self._failed[run_id]:
+                for pend in self._failed[run_id][workflow_name]:
+                    try:
+                        pend.exception()
+
+                    except (
+                        asyncio.CancelledError,
+                        asyncio.InvalidStateError,
+                        Exception
+                    ):
+                        pass
+
+                    try:
+                        pend.cancel()
+
+                    except (
+                        asyncio.CancelledError,
+                        asyncio.InvalidStateError,
+                        Exception
+                    ):
+                        pass
+        
         
         for job in self._running_workflows.values():
             for workflow in job.values():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+import socket
 import time
 from collections import defaultdict
 from typing import (
@@ -438,40 +439,37 @@ class MercurySyncHTTPConnection:
             self._optimized[optimized_param.call_name] = optimized_param
 
     async def _optimize_url(self, optimized_url: URL):
-        try:
-            upgrade_ssl: bool = False
+
+        upgrade_ssl: bool = False
+        (
+            _,
+            connection,
+            url,
+            upgrade_ssl,
+        ) = await asyncio.wait_for(
+            self._connect_to_url_location(optimized_url),
+            timeout=self.timeouts.connect_timeout,
+        )
+        if upgrade_ssl:
+            optimized_url.data = optimized_url.data.replace("http://", "https://")
+
+            await optimized_url.optimize()
+
             (
                 _,
                 connection,
                 url,
-                upgrade_ssl,
+                _,
             ) = await asyncio.wait_for(
                 self._connect_to_url_location(optimized_url),
                 timeout=self.timeouts.connect_timeout,
             )
-            if upgrade_ssl:
-                optimized_url.data = optimized_url.data.replace("http://", "https://")
 
-                await optimized_url.optimize()
+        self._url_cache[optimized_url.optimized.hostname] = url
+        self._optimized[optimized_url.call_name] = url
 
-                (
-                    _,
-                    connection,
-                    url,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(optimized_url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-            self._url_cache[optimized_url.optimized.hostname] = url
-            self._optimized[optimized_url.call_name] = url
-
-            self._connections.append(connection)
-
-        except Exception:
-            pass
-
+        self._connections.append(connection)
+        
     async def _request(
         self,
         url: str | URL,
@@ -820,7 +818,10 @@ class MercurySyncHTTPConnection:
                 timings,
             )
 
-        except Exception:
+        except (
+            Exception,
+            socket.error
+        ):
             self._connections.append(
                 HTTPConnection(
                     reset_connections=self.reset_connections,
@@ -830,8 +831,11 @@ class MercurySyncHTTPConnection:
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
 
-            elif isinstance(request_url, URL):
+            elif isinstance(request_url, URL) and request_url.optimized:
                 request_url: ParseResult = request_url.optimized.parsed
+
+            elif isinstance(request_url, URL):
+                request_url: ParseResult = urlparse(request_url.data)
 
             timings["read_end"] = time.monotonic()
 
@@ -851,7 +855,7 @@ class MercurySyncHTTPConnection:
                 False,
                 timings,
             )
-
+        
     async def _connect_to_url_location(
         self,
         request_url: str | URL,

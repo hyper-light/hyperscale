@@ -44,4 +44,5 @@ class URL(OptimizedArg, Generic[T]):
             family=address_family,
             protocol=protocol,
         )
+
         await self.optimized.lookup()
