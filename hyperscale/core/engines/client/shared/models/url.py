@@ -1,4 +1,5 @@
 import socket
+from socket import AddressFamily, SocketKind
 from asyncio.events import get_event_loop
 from ipaddress import IPv4Address, ip_address
 from typing import List, Tuple, Union
@@ -47,7 +48,10 @@ class URL:
         self.family = family
         self.protocol = protocol
         self.loop = None
-        self.ip_addresses: List[Tuple[str, IpAddressInfo]] = []
+        self.ip_addresses: List[Tuple[
+            Tuple[str, int], 
+            Tuple[AddressFamily, SocketKind, int, str, Tuple[str, int]]
+        ]] = []
         self.address: Union[str, None] = None
         self.socket_config: Union[Tuple[str, int], Tuple[str, int, int, int], None] = (
             None
@@ -83,7 +87,10 @@ class URL:
         self.family = family
         self.protocol = protocol
         self.loop = None
-        self.ip_addresses: List[Tuple[Tuple[str, int], IpAddressInfo]] = []
+        self.ip_addresses: List[Tuple[
+            Tuple[str, int], 
+            Tuple[AddressFamily, SocketKind, int, str, Tuple[str, int]]
+        ]] = []
         self.address: Union[str, None] = None
 
     async def lookup(self):

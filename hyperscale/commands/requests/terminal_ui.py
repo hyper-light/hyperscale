@@ -14,12 +14,7 @@ async def update_redirects(redirects: int):
 
 @action()
 async def update_elapsed(elapsed: float):
-    rounded_time = round(
-        elapsed,
-        2
-    )
-
-    return f'Elapsed: {rounded_time}s'
+    return f'Elapsed: {elapsed:.2f}s'
 
 @action()
 async def update_text(message: str):

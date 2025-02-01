@@ -69,6 +69,14 @@ async def make_graphql_request(
     )
 
     try:
+
+        if quiet is False:
+            await terminal.render(
+                horizontal_padding=4,
+                vertical_padding=1
+            )
+
+
         match method:
             case "query":
                 response = await graphql.query(

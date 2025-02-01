@@ -56,6 +56,14 @@ async def make_udp_request(
     )
 
     try:
+
+        if quiet is False:
+            await terminal.render(
+                horizontal_padding=4,
+                vertical_padding=1
+            )
+
+
         match method:
             case "send":
                 response = await udp.send(

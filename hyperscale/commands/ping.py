@@ -9,6 +9,7 @@ from .requests import (
     make_http3_request,
     make_udp_request,
     make_websocket_request,
+    lookup_url,
 )
 from .cli import (
     CLI,
@@ -102,7 +103,18 @@ async def ping(
     @param options A string, JSON compatible string/any map of arbitrary config options
     @param redirects The maximum number of redirects to follow
     @param timeout The request timeout
+    @param filepath Output the request results to the specified filepath
+    @param lookup Execute only the IP address lookup and output matches
+    @param wait Don't exit once the request completes or fails
+    @param quiet Mutes all terminal output
     '''
+
+    if lookup:
+        return await lookup_url(
+            url,
+            wait=wait,
+            quiet=quiet,
+        )
     
     timeout_seconds = TimeParser(timeout).time
     
