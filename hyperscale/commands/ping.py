@@ -57,13 +57,13 @@ async def ping(
     url: str,
     method: AssertSet[
         Literal[
-            "get",
-            "post",
-            "put",
-            "patch",
-            "delete",
-            "head",
-            "options",
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "HEAD",
+            "OPTIONS",
             "send",
             "receive",
             "bidirectional",
@@ -121,12 +121,14 @@ async def ping(
         )
     
     timeout_seconds = TimeParser(timeout).time
+
+    method_name = method.data.lower()
     
     match client.data:
         case "graphql":
             return await make_graphql_request(
                 url,
-                method=method.data,       
+                method=method_name,       
                 cookies=[
                     cookie.strip().split(
                         "=",
@@ -146,7 +148,7 @@ async def ping(
         case "graphqlh2":
             return await make_graphqlh2_request(
                 url,      
-                method=method.data,       
+                method=method_name,       
                 cookies=[
                     cookie.strip().split(
                         "=",
@@ -168,7 +170,7 @@ async def ping(
         case "http":
             return await make_http_request(
                 url,
-                method=method.data,       
+                method=method_name,       
                 cookies=[
                     cookie.strip().split(
                         "=",
@@ -188,7 +190,7 @@ async def ping(
         case "http2":
             return await make_http2_request(
                 url,
-                method=method.data,       
+                method=method_name,       
                 cookies=[
                     cookie.strip().split(
                         "=",
@@ -207,7 +209,7 @@ async def ping(
         case "http3":
             return await make_http3_request(
                 url,
-                method=method.data,       
+                method=method_name,       
                 cookies=[
                     cookie.strip().split(
                         "=",
@@ -226,7 +228,7 @@ async def ping(
         case "udp":
             return await make_udp_request(
                 url,
-                method=method.data,
+                method=method_name,
                 data=data,
                 options=options,
                 timeout=timeout,
@@ -238,7 +240,7 @@ async def ping(
         case "websocket":
             return await make_websocket_request(
                 url,
-                method=method.data,       
+                method=method_name,       
                 cookies=[
                     cookie.strip().split(
                         "=",

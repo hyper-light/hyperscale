@@ -10,6 +10,7 @@ from hyperscale.commands.cli.arg_types.data_types import (
     Pattern,
     RawFile,
 )
+from hyperscale.commands.cli.arg_types.data_types.reduce_pattern_type import reduce_pattern_type
 from hyperscale.commands.cli.arg_types.operators import Operator
 from typing import (
     Literal,
@@ -101,9 +102,6 @@ class KeywordArg(Generic[T]):
         if len(args) > 0 and self._is_complex_type is False:
             self._value_type = args
 
-        elif self._is_complex_type:
-            self._value_type = tuple([data_type])
-
         else:
             self._value_type = tuple([data_type])
 
@@ -122,10 +120,19 @@ class KeywordArg(Generic[T]):
         if inspect.isfunction(default) or inspect.ismethod(default):
             self.default_is_callable = True
 
+        base_type = [data_type]
+        if self._is_complex_type:
+            base_type = reduce_pattern_type(data_type)
+
         self.default = default
         self.group = group
         self.arg_type: KeywordArgType = arg_type
-        self._data_type = [subtype_type.__name__ for subtype_type in self.value_type]
+        self._data_type = [
+            subtype_type.__name__ 
+            if hasattr(subtype_type, '__name__') 
+            else subtype_type 
+            for subtype_type in base_type
+        ]
 
         self.description = description
 
