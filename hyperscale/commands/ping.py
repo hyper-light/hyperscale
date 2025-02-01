@@ -48,7 +48,11 @@ def load_data(data: str | None):
         return data
 
 
-@CLI.command()
+@CLI.command(
+    shortnames={
+        'headers': 'H'
+    }
+)
 async def ping(
     url: str,
     method: AssertSet[
