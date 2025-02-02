@@ -36,7 +36,7 @@ from hyperscale.core.jobs.models import Env, Message
 
 from hyperscale.core.snowflake import Snowflake
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
-from hyperscale.logging import Logger, Entry, LogLevel
+from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
     ControllerTrace,
     ControllerDebug,
@@ -132,9 +132,13 @@ class UDPProtocol(Generic[T, K]):
             yield node_id
 
     async def run_forever(self):
-        self._run_future = self._loop.create_future()
+        try:
 
-        await self._run_future
+            self._run_future = self._loop.create_future()
+            await self._run_future
+
+        except asyncio.CancelledError:
+            pass
 
     async def connect_client(
         self,
@@ -218,14 +222,15 @@ class UDPProtocol(Generic[T, K]):
 
                 run_start = False
 
-            except Exception:
-                pass
+            except (
+                Exception,
+                asyncio.CancelledError,
+                socket.error,
+                OSError
+            ):
+                import traceback
+                print(traceback.format_exc())
 
-            except OSError:
-                pass
-
-            except asyncio.CancelledError:
-                pass
 
             await asyncio.sleep(self._retry_interval)
         
@@ -379,7 +384,11 @@ class UDPProtocol(Generic[T, K]):
                         socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
                     )
 
-                    self.udp_socket.bind((self.host, self.port))
+                    await self._loop.run_in_executor(
+                        None,
+                        self.udp_socket.bind,
+                        (self.host, self.port)
+                    )
 
                     self.udp_socket.setblocking(False)
 
@@ -403,10 +412,12 @@ class UDPProtocol(Generic[T, K]):
                     self.host = host
                     self.port = port
 
+                    run_start = False
                     self.connected = True
+
                     self._cleanup_task = self._loop.create_task(self._cleanup())
 
-                if self.connected is False:
+                if self.connected is False and worker_server is None:
                     server = self._loop.create_datagram_endpoint(
                         lambda: UDPSocketProtocol(self.read), sock=self.udp_socket
                     )
@@ -414,10 +425,10 @@ class UDPProtocol(Generic[T, K]):
                     transport, _ = await server
 
                     self._transport = transport
-
                     self._cleanup_task = self._loop.create_task(self._cleanup())
 
                     run_start = False
+                    self.connected = True
 
             except (
                 Exception,
@@ -462,6 +473,17 @@ class UDPProtocol(Generic[T, K]):
                 )
             }
         )
+
+        self._start_tasks()
+    
+    def _start_tasks(self):
+        self.tasks.start_cleanup()
+        for task in self.tasks.all_tasks():
+            task.call = task.call.__get__(self, self.__class__)
+            setattr(self, task.name, task.call)
+
+            if task.trigger == "ON_START":
+                self.tasks.run(task.name)
 
     def _create_udp_ssl_context(
         self,
@@ -1034,9 +1056,8 @@ class UDPProtocol(Generic[T, K]):
                 name='info',
             )
 
-            await self._shutdown_task
-
-            self._running = False
+            if self._shutdown_task:
+                await self._shutdown_task
 
             if self._transport:
                 try:
@@ -1096,7 +1117,10 @@ class UDPProtocol(Generic[T, K]):
                     name='debug',
                 )
 
-            if self._run_future and not self._run_future.done():
+            if self._run_future and (
+                not self._run_future.done()
+                or not self._run_future.cancelled()
+            ):
                 try:
                     self._run_future.set_result(None)
 
@@ -1143,11 +1167,17 @@ class UDPProtocol(Generic[T, K]):
     def abort(self):
         self._running = False
 
-
         for pending in self._pending_responses:
             try:
                 pending.cancel()
 
+            except Exception:
+                pass
+
+        if self._shutdown_task:
+            try:
+                self._shutdown_task.set_result(None)
+            
             except Exception:
                 pass
 

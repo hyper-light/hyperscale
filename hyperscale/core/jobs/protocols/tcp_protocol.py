@@ -31,6 +31,14 @@ from hyperscale.core.jobs.hooks.hook_type import HookType
 from hyperscale.core.jobs.models import Env, Message
 from hyperscale.core.jobs.tasks import TaskRunner
 from hyperscale.core.snowflake import Snowflake
+from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import (
+    ControllerTrace,
+    ControllerDebug,
+    ControllerInfo,
+    ControllerError,
+    ControllerFatal,
+)
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 
 from .client_protocol import MercurySyncTCPClientProtocol
@@ -52,6 +60,7 @@ class TCPProtocol(Generic[T, K]):
         self.node_id: int | None = None
 
         self.id_generator: Optional[SnowflakeGenerator] = None
+        self._logger = Logger()
 
         self.env = env
 
@@ -97,6 +106,8 @@ class TCPProtocol(Generic[T, K]):
         self._request_timeout = TimeParser(env.MERCURY_SYNC_REQUEST_TIMEOUT).time
         self._connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_TIMEOUT).time
         self._retry_interval = TimeParser(env.MERCURY_SYNC_RETRY_INTERVAL).time
+        self._shutdown_poll_rate = TimeParser(env.MERCURY_SYNC_SHUTDOWN_POLL_RATE).time
+        self._retries = env.MERCURY_SYNC_SEND_RETRIES
 
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
         self._tcp_connect_retries = env.MERCURY_SYNC_CONNECT_RETRIES
@@ -105,6 +116,8 @@ class TCPProtocol(Generic[T, K]):
         self._nodes: Optional[LockedSet[int]] = None
         self._abort_handle_created: bool = None
         self._connect_lock: asyncio.Lock | None = None
+        self._shutdown_task: asyncio.Future | None = None
+
 
     @property
     def nodes(self):
@@ -115,26 +128,39 @@ class TCPProtocol(Generic[T, K]):
 
     async def start_server(
         self,
+        logfile: str,
         cert_path: Optional[str] = None,
         key_path: Optional[str] = None,
         worker_socket: Optional[socket.socket] = None,
         worker_server: Optional[asyncio.Server] = None,
     ):
-        try:
-            if self._loop is None:
-                self._loop = asyncio.get_event_loop()
+        if self._loop is None:
+            self._loop = asyncio.get_event_loop()
 
-            if not self._abort_handle_created:
-                for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
-                    self._loop.add_signal_handler(
-                        getattr(
-                            signal,
-                            signame,
-                        ),
-                        self.abort,
-                    )
+        if not self._abort_handle_created:
+            for signame in ("SIGINT", "SIGTERM", "SIG_IGN"):
+                self._loop.add_signal_handler(
+                    getattr(
+                        signal,
+                        signame,
+                    ),
+                    self.abort,
+                )
 
-            self._events: Dict[str, Callable[[int, T], Awaitable[K]]] = {
+        self._events: Dict[str, Callable[[int, T], Awaitable[K]]] = {
+            name: receive_hook
+            for name, receive_hook in inspect.getmembers(
+                self,
+                predicate=lambda member: hasattr(
+                    member,
+                    "hook_type",
+                )
+                and getattr(member, "hook_type") == HookType.RECEIVE,
+            )
+        }
+
+        self._events.update(
+            {
                 name: receive_hook
                 for name, receive_hook in inspect.getmembers(
                     self,
@@ -142,149 +168,173 @@ class TCPProtocol(Generic[T, K]):
                         member,
                         "hook_type",
                     )
-                    and getattr(member, "hook_type") == HookType.RECEIVE,
+                    and getattr(member, "hook_type") == HookType.BROADCAST,
+                )
+            }
+        )
+
+        self._running = True
+
+        if self._nodes is None:
+            self._nodes: LockedSet[int] = LockedSet()
+
+        if self._connect_lock is None:
+            self._connect_lock = asyncio.Lock()
+
+        if self.id_generator is None:
+            self.id_generator = SnowflakeGenerator(self._node_id_base)
+
+        if self.node_id is None:
+            snowflake_id = self.id_generator.generate()
+            snowflake = Snowflake.parse(snowflake_id)
+
+            self.node_id = snowflake.instance
+
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self._max_concurrency)
+
+        if self._compressor is None:
+            self._compressor = zstandard.ZstdCompressor()
+
+        if self._decompressor is None:
+            self._decompressor = zstandard.ZstdDecompressor()
+
+        if self.tasks is None:
+            self.tasks = TaskRunner(
+                self.id_generator.generate(),
+                self.env,
+            )
+
+            tasks = {
+                name: receive_hook
+                for name, receive_hook in inspect.getmembers(
+                    self,
+                    predicate=lambda member: hasattr(
+                        member,
+                        "hook_type",
+                    )
+                    and getattr(member, "hook_type") == HookType.TASK,
                 )
             }
 
-            self._events.update(
-                {
-                    name: receive_hook
-                    for name, receive_hook in inspect.getmembers(
-                        self,
-                        predicate=lambda member: hasattr(
-                            member,
-                            "hook_type",
-                        )
-                        and getattr(member, "hook_type") == HookType.BROADCAST,
-                    )
-                }
+            for task in tasks.values():
+                self.tasks.add(task)
+
+        if cert_path and key_path:
+            self._server_ssl_context = self._create_server_ssl_context(
+                cert_path=cert_path, key_path=key_path
             )
 
-            self._running = True
+        run_start = True
 
-            if self._nodes is None:
-                self._nodes: LockedSet[int] = LockedSet()
+        while run_start:
+            try:
 
-            if self._connect_lock is None:
-                self._connect_lock = asyncio.Lock()
+                if self.connected is False and worker_socket is None:
+                    self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-            if self.id_generator is None:
-                self.id_generator = SnowflakeGenerator(self._node_id_base)
-
-            if self.node_id is None:
-                snowflake_id = self.id_generator.generate()
-                snowflake = Snowflake.parse(snowflake_id)
-
-                self.node_id = snowflake.instance
-
-            if self._semaphore is None:
-                self._semaphore = asyncio.Semaphore(self._max_concurrency)
-
-            if self._compressor is None:
-                self._compressor = zstandard.ZstdCompressor()
-
-            if self._decompressor is None:
-                self._decompressor = zstandard.ZstdDecompressor()
-
-            if self.tasks is None:
-                self.tasks = TaskRunner(
-                    self.id_generator.generate(),
-                    self.env,
-                )
-
-                tasks = {
-                    name: receive_hook
-                    for name, receive_hook in inspect.getmembers(
-                        self,
-                        predicate=lambda member: hasattr(
-                            member,
-                            "hook_type",
-                        )
-                        and getattr(member, "hook_type") == HookType.TASK,
+                    await self._loop.run_in_executor(
+                        None,
+                        self.server_socket.bind,
+                        (self.host, self.port),
                     )
-                }
 
-                for task in tasks.values():
-                    self.tasks.add(task)
+                    self.server_socket.setblocking(False)
 
-            if cert_path and key_path:
-                self._server_ssl_context = self._create_server_ssl_context(
-                    cert_path=cert_path, key_path=key_path
-                )
+                elif self.connected is False and worker_socket:
+                    self.server_socket = worker_socket
+                    host, port = worker_socket.getsockname()
 
-            if self.connected is False and worker_socket is None:
-                self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    self.host = host
+                    self.port = port
 
-                await self._loop.run_in_executor(None, self.server_socket.sendall, "")
+                elif self.connected is False and worker_server:
+                    self._server = worker_server
 
-                while True:
-                    try:
-                        await self._loop.run_in_executor(
-                            None,
-                            self.server_socket.bind,
-                            (self.host, self.port),
-                        )
+                    server_socket, _ = worker_server.sockets
+                    host, port = server_socket.getsockname()
+                    self.host = host
+                    self.port = port
 
-                        await asyncio.sleep(1)
+                    run_start = False
+                    self.connected = True
 
-                        break
+                    self._cleanup_task = self._loop.create_task(self._cleanup())
 
-                    except OSError:
-                        pass
 
-                    except Exception:
-                        pass
-
-                self.server_socket.setblocking(False)
-
-            elif self.connected is False and worker_socket:
-                self.server_socket = worker_socket
-                host, port = worker_socket.getsockname()
-
-                self.host = host
-                self.port = port
-
-            elif self.connected is False and worker_server:
-                self._server = worker_server
-
-                server_socket, _ = worker_server.sockets
-                host, port = server_socket.getsockname()
-                self.host = host
-                self.port = port
-
-                self.connected = True
-                self._cleanup_task = self._loop.create_task(self._cleanup())
-
-            if self.connected is False:
-                try:
-                    server = await self._loop.create_server(
+                if self.connected is False and worker_server is None:
+                    server: asyncio.Server = await self._loop.create_server(
                         lambda: MercurySyncTCPServerProtocol(self.read),
                         sock=self.server_socket,
                         ssl=self._server_ssl_context,
                     )
 
                     self._server = server
+                    self._cleanup_task = self._loop.create_task(self._cleanup())
+
+                    run_start = False
                     self.connected = True
 
-                except Exception:
-                    pass
+            except (
+                Exception,
+                asyncio.CancelledError,
+                socket.error,
+                OSError
+            ):
+                import traceback
+                print(traceback.format_exc())
 
-                self._cleanup_task = self._loop.create_task(self._cleanup())
+            await asyncio.sleep(self._retry_interval)
 
-            self._start_tasks()
+        default_config = {
+            "node_id": self._node_id_base,
+            "node_host": self.host,
+            "node_port": self.port,
+        }
 
-        except Exception:
-            pass
+        self._logger.configure(
+            name=f'graph_server_{self._node_id_base}',
+            path=logfile,
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+            models={
+                'trace': (
+                    ControllerTrace,
+                    default_config
+                ),
+                'debug': (
+                    ControllerDebug,
+                    default_config,
+                ),
+                'info': (
+                    ControllerInfo,
+                    default_config,
+                ),
+                'error': (
+                    ControllerError,
+                    default_config,
+                ),
+                'fatal': (
+                    ControllerFatal,
+                    default_config,
+                )
+            }
+        )
+
+        self._start_tasks()
 
     def __iter__(self):
         for node_id in self._node_host_map:
             yield node_id
 
     async def run_forever(self):
-        self._run_future = self._loop.create_future()
+        try:
 
-        await self._run_future
+            self._run_future = self._loop.create_future()
+            await self._run_future
+
+        except asyncio.CancelledError:
+            pass
 
     def _create_server_ssl_context(
         self, cert_path: Optional[str] = None, key_path: Optional[str] = None
@@ -310,6 +360,7 @@ class TCPProtocol(Generic[T, K]):
 
     async def connect_client(
         self,
+        logfile: str,
         address: Tuple[str, int],
         cert_path: Optional[str] = None,
         key_path: Optional[str] = None,
@@ -330,104 +381,134 @@ class TCPProtocol(Generic[T, K]):
 
         await self._connect_lock.acquire()
 
-        try:
-            if self._semaphore is None:
-                self._semaphore = asyncio.Semaphore(self._max_concurrency)
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self._max_concurrency)
 
-            if self.node_id is None:
-                self.node_id = uuid.uuid4().int >> 64
+        if self.node_id is None:
+            self.node_id = uuid.uuid4().int >> 64
 
-            if self.id_generator is None:
-                self.id_generator = SnowflakeGenerator(self.node_id)
+        if self.id_generator is None:
+            self.id_generator = SnowflakeGenerator(self.node_id)
 
-            if self._nodes is None:
-                self._nodes: LockedSet[int] = LockedSet()
+        if self._nodes is None:
+            self._nodes: LockedSet[int] = LockedSet()
 
-            if self._compressor is None:
-                self._compressor = zstandard.ZstdCompressor()
+        if self._compressor is None:
+            self._compressor = zstandard.ZstdCompressor()
 
-            if self._decompressor is None:
-                self._decompressor = zstandard.ZstdDecompressor()
+        if self._decompressor is None:
+            self._decompressor = zstandard.ZstdDecompressor()
 
-            if cert_path and key_path:
-                self._client_ssl_context = self._create_client_ssl_context(
-                    cert_path=cert_path,
-                    key_path=key_path,
+        if cert_path and key_path:
+            self._client_ssl_context = self._create_client_ssl_context(
+                cert_path=cert_path,
+                key_path=key_path,
+            )
+
+        run_start = True
+        instance_id: int | None = None
+
+        while run_start:
+            try:
+                if worker_socket is None:
+                    tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    self._client_sockets[address] = tcp_socket
+
+                    await asyncio.wait_for(
+                        self._loop.run_in_executor(
+                            None, tcp_socket.connect, address
+                        ),
+                        timeout=self._connect_timeout,
+                    )
+
+                    tcp_socket.setblocking(False)
+
+                else:
+                    tcp_socket = worker_socket
+
+                client_transport, _ = await asyncio.wait_for(
+                    self._loop.create_connection(
+                        lambda: MercurySyncTCPClientProtocol(self.read),
+                        sock=tcp_socket,
+                        ssl=self._client_ssl_context,
+                    ),
+                    timeout=self._connect_timeout,
                 )
 
-            while True:
-                try:
-                    if worker_socket is None:
-                        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        tcp_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                        self._client_sockets[address] = tcp_socket
+                self._client_transports[address] = client_transport
 
-                        await asyncio.wait_for(
-                            self._loop.run_in_executor(
-                                None, tcp_socket.connect, address
-                            ),
-                            timeout=self._connect_timeout,
-                        )
+                result: Tuple[int, Message[None]] = await asyncio.wait_for(
+                    self.send(
+                        None,
+                        None,
+                        target_address=address,
+                        request_type="connect",
+                    ),
+                    timeout=self._connect_timeout,
+                )
 
-                        tcp_socket.setblocking(False)
+                shard_id, _ = result
 
-                    else:
-                        tcp_socket = worker_socket
+                snowflake = Snowflake.parse(shard_id)
 
-                    client_transport, _ = await asyncio.wait_for(
-                        self._loop.create_connection(
-                            lambda: MercurySyncTCPClientProtocol(self.read),
-                            sock=tcp_socket,
-                            ssl=self._client_ssl_context,
-                        ),
-                        timeout=self._connect_timeout,
-                    )
+                instance_id = snowflake.instance
 
-                    self._client_transports[address] = client_transport
+                self._node_host_map[instance_id] = address
+                self._nodes.put_no_wait(instance_id)
 
-                    result: Tuple[int, Message[None]] = await asyncio.wait_for(
-                        self.send(
-                            None,
-                            None,
-                            target_address=address,
-                            request_type="connect",
-                        ),
-                        timeout=self._connect_timeout,
-                    )
+                run_start = False
 
-                    shard_id, _ = result
+            except Exception:
+                pass
 
-                    snowflake = Snowflake.parse(shard_id)
+            except OSError:
+                pass
 
-                    instance = snowflake.instance
+            except asyncio.CancelledError:
+                pass
 
-                    self._node_host_map[instance] = address
-                    self._nodes.put_no_wait(instance)
+            await asyncio.sleep(1)
 
-                    if self._connect_lock.locked():
-                        self._connect_lock.release()
+        default_config = {
+            "node_id": self._node_id_base,
+            "node_host": self.host,
+            "node_port": self.port,
+        }
 
-                    return instance
+        self._logger.configure(
+            name=f'graph_client_{self._node_id_base}',
+            path=logfile,
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+            models={
+                'trace': (
+                    ControllerTrace,
+                    default_config
+                ),
+                'debug': (
+                    ControllerDebug,
+                    default_config,
+                ),
+                'info': (
+                    ControllerInfo,
+                    default_config,
+                ),
+                'error': (
+                    ControllerError,
+                    default_config,
+                ),
+                'fatal': (
+                    ControllerFatal,
+                    default_config,
+                )
+            }
+        )
 
-                except Exception:
-                    pass
-
-                except OSError:
-                    pass
-
-                except asyncio.CancelledError:
-                    pass
-
-                await asyncio.sleep(1)
-
-        except Exception:
-            pass
-
-        except asyncio.CancelledError:
-            pass
 
         if self._connect_lock.locked():
             self._connect_lock.release()
+
+        return instance_id
 
     def _create_client_ssl_context(
         self, cert_path: Optional[str] = None, key_path: Optional[str] = None
@@ -970,6 +1051,8 @@ class TCPProtocol(Generic[T, K]):
         self._stream = False
         self._running = False
 
+        await self._shutdown_task
+        
         close_task = asyncio.current_task()
 
         for client in self._client_transports.values():
@@ -981,6 +1064,7 @@ class TCPProtocol(Generic[T, K]):
 
             except Exception:
                 pass
+
 
         if self._server:
             try:
@@ -1017,7 +1101,7 @@ class TCPProtocol(Generic[T, K]):
                 pass
 
         if self.tasks:
-            await self.tasks.shutdown()
+            self.tasks.abort()
 
         for task in asyncio.all_tasks():
             try:
@@ -1030,7 +1114,10 @@ class TCPProtocol(Generic[T, K]):
             except asyncio.CancelledError:
                 pass
 
-        if self._run_future:
+        if self._run_future and (
+            not self._run_future.done()
+            or self._run_future.cancelled()
+        ):
             try:
                 self._run_future.set_result(None)
 
@@ -1040,7 +1127,20 @@ class TCPProtocol(Generic[T, K]):
             except asyncio.CancelledError:
                 pass
 
+        self._pending_responses.clear()
+
     def stop(self):
+        self._shutdown_task = asyncio.ensure_future(
+            self._shutdown()
+        )
+
+    async def _shutdown(self):
+
+        for response in self._pending_responses:
+            await response
+
+        self._running = False
+
         if self._run_future:
             try:
                 self._run_future.set_result(None)
@@ -1053,6 +1153,20 @@ class TCPProtocol(Generic[T, K]):
 
     def abort(self):
         self._running = False
+
+        for pending in self._pending_responses:
+            try:
+                pending.cancel()
+
+            except Exception:
+                pass
+
+        if self._shutdown_task:
+            try:
+                self._shutdown_task.set_result(None)
+            
+            except Exception:
+                pass
 
         if self._server:
             try:
@@ -1097,8 +1211,9 @@ class TCPProtocol(Generic[T, K]):
 
             except asyncio.CancelledError:
                 pass
-
-        self.tasks.abort()
+        
+        if self.tasks:
+            self.tasks.abort()
 
         if self._run_future:
             try:
@@ -1121,3 +1236,12 @@ class TCPProtocol(Generic[T, K]):
 
             except asyncio.CancelledError:
                 pass
+
+        self._pending_responses.clear()
+        
+        try:
+            self._logger.abort()
+
+        except Exception:
+            pass
+

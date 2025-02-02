@@ -7,7 +7,7 @@ import socket
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from multiprocessing import set_start_method, Process
+from multiprocessing import set_start_method
 from multiprocessing.context import SpawnContext
 from typing import Dict, List
 
@@ -85,6 +85,7 @@ async def run_server(
         BrokenProcessPool,
         AssertionError,
     ):
+        server.stop()
         await server.close()
 
     current_task = asyncio.current_task()
@@ -297,7 +298,8 @@ class LocalServerPool:
             ))
 
             try:
-                self._pool_task.set_result(None)
+                if self._pool_task:
+                    self._pool_task.set_result(None)
 
             except Exception:
                 pass
@@ -347,7 +349,8 @@ class LocalServerPool:
 
     def abort(self):
         try:
-            self._pool_task.set_result(None)
+            if self._pool_task:
+                self._pool_task.set_result(None)
 
         except Exception:
             pass
