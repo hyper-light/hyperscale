@@ -139,8 +139,11 @@ async def ping(
     @param quiet Mutes all terminal output
     '''
 
-    if client.data in ['http', 'http2', 'http3', 'graphql', 'graphqlh2'] and is_missing_http_prefix(url):
+    if client.data in ['http', 'graphql'] and is_missing_http_prefix(url):
         url = f'http://{url}'
+
+    elif client.data in ['http2', 'http3', 'graphqlh2'] and is_missing_http_prefix(url):
+        url = f'https://{url}'
 
     if lookup:
         return await lookup_url(
