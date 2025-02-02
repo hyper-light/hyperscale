@@ -63,6 +63,8 @@ from hyperscale.reporting.common.results_types import (
     WorkflowStats,
 )
 from hyperscale.reporting.results import Results
+from hyperscale.reporting.reporter import Reporter, ReporterConfig
+from hyperscale.reporting.reporter import ReporterConfig
 from hyperscale.ui import HyperscaleInterface, InterfaceUpdatesController
 from typing import Any, Tuple, TypeVar, Dict, Literal, Set, List
 
@@ -346,6 +348,38 @@ class ManagerTCPServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
                 workflow_vus[workflow_name][-1] += remainder_vus
 
         return (provisioned_workers, workflow_vus)
+    
+    async def _use_context(
+        self,
+        workflow: str,
+        state_actions: Dict[str, ContextHook],
+        context: Context,
+    ):
+        use_actions = [
+            action
+            for action in state_actions.values()
+            if action.action_type == StateAction.USE
+        ]
+
+        if len(use_actions) < 1:
+            return context[workflow]
+
+        for hook in use_actions:
+            hook.context_args = {
+                name: value
+                for provider in hook.workflows
+                for name, value in context[provider].items()
+            }
+
+        resolved = await asyncio.gather(
+            *[hook.call(**hook.context_args) for hook in use_actions]
+        )
+
+        await asyncio.gather(
+            *[context[workflow].set(hook_name, value) for hook_name, value in resolved]
+        )
+
+        return context[workflow]
 
     async def update_context(
         self,
@@ -408,6 +442,57 @@ class ManagerTCPServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         )
 
         return context
+    
+    async def _report_results(
+        self,
+        workflow: Workflow,
+        execution_result: WorkflowStats | Dict[str, Any | Exception],
+    ):
+
+        reporting = workflow.reporting 
+
+        configs: list[ReporterConfig] = []
+
+        if inspect.isawaitable(reporting) or inspect.iscoroutinefunction(reporting):
+            configs = await reporting()
+
+        elif inspect.isfunction(reporting):
+            configs = await self._loop.run_in_executor(
+                None,
+                reporting,
+            )
+
+        else:
+            configs = reporting
+
+        if isinstance(configs, list) is False:
+            configs = [configs]
+        
+        reporters = [
+            Reporter(config) for config in configs
+        ]
+
+        try:
+
+            await asyncio.gather(*[
+                reporter.connect() for reporter in reporters
+            ])
+
+            await asyncio.gather(*[
+                reporter.submit_workflow_results(execution_result) for reporter in reporters
+            ])
+            await asyncio.gather(*[
+                reporter.submit_step_results(execution_result) for reporter in reporters
+            ])
+
+            await asyncio.gather(*[
+                reporter.close() for reporter in reporters
+            ])
+
+        except Exception:
+            await asyncio.gather(*[
+                reporter.close() for reporter in reporters
+            ], return_exceptions=True)
 
     async def run_workflow(
         self,
@@ -465,6 +550,8 @@ class ManagerTCPServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         )
 
         results, run_context, timeout_error = worker_results
+
+        await self._provisioner.acquire(threads)
 
         if is_test_workflow and len(results) > 1:
 
@@ -530,9 +617,12 @@ class ManagerTCPServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
 
         timeouts: dict[str, Exception] = {}
 
+
+        self._provisioner.setup(max_workers=self._total_threads)
+
         for workflow_set in workflow_traversal_order:
             provisioned_batch, workflow_vus = self.provision(
-                total_threads,
+                self._total_threads,
                 workflow_set
             )
 
@@ -564,7 +654,7 @@ class ManagerTCPServer(TCPProtocol[JobContext[Any], JobContext[Any]]):
         }
 
     @send()
-    async def run_workflow(
+    async def submit_workflow(
         self,
         run_id: int,
         target_worker: tuple[str, int],
