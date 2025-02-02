@@ -116,7 +116,8 @@ class DistributedWorker:
             host,
             port + 1,
             env,
-            self._remote_manger
+            self._remote_manger,
+            workers,
         )
 
         self._pool_task: asyncio.Future | None = None
@@ -176,6 +177,11 @@ class DistributedWorker:
                     for idx, worker_ip in enumerate(worker_ips)
                 ],
                 return_exceptions=True,
+            )
+
+            await self._remote_manger.connect_to_workers(
+                worker_ips,
+                timeout=timeout,
             )
 
             await asyncio.gather(*[

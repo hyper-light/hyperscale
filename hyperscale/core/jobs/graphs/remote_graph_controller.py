@@ -93,7 +93,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         self._results: NodeData[WorkflowResult] = defaultdict(lambda: defaultdict(dict))
         self._errors: NodeData[Exception] = defaultdict(lambda: defaultdict(dict))
 
-        self._node_context: NodeContextSet = defaultdict(dict)
+        self._node_context: NodeContextSet = defaultdict(lambda: Context())
         self._statuses: NodeData[WorkflowStatus] = defaultdict(
             lambda: defaultdict(dict)
         )
@@ -439,7 +439,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
     async def acknowledge_start(
         self,
         leader_address: tuple[str, int],
-    ):
+    ) -> JobContext[tuple[str, int]]:
         async with self._logger.context(
             name=f'graph_client_{self._node_id_base}',
         ) as ctx:
@@ -464,7 +464,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         workflow: Workflow,
         vus: int,
         context: Context,
-    ) -> Response[JobContext[WorkflowStatusUpdate]]:
+    ) -> JobContext[WorkflowStatusUpdate]:
         async with self._logger.context(
             name=f'workflow_run_{run_id}',
         ) as ctx:
@@ -505,10 +505,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     name='debug',
                 )
 
-            return response
+            return workflow_status
 
     @send()
-    async def submit_stop_request(self):
+    async def submit_stop_request(self) -> list[JobContext[None]]:
         async with self._logger.context(
             name=f'graph_server_{self._node_id_base}'
         ) as ctx:
@@ -518,15 +518,19 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 name='info',
             )
 
-            return await self.broadcast(
+            responses = await self.broadcast(
                 "process_stop_request",
                 JobContext(None),
             )
 
+            return [
+                job for _, job in responses
+            ]
+
     @send()
     async def push_results(
         self,
-        node_id: str,
+        node_id: int,
         results: WorkflowResults,
         run_id: int,
     ) -> Response[JobContext[ReceivedReceipt]]:
@@ -551,17 +555,14 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
     @receive()
     async def receive_start_acknowledgement(
         self,
-        shard_id: int,
+        _: int,
         acknowledgement: JobContext[tuple[str, int]],
-    ):
+    ) -> JobContext[None]:
         async with self._logger.context(
             name=f'graph_server_{self._node_id_base}'
         ) as ctx:
         
             await self._leader_lock.acquire()
-
-            snowflake = Snowflake.parse(shard_id)
-            node_id = snowflake.instance
 
             host, port = acknowledgement.data
 
@@ -575,6 +576,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             if self._leader_lock.locked():
                 self._leader_lock.release()
+
+        return JobContext(None)
 
     @receive()
     async def process_results(
@@ -660,6 +663,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             )
 
             self.stop()
+
+        return JobContext(None)
 
     @receive()
     async def start_workflow(

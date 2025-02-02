@@ -155,6 +155,9 @@ class RemoteGraphManager:
                 key_path=key_path,
             )
 
+    def get_run_context(self, run_id: int):
+        return self._controller._node_context[run_id]
+
     async def connect_to_workers(
         self,
         workers: List[Tuple[str, int]],
@@ -199,6 +202,7 @@ class RemoteGraphManager:
         self,
         test_name: str,
         workflows: List[Workflow | DependentWorkflow],
+        skip_reporting: bool = False,
     ) -> RunResults:
         
         graph_slug = test_name.lower()
@@ -234,14 +238,14 @@ class RemoteGraphManager:
 
             self._controller.create_run_contexts(run_id)
 
-            workflow_traversal_order = self._create_workflow_graph(workflows)
+            workflow_traversal_order = self.create_workflow_graph(workflows)
 
             workflow_results: Dict[str, List[WorkflowResultsSet]] = defaultdict(list)
 
             timeouts: dict[str, Exception] = {}
 
             for workflow_set in workflow_traversal_order:
-                provisioned_batch, workflow_vus = self._provision(workflow_set)
+                provisioned_batch, workflow_vus = self.provision(workflow_set)
 
                 batch_workflows = [
                     workflow_name
@@ -269,11 +273,12 @@ class RemoteGraphManager:
 
                 results = await asyncio.gather(
                     *[
-                        self._run_workflow(
+                        self.run_workflow(
                             run_id,
                             workflow_set[workflow_name],
                             threads,
                             workflow_vus[workflow_name],
+                            skip_reporting=skip_reporting,
                         )
                         for group in provisioned_batch
                         for workflow_name, _, threads in group
@@ -302,7 +307,7 @@ class RemoteGraphManager:
 
             return {"test": test_name, "results": workflow_results, 'timeouts': timeouts}
 
-    def _create_workflow_graph(self, workflows: List[Workflow | DependentWorkflow]):
+    def create_workflow_graph(self, workflows: List[Workflow | DependentWorkflow]):
         workflow_graph = networkx.DiGraph()
 
         workflow_dependencies: Dict[str, List[str]] = {}
@@ -348,12 +353,13 @@ class RemoteGraphManager:
 
         return workflow_traversal_order
 
-    async def _run_workflow(
+    async def run_workflow(
         self,
         run_id: int,
         workflow: Workflow,
         threads: int,
         workflow_vus: List[int],
+        skip_reporting: bool = False,
     ) -> Tuple[str, WorkflowStats | WorkflowContextResult, Exception | None]:
         
         workflow_slug = workflow.name.lower()
@@ -569,7 +575,11 @@ class RemoteGraphManager:
 
                     workflow_results = Results(hooks)
                     execution_result = workflow_results.merge_results(
-                        [result_set for _, result_set in results.values()],
+                        [
+                            result_set
+                            for _, result_set in results.values()
+                            if result_set is not None
+                        ],
                         run_id=run_id,
                     )
 
@@ -608,68 +618,12 @@ class RemoteGraphManager:
                     name='trace',
                 )
 
-                reporting = workflow.reporting 
-
-                configs: list[ReporterConfig] = []
-
-                if inspect.isawaitable(reporting) or inspect.iscoroutinefunction(reporting):
-                    configs = await reporting()
-
-                elif inspect.isfunction(reporting):
-                    configs = await self._loop.run_in_executor(
-                        None,
-                        reporting,
+                if skip_reporting is False:
+                    await self._report_results(
+                        workflow,
+                        execution_result,
                     )
-
-                else:
-                    configs = reporting
-
-                if isinstance(configs, list) is False:
-                    configs = [configs]
-                
-                reporters = [
-                    Reporter(config) for config in configs
-                ]
-                await asyncio.sleep(1)
-
-                selected_reporters = ', '.join([
-                    config.reporter_type.name for config in configs
-                ])
-
-
-                await ctx.log_prepared(
-                    message=f'Submitting results to reporters {selected_reporters} for Workflow {workflow.name} run {run_id}',
-                    name='info'
-                )
-
-                await update_active_workflow_message(
-                    workflow_slug, 
-                    f"Submitting results via - {selected_reporters}"
-                )
-
-                try:
-
-                    await asyncio.gather(*[
-                        reporter.connect() for reporter in reporters
-                    ])
-
-                    await asyncio.gather(*[
-                        reporter.submit_workflow_results(execution_result) for reporter in reporters
-                    ])
-                    await asyncio.gather(*[
-                        reporter.submit_step_results(execution_result) for reporter in reporters
-                    ])
-
-                    await asyncio.gather(*[
-                        reporter.close() for reporter in reporters
-                    ])
-
-                except Exception:
-                    await asyncio.gather(*[
-                        reporter.close() for reporter in reporters
-                    ], return_exceptions=True)
-
-
+                    
                 await asyncio.sleep(1)
 
                 await update_active_workflow_message(
@@ -714,6 +668,77 @@ class RemoteGraphManager:
             setattr(workflow, action.name, action._call)
 
         return state_actions
+    
+    async def _report_results(
+        self,
+        workflow: Workflow,
+        execution_result: WorkflowStats | Dict[str, Any | Exception],
+    ):
+        async with self._logger.context(
+            name=f'{workflow_slug}_logger',
+            nested=True,
+        ) as ctx:
+            reporting = workflow.reporting 
+            workflow_slug = workflow.name.lower()
+
+            configs: list[ReporterConfig] = []
+
+            if inspect.isawaitable(reporting) or inspect.iscoroutinefunction(reporting):
+                configs = await reporting()
+
+            elif inspect.isfunction(reporting):
+                configs = await self._loop.run_in_executor(
+                    None,
+                    reporting,
+                )
+
+            else:
+                configs = reporting
+
+            if isinstance(configs, list) is False:
+                configs = [configs]
+            
+            reporters = [
+                Reporter(config) for config in configs
+            ]
+            await asyncio.sleep(1)
+
+            selected_reporters = ', '.join([
+                config.reporter_type.name for config in configs
+            ])
+
+
+            await ctx.log_prepared(
+                message=f'Submitting results to reporters {selected_reporters} for Workflow {workflow.name} run {run_id}',
+                name='info'
+            )
+
+            await update_active_workflow_message(
+                workflow_slug, 
+                f"Submitting results via - {selected_reporters}"
+            )
+
+            try:
+
+                await asyncio.gather(*[
+                    reporter.connect() for reporter in reporters
+                ])
+
+                await asyncio.gather(*[
+                    reporter.submit_workflow_results(execution_result) for reporter in reporters
+                ])
+                await asyncio.gather(*[
+                    reporter.submit_step_results(execution_result) for reporter in reporters
+                ])
+
+                await asyncio.gather(*[
+                    reporter.close() for reporter in reporters
+                ])
+
+            except Exception:
+                await asyncio.gather(*[
+                    reporter.close() for reporter in reporters
+                ], return_exceptions=True)
 
     async def _use_context(
         self,
@@ -806,7 +831,7 @@ class RemoteGraphManager:
 
                 self._graph_updates[update.workflow].put_nowait(update)
 
-    def _provision(
+    def provision(
         self,
         workflows: Dict[str, Workflow],
     ) -> Tuple[ProvisionedBatch, WorkflowVUs]:
