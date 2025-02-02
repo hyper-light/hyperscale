@@ -315,8 +315,10 @@ class MercurySyncWebsocketConnection:
             timings=timings,
         )
 
-        if redirect:
-            location = result.headers.get(b"location").decode()
+        if redirect and (
+            location := result.headers.get(b'location')
+        ):
+            location = location.decode()
 
             upgrade_ssl = False
             if "https" in location and "https" not in url:

@@ -518,8 +518,10 @@ class MercurySyncHTTPConnection:
             timings=timings,
         )
 
-        if redirect:
-            location = result.headers.get(b"location").decode()
+        if redirect and (
+            location := result.headers.get(b'location')
+        ):
+            location = location.decode()
 
             redirects_taken = 1
 

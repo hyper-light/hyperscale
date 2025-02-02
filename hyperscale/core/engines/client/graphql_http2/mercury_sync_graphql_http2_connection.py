@@ -297,8 +297,9 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             timings=timings,
         )
 
-        if redirect:
-            location = result.headers.get("location")
+        if redirect and (
+            location := result.headers.get('location')
+        ):
             upgrade_ssl = False
             
             if "http" not in location and "https" not in location:

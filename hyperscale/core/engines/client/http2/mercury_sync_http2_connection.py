@@ -545,8 +545,9 @@ class MercurySyncHTTP2Connection:
             timings=timings,
         )
 
-        if redirect:
-            location = result.headers.get("location")
+        if redirect and (
+            location := result.headers.get('location')
+        ):
 
             if "http" not in location and "https" not in location:
                 parsed_url: ParseResult = urlparse(url)
