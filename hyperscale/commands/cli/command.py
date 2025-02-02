@@ -344,6 +344,14 @@ class Command(Generic[T]):
 
             else:
                 break
+        
+        args_size = len(args)
+        if args_size == 0 or value_idx >= args_size:
+            return (
+                value,
+                Exception(f'No value found for option {keyword_arg.full_flag}'),
+                consumed_idxs,
+            )
 
         result = await keyword_arg.parse(args[value_idx])
         value, last_error = self._return_value_and_error(result)
