@@ -165,8 +165,7 @@ def run_thread(
         asyncio.CancelledError,
         asyncio.InvalidStateError,
     ):
-        import traceback
-        print(traceback.format_exc())
+        pass
 
 
 class LocalServerPool:
