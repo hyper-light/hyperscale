@@ -11,3 +11,4 @@ aioquic
 cloudpickle
 orjson
 msgspec
+numpy
