@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyperscale"
-version = "0.2.6"
+version = "0.2.7"
 requires-python = ">=3.11"
 description = "Performance testing at scale."
 readme = "README.md"
@@ -32,17 +32,9 @@ dependencies = [
     "attr",
     "networkx",
     "aiodns",
-    "click",
     "psutil",
-    "dill",
-    "scipy",
-    "art",
-    "scikit-learn",
     "uvloop",
-    "tdigest",
     "pydantic",
-    "GitPython",
-    "plotille",
     "zstandard",
     "cryptography",
     "python-dotenv",
