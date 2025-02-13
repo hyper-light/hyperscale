@@ -1,6 +1,12 @@
 from typing import Callable, Optional
 
-from playwright.async_api import WebSocket
+try:
+    from playwright.async_api import WebSocket
+
+except Exception:
+    class WebSocket:
+        pass
+    
 from pydantic import BaseModel, StrictBool, StrictFloat, StrictInt
 
 

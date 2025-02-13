@@ -11,11 +11,21 @@ from typing import (
     Type,
 )
 
-from playwright.async_api import (
-    BrowserContext,
-    Geolocation,
-    async_playwright,
-)
+try:
+    from playwright.async_api import (
+        BrowserContext,
+        Geolocation,
+        async_playwright,
+    )
+except Exception:
+    class BrowserContext:
+        pass
+
+    class Geolocation:
+        pass
+
+    async def async_playwright(*args, **kwargs):
+        pass
 
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 

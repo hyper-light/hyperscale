@@ -1,6 +1,13 @@
 from typing import Optional, Pattern
 
-from playwright.async_api import Locator
+try:
+
+    from playwright.async_api import Locator
+
+except Exception:
+    class Locator:
+        pass
+    
 from pydantic import (
     BaseModel,
     StrictFloat,

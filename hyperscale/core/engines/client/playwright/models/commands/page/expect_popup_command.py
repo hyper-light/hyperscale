@@ -1,6 +1,13 @@
 from typing import Callable, Optional
 
-from playwright.async_api import Page
+try:
+
+    from playwright.async_api import Page
+
+except Exception:
+    class Page:
+        pass
+
 from pydantic import (
     BaseModel,
     StrictFloat,

@@ -10,15 +10,40 @@ from typing import (
     Pattern,
 )
 
-from playwright.async_api import (
-    ElementHandle,
-    Frame,
-    FrameLocator,
-    JSHandle,
-    Locator,
-    Position,
-    Response,
-)
+try:
+    from playwright.async_api import (
+        ElementHandle,
+        Frame,
+        FrameLocator,
+        JSHandle,
+        Locator,
+        Position,
+        Response,
+    )
+
+except Exception:
+
+    class ElementHandle:
+        pass
+
+    class Frame:
+        pass
+
+    class FrameLocator:
+        pass
+
+    class JSHandle:
+        pass
+
+    class Locator:
+        pass
+
+    class Position:
+        pass
+    
+    class Response:
+        pass
+
 
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 

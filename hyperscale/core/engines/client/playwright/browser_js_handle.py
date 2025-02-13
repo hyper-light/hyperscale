@@ -4,7 +4,14 @@ import asyncio
 import time
 from typing import Any, Dict, Literal, Optional
 
-from playwright.async_api import JSHandle
+try:
+
+    from playwright.async_api import JSHandle
+
+except Exception:
+    
+    class JSHandle:
+        pass
 
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 

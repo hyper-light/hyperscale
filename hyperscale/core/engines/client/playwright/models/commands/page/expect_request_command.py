@@ -1,6 +1,13 @@
 from typing import Callable, Optional, Pattern
 
-from playwright.async_api import Request
+try:
+
+    from playwright.async_api import Request
+
+except Exception:
+    class Request:
+        pass
+
 from pydantic import BaseModel, StrictFloat, StrictInt, StrictStr
 
 

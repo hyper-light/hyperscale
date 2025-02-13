@@ -1,6 +1,13 @@
 from typing import Callable, Optional
 
-from playwright.async_api import FileChooser
+try:
+
+    from playwright.async_api import FileChooser
+
+except Exception:
+    class FileChooser:
+        pass
+    
 from pydantic import (
     BaseModel,
     StrictFloat,

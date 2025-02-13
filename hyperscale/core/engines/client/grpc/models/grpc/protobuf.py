@@ -1,6 +1,12 @@
 from typing import Generic, TypeVar
 
-from google.protobuf.message import Message
+try:
+
+    from google.protobuf.message import Message
+
+except Exception:
+    class Message:
+        pass
 
 T = TypeVar("T")
 

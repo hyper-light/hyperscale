@@ -1,7 +1,17 @@
 from pathlib import Path
 from typing import Literal, Optional, Sequence
 
-from playwright.async_api import FloatRect, Locator
+try:
+
+    from playwright.async_api import FloatRect, Locator
+
+except Exception:
+    class FloatRect:
+        pass
+
+    class Locator:
+        pass
+    
 from pydantic import (
     BaseModel,
     StrictBool,
