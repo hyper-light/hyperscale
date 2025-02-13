@@ -3,29 +3,17 @@ import ctypes
 import functools
 import multiprocessing
 import signal
-import socket
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from multiprocessing import set_start_method
 from multiprocessing.context import SpawnContext
 from typing import Dict, List
-
 
 from hyperscale.core.jobs.graphs.remote_graph_controller import (
     RemoteGraphController,
 )
 from hyperscale.core.jobs.models import Env
-from hyperscale.logging import (
-    Logger,
-    Entry,
-    LogLevel, 
-    LoggingConfig,
-    LogLevelName
-)
-
-
-set_start_method('spawn', force=True)
+from hyperscale.logging import Entry, Logger, LoggingConfig, LogLevel, LogLevelName
 
 
 def set_process_name():
@@ -76,8 +64,8 @@ async def run_server(
         await server.close()
 
     except (
-        Exception, 
-        asyncio.CancelledError, 
+        Exception,
+        asyncio.CancelledError,
         KeyboardInterrupt,
         multiprocessing.ProcessError,
         OSError,
@@ -106,13 +94,12 @@ async def run_server(
                 pass
 
     try:
-        await asyncio.gather(*[
-            task for task in tasks if task != current_task
-        ], return_exceptions=True)
+        await asyncio.gather(
+            *[task for task in tasks if task != current_task], return_exceptions=True
+        )
 
     except Exception:
         pass
-
 
 
 def run_thread(
@@ -121,13 +108,13 @@ def run_thread(
     worker_ip: tuple[str, int],
     worker_env: Dict[str, str | int | float | bool | None],
     logs_directory: str,
-    log_level: LogLevelName = 'info',
+    log_level: LogLevelName = "info",
     cert_path: str | None = None,
     key_path: str | None = None,
 ):
-    
     try:
         from hyperscale.logging import LoggingConfig
+
         try:
             import uvloop
 
@@ -142,7 +129,7 @@ def run_thread(
         logging_config.update(
             log_directory=logs_directory,
             log_level=log_level,
-            log_output='stderr',
+            log_output="stderr",
         )
 
         try:
@@ -171,7 +158,6 @@ def run_thread(
             )
         )
 
-
     except (
         Exception,
         OSError,
@@ -180,6 +166,7 @@ def run_thread(
         asyncio.InvalidStateError,
     ):
         pass
+
 
 class LocalServerPool:
     def __init__(
@@ -200,19 +187,20 @@ class LocalServerPool:
             max_workers=self._pool_size,
             mp_context=self._context,
             initializer=set_process_name,
-            max_tasks_per_child=1
+            max_tasks_per_child=1,
         )
 
         async with self._logger.context(
-            name='local_server_pool',
-            path='hyperscale.leader.log.json',
+            name="local_server_pool",
+            path="hyperscale.leader.log.json",
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
         ) as ctx:
-            
-            await ctx.log(Entry(
-                message='Creating interrupt handlers for local server pool',
-                level=LogLevel.TRACE,
-            ))
+            await ctx.log(
+                Entry(
+                    message="Creating interrupt handlers for local server pool",
+                    level=LogLevel.TRACE,
+                )
+            )
 
             self._loop = asyncio.get_event_loop()
 
@@ -225,10 +213,12 @@ class LocalServerPool:
                     self.abort,
                 )
 
-            await ctx.log(Entry(
-                message='Created interrupt handlers for local server pool',
-                level=LogLevel.TRACE,
-            ))
+            await ctx.log(
+                Entry(
+                    message="Created interrupt handlers for local server pool",
+                    level=LogLevel.TRACE,
+                )
+            )
 
     async def run_pool(
         self,
@@ -239,18 +229,19 @@ class LocalServerPool:
         key_path: str | None = None,
     ):
         async with self._logger.context(
-            name='local_server_pool',
-            path='hyperscale.leader.log.json',
+            name="local_server_pool",
+            path="hyperscale.leader.log.json",
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
         ) as ctx:
-            
             try:
                 leader_host, leader_port = leader_address
-            
-                await ctx.log(Entry(
-                    message=f'Creating server pool with {self._pool_size} workers and leader at {leader_host}:{leader_port}',
-                    level=LogLevel.DEBUG
-                ))
+
+                await ctx.log(
+                    Entry(
+                        message=f"Creating server pool with {self._pool_size} workers and leader at {leader_host}:{leader_port}",
+                        level=LogLevel.DEBUG,
+                    )
+                )
 
                 config = LoggingConfig()
 
@@ -275,27 +266,21 @@ class LocalServerPool:
                     return_exceptions=True,
                 )
 
-            except (
-                Exception,
-                KeyboardInterrupt
-            ):
+            except (Exception, KeyboardInterrupt):
                 pass
 
-    async def shutdown(
-        self,
-        wait: bool = True
-    ):
-
+    async def shutdown(self, wait: bool = True):
         async with self._logger.context(
-            name='local_server_pool',
-            path='hyperscale.leader.log.json',
+            name="local_server_pool",
+            path="hyperscale.leader.log.json",
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
         ) as ctx:
-            
-            await ctx.log(Entry(
-                message='Server pool received shutdown request',
-                level=LogLevel.DEBUG
-            ))
+            await ctx.log(
+                Entry(
+                    message="Server pool received shutdown request",
+                    level=LogLevel.DEBUG,
+                )
+            )
 
             try:
                 if self._pool_task:
@@ -314,14 +299,15 @@ class LocalServerPool:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
 
-                    await self._loop.run_in_executor(
-                        None,
-                        functools.partial(
-                            self._executor.shutdown,
-                            wait=wait,
-                            cancel_futures=True,
-                        ),
-                    )
+                    if self._executor._processes and self._executor._processes > 0:
+                        await self._loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                self._executor.shutdown,
+                                wait=False,
+                                cancel_futures=True,
+                            ),
+                        )
 
             except (
                 Exception,
@@ -329,23 +315,25 @@ class LocalServerPool:
                 asyncio.CancelledError,
                 asyncio.InvalidStateError,
             ):
-                
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
 
-                    await self._loop.run_in_executor(
-                        None,
-                        functools.partial(
-                            self._executor.shutdown,
-                            wait=False,
-                            cancel_futures=True,
-                        ),
-                    )
+                    if self._executor._processes and self._executor._processes > 0:
+                        await self._loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                self._executor.shutdown,
+                                wait=False,
+                                cancel_futures=True,
+                            ),
+                        )
 
-            await ctx.log(Entry(
-                message='Server pool successfully shutdown',
-                level=LogLevel.DEBUG,
-            ))
+            await ctx.log(
+                Entry(
+                    message="Server pool successfully shutdown",
+                    level=LogLevel.DEBUG,
+                )
+            )
 
     def abort(self):
         try:
@@ -365,16 +353,12 @@ class LocalServerPool:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
 
-                self._executor.shutdown(
-                    wait=True,
-                    cancel_futures=True
-                )
+                if self._executor._processes and self._executor._processes > 0:
+                    self._executor.shutdown(wait=False, cancel_futures=True)
 
         except Exception:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
 
-                self._executor.shutdown(
-                    wait=False,
-                    cancel_futures=True
-                )
+                if self._executor._processes and self._executor._processes > 0:
+                    self._executor.shutdown(wait=False, cancel_futures=True)

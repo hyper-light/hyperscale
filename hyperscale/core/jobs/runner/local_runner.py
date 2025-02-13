@@ -3,8 +3,8 @@ import os
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import (
     ProcessError,
+    active_children,
 )
-from multiprocessing import active_children, current_process
 from typing import List
 
 import psutil
@@ -12,15 +12,14 @@ import psutil
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph import Workflow
 from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
-from hyperscale.core.jobs.models import Env
+from hyperscale.core.jobs.models import Env, TerminalMode
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
-    TestInfo, 
-    TestFatal, 
     TestDebug,
-    TestTrace
+    TestFatal,
+    TestInfo,
+    TestTrace,
 )
-from hyperscale.reporting.common.results_types import RunResults
 from hyperscale.ui import HyperscaleInterface, InterfaceUpdatesController
 from hyperscale.ui.actions import update_active_workflow_message
 
@@ -101,14 +100,11 @@ class LocalRunner:
         cert_path: str | None = None,
         key_path: str | None = None,
         timeout: int | float | str | None = None,
-        terminal_ui_enabled: bool = True,
+        terminal_mode: TerminalMode = "full",
     ):
-                
-        workflow_names = [
-            workflow.name for workflow in workflows
-        ]
+        workflow_names = [workflow.name for workflow in workflows]
 
-        default_config = {   
+        default_config = {
             "runner_type": self._runner_type,
             "workflows": workflow_names,
             "workers": self._workers,
@@ -116,43 +112,47 @@ class LocalRunner:
         }
 
         self._logger.configure(
-            name='local_runner',
-            path='hyperscale.leader.log.json',
+            name="local_runner",
+            path="hyperscale.leader.log.json",
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
-                'trace': (
-                    TestTrace,
-                    default_config
-                ),
-                'debug': (
-                    TestDebug,
-                    default_config
-                ),
-                'info': (
-                    TestInfo,
-                    default_config
-                ),
-                'fatal': (
-                    TestFatal,
-                    default_config
-                ),
-            }
+                "trace": (TestTrace, default_config),
+                "debug": (TestDebug, default_config),
+                "info": (TestInfo, default_config),
+                "fatal": (TestFatal, default_config),
+            },
         )
 
-        async with self._logger.context(name='local_runner') as ctx:
-            
-            await ctx.log_prepared(f'Starting {test_name} test with {self._workers} workers', name='info')
+        async with self._logger.context(name="local_runner") as ctx:
+            await ctx.log_prepared(
+                f"Starting {test_name} test with {self._workers} workers", name="info"
+            )
 
-            await ctx.log_prepared(f'Setting interrupt handlers for SIGINT, SIGTERM, SIG_IGN for test {test_name}', name='trace')
-            await ctx.log_prepared(f'Initializing UI for test {test_name}', name='trace')
+            await ctx.log_prepared(
+                f"Setting interrupt handlers for SIGINT, SIGTERM, SIG_IGN for test {test_name}",
+                name="trace",
+            )
+            await ctx.log_prepared(
+                f"Initializing UI for test {test_name}", name="trace"
+            )
 
-            self._interface.initialize(workflows)
-            if terminal_ui_enabled:
-                await ctx.log_prepared(f'Hyperscale Terminal UI is enabled for test {test_name}', name='debug')
+            self._interface.initialize(
+                workflows,
+                terminal_mode=terminal_mode,
+            )
+
+            if terminal_mode in ["ci", "full"]:
+                await ctx.log_prepared(
+                    f"Hyperscale Terminal UI is enabled for test {test_name}",
+                    name="debug",
+                )
                 await self._interface.run()
 
             else:
-                await ctx.log_prepared(f'Hyperscale Terminal UI is disabled for test {test_name}', name='debug')
+                await ctx.log_prepared(
+                    f"Hyperscale Terminal UI is disabled for test {test_name}",
+                    name="debug",
+                )
 
             if timeout is None:
                 timeout = self._worker_connect_timeout
@@ -165,7 +165,10 @@ class LocalRunner:
 
                 worker_ips = self._bin_and_check_socket_range()
 
-                await ctx.log_prepared(f'Initializing worker servers on runner type {self._runner_type} for test {test_name}', name='info')
+                await ctx.log_prepared(
+                    f"Initializing worker servers on runner type {self._runner_type} for test {test_name}",
+                    name="info",
+                )
                 await self._server_pool.setup()
 
                 await self._remote_manger.start(
@@ -189,79 +192,102 @@ class LocalRunner:
                     timeout=timeout,
                 )
 
-                await ctx.log_prepared_batch({
-                    'info': [
-                        f'Successfully connected to {self._workers} workers on runner type {self._runner_type} for test {test_name}',
-                        f'Beginning run for test {test_name}'
-                    ]
-                })
+                await ctx.log_prepared_batch(
+                    {
+                        "info": [
+                            f"Successfully connected to {self._workers} workers on runner type {self._runner_type} for test {test_name}",
+                            f"Beginning run for test {test_name}",
+                        ]
+                    }
+                )
 
                 results = await self._remote_manger.execute_graph(
                     test_name,
                     workflows,
                 )
 
-                await ctx.log_prepared(f'Completed execution of test {test_name} on runner type {self._runner_type} - shutting down', name='info')
-                
-                if terminal_ui_enabled:
-                    await ctx.log_prepared(f'Stopping Hyperscale Terminal UI for test {test_name}', name='debug')
+                await ctx.log_prepared(
+                    f"Completed execution of test {test_name} on runner type {self._runner_type} - shutting down",
+                    name="info",
+                )
+
+                if terminal_mode in ["ci", "full"]:
+                    await ctx.log_prepared(
+                        f"Stopping Hyperscale Terminal UI for test {test_name}",
+                        name="debug",
+                    )
 
                     await self._interface.stop()
 
-                    await ctx.log_prepared(f'Stopped Hyperscale Terminal UI for test {test_name}', name='trace')
+                    await ctx.log_prepared(
+                        f"Stopped Hyperscale Terminal UI for test {test_name}",
+                        name="trace",
+                    )
 
-                await ctx.log_prepared(f'Stopping Hyperscale Remote Manager for test {test_name}', name='debug')
+                await ctx.log_prepared(
+                    f"Stopping Hyperscale Remote Manager for test {test_name}",
+                    name="debug",
+                )
 
                 await self._remote_manger.shutdown_workers()
                 await self._remote_manger.close()
 
                 loop = asyncio.get_event_loop()
-                children = await loop.run_in_executor(
-                    None,
-                    active_children
+                children = await loop.run_in_executor(None, active_children)
+
+                await asyncio.gather(
+                    *[loop.run_in_executor(None, child.kill) for child in children]
                 )
 
-                await asyncio.gather(*[
-                    loop.run_in_executor(
-                        None,
-                        child.terminate
-                    ) for child in children
-                ])
-
-                await ctx.log_prepared(f'Stopping Hyperscale Server Pool for test {test_name}', name='debug')
+                await ctx.log_prepared(
+                    f"Stopping Hyperscale Server Pool for test {test_name}",
+                    name="debug",
+                )
                 await self._server_pool.shutdown()
 
-                await ctx.log_prepared(f'Exiting test {test_name}', name='info')
- 
+                await ctx.log_prepared(f"Exiting test {test_name}", name="info")
+
                 return results
 
             except (
-                Exception, 
-                KeyboardInterrupt, 
-                ProcessError, 
+                Exception,
+                KeyboardInterrupt,
+                ProcessError,
                 asyncio.TimeoutError,
                 asyncio.CancelledError,
                 BrokenProcessPool,
             ) as e:
                 if isinstance(e, asyncio.CancelledError):
-                    await ctx.log_prepared(f'Encountered interrupt while running test {test_name} - aborting', name='fatal')
+                    await ctx.log_prepared(
+                        f"Encountered interrupt while running test {test_name} - aborting",
+                        name="fatal",
+                    )
 
                 else:
-                    await ctx.log_prepared(f'Encountered fatal exception {str(e)} while running test {test_name} - aborting', name='fatal')
+                    await ctx.log_prepared(
+                        f"Encountered fatal exception {str(e)} while running test {test_name} - aborting",
+                        name="fatal",
+                    )
 
                 try:
-                    if terminal_ui_enabled:
-                        await ctx.log_prepared(f'Aborting Hyperscale Terminal UI for test {test_name}', name='debug')
+                    if terminal_mode in ["ci", "full"]:
+                        await ctx.log_prepared(
+                            f"Aborting Hyperscale Terminal UI for test {test_name}",
+                            name="debug",
+                        )
                         await self._interface.stop()
 
                 except Exception as e:
-                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Terminal UI for test {test_name}', name='trace')
+                    await ctx.log_prepared(
+                        f"Encountered error {str(e)} aborting Hyperscale Terminal UI for test {test_name}",
+                        name="trace",
+                    )
 
                 except asyncio.CancelledError:
                     pass
-                
+
                 if not isinstance(
-                    e, 
+                    e,
                     (
                         KeyboardInterrupt,
                         ProcessError,
@@ -272,22 +298,34 @@ class LocalRunner:
                     await self._remote_manger.shutdown_workers()
 
                 try:
-                    await ctx.log_prepared(f'Aborting Hyperscale Remote Manager for test {test_name}', name='debug')
+                    await ctx.log_prepared(
+                        f"Aborting Hyperscale Remote Manager for test {test_name}",
+                        name="debug",
+                    )
                     await self._remote_manger.close()
 
                 except Exception as e:
-                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Remote Manager for test {test_name}', name='trace')
+                    await ctx.log_prepared(
+                        f"Encountered error {str(e)} aborting Hyperscale Remote Manager for test {test_name}",
+                        name="trace",
+                    )
 
                 except asyncio.CancelledError:
                     pass
-                
+
                 try:
-                    await ctx.log_prepared(f'Aborting Hyperscale Server Pool for test {test_name}', name='debug')
+                    await ctx.log_prepared(
+                        f"Aborting Hyperscale Server Pool for test {test_name}",
+                        name="debug",
+                    )
                     await self._server_pool.shutdown()
 
                 except Exception as e:
-                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Server Pool for test {test_name}', name='trace')
- 
+                    await ctx.log_prepared(
+                        f"Encountered error {str(e)} aborting Hyperscale Server Pool for test {test_name}",
+                        name="trace",
+                    )
+
                 except asyncio.CancelledError:
                     pass
 
@@ -296,45 +334,63 @@ class LocalRunner:
     async def abort(
         self,
         error: Exception | None = None,
-        terminal_ui_enabled: bool = True,
+        terminal_mode: TerminalMode = "full",
     ):
         async with self._logger.context(
-            name='local_runner',
+            name="local_runner",
         ) as ctx:
-
             if error is None:
-                await ctx.log_prepared(f'Runner type {self._runner_type} received a call to abort and is now aborting all running tests', name='fatal')
+                await ctx.log_prepared(
+                    f"Runner type {self._runner_type} received a call to abort and is now aborting all running tests",
+                    name="fatal",
+                )
 
             else:
-                await ctx.log_prepared(f'Runner type {self._runner_type} encountered exception {str(error)} is now aborting all running tests', name='fatal')
+                await ctx.log_prepared(
+                    f"Runner type {self._runner_type} encountered exception {str(error)} is now aborting all running tests",
+                    name="fatal",
+                )
 
             try:
-                if terminal_ui_enabled:
-                    await ctx.log_prepared('Aborting Hyperscale Terminal UI', name='debug')
+                if terminal_mode in ["ci", "full"]:
+                    await ctx.log_prepared(
+                        "Aborting Hyperscale Terminal UI", name="debug"
+                    )
                     await self._interface.abort()
 
             except Exception as e:
-                    await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Terminal UI', name='trace')
+                await ctx.log_prepared(
+                    f"Encountered error {str(e)} aborting Hyperscale Terminal UI",
+                    name="trace",
+                )
 
             except asyncio.CancelledError:
                 pass
 
             try:
                 self._remote_manger.abort()
-                await ctx.log_prepared('Aborting Hyperscale Remote Manager', name='debug')
+                await ctx.log_prepared(
+                    "Aborting Hyperscale Remote Manager", name="debug"
+                )
 
             except Exception as e:
-                await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Remote Manager', name='trace')
-                
+                await ctx.log_prepared(
+                    f"Encountered error {str(e)} aborting Hyperscale Remote Manager",
+                    name="trace",
+                )
+
             except asyncio.CancelledError:
                 pass
 
             try:
-                await ctx.log_prepared('Aborting Hyperscale Server Pool', name='debug')
+                await ctx.log_prepared("Aborting Hyperscale Server Pool", name="debug")
                 self._server_pool.abort()
             except Exception as e:
-                await ctx.log_prepared(f'Encountered error {str(e)} aborting Hyperscale Server Pool', name='debug')
-                
+                await ctx.log_prepared(
+                    f"Encountered error {str(e)} aborting Hyperscale Server Pool",
+                    name="debug",
+                )
+
             except asyncio.CancelledError:
                 pass
 
@@ -347,7 +403,7 @@ class LocalRunner:
             )
             for port in range(
                 base_worker_port,
-                base_worker_port + (self._workers ** 2),
+                base_worker_port + (self._workers**2),
                 self._workers,
             )
         ]

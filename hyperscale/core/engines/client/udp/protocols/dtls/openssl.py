@@ -32,33 +32,41 @@ Exceptions:
   OpenSSLError -- exception raised when errors occur in the OpenSSL library
 """
 
-import sys
 import array
+import ctypes
 import socket
+import sys
+from ctypes import (
+    CDLL,
+    CFUNCTYPE,
+    POINTER,
+    Structure,
+    Union,
+    byref,
+    c_char,
+    c_char_p,
+    c_int,
+    c_long,
+    c_short,
+    c_size_t,
+    c_ubyte,
+    c_uint,
+    c_uint64,
+    c_ulong,
+    c_ushort,
+    c_void_p,
+    cast,
+    create_string_buffer,
+    memmove,
+    sizeof,
+)
+from datetime import timedelta
 from logging import getLogger
 from os import path
-from datetime import timedelta
-from .err import openssl_error, SSL_ERROR_TEXT
-from .err import SSL_ERROR_NONE
-from .util import _EC_KEY, _BIO
-import ctypes
-from ctypes import CDLL
-from ctypes import CFUNCTYPE
-from ctypes import (
-    c_void_p,
-    c_int,
-    c_uint64,
-    c_long,
-    c_uint,
-    c_ulong,
-    c_char_p,
-    c_size_t,
-)
-from ctypes import c_short, c_ushort, c_ubyte, c_char
-from ctypes import byref, POINTER
-from ctypes import Structure, Union
-from ctypes import create_string_buffer, sizeof, memmove, cast
 from threading import Lock
+
+from .err import SSL_ERROR_NONE, SSL_ERROR_TEXT, openssl_error
+from .util import _BIO, _EC_KEY
 
 #
 # Module initialization
@@ -68,16 +76,26 @@ _logger = getLogger(__name__)
 #
 # Library loading
 #
-if sys.platform.startswith("win"):
-    dll_path = path.abspath(path.dirname(__file__))
-    cryptodll_path = path.join(dll_path, "libcrypto-1_1-x64.dll")
-    ssldll_path = path.join(dll_path, "libssl-1_1-x64.dll")
-    libcrypto = CDLL(cryptodll_path)
-    libssl = CDLL(ssldll_path)
-else:
-    libcrypto = CDLL("libcrypto.so.1.1")
-    libssl = CDLL("libssl.so.1.1")
-
+try:
+    if sys.platform.startswith("win"):
+        dll_path = path.abspath(path.dirname(__file__))
+        cryptodll_path = path.join(dll_path, "libcrypto-1_1-x64.dll")
+        ssldll_path = path.join(dll_path, "libssl-1_1-x64.dll")
+        libcrypto = CDLL(cryptodll_path)
+        libssl = CDLL(ssldll_path)
+    else:
+        libcrypto = CDLL("libcrypto.so.1.1")
+        libssl = CDLL("libssl.so.1.1")
+except (Exception, OSError):
+    if sys.platform.startswith("win"):
+        dll_path = path.abspath(path.dirname(__file__))
+        cryptodll_path = path.join(dll_path, "libcrypto-3-x64.dll")
+        ssldll_path = path.join(dll_path, "libssl-3-x64.dll")
+        libcrypto = CDLL(cryptodll_path)
+        libssl = CDLL(ssldll_path)
+    else:
+        libcrypto = CDLL("libcrypto.3.dylib")
+        libssl = CDLL("libssl.3.dylib")
 #
 # Integer constants - exported
 #
@@ -596,7 +614,9 @@ def errcheck_FuncParam(result, func, args):
 #
 # Function prototypes
 #
-def _make_function(name, lib, args, export=True, errcheck="default"):
+def _make_function(
+    name, lib, args, export=True, errcheck="default", alt_name: str = None
+):
     assert len(args)
 
     def type_subst(map_type):
@@ -619,15 +639,31 @@ def _make_function(name, lib, args, export=True, errcheck="default"):
     else:
         glbl_name = "_" + name
     # print('opensslL564 func_name= ' + name)
-    func = _sigs[sig](
-        (name, lib),
-        tuple(
-            (i[2] if len(i) > 2 else 1, i[1], i[3] if len(i) > 3 else None)[
-                : 3 if len(i) > 3 else 2
-            ]
-            for i in args[1:]
-        ),
-    )
+    try:
+        func = _sigs[sig](
+            (name, lib),
+            tuple(
+                (i[2] if len(i) > 2 else 1, i[1], i[3] if len(i) > 3 else None)[
+                    : 3 if len(i) > 3 else 2
+                ]
+                for i in args[1:]
+            ),
+        )
+    except Exception as e:
+        if alt_name:
+            func = _sigs[sig](
+                (alt_name, lib),
+                tuple(
+                    (i[2] if len(i) > 2 else 1, i[1], i[3] if len(i) > 3 else None)[
+                        : 3 if len(i) > 3 else 2
+                    ]
+                    for i in args[1:]
+                ),
+            )
+
+        else:
+            raise e
+
     func.func_name = name
     if pointer_return:
         func.ret_type = args[0][0]  # for fix-up during error checking protocol
@@ -961,7 +997,14 @@ list(
             ("SSL_set_connect_state", libssl, ((None, "ret"), (SSL, "ssl"))),
             ("SSL_set_accept_state", libssl, ((None, "ret"), (SSL, "ssl"))),
             ("SSL_do_handshake", libssl, ((c_int, "ret"), (SSL, "ssl"))),
-            ("SSL_get_peer_certificate", libssl, ((X509, "ret"), (SSL, "ssl"))),
+            (
+                "SSL_get1_peer_certificate",
+                libssl,
+                ((X509, "ret"), (SSL, "ssl")),
+                True,
+                "default",
+                "SSL_get_peer_certificate",
+            ),
             (
                 "SSL_get_peer_cert_chain",
                 libssl,

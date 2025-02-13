@@ -7,8 +7,8 @@ from typing import (
 )
 
 import zstandard
-from dtls import do_patch
 
+from hyperscale.core.engines.client.udp.protocols.dtls import do_patch
 from hyperscale.distributed.connection.udp.protocols import MercurySyncUDPProtocol
 from hyperscale.distributed.env import Env
 

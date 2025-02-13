@@ -42,17 +42,19 @@ from types import MethodType
 from weakref import proxy
 
 from .err import patch_ssl_errors, raise_as_ssl_module_error
-from .sslconnection import (
-    DTLS_OPENSSL_VERSION,
-    DTLS_OPENSSL_VERSION_INFO,
-    DTLS_OPENSSL_VERSION_NUMBER,
-    PROTOCOL_DTLS,
+from .openssl import (
     SSL_BUILD_CHAIN_FLAG_CHECK,
     SSL_BUILD_CHAIN_FLAG_CLEAR_ERROR,
     SSL_BUILD_CHAIN_FLAG_IGNORE_ERROR,
     SSL_BUILD_CHAIN_FLAG_NO_ROOT,
     SSL_BUILD_CHAIN_FLAG_NONE,
     SSL_BUILD_CHAIN_FLAG_UNTRUSTED,
+)
+from .sslconnection import (
+    DTLS_OPENSSL_VERSION,
+    DTLS_OPENSSL_VERSION_INFO,
+    DTLS_OPENSSL_VERSION_NUMBER,
+    PROTOCOL_DTLS,
     PROTOCOL_DTLSv1,
     PROTOCOL_DTLSv1_2,
     SSLConnection,

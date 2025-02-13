@@ -3,7 +3,6 @@ import time
 import traceback
 from typing import Any, Awaitable, Callable, Optional
 
-from .cancel import cancel
 from .models import RunStatus, TaskRun
 
 

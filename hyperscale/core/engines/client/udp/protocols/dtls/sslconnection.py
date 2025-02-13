@@ -40,26 +40,124 @@ library's ssl module, since its values can be passed to this module.
   CERT_REQUIRED
 """
 
-import errno
-import socket
-import hmac
 import datetime
+import errno
 import hashlib
+import hmac
+import socket
 from logging import getLogger
-from os import urandom, fsencode
+from os import fsencode, urandom
 from select import select
 from weakref import proxy
 
-from .err import openssl_error, InvalidSocketError
-from .err import raise_ssl_error
-from .err import SSL_ERROR_WANT_READ, SSL_ERROR_SYSCALL
-from .err import ERR_WRONG_VERSION_NUMBER, ERR_COOKIE_MISMATCH, ERR_NO_SHARED_CIPHER
-from .err import ERR_NO_CIPHER, ERR_HANDSHAKE_TIMEOUT, ERR_PORT_UNREACHABLE
-from .err import ERR_READ_TIMEOUT, ERR_WRITE_TIMEOUT
-from .err import ERR_BOTH_KEY_CERT_FILES, ERR_BOTH_KEY_CERT_FILES_SVR
+from .err import (
+    ERR_BOTH_KEY_CERT_FILES,
+    ERR_BOTH_KEY_CERT_FILES_SVR,
+    ERR_COOKIE_MISMATCH,
+    ERR_HANDSHAKE_TIMEOUT,
+    ERR_NO_CIPHER,
+    ERR_NO_SHARED_CIPHER,
+    ERR_PORT_UNREACHABLE,
+    ERR_READ_TIMEOUT,
+    ERR_WRITE_TIMEOUT,
+    ERR_WRONG_VERSION_NUMBER,
+    SSL_ERROR_SYSCALL,
+    SSL_ERROR_WANT_READ,
+    InvalidSocketError,
+    openssl_error,
+    raise_ssl_error,
+)
+from .openssl import (
+    BIO_NOCLOSE,
+    OPENSSL_VERSION,
+    SSL_BUILD_CHAIN_FLAG_NONE,
+    SSL_CB_ALERT,
+    SSL_CB_EXIT,
+    SSL_CB_HANDSHAKE_DONE,
+    SSL_CB_HANDSHAKE_START,
+    SSL_CB_LOOP,
+    SSL_CB_READ,
+    SSL_FILE_TYPE_PEM,
+    SSL_OP_NO_COMPRESSION,
+    SSL_OP_NO_QUERY_MTU,
+    SSL_SESS_CACHE_OFF,
+    SSL_ST_ACCEPT,
+    SSL_ST_CONNECT,
+    SSL_ST_INIT,
+    SSL_ST_MASK,
+    SSL_ST_RENEGOTIATE,
+    SSL_VERIFY_CLIENT_ONCE,
+    SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+    SSL_VERIFY_NONE,
+    SSL_VERIFY_PEER,
+    BIO_dgram_get_peer,
+    BIO_dgram_set_connected,
+    BIO_dgram_set_peer,
+    BIO_new_dgram,
+    BIO_set_nbio,
+    DTLS_server_method,
+    DTLS_set_link_mtu,
+    DTLS_set_timer_cb,
+    DTLSv1_2_client_method,
+    DTLSv1_2_server_method,
+    DTLSv1_client_method,
+    DTLSv1_get_timeout,
+    DTLSv1_handle_timeout,
+    DTLSv1_listen,
+    DTLSv1_server_method,
+    EC_curve_nid2nist,
+    EC_curve_nist2nid,
+    OPENSSL_init_ssl,
+    OpenSSL_version,
+    OpenSSL_version_num,
+    SSL_alert_desc_string_long,
+    SSL_alert_type_string_long,
+    SSL_CIPHER_get_bits,
+    SSL_CIPHER_get_name,
+    SSL_CIPHER_get_version,
+    SSL_clear_options,
+    SSL_CTX_build_cert_chain,
+    SSL_CTX_free,
+    SSL_CTX_load_verify_locations,
+    SSL_CTX_new,
+    SSL_CTX_set1_curves,
+    SSL_CTX_set1_curves_list,
+    SSL_CTX_set1_sigalgs_list,
+    SSL_CTX_set_cipher_list,
+    SSL_CTX_set_cookie_cb,
+    SSL_CTX_set_ecdh_auto,
+    SSL_CTX_set_info_callback,
+    SSL_CTX_set_options,
+    SSL_CTX_set_read_ahead,
+    SSL_CTX_set_session_cache_mode,
+    SSL_CTX_set_tmp_ecdh,
+    SSL_CTX_set_verify,
+    SSL_CTX_use_certificate_chain_file,
+    SSL_CTX_use_PrivateKey_file,
+    SSL_do_handshake,
+    SSL_free,
+    SSL_get1_peer_certificate,
+    SSL_get_current_cipher,
+    SSL_get_peer_cert_chain,
+    SSL_get_rbio,
+    SSL_new,
+    SSL_pending,
+    SSL_read,
+    SSL_set_accept_state,
+    SSL_set_bio,
+    SSL_set_connect_state,
+    SSL_set_mtu,
+    SSL_set_options,
+    SSL_shutdown,
+    SSL_state_string_long,
+    SSL_write,
+    get_elliptic_curves,
+    i2d_X509,
+    remove_from_info_callback,
+    remove_from_timer_callbacks,
+)
+from .util import _BIO, _Rsrc
 from .x509 import _X509, decode_cert
-from .openssl import *
-from .util import _Rsrc, _BIO
 
 _logger = getLogger(__name__)
 
@@ -926,7 +1024,7 @@ class SSLConnection(object):
         """
 
         try:
-            peer_cert = _X509(SSL_get_peer_certificate(self._ssl.value))
+            peer_cert = _X509(SSL_get1_peer_certificate(self._ssl.value))
         except openssl_error():
             return
 

@@ -1,7 +1,10 @@
 import asyncio
 import time
+
 from hyperscale.core.graph import Workflow
-from hyperscale.ui.components.terminal import Terminal, Section
+from hyperscale.core.jobs.models import TerminalMode
+from hyperscale.ui.components.terminal import Section, Terminal
+
 from .generate_ui_sections import generate_ui_sections
 from .hyperscale_interface_config import HyperscaleInterfaceConfig
 from .interface_updates_controller import InterfaceUpdatesController
@@ -54,12 +57,14 @@ class HyperscaleInterface:
     def initialize(
         self,
         workflows: list[Workflow],
+        terminal_mode: TerminalMode = "full",
     ):
-        sections: list[Section] = generate_ui_sections(workflows)
-        self._terminal = Terminal(sections)
+        if terminal_mode in ["ci", "full"]:
+            sections: list[Section] = generate_ui_sections(workflows)
+            self._terminal = Terminal(sections)
 
     def reset_active(self):
-        self._active_workflow = 'initializing'
+        self._active_workflow = "initializing"
         self._current_active_idx = 0
 
     async def run(self):
@@ -78,7 +83,6 @@ class HyperscaleInterface:
             )
 
     async def _run(self):
-
         start = time.monotonic()
 
         while not self._run_switch_loop.is_set():
@@ -95,10 +99,12 @@ class HyperscaleInterface:
 
             elapsed = time.monotonic() - start
 
-            if self._active_workflow == 'initializing':
+            if self._active_workflow == "initializing":
                 active_workflows_update: (
                     list[str] | None
-                ) = await self._updates.get_active_workflows(self._config.update_interval)
+                ) = await self._updates.get_active_workflows(
+                    self._config.update_interval
+                )
 
             if isinstance(active_workflows_update, list):
                 self._active_workflows = active_workflows_update
@@ -110,8 +116,10 @@ class HyperscaleInterface:
             elif len(self._active_workflows) > 0:
                 self._active_workflow = self._active_workflows[self._current_active_idx]
 
-            
-            if not isinstance(active_workflows_update, list) and elapsed > self._config.update_interval:
+            if (
+                not isinstance(active_workflows_update, list)
+                and elapsed > self._config.update_interval
+            ):
                 self._current_active_idx = (self._current_active_idx + 1) % len(
                     self._active_workflows
                 )

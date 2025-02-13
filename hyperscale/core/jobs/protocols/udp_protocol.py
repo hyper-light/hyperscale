@@ -1,49 +1,48 @@
 from __future__ import annotations
-import inspect
-import psutil
-import uuid
-import functools
+
 import asyncio
-import cloudpickle
+import inspect
 import pickle
-import socket
 import signal
+import socket
 import ssl
+import uuid
 from collections import defaultdict, deque
 from typing import (
     Any,
     AsyncIterable,
+    Awaitable,
+    Callable,
     Coroutine,
     Deque,
     Dict,
+    Generic,
     Literal,
     Tuple,
-    Union,
     TypeVar,
-    Callable,
-    Awaitable,
-    Generic,
+    Union,
 )
 
+import cloudpickle
 import zstandard
-from dtls import do_patch
 
-from hyperscale.core.jobs.tasks import TaskRunner
+from hyperscale.core.engines.client.time_parser import TimeParser
+from hyperscale.core.engines.client.udp.protocols.dtls import do_patch
 from hyperscale.core.jobs.data_structures import LockedSet
 from hyperscale.core.jobs.hooks.hook_type import HookType
-from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.jobs.models import Env, Message
-
+from hyperscale.core.jobs.tasks import TaskRunner
 from hyperscale.core.snowflake import Snowflake
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
-    ControllerTrace,
     ControllerDebug,
-    ControllerInfo,
     ControllerError,
     ControllerFatal,
+    ControllerInfo,
+    ControllerTrace,
 )
+
 from .encryption import AESGCMFernet
 from .udp_socket_protocol import UDPSocketProtocol
 
@@ -133,7 +132,6 @@ class UDPProtocol(Generic[T, K]):
 
     async def run_forever(self):
         try:
-
             self._run_future = self._loop.create_future()
             await self._run_future
 
@@ -222,18 +220,11 @@ class UDPProtocol(Generic[T, K]):
 
                 run_start = False
 
-            except (
-                Exception,
-                asyncio.CancelledError,
-                socket.error,
-                OSError
-            ):
-                import traceback
-                print(traceback.format_exc())
-
+            except (Exception, asyncio.CancelledError, socket.error, OSError):
+                pass
 
             await asyncio.sleep(self._retry_interval)
-        
+
         default_config = {
             "node_id": self._node_id_base,
             "node_host": self.host,
@@ -241,31 +232,28 @@ class UDPProtocol(Generic[T, K]):
         }
 
         self._logger.configure(
-            name=f'graph_client_{self._node_id_base}',
+            name=f"graph_client_{self._node_id_base}",
             path=logfile,
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
-                'trace': (
-                    ControllerTrace,
-                    default_config
-                ),
-                'debug': (
+                "trace": (ControllerTrace, default_config),
+                "debug": (
                     ControllerDebug,
                     default_config,
                 ),
-                'info': (
+                "info": (
                     ControllerInfo,
                     default_config,
                 ),
-                'error': (
+                "error": (
                     ControllerError,
                     default_config,
                 ),
-                'fatal': (
+                "fatal": (
                     ControllerFatal,
                     default_config,
-                )
-            }
+                ),
+            },
         )
 
         return instance_id
@@ -376,7 +364,6 @@ class UDPProtocol(Generic[T, K]):
         while run_start:
             try:
                 if self.connected is False and worker_socket is None:
-
                     self.udp_socket = socket.socket(
                         socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP
                     )
@@ -385,9 +372,7 @@ class UDPProtocol(Generic[T, K]):
                     )
 
                     await self._loop.run_in_executor(
-                        None,
-                        self.udp_socket.bind,
-                        (self.host, self.port)
+                        None, self.udp_socket.bind, (self.host, self.port)
                     )
 
                     self.udp_socket.setblocking(False)
@@ -430,12 +415,7 @@ class UDPProtocol(Generic[T, K]):
                     run_start = False
                     self.connected = True
 
-            except (
-                Exception,
-                asyncio.CancelledError,
-                socket.error,
-                OSError
-            ):
+            except (Exception, asyncio.CancelledError, socket.error, OSError):
                 pass
 
             await asyncio.sleep(self._retry_interval)
@@ -447,35 +427,32 @@ class UDPProtocol(Generic[T, K]):
         }
 
         self._logger.configure(
-            name=f'graph_server_{self._node_id_base}',
+            name=f"graph_server_{self._node_id_base}",
             path=logfile,
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
-                'trace': (
-                    ControllerTrace,
-                    default_config
-                ),
-                'debug': (
+                "trace": (ControllerTrace, default_config),
+                "debug": (
                     ControllerDebug,
                     default_config,
                 ),
-                'info': (
+                "info": (
                     ControllerInfo,
                     default_config,
                 ),
-                'error': (
+                "error": (
                     ControllerError,
                     default_config,
                 ),
-                'fatal': (
+                "fatal": (
                     ControllerFatal,
                     default_config,
-                )
-            }
+                ),
+            },
         )
 
         self._start_tasks()
-    
+
     def _start_tasks(self):
         self.tasks.start_cleanup()
         for task in self.tasks.all_tasks():
@@ -608,6 +585,7 @@ class UDPProtocol(Generic[T, K]):
         self,
         target: str,
         data: bytes,
+        node_id: int | None = None,
         target_address: Tuple[str, int] | None = None,
     ) -> bytes:
         self._last_call.append(target)
@@ -1047,13 +1025,12 @@ class UDPProtocol(Generic[T, K]):
             await asyncio.sleep(self._shutdown_poll_rate)
 
     async def close(self) -> None:
-
         async with self._logger.context(
-            name=f'graph_server_{self._node_id_base}'
+            name=f"graph_server_{self._node_id_base}"
         ) as ctx:
             await ctx.log_prepared(
-                message=f'Node {self._node_id_base} at {self.host}:{self.port} shutting down',
-                name='info',
+                message=f"Node {self._node_id_base} at {self.host}:{self.port} shutting down",
+                name="info",
             )
 
             if self._shutdown_task:
@@ -1067,16 +1044,16 @@ class UDPProtocol(Generic[T, K]):
                     pass
 
                 await ctx.log_prepared(
-                    message=f'Node {self._node_id_base} at {self.host}:{self.port} server transport closed',
-                    name='debug',
+                    message=f"Node {self._node_id_base} at {self.host}:{self.port} server transport closed",
+                    name="debug",
                 )
 
             if self.udp_socket:
                 self.udp_socket.close()
 
                 await ctx.log_prepared(
-                    message=f'Node {self._node_id_base} at {self.host}:{self.port} server socket closed',
-                    name='debug',
+                    message=f"Node {self._node_id_base} at {self.host}:{self.port} server socket closed",
+                    name="debug",
                 )
 
             if self._sleep_task:
@@ -1090,8 +1067,8 @@ class UDPProtocol(Generic[T, K]):
                     pass
 
                 await ctx.log_prepared(
-                    message=f'Node {self._node_id_base} at {self.host}:{self.port} sleep task cancelled closed',
-                    name='debug',
+                    message=f"Node {self._node_id_base} at {self.host}:{self.port} sleep task cancelled closed",
+                    name="debug",
                 )
 
             if self._cleanup_task:
@@ -1105,21 +1082,20 @@ class UDPProtocol(Generic[T, K]):
                     pass
 
                 await ctx.log_prepared(
-                    message=f'Node {self._node_id_base} at {self.host}:{self.port} cleanup task closed',
-                    name='debug',
+                    message=f"Node {self._node_id_base} at {self.host}:{self.port} cleanup task closed",
+                    name="debug",
                 )
 
             if self.tasks:
                 self.tasks.abort()
 
                 await ctx.log_prepared(
-                    message=f'Node {self._node_id_base} at {self.host}:{self.port} task runner closed',
-                    name='debug',
+                    message=f"Node {self._node_id_base} at {self.host}:{self.port} task runner closed",
+                    name="debug",
                 )
 
             if self._run_future and (
-                not self._run_future.done()
-                or not self._run_future.cancelled()
+                not self._run_future.done() or not self._run_future.cancelled()
             ):
                 try:
                     self._run_future.set_result(None)
@@ -1131,24 +1107,21 @@ class UDPProtocol(Generic[T, K]):
                     pass
 
                 await ctx.log_prepared(
-                    message=f'Node {self._node_id_base} at {self.host}:{self.port} run task completed',
-                    name='debug',
+                    message=f"Node {self._node_id_base} at {self.host}:{self.port} run task completed",
+                    name="debug",
                 )
 
             await ctx.log_prepared(
-                message=f'Node {self._node_id_base} at {self.host}:{self.port} task cleanup complete',
-                name='debug',
+                message=f"Node {self._node_id_base} at {self.host}:{self.port} task cleanup complete",
+                name="debug",
             )
 
         self._pending_responses.clear()
 
     def stop(self):
-        self._shutdown_task = asyncio.ensure_future(
-            self._shutdown()
-        )
+        self._shutdown_task = asyncio.ensure_future(self._shutdown())
 
     async def _shutdown(self):
-
         for response in self._pending_responses:
             await response
 
@@ -1177,10 +1150,9 @@ class UDPProtocol(Generic[T, K]):
         if self._shutdown_task:
             try:
                 self._shutdown_task.set_result(None)
-            
+
             except Exception:
                 pass
-
 
         if self._transport:
             try:
@@ -1248,10 +1220,9 @@ class UDPProtocol(Generic[T, K]):
                 pass
 
         self._pending_responses.clear()
-        
+
         try:
             self._logger.abort()
 
         except Exception:
             pass
-

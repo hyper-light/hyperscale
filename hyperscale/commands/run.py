@@ -1,19 +1,22 @@
 import asyncio
 import functools
+import json
+import os
+
 import psutil
 import uvloop
 
-
+from hyperscale.core.jobs.models import HyperscaleConfig, TerminalMode
 from hyperscale.core.jobs.runner.local_runner import LocalRunner
 from hyperscale.graph import Workflow
+from hyperscale.logging import LoggingConfig, LogLevelName
+
 from .cli import (
     CLI,
+    AssertSet,
     ImportFile,
     JsonFile,
-    AssertSet,
 )
-from hyperscale.logging import LogLevelName, LoggingConfig
-from hyperscale.core.jobs.models import HyperscaleConfig
 
 uvloop.install()
 
@@ -30,7 +33,21 @@ async def get_default_workers():
 
 
 def get_default_config():
-    return HyperscaleConfig()
+    config = HyperscaleConfig()
+    config_path = ".hyperscale.config.json"
+    if not os.path.exists(config_path):
+        with open(config_path, "w") as config_file:
+            json.dump(
+                config.model_dump(),
+                config_file,
+                indent=4,
+            )
+
+    else:
+        with open(config_path, "r") as config_file:
+            config = HyperscaleConfig(**json.load(config_file))
+
+    return config
 
 
 @CLI.command()
@@ -58,7 +75,7 @@ async def run(
     logging_config.update(
         log_directory=config.data.logs_directory,
         log_level=log_level.data,
-        log_output='stderr',
+        log_output="stderr",
     )
 
     runner = LocalRunner(
@@ -67,13 +84,15 @@ async def run(
         workers=workers,
     )
 
-    terminal_ui_enabled = quiet is False
+    terminal_mode: TerminalMode = config.data.terminal_mode
+    if quiet:
+        terminal_mode = "disabled"
 
     try:
         await runner.run(
             name,
             workflows,
-            terminal_ui_enabled=terminal_ui_enabled,
+            terminal_mode=terminal_mode,
         )
 
     except (
@@ -84,5 +103,5 @@ async def run(
     ) as e:
         await runner.abort(
             error=e,
-            terminal_ui_enabled=terminal_ui_enabled,
+            terminal_mode=terminal_mode,
         )
