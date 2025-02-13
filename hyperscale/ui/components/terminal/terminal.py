@@ -263,7 +263,8 @@ class Terminal:
         self._stdout = await self._dup_stdout()
 
         transport, protocol = await self._loop.connect_write_pipe(
-            lambda: TerminalProtocol(), self._stdout
+            lambda: TerminalProtocol(),
+            self._stdout,
         )
 
         try:

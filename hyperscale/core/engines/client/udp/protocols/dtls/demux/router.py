@@ -62,7 +62,7 @@ class UDPDemux(object):
     """
 
     _forwarding_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    _forwarding_socket.bind(("127.0.0.1", 0))
+    _forwarding_socket.bind(("0.0.0.0", 0))
 
     def __init__(self, datagram_socket):
         """Constructor

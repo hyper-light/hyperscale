@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import os
 import sys
-import textwrap
 
 from typing import Generic, TypeVar, Any, Callable
 
@@ -15,6 +16,7 @@ from .arg_types import (
     is_unsupported_keyword_arg,
     PositionalArg,
 )
+from .cli_protocol import CLIProtocol, patch_transport_close
 from .command import Command, create_command
 from .help_message import HelpMessage, CLIStyle
 from .inspect_wrapped import inspect_wrapped, assemble_exanded_args, is_context_arg
@@ -87,6 +89,7 @@ class Group(Generic[T]):
         self.keyword_args_map = keyword_args_map
         self.keyword_args_count = len(keyword_args_map)
         self.positional_args_count = len(positional_args)
+        self._loop = asyncio.get_event_loop()
 
     def update_command(
         self,
@@ -150,18 +153,9 @@ class Group(Generic[T]):
             return (None, errors)
 
         elif len(errors) > 0:
-            help_message_lines = await self.help_message.to_lines(
+            await self._print_group_help_message(
                 error=errors[0],
                 subcommands=subcommands,
-                global_styles=self._global_styles,
-            )
-
-            loop = asyncio.get_event_loop()
-
-            await loop.run_in_executor(
-                None,
-                sys.stdout.write,
-                help_message_lines,
             )
 
             return (None, errors)
@@ -221,22 +215,59 @@ class Group(Generic[T]):
             return command_call
 
         return wrap
+    
+    async def _dup_stdout(self, loop: asyncio.AbstractEventLoop):
+        stdout_fileno = await loop.run_in_executor(None, sys.stdout.fileno)
+
+        stdout_dup = await loop.run_in_executor(
+            None,
+            os.dup,
+            stdout_fileno,
+        )
+
+        return await loop.run_in_executor(
+            None, functools.partial(os.fdopen, stdout_dup, mode=sys.stdout.mode)
+        )
+
 
     async def _print_group_help_message(
         self,
         subcommands: list[str],
+        error: str | None = None
     ):
         loop = asyncio.get_event_loop()
 
         help_message_lines = await self.help_message.to_lines(
+            error=error,
             subcommands=subcommands,
             global_styles=self._global_styles,
         )
 
+        stdout_dup = await self._dup_stdout(loop)
+
+        transport, protocol = await loop.connect_write_pipe(
+            lambda: CLIProtocol(), 
+            stdout_dup,
+        )
+
+        try:
+            transport.close = patch_transport_close(transport, loop)
+
+        except Exception:
+            pass
+
+        writer = asyncio.StreamWriter(
+            transport,
+            protocol,
+            None,
+            loop,
+        )
+
+
         await loop.run_in_executor(
             None,
-            sys.stdout.write,
-            help_message_lines,
+            writer.write,
+            help_message_lines.encode(),
         )
 
     async def _find_args(
