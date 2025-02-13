@@ -306,6 +306,12 @@ class Terminal:
         if height is None:
             height = terminal_size.lines - 5 - self._vertical_padding
 
+        self._stop_run = asyncio.Event()
+        self._hide_run = asyncio.Event()
+
+        if self._stdout_lock is None:
+            self._stdout_lock = asyncio.Lock()
+
         await self.canvas.initialize(
             width=width,
             height=height,
@@ -321,11 +327,6 @@ class Terminal:
 
         self._start_time = time.time()
         self._stop_time = None  # Reset value to properly calculate subsequent spinner starts (if any)  # pylint: disable=line-too-long
-        self._stop_run = asyncio.Event()
-        self._hide_run = asyncio.Event()
-
-        if self._stdout_lock is None:
-            self._stdout_lock = asyncio.Lock()
 
         try:
             self._spin_thread = asyncio.ensure_future(self._execute_render_loop())
