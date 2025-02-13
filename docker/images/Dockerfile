@@ -1,4 +1,4 @@
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.13
 ARG OS_BASE=bookworm
 FROM python:${PYTHON_VERSION}-slim-${OS_BASE} AS base
 
@@ -10,14 +10,7 @@ USER root
 
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
-RUN apt-get update && \
-    apt-get install -y gcc g++ curl git
-
-ADD https://astral.sh/uv/install.sh /install.sh
-RUN chmod -R 655 /install.sh && /install.sh && rm /install.sh && \
-    ln -s /root/.cargo/bin/uv /usr/local/bin/uv
-
-ENV PATH="$PATH:/root/.cargo/bin"
+RUN pip install uv
 
 RUN mkdir -p /app
 WORKDIR /app
@@ -27,8 +20,7 @@ RUN uv venv && \
     . /app/.venv/bin/activate && \
     uv pip install setuptools wheel && \
     uv pip install -r requirements.txt && \
-    uv pip install . && \
-    playwright install --with-deps
+    uv pip install .
 
 RUN groupadd --gid $USER_GID $USERNAME \
 && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyperscale"
-version = "0.2.12"
+version = "0.2.13"
 requires-python = ">=3.11"
 description = "Performance testing at scale."
 readme = "README.md"
@@ -43,10 +43,6 @@ dependencies = [
     "orjson",
     "msgspec",
     "numpy",
-    "grpcio",
-    "grpcio-tools",
-    "gql",
-    "playwright",
 ]
 
 [project.optional-dependencies]
