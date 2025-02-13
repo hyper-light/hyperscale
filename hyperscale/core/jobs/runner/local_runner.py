@@ -256,8 +256,8 @@ class LocalRunner:
                 asyncio.TimeoutError,
                 asyncio.CancelledError,
                 BrokenProcessPool,
-            ) as e:
-                if isinstance(e, asyncio.CancelledError):
+            ) as err:
+                if isinstance(err, asyncio.CancelledError):
                     await ctx.log_prepared(
                         f"Encountered interrupt while running test {test_name} - aborting",
                         name="fatal",
@@ -265,7 +265,7 @@ class LocalRunner:
 
                 else:
                     await ctx.log_prepared(
-                        f"Encountered fatal exception {str(e)} while running test {test_name} - aborting",
+                        f"Encountered fatal exception {str(err)} while running test {test_name} - aborting",
                         name="fatal",
                     )
 
@@ -287,7 +287,7 @@ class LocalRunner:
                     pass
 
                 if not isinstance(
-                    e,
+                    err,
                     (
                         KeyboardInterrupt,
                         ProcessError,
@@ -312,6 +312,13 @@ class LocalRunner:
 
                 except asyncio.CancelledError:
                     pass
+                
+                loop = asyncio.get_event_loop()
+                children = await loop.run_in_executor(None, active_children)
+
+                await asyncio.gather(
+                    *[loop.run_in_executor(None, child.kill) for child in children]
+                )
 
                 try:
                     await ctx.log_prepared(
@@ -329,7 +336,7 @@ class LocalRunner:
                 except asyncio.CancelledError:
                     pass
 
-                return e
+                return err
 
     async def abort(
         self,

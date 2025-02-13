@@ -101,6 +101,8 @@ async def run(
         asyncio.CancelledError,
         asyncio.InvalidStateError,
     ) as e:
+        import traceback
+        print(traceback.format_exc())
         await runner.abort(
             error=e,
             terminal_mode=terminal_mode,
