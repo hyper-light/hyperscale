@@ -106,7 +106,7 @@ async def create_new_file_ui(
 
     terminal_text = await terminal.render_once()
 
-    return f"\033[2J\033[H\n{terminal_text}\n\n"
+    return f"\033[2J\033[H\n{terminal_text}\n"
 
 
 async def create_test(
