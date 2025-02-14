@@ -1,18 +1,20 @@
 import asyncio
 import inspect
-import textwrap
 import pathlib
 import sys
+import textwrap
+
 import uvloop
 
 from hyperscale.ui.components.header import Header, HeaderConfig
+from hyperscale.ui.components.terminal import Section, SectionConfig, Terminal
 from hyperscale.ui.components.text import Text, TextConfig
-from hyperscale.ui.components.terminal import Section, SectionConfig
-from hyperscale.ui.components.terminal import Terminal
+
 from .cli import CLI
 from .workflow import test
 
 uvloop.install()
+
 
 async def create_new_file_ui(
     path: str,
@@ -21,7 +23,7 @@ async def create_new_file_ui(
     header = Section(
         SectionConfig(
             left_padding=4,
-            height="smallest", 
+            height="smallest",
             width="full",
             max_height=3,
         ),
@@ -64,18 +66,18 @@ async def create_new_file_ui(
     )
 
     text_component = Text(
-        f"new_test_display",
+        "new_test_display",
         TextConfig(
-            horizontal_alignment='left',
+            horizontal_alignment="left",
             text=f"New test created at {path}",
         ),
     )
 
     if failed_overwrite_check:
         text_component = Text(
-            f"new_test_display",
+            "new_test_display",
             TextConfig(
-                horizontal_alignment='left',
+                horizontal_alignment="left",
                 text=f"File already exists at {path}! Please run again with the --overwrite/-o flag.",
             ),
         )
@@ -92,9 +94,7 @@ async def create_new_file_ui(
             max_height=3,
             vertical_alignment="center",
         ),
-        components=[
-            text_component
-        ],
+        components=[text_component],
     )
 
     terminal = Terminal(
@@ -106,8 +106,7 @@ async def create_new_file_ui(
 
     terminal_text = await terminal.render_once()
 
-    return f'\033[2J\033[H\n\n{terminal_text}\n\n'
-    
+    return f"\033[2J\033[H\n{terminal_text}\n\n"
 
 
 async def create_test(
@@ -118,37 +117,33 @@ async def create_test(
         None,
         open,
         path,
-        'w',
+        "w",
     )
 
     try:
         await loop.run_in_executor(
             None,
             test_file.write,
-            textwrap.dedent(
-                inspect.getsource(test)
-            ),
+            textwrap.dedent(inspect.getsource(test)),
         )
 
     except Exception:
         pass
 
-    await loop.run_in_executor(
-        None,
-        test_file.close
-    )
+    await loop.run_in_executor(None, test_file.close)
+
 
 @CLI.command()
 async def new(
     path: str,
     overwrite: bool = False,
 ):
-    '''
+    """
     Create a new test at the provided path
 
     @param path The path to create the test file at
     @param overwrite If specified, if a file exists at the provided path it will be overwritten
-    '''
+    """
     loop = asyncio.get_event_loop()
 
     test_path = await loop.run_in_executor(
@@ -157,21 +152,11 @@ async def new(
         path,
     )
 
-    absolute_path = await loop.run_in_executor(
-        None,
-        test_path.absolute
-    )
+    absolute_path = await loop.run_in_executor(None, test_path.absolute)
 
-    resolved_path = await loop.run_in_executor(
-        None,
-        absolute_path.resolve
-    )
+    resolved_path = await loop.run_in_executor(None, absolute_path.resolve)
 
-    filepath_exists = await loop.run_in_executor(
-        None,
-        resolved_path.exists
-    )
-
+    filepath_exists = await loop.run_in_executor(None, resolved_path.exists)
 
     if filepath_exists and overwrite is True:
         await create_test(
@@ -180,9 +165,7 @@ async def new(
         )
 
         await loop.run_in_executor(
-            None,
-            sys.stdout.write,
-            await create_new_file_ui(path, False)
+            None, sys.stdout.write, await create_new_file_ui(path, False)
         )
 
     elif filepath_exists is False:
@@ -192,15 +175,10 @@ async def new(
         )
 
         await loop.run_in_executor(
-            None,
-            sys.stdout.write,
-            await create_new_file_ui(path, False)
+            None, sys.stdout.write, await create_new_file_ui(path, False)
         )
 
     else:
         await loop.run_in_executor(
-            None,
-            sys.stdout.write,
-            await create_new_file_ui(path, True)
+            None, sys.stdout.write, await create_new_file_ui(path, True)
         )
-        
