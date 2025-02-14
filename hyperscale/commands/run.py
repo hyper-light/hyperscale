@@ -1,7 +1,9 @@
 import asyncio
+import cloudpickle
 import functools
 import json
 import os
+import sys
 
 import psutil
 import uvloop
@@ -71,6 +73,9 @@ async def run(
     """
     workflows = [workflow() for workflow in path.data.values()]
 
+    for workflow in workflows:
+        cloudpickle.register_pickle_by_value(sys.modules[workflow.__module__])
+
     logging_config = LoggingConfig()
     logging_config.update(
         log_directory=config.data.logs_directory,
@@ -79,7 +84,7 @@ async def run(
     )
 
     runner = LocalRunner(
-        "0.0.0.0",
+        "127.0.0.1",
         config.data.server_port,
         workers=workers,
     )

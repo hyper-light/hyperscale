@@ -299,7 +299,7 @@ class LocalServerPool:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
 
-                    if self._executor._processes and self._executor._processes > 0:
+                    if self._executor._processes and len(self._executor._processes) > 0:
                         await self._loop.run_in_executor(
                             None,
                             functools.partial(
@@ -318,7 +318,7 @@ class LocalServerPool:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
 
-                    if self._executor._processes and self._executor._processes > 0:
+                    if self._executor._processes and len(self._executor._processes) > 0:
                         await self._loop.run_in_executor(
                             None,
                             functools.partial(
@@ -353,12 +353,12 @@ class LocalServerPool:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
 
-                if self._executor._processes and self._executor._processes > 0:
+                if self._executor._processes and len(self._executor._processes) > 0:
                     self._executor.shutdown(wait=False, cancel_futures=True)
 
         except Exception:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
 
-                if self._executor._processes and self._executor._processes > 0:
+                if self._executor._processes and len(self._executor._processes) > 0:
                     self._executor.shutdown(wait=False, cancel_futures=True)
