@@ -1,7 +1,14 @@
 from pathlib import Path
 from typing import Optional, Sequence
 
-from playwright.async_api import FilePayload
+try:
+
+    from playwright.async_api import FilePayload
+
+except Exception:
+    class FilePayload:
+        pass
+
 from pydantic import (
     BaseModel,
     StrictBool,
@@ -23,3 +30,6 @@ class SetInputFilesCommand(BaseModel):
     strict: Optional[StrictBool] = None
     no_wait_after: Optional[StrictBool] = None
     timeout: StrictInt | StrictFloat
+
+    class Config:
+        arbitrary_types_allowed = True

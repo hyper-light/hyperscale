@@ -1,28 +1,30 @@
 from __future__ import annotations
 
-
 import asyncio
 import functools
+import io
 import math
+import os
 import shutil
 import signal
 import sys
 import time
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Dict,
     List,
     TypeVar,
-    Awaitable,
 )
 
-from hyperscale.ui.state import Action, ActionData, observe, SubscriptionSet
+from hyperscale.ui.state import Action, ActionData, SubscriptionSet, observe
+
 from .canvas import Canvas
 from .engine_config import EngineConfig
-from .refresh_rate import RefreshRateMap, RefreshRate
+from .refresh_rate import RefreshRate, RefreshRateMap
 from .section import Section
-
+from .terminal_protocol import TerminalProtocol, patch_transport_close
 
 SignalHandlers = Callable[[int], Any] | int | None
 Notification = Callable[[], Awaitable[None]]
@@ -70,13 +72,15 @@ async def handle_resize(engine: Terminal):
             )
 
         if len(engine._updates.triggers) > 0:
-            await asyncio.gather(*[
-                engine._updates.rerender_last(trigger) for trigger in engine._updates.triggers.values()
-            ])
+            await asyncio.gather(
+                *[
+                    engine._updates.rerender_last(trigger)
+                    for trigger in engine._updates.triggers.values()
+                ]
+            )
 
         await engine.resume()
 
-  
     except Exception:
         pass
 
@@ -114,6 +118,10 @@ class Terminal:
         self._frame_height: int = 0
         self._horizontal_padding: int = 0
         self._vertical_padding: int = 0
+        self._stdout: io.TextIOBase | None = None
+        self._transport: asyncio.Transport | None = None
+        self._protocol: asyncio.Protocol | None = None
+        self._writer: asyncio.StreamWriter | None = None
 
         # Maps signals to their default handlers in order to reset
         # custom handlers set by ``sigmap`` at the cleanup phase.
@@ -231,11 +239,49 @@ class Terminal:
 
             self._run_engine = asyncio.ensure_future(self._run())
 
+    async def _dup_stdout(self):
+        stdout_fileno = await self._loop.run_in_executor(None, sys.stdout.fileno)
+
+        stdout_dup = await self._loop.run_in_executor(
+            None,
+            os.dup,
+            stdout_fileno,
+        )
+
+        return await self._loop.run_in_executor(
+            None, functools.partial(os.fdopen, stdout_dup, mode=sys.stdout.mode)
+        )
+
     async def _initialize_canvas(
         self,
         horizontal_padding: int = 0,
         vertical_padding: int = 0,
     ):
+        if self._loop is None:
+            self._loop = asyncio.get_event_loop()
+
+        self._stdout = await self._dup_stdout()
+
+        transport, protocol = await self._loop.connect_write_pipe(
+            lambda: TerminalProtocol(),
+            self._stdout,
+        )
+
+        try:
+            transport.close = patch_transport_close(transport, self._loop)
+
+        except Exception:
+            pass
+
+        self._transport = transport
+        self._protocol = protocol
+        self._writer = asyncio.StreamWriter(
+            transport,
+            protocol,
+            None,
+            self._loop,
+        )
+
         width: int | None = None
         height: int | None = None
 
@@ -244,9 +290,6 @@ class Terminal:
 
         if vertical_padding != self._vertical_padding:
             self._vertical_padding = vertical_padding
-
-        if self._loop is None:
-            self._loop = asyncio.get_event_loop()
 
         terminal_size = await self._loop.run_in_executor(None, shutil.get_terminal_size)
 
@@ -264,6 +307,12 @@ class Terminal:
         if height is None:
             height = terminal_size.lines - 5 - self._vertical_padding
 
+        self._stop_run = asyncio.Event()
+        self._hide_run = asyncio.Event()
+
+        if self._stdout_lock is None:
+            self._stdout_lock = asyncio.Lock()
+
         await self.canvas.initialize(
             width=width,
             height=height,
@@ -279,11 +328,6 @@ class Terminal:
 
         self._start_time = time.time()
         self._stop_time = None  # Reset value to properly calculate subsequent spinner starts (if any)  # pylint: disable=line-too-long
-        self._stop_run = asyncio.Event()
-        self._hide_run = asyncio.Event()
-
-        if self._stdout_lock is None:
-            self._stdout_lock = asyncio.Lock()
 
         try:
             self._spin_thread = asyncio.ensure_future(self._execute_render_loop())
@@ -301,8 +345,8 @@ class Terminal:
 
                 frame = await self.canvas.render()
 
-                frame = f"\033[3J\033[H{frame}\n"
-                await self._loop.run_in_executor(None, sys.stdout.write, frame)
+                frame = f"\033[3J\033[H{frame}\n".encode()
+                await self._loop.run_in_executor(None, self._writer.write, frame)
 
                 if self._stdout_lock.locked():
                     self._stdout_lock.release()
@@ -313,21 +357,27 @@ class Terminal:
                 # Wait
             await asyncio.sleep(self._interval)
 
-    @staticmethod
-    async def _show_cursor():
+    async def _show_cursor(self):
         loop = asyncio.get_event_loop()
-        if sys.stdout.isatty():
+        if await self._loop.run_in_executor(None, self._stdout.isatty):
             # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
-            await loop.run_in_executor(None, sys.stdout.write, "\033[?25h")
-            await loop.run_in_executor(None, sys.stdout.flush)
 
-    @staticmethod
-    async def _hide_cursor():
+            await self._stdout_lock.acquire()
+
+            await loop.run_in_executor(None, self._writer.write, b"\033[?25h")
+
+            if self._stdout_lock.locked():
+                self._stdout_lock.release()
+
+    async def _hide_cursor(self):
         loop = asyncio.get_event_loop()
-        if sys.stdout.isatty():
+        if await self._loop.run_in_executor(None, self._stdout.isatty):
+            await self._stdout_lock.acquire()
             # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
-            await loop.run_in_executor(None, sys.stdout.write, "\033[?25l")
-            await loop.run_in_executor(None, sys.stdout.flush)
+            await loop.run_in_executor(None, self._writer.write, b"\033[?25l")
+
+            if self._stdout_lock.locked():
+                self._stdout_lock.release()
 
     async def _clear_terminal(
         self,
@@ -336,15 +386,15 @@ class Terminal:
         if force:
             await self._loop.run_in_executor(
                 None,
-                sys.stdout.write,
-                "\033[2J\033H",
+                self._writer.write,
+                b"\033[2J\033H",
             )
 
         else:
             await self._loop.run_in_executor(
                 None,
-                sys.stdout.write,
-                "\033[3J\033[H",
+                self._writer.write,
+                b"\033[3J\033[H",
             )
 
     async def pause(self):
@@ -415,10 +465,9 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        frame = f"\033[3J\033[H{frame}\n"
+        frame = f"\033[3J\033[H{frame}\n".encode()
 
-        await self._loop.run_in_executor(None, sys.stdout.write, frame)
-        await self._loop.run_in_executor(None, sys.stdout.flush)
+        await self._loop.run_in_executor(None, self._writer.write, frame)
 
         if self._stdout_lock.locked():
             self._stdout_lock.release()
@@ -454,9 +503,9 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        frame = f"\033[3J\033[H{frame}\n"
+        frame = f"\033[3J\033[H{frame}\n".encode()
 
-        await self._loop.run_in_executor(None, sys.stdout.write, frame)
+        await self._loop.run_in_executor(None, self._writer.write, frame)
 
         try:
             self._run_engine.cancel()
@@ -479,6 +528,5 @@ class Terminal:
 
     def _register_signal_handlers(self):
         self._loop.add_signal_handler(
-            signal.SIGWINCH,
-            lambda: asyncio.create_task(handle_resize(self))
+            signal.SIGWINCH, lambda: asyncio.create_task(handle_resize(self))
         )

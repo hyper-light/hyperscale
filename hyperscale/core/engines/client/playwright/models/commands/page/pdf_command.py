@@ -1,7 +1,14 @@
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import PdfMargins
+try:
+
+    from playwright.async_api import PdfMargins
+
+except Exception:
+    class PdfMargins:
+        pass
+
 from pydantic import (
     BaseModel,
     StrictBool,
@@ -28,3 +35,6 @@ class PdfCommand(BaseModel):
     outline: Optional[StrictBool] = None
     tagged: Optional[StrictBool] = None
     timeout: Optional[StrictInt | StrictFloat] = None
+
+    class Config:
+        arbitrary_types_allowed = True

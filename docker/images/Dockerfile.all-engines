@@ -20,7 +20,9 @@ RUN uv venv && \
     . /app/.venv/bin/activate && \
     uv pip install setuptools wheel && \
     uv pip install -r requirements.txt && \
-    uv pip install .
+    uv pip install . && \
+    uv pip install grpcio grpcio-tools gql playwright && \
+    playwright install --with-deps
 
 RUN groupadd --gid $USER_GID $USERNAME \
 && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \

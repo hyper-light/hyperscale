@@ -1,5 +1,5 @@
 import os
-from dotenv import dotenv_values
+from .dotenv import dotenv_values
 from typing import Dict, Union, Type, TypeVar
 from .env import Env
 from .monitor_env import MonitorEnv

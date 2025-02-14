@@ -3,7 +3,14 @@ from typing import (
     Sequence,
 )
 
-from playwright.async_api import ElementHandle
+try:
+
+    from playwright.async_api import ElementHandle
+
+except Exception:
+    class ElementHandle:
+        pass
+
 from pydantic import (
     BaseModel,
     StrictBool,

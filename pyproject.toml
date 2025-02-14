@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyperscale"
-version = "0.2.5"
+version = "0.2.14"
 requires-python = ">=3.11"
 description = "Performance testing at scale."
 readme = "README.md"
@@ -32,22 +32,17 @@ dependencies = [
     "attr",
     "networkx",
     "aiodns",
-    "click",
     "psutil",
-    "dill",
-    "scipy",
-    "art",
-    "scikit-learn",
     "uvloop",
-    "tdigest",
     "pydantic",
-    "GitPython",
-    "plotille",
     "zstandard",
     "cryptography",
     "python-dotenv",
     "aioquic",
     "cloudpickle",
+    "orjson",
+    "msgspec",
+    "numpy",
 ]
 
 [project.optional-dependencies]
@@ -87,7 +82,6 @@ all = [
     'haralyzer',
     'asyncpg',
     'xmltodict',
-    'python3-dtls'
 ]
 all-engines = [
     'grpcio',
@@ -126,9 +120,6 @@ all-reporters = [
     'aiokafka'
 ]
 
-distributed = [
-    'python3-dtls'
-]
 playwright = [
     'playwright'
 ]

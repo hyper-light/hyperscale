@@ -6,7 +6,13 @@ from typing import (
     Optional,
 )
 
-from playwright.async_api import Touchscreen
+try:
+
+    from playwright.async_api import Touchscreen
+
+except Exception:
+    class Touchscreen:
+        pass
 
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 

@@ -2,8 +2,14 @@ import asyncio
 import time
 from typing import Dict, Literal, Optional
 
-from playwright.async_api import Mouse
+try:
 
+    from playwright.async_api import Mouse
+
+except Exception:
+    class Mouse:
+        pass
+    
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 
 from .models.browser import BrowserMetadata

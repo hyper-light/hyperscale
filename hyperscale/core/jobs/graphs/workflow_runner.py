@@ -1,10 +1,11 @@
 import asyncio
 import inspect
 import math
+import socket
 import time
 import warnings
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Coroutine, Dict, List, Tuple, Literal
+from typing import Any, AsyncGenerator, Coroutine, Dict, List, Literal, Tuple
 
 import networkx
 import psutil
@@ -19,19 +20,18 @@ from hyperscale.core.monitoring import CPUMonitor, MemoryMonitor
 from hyperscale.core.state import Context, ContextHook, StateAction
 from hyperscale.core.state.workflow_context import WorkflowContext
 from hyperscale.core.testing.models.base import OptimizedArg
-from hyperscale.logging import Logger, Entry, LogLevel
+from hyperscale.logging import Entry, Logger, LogLevel
 from hyperscale.logging.hyperscale_logging_models import (
-    RunTrace,
     RunDebug,
-    RunInfo,
     RunError,
     RunFatal,
+    RunInfo,
+    RunTrace,
 )
-from hyperscale.reporting.results import Results
 from hyperscale.reporting.common.results_types import WorkflowStats
+from hyperscale.reporting.results import Results
 
 from .completion_counter import CompletionCounter
-
 
 StepStatsType = Literal[
     "total",
@@ -73,8 +73,11 @@ async def cancel_pending(pend: asyncio.Task):
 
     except asyncio.InvalidStateError as invalid_state:
         return invalid_state
-    
+
     except Exception:
+        pass
+
+    except socket.error:
         pass
 
 
@@ -88,16 +91,16 @@ def guard_result(result: asyncio.Task):
 
 class WorkflowRunner:
     def __init__(
-        self, 
+        self,
         env: Env,
         worker_id: int,
         node_id: int,
     ) -> None:
         self._worker_id = worker_id
 
-        self._logfile = f'hyperscale.worker.{self._worker_id}.log.json'
+        self._logfile = f"hyperscale.worker.{self._worker_id}.log.json"
         if worker_id is None:
-            self._logfile = 'hyperscale.leader.log.json'
+            self._logfile = "hyperscale.leader.log.json"
 
         self._node_id = node_id
         self.run_statuses: Dict[int, Dict[str, WorkflowStatus]] = defaultdict(dict)
@@ -255,8 +258,7 @@ class WorkflowRunner:
         Exception | None,
         WorkflowStatus,
     ]:
-
-        default_config = {   
+        default_config = {
             "node_id": self._node_id,
             "workflow": workflow.name,
             "run_id": run_id,
@@ -265,44 +267,40 @@ class WorkflowRunner:
         }
 
         workflow_slug = workflow.name.lower()
-        
+
         self._logger.configure(
-            name=f'{workflow_slug}_{run_id}_logger',
+            name=f"{workflow_slug}_{run_id}_logger",
             path=self._logfile,
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
-                'trace': (
-                    RunTrace,
-                    default_config
-                ),
-                'debug': (
+                "trace": (RunTrace, default_config),
+                "debug": (
                     RunDebug,
                     default_config,
                 ),
-                'info': (
+                "info": (
                     RunInfo,
                     default_config,
                 ),
-                'error': (
+                "error": (
                     RunError,
                     default_config,
                 ),
-                'fatal': (
+                "fatal": (
                     RunFatal,
                     default_config,
-                )
-            }
+                ),
+            },
         )
 
         async with self._logger.context(
-            name=f'{workflow_slug}_{run_id}_logger',
+            name=f"{workflow_slug}_{run_id}_logger",
         ) as ctx:
-            
             await self._run_check_lock.acquire()
-            
+
             await ctx.log_prepared(
-                message=f'Run {run_id} of Workflow {workflow.name} entering pre-pnding execution check',
-                name='info',
+                message=f"Run {run_id} of Workflow {workflow.name} entering pre-pnding execution check",
+                name="info",
             )
 
             already_running = (
@@ -310,10 +308,9 @@ class WorkflowRunner:
             )
 
             if self.pending >= self._max_pending_workflows:
-
                 await ctx.log_prepared(
-                    message=f'Run {run_id} of Workflow {workflow.name} failed to start due to exceeded max pending workflow limit of {self._max_pending_workflows}',
-                    name='error',
+                    message=f"Run {run_id} of Workflow {workflow.name} failed to start due to exceeded max pending workflow limit of {self._max_pending_workflows}",
+                    name="error",
                 )
 
                 return (
@@ -325,10 +322,9 @@ class WorkflowRunner:
                 )
 
             elif already_running and self._duplicate_job_policy == "reject":
-
                 await ctx.log_prepared(
-                    message=f'Run {run_id} of Workflow {workflow.name} failed to start due to workflow already being in running stats with duplicate job policy of REJECT',
-                    name='error',
+                    message=f"Run {run_id} of Workflow {workflow.name} failed to start due to workflow already being in running stats with duplicate job policy of REJECT",
+                    name="error",
                 )
 
                 return (
@@ -338,9 +334,8 @@ class WorkflowRunner:
                     Exception("Err. - Run rejected. Already running."),
                     WorkflowStatus.REJECTED,
                 )
-            
-            elif already_running and self._duplicate_job_policy == "replace":
 
+            elif already_running and self._duplicate_job_policy == "replace":
                 workflow_name = workflow.name
 
                 self._active[run_id][workflow_name] = 0
@@ -356,14 +351,13 @@ class WorkflowRunner:
                     del self._max_active[run_id][workflow_name]
 
                 self._pending[run_id][workflow_name].clear()
-                
+
                 if self._running_workflows[run_id].get(workflow.name):
                     del self._running_workflows[run_id][workflow.name]
-                
-            
+
             await ctx.log_prepared(
-                message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.PENDING.name} state',
-                name='info',
+                message=f"Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.PENDING.name} state",
+                name="info",
             )
 
             self._run_check_lock.release()
@@ -374,12 +368,14 @@ class WorkflowRunner:
                 workflow_name = workflow.name
 
                 await ctx.log_prepared(
-                    message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.CREATED.name} state',
-                    name='info',
+                    message=f"Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.CREATED.name} state",
+                    name="info",
                 )
 
                 await self._cpu_monitor.start_background_monitor(run_id, workflow_name)
-                await self._memory_monitor.start_background_monitor(run_id, workflow_name)
+                await self._memory_monitor.start_background_monitor(
+                    run_id, workflow_name
+                )
 
                 self.run_statuses[run_id][workflow_name] = WorkflowStatus.CREATED
 
@@ -393,8 +389,8 @@ class WorkflowRunner:
                 )
 
                 await ctx.log_prepared(
-                    message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.RUNNING.name} state',
-                    name='info',
+                    message=f"Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.RUNNING.name} state",
+                    name="info",
                 )
 
                 self.run_statuses[run_id][workflow.name] = WorkflowStatus.RUNNING
@@ -402,7 +398,6 @@ class WorkflowRunner:
                 self._running_workflows[run_id][workflow.name] = workflow
 
                 try:
-
                     self._run_tasks[run_id][workflow_name] = asyncio.ensure_future(
                         self._run_workflow(
                             run_id,
@@ -412,11 +407,13 @@ class WorkflowRunner:
                         )
                     )
 
-                    (results, updated_context) = await self._run_tasks[run_id][workflow_name]
+                    (results, updated_context) = await self._run_tasks[run_id][
+                        workflow_name
+                    ]
 
                     await ctx.log_prepared(
-                        message=f'Run {run_id} of Workflow {workflow.name} successfully halted run',
-                        name='info',
+                        message=f"Run {run_id} of Workflow {workflow.name} successfully halted run",
+                        name="info",
                     )
 
                     await asyncio.gather(
@@ -430,13 +427,13 @@ class WorkflowRunner:
                     workflow_name = workflow.name
 
                     await ctx.log_prepared(
-                        message=f'Run {run_id} of Workflow {workflow.name} clearing run context',
-                        name='info',
+                        message=f"Run {run_id} of Workflow {workflow.name} clearing run context",
+                        name="info",
                     )
 
                     await ctx.log_prepared(
-                        message=f'Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.COMPLETED.name} state',
-                        name='info',
+                        message=f"Run {run_id} of Workflow {workflow.name} successfully entered {WorkflowStatus.COMPLETED.name} state",
+                        name="info",
                     )
 
                     self.run_statuses[run_id][workflow_name] = WorkflowStatus.COMPLETED
@@ -460,8 +457,8 @@ class WorkflowRunner:
 
                 except Exception as err:
                     await ctx.log_prepared(
-                        message=f'Run {run_id} of Workflow {workflow.name} encountered error {str(err)}',
-                        name='error',
+                        message=f"Run {run_id} of Workflow {workflow.name} encountered error {str(err)}",
+                        name="error",
                     )
 
                     self.run_statuses[run_id][workflow.name] = WorkflowStatus.FAILED
@@ -496,18 +493,16 @@ class WorkflowRunner:
         ],
         Context,
     ]:
-        
         workflow_slug = workflow.name.lower()
 
         async with self._logger.context(
-            name=f'{workflow_slug}_{run_id}_logger',
+            name=f"{workflow_slug}_{run_id}_logger",
         ) as ctx:
-            
             await ctx.log_prepared(
-                message=f'Run {run_id} of Workflow {workflow.name} setting actions and context',
-                name='debug'
+                message=f"Run {run_id} of Workflow {workflow.name} setting actions and context",
+                name="debug",
             )
-            
+
             state_actions = self._setup_state_actions(workflow)
             context = await self._use_context(
                 workflow.name,
@@ -516,8 +511,8 @@ class WorkflowRunner:
             )
 
             await ctx.log_prepared(
-                message=f'Run {run_id} of Workflow {workflow.name} creating traversal order and optimizations',
-                name='debug'
+                message=f"Run {run_id} of Workflow {workflow.name} creating traversal order and optimizations",
+                name="debug",
             )
 
             (
@@ -533,14 +528,16 @@ class WorkflowRunner:
             )
 
             is_test_workflow = (
-                len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST])
+                len(
+                    [hook for hook in hooks.values() if hook.hook_type == HookType.TEST]
+                )
                 > 0
             )
 
             if is_test_workflow:
                 await ctx.log_prepared(
-                    message=f'Run {run_id} of test Workflow {workflow.name} beginning execution',
-                    name='debug'
+                    message=f"Run {run_id} of test Workflow {workflow.name} beginning execution",
+                    name="debug",
                 )
 
                 results = await self._execute_test_workflow(
@@ -553,10 +550,9 @@ class WorkflowRunner:
                 )
 
             else:
-
                 await ctx.log_prepared(
-                    message=f'Run {run_id} of non test Workflow {workflow.name} beginning execution',
-                    name='debug'
+                    message=f"Run {run_id} of non test Workflow {workflow.name} beginning execution",
+                    name="debug",
                 )
 
                 results = await self._execute_non_test_workflow(
@@ -567,10 +563,9 @@ class WorkflowRunner:
                     config,
                 )
 
-            
             await ctx.log_prepared(
-                message=f'Run {run_id} of Workflow {workflow.name} completed execution and updated context',
-                name='debug'
+                message=f"Run {run_id} of Workflow {workflow.name} completed execution and updated context",
+                name="debug",
             )
 
             context = await self._provide_context(
@@ -648,12 +643,11 @@ class WorkflowRunner:
     ]:
         workflow_slug = workflow.name.lower()
         async with self._logger.context(
-            name=f'{workflow_slug}_{run_id}_logger',
+            name=f"{workflow_slug}_{run_id}_logger",
         ) as ctx:
-            
             await ctx.log_prepared(
-                message=f'Run {run_id} of Workflow {workflow.name} executing for {workflow.duration} with {vus} VUs and timeout of {workflow.timeout}',
-                name='debug',
+                message=f"Run {run_id} of Workflow {workflow.name} executing for {workflow.duration} with {vus} VUs and timeout of {workflow.timeout}",
+                name="debug",
             )
 
             self._active[run_id][workflow.name] = 0
@@ -673,16 +667,20 @@ class WorkflowRunner:
                 "duration": "1m",
                 "threads": self._threads,
                 "connect_retries": 3,
-                "interval": workflow.interval
+                "interval": workflow.interval,
             }
 
-            engines_count = len(set([
-                hook.engine_type.name for hook in hooks.values() if hook.hook_type == HookType.TEST
-            ]))
-
-            vus_per_engine = math.ceil(
-                vus/max(engines_count, 1)
+            engines_count = len(
+                set(
+                    [
+                        hook.engine_type.name
+                        for hook in hooks.values()
+                        if hook.hook_type == HookType.TEST
+                    ]
+                )
             )
+
+            vus_per_engine = math.ceil(vus / max(engines_count, 1))
 
             config.update(
                 {
@@ -695,9 +693,7 @@ class WorkflowRunner:
             config["vus"] = vus_per_engine
             config["duration"] = TimeParser(config["duration"]).time
 
-            if (
-                interval := config.get("interval")
-            ) and interval is not None:
+            if (interval := config.get("interval")) and interval is not None:
                 config["interval"] = TimeParser(interval).time
 
             threads = config.get("threads")
@@ -717,7 +713,7 @@ class WorkflowRunner:
                 )
 
             self._workflow_hooks[run_id][workflow] = list(hooks.keys())
-            
+
             step_graph = networkx.DiGraph()
             sources = []
 
@@ -730,10 +726,10 @@ class WorkflowRunner:
 
             for hook in hooks.values():
                 await ctx.log_prepared(
-                    message=f'Run {run_id} of Workflow {workflow.name} setting up action {hook.name}',
-                    name='debug',
+                    message=f"Run {run_id} of Workflow {workflow.name} setting up action {hook.name}",
+                    name="debug",
                 )
-                
+
                 stats_key = (workflow.name, hook.name)
                 self._workflow_step_stats[run_id][stats_key] = {
                     "total": CompletionCounter(),
@@ -816,7 +812,7 @@ class WorkflowRunner:
 
         start = time.monotonic()
 
-        if config.get('interval') is None:
+        if config.get("interval") is None:
             completed, pending = await asyncio.wait(
                 [
                     loop.create_task(
@@ -839,7 +835,6 @@ class WorkflowRunner:
             )
 
         else:
-
             completed, pending = await asyncio.wait(
                 [
                     loop.create_task(
@@ -871,7 +866,7 @@ class WorkflowRunner:
                 )
                 for pend in self._pending[run_id][workflow.name]
             ],
-            return_exceptions=True
+            return_exceptions=True,
         )
 
         if len(self._failed[run_id][workflow_name]) > 0:
@@ -981,7 +976,7 @@ class WorkflowRunner:
                 self._workflow_step_stats[run_id][(workflow_name, step_name)][
                     "total"
                 ].increment()
-                
+
                 try:
                     result = complete.result()
                     self._workflow_step_stats[run_id][(workflow_name, step_name)][
@@ -1004,7 +999,7 @@ class WorkflowRunner:
                     result = err
 
                     self._failed[run_id][workflow_name].append(complete)
-                
+
                 context[step_name] = result
                 self._completed_counts[run_id][workflow_name].increment()
 
@@ -1081,7 +1076,7 @@ class WorkflowRunner:
             run_id,
             workflow_name,
         )
-    
+
     async def _generate_constant(
         self,
         run_id: int,
@@ -1089,8 +1084,8 @@ class WorkflowRunner:
         config: Dict[str, Any],
     ) -> AsyncGenerator[float, None]:
         duration = config.get("duration")
-        vus = config.get('vus')
-        interval = config.get('interval')
+        vus = config.get("vus")
+        interval = config.get("interval")
 
         elapsed = 0
         generated = 0
@@ -1198,26 +1193,15 @@ class WorkflowRunner:
 
     async def close(self):
         async with self._logger.context(
-            name='workflow_manager',
+            name="workflow_manager",
             path=self._logfile,
-            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}"
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
         ) as ctx:
-            
-            await ctx.log(Entry(
-                message=f'Closing Workflow Runner at {self._node_id}',
-                level=LogLevel.INFO
-            ))
-
-            await asyncio.gather(
-            *[
-                    asyncio.create_task(
-                        cancel_pending(pend),
-                    )
-                    for run_id in self._pending 
-                    for workflow_name in self._pending[run_id] 
-                    for pend in self._pending[run_id][workflow_name]
-                ],
-                return_exceptions=True
+            await ctx.log(
+                Entry(
+                    message=f"Closing Workflow Runner at {self._node_id}",
+                    level=LogLevel.INFO,
+                )
             )
 
             await asyncio.gather(
@@ -1225,20 +1209,30 @@ class WorkflowRunner:
                     asyncio.create_task(
                         cancel_pending(pend),
                     )
-                    for run_id in self._pending 
-                    for workflow_name in self._pending[run_id] 
+                    for run_id in self._pending
+                    for workflow_name in self._pending[run_id]
                     for pend in self._pending[run_id][workflow_name]
                 ],
-                return_exceptions=True
+                return_exceptions=True,
             )
 
-            
+            await asyncio.gather(
+                *[
+                    asyncio.create_task(
+                        cancel_pending(pend),
+                    )
+                    for run_id in self._pending
+                    for workflow_name in self._pending[run_id]
+                    for pend in self._pending[run_id][workflow_name]
+                ],
+                return_exceptions=True,
+            )
+
             for job in self._running_workflows.values():
                 for workflow in job.values():
                     workflow.client.close()
 
             try:
-                
                 await self._cpu_monitor.stop_all_background_monitors()
             except Exception:
                 pass
@@ -1251,7 +1245,6 @@ class WorkflowRunner:
     def abort(self):
         self._logger.abort()
 
-
         for run_id in self._pending:
             for workflow_name in self._pending[run_id]:
                 for pend in self._pending[run_id][workflow_name]:
@@ -1261,7 +1254,7 @@ class WorkflowRunner:
                     except (
                         asyncio.CancelledError,
                         asyncio.InvalidStateError,
-                        Exception
+                        Exception,
                     ):
                         pass
 
@@ -1271,11 +1264,9 @@ class WorkflowRunner:
                     except (
                         asyncio.CancelledError,
                         asyncio.InvalidStateError,
-                        Exception
+                        Exception,
                     ):
                         pass
-
-
 
         for run_id in self._failed:
             for workflow_name in self._failed[run_id]:
@@ -1286,7 +1277,7 @@ class WorkflowRunner:
                     except (
                         asyncio.CancelledError,
                         asyncio.InvalidStateError,
-                        Exception
+                        Exception,
                     ):
                         pass
 
@@ -1296,11 +1287,10 @@ class WorkflowRunner:
                     except (
                         asyncio.CancelledError,
                         asyncio.InvalidStateError,
-                        Exception
+                        Exception,
                     ):
                         pass
-        
-        
+
         for job in self._running_workflows.values():
             for workflow in job.values():
                 try:

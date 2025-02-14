@@ -1,7 +1,13 @@
 import binascii
 from typing import Generic, Optional, TypeVar
 
-from google.protobuf.message import Message
+try:
+
+    from google.protobuf.message import Message
+
+except Exception:
+    class Message:
+        pass
 
 from hyperscale.core.testing.models.base import OptimizedArg
 

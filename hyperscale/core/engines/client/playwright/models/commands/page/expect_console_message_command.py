@@ -1,6 +1,14 @@
 from typing import Callable, Optional
 
-from playwright.async_api import ConsoleMessage
+try:
+
+    from playwright.async_api import ConsoleMessage
+
+except Exception:
+
+    class ConsoleMessage:
+        pass
+
 from pydantic import (
     BaseModel,
     StrictFloat,

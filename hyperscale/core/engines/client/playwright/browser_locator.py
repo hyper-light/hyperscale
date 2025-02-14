@@ -13,16 +13,37 @@ from typing import (
     Sequence,
 )
 
-from playwright.async_api import (
-    ElementHandle,
-    FilePayload,
-    FloatRect,
-    FrameLocator,
-    JSHandle,
-    Locator,
-    Position,
-)
+try:
+    from playwright.async_api import (
+        ElementHandle,
+        FilePayload,
+        FloatRect,
+        FrameLocator,
+        JSHandle,
+        Locator,
+        Position,
+    )
 
+except Exception:
+
+    class ElementHandle:
+        pass
+
+    class FilePayload:
+        pass
+
+    class FloatRect:
+        pass
+
+    class JSHandle:
+        pass
+
+    class Locator:
+        pass
+
+    class Position:
+        pass
+    
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 
 from .browser_js_handle import BrowserJSHandle

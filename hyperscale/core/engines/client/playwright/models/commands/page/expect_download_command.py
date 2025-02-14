@@ -1,6 +1,14 @@
 from typing import Callable, Optional
 
-from playwright.async_api import Download
+try:
+
+    from playwright.async_api import Download
+
+except Exception:
+
+    class Download:
+        pass
+    
 from pydantic import (
     BaseModel,
     StrictFloat,

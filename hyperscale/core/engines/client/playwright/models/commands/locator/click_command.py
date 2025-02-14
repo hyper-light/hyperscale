@@ -1,6 +1,14 @@
 from typing import Literal, Optional, Sequence
 
-from playwright.async_api import Position
+try:
+
+    from playwright.async_api import Position
+
+except Exception:
+    
+    class Position:
+        pass
+
 from pydantic import (
     BaseModel,
     StrictBool,

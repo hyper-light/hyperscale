@@ -4,7 +4,15 @@ from typing import (
     Optional,
 )
 
-from playwright.async_api import Locator
+try:
+
+    from playwright.async_api import Locator
+
+except Exception:
+    
+    class Locator:
+        pass
+
 from pydantic import (
     BaseModel,
     StrictBool,

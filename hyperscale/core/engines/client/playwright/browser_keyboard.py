@@ -2,7 +2,13 @@ import asyncio
 import time
 from typing import Dict, Literal, Optional
 
-from playwright.async_api import Keyboard
+try:
+
+    from playwright.async_api import Keyboard
+
+except Exception:
+    class Keyboard:
+        pass
 
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 

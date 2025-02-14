@@ -8,8 +8,8 @@ from collections import defaultdict, deque
 from typing import Any, AsyncIterable, Coroutine, Deque, Dict, Optional, Tuple, Union
 
 import zstandard
-from dtls import do_patch
 
+from hyperscale.core.engines.client.udp.protocols.dtls import do_patch
 from hyperscale.distributed.connection.base.connection_type import ConnectionType
 from hyperscale.distributed.connection.udp.protocols import MercurySyncUDPProtocol
 from hyperscale.distributed.encryption import AESGCMFernet

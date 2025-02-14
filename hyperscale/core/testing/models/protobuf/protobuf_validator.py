@@ -1,4 +1,12 @@
-from google.protobuf.message import Message
+
+try:
+
+    from google.protobuf.message import Message
+
+except Exception:
+    class Message:
+        pass
+
 from pydantic import BaseModel
 
 

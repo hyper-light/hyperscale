@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import textwrap
+import functools
+import os
 import sys
 
 from typing import Generic, TypeVar, Literal, Any, Callable
@@ -15,6 +16,7 @@ from .arg_types import (
     is_unsupported_keyword_arg,
     PositionalArg,
 )
+from .cli_protocol import CLIProtocol, patch_transport_close
 from .help_message import HelpMessage, CLIStyle
 from .inspect_wrapped import inspect_wrapped, assemble_exanded_args, is_context_arg
 
@@ -78,6 +80,7 @@ class Command(Generic[T]):
         self.keyword_args_map = keyword_args_map
         self.keyword_args_count = len(keyword_args_map)
         self.positional_args_count = len(positional_args)
+        self._loop = asyncio.get_event_loop()
 
     @property
     def source(self):
@@ -92,32 +95,13 @@ class Command(Generic[T]):
         (positional_args, keyword_args, errors) = await self._find_args(args, context)
 
         if positional_args is None and keyword_args is None:
-            loop = asyncio.get_event_loop()
-
-            help_message_lines = await self.help_message.to_lines(
-                global_styles=self._global_styles,
-            )
-
-            await loop.run_in_executor(
-                None,
-                sys.stdout.write,
-                help_message_lines,
-            )
+            await self._print_group_help_message()
 
             return (None, errors)
 
         elif len(errors) > 0:
-            help_message_lines = await self.help_message.to_lines(
+            await self._print_group_help_message(
                 error=errors[0],
-                global_styles=self._global_styles,
-            )
-
-            loop = asyncio.get_event_loop()
-
-            await loop.run_in_executor(
-                None,
-                sys.stdout.write,
-                help_message_lines,
             )
 
             return (
@@ -130,6 +114,77 @@ class Command(Generic[T]):
         return (
             result,
             errors,
+        )
+    
+    def command(
+        self,
+        styling: CLIStyle | None = None,
+        shortnames: dict[str, str] | None = None,
+    ):
+        if shortnames is None:
+            shortnames = {}
+
+        def wrap(command_call):
+            create_command(
+                command_call,
+                styling=styling,
+                shortnames=shortnames,
+            )
+
+            return command_call
+
+        return wrap
+    
+    async def _dup_stdout(self, loop: asyncio.AbstractEventLoop):
+        stdout_fileno = await loop.run_in_executor(None, sys.stdout.fileno)
+
+        stdout_dup = await loop.run_in_executor(
+            None,
+            os.dup,
+            stdout_fileno,
+        )
+
+        return await loop.run_in_executor(
+            None, functools.partial(os.fdopen, stdout_dup, mode=sys.stdout.mode)
+        )
+
+
+    async def _print_group_help_message(
+        self,
+        error: str | None = None
+    ):
+        loop = asyncio.get_event_loop()
+
+        help_message_lines = await self.help_message.to_lines(
+            error=error,
+            global_styles=self._global_styles,
+        )
+
+        stdout_dup = await self._dup_stdout(loop)
+
+        transport, protocol = await loop.connect_write_pipe(
+            lambda: CLIProtocol(), 
+            stdout_dup,
+        )
+
+        try:
+            transport.close = patch_transport_close(transport, loop)
+
+        except Exception:
+            pass
+
+        writer = asyncio.StreamWriter(
+            transport,
+            protocol,
+            None,
+            loop,
+        )
+
+
+        await loop.run_in_executor(
+            None,
+            writer.write,
+            help_message_lines.encode(),
         )
 
     async def _find_args(self, args: list[str], context: Context[str, Any]):

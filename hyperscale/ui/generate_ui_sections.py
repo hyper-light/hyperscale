@@ -1,23 +1,20 @@
 import math
 import pathlib
+from typing import List, Literal
 
+from hyperscale.core.engines.client import TimeParser
 from hyperscale.core.graph import Workflow
+from hyperscale.core.jobs.models import TerminalMode
 from hyperscale.ui.components.counter import Counter, CounterConfig
 from hyperscale.ui.components.header import Header, HeaderConfig
 from hyperscale.ui.components.multiline_text import MultilineText, MultilineTextConfig
 from hyperscale.ui.components.progress_bar import ProgressBar, ProgressBarConfig
 from hyperscale.ui.components.scatter_plot import PlotConfig, ScatterPlot
 from hyperscale.ui.components.table import Table, TableConfig
-from hyperscale.ui.components.text import Text, TextConfig
 from hyperscale.ui.components.terminal import Section, SectionConfig
 from hyperscale.ui.components.text import Text, TextConfig
 from hyperscale.ui.components.timer import Timer, TimerConfig
 from hyperscale.ui.components.total_rate import TotalRate, TotalRateConfig
-
-from hyperscale.core.engines.client import TimeParser
-
-from typing import List, Literal
-
 
 WorkflowConfig = list[
     dict[
@@ -36,6 +33,7 @@ WorkflowConfig = list[
 
 def generate_ui_sections(
     workflows: List[Workflow],
+    terminal_mode: TerminalMode = "full",
 ):
     workflow_configs: WorkflowConfig = [
         {
@@ -49,11 +47,16 @@ def generate_ui_sections(
         for workflow in workflows
     ]
 
+    hyperscale_terminal_mode = "extended"
+    if terminal_mode == "ci":
+        hyperscale_terminal_mode = "compatability"
+
     text_components = [
         Text(
             f"run_message_display_{config['workflow_name']}",
             TextConfig(
                 text="Initializing...",
+                terminal_mode=hyperscale_terminal_mode,
             ),
             subscriptions=[f"update_run_message_{config['workflow_name']}"],
         )
@@ -63,11 +66,11 @@ def generate_ui_sections(
     text_components.insert(
         0,
         Text(
-            f"run_message_display_initializing",
+            "run_message_display_initializing",
             TextConfig(
                 text="Initializing...",
             ),
-            subscriptions=[f"update_run_message_initializing"],
+            subscriptions=["update_run_message_initializing"],
         ),
     )
 
@@ -78,7 +81,7 @@ def generate_ui_sections(
                 text=["Gathering test config."],
                 horizontal_alignment="right",
                 color="hot_pink_3",
-                terminal_mode="extended",
+                terminal_mode=hyperscale_terminal_mode,
             ),
             subscriptions=["update_workflow_metadata"],
         )
@@ -97,7 +100,7 @@ def generate_ui_sections(
                     ],
                     horizontal_alignment="right",
                     color="hot_pink_3",
-                    terminal_mode="extended",
+                    terminal_mode=hyperscale_terminal_mode,
                 ),
                 subscriptions=["update_workflow_metadata"],
             )
@@ -140,7 +143,7 @@ def generate_ui_sections(
                         },
                         color="aquamarine_2",
                         attributes=["bold"],
-                        terminal_mode="extended",
+                        terminal_mode=hyperscale_terminal_mode,
                     ),
                 ),
             ],
@@ -170,7 +173,7 @@ def generate_ui_sections(
                         active_color="royal_blue",
                         failed_color="white",
                         complete_color="hot_pink_3",
-                        terminal_mode="extended",
+                        terminal_mode=hyperscale_terminal_mode,
                     ),
                     subscriptions=[
                         f"update_run_progress_seconds_{config['workflow_name']}"
@@ -208,7 +211,7 @@ def generate_ui_sections(
                     f"run_timer_{config['workflow_name']}",
                     TimerConfig(
                         color="aquamarine_2",
-                        terminal_mode="extended",
+                        terminal_mode=hyperscale_terminal_mode,
                         horizontal_alignment="center",
                     ),
                     subscriptions=[f"update_run_timer_{config['workflow_name']}"],
@@ -231,7 +234,9 @@ def generate_ui_sections(
             components=[
                 Counter(
                     f"executions_counter_{config['workflow_name']}",
-                    CounterConfig(unit="total actions", terminal_mode="extended"),
+                    CounterConfig(
+                        unit="total actions", terminal_mode=hyperscale_terminal_mode
+                    ),
                     subscriptions=[
                         f"update_total_executions_{config['workflow_name']}"
                     ],
@@ -253,7 +258,7 @@ def generate_ui_sections(
             components=[
                 TotalRate(
                     f"total_executions_{config['workflow_name']}",
-                    TotalRateConfig(unit="aps", terminal_mode="extended"),
+                    TotalRateConfig(unit="aps", terminal_mode=hyperscale_terminal_mode),
                     subscriptions=[
                         f"update_total_executions_rate_{config['workflow_name']}"
                     ],
@@ -281,7 +286,7 @@ def generate_ui_sections(
                         y_axis_name="Value",
                         line_color="aquamarine_2",
                         point_char="dot",
-                        terminal_mode="extended",
+                        terminal_mode=hyperscale_terminal_mode,
                     ),
                     subscriptions=[f"update_execution_rates_{config['workflow_name']}"],
                 )
@@ -327,7 +332,7 @@ def generate_ui_sections(
                         },
                         minimum_column_width=8,
                         border_color="aquamarine_2",
-                        terminal_mode="extended",
+                        terminal_mode=hyperscale_terminal_mode,
                         table_format="simple",
                     ),
                     subscriptions=[f"update_execution_stats_{config['workflow_name']}"],

@@ -1,8 +1,10 @@
 import asyncio
+import logging
 import sys
-from hyperscale.ui.components.terminal import Section, SectionConfig
-from hyperscale.ui.components.terminal import Terminal
+
 from hyperscale.ui.components.header import Header, HeaderConfig
+from hyperscale.ui.components.terminal import Section, SectionConfig, Terminal
+
 from .cli import (
     CLI,
     CLIStyle,
@@ -85,12 +87,13 @@ async def hyperscale():
 
 
 def run():
+    logging.disable(logging.CRITICAL)
     try:
         asyncio.run(CLI.run(args=sys.argv[1:]))
 
     except (
         KeyboardInterrupt,
         asyncio.CancelledError,
-        asyncio.InvalidStateError
+        asyncio.InvalidStateError,
     ):
         pass

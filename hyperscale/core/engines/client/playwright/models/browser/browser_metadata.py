@@ -1,6 +1,13 @@
 from typing import List, Literal, Optional
 
-from playwright.async_api import Geolocation
+try:
+
+    from playwright.async_api import Geolocation
+
+except Exception:
+    class Geolocation:
+        pass
+    
 from pydantic import BaseModel, StrictStr
 
 

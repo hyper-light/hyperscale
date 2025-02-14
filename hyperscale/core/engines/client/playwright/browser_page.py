@@ -13,30 +13,99 @@ from typing import (
     Sequence,
 )
 
-from playwright._impl._async_base import AsyncEventContextManager
-from playwright.async_api import (
-    ConsoleMessage,
-    Dialog,
-    Download,
-    ElementHandle,
-    Error,
-    FileChooser,
-    FilePayload,
-    FloatRect,
-    Frame,
-    FrameLocator,
-    JSHandle,
-    Locator,
-    Page,
-    PdfMargins,
-    Position,
-    Request,
-    Response,
-    Route,
-    ViewportSize,
-    WebSocket,
-    Worker,
-)
+try:
+    from playwright._impl._async_base import AsyncEventContextManager
+    from playwright.async_api import (
+        ConsoleMessage,
+        Dialog,
+        Download,
+        ElementHandle,
+        Error,
+        FileChooser,
+        FilePayload,
+        FloatRect,
+        Frame,
+        FrameLocator,
+        JSHandle,
+        Locator,
+        Page,
+        PdfMargins,
+        Position,
+        Request,
+        Response,
+        Route,
+        ViewportSize,
+        WebSocket,
+        Worker,
+    )
+
+except Exception:
+
+    class AsyncEventContextManager:
+        pass
+
+    class ConsoleMessage:
+        pass
+
+    class Dialog:
+        pass
+
+    class Download:
+        pass
+
+    class ElementHandle:
+        pass
+
+    class Error:
+        pass
+
+    class FileChooser:
+        pass
+
+    class FilePayload:
+        pass
+
+    class FloatRect:
+        pass
+
+    class Frame:
+        pass
+
+    class FrameLocator:
+        pass
+
+    class JSHandle:
+        pass
+
+    class Locator:
+        pass
+
+    class Page:
+        pass
+
+    class PdfMargins:
+        pass
+
+    class Position:
+        pass
+
+    class Request:
+        pass
+
+    class Response:
+        pass
+    
+    class Route:
+        pass
+
+    class ViewportSize:
+        pass
+    
+    class WebSocket:
+        pass
+
+    class Worker:
+        pass
 
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 

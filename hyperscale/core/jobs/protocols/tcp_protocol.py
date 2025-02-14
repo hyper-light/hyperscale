@@ -31,15 +31,15 @@ from hyperscale.core.jobs.hooks.hook_type import HookType
 from hyperscale.core.jobs.models import Env, Message
 from hyperscale.core.jobs.tasks import TaskRunner
 from hyperscale.core.snowflake import Snowflake
+from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
-    ControllerTrace,
     ControllerDebug,
-    ControllerInfo,
     ControllerError,
     ControllerFatal,
+    ControllerInfo,
+    ControllerTrace,
 )
-from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 
 from .client_protocol import MercurySyncTCPClientProtocol
 from .encryption import AESGCMFernet
@@ -117,7 +117,6 @@ class TCPProtocol(Generic[T, K]):
         self._abort_handle_created: bool = None
         self._connect_lock: asyncio.Lock | None = None
         self._shutdown_task: asyncio.Future | None = None
-
 
     @property
     def nodes(self):
@@ -229,10 +228,13 @@ class TCPProtocol(Generic[T, K]):
 
         while run_start:
             try:
-
                 if self.connected is False and worker_socket is None:
-                    self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    self.server_socket = socket.socket(
+                        socket.AF_INET, socket.SOCK_STREAM
+                    )
+                    self.server_socket.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
+                    )
 
                     await self._loop.run_in_executor(
                         None,
@@ -262,7 +264,6 @@ class TCPProtocol(Generic[T, K]):
 
                     self._cleanup_task = self._loop.create_task(self._cleanup())
 
-
                 if self.connected is False and worker_server is None:
                     server: asyncio.Server = await self._loop.create_server(
                         lambda: MercurySyncTCPServerProtocol(self.read),
@@ -276,14 +277,8 @@ class TCPProtocol(Generic[T, K]):
                     run_start = False
                     self.connected = True
 
-            except (
-                Exception,
-                asyncio.CancelledError,
-                socket.error,
-                OSError
-            ):
-                import traceback
-                print(traceback.format_exc())
+            except (Exception, asyncio.CancelledError, socket.error, OSError):
+                pass
 
             await asyncio.sleep(self._retry_interval)
 
@@ -294,31 +289,28 @@ class TCPProtocol(Generic[T, K]):
         }
 
         self._logger.configure(
-            name=f'graph_server_{self._node_id_base}',
+            name=f"graph_server_{self._node_id_base}",
             path=logfile,
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
-                'trace': (
-                    ControllerTrace,
-                    default_config
-                ),
-                'debug': (
+                "trace": (ControllerTrace, default_config),
+                "debug": (
                     ControllerDebug,
                     default_config,
                 ),
-                'info': (
+                "info": (
                     ControllerInfo,
                     default_config,
                 ),
-                'error': (
+                "error": (
                     ControllerError,
                     default_config,
                 ),
-                'fatal': (
+                "fatal": (
                     ControllerFatal,
                     default_config,
-                )
-            }
+                ),
+            },
         )
 
         self._start_tasks()
@@ -329,7 +321,6 @@ class TCPProtocol(Generic[T, K]):
 
     async def run_forever(self):
         try:
-
             self._run_future = self._loop.create_future()
             await self._run_future
 
@@ -416,9 +407,7 @@ class TCPProtocol(Generic[T, K]):
                     self._client_sockets[address] = tcp_socket
 
                     await asyncio.wait_for(
-                        self._loop.run_in_executor(
-                            None, tcp_socket.connect, address
-                        ),
+                        self._loop.run_in_executor(None, tcp_socket.connect, address),
                         timeout=self._connect_timeout,
                     )
 
@@ -477,33 +466,29 @@ class TCPProtocol(Generic[T, K]):
         }
 
         self._logger.configure(
-            name=f'graph_client_{self._node_id_base}',
+            name=f"graph_client_{self._node_id_base}",
             path=logfile,
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
-                'trace': (
-                    ControllerTrace,
-                    default_config
-                ),
-                'debug': (
+                "trace": (ControllerTrace, default_config),
+                "debug": (
                     ControllerDebug,
                     default_config,
                 ),
-                'info': (
+                "info": (
                     ControllerInfo,
                     default_config,
                 ),
-                'error': (
+                "error": (
                     ControllerError,
                     default_config,
                 ),
-                'fatal': (
+                "fatal": (
                     ControllerFatal,
                     default_config,
-                )
-            }
+                ),
+            },
         )
-
 
         if self._connect_lock.locked():
             self._connect_lock.release()
@@ -1052,7 +1037,7 @@ class TCPProtocol(Generic[T, K]):
         self._running = False
 
         await self._shutdown_task
-        
+
         close_task = asyncio.current_task()
 
         for client in self._client_transports.values():
@@ -1064,7 +1049,6 @@ class TCPProtocol(Generic[T, K]):
 
             except Exception:
                 pass
-
 
         if self._server:
             try:
@@ -1115,8 +1099,7 @@ class TCPProtocol(Generic[T, K]):
                 pass
 
         if self._run_future and (
-            not self._run_future.done()
-            or self._run_future.cancelled()
+            not self._run_future.done() or self._run_future.cancelled()
         ):
             try:
                 self._run_future.set_result(None)
@@ -1130,12 +1113,9 @@ class TCPProtocol(Generic[T, K]):
         self._pending_responses.clear()
 
     def stop(self):
-        self._shutdown_task = asyncio.ensure_future(
-            self._shutdown()
-        )
+        self._shutdown_task = asyncio.ensure_future(self._shutdown())
 
     async def _shutdown(self):
-
         for response in self._pending_responses:
             await response
 
@@ -1164,7 +1144,7 @@ class TCPProtocol(Generic[T, K]):
         if self._shutdown_task:
             try:
                 self._shutdown_task.set_result(None)
-            
+
             except Exception:
                 pass
 
@@ -1211,7 +1191,7 @@ class TCPProtocol(Generic[T, K]):
 
             except asyncio.CancelledError:
                 pass
-        
+
         if self.tasks:
             self.tasks.abort()
 
@@ -1238,10 +1218,9 @@ class TCPProtocol(Generic[T, K]):
                 pass
 
         self._pending_responses.clear()
-        
+
         try:
             self._logger.abort()
 
         except Exception:
             pass
-

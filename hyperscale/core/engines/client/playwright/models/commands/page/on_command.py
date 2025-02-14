@@ -1,18 +1,56 @@
 from typing import Awaitable, Callable, Literal
 
-from playwright.async_api import (
-    ConsoleMessage,
-    Dialog,
-    Download,
-    Error,
-    FileChooser,
-    Frame,
-    Page,
-    Request,
-    Response,
-    WebSocket,
-    Worker,
-)
+try:
+
+    from playwright.async_api import (
+        ConsoleMessage,
+        Dialog,
+        Download,
+        Error,
+        FileChooser,
+        Frame,
+        Page,
+        Request,
+        Response,
+        WebSocket,
+        Worker,
+    )
+
+except Exception:
+
+    class ConsoleMessage:
+        pass
+
+    class Dialog:
+        pass
+
+    class Download:
+        pass
+
+    class Error:
+        pass
+
+    class FileChooser:
+        pass
+
+    class Frame:
+        pass
+
+    class Page:
+        pass
+
+    class Request:
+        pass
+
+    class Response:
+        pass
+
+    class WebSocket:
+        pass
+
+    class Worker:
+        pass
+
 from pydantic import (
     BaseModel,
     StrictFloat,
@@ -64,3 +102,6 @@ class OnCommand(BaseModel):
         | Callable[[Worker], Awaitable[None] | None]
     )
     timeout: StrictInt | StrictFloat
+
+    class Config:
+        arbitrary_types_allowed = True

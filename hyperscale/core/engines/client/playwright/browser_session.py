@@ -1,7 +1,30 @@
 import asyncio
 from typing import Any, Dict, List, Literal, Optional
 
-from playwright.async_api import Browser, BrowserContext, Geolocation, Page, Playwright
+try:
+    from playwright.async_api import (
+        Browser,
+        BrowserContext,
+        Geolocation,
+        Page,
+        Playwright,
+    )
+
+except Exception:
+    class Browser:
+        pass
+
+    class BrowserContext:
+        pass
+
+    class Geolocation:
+        pass
+
+    class Page:
+        pass
+
+    class Playwright:
+        pass
 
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 
