@@ -50,15 +50,12 @@ class HTTPResponse(CallResult):
             ],
             float | None,
         ]
-    ] = None,
+    ] = (None,)
     redirects: int = 0
 
     @classmethod
     def response_type(cls):
         return RequestType.HTTP
-
-    def check_success(self) -> bool:
-        return self.status and self.status >= 200 and self.status < 300
 
     def json(self):
         if self.content:
@@ -71,27 +68,36 @@ class HTTPResponse(CallResult):
 
     def to_model(self, model: Type[T]) -> T:
         return model(**orjson.loads(self.content))
-    
+
     @property
     def params(self):
-
         params: list[tuple[str, str]] = []
 
         if len(self.url.params) > 0:
-            params.extend([
-                tuple(param.split(
-                    '=',
-                    maxsplit=1,
-                )) for param in self.url.params.split('&')
-            ])
+            params.extend(
+                [
+                    tuple(
+                        param.split(
+                            "=",
+                            maxsplit=1,
+                        )
+                    )
+                    for param in self.url.params.split("&")
+                ]
+            )
 
         if len(self.url.query) > 0:
-            params.extend([
-                tuple(param.split(
-                    '=',
-                    maxsplit=1,
-                )) for param in self.url.query.split('&')
-            ])
+            params.extend(
+                [
+                    tuple(
+                        param.split(
+                            "=",
+                            maxsplit=1,
+                        )
+                    )
+                    for param in self.url.query.split("&")
+                ]
+            )
 
         return params
 
@@ -124,8 +130,9 @@ class HTTPResponse(CallResult):
         except Exception:
             return self.content
 
-    def check(self):
-        return self.status >= 200 and self.status < 300
+    @property
+    def successful(self) -> bool:
+        return self.status and self.status >= 200 and self.status < 300
 
     def context(self):
         return self.status_message
