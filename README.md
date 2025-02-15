@@ -8,7 +8,7 @@
 
 | Package     | Hyperscale                                                      |
 | ----------- | -----------                                                     |
-| Version     | 0.2.24                                                          |
+| Version     | 0.2.25                                                          |
 | Download    | https://pypi.org/project/hyperscale/                            | 
 | Source      | https://github.com/hyper-light/hyperscale                       |
 | Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
@@ -48,7 +48,7 @@ pip install "hyperscale[<extra_here>]"
 
 You can use any installed and supported client concurrently in the same or an independent Workflow, allowing you to exercise each part of your application's stack to the fullest. Performing non-test work to accomplish setup is easy and only requires writing a workflow where no actions specify a client response return type.
 
-Hyperscale offers JSON and CSV results reporting by default, with 29 additional reporters readily available as extra install options. All additional reporting options utilize the same config API and require no additional boilerplate. Specifying custom metrics only entails specifying the Metric return type, and all reporters support customer metrics just like the default metrics Hyperscale provides.
+Hyperscale offers JSON and CSV results reporting by default, with 29 additional reporters readily available as extra install options. All additional reporting options utilize the same config API and require no additional boilerplate. Specifying custom metrics only entails specifying the `Metric[T]` return type, and all reporters support customer metrics just like the default metrics Hyperscale provides.
 
 <br/>
 
