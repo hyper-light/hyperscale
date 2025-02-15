@@ -14,6 +14,10 @@ from .honeycomb import HoneycombConfig as HoneycombConfig
 from .influxdb import InfluxDBConfig as InfluxDBConfig
 from .json import JSONConfig as JSONConfig
 from .kafka import KafkaConfig as KafkaConfig
+from .models import COUNT as COUNT
+from .models import DISTRIBUTION as DISTRIBUTION
+from .models import RATE as RATE
+from .models import SAMPLE as SAMPLE
 from .models import Metric as Metric
 from .mongodb import MongoDBConfig as MongoDBConfig
 from .mysql import MySQLConfig as MySQLConfig
