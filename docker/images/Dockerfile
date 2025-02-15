@@ -14,10 +14,13 @@ RUN pip install uv
 
 RUN mkdir -p /hyperscale
 WORKDIR /hyperscale
-
+COPY pyproject.toml requirements.txt LICENSE README.md .version /hyperscale/
+COPY hyperscale /hyperscale
 RUN uv venv && \
     . /hyperscale/.venv/bin/activate && \
-    uv pip install hyperscale
+    uv pip install setuptools wheel && \
+    uv pip install -r requirements.txt && \
+    uv pip install .
 
 RUN groupadd --gid $USER_GID $USERNAME \
 && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
