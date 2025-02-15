@@ -138,7 +138,7 @@ which will output:
 
 ![The hyperscale run test.py command starting a test run](https://github.com/hyper-light/hyperscale/blob/main/images/hyperscale_run_start.png?raw=true "A test started by running the hyperscale run test.py command")
 
-Hyperscale runs a independent "worker" server on each thread and uses all available CPUs by default, so it may take a few seconds while the worker servers connect. During this few seconds, Hyperscale will let 
+Hyperscale runs a independent "worker" server on each CPU core and uses all available CPUs by default, so it may take a few seconds while the worker servers connect. During this few seconds, Hyperscale will let 
 you know how many workers have successfully connected thusfar:
 
 ![Waiting for worker servers to connect](https://github.com/hyper-light/hyperscale/blob/main/images/hyperscale_run_connecting.png?raw=true "Local worker servers connecting prior to starting the test run")
