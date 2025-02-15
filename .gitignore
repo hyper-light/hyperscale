@@ -15,7 +15,6 @@ chromedriver
 kube_config
 dev.yaml
 .venv
-*.png
 *.json
 *.txt
 *.log

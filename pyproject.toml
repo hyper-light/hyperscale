@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyperscale"
-version = "0.2.18"
+version = "0.2.19"
 requires-python = ">=3.11"
 description = "Performance testing at scale."
 readme = "README.md"
@@ -73,7 +73,7 @@ all = [
     'google-cloud-bigquery',
     'google-cloud-bigtable',
     'google-cloud-storage',
-    'cryptography==38.0.4',
+    'cryptography',
     'aioquic',
     'dicttoxml',
     'opentelemetry-api',
@@ -88,7 +88,7 @@ all-engines = [
     'grpcio-tools',
     'gql',
     'playwright',
-    'cryptography==38.0.4',
+    'cryptography',
     'aioquic',
     'opentelemetry-api'
 ]
@@ -177,7 +177,7 @@ graphql = [
     'gql'
 ]
 http3 = [
-    'cryptography==38.0.4',
+    'cryptography',
     'aioquic'
 ]
 snowflake = [
