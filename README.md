@@ -29,13 +29,13 @@ Understanding how your application performs under load provides valuable insight
 
 ### __Speed and efficiency by default__ 
 
-Whether running on your personal laptop or distributed across a cluster, Hyperscale should be *fast*, capable of generating millions of requests or interactions per minute and without consuming excessive memory such that running in modern cloud environments becomes difficult.
+Whether running on your personal laptop or distributed across a cluster, Hyperscale is *fast*, capable of generating millions of requests or interactions per minute and without consuming excessive memory such that running in modern cloud environments becomes difficult.
 
 <br/>
 
 ### __Run with ease anywhere__
 
-Hyperscale should just work, without any additional setup beyond a supported Python distribution. Options (like ready made containers) to make running Hyperscale in more challenging environments easy should be readily provided and maintained, but never required. Test code should require *no changes* whether running locally or distributed, and CLI option or configuration tweaks should be kept to as few as possible. Hyperscale should embrace carefully selected modern developer experience features like starter templates generation, include useful dev tools like one-off request/response checking and IP lookup, and should enforce a minimal but flexible API so that developer spend less time learning the framework and more time making their applications the best they can.
+Hyperscale just works, requiring no additional setup beyond a supported Python distribution. Options (like ready made containers) to make running Hyperscale in more challenging environments easy are readily provided and maintained, but never required. Test code requires *no changes* whether running locally or distributed, and CLI option or configuration tweaks are kept as few as possible. Hyperscale embraces carefully selected modern developer experience features like starter templates generation, includes useful debugging tools like one-off request/response checking and IP lookup, and enforced a minimal but flexible API. This means developers and engineers spend less time learning the framework and more time making their applications the best they can.
 
 <br/>
 
@@ -46,7 +46,9 @@ Hyperscale ships with support for HTTP, HTTP2, HTTP3, Websockets, and UDP out of
 pip install "hyperscale[<extra_here>]"
 ```
 
-Hyperscale offers JSON and CSV results reporting by default, with 29 additional reporters readily available as extra install options.
+You can use any installed and supported client concurrently in the same or an independent Workflow, allowing you to exercise each part of your application's stack to the fullest. Performing non-test work to accomplish setup is easy and only requires writing a workflow where no actions specify a client response return type.
+
+Hyperscale offers JSON and CSV results reporting by default, with 29 additional reporters readily available as extra install options. All additional reporting options utilize the same config API and require no additional boilerplate. Specifying custom metrics only entails specifying the Metric return type, and all reporters support customer metrics just like the default metrics Hyperscale provides.
 
 <br/>
 
