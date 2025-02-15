@@ -8,7 +8,7 @@
 
 | Package     | Hyperscale                                                      |
 | ----------- | -----------                                                     |
-| Version     | 0.2.23                                                          |
+| Version     | 0.2.24                                                          |
 | Download    | https://pypi.org/project/hyperscale/                            | 
 | Source      | https://github.com/hyper-light/hyperscale                       |
 | Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
