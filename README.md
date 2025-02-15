@@ -79,7 +79,7 @@ which should output
 
 <br/>
 
-### __Running Your First Workflow Test__ 
+### __Running your first test__ 
 
 Get started by running Hyperscale's:
 ```bash
