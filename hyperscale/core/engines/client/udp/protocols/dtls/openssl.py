@@ -76,6 +76,9 @@ _logger = getLogger(__name__)
 #
 # Library loading
 #
+
+error: Exception | None = None
+
 try:
     if sys.platform.startswith("win"):
         dll_path = path.abspath(path.dirname(__file__))
@@ -86,17 +89,39 @@ try:
     else:
         libcrypto = CDLL("libcrypto.so.1.1")
         libssl = CDLL("libssl.so.1.1")
-except (Exception, OSError):
-    if sys.platform.startswith("win"):
-        dll_path = path.abspath(path.dirname(__file__))
-        cryptodll_path = path.join(dll_path, "libcrypto-3-x64.dll")
-        ssldll_path = path.join(dll_path, "libssl-3-x64.dll")
-        libcrypto = CDLL(cryptodll_path)
-        libssl = CDLL(ssldll_path)
-    else:
-        libcrypto = CDLL("libcrypto.3.dylib")
-        libssl = CDLL("libssl.3.dylib")
-#
+except (Exception, OSError) as err:
+    error = err
+
+if error:
+    try:
+        if sys.platform.startswith("win"):
+            dll_path = path.abspath(path.dirname(__file__))
+            cryptodll_path = path.join(dll_path, "libcrypto-3-x64.dll")
+            ssldll_path = path.join(dll_path, "libssl-3-x64.dll")
+            libcrypto = CDLL(cryptodll_path)
+            libssl = CDLL(ssldll_path)
+        else:
+            libcrypto = CDLL("libcrypto.3.dylib")
+            libssl = CDLL("libssl.3.dylib")
+
+    except (Exception, OSError) as err:
+        error = err
+
+if error:
+    try:
+        if sys.platform.startswith("win"):
+            dll_path = path.abspath(path.dirname(__file__))
+            cryptodll_path = path.join(dll_path, "libcrypto-3-x64.dll")
+            ssldll_path = path.join(dll_path, "libssl-3-x64.dll")
+            libcrypto = CDLL(cryptodll_path)
+            libssl = CDLL(ssldll_path)
+        else:
+            libcrypto = CDLL("libcrypto.so.3")
+            libssl = CDLL("libssl.so.3")
+
+    except (Exception, OSError) as err:
+        error = err
+    #
 # Integer constants - exported
 #
 BIO_NOCLOSE = 0x00
