@@ -35,7 +35,7 @@ Whether running on your personal laptop or distributed across a cluster, Hypersc
 
 ### __Run with ease anywhere__
 
-Authoring, managing, and running test workflows should be easy. Hyperscale should run without any additional setup beyond a supported Python distribution and offer options (like ready made containers) to make running in more challenging environments easy. Test code should require *no changes* whether running locally or distributed, and CLI option or configuration tweaks should be kept to as few as possible. Hyperscale should facilitate modern developer experience features like starter templates generation or dev tools like one-off request/response checks, and should enforce a minimal but flexible API so that developer spend less time learning the framework and more time making their applications the best they can.
+Authoring, managing, and running test workflows should be easy. Hyperscale should run without any additional setup beyond a supported Python distribution and offer options (like ready made containers) to make running in more challenging environments easy. Test code should require *no changes* whether running locally or distributed, and CLI option or configuration tweaks should be kept to as few as possible. Hyperscale should embrace carefully selected modern developer experience features like starter templates generation, includr useful dev tools like one-off request/response checking and IP lookup, and should enforce a minimal but flexible API so that developer spend less time learning the framework and more time making their applications the best they can.
 
 <br/>
 
