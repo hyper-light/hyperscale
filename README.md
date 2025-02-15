@@ -15,7 +15,7 @@
 
 Hyperscale is a Python performance and scalable unit/integration testing framework that makes creating and running complex test workflows easy.
 
-Write and orchestrate workflows as Python classes and decorator-wrapped async methods (called <b>actions</b>) using clients from Playwright and HTTP3 to GRPC and DTLS-UDP concurrently, connect to over thirty one different reporting options, and execute your tests the same locally and distributed via an intuitive CLI. Test execution statistics and performance is displayed via an intuitive terminal UI allowing for real-time feedback.
+Write and orchestrate workflows as Python classes and decorator-wrapped async methods (called <b>actions</b>) using clients from Playwright and HTTP3 to GRPC and DTLS-UDP concurrently, connect to over thirty one different reporting options, and execute your tests the same locally and distributed via an intuitive CLI. Test execution statistics and performance are displayed via an intuitive terminal UI allowing for real-time feedback.
 
 <br/>
 
