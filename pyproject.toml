@@ -84,7 +84,7 @@ all = [
     'asyncpg',
     'xmltodict',
 ]
-all-engines = [
+all-clients = [
     'grpcio',
     'grpcio-tools',
     'gql',

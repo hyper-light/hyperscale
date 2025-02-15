@@ -12,15 +12,12 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
 RUN pip install uv
 
-RUN mkdir -p /app
-WORKDIR /app
-COPY pyproject.toml requirements.txt LICENSE README.md .version /app/
-COPY hyperscale /app/hyperscale
+RUN mkdir -p /hyperscale
+WORKDIR /hyperscale
+
 RUN uv venv && \
-    . /app/.venv/bin/activate && \
-    uv pip install setuptools wheel && \
-    uv pip install -r requirements.txt && \
-    uv pip install .
+    . /hyperscale/.venv/bin/activate && \
+    uv pip install hyperscale
 
 RUN groupadd --gid $USER_GID $USERNAME \
 && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
