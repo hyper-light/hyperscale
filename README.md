@@ -179,7 +179,7 @@ source .venv/bin/activate
 # Install Hyperscale
 
 # NOTE: To install ALL dependencies for ALL reporting and
-# engine options, uncomment the line below:
+# client options, uncomment the line below:
 
 # uv pip install -r requirements.txt.dev
 
@@ -188,14 +188,14 @@ uv pip install -e .
 ```
 ___________
 
-## <b>Engines and Reporters</b>
+## <b>Clients and Reporters</b>
 
 Below find a tables of Hyperscale's supported client and reporting options, as well as co-requisite dependencies (if any):
 <br/>
 
-### __Engines__ 
+### __Clients__ 
 
-| Engine           | Additional Install Option                                       |  Dependencies                 |
+| Client           | Additional Install Option                                       |  Dependencies                 |
 | -----------      | -----------                                                     |------------                   |
 | HTTP             | N/A                                                             | N/A                           |
 | HTTP2            | N/A                                                             | N/A                           |
@@ -212,7 +212,7 @@ Below find a tables of Hyperscale's supported client and reporting options, as w
 
 ### __Reporters__
 
-| Engine               | Additional Install Option                                 |  Dependencies                            |
+| Reporter             | Additional Install Option                                 |  Dependencies                            |
 | -----------          | -----------                                               |------------                              |
 | AWS Lambda           | pip install hyperscale[aws]                               | boto3                                    |
 | AWS Timestream       | pip install hyperscale[aws]                               | boto3                                    |
