@@ -36,7 +36,7 @@ from .common.results_types import (
 )
 from .cosmosdb import CosmosDB as CosmosDB
 from .cosmosdb import CosmosDBConfig as CosmosDBConfig
-from .custom import Custom as Custom
+from .custom import CustomReporter as CustomReporter
 from .csv import CSV as CSV
 from .csv import CSVConfig as CSVConfig
 from .datadog import Datadog as Datadog
@@ -107,6 +107,7 @@ ReporterConfig = (
     | CloudwatchConfig
     | CosmosDBConfig
     | CSVConfig
+    | CustomReporter
     | DatadogConfig
     | DogStatsDConfig
     | GoogleCloudStorageConfig

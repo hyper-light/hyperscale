@@ -1,1 +1,1 @@
-from .custom import Custom as Custom
+from .custom import CustomReporter as CustomReporter

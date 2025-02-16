@@ -39,7 +39,8 @@ from hyperscale.reporting.common.results_types import (
     WorkflowResultsSet,
     WorkflowStats,
 )
-from hyperscale.reporting.reporter import Reporter, ReporterConfig, Custom
+from hyperscale.reporting.custom import CustomReporter
+from hyperscale.reporting.reporter import Reporter, ReporterConfig
 from hyperscale.reporting.results import Results
 from hyperscale.ui import InterfaceUpdatesController
 from hyperscale.ui.actions import (
@@ -644,13 +645,13 @@ class RemoteGraphManager:
                 custom_reporters = [
                     option
                     for option in options
-                    if isinstance(option, Custom)
+                    if isinstance(option, CustomReporter)
                 ]
 
                 configs = [
                     option
                     for option in options
-                    if not isinstance(option, Custom)
+                    if not isinstance(option, CustomReporter)
                 ]
 
                 reporters = [Reporter(config) for config in configs]
@@ -674,7 +675,6 @@ class RemoteGraphManager:
                     reporters.extend(custom_reporters)
 
                 await asyncio.sleep(1)
-
 
                 selected_reporters = ", ".join(
                     [config.reporter_type.name for config in configs]
@@ -905,7 +905,7 @@ class RemoteGraphManager:
                     if config.get("threads")
                     else self._threads
                     if test_workflows[workflow_name]
-                    else 0,
+                    else 1,
                 }
                 for workflow_name, config in configs.items()
             ]

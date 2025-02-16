@@ -50,7 +50,7 @@ class HTTPResponse(CallResult):
             ],
             float | None,
         ]
-    ] = (None,)
+    ] = None
     redirects: int = 0
 
     @classmethod

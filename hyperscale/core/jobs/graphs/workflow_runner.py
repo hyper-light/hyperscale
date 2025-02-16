@@ -674,6 +674,8 @@ class WorkflowRunner:
                 set(
                     [
                         hook.engine_type.name
+                        if hasattr(hook.engine_type, 'name')
+                        else hook.engine_type
                         for hook in hooks.values()
                         if hook.hook_type == HookType.TEST
                     ]
@@ -868,6 +870,13 @@ class WorkflowRunner:
             ],
             return_exceptions=True,
         )
+
+        if len(pending) > 0:
+            await asyncio.gather(*[
+                asyncio.create_task(
+                    cancel_pending(pend),
+                ) for pend in pending
+            ], return_exceptions=True)
 
         if len(self._failed[run_id][workflow_name]) > 0:
             await asyncio.gather(

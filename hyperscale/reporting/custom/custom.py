@@ -1,11 +1,10 @@
 from hyperscale.reporting.common import (
-    ReporterTypes,
     WorkflowMetricSet,
     StepMetricSet,
 )
 
 
-class Custom:
+class CustomReporter:
 
     async def connect(self):
         pass

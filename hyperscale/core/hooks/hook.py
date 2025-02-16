@@ -12,7 +12,7 @@ from typing import (
     get_args,
     get_type_hints,
 )
-
+from hyperscale.core.engines.client.custom import CustomResponse
 from hyperscale.core.engines.client.shared.models import (
     CallResult,
     RequestType,
@@ -111,6 +111,18 @@ class Hook:
             annotation_subtypes = [return_type for return_type in annotation_subtypes]
 
         is_test = self.return_type in CallResult.__subclasses__() or (
+            self.return_type in CustomResponse.__subclasses__()
+        ) or (
+            len(
+                [
+                    return_type
+                    for return_type in annotation_subtypes
+                    if return_type in CustomResponse.__subclasses__()
+                ]
+            )
+            > 0
+
+        ) or (
             len(
                 [
                     return_type

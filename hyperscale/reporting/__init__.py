@@ -5,7 +5,6 @@ from .bigtable import BigTableConfig as BigTableConfig
 from .cassandra import CassandraConfig as CassandraConfig
 from .cloudwatch import CloudwatchConfig as CloudwatchConfig
 from .cosmosdb import CosmosDBConfig as CosmosDBConfig
-from .custom import Custom as Custom
 from .csv import CSVConfig as CSVConfig
 from .datadog import DatadogConfig as DatadogConfig
 from .dogstatsd import DogStatsDConfig as DogStatsDConfig
