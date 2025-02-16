@@ -366,7 +366,7 @@ class Results:
                     self._calculate_quantiles(results_set),
                 )
 
-        checks = Counter([result.check() for result in results])
+        checks = Counter([result.successful for result in results])
         statuses = Counter([result.status for result in results])
 
         result_contexts = [
