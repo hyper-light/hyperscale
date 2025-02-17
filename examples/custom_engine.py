@@ -1,15 +1,14 @@
 import asyncio
 import time
 from hyperscale.graph import Workflow, step
-from hyperscale.plugin import CustomResponse
+from hyperscale.plugin import CustomResult
 
     
-class ExampleResponse(CustomResponse):
+class ExampleResponse(CustomResult):
     message: str
 
-    @classmethod
-    def response_type(cls):
-        return 'Example'
+    def context(self):
+        return self.message
 
     @property
     def successful(self):
@@ -18,13 +17,10 @@ class ExampleResponse(CustomResponse):
 
 class ExampleEngine:
 
-    def __init__(self):
-        pass
-
     async def go(self, message: str) -> ExampleResponse:
 
         start = time.monotonic()
-        await asyncio.sleep(10)
+        await asyncio.sleep(1)
 
         return ExampleResponse(
             message=message,

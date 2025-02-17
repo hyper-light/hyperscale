@@ -1,1 +1,1 @@
-from .custom_response import CustomResponse as CustomResponse
+from .custom_result import CustomResult as CustomResult

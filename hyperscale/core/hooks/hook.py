@@ -12,7 +12,7 @@ from typing import (
     get_args,
     get_type_hints,
 )
-from hyperscale.core.engines.client.custom import CustomResponse
+from hyperscale.core.engines.client.custom import CustomResult
 from hyperscale.core.engines.client.shared.models import (
     CallResult,
     RequestType,
@@ -99,6 +99,7 @@ class Hook:
         self.dependencies = dependencies
         self.timeouts = timeouts
         self.call_id: int = id_generator.generate()
+        self.custom_result_type_name: str | None = None
 
         self.static = True
         self.return_type = param_types.get("return")
@@ -111,13 +112,13 @@ class Hook:
             annotation_subtypes = [return_type for return_type in annotation_subtypes]
 
         is_test = self.return_type in CallResult.__subclasses__() or (
-            self.return_type in CustomResponse.__subclasses__()
+            self.return_type in CustomResult.__subclasses__()
         ) or (
             len(
                 [
                     return_type
                     for return_type in annotation_subtypes
-                    if return_type in CustomResponse.__subclasses__()
+                    if return_type in CustomResult.__subclasses__()
                 ]
             )
             > 0
@@ -157,10 +158,16 @@ class Hook:
 
         is_metric = len(metric_type) > 0
 
-        if is_test:
+        if is_test and self.return_type in CallResult.__subclasses__():
             self.hook_type = HookType.TEST
-            self.return_type: CallResult = self.return_type
             self.engine_type: RequestType = self.return_type.response_type()
+
+            self.call = self._call
+
+        elif is_test and self.return_type in CustomResult.__subclasses__():
+            self.hook_type = HookType.TEST
+            self.engine_type: RequestType = self.return_type.response_type()
+            self.custom_result_type_name = self.return_type.__name__
 
             self.call = self._call
 

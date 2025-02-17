@@ -2,6 +2,7 @@ from enum import Enum
 
 
 class RequestType(Enum):
+    CUSTOM = 'CUSTOM'
     HTTP = "HTTP"
     HTTP2 = "HTTP2"
     HTTP3 = "HTTP3"
@@ -11,5 +12,3 @@ class RequestType(Enum):
     GRPC = "GRPC"
     PLAYWRIGHT = "PLAYWRIGHT"
     UDP = "UDP"
-    TASK = "TASK"
-    CUSTOM = "CUSTOM"

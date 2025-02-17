@@ -11,6 +11,7 @@ import networkx
 import psutil
 
 from hyperscale.core.engines.client import TimeParser
+from hyperscale.core.engines.client.shared.models import RequestType
 from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
@@ -674,8 +675,8 @@ class WorkflowRunner:
                 set(
                     [
                         hook.engine_type.name
-                        if hasattr(hook.engine_type, 'name')
-                        else hook.engine_type
+                        if hook.engine_type != RequestType.CUSTOM
+                        else hook.custom_result_type_name
                         for hook in hooks.values()
                         if hook.hook_type == HookType.TEST
                     ]

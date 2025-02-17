@@ -104,4 +104,7 @@ class ImportFile(Generic[T]):
             return imported_types
 
         except Exception as e:
-            return Exception(f"could not import objects from file {arg}")
+            import traceback
+            print(traceback.format_exc())
+            exit(0)
+            return Exception(f"could not import objects from file {arg}\n\t   {str(e)}")

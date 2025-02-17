@@ -12,7 +12,7 @@ from typing import (
 
 import numpy as np
 
-from hyperscale.core.engines.client.custom import CustomResponse
+from hyperscale.core.engines.client.custom import CustomResult
 from hyperscale.core.engines.client.graphql import GraphQLResponse
 from hyperscale.core.engines.client.graphql_http2 import GraphQLHTTP2Response
 from hyperscale.core.engines.client.grpc import GRPCResponse
@@ -55,7 +55,7 @@ class Results:
         precision: int = 8,
     ) -> None:
         self._result_type: Dict[
-            Type[CustomResponse]
+            Type[CustomResult]
             | Type[GraphQLResponse]
             | Type[GraphQLHTTP2Response]
             | Type[GRPCResponse]
@@ -70,7 +70,7 @@ class Results:
             Callable[
                 [
                     str,
-                    List[CustomResponse]
+                    List[CustomResult]
                     | List[GraphQLResponse]
                     | List[GraphQLHTTP2Response]
                     | List[GRPCResponse]
@@ -332,11 +332,11 @@ class Results:
 
             results_types = ["total"]
 
-        elif isinstance(result_type, str):
+        elif result_type == RequestType.CUSTOM:
             timing_results_set = [
                 result.process_timings()
                 for result in results
-                if isinstance(result, CustomResponse)
+                if isinstance(result, CustomResult)
             ]
 
             timing_stats: dict[
