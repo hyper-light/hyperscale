@@ -15,7 +15,7 @@ class ExampleResponse(CustomResult):
         return self.message is not None
 
 
-class ExampleEngine:
+class ExampleClient:
 
     async def go(self, message: str) -> ExampleResponse:
 
@@ -33,7 +33,7 @@ class ExampleEngine:
 class Test(Workflow):
     vus = 1000
     duration = "1m"
-    example=ExampleEngine()
+    example=ExampleClient()
 
     @step()
     async def login(self) -> ExampleResponse:
