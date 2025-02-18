@@ -19,7 +19,7 @@ try:
     from opentelemetry.trace import Tracer
     from opentelemetry.propagate import inject
     from opentelemetry.semconv.trace import SpanAttributes
-    from opentelemetry.trace import SpanKind,  get_tracer, Span
+    from opentelemetry.trace import SpanKind,  get_tracer, Span as HTTPSpan
     from opentelemetry.trace.status import Status, StatusCode
     from .utils import (
         SUPPRESS_INSTRUMENTATION_KEY_PLAIN,
@@ -57,7 +57,7 @@ except Exception:
     def get_tracer(*args, **kwargs):
         return Tracer()
 
-    class Span:
+    class HTTPSpan:
         pass
 
     class Status:
@@ -74,6 +74,7 @@ OpenTelemetryTracingConfig = UrlFilter | RequestHook | ResponseHook | TraceSigna
 
 
 class HTTPTrace:
+    enabled = opentelemetry_enabled
     """First-class used to trace requests launched via ClientSession objects."""
 
     __slots__ = (
@@ -114,51 +115,50 @@ class HTTPTrace:
         self.response_hook: Union[RequestHook, None] = response_hook
 
         self.tracer = get_tracer(__name__, __version__, None)
-        self.span: Span = None
         self.token: object = None
         self._context_active = False
-        self._span_name: str | None = None
 
-    async def on_request_queued_start(self):
-        if self.span is None or not self.span.is_recording():
-            return
-        
+    async def on_request_queued_start(
+        self,
+        span: HTTPSpan
+    ):
         attributes = {
             'max_connections': self.max_connections,
         }
 
 
-        self.span.add_event(
+        span.add_event(
             f'request_queued_start',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
-    async def on_request_queued_end(self):
-        if self.span is None or not self.span.is_recording():
-            return
-        
+        return span
+
+    async def on_request_queued_end(
+        self,
+        span: HTTPSpan
+    ):
         attributes = {
             'max_connections': self.max_connections,
         }
 
 
-        self.span.add_event(
+        span.add_event(
             f'request_queued_end',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
+        return span
 
     async def on_connection_create_start(
         self,
+        span: HTTPSpan,
         connection_url: str,
         ssl_upgrade_url: str | None = None,
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-
-        self.span.add_event(
+        span.add_event(
             f'connection_create_start',
             attributes={
                 'connection_url': connection_url,
@@ -168,14 +168,14 @@ class HTTPTrace:
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_connection_create_end(
         self,
+        span: HTTPSpan,
         address: str,
         port: int,
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-        
         ip_version = 'ipv4'
         if not isinstance(ip_address(address), IPv4Address):
             ip_version = 'ipv6'
@@ -189,20 +189,20 @@ class HTTPTrace:
             
         }
 
-        self.span.add_event(
+        span.add_event(
             f'connection_create_end',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_dns_cache_hit(
         self,
+        span: HTTPSpan,
         address: str,
         port: int,
-    ):
-        if self.span is None or not self.span.is_recording():
-            return
-        
+    ):  
         ip_version = 'ipv4'
         if not isinstance(ip_address(address), IPv4Address):
             ip_version = 'ipv6'
@@ -216,48 +216,52 @@ class HTTPTrace:
             
         }
 
-        self.span.add_event(
+        span.add_event(
             f'dns_cache_hit',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
-    async def on_dns_cache_miss(self):
-        if self.span is None or not self.span.is_recording():
-            return
-        
+        return span
+
+    async def on_dns_cache_miss(
+        self,
+        span: HTTPSpan
+    ):
         attributes = {
             'ssl_version': self.ssl_version,
         }
 
-        self.span.add_event(
+        span.add_event(
             f'dns_cache_miss',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
-    async def on_dns_resolve_host_start(self):
-        if self.span is None or not self.span.is_recording():
-            return
-        
+        return span
+
+    async def on_dns_resolve_host_start(
+        self,
+        span: HTTPSpan,
+    ):
         attributes = {
             'ssl_version': self.ssl_version,
         }
 
-        self.span.add_event(
+        span.add_event(
             f'dns_resolve_host_start',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_dns_resolve_host_end(
         self,
+        span: HTTPSpan,
         addresses: list[str],
         port: int,
-    ):
-        if self.span is None or not self.span.is_recording():
-            return
-        
+    ):  
         attributes = {
             'protocol': self.protocol,
             'ip_address': addresses,
@@ -266,20 +270,20 @@ class HTTPTrace:
             
         }
 
-        self.span.add_event(
+        span.add_event(
             f'dns_resolve_host_end',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_connection_reuse(
         self,
+        span: HTTPSpan,
         address: str,
         port: int,
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-        
         ip_version = 'ipv4'
         if not isinstance(ip_address(address), IPv4Address):
             ip_version = 'ipv6'
@@ -293,20 +297,20 @@ class HTTPTrace:
             
         }
 
-        self.span.add_event(
+        span.add_event(
             f'connection_reuse',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_request_headers_sent(
         self,
+        span: HTTPSpan,
         encoded_headers: bytes,
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-
-        self.span.add_event(
+        span.add_event(
             f'request_headers_sent',
             attributes={
                 'bytes_sent': len(encoded_headers)
@@ -314,48 +318,48 @@ class HTTPTrace:
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_request_data_sent(
         self,
+        span: HTTPSpan,
         encoded_data: bytes,
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-        
         attributes = {
             'bytes_sent': len(encoded_data),
         }
 
-        self.span.add_event(
+        span.add_event(
             f'request_data_sent',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_request_chunk_sent(
         self,
+        span: HTTPSpan,
         chunk_data: bytes,
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-        
         attributes = {
             'bytes_sent': len(chunk_data),
         }
 
-        self.span.add_event(
+        span.add_event(
             f'request_chunk_sent',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_response_header_line_received(
         self,
+        span: HTTPSpan,
         header_line: bytes,
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-
-        self.span.add_event(
+        span.add_event(
             f'response_headers_received',
             attributes={
                 'header_line': str(header_line)
@@ -363,14 +367,14 @@ class HTTPTrace:
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_response_headers_received(
         self,
+        span: HTTPSpan,
         response_headers: dict[bytes, bytes],
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-
-        self.span.add_event(
+        span.add_event(
             f'response_headers_received',
             attributes={
                 key.decode(): value.decode() for key, value in response_headers.items()
@@ -378,14 +382,14 @@ class HTTPTrace:
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_response_data_received(
         self,
+        span: HTTPSpan,
         data: bytes | int,
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-        
-        self.span.add_event(
+        span.add_event(
             f'response_headers_received',
             attributes={
                 'bytes_received': len(bytes(data))
@@ -393,14 +397,14 @@ class HTTPTrace:
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_response_chunk_received(
         self,
+        span: HTTPSpan,
         data: bytes,
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-        
-        self.span.add_event(
+        span.add_event(
             f'response_chunk_received',
             attributes={
                 'bytes_received': len(data)
@@ -408,17 +412,17 @@ class HTTPTrace:
             timestamp=int(time.monotonic())
         )
 
+        return span
+
     async def on_request_redirect(
         self,
+        span: HTTPSpan,
         redirect_url: str,
         redirects_taken: int,
         max_redirects: int,
         is_ssl_upgrade: bool = False
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-        
-        self.span.add_event(
+        span.add_event(
             f'request_redirect',
             attributes={
                 'redirect_url': redirect_url,
@@ -428,7 +432,8 @@ class HTTPTrace:
             },
             timestamp=int(time.monotonic())
         )
-        
+
+        return span
 
     async def on_request_start(
         self,
@@ -436,15 +441,11 @@ class HTTPTrace:
         method: str,
         headers: Dict[str, str] | None = None,
     ):
-        
-        if opentelemetry_enabled is False:
-            return
-
+        span: HTTPSpan | None = None
         if context_api.get_value(SUPPRESS_INSTRUMENTATION_KEY_PLAIN):
-            self.span = None
-            return
+            return span
 
-        self._span_name = f"{self.protocol} {method}"
+        span_name = f"{self.protocol} {method}"
 
         request_url = (
             remove_url_credentials(self.url_filter(url))
@@ -457,88 +458,86 @@ class HTTPTrace:
             SpanAttributes.HTTP_URL: request_url,
         }
 
-        self.span: Span = self.tracer.start_span(
-            self._span_name, 
+        span: HTTPSpan = self.tracer.start_span(
+            span_name, 
             kind=SpanKind.CLIENT, 
             attributes=span_attributes,
         )
 
         if self.request_hook:
             self.request_hook(
-                self.span,
+                span,
                 url,
                 method=method,
                 headers=headers,
             )
 
         self.token = context_api.attach(
-            trace.set_span_in_context(self.span)
+            trace.set_span_in_context(span)
         )
 
         self._context_active = True
 
         inject(headers)
 
+        return span
+
     async def on_request_end(
         self,
+        span: HTTPSpan,
         url: str,
         method: str,
         status: int,
         status_message: str | None = None,
         headers: Dict[str, str] | None = None,
     ):
-        if self.span is None or not self.span.is_recording():
-            return
-
         if self.response_hook:
             self.request_hook(
-                self.span,
+                span,
                 url,
                 method=method,
                 headers=headers,
                 status=status,
             )
 
-        if self.span.is_recording() and status:
-            self.span.set_status(
+        if status:
+            span.set_status(
                 Status(
                     http_status_to_status_code(status),
                     description=status_message,
                 )
             )
 
-            self.span.set_attribute(
+            span.set_attribute(
                 SpanAttributes.HTTP_STATUS_CODE, status
             )
 
-        self._end_trace()
+        return self._end_trace(span)
 
     async def on_request_exception(
         self,
+        span: HTTPSpan,
         url: str,
         method: str,
         error: Exception,
         status: int | None = None,
         headers: Dict[str, str] | None = None,
-    ) -> None:
-        if self.span is None or not self.span.is_recording():
-            return
-
+    ):
         exception_message = str(error)
 
         if status:
-            self.span.set_status(
+            span.set_status(
                 Status(
                     StatusCode.ERROR,
                     description=exception_message
                 )
             )
 
-        self.span.record_exception(exception_message)
+        span.record_exception(exception_message)
 
         if self.response_hook:
             self.request_hook(
-                self.span,
+                span,
                 url,
                 method=method,
                 headers=headers,
@@ -546,13 +545,18 @@ class HTTPTrace:
                 error=error,
             )
 
-        self._end_trace()
+        return self._end_trace(span)
     
-    def _end_trace(self) -> None:
+    def _end_trace(
+        self,
+        span: HTTPSpan,
+    ):
         # context = context_api.get_current()
 
         if self._context_active:
             context_api.detach(self.token)
             self._context_active = False
 
-            self.span.end()
+            span.end()
+
+        return span

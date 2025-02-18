@@ -11,7 +11,7 @@ from hyperscale.core.engines.client.shared.models import (
     RequestType,
     URLMetadata,
 )
-from hyperscale.core.engines.client.tracing import Trace
+from hyperscale.core.engines.client.tracing import Span
 
 space_pattern = re.compile(r"\s+")
 
@@ -49,7 +49,7 @@ class HTTPResponse(CallResult):
         float | None,
     ] | None = None
     redirects: int = 0
-    trace: Trace | None = None
+    trace: Span | None = None
 
     @classmethod
     def response_type(cls):
