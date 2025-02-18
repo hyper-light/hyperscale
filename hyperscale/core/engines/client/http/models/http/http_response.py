@@ -1,6 +1,6 @@
 import gzip
 import re
-from typing import Dict, Literal, Optional, Type, TypeVar
+from typing import Dict, Literal, Type, TypeVar
 
 import orjson
 from pydantic import BaseModel
@@ -11,6 +11,7 @@ from hyperscale.core.engines.client.shared.models import (
     RequestType,
     URLMetadata,
 )
+from hyperscale.core.engines.client.tracing import Trace
 
 space_pattern = re.compile(r"\s+")
 
@@ -20,38 +21,35 @@ T = TypeVar("T", bound=BaseModel)
 
 class HTTPResponse(CallResult):
     url: URLMetadata
-    method: Optional[
-        Literal[
-            "GET",
-            "POST",
-            "HEAD",
-            "OPTIONS",
-            "PUT",
-            "PATCH",
-            "DELETE",
-        ]
-    ] = None
-    cookies: Optional[Cookies] = None
-    status: Optional[int] = None
-    status_message: Optional[str] = None
-    headers: Optional[Dict[bytes, bytes]] = None
+    method: Literal[
+        "GET",
+        "POST",
+        "HEAD",
+        "OPTIONS",
+        "PUT",
+        "PATCH",
+        "DELETE",
+    ] | None = None
+    cookies: Cookies | None = None
+    status: int | None = None
+    status_message: str | None = None
+    headers: Dict[bytes, bytes] | None = None
     content: bytes = b""
-    timings: Optional[
-        Dict[
-            Literal[
-                "request_start",
-                "connect_start",
-                "connect_end",
-                "write_start",
-                "write_end",
-                "read_start",
-                "read_end",
-                "request_end",
-            ],
-            float | None,
-        ]
-    ] = None
+    timings: Dict[
+        Literal[
+            "request_start",
+            "connect_start",
+            "connect_end",
+            "write_start",
+            "write_end",
+            "read_start",
+            "read_end",
+            "request_end",
+        ],
+        float | None,
+    ] | None = None
     redirects: int = 0
+    trace: Trace | None = None
 
     @classmethod
     def response_type(cls):
@@ -107,7 +105,7 @@ class HTTPResponse(CallResult):
             return self.headers.get("reason")
 
     @property
-    def data(self, model: Optional[Type[T]] = None):
+    def data(self, model: Type[T] | None = None):
         content_type = self.headers.get("content-type")
 
         if model:

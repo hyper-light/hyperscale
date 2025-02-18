@@ -50,6 +50,7 @@ from hyperscale.core.testing.models import (
     Headers,
     Params,
 )
+from hyperscale.core.engines.client.tracing import HTTPTrace
 
 from .models.http import (
     HTTPResponse,
@@ -103,9 +104,31 @@ class MercurySyncHTTPConnection:
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
+        enable_trace: bool | None = None,
     ):
+        trace: HTTPTrace | None = None
+        if enable_trace:
+            trace = HTTPTrace(
+                protocol='HTTP/1.1',
+                max_connections=self._concurrency,
+                ssl_version='TLSv1.1'
+            )
+
+            await trace.on_request_start(
+                url,
+                method='HEAD',
+                headers=headers,
+            )
+
+        if trace:
+            await trace.on_request_queued_start()
+
         async with self._semaphore:
             try:
+
+                if trace:
+                    await trace.on_request_queued_end()
+
                 return await asyncio.wait_for(
                     self._request(
                         url,
@@ -115,6 +138,7 @@ class MercurySyncHTTPConnection:
                         headers=headers,
                         params=params,
                         redirects=redirects,
+                        trace=trace,
                     ),
                     timeout=timeout,
                 )
@@ -149,9 +173,30 @@ class MercurySyncHTTPConnection:
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
+        enable_trace: bool | None = None,
     ):
+        trace: HTTPTrace | None = None
+        if enable_trace:
+            trace = HTTPTrace(
+                protocol='HTTP/1.1',
+                max_connections=self._concurrency,
+                ssl_version='TLSv1.1'
+            )
+
+            await trace.on_request_start(
+                url,
+                method='OPTIONS',
+                headers=headers,
+            )
+
+        if trace:
+            await trace.on_request_queued_start()
+
         async with self._semaphore:
             try:
+                if trace:
+                    await trace.on_request_queued_end()
+
                 return await asyncio.wait_for(
                     self._request(
                         url,
@@ -161,6 +206,7 @@ class MercurySyncHTTPConnection:
                         headers=headers,
                         params=params,
                         redirects=redirects,
+                        trace=trace,
                     ),
                     timeout=timeout,
                 )
@@ -195,9 +241,30 @@ class MercurySyncHTTPConnection:
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
+        enable_trace: bool | None = None,
     ):
+        trace: HTTPTrace | None = None
+        if enable_trace:
+            trace = HTTPTrace(
+                protocol='HTTP/1.1',
+                max_connections=self._concurrency,
+                ssl_version='TLSv1.1'
+            )
+
+            await trace.on_request_start(
+                url,
+                method='GET',
+                headers=headers,
+            )
+
+        if trace:
+            await trace.on_request_queued_start()
+
         async with self._semaphore:
             try:
+                if trace:
+                    await trace.on_request_queued_end()
+
                 return await asyncio.wait_for(
                     self._request(
                         url,
@@ -207,6 +274,7 @@ class MercurySyncHTTPConnection:
                         headers=headers,
                         params=params,
                         redirects=redirects,
+                        trace=trace,
                     ),
                     timeout=timeout,
                 )
@@ -244,9 +312,30 @@ class MercurySyncHTTPConnection:
         ] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
+        enable_trace: bool | None = None,
     ):
+        trace: HTTPTrace | None = None
+        if enable_trace:
+            trace = HTTPTrace(
+                protocol='HTTP/1.1',
+                max_connections=self._concurrency,
+                ssl_version='TLSv1.1'
+            )
+
+            await trace.on_request_start(
+                url,
+                method='POST',
+                headers=headers,
+            )
+
+        if trace:
+            await trace.on_request_queued_start()
+
         async with self._semaphore:
             try:
+                if trace:
+                    await trace.on_request_queued_end()
+
                 return await asyncio.wait_for(
                     self._request(
                         url,
@@ -257,6 +346,7 @@ class MercurySyncHTTPConnection:
                         params=params,
                         data=data,
                         redirects=redirects,
+                        trace=trace,
                     ),
                     timeout=timeout,
                 )
@@ -294,9 +384,30 @@ class MercurySyncHTTPConnection:
             str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
         redirects: int = 3,
+        enable_trace: bool | None = None,
     ):
+        trace: HTTPTrace | None = None
+        if enable_trace:
+            trace = HTTPTrace(
+                protocol='HTTP/1.1',
+                max_connections=self._concurrency,
+                ssl_version='TLSv1.1'
+            )
+
+            await trace.on_request_start(
+                url,
+                method='PUT',
+                headers=headers,
+            )
+
+        if trace:
+            await trace.on_request_queued_start()
+
         async with self._semaphore:
             try:
+                if trace:
+                    await trace.on_request_queued_end()
+
                 return await asyncio.wait_for(
                     self._request(
                         url,
@@ -307,6 +418,7 @@ class MercurySyncHTTPConnection:
                         params=params,
                         data=data,
                         redirects=redirects,
+                        trace=trace,
                     ),
                     timeout=timeout,
                 )
@@ -344,9 +456,30 @@ class MercurySyncHTTPConnection:
         ] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
+        enable_trace: bool | None = None,
     ):
+        trace: HTTPTrace | None = None
+        if enable_trace:
+            trace = HTTPTrace(
+                protocol='HTTP/1.1',
+                max_connections=self._concurrency,
+                ssl_version='TLSv1.1'
+            )
+
+            await trace.on_request_start(
+                url,
+                method='PATCH',
+                headers=headers,
+            )
+
+        if trace:
+            await trace.on_request_queued_start()
+
         async with self._semaphore:
             try:
+                if trace:
+                    await trace.on_request_queued_end()
+
                 return await asyncio.wait_for(
                     self._request(
                         url,
@@ -357,6 +490,7 @@ class MercurySyncHTTPConnection:
                         params=params,
                         data=data,
                         redirects=redirects,
+                        trace=trace,
                     ),
                     timeout=timeout,
                 )
@@ -391,9 +525,30 @@ class MercurySyncHTTPConnection:
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
+        enable_trace: bool | None = None,
     ):
+        trace: HTTPTrace | None = None
+        if enable_trace:
+            trace = HTTPTrace(
+                protocol='HTTP/1.1',
+                max_connections=self._concurrency,
+                ssl_version='TLSv1.1'
+            )
+
+            await trace.on_request_start(
+                url,
+                method='DELETE',
+                headers=headers,
+            )
+
+        if trace:
+            await trace.on_request_queued_start()
+
         async with self._semaphore:
             try:
+                if trace:
+                    await trace.on_request_queued_end()
+
                 return await asyncio.wait_for(
                     self._request(
                         url,
@@ -403,6 +558,7 @@ class MercurySyncHTTPConnection:
                         headers=headers,
                         params=params,
                         redirects=redirects,
+                        trace=trace,
                     ),
                     timeout=timeout,
                 )
@@ -482,6 +638,7 @@ class MercurySyncHTTPConnection:
             str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
         redirects: int = 3,
+        trace: HTTPTrace | None = None,
     ):
         timings: Dict[
             Literal[
@@ -510,12 +667,12 @@ class MercurySyncHTTPConnection:
         result, redirect, timings = await self._execute(
             url,
             method,
-            auth=auth,
             cookies=cookies,
             headers=headers,
             params=params,
             data=data,
             timings=timings,
+            trace=trace,
         )
 
         if redirect and (
@@ -545,7 +702,6 @@ class MercurySyncHTTPConnection:
                 result, redirect, timings = await self._execute(
                     url,
                     method,
-                    auth=auth,
                     cookies=cookies,
                     headers=headers,
                     params=params,
@@ -553,6 +709,7 @@ class MercurySyncHTTPConnection:
                     upgrade_ssl=upgrade_ssl,
                     redirect_url=location,
                     timings=timings,
+                    trace=trace,
                 )
 
                 if redirect is False:
@@ -569,6 +726,8 @@ class MercurySyncHTTPConnection:
             result.redirects = redirects_taken
 
         timings["request_end"] = time.monotonic()
+
+        result.trace = trace
         result.timings.update(timings)
 
         return result
@@ -577,7 +736,6 @@ class MercurySyncHTTPConnection:
         self,
         request_url: str | URL,
         method: str,
-        auth: Optional[Tuple[str, str]] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
         headers: Optional[Dict[str, str] | Headers] = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
@@ -599,6 +757,7 @@ class MercurySyncHTTPConnection:
             ],
             float | None,
         ] = None,
+        trace: HTTPTrace | None = None,
     ) -> Tuple[
         HTTPResponse,
         bool,
@@ -627,6 +786,7 @@ class MercurySyncHTTPConnection:
                 self._connect_to_url_location(
                     request_url,
                     ssl_redirect_url=request_url if upgrade_ssl else None,
+                    trace=trace,
                 ),
                 timeout=self.timeouts.connect_timeout,
             )
@@ -648,6 +808,16 @@ class MercurySyncHTTPConnection:
             content_type: Optional[str] = None
 
             if connection.reader is None or error:
+
+                if trace:
+                    await trace.on_request_exception(
+                        url,
+                        method,
+                        error if error else Exception('Connection failed.'),
+                        status=400,
+                        headers=headers,
+                    )
+
                 timings["connect_end"] = time.monotonic()
                 self._connections.append(
                     HTTPConnection(
@@ -697,14 +867,23 @@ class MercurySyncHTTPConnection:
 
             connection.write(encoded_headers)
 
+            if trace:
+                await trace.on_request_headers_sent(encoded_headers)
+
             if isinstance(encoded_data, Iterator):
                 for chunk in encoded_data:
                     connection.write(chunk)
+
+                    if trace:
+                        await trace.on_request_chunk_sent(chunk)  
 
                 connection.write(("0" + NEW_LINE * 2).encode())
 
             elif data:
                 connection.write(encoded_data)
+
+                if trace:
+                    await trace.on_request_data_sent()
 
             timings["write_end"] = time.monotonic()
 
@@ -714,6 +893,9 @@ class MercurySyncHTTPConnection:
             response_code = await asyncio.wait_for(
                 connection.reader.readline(), timeout=self.timeouts.read_timeout
             )
+
+            if trace:
+                await trace.on_response_header_line_received(response_code)
             
             status_string: List[bytes] = response_code.split()
             status = int(status_string[1])
@@ -722,6 +904,9 @@ class MercurySyncHTTPConnection:
                 connection.read_headers(),
                 timeout=self.timeouts.read_timeout,
             )
+
+            if trace:
+                await trace.on_response_headers_received(headers)
 
             content_length = headers.get(b"content-length")
             transfer_encoding = headers.get(b"transfer-encoding")
@@ -732,7 +917,6 @@ class MercurySyncHTTPConnection:
                 cookies = HTTPCookies()
                 cookies.update(cookies_data)
                 
-
 
             # We require Content-Length or Transfer-Encoding headers to read a
             # request body, otherwise it's anyone's guess as to how big the body
@@ -745,6 +929,9 @@ class MercurySyncHTTPConnection:
                     connection.readexactly(int(content_length)),
                     timeout=self.timeouts.read_timeout,
                 )
+
+                if trace:
+                    await trace.on_response_data_received(body)
 
             elif transfer_encoding:
                 body = bytearray()
@@ -772,6 +959,10 @@ class MercurySyncHTTPConnection:
                         connection.readexactly(chunk_size + 2),
                         self.timeouts.read_timeout,
                     )
+
+                    if trace:
+                        await trace.on_response_chunk_received(chunk)
+                    
                     body.extend(chunk[:-2])
 
                 all_chunks_read = True
@@ -801,6 +992,14 @@ class MercurySyncHTTPConnection:
 
             timings["read_end"] = time.monotonic()
 
+            if trace:
+                await trace.on_request_end(
+                    url,
+                    method,
+                    status,
+                    headers=headers,
+                )
+
             return (
                 HTTPResponse(
                     url=URLMetadata(
@@ -823,7 +1022,7 @@ class MercurySyncHTTPConnection:
         except (
             Exception,
             socket.error
-        ):
+        ) as err:
             self._connections.append(
                 HTTPConnection(
                     reset_connections=self.reset_connections,
@@ -841,6 +1040,15 @@ class MercurySyncHTTPConnection:
 
             timings["read_end"] = time.monotonic()
 
+            if trace:
+                await trace.on_request_exception(
+                    url,
+                    method,
+                    str(err),
+                    status=status,
+                    headers=headers,
+                )
+
             return (
                 HTTPResponse(
                     url=URLMetadata(
@@ -851,7 +1059,7 @@ class MercurySyncHTTPConnection:
                     ),
                     method=method,
                     status=400,
-                    status_message="Request failed or timed out.",
+                    status_message=str(err),
                     timings=timings,
                 ),
                 False,
@@ -862,12 +1070,21 @@ class MercurySyncHTTPConnection:
         self,
         request_url: str | URL,
         ssl_redirect_url: Optional[str | URL] = None,
+        trace: HTTPTrace | None = None
     ) -> Tuple[
         Optional[Exception],
         HTTPConnection,
         HTTPUrl,
         bool,
     ]:
+        
+
+        if trace:
+            await trace.on_connection_create_start(
+                request_url,
+                ssl_upgrade_url=ssl_redirect_url,
+            )
+
         has_optimized_url = isinstance(request_url, URL)
 
         if has_optimized_url:
@@ -895,10 +1112,23 @@ class MercurySyncHTTPConnection:
             url is None or ssl_redirect_url
         ) and has_optimized_url is False
 
+        if trace and do_dns_lookup:
+            await trace.on_dns_cache_miss()
+
         if do_dns_lookup and dns_lock.locked() is False:
+
+            if trace:
+                await trace.on_dns_resolve_host_start()
+
             await dns_lock.acquire()
             url = parsed_url
             await url.lookup()
+
+            if trace:
+                await trace.on_dns_resolve_host_end(
+                    [address for address, _ in url],
+                    url.port,
+                )
 
             self._dns_lock[parsed_url.hostname] = dns_lock
             self._url_cache[parsed_url.hostname] = url
@@ -914,13 +1144,28 @@ class MercurySyncHTTPConnection:
             await dns_waiter
             url = self._url_cache.get(parsed_url.hostname)
 
+            if trace:
+                await trace.on_dns_cache_hit(
+                    [address for address, _ in url],
+                    url.port,
+                )
+
         elif has_optimized_url:
             url = request_url.optimized
+            
+        if trace and do_dns_lookup is False:
+            await trace.on_dns_cache_hit(
+                [address for address, _ in url],
+                url.port,
+            )
 
         connection = self._connections.pop()
         connection_error: Optional[Exception] = None
 
         if url.address is None or ssl_redirect_url:
+
+
+
             for address, ip_info in url:
                 try:
                     await connection.make_connection(
@@ -946,6 +1191,13 @@ class MercurySyncHTTPConnection:
                         )
 
         else:
+
+            if trace:
+                await trace.on_connection_reuse(
+                    [address for address, _ in url],
+                    url.port,
+                )
+
             try:
                 await connection.make_connection(
                     url.hostname,
@@ -963,6 +1215,12 @@ class MercurySyncHTTPConnection:
                     return None, parsed_url, True
 
                 connection_error = err
+
+        if trace:
+            await trace.on_connection_create_end(
+                url.address,
+                url.port,
+            )
 
         return (
             connection_error,
