@@ -47,7 +47,13 @@ def get_default_config():
 
     else:
         with open(config_path, "r") as config_file:
-            config = HyperscaleConfig(**json.load(config_file))
+            config_data = json.load(config_file)
+            config_data['logs_directory'] = os.path.join(
+                os.getcwd(),
+                'logs',
+            )
+            
+            config = HyperscaleConfig(**config_data)
 
     return config
 
