@@ -1,9 +1,10 @@
 import asyncio
 import textwrap
-from pydantic import BaseModel, StrictInt
-from hyperscale.commands.cli.arg_types import KeywordArg
-from hyperscale.ui.styling import stylize, get_style
 
+from pydantic import BaseModel, StrictInt
+
+from hyperscale.commands.cli.arg_types import KeywordArg
+from hyperscale.ui.styling import get_style, stylize
 
 from .cli_style import CLIStyle
 from .description_help_message import DescriptionHelpMessage
@@ -95,7 +96,7 @@ class HelpMessage(BaseModel):
 
         message_lines = "\n".join(lines)
 
-        return f"\033[2J\033[H\n\n{message_lines}\n\n"
+        return f"\033[2J\033[H\n{message_lines}\n\n"
 
     async def _create_subcommands_description(
         self,
@@ -127,7 +128,7 @@ class HelpMessage(BaseModel):
             styled_subcommands = subcommands
 
         header_indentation = max(indentation - 1, 0)
-        header_indentation_tabs = f" " * header_indentation
+        header_indentation_tabs = " " * header_indentation
 
         header = "commands"
         if styles and styles.has_subcommand_styles():

@@ -3,66 +3,100 @@ from __future__ import annotations
 import os
 import threading
 import uuid
-from .common.results_types import (
-    WorkflowStats,
-    ResultSet,
-    MetricsSet,
-    CheckSet,
-    CountResults,
-)
-from typing import List, TypeVar, Generic
+from typing import Generic, List, TypeVar
 
-from .common import (
-    ReporterTypes as ReporterTypes,
-    StepMetricSet as StepMetricSet,
-    StepMetricSet as StepMetricSet,
-    WorkflowMetric as WorkflowMetric,
-    WorkflowMetricSet as WorkflowMetricSet,
-)
-from .aws_lambda import AWSLambda as AWSLambda, AWSLambdaConfig as AWSLambdaConfig
+from .aws_lambda import AWSLambda as AWSLambda
+from .aws_lambda import AWSLambdaConfig as AWSLambdaConfig
 from .aws_timestream import (
     AWSTimestream as AWSTimestream,
+)
+from .aws_timestream import (
     AWSTimestreamConfig as AWSTimestreamConfig,
 )
-from .bigquery import BigQuery as BigQuery, BigQueryConfig as BigQueryConfig
-from .bigtable import BigTable as BigTable, BigTableConfig as BigTableConfig
-from .cassandra import Cassandra as Cassandra, CassandraConfig as CassandraConfig
-from .cloudwatch import Cloudwatch as Cloudwatch, CloudwatchConfig as CloudwatchConfig
-from .cosmosdb import CosmosDB as CosmosDB, CosmosDBConfig as CosmosDBConfig
-from .csv import CSV as CSV, CSVConfig as CSVConfig
-from .datadog import Datadog as Datadog, DatadogConfig as DatadogConfig
-from .dogstatsd import DogStatsD as DogStatsD, DogStatsDConfig as DogStatsDConfig
+from .bigquery import BigQuery as BigQuery
+from .bigquery import BigQueryConfig as BigQueryConfig
+from .bigtable import BigTable as BigTable
+from .bigtable import BigTableConfig as BigTableConfig
+from .cassandra import Cassandra as Cassandra
+from .cassandra import CassandraConfig as CassandraConfig
+from .cloudwatch import Cloudwatch as Cloudwatch
+from .cloudwatch import CloudwatchConfig as CloudwatchConfig
+from .common import (
+    ReporterTypes as ReporterTypes,
+)
+from .common import StepMetricSet as StepMetricSet
+from .common import WorkflowMetric as WorkflowMetric
+from .common import WorkflowMetricSet as WorkflowMetricSet
+from .common.results_types import (
+    CheckSet,
+    CountResults,
+    MetricsSet,
+    ResultSet,
+    WorkflowStats,
+)
+from .cosmosdb import CosmosDB as CosmosDB
+from .cosmosdb import CosmosDBConfig as CosmosDBConfig
+from .custom import CustomReporter as CustomReporter
+from .csv import CSV as CSV
+from .csv import CSVConfig as CSVConfig
+from .datadog import Datadog as Datadog
+from .datadog import DatadogConfig as DatadogConfig
+from .dogstatsd import DogStatsD as DogStatsD
+from .dogstatsd import DogStatsDConfig as DogStatsDConfig
 from .google_cloud_storage import (
     GoogleCloudStorage as GoogleCloudStorage,
+)
+from .google_cloud_storage import (
     GoogleCloudStorageConfig as GoogleCloudStorageConfig,
 )
-from .graphite import Graphite as Graphite, GraphiteConfig as GraphiteConfig
-from .honeycomb import Honeycomb as Honeycomb, HoneycombConfig as HoneycombConfig
-from .influxdb import InfluxDB as InfluxDB, InfluxDBConfig as InfluxDBConfig
-from .json import JSON as JSON, JSONConfig as JSONConfig
-from .kafka import Kafka as Kafka, KafkaConfig as KafkaConfig
-from .mongodb import MongoDB as MongoDB, MongoDBConfig as MongoDBConfig
-from .mysql import MySQL as MySQL, MySQLConfig as MySQLConfig
-from .netdata import Netdata as Netdata, NetdataConfig as NetdataConfig
-from .newrelic import NewRelic as NewRelic, NewRelicConfig as NewRelicConfig
-from .postgres import Postgres as Postgres, PostgresConfig as PostgresConfig
-from .prometheus import Prometheus as Prometheus, PrometheusConfig as PrometheusConfig
-from .redis import Redis as Redis, RedisConfig as RedisConfig
-from .s3 import S3 as S3, S3Config as S3Config
-from .snowflake import Snowflake as Snowflake, SnowflakeConfig as SnowflakeConfig
-from .sqlite import SQLite as SQLite, SQLiteConfig as SQLiteConfig
-from .statsd import StatsD as StatsD, StatsDConfig as StatsDConfig
-from .telegraf import Telegraf as Telegraf, TelegrafConfig as TelegrafConfig
+from .graphite import Graphite as Graphite
+from .graphite import GraphiteConfig as GraphiteConfig
+from .honeycomb import Honeycomb as Honeycomb
+from .honeycomb import HoneycombConfig as HoneycombConfig
+from .influxdb import InfluxDB as InfluxDB
+from .influxdb import InfluxDBConfig as InfluxDBConfig
+from .json import JSON as JSON
+from .json import JSONConfig as JSONConfig
+from .kafka import Kafka as Kafka
+from .kafka import KafkaConfig as KafkaConfig
+from .mongodb import MongoDB as MongoDB
+from .mongodb import MongoDBConfig as MongoDBConfig
+from .mysql import MySQL as MySQL
+from .mysql import MySQLConfig as MySQLConfig
+from .netdata import Netdata as Netdata
+from .netdata import NetdataConfig as NetdataConfig
+from .newrelic import NewRelic as NewRelic
+from .newrelic import NewRelicConfig as NewRelicConfig
+from .postgres import Postgres as Postgres
+from .postgres import PostgresConfig as PostgresConfig
+from .prometheus import Prometheus as Prometheus
+from .prometheus import PrometheusConfig as PrometheusConfig
+from .redis import Redis as Redis
+from .redis import RedisConfig as RedisConfig
+from .s3 import S3 as S3
+from .s3 import S3Config as S3Config
+from .snowflake import Snowflake as Snowflake
+from .snowflake import SnowflakeConfig as SnowflakeConfig
+from .sqlite import SQLite as SQLite
+from .sqlite import SQLiteConfig as SQLiteConfig
+from .statsd import StatsD as StatsD
+from .statsd import StatsDConfig as StatsDConfig
+from .telegraf import Telegraf as Telegraf
+from .telegraf import TelegrafConfig as TelegrafConfig
 from .telegraf_statsd import (
     TelegrafStatsD as TelegrafStatsD,
+)
+from .telegraf_statsd import (
     TelegrafStatsDConfig as TelegrafStatsDConfig,
 )
 from .timescaledb import (
     TimescaleDB as TimescaleDB,
+)
+from .timescaledb import (
     TimescaleDBConfig as TimescaleDBConfig,
 )
-from .xml import XML as XML, XMLConfig as XMLConfig
-
+from .xml import XML as XML
+from .xml import XMLConfig as XMLConfig
 
 ReporterConfig = (
     AWSLambdaConfig
@@ -73,6 +107,7 @@ ReporterConfig = (
     | CloudwatchConfig
     | CosmosDBConfig
     | CSVConfig
+    | CustomReporter
     | DatadogConfig
     | DogStatsDConfig
     | GoogleCloudStorageConfig
@@ -202,7 +237,9 @@ class Reporter(Generic[T]):
             {
                 "metric_workflow": results_metrics.get("workflow"),
                 "metric_step": results_metrics.get("step"),
-                "metric_type": "DISTRIBUTION" if "quantile" in metric_name else "TIMING",
+                "metric_type": "DISTRIBUTION"
+                if "quantile" in metric_name
+                else "TIMING",
                 "metric_group": timing_name,
                 "metric_name": metric_name,
                 "metric_value": metric_value,
@@ -226,7 +263,7 @@ class Reporter(Generic[T]):
                 }
                 for results_metrics in results_set
                 for count_name, count_metric in results_metrics.get(
-                    "counts", 
+                    "counts",
                     {},
                 ).items()
             ]
@@ -239,9 +276,9 @@ class Reporter(Generic[T]):
                 {
                     "metric_workflow": metrics.get("workflow"),
                     "metric_step": metrics.get("step"),
-                    "metric_type": "DISTRIBUTION" if "quantile" in metric_name else metrics.get(
-                        "metric_type"
-                    ),
+                    "metric_type": "DISTRIBUTION"
+                    if "quantile" in metric_name
+                    else metrics.get("metric_type"),
                     "metric_group": "custom",
                     "metric_name": metric_name,
                     "metric_value": metric_value,
@@ -281,7 +318,7 @@ class Reporter(Generic[T]):
                     "metric_value": metric_value,
                 }
                 for check_metrics in check_set
-                for metric_name, metric_value in check_metrics.get("counts", {}).items() 
+                for metric_name, metric_value in check_metrics.get("counts", {}).items()
                 if metric_name in ["succeeded", "failed", "executed"]
             ]
         )

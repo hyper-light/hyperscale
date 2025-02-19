@@ -43,9 +43,6 @@ class GRPCResponse(HTTP2Response):
     def response_type(cls):
         return RequestType.GRPC
 
-    def check_success(self) -> bool:
-        return self.status and self.status >= 200 and self.status < 300
-
     @property
     def data(self):
         parsed: bytes = b""

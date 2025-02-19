@@ -56,6 +56,10 @@ class UDPResponse(CallResult):
     def data(self):
         return self.content
 
+    @property
+    def successful(self):
+        return self.error is None
+
     def check(self):
         return self.error is None
 

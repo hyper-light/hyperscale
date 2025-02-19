@@ -12,6 +12,7 @@ from typing import (
 
 import numpy as np
 
+from hyperscale.core.engines.client.custom import CustomResult
 from hyperscale.core.engines.client.graphql import GraphQLResponse
 from hyperscale.core.engines.client.graphql_http2 import GraphQLHTTP2Response
 from hyperscale.core.engines.client.grpc import GRPCResponse
@@ -54,7 +55,8 @@ class Results:
         precision: int = 8,
     ) -> None:
         self._result_type: Dict[
-            Type[GraphQLResponse]
+            Type[CustomResult]
+            | Type[GraphQLResponse]
             | Type[GraphQLHTTP2Response]
             | Type[GRPCResponse]
             | Type[HTTPRequest]
@@ -68,7 +70,8 @@ class Results:
             Callable[
                 [
                     str,
-                    List[GraphQLResponse]
+                    List[CustomResult]
+                    | List[GraphQLResponse]
                     | List[GraphQLHTTP2Response]
                     | List[GRPCResponse]
                     | List[HTTPRequest]
@@ -300,7 +303,7 @@ class Results:
         self,
         workflow: str,
         step_name: str,
-        result_type: RequestType,
+        result_type: RequestType | str,
         results: List[GraphQLResponse]
         | List[GraphQLHTTP2Response]
         | List[GRPCResponse]
@@ -328,6 +331,20 @@ class Results:
             ] = {}
 
             results_types = ["total"]
+
+        elif result_type == RequestType.CUSTOM:
+            timing_results_set = [
+                result.process_timings()
+                for result in results
+                if isinstance(result, CustomResult)
+            ]
+
+            timing_stats: dict[
+                str,
+                dict[StatTypes, int | float]
+            ] = {}
+
+            results_types = list(timing_results_set[0].keys())
 
         else:
             timing_results_set = [
@@ -366,8 +383,11 @@ class Results:
                     self._calculate_quantiles(results_set),
                 )
 
-        checks = Counter([result.check() for result in results])
-        statuses = Counter([result.status for result in results])
+        checks = Counter([result.successful for result in results])
+        statuses = Counter([
+            result.status for result in results
+            if not result_type == RequestType.PLAYWRIGHT and not isinstance(result_type, str)
+        ])
 
         result_contexts = [
             result.context() for result in results if result.context() is not None

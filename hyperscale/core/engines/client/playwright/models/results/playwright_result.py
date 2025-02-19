@@ -36,3 +36,7 @@ class PlaywrightResult(CallResult, Generic[T]):
 
     def context(self):
         return self.error if self.error else "OK"
+
+    @property
+    def successful(self):
+        return self.error is None

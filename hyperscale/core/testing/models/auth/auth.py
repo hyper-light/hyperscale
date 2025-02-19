@@ -1,10 +1,11 @@
+import base64
 from typing import (
     Generic,
     Optional,
-    Tuple,
     TypeVar,
 )
 
+from hyperscale.core.engines.client.shared.protocols import NEW_LINE
 from hyperscale.core.testing.models.base import OptimizedArg
 
 from .auth_validator import AuthValidator
@@ -13,7 +14,10 @@ T = TypeVar("T")
 
 
 class Auth(OptimizedArg, Generic[T]):
-    def __init__(self, auth: Tuple[str, str]) -> None:
+    def __init__(
+        self,
+        auth: tuple[str, str] | tuple[str],
+    ) -> None:
         super(
             Auth,
             self,
@@ -30,10 +34,18 @@ class Auth(OptimizedArg, Generic[T]):
             return
 
         if len(self.data) > 1:
-            self.data = f"{self.data[0]}:{self.data[1]}"
+            credentials_string = f"{self.data[0]}:{self.data[1]}"
+            encoded_credentials = base64.b64encode(
+                credentials_string.encode(),
+            ).decode()
 
         else:
-            self.data = self.data[0]
+
+            encoded_credentials = base64.b64encode(
+                self.data[0].encode()
+            ).decode()
+
+        self.data = f'Authorization: Basic {encoded_credentials}{NEW_LINE}'
 
     @property
     def user(self):

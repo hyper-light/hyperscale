@@ -1,7 +1,7 @@
 from enum import Enum
-import uuid
+from typing import Dict, List, Literal
+
 from hyperscale.reporting.common.results_types import MetricType
-from typing import Literal, Dict, List
 
 
 class ReporterTypes(Enum):

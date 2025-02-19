@@ -11,6 +11,7 @@ import networkx
 import psutil
 
 from hyperscale.core.engines.client import TimeParser
+from hyperscale.core.engines.client.shared.models import RequestType
 from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
@@ -674,6 +675,8 @@ class WorkflowRunner:
                 set(
                     [
                         hook.engine_type.name
+                        if hook.engine_type != RequestType.CUSTOM
+                        else hook.custom_result_type_name
                         for hook in hooks.values()
                         if hook.hook_type == HookType.TEST
                     ]
@@ -868,6 +871,13 @@ class WorkflowRunner:
             ],
             return_exceptions=True,
         )
+
+        if len(pending) > 0:
+            await asyncio.gather(*[
+                asyncio.create_task(
+                    cancel_pending(pend),
+                ) for pend in pending
+            ], return_exceptions=True)
 
         if len(self._failed[run_id][workflow_name]) > 0:
             await asyncio.gather(

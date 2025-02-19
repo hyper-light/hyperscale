@@ -5,6 +5,7 @@ from typing import List, Callable, Awaitable
 
 from hyperscale.core.engines.client import Client
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
+from hyperscale.reporting.custom import CustomReporter
 from hyperscale.reporting.reporter import ReporterConfig, JSONConfig
 
 
@@ -23,7 +24,7 @@ class Workflow:
     duration: str = "1m"
     timeout: str = "30s"
     interval: str | None = None
-    reporting: ReporterConfigs | None = None
+    reporting: ReporterConfigs | CustomReporter | None = None
 
     def __init__(self):
         module = importlib.import_module(self.__module__)
