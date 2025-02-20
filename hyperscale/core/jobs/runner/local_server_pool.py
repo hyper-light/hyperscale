@@ -59,7 +59,7 @@ async def run_server(
 
         except Exception:
             pass
-
+        
         await server.run_forever()
         await server.close()
 

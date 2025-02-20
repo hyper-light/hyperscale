@@ -3,6 +3,7 @@ import ssl
 from random import randrange
 from typing import Optional
 
+from hyperscale.core.engines.client.tracing import HTTPTrace
 from .graphql import MercurySyncGraphQLConnection
 from .graphql_http2 import MercurySyncGraphQLHTTP2Connection
 from .grpc import MercurySyncGRPCConnection
@@ -58,6 +59,13 @@ def setup_client(
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+
+
+        client.trace = HTTPTrace(
+            'HTTP/1.1',
+            vus,
+            ssl_version='TLSv1.2'
+        )
 
         client._client_ssl_context = ctx
 

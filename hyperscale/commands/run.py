@@ -52,7 +52,7 @@ def get_default_config():
                 os.getcwd(),
                 'logs',
             )
-
+            
             config = HyperscaleConfig(**config_data)
 
     return config
