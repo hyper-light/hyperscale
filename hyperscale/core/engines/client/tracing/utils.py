@@ -1,5 +1,12 @@
 from urllib.parse import urlparse, urlunparse
-from opentelemetry.trace import StatusCode
+
+try:
+    
+    from opentelemetry.trace import StatusCode
+
+except Exception:
+    class StatusCode:
+        pass
 
 SUPPRESS_INSTRUMENTATION_KEY_PLAIN = (
     "suppress_instrumentation"  # Set for backward compatibility

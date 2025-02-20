@@ -19,7 +19,7 @@ try:
     from opentelemetry.trace import Tracer
     from opentelemetry.propagate import inject
     from opentelemetry.semconv.trace import SpanAttributes
-    from opentelemetry.trace import SpanKind,  get_tracer, Span as HTTPSpan
+    from opentelemetry.trace import SpanKind,  get_tracer, Span
     from opentelemetry.trace.status import Status, StatusCode
     from .utils import (
         SUPPRESS_INSTRUMENTATION_KEY_PLAIN,
@@ -55,7 +55,7 @@ except Exception:
         pass
 
     def get_tracer(*args, **kwargs):
-        return Tracer()
+        pass
 
     class HTTPSpan:
         pass
@@ -77,19 +77,6 @@ class HTTPTrace:
     enabled = opentelemetry_enabled
     """First-class used to trace requests launched via ClientSession objects."""
 
-    __slots__ = (
-        'protocol',
-        'max_connections',
-        'ssl_version',
-        'tracer',
-        'span',
-        'token',
-        'allowed_traces',
-        'url_filter',
-        'request_hook',
-        'response_hook',
-        '_context_active'
-    )
 
     def __init__(
         self, 
@@ -120,15 +107,14 @@ class HTTPTrace:
 
     async def on_request_queued_start(
         self,
-        span: HTTPSpan
+        span: Span
     ):
         attributes = {
             'max_connections': self.max_connections,
         }
 
-
         span.add_event(
-            f'request_queued_start',
+            'request_queued_start',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -137,15 +123,14 @@ class HTTPTrace:
 
     async def on_request_queued_end(
         self,
-        span: HTTPSpan
+        span: Span
     ):
         attributes = {
             'max_connections': self.max_connections,
         }
 
-
         span.add_event(
-            f'request_queued_end',
+            'request_queued_end',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -154,12 +139,12 @@ class HTTPTrace:
 
     async def on_connection_create_start(
         self,
-        span: HTTPSpan,
+        span: Span,
         connection_url: str,
         ssl_upgrade_url: str | None = None,
     ):
         span.add_event(
-            f'connection_create_start',
+            'connection_create_start',
             attributes={
                 'connection_url': connection_url,
                 'ssl_upgrade_url': ssl_upgrade_url,
@@ -172,7 +157,7 @@ class HTTPTrace:
 
     async def on_connection_create_end(
         self,
-        span: HTTPSpan,
+        span: Span,
         address: str,
         port: int,
     ):
@@ -190,7 +175,7 @@ class HTTPTrace:
         }
 
         span.add_event(
-            f'connection_create_end',
+            'connection_create_end',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -199,7 +184,7 @@ class HTTPTrace:
 
     async def on_dns_cache_hit(
         self,
-        span: HTTPSpan,
+        span: Span,
         address: str,
         port: int,
     ):  
@@ -217,7 +202,7 @@ class HTTPTrace:
         }
 
         span.add_event(
-            f'dns_cache_hit',
+            'dns_cache_hit',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -226,14 +211,14 @@ class HTTPTrace:
 
     async def on_dns_cache_miss(
         self,
-        span: HTTPSpan
+        span: Span
     ):
         attributes = {
             'ssl_version': self.ssl_version,
         }
 
         span.add_event(
-            f'dns_cache_miss',
+            'dns_cache_miss',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -242,14 +227,14 @@ class HTTPTrace:
 
     async def on_dns_resolve_host_start(
         self,
-        span: HTTPSpan,
+        span: Span,
     ):
         attributes = {
             'ssl_version': self.ssl_version,
         }
 
         span.add_event(
-            f'dns_resolve_host_start',
+            'dns_resolve_host_start',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -258,7 +243,7 @@ class HTTPTrace:
 
     async def on_dns_resolve_host_end(
         self,
-        span: HTTPSpan,
+        span: Span,
         addresses: list[str],
         port: int,
     ):  
@@ -271,7 +256,7 @@ class HTTPTrace:
         }
 
         span.add_event(
-            f'dns_resolve_host_end',
+            'dns_resolve_host_end',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -280,7 +265,7 @@ class HTTPTrace:
 
     async def on_connection_reuse(
         self,
-        span: HTTPSpan,
+        span: Span,
         address: str,
         port: int,
     ):
@@ -298,7 +283,7 @@ class HTTPTrace:
         }
 
         span.add_event(
-            f'connection_reuse',
+            'connection_reuse',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -307,11 +292,11 @@ class HTTPTrace:
 
     async def on_request_headers_sent(
         self,
-        span: HTTPSpan,
+        span: Span,
         encoded_headers: bytes,
     ):
         span.add_event(
-            f'request_headers_sent',
+            'request_headers_sent',
             attributes={
                 'bytes_sent': len(encoded_headers)
             },
@@ -322,7 +307,7 @@ class HTTPTrace:
 
     async def on_request_data_sent(
         self,
-        span: HTTPSpan,
+        span: Span,
         encoded_data: bytes,
     ):
         attributes = {
@@ -330,7 +315,7 @@ class HTTPTrace:
         }
 
         span.add_event(
-            f'request_data_sent',
+            'request_data_sent',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -339,7 +324,7 @@ class HTTPTrace:
 
     async def on_request_chunk_sent(
         self,
-        span: HTTPSpan,
+        span: Span,
         chunk_data: bytes,
     ):
         attributes = {
@@ -347,7 +332,7 @@ class HTTPTrace:
         }
 
         span.add_event(
-            f'request_chunk_sent',
+            'request_chunk_sent',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -356,11 +341,11 @@ class HTTPTrace:
 
     async def on_response_header_line_received(
         self,
-        span: HTTPSpan,
+        span: Span,
         header_line: bytes,
     ):
         span.add_event(
-            f'response_headers_received',
+            'response_headers_received',
             attributes={
                 'header_line': str(header_line)
             },
@@ -371,11 +356,11 @@ class HTTPTrace:
 
     async def on_response_headers_received(
         self,
-        span: HTTPSpan,
+        span: Span,
         response_headers: dict[bytes, bytes],
     ):
         span.add_event(
-            f'response_headers_received',
+            'response_headers_received',
             attributes={
                 key.decode(): value.decode() for key, value in response_headers.items()
             },
@@ -386,11 +371,11 @@ class HTTPTrace:
 
     async def on_response_data_received(
         self,
-        span: HTTPSpan,
+        span: Span,
         data: bytes | int,
     ):
         span.add_event(
-            f'response_headers_received',
+            'response_headers_received',
             attributes={
                 'bytes_received': len(bytes(data))
             },
@@ -401,11 +386,11 @@ class HTTPTrace:
 
     async def on_response_chunk_received(
         self,
-        span: HTTPSpan,
+        span: Span,
         data: bytes,
     ):
         span.add_event(
-            f'response_chunk_received',
+            'response_chunk_received',
             attributes={
                 'bytes_received': len(data)
             },
@@ -416,14 +401,14 @@ class HTTPTrace:
 
     async def on_request_redirect(
         self,
-        span: HTTPSpan,
+        span: Span,
         redirect_url: str,
         redirects_taken: int,
         max_redirects: int,
         is_ssl_upgrade: bool = False
     ):
         span.add_event(
-            f'request_redirect',
+            'request_redirect',
             attributes={
                 'redirect_url': redirect_url,
                 'redirects_taken': redirects_taken,
@@ -441,7 +426,7 @@ class HTTPTrace:
         method: str,
         headers: Dict[str, str] | None = None,
     ):
-        span: HTTPSpan | None = None
+        span: Span | None = None
         if context_api.get_value(SUPPRESS_INSTRUMENTATION_KEY_PLAIN):
             return span
 
@@ -458,7 +443,7 @@ class HTTPTrace:
             SpanAttributes.HTTP_URL: request_url,
         }
 
-        span: HTTPSpan = self.tracer.start_span(
+        span: Span = self.tracer.start_span(
             span_name, 
             kind=SpanKind.CLIENT, 
             attributes=span_attributes,
@@ -484,7 +469,7 @@ class HTTPTrace:
 
     async def on_request_end(
         self,
-        span: HTTPSpan,
+        span: Span,
         url: str,
         method: str,
         status: int,
@@ -516,7 +501,7 @@ class HTTPTrace:
 
     async def on_request_exception(
         self,
-        span: HTTPSpan,
+        span: Span,
         url: str,
         method: str,
         error: Exception,
@@ -549,7 +534,7 @@ class HTTPTrace:
     
     def _end_trace(
         self,
-        span: HTTPSpan,
+        span: Span,
     ):
         # context = context_api.get_current()
 
