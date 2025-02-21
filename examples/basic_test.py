@@ -1,5 +1,5 @@
 from hyperscale.graph import Workflow, step
-from hyperscale.testing import URL, TCPResponse
+from hyperscale.testing import URL, HTTPResponse
 
 
 class Test(Workflow):
@@ -10,8 +10,7 @@ class Test(Workflow):
     async def login(
         self,
         url: URL = "https://httpbin.org/get",
-    ) -> TCPResponse:
-        return await self.client.tcp.bidirectional(
+    ) -> HTTPResponse:
+        return await self.client.http.get(
             url,
-            'HELLO!',
         )

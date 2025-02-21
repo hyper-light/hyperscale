@@ -8,7 +8,7 @@
 
 | Package     | Hyperscale                                                      |
 | ----------- | -----------                                                     |
-| Version     | 0.3.7                                                           |
+| Version     | 0.4.0                                                           |
 | Download    | https://pypi.org/project/hyperscale/                            | 
 | Source      | https://github.com/hyper-light/hyperscale                       |
 | Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
@@ -40,7 +40,7 @@ Hyperscale just works, requiring no additional setup beyond a supported Python d
 <br/>
 
 ### __Flexibility and and painless extensibility__
-Hyperscale ships with support for HTTP, HTTP2, HTTP3, Websockets, and UDP out of the box. GraphQL, GraphQL-HTTP2, GRPC, and Playwright are available as optional extras that can be installed via:
+Hyperscale ships with support for HTTP, HTTP2, HTTP3, TCP, UDP, and Websockets out of the box. GraphQL, GraphQL-HTTP2, GRPC, and Playwright are available as optional extras that can be installed via:
 
 ```bash
 pip install "hyperscale[<extra_here>]"
@@ -203,6 +203,7 @@ Below find a tables of Hyperscale's supported client and reporting options, as w
 | HTTP             | N/A                                                             | N/A                           |
 | HTTP2            | N/A                                                             | N/A                           |
 | HTTP3 (unstable) | pip install hyperscale[http3]                                   | aioquic                       |
+| TCP              | N/A                                                             | N/A                           |
 | UDP              | N/A                                                             | N/A                           |
 | Websocket        | N/A                                                             | N/A                           |
 | GRPC             | pip install hyperscale[grpc]                                    | protobuf                      |
