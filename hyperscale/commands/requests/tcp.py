@@ -1,106 +1,107 @@
 import asyncio
 from typing import Literal, Any
+from pydantic import BaseModel, StrictStr, StrictInt
+
 from hyperscale.core.engines.client.setup_clients import setup_client
-from hyperscale.core.engines.client.websocket import MercurySyncWebsocketConnection
+from hyperscale.core.engines.client.tcp import MercurySyncTCPConnection
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
-from hyperscale.core.engines.client.shared.models import HTTPCookie
 from .terminal_ui import (
-    update_status,
-    update_cookies,
     update_elapsed,
-    update_headers,
-    update_params,
-    update_redirects,
     update_text,
+    update_status,
     create_ping_ui,
-    map_status_to_error,
 )
 
 
-async def make_websocket_request(
+class TCPOptions(BaseModel):
+    delimiter: StrictStr = "\n"
+    size: StrictInt | None = None
+
+
+async def make_tcp_request(
     url: str,
-    cookies: list[HTTPCookie],
-    params: dict[str, str],
-    headers: dict[str, Any],
     method: Literal[
         "send",
         "receive",
+        "bidirectional"
     ],
     data: Any | None,
-    redirects: int, 
+    options: dict[
+        Literal[
+            "delimiter",
+            "size"
+        ],
+        str | int,
+    ],
     timeout: int | float,
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
 ):
     
-    if method is None or method not in ["send", "receive"]:
+    if method is None or method not in ["send", "receive", "bidirectional"]:
         method = "send"
+        data = b"PING"
     
     timeouts = Timeouts(request_timeout=timeout)
-    websocket = MercurySyncWebsocketConnection(
+    tcp = MercurySyncTCPConnection(
         timeouts=timeouts,
     )
 
-    websocket = setup_client(websocket, 1)
+    tcp = setup_client(tcp, 1)
     terminal = create_ping_ui(
         url,
         method,
     )
 
     try:
+
         if quiet is False:
             await terminal.render(
                 horizontal_padding=4,
                 vertical_padding=1
             )
 
+
         match method:
             case "send":
-                response = await websocket.send(
+                response = await tcp.send(
                     url,
-                    cookies=cookies,
-                    headers=headers,
-                    params=params,
                     data=data,
-                    redirects=redirects,
                     timeout=timeout,
                 )
             
             case "receive":
-                response = await websocket.receive(
+                tcp_options = TCPOptions(**options)
+                response = await tcp.receive(
                     url,
-                    cookies=cookies,
-                    headers=headers,
-                    params=params,
-                    redirects=redirects,
+                    delimiter=tcp_options.delimiter.encode(),
+                    response_size=tcp_options.size,
                     timeout=timeout,
-
+                )
+            
+            case "bidirectional":
+                tcp_options = TCPOptions(**options)
+                response = await tcp.bidirectional(
+                    url,
+                    data=data,
+                    delimiter=tcp_options.delimiter.encode(),
+                    response_size=tcp_options.size,
+                    timeout=timeout,
                 )
             
             case _:
-                response = await websocket.send(
+                response = await tcp.send(
                     url,
-                    cookies=cookies,
-                    headers=headers,
-                    params=params,
                     data=data,
-                    redirects=redirects,
                     timeout=timeout,
                 )
 
         if quiet is False:
-            response_text = response.reason
-            response_status = response.status
+            response_text = "OK!"
 
-            if response_text is None and response.status_message:
-                response_text = response.status_message
-
-            elif response_text is None and response_status >= 200 and response_status < 300:
-                response_text = "OK!"
-
-            elif response_text is None and response_status:
-                response_text = map_status_to_error(response_status)
+            if response.error:
+                response_text = str(response.error)
 
             response_end = response.timings.get('request_end', 0)
             if response_end is None:
@@ -114,21 +115,13 @@ async def make_websocket_request(
             if elapsed < 0:
                 elapsed = 0
                 response_text = "Encountered unknown error."
-
+                
             updates = [
-                update_redirects(response.redirects),
-                update_status(response.status),
-                update_headers(response.headers),
                 update_text(response_text),
                 update_elapsed(elapsed),
-                update_params(response.params, params),
+                update_status('Errored' if response.error else 'OK')
             ]
 
-            if cookies := response.cookies:
-                updates.append(
-                    update_cookies(cookies)
-                )
-            
             await asyncio.sleep(0.5)
             await asyncio.gather(*updates)
 
@@ -147,7 +140,7 @@ async def make_websocket_request(
         if quiet is False:
             await update_text("Aborted")
             await terminal.stop()
-
+    
     except Exception as err:
         error_message = str(err)
         if str(err) == "":

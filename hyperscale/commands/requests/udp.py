@@ -6,15 +6,9 @@ from hyperscale.core.engines.client.setup_clients import setup_client
 from hyperscale.core.engines.client.udp import MercurySyncUDPConnection
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from .terminal_ui import (
-    update_status,
-    update_cookies,
     update_elapsed,
-    update_headers,
-    update_params,
-    update_redirects,
     update_text,
     create_ping_ui,
-    map_status_to_error,
 )
 
 
@@ -43,7 +37,11 @@ async def make_udp_request(
     wait: bool = False,
     quiet:bool= False,
 ):
-    
+   
+    if method is None or method not in ["send", "receive", "bidirectional"]:
+        method = "send"
+        data = b"PING"
+
     timeouts = Timeouts(request_timeout=timeout)
     udp = MercurySyncUDPConnection(
         timeouts=timeouts,
@@ -99,35 +97,29 @@ async def make_udp_request(
                 )
 
         if quiet is False:
-            response_text = response.reason
-            response_status = response.status
+            response_text = "OK!"
 
-            if response_text is None and response.status_message:
-                response_text = response.status_message
+            if response.error:
+                response_text = str(response.error)
 
-            elif response_text is None and response_status >= 200 and response_status < 300:
-                response_text = "OK!"
+            response_end = response.timings.get('request_end', 0)
+            if response_end is None:
+                response_end = 0
 
-            elif response_text is None and response_status:
-                response_text = map_status_to_error(response_status)
+            response_start = response.timings.get('request_start', 0)
+            if response_start is None:
+                response_start = 0
 
-
-            elapsed = response.timings.get('request_end', 0) - response.timings.get('request_start', 0)
+            elapsed = response_end - response_start
+            if elapsed < 0:
+                elapsed = 0
+                response_text = "Encountered unknown error."
                 
             updates = [
-                update_redirects(response.redirects),
-                update_status(response.status),
-                update_headers(response.headers),
                 update_text(response_text),
                 update_elapsed(elapsed),
-                update_params([], {}),
             ]
 
-            if cookies := response.cookies:
-                updates.append(
-                    update_cookies(cookies)
-                )
-            
             await asyncio.sleep(0.5)
             await asyncio.gather(*updates)
 
@@ -145,4 +137,13 @@ async def make_udp_request(
     ):
         if quiet is False:
             await update_text("Aborted")
+            await terminal.stop()
+
+    except Exception as err:
+        error_message = str(err)
+        if str(err) == "":
+            error_message = "Encountered unknown error"
+
+        if quiet is False:
+            await update_text(error_message)
             await terminal.stop()

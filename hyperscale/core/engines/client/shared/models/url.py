@@ -42,6 +42,9 @@ class URL:
         if self.is_ssl:
             port = 443
 
+        if family is None:
+            family = SocketTypes.DEFAULT
+
         self.port = self.parsed.port if self.parsed.port else port
         self.full = url
         self.has_ip_addr = False
@@ -96,6 +99,7 @@ class URL:
     async def lookup(self):
         if self.loop is None:
             self.loop = get_event_loop()
+
 
         if self.parsed.hostname is None:
             try:

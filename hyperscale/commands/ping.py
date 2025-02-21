@@ -8,6 +8,7 @@ from .requests import (
     make_http_request,
     make_http2_request,
     make_http3_request,
+    make_tcp_request,
     make_udp_request,
     make_websocket_request,
     lookup_url,
@@ -36,6 +37,13 @@ def get_default_headers():
 def get_default_data():
     return None
 
+
+def load_options(options: str | None):
+    try:
+        return json.loads(options)
+    
+    except Exception:
+        return {}
 
 def load_data(data: str | None):
 
@@ -103,12 +111,13 @@ async def ping(
     data: str = get_default_data,
     client: AssertSet[
         Literal[
+            "graphql",
+            "graphqlh2",
             "http",
             "http2",
             "http3",
+            "tcp",
             "udp",
-            "graphql",
-            "graphqlh2",
             "websocket"
         ]
     ] = "http",
@@ -257,13 +266,25 @@ async def ping(
                 quiet=quiet,
             )
         
+        case "tcp":
+            return await make_tcp_request(
+                url,
+                method=method_name,
+                data=data,
+                options=load_options(options),
+                timeout=timeout_seconds,
+                output_file=filepath,
+                wait=wait,
+                quiet=quiet,
+            )
+        
         case "udp":
             return await make_udp_request(
                 url,
                 method=method_name,
                 data=data,
-                options=options,
-                timeout=timeout,
+                options=load_options(options),
+                timeout=timeout_seconds,
                 output_file=filepath,
                 wait=wait,
                 quiet=quiet,
@@ -282,7 +303,7 @@ async def ping(
                 headers=json.loads(headers),
                 data=load_data(data),
                 redirects=redirects,
-                timeout=timeout,
+                timeout=timeout_seconds,
                 output_file=filepath,
                 wait=wait,
                 quiet=quiet,

@@ -156,8 +156,18 @@ async def make_http3_request(
             elif response_text is None and response_status:
                 response_text = map_status_to_error(response_status)
 
+            response_end = response.timings.get('request_end', 0)
+            if response_end is None:
+                response_end = 0
 
-            elapsed = response.timings.get('request_end', 0) - response.timings.get('request_start', 0)
+            response_start = response.timings.get('request_start', 0)
+            if response_start is None:
+                response_start = 0
+
+            elapsed = response_end - response_start
+            if elapsed < 0:
+                elapsed = 0
+                response_text = "Encountered unknown error."
                 
             updates = [
                 update_redirects(response.redirects),
@@ -190,4 +200,13 @@ async def make_http3_request(
     ):
         if quiet is False:
             await update_text("Aborted")
+            await terminal.stop()
+    
+    except Exception as err:
+        error_message = str(err)
+        if str(err) == "":
+            error_message = "Encountered unknown error"
+
+        if quiet is False:
+            await update_text(error_message)
             await terminal.stop()

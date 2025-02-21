@@ -22,7 +22,7 @@ async def update_text(message: str):
 
 
 @action()
-async def update_status(status: int):
+async def update_status(status: int | str):
     return str(status)
 
 
@@ -71,15 +71,19 @@ async def update_cookies(cookies: tuple[str, str]):
 def colorize_status(status: str):
 
     try:
-        status = int(status)
+        if status not in ["OK", "ERRORED"]:
+            status = int(status)
 
     except Exception:
         pass
 
-    if isinstance(status, int) is False:
+    if isinstance(status, int) is False and status not in ["OK", "Errored"]:
         return "white"
     
-    if status >= 200 and status < 300:
+    if isinstance(status, int) and status >= 200 and status < 300:
+        return "aquamarine_2"
+    
+    if status == "OK":
         return "aquamarine_2"
     
     return "hot_pink_3"

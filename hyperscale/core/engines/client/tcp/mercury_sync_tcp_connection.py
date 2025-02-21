@@ -324,13 +324,19 @@ class MercurySyncTCPConnection:
                     timings["read_start"] = time.monotonic()
 
                     if response_size:
-                        response_data = await connection.reader.readexactly(
-                            response_size
+                        response_data = await asyncio.wait_for(
+                            connection.reader.readexactly(
+                                response_size
+                            ),
+                            timeout=self.timeouts.read_timeout
                         )
 
                     else:
-                        response_data = await connection.reader.readuntil(
-                            separator=delimiter
+                        response_data = await asyncio.wait_for(
+                            connection.reader.readuntil(
+                                separator=delimiter
+                            ),
+                            timeout=self.timeouts.read_timeout
                         )
 
                     timings["read_end"] = time.monotonic()
@@ -391,8 +397,11 @@ class MercurySyncTCPConnection:
             if isinstance(request_url, str):
                 request_url: ParseResult = urlparse(request_url)
 
-            elif isinstance(request_url, URL):
+            elif isinstance(request_url, URL) and request_url.optimized:
                 request_url: ParseResult = request_url.optimized.parsed
+
+            elif isinstance(request_url, URL):
+                request_url: ParseResult = urlparse(request_url.data)
 
             self._connections.append(
                 TCPConnection(
@@ -404,8 +413,8 @@ class MercurySyncTCPConnection:
 
             return TCPResponse(
                 url=URLMetadata(
-                    host=url.hostname,
-                    path=url.path,
+                    host=request_url.hostname,
+                    path=request_url.path,
                 ),
                 error=str(err),
                 timings=timings,
