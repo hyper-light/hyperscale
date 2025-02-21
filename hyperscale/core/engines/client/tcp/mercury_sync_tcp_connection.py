@@ -488,14 +488,14 @@ class MercurySyncTCPConnection:
 
                 except Exception:
                     pass
-
+                
         else:
             try:
                 await connection.make_connection(
                     url.hostname,
-                    address,
+                    url.address,
                     url.port,
-                    ip_info,
+                    url.socket_config,
                     ssl=self._tcp_ssl_context if  url.scheme in ['ssl', 'tls', 'https'] else None,
                 )
 

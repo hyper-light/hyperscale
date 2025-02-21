@@ -300,7 +300,7 @@ class Reporter(Generic[T]):
                 }
                 for metrics in results_set
                 for status_count_name, status_count in metrics.get("counts", {})
-                .get("statuses")
+                .get("statuses", {})
                 .items()
             ]
         )
