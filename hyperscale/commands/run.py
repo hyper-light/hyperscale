@@ -6,7 +6,14 @@ import os
 import sys
 
 import psutil
-import uvloop
+
+try:
+
+    import uvloop
+    uvloop.install()
+
+except Exception:
+    pass
 
 from hyperscale.core.jobs.models import HyperscaleConfig, TerminalMode
 from hyperscale.core.jobs.runner.local_runner import LocalRunner
@@ -19,8 +26,6 @@ from .cli import (
     ImportFile,
     JsonFile,
 )
-
-uvloop.install()
 
 
 async def get_default_workers():
@@ -47,7 +52,13 @@ def get_default_config():
 
     else:
         with open(config_path, "r") as config_file:
-            config = HyperscaleConfig(**json.load(config_file))
+            config_data = json.load(config_file)
+            config_data['logs_directory'] = os.path.join(
+                os.getcwd(),
+                'logs',
+            )
+            
+            config = HyperscaleConfig(**config_data)
 
     return config
 

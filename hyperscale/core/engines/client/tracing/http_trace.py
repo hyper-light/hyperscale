@@ -11,21 +11,19 @@ from .tracing_types import (
     UrlFilter
 )
 from .url_filters import default_params_strip_filter
-
+from .utils import (
+    SUPPRESS_INSTRUMENTATION_KEY_PLAIN,
+    http_status_to_status_code,
+    remove_url_credentials,
+)
 
 try:
     from opentelemetry import context as context_api
     from opentelemetry import trace
-    from opentelemetry.trace import Tracer
     from opentelemetry.propagate import inject
     from opentelemetry.semconv.trace import SpanAttributes
     from opentelemetry.trace import SpanKind,  get_tracer, Span
     from opentelemetry.trace.status import Status, StatusCode
-    from .utils import (
-        SUPPRESS_INSTRUMENTATION_KEY_PLAIN,
-        http_status_to_status_code,
-        remove_url_credentials,
-    )
 
     opentelemetry_enabled = True
 
@@ -39,23 +37,20 @@ except Exception:
     class trace:
         pass
 
-    class Tracer:
-        pass
-
-    def http_status_to_status_code(*args, **kwargs):
-        pass
-
     def inject(*args, **kwargs):
         pass
 
-    class SpanAttribuates:
+    class SpanAttributes:
         pass
 
     class SpanKind:
         pass
 
+    class Span:
+        pass
+
     def get_tracer(*args, **kwargs):
-        return Tracer()
+        pass
 
     class Span:
         pass
@@ -66,30 +61,12 @@ except Exception:
     class StatusCode:
         pass
 
-    def remove_url_credentials(url: str):
-        return url
-
 
 OpenTelemetryTracingConfig = UrlFilter | RequestHook | ResponseHook | TraceSignal
-
 
 class HTTPTrace:
     enabled = opentelemetry_enabled
     """First-class used to trace requests launched via ClientSession objects."""
-
-    __slots__ = (
-        'protocol',
-        'max_connections',
-        'ssl_version',
-        'tracer',
-        'span',
-        'token',
-        'allowed_traces',
-        'url_filter',
-        'request_hook',
-        'response_hook',
-        '_context_active'
-    )
 
     def __init__(
         self, 
@@ -100,8 +77,6 @@ class HTTPTrace:
         request_hook: Optional[RequestHook]=None,
         response_hook: Optional[ResponseHook]=None,
     ) -> None:
-    
-    
         self.protocol = protocol
         self.max_connections = max_connections
         self.ssl_version = ssl_version
@@ -126,7 +101,6 @@ class HTTPTrace:
             'http.max_connections': self.max_connections,
         }
 
-
         span.add_event(
             'http.request_queued_start',
             attributes=attributes,
@@ -142,7 +116,6 @@ class HTTPTrace:
         attributes = {
             'http.max_connections': self.max_connections,
         }
-
 
         span.add_event(
             'http.request_queued_end',

@@ -4,7 +4,7 @@ try:
 
     from opentelemetry.trace import Span
 
-except ImportError:
+except Exception:
     class Span:
         pass
 

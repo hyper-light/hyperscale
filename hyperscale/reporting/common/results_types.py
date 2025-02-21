@@ -71,7 +71,7 @@ MetricsSet = Dict[
 ]
 
 WorkflowStats = Dict[
-    Literal["workflow", "stats", "results", "metrics", "checks", "elapsed", "rps"]
+    Literal["workflow", "stats", "results", "metrics", "checks", "elapsed", "aps"]
     | Literal["run_id"],
     int
     | str

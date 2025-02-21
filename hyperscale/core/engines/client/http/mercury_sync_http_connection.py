@@ -95,11 +95,7 @@ class MercurySyncHTTPConnection:
 
         self.address_family = address_family
         self.address_protocol = protocol
-        self.trace = HTTPTrace(
-            protocol='HTTP/1.1',
-            max_connections=self._concurrency,
-            ssl_version='TLSv1.1'
-        )
+        self.trace: HTTPTrace | None = None
 
     async def head(
         self,
@@ -1181,7 +1177,7 @@ class MercurySyncHTTPConnection:
         self,
         request_url: str | URL,
         ssl_redirect_url: Optional[str | URL] = None,
-        span: HTTPTrace | None = None
+        span: Span | None = None
     ) -> Tuple[
         Optional[Exception],
         HTTPConnection,
@@ -1189,8 +1185,6 @@ class MercurySyncHTTPConnection:
         bool,
         Span,
     ]:
-        
-
         if span and self.trace.enabled:
             span = await self.trace.on_connection_create_start(
                 span,

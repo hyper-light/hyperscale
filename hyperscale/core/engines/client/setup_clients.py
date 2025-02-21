@@ -3,6 +3,7 @@ import ssl
 from random import randrange
 from typing import Optional
 
+from hyperscale.core.engines.client.tracing import HTTPTrace
 from .graphql import MercurySyncGraphQLConnection
 from .graphql_http2 import MercurySyncGraphQLHTTP2Connection
 from .grpc import MercurySyncGRPCConnection
@@ -16,6 +17,8 @@ from .http2.settings import Settings
 from .http3 import MercurySyncHTTP3Connection
 from .http3.protocols import HTTP3Connection
 from .playwright import MercurySyncPlaywrightConnection
+from .tcp import MercurySyncTCPConnection
+from .tcp.protocols import TCPConnection
 from .udp import MercurySyncUDPConnection
 from .udp.protocols import UDPConnection
 from .websocket import MercurySyncWebsocketConnection
@@ -59,8 +62,14 @@ def setup_client(
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        client._client_ssl_context = ctx
 
+        client.trace = HTTPTrace(
+            'HTTP/1.1',
+            vus,
+            ssl_version='TLSv1.2'
+        )
+
+        client._client_ssl_context = ctx
         client._semaphore = asyncio.Semaphore(vus)
 
     elif isinstance(
@@ -165,6 +174,22 @@ def setup_client(
     elif isinstance(client, MercurySyncPlaywrightConnection):
         client._semaphore = asyncio.Semaphore(vus)
         client._max_pages = pages
+
+    elif isinstance(client, MercurySyncTCPConnection):
+        client.reset_connections = reset_connections
+        client._connections = [
+            TCPConnection(
+                reset_connections=reset_connections,
+            )
+            for _ in range(vus)
+        ]
+
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        client._tcp_ssl_context = ctx
+        client._semaphore = asyncio.Semaphore(vus)
 
     elif isinstance(client, MercurySyncUDPConnection):
         if cert_path is None:

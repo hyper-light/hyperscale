@@ -19,6 +19,13 @@ from typing import (
 )
 
 from hyperscale.ui.state import Action, ActionData, SubscriptionSet, observe
+try:
+    import uvloop as uvloop
+    has_uvloop = True
+
+except Exception:
+    has_uvloop = False
+
 
 from .canvas import Canvas
 from .engine_config import EngineConfig
@@ -268,7 +275,8 @@ class Terminal:
         )
 
         try:
-            transport.close = patch_transport_close(transport, self._loop)
+            if has_uvloop:
+                transport.close = patch_transport_close(transport, self._loop)
 
         except Exception:
             pass

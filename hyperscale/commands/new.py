@@ -4,7 +4,13 @@ import pathlib
 import sys
 import textwrap
 
-import uvloop
+try:
+
+    import uvloop
+    uvloop.install()
+
+except Exception:
+    pass
 
 from hyperscale.ui.components.header import Header, HeaderConfig
 from hyperscale.ui.components.terminal import Section, SectionConfig, Terminal
@@ -13,7 +19,6 @@ from hyperscale.ui.components.text import Text, TextConfig
 from .cli import CLI
 from .workflow import test
 
-uvloop.install()
 
 
 async def create_new_file_ui(

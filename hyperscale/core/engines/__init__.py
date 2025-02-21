@@ -5,5 +5,6 @@ from .client.http import HTTPResponse as HTTPResponse
 from .client.http2 import HTTP2Response as HTTP2Response
 from .client.http3 import HTTP3Response as HTTP3Response
 from .client.playwright import PlaywrightResult as PlaywrightResult
+from .client.tcp import TCPResponse as TCPResponse
 from .client.udp import UDPResponse as UDPResponse
 from .client.websocket import WebsocketResponse as WebsocketResponse

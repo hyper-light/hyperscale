@@ -59,7 +59,7 @@ async def run_server(
 
         except Exception:
             pass
-
+        
         await server.run_forever()
         await server.close()
 
@@ -124,6 +124,9 @@ def run_thread(
             pass
 
         import asyncio
+        import logging
+
+        logging.disable(logging.CRITICAL)
 
         logging_config = LoggingConfig()
         logging_config.update(

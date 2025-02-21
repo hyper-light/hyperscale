@@ -6,6 +6,12 @@ import os
 import sys
 
 from typing import Generic, TypeVar, Literal, Any, Callable
+try:
+    import uvloop as uvloop
+    has_uvloop = True
+
+except Exception:
+    has_uvloop = False
 
 from .arg_types import (
     Context,
@@ -168,7 +174,8 @@ class Command(Generic[T]):
         )
 
         try:
-            transport.close = patch_transport_close(transport, loop)
+            if has_uvloop:
+                transport.close = patch_transport_close(transport, loop)
 
         except Exception:
             pass

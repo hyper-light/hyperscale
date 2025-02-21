@@ -79,7 +79,7 @@ class Timer:
     async def update(self, run_timer: bool):
         await self._update_lock.acquire()
 
-        if run_timer:
+        if run_timer and self._status != TimerStatus.RUNNING:
             self._updates.put_nowait((time.monotonic(), TimerStatus.STARTING))
 
         elif run_timer is False:

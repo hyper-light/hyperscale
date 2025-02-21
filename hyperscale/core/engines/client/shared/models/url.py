@@ -1,7 +1,7 @@
 import socket
 from socket import AddressFamily, SocketKind
 from asyncio.events import get_event_loop
-from ipaddress import IPv4Address, ip_address
+from ipaddress import IPv4Address, ip_address, IPv6Address
 from typing import List, Tuple, Union
 from urllib.parse import urlparse
 
@@ -99,23 +99,27 @@ class URL:
 
         if self.parsed.hostname is None:
             try:
-                address = self.full.split(":")
-                assert len(address) == 2
 
-                host, port = address
-                self.port = int(port)
+                host = self.full
+                port = int(self.port)
+                address_info = (host, port)
 
-                if isinstance(ip_address(host), IPv4Address):
+                if isinstance(ip_address(self.full), IPv6Address):
+                    socket_family = socket.AF_INET6
+                    address_info = (host, port, 0 , 0)
+
+                elif isinstance(ip_address(self.full), IPv4Address):
                     socket_family = socket.AF_INET
 
                 else:
-                    socket_family = socket.AF_INET6
+                    raise Exception('Err. - Invalid raw IP Address')
+                
+                address = (host, port)
 
-                address_info = (host, self.port)
-
+                
                 self.ip_addresses = [
                     (
-                        address_info,
+                        address,
                         (
                             socket_family,
                             socket.SOCK_STREAM,

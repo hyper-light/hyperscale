@@ -15,6 +15,7 @@ from .http2 import MercurySyncHTTP2Connection
 from .http3 import MercurySyncHTTP3Connection
 from .playwright import MercurySyncPlaywrightConnection
 from .shared.models import RequestType
+from .tcp import MercurySyncTCPConnection
 from .udp import MercurySyncUDPConnection
 from .websocket import MercurySyncWebsocketConnection
 
@@ -36,6 +37,7 @@ class Client(Generic[Unpack[T]]):
         self.http2 = MercurySyncHTTP2Connection()
         self.http3 = MercurySyncHTTP3Connection()
         self.playwright = MercurySyncPlaywrightConnection()
+        self.tcp = MercurySyncTCPConnection()
         self.udp = MercurySyncUDPConnection()
         self.websocket = MercurySyncWebsocketConnection()
 
@@ -62,6 +64,7 @@ class Client(Generic[Unpack[T]]):
             self.http2,
             self.http3,
             self.playwright,
+            self.tcp,
             self.udp,
             self.websocket,
         ]
@@ -94,6 +97,9 @@ class Client(Generic[Unpack[T]]):
 
             case RequestType.PLAYWRIGHT:
                 return self.playwright
+            
+            case RequestType.TCP:
+                return self.tcp
 
             case RequestType.UDP:
                 return self.udp
@@ -113,6 +119,7 @@ class Client(Generic[Unpack[T]]):
             | MercurySyncHTTP2Connection
             | MercurySyncHTTP3Connection
             | MercurySyncPlaywrightConnection
+            | MercurySyncTCPConnection
             | MercurySyncUDPConnection
             | MercurySyncWebsocketConnection,
         ] = [
@@ -123,6 +130,7 @@ class Client(Generic[Unpack[T]]):
             self.http2,
             self.http3,
             self.playwright,
+            self.tcp,
             self.udp,
             self.websocket,
         ]

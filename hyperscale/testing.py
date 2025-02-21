@@ -5,6 +5,7 @@ from .core.engines import HTTP2Response as HTTP2Response
 from .core.engines import HTTP3Response as HTTP3Response
 from .core.engines import HTTPResponse as HTTPResponse
 from .core.engines import PlaywrightResult as PlaywrightResult
+from .core.engines import TCPResponse as TCPResponse
 from .core.engines import UDPResponse as UDPResponse
 from .core.engines import WebsocketResponse as WebsocketResponse
 from .core.testing import URL as URL

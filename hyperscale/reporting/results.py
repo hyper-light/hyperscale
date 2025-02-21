@@ -21,6 +21,7 @@ from hyperscale.core.engines.client.http2 import HTTP2Request
 from hyperscale.core.engines.client.http3 import HTTP3Request
 from hyperscale.core.engines.client.playwright import PlaywrightResult
 from hyperscale.core.engines.client.shared.models import RequestType
+from hyperscale.core.engines.client.tcp import TCPResponse
 from hyperscale.core.engines.client.udp import UDPResponse
 from hyperscale.core.engines.client.websocket import WebsocketResponse
 from hyperscale.core.hooks import Hook, HookType
@@ -63,6 +64,7 @@ class Results:
             | Type[HTTP2Request]
             | Type[HTTP3Request]
             | Type[PlaywrightResult]
+            | Type[TCPResponse]
             | Type[UDPResponse]
             | Type[WebsocketResponse]
             | Type[Metric]
@@ -78,6 +80,7 @@ class Results:
                     | List[HTTP2Request]
                     | List[HTTP3Request]
                     | List[PlaywrightResult]
+                    | List[TCPResponse]
                     | List[UDPResponse]
                     | List[WebsocketResponse]
                     | List[Metric]
@@ -165,7 +168,7 @@ class Results:
                 case _:
                     pass
 
-        workflow_stats["rps"] = executed / elapsed
+        workflow_stats["aps"] = executed / elapsed
 
         return workflow_stats
 
@@ -311,6 +314,7 @@ class Results:
         | List[HTTP2Request]
         | List[HTTP3Request]
         | List[PlaywrightResult]
+        | List[TCPResponse]
         | List[UDPResponse]
         | List[WebsocketResponse],
     ) -> ResultSet:
@@ -475,7 +479,7 @@ class Results:
             [workflow_set["stats"]["executed"] for workflow_set in workflow_stats_set]
         )
 
-        merged["rps"] = total_executed / median_elapsed
+        merged["aps"] = total_executed / median_elapsed
         merged["elapsed"] = median_elapsed
 
         return merged
@@ -688,6 +692,7 @@ class Results:
         | HTTPRequest
         | HTTP2Request
         | HTTP3Request
+        | TCPResponse
         | UDPResponse
         | WebsocketResponse,
     ) -> Dict[

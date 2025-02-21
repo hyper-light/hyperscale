@@ -41,8 +41,8 @@ class Data(OptimizedArg, Generic[T]):
             case RequestType.HTTP | RequestType.HTTP2 | RequestType.WEBSOCKET:
                 self._optimize_http()
 
-            case RequestType.WEBSOCKET:
-                self._optimize_udp()
+            case RequestType.TCP | RequestType.WEBSOCKET:
+                self._optimize_raw()
 
             case _:
                 pass
@@ -79,8 +79,18 @@ class Data(OptimizedArg, Generic[T]):
         else:
             self.optimized = self.data
 
-    def _optimize_udp(self):
-        if isinstance(self.data, BaseModel):
+    def _optimize_raw(self):
+
+        if isinstance(self.data, Iterator) and not isinstance(self.data, list):
+            chunks: List[bytes] = []
+            for chunk in self.data:
+                chunk_size = hex(len(chunk)).replace("0x", "") + NEW_LINE
+                encoded_chunk = chunk_size.encode() + chunk + NEW_LINE.encode()
+                chunks.append(encoded_chunk)
+
+            self.optimized = chunks
+        
+        elif isinstance(self.data, BaseModel):
             self.optimized = orjson.dumps(self.data.model_dump())
 
         elif isinstance(self.data, (list, dict)):
@@ -93,4 +103,4 @@ class Data(OptimizedArg, Generic[T]):
             self.optimized = bytes(self.data)
 
         else:
-            self.optimized = Data
+            self.optimized = self.data

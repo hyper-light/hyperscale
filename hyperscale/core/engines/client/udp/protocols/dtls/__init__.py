@@ -63,6 +63,36 @@ def _prep_bins():
 
 _prep_bins()  # prepare before module imports
 
-from .patch import do_patch
-from .sslconnection import SSLContext, SSL, SSLConnection
-from .demux import force_routing_demux, reset_default_demux
+try:
+    from .patch import do_patch as do_patch
+    from .sslconnection import (
+        SSLContext as SSLContext,
+        SSL as SSL, 
+        SSLConnection as SSLConnection,
+    )
+    from .demux import (
+        force_routing_demux as force_routing_demux, 
+        reset_default_demux as reset_default_demux,
+    )
+
+except (Exception, OSError):
+    # This import guard is added to prevent non openssl envs
+    # from causing Hyperscale to crash.
+
+    def do_patch():
+        pass
+
+    class SSLContext:
+        pass
+
+    class SSL:
+        pass
+
+    class SSLConnection:
+        pass
+
+    def force_routing_demux(*args, **kwargs):
+        pass
+
+    def reset_default_demux(*args, **kwargs):
+        pass

@@ -63,7 +63,6 @@ async def create_header():
 
     return await terminal.render_once()
 
-
 @CLI.root(
     new,
     ping,
@@ -85,9 +84,9 @@ async def hyperscale():
     The Hyperscale next-generation performance testing framework
     """
 
-
 def run():
     logging.disable(logging.CRITICAL)
+
     try:
         asyncio.run(CLI.run(args=sys.argv[1:]))
 

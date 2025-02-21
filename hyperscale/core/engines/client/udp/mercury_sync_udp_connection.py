@@ -2,7 +2,7 @@ import asyncio
 import ssl
 import time
 from collections import defaultdict
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple, Iterator
 from urllib.parse import ParseResult, urlparse
 
 import orjson
@@ -240,6 +240,7 @@ class MercurySyncUDPConnection:
         data: str | bytes | BaseModel | Data,
         delimiter: Optional[str | bytes] = b"\n",
         response_size: Optional[int] = None,
+    ):
         timings: Dict[
             Literal[
                 "request_start",
@@ -252,52 +253,67 @@ class MercurySyncUDPConnection:
                 "request_end",
             ],
             float | None,
-        ] = None,
-    ):
-        if timings["connect_start"] is None:
+        ] = {
+            "request_start": time.monotonic(),
+            "connect_start": None,
+            "connect_end": None,
+            "write_start": None,
+            "write_end": None,
+            "read_start": None,
+            "read_end": None,
+            "request_end": None,
+        }
+
+        try:
+
             timings["connect_start"] = time.monotonic()
 
-        (
-            error,
-            connection,
-            url,
-        ) = await asyncio.wait_for(
-            self._connect_to_url_location(request_url),
-            timeout=self.timeouts.connect_timeout,
-        )
-
-        if connection.reader is None:
-            timings["connect_end"] = time.monotonic()
-            self._connections.append(
-                UDPConnection(
-                    reset_connections=self.reset_connections,
-                )
+            (
+                error,
+                connection,
+                url,
+            ) = await asyncio.wait_for(
+                self._connect_to_url_location(request_url),
+                timeout=self.timeouts.connect_timeout,
             )
 
-            return (
-                UDPResponse(
+            if connection.reader is None:
+                timings["connect_end"] = time.monotonic()
+                self._connections.append(
+                    UDPConnection(
+                        reset_connections=self.reset_connections,
+                    )
+                )
+
+                return UDPResponse(
                     url=URLMetadata(
                         host=url.hostname,
                         path=url.path,
                     ),
                     error=str(error),
                     timings=timings,
-                ),
-                False,
-                timings,
-            )
+                )
+            
+            timings["connect_end"] = time.monotonic()
 
-        timings["connect_end"] = time.monotonic()
+            response_data = b""
 
-        response_data = b""
-
-        try:
             match method:
                 case "BIDIRECTIONAL":
-                    timings["write_start"] = time.monotonic()
+                    raw_data = data
+                    if isinstance(data, Data):
+                        raw_data = data.optimized
 
-                    encoded_data = self._encode_data(data)
-                    connection.writer.write(encoded_data)
+                    else:
+                        raw_data = self._encode_data(data)
+
+                    timings["write_start"] = time.monotonic()
+                    if isinstance(raw_data, (Iterator, list)):
+                        for chunk in raw_data:
+                            connection.writer.write(chunk)
+
+                    else:
+                        connection.writer.write(raw_data)
 
                     timings["write_end"] = time.monotonic()
                     timings["read_start"] = time.monotonic()
@@ -315,10 +331,20 @@ class MercurySyncUDPConnection:
                     timings["read_end"] = time.monotonic()
 
                 case "SEND":
-                    timings["write_start"] = time.monotonic()
+                    raw_data = data
+                    if isinstance(data, Data):
+                        raw_data = data.optimized
 
-                    encoded_data = self._encode_data(data)
-                    connection.writer.write(data)
+                    else:
+                        raw_data = self._encode_data(data)
+
+                    timings["write_start"] = time.monotonic()
+                    if isinstance(raw_data, (Iterator, list)):
+                        for chunk in raw_data:
+                            connection.writer.write(chunk)
+
+                    else:
+                        connection.writer.write(raw_data)
 
                     timings["write_end"] = time.monotonic()
 
@@ -338,16 +364,13 @@ class MercurySyncUDPConnection:
                     timings["read_end"] = time.monotonic()
 
                 case _:
-                    if timings["write_start"]:
-                        timings["write_end"] = time.monotonic()
-
-                    if timings["read_start"]:
-                        timings["read_end"] = time.monotonic()
+                    timings["request_end"] = time.monotonic()
 
                     raise Exception(
                         "Err. - invalid UDP operation. Must be one of - BIDIRECTIONAL, SEND, or RECEIVE."
                     )
-
+  
+            timings["request_end"] = time.monotonic()
             self._connections.append(connection)
 
             return UDPResponse(
@@ -372,17 +395,13 @@ class MercurySyncUDPConnection:
                 )
             )
 
-            return (
-                UDPResponse(
-                    url=URLMetadata(
-                        host=url.hostname,
-                        path=url.path,
-                    ),
-                    error=str(err),
-                    timings=timings,
+            return UDPResponse(
+                url=URLMetadata(
+                    host=url.hostname,
+                    path=url.path,
                 ),
-                False,
-                timings,
+                error=str(err),
+                timings=timings,
             )
 
     async def _connect_to_url_location(

@@ -213,8 +213,8 @@ class Reporter(Generic[T]):
                 "metric_workflow": results.get("workflow"),
                 "metric_type": "RATE",
                 "metric_group": "workflow",
-                "metric_name": "rps",
-                "metric_value": results.get("rps"),
+                "metric_name": "aps",
+                "metric_value": results.get("aps"),
             }
         )
 

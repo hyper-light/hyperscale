@@ -11,7 +11,7 @@ from hyperscale.core.engines.client.shared.protocols import (
 from .protocol import TCPProtocol
 
 
-class TCPConnection:
+class TCPConnectionFactory:
     def __init__(self) -> None:
         self.loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
         self.transport = None

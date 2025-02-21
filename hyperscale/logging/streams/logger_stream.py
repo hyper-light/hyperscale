@@ -37,6 +37,13 @@ from hyperscale.logging.config.stream_type import StreamType
 
 T = TypeVar('T', bound=Entry)
 
+try:
+    import uvloop as uvloop
+    has_uvloop = True
+
+except Exception:
+    has_uvloop = False
+
 
 def patch_transport_close(
     transport: asyncio.Transport, 
@@ -169,8 +176,8 @@ class LoggerStream:
                 )
 
                 try:
-
-                    transport.close = patch_transport_close(transport, self._loop)
+                    if has_uvloop:
+                        transport.close = patch_transport_close(transport, self._loop)
                 
                 except Exception:
                     pass
@@ -189,7 +196,8 @@ class LoggerStream:
 
                 try:
 
-                    transport.close = patch_transport_close(transport, self._loop)
+                    if has_uvloop:
+                        transport.close = patch_transport_close(transport, self._loop)
 
                 except Exception:
                     pass
