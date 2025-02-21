@@ -73,7 +73,7 @@ except Exception:
 OpenTelemetryTracingConfig = UrlFilter | RequestHook | ResponseHook | TraceSignal
 
 
-class HTTPTrace:
+class HTTP2Trace:
     enabled = opentelemetry_enabled
     """First-class used to trace requests launched via ClientSession objects."""
 
@@ -123,12 +123,12 @@ class HTTPTrace:
         span: Span
     ):
         attributes = {
-            'http.max_connections': self.max_connections,
+            'http2.max_connections': self.max_connections,
         }
 
 
         span.add_event(
-            'http.request_queued_start',
+            'http2.request_queued_start',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -140,17 +140,28 @@ class HTTPTrace:
         span: Span
     ):
         attributes = {
-            'http.max_connections': self.max_connections,
+            'http2.max_connections': self.max_connections,
         }
 
 
         span.add_event(
-            'http.request_queued_end',
+            'http2.request_queued_end',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
 
         return span
+    
+    async def on_preamble_sent(
+        self,
+        span: Span
+    ):
+        span.add_event(
+            'http2.preamble_sent',
+            attributes={
+                'http2.protocol': self.protocol,
+            }
+        )
 
     async def on_connection_create_start(
         self,
@@ -159,11 +170,11 @@ class HTTPTrace:
         ssl_upgrade_url: str | None = None,
     ):
         span.add_event(
-            'http.connection_create_start',
+            'http2.connection_create_start',
             attributes={
-                'http.connection_url': connection_url,
-                'http.ssl_upgrade_url': ssl_upgrade_url,
-                'http.ssl_version': self.ssl_version,
+                'http2.connection_url': connection_url,
+                'http2.ssl_upgrade_url': ssl_upgrade_url,
+                'http2.ssl_version': self.ssl_version,
             },
             timestamp=int(time.monotonic())
         )
@@ -181,16 +192,16 @@ class HTTPTrace:
             ip_version = 'ipv6'
         
         attributes = {
-            'http.protocol': self.protocol,
-            'http.ip_address': address,
-            'http.ip_version': ip_version,
-            'http.port': port,
-            'http.ssl_version': self.ssl_version
+            'http2.protocol': self.protocol,
+            'http2.ip_address': address,
+            'http2.ip_version': ip_version,
+            'http2.port': port,
+            'http2.ssl_version': self.ssl_version
             
         }
 
         span.add_event(
-            'http.connection_create_end',
+            'http2.connection_create_end',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -208,16 +219,16 @@ class HTTPTrace:
             ip_version = 'ipv6'
         
         attributes = {
-            'http.protocol': self.protocol,
-            'http.ip_address': address,
-            'http.ip_version': ip_version,
-            'http.port': port,
-            'http.ssl_version': self.ssl_version
+            'http2.protocol': self.protocol,
+            'http2.ip_address': address,
+            'http2.ip_version': ip_version,
+            'http2.port': port,
+            'http2.ssl_version': self.ssl_version
             
         }
 
         span.add_event(
-            'http.dns_cache_hit',
+            'http2.dns_cache_hit',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -229,11 +240,11 @@ class HTTPTrace:
         span: Span
     ):
         attributes = {
-            'http.ssl_version': self.ssl_version,
+            'http2.ssl_version': self.ssl_version,
         }
 
         span.add_event(
-            'http.dns_cache_miss',
+            'http2.dns_cache_miss',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -245,11 +256,11 @@ class HTTPTrace:
         span: Span,
     ):
         attributes = {
-            'http.ssl_version': self.ssl_version,
+            'http2.ssl_version': self.ssl_version,
         }
 
         span.add_event(
-            'http.dns_resolve_host_start',
+            'http2.dns_resolve_host_start',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -263,15 +274,15 @@ class HTTPTrace:
         port: int,
     ):  
         attributes = {
-            'http.protocol': self.protocol,
-            'http.ip_address': addresses,
-            'http.port': port,
-            'http.ssl_version': self.ssl_version,
+            'http2.protocol': self.protocol,
+            'http2.ip_address': addresses,
+            'http2.port': port,
+            'http2.ssl_version': self.ssl_version,
             
         }
 
         span.add_event(
-            'http.dns_resolve_host_end',
+            'http2.dns_resolve_host_end',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -289,16 +300,16 @@ class HTTPTrace:
             ip_version = 'ipv6'
         
         attributes = {
-            'http.protocol': self.protocol,
-            'http.ip_address': address,
-            'http.ip_version': ip_version,
-            'http.port': port,
-            'http.ssl_version': self.ssl_version,
+            'http2.protocol': self.protocol,
+            'http2.ip_address': address,
+            'http2.ip_version': ip_version,
+            'http2.port': port,
+            'http2.ssl_version': self.ssl_version,
             
         }
 
         span.add_event(
-            'http.connection_reuse',
+            'http2.connection_reuse',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -311,9 +322,9 @@ class HTTPTrace:
         encoded_headers: bytes,
     ):
         span.add_event(
-            'http.request_headers_sent',
+            'http2.request_headers_sent',
             attributes={
-                'http.bytes_sent': len(encoded_headers)
+                'http2.bytes_sent': len(encoded_headers)
             },
             timestamp=int(time.monotonic())
         )
@@ -326,11 +337,11 @@ class HTTPTrace:
         encoded_data: bytes,
     ):
         attributes = {
-            'http.bytes_sent': len(encoded_data),
+            'http2.bytes_sent': len(encoded_data),
         }
 
         span.add_event(
-            'http.request_data_sent',
+            'http2.request_data_sent',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -343,11 +354,11 @@ class HTTPTrace:
         chunk_data: bytes,
     ):
         attributes = {
-            'http.bytes_sent': len(chunk_data),
+            'http2.bytes_sent': len(chunk_data),
         }
 
         span.add_event(
-            'http.request_chunk_sent',
+            'http2.request_chunk_sent',
             attributes=attributes,
             timestamp=int(time.monotonic())
         )
@@ -360,9 +371,9 @@ class HTTPTrace:
         header_line: bytes,
     ):
         span.add_event(
-            'http.response_header_line_received',
+            'http2.response_header_line_received',
             attributes={
-                'http.header_line': str(header_line)
+                'http2.header_line': str(header_line)
             },
             timestamp=int(time.monotonic())
         )
@@ -375,9 +386,9 @@ class HTTPTrace:
         response_headers: dict[bytes, bytes],
     ):
         span.add_event(
-            'http.response_headers_received',
+            'http2.response_headers_received',
             attributes={
-                f'http.{key.decode()}': value.decode() for key, value in response_headers.items()
+                f'http2.{key.decode()}': value.decode() for key, value in response_headers.items()
             },
             timestamp=int(time.monotonic())
         )
@@ -390,9 +401,9 @@ class HTTPTrace:
         data: bytes | int,
     ):
         span.add_event(
-            'http.response_headers_received',
+            'http2.response_headers_received',
             attributes={
-                'http.bytes_received': len(bytes(data))
+                'http2.bytes_received': len(bytes(data))
             },
             timestamp=int(time.monotonic())
         )
@@ -405,9 +416,9 @@ class HTTPTrace:
         data: bytes,
     ):
         span.add_event(
-            'http.response_chunk_received',
+            'http2.response_chunk_received',
             attributes={
-                'http.bytes_received': len(data)
+                'http2.bytes_received': len(data)
             },
             timestamp=int(time.monotonic())
         )
@@ -423,12 +434,12 @@ class HTTPTrace:
         is_ssl_upgrade: bool = False
     ):
         span.add_event(
-            'http.request_redirect',
+            'http2.request_redirect',
             attributes={
-                'http.redirect_url': redirect_url,
-                'http.redirects_taken': redirects_taken,
-                'http.max_redirects': max_redirects,
-                'http.is_ssl_upgrade': is_ssl_upgrade,
+                'http2.redirect_url': redirect_url,
+                'http2.redirects_taken': redirects_taken,
+                'http2.max_redirects': max_redirects,
+                'http2.is_ssl_upgrade': is_ssl_upgrade,
             },
             timestamp=int(time.monotonic())
         )
@@ -454,8 +465,8 @@ class HTTPTrace:
         )
 
         span_attributes = {
-            SpanAttributes.HTTP_METHOD: method,
-            SpanAttributes.HTTP_URL: request_url,
+            'http2.method': method,
+            'http2.url': request_url,
         }
 
         span: Span = self.tracer.start_span(
@@ -509,7 +520,7 @@ class HTTPTrace:
             )
 
             span.set_attribute(
-                SpanAttributes.HTTP_STATUS_CODE, status
+                'http2.status_code', status
             )
 
         return self._end_trace(span)
