@@ -52,6 +52,40 @@ class HTTP3Response(CallResult):
     ] = None
     redirects: int = 0
 
+    @property
+    def content_type(self):
+        content_type: bytes | None = None 
+        if self.headers:
+            content_type = self.headers.get(b"content-type", b"application/text")
+
+
+        if content_type:
+            return content_type.decode()
+
+        return content_type
+
+    @property
+    def compression(self):
+        if self.headers and (
+            compression := self.headers.get(b"content-encoding")
+        ):
+            return compression.decode()
+        
+    @property
+    def version(self):
+        if self.headers and (
+            version := self.headers.get(b"version")
+        ):
+            return version.decode()
+
+    @property
+    def reason(self):
+        if self.headers and (
+            reason := self.headers.get(b"reason")
+        ):
+            return reason.decode()
+
+
     @classmethod
     def response_type(cls):
         return RequestType.HTTP3
@@ -67,11 +101,6 @@ class HTTP3Response(CallResult):
 
     def to_model(self, model: Type[T]) -> T:
         return model(**orjson.loads(self.content))
-
-    @property
-    def reason(self) -> str | None:
-        if self.headers:
-            return self.headers.get("reason")
 
     @property
     def params(self):
@@ -107,13 +136,12 @@ class HTTP3Response(CallResult):
 
     @property
     def data(self, model: Optional[Type[T]] = None):
-        content_type = self.headers.get("content-type")
 
         if model:
             return self.to_model(model)
 
         try:
-            match content_type:
+            match self.content_type:
                 case "application/json":
                     return self.json()
 

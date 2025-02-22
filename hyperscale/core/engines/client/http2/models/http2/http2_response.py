@@ -89,25 +89,42 @@ class HTTP2Response(CallResult):
 
     @property
     def content_type(self):
-        return self.headers.get(b"content-type", "application/text")
+        content_type: bytes | None = None 
+        if self.headers:
+            content_type = self.headers.get(b"content-type", b"application/text")
+
+
+        if content_type:
+            return content_type.decode()
+
+        return content_type
 
     @property
     def compression(self):
-        return self.headers.get(b"content-encoding")
-
+        if self.headers and (
+            compression := self.headers.get(b"content-encoding")
+        ):
+            return compression.decode()
+        
     @property
     def version(self) -> Union[str, None]:
-        return self.headers.get(b"version")
+        if self.headers and (
+            version := self.headers.get(b"version")
+        ):
+            return version.decode()
 
     @property
     def reason(self) -> Union[str, None]:
-        if self.headers:
-            return self.headers.get(b"reason")
+        if self.headers and (
+            reason := self.headers.get(b"reason")
+        ):
+            return reason.decode()
 
     @property
     def size(self):
-        content_length = self.headers.get(b"content-length")
-        if content_length:
+        if self.headers and (
+            content_length :=  self.headers.get(b"content-length")
+        ):
             self._size = int(content_length)
 
         elif len(self.content) > 0:

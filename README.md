@@ -77,8 +77,8 @@ which should output
 ![Output of the hyperscale --help command](https://github.com/hyper-light/hyperscale/blob/main/images/hyperscale_help.png?raw=true "Verifying Install")
 
 
-
-*<b>Note</b>*: Hyperscale has been tested using and fully supports both `poetry` and `uv` package managers. We strongly recommend `uv` for its speed and ease of use.
+> [!TIP]
+> Hyperscale has been tested using and fully supports both `poetry` and `uv` package managers. We strongly recommend `uv` for its speed and ease of use.
 
 <br/>
 
@@ -122,7 +122,10 @@ by running:
 ulimit -n 256000
 ```
 
-Note that you can provide any number here, as long as it is greater than the `vus` specified in a given `Workflow`. Next, let's verify that [httpbin.org/get](https://httpbin.org/get) 
+> [!IMPORTANT]
+> You can provide any number when setting the file limit, but it must be more than the maximum number of `vus` specified in your `Workflow`.
+
+Next, let's verify that [httpbin.org/get](https://httpbin.org/get) 
 can actually be reached by running:
 ```bash
 hyperscale ping https://httpbin.org/get
@@ -161,6 +164,30 @@ You have officially created and run your first workflow!
 
 <br/>
 
+___________
+
+
+## <b>Running in Docker</b>
+
+Hyperscale offers a Docker image that allows you to create and run tests in any Docker compatible environment. To run the Hyperscale Docker image run:
+
+```bash
+docker pull hyperlightorg/hyperscale:latest
+```
+
+then execute commands from within the image via:
+
+```bash
+docker run -e COLUMNS=200 -e LINES=60 -v <TEST_DIR>:/tests hyperscae <ARGS_HERE>
+```
+
+> [!IMPORTANT]  
+> The Hyperscale image runs using a non-root user (`hyperscale`) that has read and write permissions for *only* the `/tests` directory. You <b><i>must</i></b> mount the directory where you wish to create and run tests to the `/tests` path
+
+> [!TIP]
+> By default the Hyperscale UI is fully enabled when running inside the Docker image. Unfortunately, Docker's default terminal size for running commands in an image causes issues. We recommend passing `-e COLUMNS=200` and `-e LINES=60` as options to prevent UI issues. Alternatively, you may disable Hyperscale's UI by running `hyperscale run -q <TEST_NAME_AND_OTHER_ARGS>`.
+
+</br>
 
 ___________
 

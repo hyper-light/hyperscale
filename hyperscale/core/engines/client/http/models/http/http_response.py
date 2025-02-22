@@ -51,6 +51,40 @@ class HTTPResponse(CallResult):
     redirects: int = 0
     trace: Span | None = None
 
+    @property
+    def content_type(self):
+        content_type: bytes | None = None 
+        if self.headers:
+            content_type = self.headers.get(b"content-type", b"application/text")
+
+
+        if content_type:
+            return content_type.decode()
+
+        return content_type
+
+    @property
+    def compression(self):
+        if self.headers and (
+            compression := self.headers.get(b"content-encoding")
+        ):
+            return compression.decode()
+        
+    @property
+    def version(self):
+        if self.headers and (
+            version := self.headers.get(b"version")
+        ):
+            return version.decode()
+
+    @property
+    def reason(self):
+        if self.headers and (
+            reason := self.headers.get(b"reason")
+        ):
+            return reason.decode()
+
+
     @classmethod
     def response_type(cls):
         return RequestType.HTTP
@@ -106,13 +140,12 @@ class HTTPResponse(CallResult):
 
     @property
     def data(self, model: Type[T] | None = None):
-        content_type = self.headers.get("content-type")
-
+        
         if model:
             return self.to_model(model)
 
         try:
-            match content_type:
+            match self.content_type:
                 case "application/json":
                     return self.json()
 

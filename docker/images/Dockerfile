@@ -13,9 +13,16 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1
 RUN apt update && \ 
     apt install -y libssl3 && \
     pip install uv && \
-    uv pip install --system hyperscale
+    uv pip install --system hyperscale uvloop
 
 RUN groupadd --gid $USER_GID $USERNAME \
 && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME
+
+
+RUN mkdir /tests && \
+    chown -R $USERNAME:$USER_UID /tests
+
+WORKDIR /tests
+
 
 USER hyperscale
