@@ -7,7 +7,7 @@ class Test(Workflow):
     duration = "1m"
 
     @step()
-    async def login(
+    async def get_httpbin(
         self,
         url: URL = "https://httpbin.org/get",
     ) -> HTTPResponse:
