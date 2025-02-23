@@ -1,5 +1,10 @@
 from hyperscale.graph import Workflow, step
-from hyperscale.testing import URL, HTTPResponse, TCPResponse
+from hyperscale.testing import (
+    URL, 
+    HTTPResponse, 
+    HTTP2Response, 
+    HTTP3Response,
+)
 
 
 class Test(Workflow):
@@ -9,13 +14,20 @@ class Test(Workflow):
     @step()
     async def get_httpbin(
         self,
-        url: URL = "https://httpbin.org/get",
+        url: URL = "https://google.com",
     ) -> HTTPResponse:
         return await self.client.http.get(url)
 
     @step()
-    async def tcp_get_httpbin(
+    async def get_httpbin_http2(
         self,
-        tcp_url: URL = "https://httpbin.org/get",
-    ) -> TCPResponse:
-        return await self.client.tcp.send(tcp_url, b"hello")
+        url: URL = "https://google.com",
+    ) -> HTTP2Response:
+        return await self.client.http2.get(url)
+    
+    @step()
+    async def get_httpbin_http3(
+        self,
+        url: URL = "https://google.com",
+    ) -> HTTP3Response:
+        return await self.client.http3.get(url)

@@ -1,0 +1,1 @@
+from .mercury_sync_smtp_connection import MercurySyncSMTPConnection as MercurySyncSMTPConnection

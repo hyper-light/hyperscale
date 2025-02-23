@@ -34,11 +34,9 @@ class TCPConnection:
 
         self.loop = asyncio.get_event_loop()
 
-        family, type_, proto, _, address = socket_config
+        family, _, _, _, address = socket_config
 
-        socket_family = socket.AF_INET6 if family == 2 else socket.AF_INET
-
-        self.socket = socket.socket(family=family, type=type_, proto=proto)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         await self.loop.run_in_executor(None, self.socket.connect, address)
@@ -50,7 +48,7 @@ class TCPConnection:
         protocol = TLSProtocol(reader, loop=self.loop)
 
         self.transport, _ = await self.loop.create_connection(
-            lambda: protocol, sock=self.socket, family=socket_family
+            lambda: protocol, sock=self.socket, family=family
         )
 
         ssl_protocol = SSLProtocol(
