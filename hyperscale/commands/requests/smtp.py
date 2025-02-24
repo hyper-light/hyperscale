@@ -122,6 +122,3 @@ async def make_smtp_request(
         if quiet is False:
             await update_text(error_message)
             await terminal.stop()
-
-        import traceback
-        print(traceback.format_exc())
