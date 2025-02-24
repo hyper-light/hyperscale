@@ -178,7 +178,7 @@ docker pull hyperlightorg/hyperscale:latest
 then execute commands from within the image via:
 
 ```bash
-docker run -e COLUMNS=200 -e LINES=60 -v <TEST_DIR>:/tests hyperscae <ARGS_HERE>
+docker run -e COLUMNS=200 -e LINES=60 -v <TEST_DIR>:/tests hyperscale <ARGS_HERE>
 ```
 
 > [!IMPORTANT]  
