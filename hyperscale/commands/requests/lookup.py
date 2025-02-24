@@ -4,6 +4,7 @@ from hyperscale.core.engines.client.shared.models import URL
 from .lookup_ui import (
     update_elapsed,
     update_socket_info,
+    update_socket_info_smtp,
     update_text,
     create_lookup_ui
 )
@@ -11,6 +12,7 @@ from .lookup_ui import (
 
 async def lookup_url(
     url: str,
+    as_smtp: bool = False,
     wait: bool = False,
     quiet:bool= False,
 ):
@@ -33,7 +35,11 @@ async def lookup_url(
                 vertical_padding=1
             )
 
-        await url_data.lookup()
+        if as_smtp:
+            await url_data.lookup_smtp()
+
+        else:
+            await url_data.lookup()
 
         elapsed = time.monotonic() - start
 
@@ -55,11 +61,20 @@ async def lookup_url(
         message = "OK" if error is None else str(error)
         
         await asyncio.sleep(0.5)
-        await asyncio.gather(*[
-            update_elapsed(elapsed),
-            update_socket_info(url_data.ip_addresses),
-            update_text(message)
-        ])
+
+        if as_smtp:
+            await asyncio.gather(*[
+                update_elapsed(elapsed),
+                update_socket_info_smtp(url_data.ip_addresses),
+                update_text(message)
+            ])
+
+        else:
+            await asyncio.gather(*[
+                update_elapsed(elapsed),
+                update_socket_info(url_data.ip_addresses),
+                update_text(message)
+            ])
 
         if wait:
             loop = asyncio.get_event_loop()

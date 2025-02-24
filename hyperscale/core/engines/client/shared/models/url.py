@@ -1,8 +1,10 @@
+import asyncio
+import functools
 import socket
 from socket import AddressFamily, SocketKind
 from asyncio.events import get_event_loop
 from ipaddress import IPv4Address, ip_address, IPv6Address
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Literal
 from urllib.parse import urlparse
 
 import aiodns
@@ -96,6 +98,59 @@ class URL:
         ]] = []
         self.address: Union[str, None] = None
 
+
+    async def lookup_smtp(
+        self,
+        server: str,
+        loop: asyncio.AbstractEventLoop,
+        connection_type: Literal['insecure', 'ssl', 'tls'] = 'tls',
+    ):
+        
+        port = 587
+        match connection_type:
+            case "insecure":
+                port = 25
+
+            case "ssl":
+                port = 465
+
+            case "tls":
+                port = 587
+
+            case _:
+                port = None
+
+        
+                
+        self.ip_addresses = []
+
+        if port:
+            self.ip_addresses = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    socket.getaddrinfo,
+                    server, 
+                    port, 
+                    0, 
+                    socket.SOCK_STREAM
+                )
+            )
+
+        else:
+            for port in [587, 465, 25]:
+                self.ip_addresses.extend(
+                    await loop.run_in_executor(
+                        None,
+                        functools.partial(
+                            socket.getaddrinfo,
+                            server, 
+                            port, 
+                            0, 
+                            socket.SOCK_STREAM
+                        )
+                    )
+                )
+
     async def lookup(self):
         if self.loop is None:
             self.loop = get_event_loop()
@@ -115,9 +170,6 @@ class URL:
                 elif isinstance(ip_address(self.full), IPv4Address):
                     socket_family = socket.AF_INET
 
-                else:
-                    raise Exception('Err. - Invalid raw IP Address')
-                
                 address = (host, port)
 
                 

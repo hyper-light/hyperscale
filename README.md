@@ -8,7 +8,7 @@
 
 | Package     | Hyperscale                                                      |
 | ----------- | -----------                                                     |
-| Version     | 0.4.2                                                           |
+| Version     | 0.5.0                                                           |
 | Download    | https://pypi.org/project/hyperscale/                            | 
 | Source      | https://github.com/hyper-light/hyperscale                       |
 | Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
@@ -40,7 +40,7 @@ Hyperscale just works, requiring no additional setup beyond a supported Python d
 <br/>
 
 ### __Flexibility and and painless extensibility__
-Hyperscale ships with support for HTTP, HTTP2, HTTP3, TCP, UDP, and Websockets out of the box. GraphQL, GraphQL-HTTP2, GRPC, and Playwright are available as optional extras that can be installed via:
+Hyperscale ships with support for HTTP, HTTP2, HTTP3, SMTP, TCP, UDP, and Websockets out of the box. GraphQL, GraphQL-HTTP2, GRPC, and Playwright are available as optional extras that can be installed via:
 
 ```bash
 pip install "hyperscale[<extra_here>]"
@@ -128,12 +128,12 @@ ulimit -n 256000
 Next, let's verify that [httpbin.org/get](https://httpbin.org/get) 
 can actually be reached by running:
 ```bash
-hyperscale ping https://httpbin.org/get
+hyperscale ping http https://httpbin.org/get
 ```
 
 which should output:
 
-![Output of the hyperscale ping https://httpbin.org/get command](https://github.com/hyper-light/hyperscale/blob/main/images/hyperscale_ping_httpbin.png?raw=true "Checking httpbin.org/get is reachable before running the test")
+![Output of the hyperscale ping http https://httpbin.org/get command](https://github.com/hyper-light/hyperscale/blob/main/images/hyperscale_ping_httpbin.png?raw=true "Checking httpbin.org/get is reachable before running the test")
 
 Awesome! Now let's run the test by executing:
 ```bash
@@ -178,7 +178,7 @@ docker pull hyperlightorg/hyperscale:latest
 then execute commands from within the image via:
 
 ```bash
-docker run -e COLUMNS=200 -e LINES=60 -v <TEST_DIR>:/tests hyperscae <ARGS_HERE>
+docker run -e COLUMNS=200 -e LINES=60 -v <TEST_DIR>:/tests hyperscale <ARGS_HERE>
 ```
 
 > [!IMPORTANT]  
@@ -230,6 +230,7 @@ Below find a tables of Hyperscale's supported client and reporting options, as w
 | HTTP             | N/A                                                             | N/A                           |
 | HTTP2            | N/A                                                             | N/A                           |
 | HTTP3 (unstable) | pip install hyperscale[http3]                                   | aioquic                       |
+| SMTP             | N/A                                                             | N/A                           |
 | TCP              | N/A                                                             | N/A                           |
 | UDP              | N/A                                                             | N/A                           |
 | Websocket        | N/A                                                             | N/A                           |

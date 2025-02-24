@@ -1,7 +1,7 @@
 import asyncio
 import ssl
 from random import randrange
-from typing import Optional
+from typing import Optional, TypeVar
 
 from hyperscale.core.engines.client.tracing import HTTPTrace
 from .graphql import MercurySyncGraphQLConnection
@@ -17,6 +17,8 @@ from .http2.settings import Settings
 from .http3 import MercurySyncHTTP3Connection
 from .http3.protocols import HTTP3Connection
 from .playwright import MercurySyncPlaywrightConnection
+from .smtp import MercurySyncSMTPConnection
+from .smtp.protocols import SMTPConnection
 from .tcp import MercurySyncTCPConnection
 from .tcp.protocols import TCPConnection
 from .udp import MercurySyncUDPConnection
@@ -25,22 +27,17 @@ from .websocket import MercurySyncWebsocketConnection
 from .websocket.protocols import WebsocketConnection
 
 
+T = TypeVar('T')
+
+
 def setup_client(
-    client: MercurySyncGraphQLConnection
-    | MercurySyncGraphQLHTTP2Connection
-    | MercurySyncGRPCConnection
-    | MercurySyncHTTPConnection
-    | MercurySyncHTTP2Connection
-    | MercurySyncHTTP3Connection
-    | MercurySyncPlaywrightConnection
-    | MercurySyncUDPConnection
-    | MercurySyncWebsocketConnection,
+    client: T,
     vus: int,
     pages: Optional[int] = None,
     cert_path: Optional[str] = None,
     key_path: Optional[str] = None,
     reset_connections: bool = False,
-):
+) -> T:
     client._concurrency = vus
 
     if isinstance(
@@ -174,6 +171,20 @@ def setup_client(
     elif isinstance(client, MercurySyncPlaywrightConnection):
         client._semaphore = asyncio.Semaphore(vus)
         client._max_pages = pages
+
+    elif isinstance(client, MercurySyncSMTPConnection):
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        client._ssl_context = ctx
+        
+        client._semaphore = asyncio.Semaphore(vus)
+        client._connections = [
+            SMTPConnection(
+                reset_connections=reset_connections,
+            ) for _ in range(vus)
+        ]
 
     elif isinstance(client, MercurySyncTCPConnection):
         client.reset_connections = reset_connections

@@ -58,7 +58,7 @@ async def make_http_request(
                 horizontal_padding=4,
                 vertical_padding=1
             )
-
+            
         match method:
             case "get":
                 response = await http.get(
