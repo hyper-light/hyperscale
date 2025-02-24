@@ -173,6 +173,48 @@ class MercurySyncSMTPConnection:
                 email.attach(part)
 
         return email.as_string()
+         
+    async def _attach_file(
+        self,
+        filepath: str,
+        mime_type: str = 'application/octet-stream'
+    ):
+        mime_base, mime_subtype = mime_type.split('/', maxsplit=1)
+        part = MIMEBase(mime_base, mime_subtype)
+
+        attachment_file = await self._loop.run_in_executor(
+            None,
+            open,
+            filepath,
+            'rb'
+        )
+
+        part.set_payload(
+            await self._loop.run_in_executor(
+                None,
+                attachment_file.read
+            )
+        )
+
+        encoders.encode_base64(part)
+
+        orig = part.get_payload(decode=True)
+        encdata = str(_bencode(orig), 'ascii')
+        part.set_payload(encdata)
+        part['Content-Transfer-Encoding'] = 'base64'
+
+        path = await self._loop.run_in_executor(
+            None,
+            Path,
+            filepath
+        )
+
+        part.add_header(
+            'Content-Disposition',
+            f'attachment; filename={path.name}'
+        )
+
+        return part
     
     async def _optimize(
         self,
@@ -222,48 +264,6 @@ class MercurySyncSMTPConnection:
 
         except Exception:
             pass
-     
-    async def _attach_file(
-        self,
-        filepath: str,
-        mime_type: str = 'application/octet-stream'
-    ):
-        mime_base, mime_subtype = mime_type.split('/', maxsplit=1)
-        part = MIMEBase(mime_base, mime_subtype)
-
-        attachment_file = await self._loop.run_in_executor(
-            None,
-            open,
-            filepath,
-            'rb'
-        )
-
-        part.set_payload(
-            await self._loop.run_in_executor(
-                None,
-                attachment_file.read
-            )
-        )
-
-        encoders.encode_base64(part)
-
-        orig = part.get_payload(decode=True)
-        encdata = str(_bencode(orig), 'ascii')
-        part.set_payload(encdata)
-        part['Content-Transfer-Encoding'] = 'base64'
-
-        path = await self._loop.run_in_executor(
-            None,
-            Path,
-            filepath
-        )
-
-        part.add_header(
-            'Content-Disposition',
-            f'attachment; filename={path.name}'
-        )
-
-        return part
 
     async def _execute(
         self,
