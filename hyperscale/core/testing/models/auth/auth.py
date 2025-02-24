@@ -45,7 +45,7 @@ class Auth(OptimizedArg, Generic[T]):
                 self.data[0].encode()
             ).decode()
 
-        self.data = f'Authorization: Basic {encoded_credentials}{NEW_LINE}'
+        self.optimized = f'Authorization: Basic {encoded_credentials}{NEW_LINE}'
 
     @property
     def user(self):

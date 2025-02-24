@@ -9,6 +9,7 @@ from .terminal_ui import (
     update_elapsed,
     update_text,
     create_ping_ui,
+    colorize_udp_or_tcp,
 )
 
 
@@ -51,6 +52,7 @@ async def make_udp_request(
     terminal = create_ping_ui(
         url,
         method,
+        override_status_colorizer=colorize_udp_or_tcp,
     )
 
     try:

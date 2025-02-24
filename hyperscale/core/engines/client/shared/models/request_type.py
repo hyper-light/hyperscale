@@ -11,5 +11,6 @@ class RequestType(Enum):
     GRAPHQL_HTTP2 = "GRAPHQL_HTTP2"
     GRPC = "GRPC"
     PLAYWRIGHT = "PLAYWRIGHT"
+    SMTP = "SMTP"
     TCP = "TCP"
     UDP = "UDP"

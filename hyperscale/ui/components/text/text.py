@@ -79,9 +79,14 @@ class Text:
         return self._last_frame, rerender
 
     async def _rerender(self, text: str):
+        text_length = len(text)
+
+        if text_length >= self._max_width:
+            text = text[:self._max_width - 3] + '...'
+
         remainder = self._max_width - len(text)
 
-        text = await stylize(
+        styled_text = await stylize(
             text,
             color=get_style(
                 self._config.color,
@@ -103,7 +108,7 @@ class Text:
             mode=self._mode,
         )
 
-        return self._pad_text_horizontal(text, remainder)
+        return self._pad_text_horizontal(styled_text, remainder)
 
     async def _check_if_should_rerender(self):
         await self._update_lock.acquire()

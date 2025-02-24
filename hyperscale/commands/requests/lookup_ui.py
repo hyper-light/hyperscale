@@ -48,6 +48,33 @@ async def update_socket_info(socket_info: list[
 
     return socket_rows
 
+@action()
+async def update_socket_info_smtp(socket_info: list[
+    tuple[AddressFamily, SocketKind, int, str, tuple[str, int]]
+]):
+    
+    socket_rows = []
+
+    for info in socket_info:
+        family, socket_kind, _, _, address = info
+        host, port = address
+
+        if isinstance(ip_address(host), IPv4Address):
+            ip_type = 'ipv4'
+
+        else:
+            ip_type = 'ipv6'
+
+        socket_rows.append({
+            "ip": host,
+            "port": port,
+            "family": family.name,
+            "socket type": socket_kind.name,
+            "ip type": ip_type,
+        })
+
+    return socket_rows
+
 def colorize_status(status: str):
 
     try:

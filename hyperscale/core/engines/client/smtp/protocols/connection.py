@@ -29,6 +29,8 @@ class SMTPConnection:
         "_connection_factory",
         "_reader_and_writer",
         "reset_connection",
+        "server_name",
+        "command_encoding",
     )
 
     def __init__(self, reset_connections: bool = False) -> None:
@@ -53,7 +55,9 @@ class SMTPConnection:
         self.reset_connection = reset_connections
         self.pending = 0
         self._connection_factory = TCPConnection()
-
+        self.server_name: str | None = None
+        self.command_encoding: Literal['ascii', 'utf-8'] = 'ascii'
+        
     async def make_connection(
         self,
         hostname: str,

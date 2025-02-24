@@ -21,6 +21,7 @@ from hyperscale.core.engines.client.http2 import HTTP2Request
 from hyperscale.core.engines.client.http3 import HTTP3Request
 from hyperscale.core.engines.client.playwright import PlaywrightResult
 from hyperscale.core.engines.client.shared.models import RequestType
+from hyperscale.core.engines.client.smtp import SMTPResponse
 from hyperscale.core.engines.client.tcp import TCPResponse
 from hyperscale.core.engines.client.udp import UDPResponse
 from hyperscale.core.engines.client.websocket import WebsocketResponse
@@ -64,6 +65,7 @@ class Results:
             | Type[HTTP2Request]
             | Type[HTTP3Request]
             | Type[PlaywrightResult]
+            | Type[SMTPResponse]
             | Type[TCPResponse]
             | Type[UDPResponse]
             | Type[WebsocketResponse]
@@ -80,6 +82,7 @@ class Results:
                     | List[HTTP2Request]
                     | List[HTTP3Request]
                     | List[PlaywrightResult]
+                    | List[SMTPResponse]
                     | List[TCPResponse]
                     | List[UDPResponse]
                     | List[WebsocketResponse]
@@ -314,6 +317,7 @@ class Results:
         | List[HTTP2Request]
         | List[HTTP3Request]
         | List[PlaywrightResult]
+        | List[SMTPResponse]
         | List[TCPResponse]
         | List[UDPResponse]
         | List[WebsocketResponse],
@@ -349,6 +353,39 @@ class Results:
             ] = {}
 
             results_types = list(timing_results_set[0].keys())
+
+        elif result_type == RequestType.SMTP:
+            timing_results_set = [
+                self._process_smtp_timings(result)
+                for result in results
+                if result not in errors
+            ]
+
+            timing_stats: Dict[
+                Literal[
+                    "total",
+                    "connecting",
+                    "ehlo",
+                    "tls_check",
+                    "tls_upgrade",
+                    "ehlo_tls",
+                    "login",
+                    "send_mail",
+                ],
+                Dict[StatTypes, int | float],
+            ] = {}
+
+            results_types = [
+                "total",
+                "connecting",
+                "ehlo",
+                "tls_check",
+                "tls_upgrade",
+                "ehlo_tls",
+                "login",
+                "send_mail",
+            ]
+
 
         else:
             timing_results_set = [
@@ -681,6 +718,83 @@ class Results:
         ] = {
             "total": timings["command_end"] - timings["command_start"],
         }
+
+        return timing_results
+    
+    def _process_smtp_timings(
+        self,
+        result: SMTPResponse
+    ) -> Dict[
+        Optional[
+            Literal[
+                "total",
+                "connecting",
+                "ehlo",
+                "tls_check",
+                "tls_upgrade",
+                "ehlo_tls",
+                "login",
+                "send_mail",
+            ]
+        ],
+        int | float
+    ]:
+        timings = result.timings
+        timing_results: Dict[
+            Optional[
+                Literal[
+                    "total",
+                    "connecting",
+                    "ehlo",
+                    "tls_check",
+                    "tls_upgrade",
+                    "ehlo_tls",
+                    "login",
+                    "send_mail",
+                ]
+            ],
+            int | float
+        ] = {}
+
+        if (request_end := timings.get("request_end")) and (
+            request_start := timings.get("request_start")
+        ):
+            timing_results["total"] = request_end - request_start
+
+        if (connect_end := timings.get("connect_end")) and (
+            connect_start := timings.get("connect_start")
+        ):
+            timing_results["connecting"] = connect_end - connect_start
+
+        if (ehlo_end := timings.get('ehlo_end')) and (
+            ehlo_start := timings.get('ehlo_start')
+        ):
+            timing_results['ehlo'] = ehlo_end - ehlo_start
+
+        if (tls_check_end := timings.get('tls_check_end')) and (
+            tls_check_start := timings.get('tls_check_start')
+        ):
+            timing_results['tls_check'] = tls_check_end - tls_check_start
+
+        if (tls_upgrade_end := timings.get('tls_upgrade_end')) and (
+            tls_upgrade_start := timings.get('tls_upgrade_start')
+        ):
+            timing_results['tls_upgrade'] = tls_upgrade_end - tls_check_start
+
+        if (ehlo_tls_end := timings.get('ehlo_tls_end')) and (
+            ehlo_tls_start := timings.get('ehlo_tls_start')
+        ):
+            timing_results['ehlo_tls'] = ehlo_tls_end - ehlo_tls_start
+
+        if (login_end := timings.get('login_end')) and (
+            login_start := timings.get('login_start')
+        ):
+            timing_results['login'] = login_end - login_start
+
+        if (send_email_end := timings.get('send_mail_end')) and (
+            send_email_start := timings.get('send_mail_start')
+        ):
+            timing_results['send_mail'] = send_email_end - send_email_start
 
         return timing_results
 

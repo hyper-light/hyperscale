@@ -8,7 +8,7 @@
 
 | Package     | Hyperscale                                                      |
 | ----------- | -----------                                                     |
-| Version     | 0.4.2                                                           |
+| Version     | 0.5.0                                                           |
 | Download    | https://pypi.org/project/hyperscale/                            | 
 | Source      | https://github.com/hyper-light/hyperscale                       |
 | Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
@@ -128,12 +128,12 @@ ulimit -n 256000
 Next, let's verify that [httpbin.org/get](https://httpbin.org/get) 
 can actually be reached by running:
 ```bash
-hyperscale ping https://httpbin.org/get
+hyperscale ping http https://httpbin.org/get
 ```
 
 which should output:
 
-![Output of the hyperscale ping https://httpbin.org/get command](https://github.com/hyper-light/hyperscale/blob/main/images/hyperscale_ping_httpbin.png?raw=true "Checking httpbin.org/get is reachable before running the test")
+![Output of the hyperscale ping http https://httpbin.org/get command](https://github.com/hyper-light/hyperscale/blob/main/images/hyperscale_ping_httpbin.png?raw=true "Checking httpbin.org/get is reachable before running the test")
 
 Awesome! Now let's run the test by executing:
 ```bash

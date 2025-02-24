@@ -1,6 +1,7 @@
 import os
 import time
 import base64
+from email.utils import make_msgid 
 
 
 def get_attachment_content(file_path):
@@ -29,10 +30,13 @@ def guess_mime_type(file_path):
 
 
 def generate_email_content(to, from_, subject, message, attachment_file_list, cc_recipients):
+
+    message_id = make_msgid()
+
     boundary = '------' + str(time.time()) + '------'
     email_content = ''
     email_content += f'Content-Type: multipart/mixed; boundary="{boundary}"\r\n'
-    email_content += f"Message-ID: {generate_message_id()}\r\n"
+    email_content += f"Message-ID: {message_id}\r\n"
     email_content += f'Date: {time.strftime("%a, %d %b %Y %H:%M:%S +0700", time.localtime())}\r\n'
     email_content += f'User-Agent: VMS\r\n'
     email_content += f'To: {to}\r\n'

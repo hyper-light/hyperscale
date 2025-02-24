@@ -4,7 +4,7 @@ from hyperscale.ui.components.table import Table, TableConfig
 from hyperscale.ui.components.text import Text, TextConfig
 from hyperscale.ui.components.terminal import Section, SectionConfig
 from hyperscale.ui.components.terminal import Terminal, action
-from typing import Any
+from typing import Any, Callable
 
 
 @action()
@@ -71,19 +71,36 @@ async def update_cookies(cookies: tuple[str, str]):
 def colorize_status(status: str):
 
     try:
-        if status not in ["OK", "ERRORED"]:
-            status = int(status)
+        status = int(status)
 
     except Exception:
-        pass
+        return status
 
-    if isinstance(status, int) is False and status not in ["OK", "Errored"]:
+    if isinstance(status, int) is False:
         return "white"
     
-    if isinstance(status, int) and status >= 200 and status < 300:
+    if status >= 200 and status < 300:
         return "aquamarine_2"
     
+    return "hot_pink_3"
+
+def colorize_udp_or_tcp(status: str):
+    
     if status == "OK":
+        return "aquamarine_2"
+    
+    return "hot_pink_3"
+
+
+def colorize_smtp(status: str):
+
+    try:
+        status = int(status)
+
+    except Exception:
+        return status
+    
+    if status == 250:
         return "aquamarine_2"
     
     return "hot_pink_3"
@@ -147,7 +164,12 @@ def map_status_to_error(status: int):
 def create_ping_ui(
     url: str,
     method: str,
+    override_status_colorizer: Callable[[int], str] | None = None
 ):
+    
+    status_colorizer = colorize_status
+    if override_status_colorizer:
+        status_colorizer = override_status_colorizer
     
     header = Section(
         SectionConfig(
@@ -311,7 +333,7 @@ def create_ping_ui(
                 "status_display",
                 TextConfig(
                     text="Status: ...",
-                    color=colorize_status,
+                    color=status_colorizer,
                     terminal_mode='extended'
                 ),
                 subscriptions=["update_status"]

@@ -4,6 +4,8 @@ from .client.grpc import GRPCResponse as GRPCResponse
 from .client.http import HTTPResponse as HTTPResponse
 from .client.http2 import HTTP2Response as HTTP2Response
 from .client.http3 import HTTP3Response as HTTP3Response
+from .client.smtp import EmailAttachment as EmailAttachment
+from .client.smtp import SMTPResponse as SMTPResponse
 from .client.playwright import PlaywrightResult as PlaywrightResult
 from .client.tcp import TCPResponse as TCPResponse
 from .client.udp import UDPResponse as UDPResponse
