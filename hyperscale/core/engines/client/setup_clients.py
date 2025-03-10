@@ -1,4 +1,5 @@
 import asyncio
+import re
 import ssl
 from random import randrange
 from typing import Optional, TypeVar
@@ -178,6 +179,8 @@ def setup_client(
         ctx.verify_mode = ssl.CERT_NONE
 
         client._ssl_context = ctx
+        client._loop = asyncio.get_event_loop()
+        client._OLDSTYLE_AUTH = re.compile(r"auth=(.*)", re.I)
         
         client._semaphore = asyncio.Semaphore(vus)
         client._connections = [
@@ -232,7 +235,7 @@ def setup_client(
 
         client._semaphore = asyncio.Semaphore(vus)
 
-    else:
+    elif isinstance(client, MercurySyncWebsocketConnection):
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
