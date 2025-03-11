@@ -43,7 +43,7 @@ Hyperscale just works, requiring no additional setup beyond a supported Python d
 Hyperscale ships with support for HTTP, HTTP2, HTTP3, SMTP, TCP, UDP, and Websockets out of the box. GraphQL, GraphQL-HTTP2, GRPC, and Playwright are available as optional extras that can be installed via:
 
 ```bash
-pip install "hyperscale[<extra_here>]"
+pip install "hyperlight-hyperscale[<extra_here>]"
 ```
 
 You can use any installed and supported client concurrently in the same or an independent Workflow, allowing you to exercise each part of your application's stack to the fullest. Performing non-test work to accomplish setup is easy and only requires writing a workflow where no actions specify a client response return type.
@@ -65,7 +65,7 @@ Hyperscale makes use of the latest and greatest Python features, and requires Py
 
 To install Hyperscale run:
 ```
-pip install hyperscale
+pip install hyperlight-hyperscale
 ```
 Verify the installation was was successful by running the command:
 ```
