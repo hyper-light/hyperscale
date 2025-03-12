@@ -3,13 +3,13 @@
 [![PyPI version](https://img.shields.io/pypi/v/hyperlight-hyperscale?color=blue)](https://pypi.org/project/hyperscale/)
 [![License](https://img.shields.io/github/license/hyper-light/hyperscale)](https://github.com/hyper-light/hyperscale/blob/main/LICENSE)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](https://github.com/hyper-light/hyperscale/blob/main/CODE_OF_CONDUCT.md)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/hyperscale?color=red)](https://pypi.org/project/hyperscale/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/hyperlight-hyperscale?color=red)](https://pypi.org/project/hyperscale/)
 
 
 | Package     | Hyperscale                                                      |
 | ----------- | -----------                                                     |
 | Version     | 0.5.2                                                           |
-| Download    | https://pypi.org/project/hyperscale/                            | 
+| Download    | https://pypi.org/project/hyperlight-hyperscale/                            | 
 | Source      | https://github.com/hyper-light/hyperscale                       |
 | Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
 
