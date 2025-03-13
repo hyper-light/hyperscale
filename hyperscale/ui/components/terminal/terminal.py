@@ -447,6 +447,8 @@ class Terminal:
     async def stop(self):
         self._stop_time = time.time()
 
+        await self.canvas.stop()
+
         if self._dfl_sigmap:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
@@ -463,12 +465,6 @@ class Terminal:
         except Exception:
             pass
 
-        try:
-            self._run_engine.set_result(None)
-            await asyncio.sleep(0)
-        except Exception:
-            pass
-
         await self._stdout_lock.acquire()
 
         frame = await self.canvas.render()
@@ -476,6 +472,12 @@ class Terminal:
         frame = f"\033[3J\033[H{frame}\n".encode()
 
         await self._loop.run_in_executor(None, self._writer.write, frame)
+
+        try:
+            self._run_engine.set_result(None)
+            await asyncio.sleep(0)
+        except Exception:
+            pass
 
         if self._stdout_lock.locked():
             self._stdout_lock.release()
