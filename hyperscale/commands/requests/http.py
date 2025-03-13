@@ -194,7 +194,6 @@ async def make_http_request(
                 await loop.create_future()
 
             await asyncio.sleep(0.5)
-            await terminal.stop()
 
     except (
         KeyboardInterrupt,
@@ -202,7 +201,6 @@ async def make_http_request(
     ):
         if quiet is False:
             await update_text("Aborted")
-            await terminal.stop()
 
     except Exception as err:
         error_message = str(err)
@@ -211,4 +209,6 @@ async def make_http_request(
 
         if quiet is False:
             await update_text(error_message)
-            await terminal.stop()
+    
+    if quiet is False:
+        await terminal.stop()
