@@ -360,8 +360,4 @@ class LocalServerPool:
                     self._executor.shutdown(wait=False, cancel_futures=True)
 
         except Exception:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-
-                if self._executor._processes and len(self._executor._processes) > 0:
-                    self._executor.shutdown(wait=False, cancel_futures=True)
+            pass
