@@ -1,15 +1,15 @@
 
 # <b>Hyperscale</b>
-[![PyPI version](https://img.shields.io/pypi/v/hyperscale?color=blue)](https://pypi.org/project/hyperscale/)
+[![PyPI version](https://img.shields.io/pypi/v/hyperlight-hyperscale?color=blue)](https://pypi.org/project/hyperscale/)
 [![License](https://img.shields.io/github/license/hyper-light/hyperscale)](https://github.com/hyper-light/hyperscale/blob/main/LICENSE)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](https://github.com/hyper-light/hyperscale/blob/main/CODE_OF_CONDUCT.md)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/hyperscale?color=red)](https://pypi.org/project/hyperscale/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/hyperlight-hyperscale?color=red)](https://pypi.org/project/hyperscale/)
 
 
 | Package     | Hyperscale                                                      |
 | ----------- | -----------                                                     |
-| Version     | 0.5.0                                                           |
-| Download    | https://pypi.org/project/hyperscale/                            | 
+| Version     | 0.5.5                                                           |
+| Download    | https://pypi.org/project/hyperlight-hyperscale/                            | 
 | Source      | https://github.com/hyper-light/hyperscale                       |
 | Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
 
@@ -43,7 +43,7 @@ Hyperscale just works, requiring no additional setup beyond a supported Python d
 Hyperscale ships with support for HTTP, HTTP2, HTTP3, SMTP, TCP, UDP, and Websockets out of the box. GraphQL, GraphQL-HTTP2, GRPC, and Playwright are available as optional extras that can be installed via:
 
 ```bash
-pip install "hyperscale[<extra_here>]"
+pip install "hyperlight-hyperscale[<extra_here>]"
 ```
 
 You can use any installed and supported client concurrently in the same or an independent Workflow, allowing you to exercise each part of your application's stack to the fullest. Performing non-test work to accomplish setup is easy and only requires writing a workflow where no actions specify a client response return type.
@@ -65,7 +65,7 @@ Hyperscale makes use of the latest and greatest Python features, and requires Py
 
 To install Hyperscale run:
 ```
-pip install hyperscale
+pip install hyperlight-hyperscale
 ```
 Verify the installation was was successful by running the command:
 ```

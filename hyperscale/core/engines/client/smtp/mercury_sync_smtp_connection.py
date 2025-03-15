@@ -59,7 +59,7 @@ class MercurySyncSMTPConnection:
         self._key_path = key_path
         self._ssl_context: ssl.SSLContext | None = None
 
-        self._loop = asyncio.get_event_loop()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
 
         self._dns_lock: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)

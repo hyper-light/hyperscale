@@ -1,3 +1,4 @@
+import asyncio
 import json
 from ipaddress import IPv4Address, IPv6Address
 from typing import Literal, Any
@@ -344,25 +345,31 @@ async def http(
 
     method_name = method.data.lower()
     
-    return await make_http_request(
-        url,
-        method=method_name,       
-        cookies=[
-            cookie.strip().split(
-                "=",
-            ) for cookie in cookies.split(";")
-        ] if cookies else None,
-        params=json.loads(params),
-        headers=json.loads(headers),
-        data=load_data(data),
-        redirects=redirects,
-        timeout=timeout_seconds,
-        output_file=filepath,
-        wait=wait,
-        quiet=quiet,
+    try:
+          
+        return await make_http_request(
+            url,
+            method=method_name,       
+            cookies=[
+                cookie.strip().split(
+                    "=",
+                ) for cookie in cookies.split(";")
+            ] if cookies else None,
+            params=json.loads(params),
+            headers=json.loads(headers),
+            data=load_data(data),
+            redirects=redirects,
+            timeout=timeout_seconds,
+            output_file=filepath,
+            wait=wait,
+            quiet=quiet,
 
-    )
-        
+        )
+    
+    except Exception:
+        import traceback
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, print, traceback.format_exc())
 
 @ping.command(
     shortnames={
