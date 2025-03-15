@@ -5,8 +5,8 @@ requires      = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hyperlight-hyperscale"
-version = "0.5.5"
+name = "hyperscale"
+version = "0.5.6"
 requires-python = ">=3.11"
 description = "Performance testing at scale."
 readme = "README.md"
