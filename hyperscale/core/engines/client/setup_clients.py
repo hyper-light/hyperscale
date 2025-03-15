@@ -1,4 +1,5 @@
 import asyncio
+import re
 import ssl
 from random import randrange
 from typing import Optional, TypeVar
@@ -178,6 +179,7 @@ def setup_client(
         ctx.verify_mode = ssl.CERT_NONE
 
         client._ssl_context = ctx
+        client._OLDSTYLE_AUTH = re.compile(r"auth=(.*)", re.I)
         
         client._semaphore = asyncio.Semaphore(vus)
         client._connections = [

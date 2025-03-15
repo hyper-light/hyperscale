@@ -17,6 +17,7 @@ from email.utils import formatdate
 from email import encoders
 from email.base64mime import body_encode as encode_base64
 from pathlib import Path
+from re import Pattern
 from typing import Literal, Tuple, Callable
 from .protocols import SMTPConnection
 from .protocols.tcp import SMTP_LIMIT
@@ -83,7 +84,7 @@ class MercurySyncSMTPConnection:
 
         self.address_family = address_family
         self.address_protocol = protocol
-        self._OLDSTYLE_AUTH = re.compile(r"auth=(.*)", re.I)
+        self._OLDSTYLE_AUTH: Pattern[str] | None = None
 
         self._ehlo_command = f"ehlo [127.0.0.1]{CRLF}".encode('ascii') 
         self._check_start_tls_command = f"STARTTLS{CRLF}".encode('ascii')
@@ -267,10 +268,10 @@ class MercurySyncSMTPConnection:
 
     async def _execute(
         self,
-        server: str,
+        server: str | URL,
         sender: str,
         recipients: list[str] | str,
-        email: str,
+        email: str | Email,
         auth: tuple[str, str] = None,
     ):
         timings: SMTPTimings = {
@@ -1198,3 +1199,7 @@ class MercurySyncSMTPConnection:
             connection,
             parsed_url,
         )
+
+    def close(self):
+        for connection in self._connections:
+            connection.close()
