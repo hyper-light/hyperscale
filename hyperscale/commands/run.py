@@ -1,15 +1,15 @@
 import asyncio
-import cloudpickle
 import functools
 import json
 import os
 import sys
 
+import cloudpickle
 import psutil
 
 try:
-
     import uvloop
+
     uvloop.install()
 
 except Exception:
@@ -53,11 +53,11 @@ def get_default_config():
     else:
         with open(config_path, "r") as config_file:
             config_data = json.load(config_file)
-            config_data['logs_directory'] = os.path.join(
+            config_data["logs_directory"] = os.path.join(
                 os.getcwd(),
-                'logs',
+                "logs",
             )
-            
+
             config = HyperscaleConfig(**config_data)
 
     return config
