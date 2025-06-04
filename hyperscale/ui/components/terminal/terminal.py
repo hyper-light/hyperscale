@@ -19,6 +19,7 @@ from typing import (
 )
 
 from hyperscale.ui.state import Action, ActionData, SubscriptionSet, observe
+
 try:
     import uvloop as uvloop
     has_uvloop = True
@@ -32,6 +33,7 @@ from .engine_config import EngineConfig
 from .refresh_rate import RefreshRate, RefreshRateMap
 from .section import Section
 from .terminal_protocol import TerminalProtocol, patch_transport_close
+from .writer import Writer
 
 SignalHandlers = Callable[[int], Any] | int | None
 Notification = Callable[[], Awaitable[None]]
@@ -128,7 +130,7 @@ class Terminal:
         self._stdout: io.TextIOBase | None = None
         self._transport: asyncio.Transport | None = None
         self._protocol: asyncio.Protocol | None = None
-        self._writer: asyncio.StreamWriter | None = None
+        self._writer: Writer | None = None
 
         # Maps signals to their default handlers in order to reset
         # custom handlers set by ``sigmap`` at the cleanup phase.
@@ -283,7 +285,7 @@ class Terminal:
 
         self._transport = transport
         self._protocol = protocol
-        self._writer = asyncio.StreamWriter(
+        self._writer = Writer(
             transport,
             protocol,
             None,
@@ -354,7 +356,8 @@ class Terminal:
                 frame = await self.canvas.render()
 
                 frame = f"\033[3J\033[H{frame}\n".encode()
-                await self._loop.run_in_executor(None, self._writer.write, frame)
+                self._writer.write(frame)
+                await self._writer.drain()
 
                 if self._stdout_lock.locked():
                     self._stdout_lock.release()
@@ -371,8 +374,8 @@ class Terminal:
             # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
 
             await self._stdout_lock.acquire()
-
-            await loop.run_in_executor(None, self._writer.write, b"\033[?25h")
+            self._writer.write(b"\033[?25h")
+            await self._writer.drain()
 
             if self._stdout_lock.locked():
                 self._stdout_lock.release()
@@ -381,8 +384,8 @@ class Terminal:
         loop = asyncio.get_event_loop()
         if await self._loop.run_in_executor(None, self._stdout.isatty):
             await self._stdout_lock.acquire()
-            # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
-            await loop.run_in_executor(None, self._writer.write, b"\033[?25l")
+            self._writer.write(b"\033[?25l")
+            await self._writer.drain()
 
             if self._stdout_lock.locked():
                 self._stdout_lock.release()
@@ -392,18 +395,12 @@ class Terminal:
         force: bool = False,
     ):
         if force:
-            await self._loop.run_in_executor(
-                None,
-                self._writer.write,
-                b"\033[2J\033H",
-            )
+            self._writer.write(b"\033[2J\033H")
 
         else:
-            await self._loop.run_in_executor(
-                None,
-                self._writer.write,
-                b"\033[3J\033[H",
-            )
+            self._writer.write(b"\033[3J\033[H")
+        
+        await self._writer.drain()
 
     async def pause(self):
         await self.canvas.pause()
@@ -447,35 +444,35 @@ class Terminal:
     async def stop(self):
         self._stop_time = time.time()
 
+        await self.canvas.stop()
+
         if self._dfl_sigmap:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
 
         self._stop_run.set()
 
+        try:
+            await self._spin_thread
+
+        except Exception:
+            pass
+
         if self._stdout_lock.locked():
             self._stdout_lock.release()
-
-        try:
-            self._spin_thread.set_result(None)
-            await asyncio.sleep(0)
-
-        except Exception:
-            pass
-
-        try:
-            self._run_engine.set_result(None)
-            await asyncio.sleep(0)
-        except Exception:
-            pass
 
         await self._stdout_lock.acquire()
 
         frame = await self.canvas.render()
 
         frame = f"\033[3J\033[H{frame}\n".encode()
+        self._writer.write(frame)
+        await self._writer.drain()
 
-        await self._loop.run_in_executor(None, self._writer.write, frame)
+        try:
+            await self._run_engine
+        except Exception:
+            pass
 
         if self._stdout_lock.locked():
             self._stdout_lock.release()
@@ -512,8 +509,8 @@ class Terminal:
         frame = await self.canvas.render()
 
         frame = f"\033[3J\033[H{frame}\n".encode()
-
-        await self._loop.run_in_executor(None, self._writer.write, frame)
+        self._writer.write(frame)
+        await self._writer.drain()
 
         try:
             self._run_engine.cancel()

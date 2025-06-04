@@ -60,9 +60,22 @@ async def make_smtp_request(
             auth=auth_data,
         )
 
+        import traceback
+        traceback.print_tb(response.error.__traceback__)
+
         if quiet is False:
-            response_text = response.last_smtp_message.decode(response.encoding).replace('\n', ' ')
-            response_status = response.last_smtp_code
+
+            if response.last_smtp_message:
+                response_text = response.last_smtp_message.decode(response.encoding).replace('\n', ' ')
+                response_status = response.last_smtp_code
+
+            elif response.error:
+                response_text = str(response.error)
+                response_status = response.last_smtp_code
+
+            else:
+                response_text = "Failed."
+                response_status = response.last_smtp_code
 
             response_end = response.timings.get('request_end', 0)
             if response_end is None:

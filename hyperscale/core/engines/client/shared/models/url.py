@@ -207,18 +207,23 @@ class URL:
 
         else:
             for port in [587, 465, 25]:
-                self.ip_addresses.extend(
-                    await loop.run_in_executor(
-                        None,
-                        functools.partial(
-                            socket.getaddrinfo,
-                            server, 
-                            port, 
-                            0, 
-                            socket.SOCK_STREAM
+                try:
+
+                    self.ip_addresses.extend(
+                        await loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                socket.getaddrinfo,
+                                server, 
+                                port, 
+                                0, 
+                                socket.SOCK_STREAM
+                            )
                         )
                     )
-                )
+
+                except Exception:
+                    raise Exception(f'Invalid server {server}')
 
     async def lookup(self):
         if self.loop is None:

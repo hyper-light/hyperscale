@@ -60,7 +60,7 @@ class MercurySyncSMTPConnection:
         self._key_path = key_path
         self._ssl_context: ssl.SSLContext | None = None
 
-        self._loop = asyncio.get_event_loop()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
 
         self._dns_lock: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -235,7 +235,6 @@ class MercurySyncSMTPConnection:
                     _,
                     connection,
                     url,
-                    upgrade_ssl,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
@@ -252,7 +251,6 @@ class MercurySyncSMTPConnection:
                     _,
                     connection,
                     url,
-                    _,
                 ) = await asyncio.wait_for(
                     self._connect_to_url_location(url),
                     timeout=self.timeouts.connect_timeout,
@@ -549,7 +547,6 @@ class MercurySyncSMTPConnection:
                 email=email,
                 error=err,
                 timings=timings,
-                encoding=connection.command_encoding,
             )
 
     async def _ehlo(
@@ -784,7 +781,7 @@ class MercurySyncSMTPConnection:
 
             (code, message, err) = await self._get_reply(connection)
             auth_challenge_count = 0
-
+            
         if err:
             return (
                 code,
