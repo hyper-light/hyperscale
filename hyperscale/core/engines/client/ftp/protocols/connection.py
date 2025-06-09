@@ -31,6 +31,10 @@ class FTPConnection:
         "server_name",
         "socket_family",
         "host",
+        "logged_in",
+        "secure",
+        "login_lock",
+        "secure_lock",
     )
 
     def __init__(self, reset_connections: bool = False) -> None:
@@ -58,6 +62,10 @@ class FTPConnection:
         self.server_name: str | None = None
         self.socket_family: int = None
         self.host: str | None = None
+        self._logged_in_locations: dict[str, bool] = {}
+        self._secure_locations: dict[str, bool] = {}
+        self.secure_lock = asyncio.Lock()
+        self.login_lock = asyncio.Lock()
     
     async def make_connection(
         self,

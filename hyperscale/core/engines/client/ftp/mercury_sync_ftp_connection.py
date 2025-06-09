@@ -14,9 +14,9 @@ from hyperscale.core.testing.models import (
     Auth,
     Data
 )
-from .models.ftp import ConnectionType, CRLF
-from .protocols import FTPConnection
-from .protocols.tcp import MAXLINE
+from hyperscale.core.engines.client.ftp.models.ftp import ConnectionType, CRLF
+from hyperscale.core.engines.client.ftp.protocols import FTPConnection
+from hyperscale.core.engines.client.ftp.protocols.tcp import MAXLINE
 
 
 
@@ -65,6 +65,7 @@ class MercurySyncFTPConnection:
 
         self.address_family = address_family
         self.address_protocol = protocol
+        self._is_secured: bool = False
         
         self._227_re = re.compile(
             r'(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)', 
@@ -92,12 +93,11 @@ class MercurySyncFTPConnection:
         ],
         data: str | Data | None = None,
         auth: tuple[str, str, str] = None,
-        options: list[str] = []
+        options: list[str] = [],
+        secure_connection: bool = True,
     ):
         
         control_connection: FTPConnection | None = None
-
-        
         
         try:
             (
@@ -138,13 +138,17 @@ class MercurySyncFTPConnection:
                     err
                 )
             
-            (
-                response,
-                err
-            ) = await self._login(
-                control_connection,
-                auth=auth,
-            )
+            if control_connection.logged_in is False:
+                await control_connection.login_lock.acquire()
+                (
+                    control_connection,
+                    err
+                ) = await self._login(
+                    control_connection,
+                    auth=auth,
+                )
+                
+                control_connection.login_lock.release()
 
             if err:
                 return (
@@ -152,6 +156,22 @@ class MercurySyncFTPConnection:
                     err,
                 )
             
+            if secure_connection and control_connection.secure is False:
+                await control_connection.secure_lock.acquire()
+
+                (
+                    control_connection,
+                    err
+                ) = await self._secure_connection(control_connection)
+            
+                control_connection.secure_lock.release()
+            
+            if err:
+                return (
+                    None,
+                    err,
+                )
+
             result: Any | None = None
 
             match action:
@@ -178,10 +198,17 @@ class MercurySyncFTPConnection:
                     )
 
                 case 'MAKE_DIRECTORY':
-                    pass
+                    (
+                        result,
+                        err,
+                    ) = await self._mkdir(control_connection)
 
                 case 'PWD':
-                    pass
+                    (
+                        control_connection,
+                        result,
+                        err,
+                    ) = await self._pwd(control_connection)
 
                 case 'RECEIVE':
                     pass
@@ -323,9 +350,47 @@ class MercurySyncFTPConnection:
             )
         
         return (
-            response,
+            connection,
             err,
         )
+    
+    async def _secure_connection(
+        self,
+        connection: FTPConnection,
+    ):
+        pbsz_command = b'PBSZ 0'
+        connection.write(pbsz_command + CRLF)
+        (
+            _,
+            err
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                None,
+                err,
+            )
+        
+        prot_p_command = b'PROT P'
+        connection.write(prot_p_command + CRLF)
+        (
+            _,
+            err
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                None,
+                err,
+            )
+        
+        self._is_secured = True
+
+        return (
+            connection,
+            None,
+        )
+
     
     async def _list(
         self,
@@ -394,6 +459,237 @@ class MercurySyncFTPConnection:
             data_connection,
             entries,
             None,
+        )
+    
+    async def _mkdir(
+        self,
+        connection: FTPConnection,
+        path: str,
+    ):
+        mkdir_command = f'MKD {path}'.encode()
+
+        connection.write(mkdir_command + CRLF)
+        (
+            response,
+            err
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                connection,
+                None,
+                err,
+            )
+        
+        if not response[:3] != b'257':
+            return (
+                connection,
+                None,
+                Exception('Unknown error occured during MKD command')
+            )
+        
+
+        elif response[3:5] != b' "':
+            return (
+                connection,
+                b'',
+                None, # Not compliant to RFC 959, but UNIX ftpd does this
+            )
+        
+        dirname = b''
+
+        idx = 5
+        response_length = len(response)
+
+        while idx < response_length:
+            current_char = response[idx]
+            idx = idx+1
+
+            if current_char == b'"':
+                if idx >= response_length or response[idx] != b'"':
+                    break
+
+                idx = idx+1
+
+            dirname = dirname + current_char
+
+        return (
+            connection,
+            dirname,
+            None,
+        )
+    
+    async def _rename(
+        self,
+        connection: FTPConnection,
+        from_name: str,
+        to_name: str,
+    ):
+        rnfr_command = f'RNFR {from_name}'.encode()
+        connection.write(rnfr_command + CRLF)
+
+        (
+            _,
+            err
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                connection,
+                None,
+                err,
+            )
+        
+        rnto_command = f'RNTO {to_name}'.encode()
+        connection.write(rnto_command + CRLF)
+        (
+            response,
+            err
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                connection,
+                None,
+                err,
+            )
+        
+        if response[:1] != b'2':
+            return (
+                connection,
+                None,
+                Exception(response.decode())
+            )
+        
+        return (
+            connection,
+            response,
+            None,
+        )
+    
+    async def _pwd(
+        self,
+        connection: FTPConnection
+    ):
+        pwd_command = b'PWD'
+
+        connection.write(pwd_command + CRLF)
+        (
+            response,
+            err
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                connection,
+                None,
+                err,
+            )
+        
+        if not response[:3] != b'257':
+            return (
+                connection,
+                None,
+                Exception('Unknown error occured during PWD command')
+            )
+        
+
+        elif response[3:5] != b' "':
+            return (
+                connection,
+                b'',
+                None, # Not compliant to RFC 959, but UNIX ftpd does this
+            )
+        
+        dirname = b''
+
+        idx = 5
+        response_length = len(response)
+
+        while idx < response_length:
+            current_char = response[idx]
+            idx = idx+1
+
+            if current_char == b'"':
+                if idx >= response_length or response[idx] != b'"':
+                    break
+
+                idx = idx+1
+
+            dirname = dirname + current_char
+
+        return (
+            connection,
+            dirname,
+            None,
+        )
+        
+    async def _remove_directory(
+        self,
+        connection: FTPConnection,
+        path: str,
+    ):
+        mkdir_command = f'RMD {path}'.encode()
+
+        connection.write(mkdir_command + CRLF)
+        (
+            response,
+            err
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                connection,
+                None,
+                err,
+            )
+        
+        
+        if response[:1] != b'2':
+            return (
+                connection,
+                None,
+                Exception(response.decode())
+            )
+        
+        return (
+            connection,
+            response,
+            None,
+        )
+    
+    async def _remove_file(
+        self,
+        connection: FTPConnection,
+        path: str,
+    ):
+        mkdir_command = f'DELE {path}'.encode()
+
+        connection.write(mkdir_command + CRLF)
+        (
+            response,
+            err
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                connection,
+                None,
+                err,
+            )
+        
+
+        if response[:3] in {b'250', b'200'}:
+            return (
+                connection,
+                response,
+                None,
+            )
+        
+        return (
+            connection,
+            None,
+            Exception(response.decode()),
         )
 
     async def _return(
