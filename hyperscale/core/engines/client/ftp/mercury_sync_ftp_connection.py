@@ -192,7 +192,13 @@ class MercurySyncFTPConnection:
 
             match action:
                 case 'CREATE_ACCOUNT':
-                    pass
+                    (
+                        result,
+                        err,
+                    ) = await self._create_account(
+                        control_connection,
+                        data,
+                    )
                 
                 case 'CHANGE_DIRECTORY':
                     (
@@ -411,7 +417,6 @@ class MercurySyncFTPConnection:
             #   host or country.
             password = password + b'anonymous@'
 
-
         username_command = b'USER ' + username
         connection.write(username_command + CRLF)
         (
@@ -425,7 +430,6 @@ class MercurySyncFTPConnection:
                 err,
             )
         
-
         if response[0] == 51:
             password_command = b'PASS ' + password
             connection.write(password_command + CRLF)
@@ -539,6 +543,30 @@ class MercurySyncFTPConnection:
         return (
             data_connection,
             lines,
+            None,
+        )
+    
+    async def _create_account(
+        self,
+        connection: FTPConnection,
+        password: str,
+    ):
+        command = f'ACCT {password}'
+        connection.write(command + CRLF)
+
+        (
+            result,
+            err
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                None,
+                err,
+            )
+        
+        return (
+            result,
             None,
         )
     
@@ -1008,8 +1036,8 @@ class MercurySyncFTPConnection:
         connection: FTPConnection,
         path: str,
     ):
-        command = f'SIZE {path}{CRLF}'.encode()
-        connection.write(command)
+        command = f'SIZE {path}'.encode()
+        connection.write(command + CRLF)
 
         (
             result,
@@ -1036,8 +1064,7 @@ class MercurySyncFTPConnection:
         self,
         connection: FTPConnection
     ):
-        command = f'QUIT{CRLF}'.encode()
-        connection.write(command)
+        connection.write(b'QUIT' + CRLF)
 
         (
             result,
