@@ -66,6 +66,9 @@ class FTPConnection:
         self._secure_locations: dict[str, bool] = {}
         self.secure_lock = asyncio.Lock()
         self.login_lock = asyncio.Lock()
+
+    async def check_logged_in(self, url: str):
+        pass    
     
     async def make_connection(
         self,

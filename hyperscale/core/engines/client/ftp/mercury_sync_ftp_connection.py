@@ -77,23 +77,39 @@ class MercurySyncFTPConnection:
             re.IGNORECASE | re.ASCII,
         )
 
+    async def close(self) -> Exception:
+        results = await asyncio.gather(*[
+            self._quit(control_connection) for control_connection in self._control_connections
+        ])
+
+        for _, err in results:
+            if err:
+                return err
+
     async def _execute(
         self,
         url: str | URL,
         action: Literal[
+            'CREATE_ACCOUNT',
             'CHANGE_DIRECTORY',
-            'LIST', 
+            'LIST',
+            'LIST_DIRECTORY', 
+            'LIST_DETAILS',
             'MAKE_DIRECTORY',
             'PWD',
-            'RECEIVE', 
+            'RECEIVE_BINARY',
+            'RECEIVE_LINES', 
             'REMOVE_FILE',
             'REMOVE_DIRECTORY',
-            'RENAME_FILE', 
-            'SEND', 
+            'RENAME', 
+            'SEND_BINARY',
+            'SEND_LINES',
+            'SIZE',
         ],
-        data: str | Data | None = None,
+        data: str | tuple[str, str] | Data | None = None,
         auth: tuple[str, str, str] = None,
         options: list[str] = [],
+        chunk_size: int = 8192,
         secure_connection: bool = True,
     ):
         
@@ -175,7 +191,9 @@ class MercurySyncFTPConnection:
             result: Any | None = None
 
             match action:
-
+                case 'CREATE_ACCOUNT':
+                    pass
+                
                 case 'CHANGE_DIRECTORY':
                     (
                         result,
@@ -184,13 +202,35 @@ class MercurySyncFTPConnection:
                         control_connection,
                         data,
                     )
-
+                
                 case 'LIST':
                     (
                         data_connection,
                         result,
                         err
                     ) = await self._list(
+                        control_connection,
+                        url,
+                        data,
+                    )
+
+                case 'LIST_DIRECTORY':
+                    (
+                        data_connection,
+                        result,
+                        err,
+                    ) = await self._list_directory(
+                        control_connection,
+                        url,
+                        data,
+                    )
+
+                case 'LIST_DETAILS':
+                    (
+                        data_connection,
+                        result,
+                        err
+                    ) = await self._list_details(
                         control_connection,
                         url,
                         data,
@@ -201,30 +241,104 @@ class MercurySyncFTPConnection:
                     (
                         result,
                         err,
-                    ) = await self._mkdir(control_connection)
+                    ) = await self._mkdir(
+                        control_connection,
+                        data,
+                    )
 
                 case 'PWD':
                     (
-                        control_connection,
                         result,
                         err,
                     ) = await self._pwd(control_connection)
 
-                case 'RECEIVE':
-                    pass
+                case 'RECEIVE_BINARY':
+                    (
+                        data_connection,
+                        result,
+                        err,
+                    ) = await self._receive_binary(
+                        control_connection,
+                        url,
+                        data,
+                        block_size=chunk_size,
+                    )
+
+                case 'RECEIVE_LINES':
+                    (
+                        data_connection,
+                        result,
+                        err,
+                    ) = await self._receive_lines(
+                        control_connection,
+                        url,
+                        data,
+                        block_size=chunk_size,
+                    )
 
                 case 'REMOVE_FILE':
-                    pass
+                    (
+                        result,
+                        err,
+                    ) = await self._remove_file(
+                        control_connection,
+                        data,
+                    )
 
                 case 'REMOVE_DIRECTORY':
-                    pass
+                    (
+                        result,
+                        err,
+                    ) = await self._remove_directory(
+                        control_connection,
+                        data,
+                    )
 
-                case 'RENAME_FILE':
-                    pass
+                case 'RENAME':
+                    (
+                        result, 
+                        err,
+                    ) = await self._rename(
+                        control_connection,
+                        data[0],
+                        data[1],
+                    )
 
-                case 'SEND':
-                    pass
+                case 'SEND_BINARY':
+                    (
+                        data_connection,
+                        result,
+                        err,
+                    ) = await self._send_binary(
+                        control_connection,
+                        url,
+                        data[0],
+                        data[1],
+                        block_size=chunk_size,
 
+                    )
+                
+                case 'SEND_LINES':
+                    (
+                        data_connection,
+                        result,
+                        err,
+                    ) = await self._send_lines(
+                        control_connection,
+                        url,
+                        data[0],
+                        data[1],
+                        block_size=chunk_size,
+                    )
+
+                case 'SIZE':
+                    (
+                        result,
+                        err,
+                    ) = await self._size(
+                        control_connection,
+                        data,
+                    )
 
                 case _:
                     return (
@@ -390,9 +504,81 @@ class MercurySyncFTPConnection:
             connection,
             None,
         )
-
     
     async def _list(
+        self,
+        connection: FTPConnection,
+        url: FTPUrl,
+        path: str | None = None,
+    ):
+        if path:
+            command = f"NLST {path}".encode()
+        else:
+            command = "NLST".encode()
+
+        (
+            connection,
+            data_connection,
+            lines,
+            err,
+        ) = await self._return(
+            'TYPE A',
+            connection,
+            url,
+            command,
+
+        )
+
+        if err:
+            return (
+                data_connection,
+                None,
+                err,
+            )
+        
+        return (
+            data_connection,
+            lines,
+            None,
+        )
+    
+    async def _list_directory(
+        self,
+        connection: FTPConnection,
+        url: FTPUrl,
+        path: str | None = None,
+    ):
+        if path:
+            command = f"LIST {path}".encode()
+        else:
+            command = "LIST".encode()
+        
+        (
+            connection,
+            data_connection,
+            lines,
+            err,
+        ) = await self._return(
+            'TYPE A',
+            connection,
+            url,
+            command,
+        )
+
+        if err:
+            return (
+                data_connection,
+                None,
+                err,
+            )
+        
+        return (
+            data_connection,
+            lines,
+            None,
+        )
+
+    async def _list_details(
         self,
         connection: FTPConnection,
         url: FTPUrl,
@@ -426,6 +612,7 @@ class MercurySyncFTPConnection:
             command = "MLSD".encode()
 
         (
+            connection,
             data_connection,
             lines,
             err,
@@ -433,8 +620,7 @@ class MercurySyncFTPConnection:
             'TYPE A',
             connection,
             url,
-            command
-
+            command,
         )
 
         if err:
@@ -453,7 +639,9 @@ class MercurySyncFTPConnection:
                 key, _, value = fact.partition(b"=")
                 entry[key.lower()] = value
 
-                entries.append(entry)
+            entries.append(
+                (name, entry),
+            )
 
         return (
             data_connection,
@@ -476,14 +664,12 @@ class MercurySyncFTPConnection:
 
         if err:
             return (
-                connection,
                 None,
                 err,
             )
         
         if not response[:3] != b'257':
             return (
-                connection,
                 None,
                 Exception('Unknown error occured during MKD command')
             )
@@ -491,7 +677,6 @@ class MercurySyncFTPConnection:
 
         elif response[3:5] != b' "':
             return (
-                connection,
                 b'',
                 None, # Not compliant to RFC 959, but UNIX ftpd does this
             )
@@ -514,7 +699,6 @@ class MercurySyncFTPConnection:
             dirname = dirname + current_char
 
         return (
-            connection,
             dirname,
             None,
         )
@@ -535,7 +719,6 @@ class MercurySyncFTPConnection:
 
         if err:
             return (
-                connection,
                 None,
                 err,
             )
@@ -549,20 +732,17 @@ class MercurySyncFTPConnection:
 
         if err:
             return (
-                connection,
                 None,
                 err,
             )
         
         if response[:1] != b'2':
             return (
-                connection,
                 None,
                 Exception(response.decode())
             )
         
         return (
-            connection,
             response,
             None,
         )
@@ -581,14 +761,12 @@ class MercurySyncFTPConnection:
 
         if err:
             return (
-                connection,
                 None,
                 err,
             )
         
         if not response[:3] != b'257':
             return (
-                connection,
                 None,
                 Exception('Unknown error occured during PWD command')
             )
@@ -596,7 +774,6 @@ class MercurySyncFTPConnection:
 
         elif response[3:5] != b' "':
             return (
-                connection,
                 b'',
                 None, # Not compliant to RFC 959, but UNIX ftpd does this
             )
@@ -619,7 +796,6 @@ class MercurySyncFTPConnection:
             dirname = dirname + current_char
 
         return (
-            connection,
             dirname,
             None,
         )
@@ -639,7 +815,6 @@ class MercurySyncFTPConnection:
 
         if err:
             return (
-                connection,
                 None,
                 err,
             )
@@ -647,13 +822,11 @@ class MercurySyncFTPConnection:
         
         if response[:1] != b'2':
             return (
-                connection,
                 None,
                 Exception(response.decode())
             )
         
         return (
-            connection,
             response,
             None,
         )
@@ -673,7 +846,6 @@ class MercurySyncFTPConnection:
 
         if err:
             return (
-                connection,
                 None,
                 err,
             )
@@ -681,15 +853,434 @@ class MercurySyncFTPConnection:
 
         if response[:3] in {b'250', b'200'}:
             return (
-                connection,
                 response,
                 None,
             )
         
         return (
-            connection,
             None,
             Exception(response.decode()),
+        )
+    
+    async def _receive_binary(
+        self,
+        connection: FTPConnection,
+        url: FTPUrl,
+        path: str,
+        block_size: int = 8192,      
+    ):
+        command = f'RETR {path}'.encode()
+
+        (
+            connection,
+            data_connection,
+            data,
+            err,
+        ) = await self._return_binary(
+            connection,
+            url,
+            command,
+            block_size=block_size,
+        )
+
+        if err:
+            return (
+                data_connection,
+                None,
+                err,
+            )
+        
+        return (
+            data_connection,
+            data,
+            None,
+        )
+    
+    async def _receive_lines(
+        self,
+        connection: FTPConnection,
+        url: FTPUrl,
+        path: str,
+        block_size: int = 8192,   
+    ):
+        command = f'RETR {path}'.encode()        
+
+        (
+            connection,
+            data_connection,
+            data,
+            err,
+        ) = await self._return(
+            'TYPE A',
+            connection,
+            url,
+            command,
+            block_size=block_size,
+        )
+
+        if err:
+            return (
+                data_connection,
+                None,
+                err,
+            )
+        
+        return (
+            data_connection,
+            data,
+            None,
+        )
+    
+    async def _send_binary(
+        self,
+        connection: FTPConnection,
+        url: FTPUrl,
+        path: bytes,
+        data: bytes,
+        block_size: int = 8192,
+    ):
+        command = f'STOR {path}'.encode()
+
+        (
+            connection,
+            data_connection,
+            result,
+            err,
+        ) = await self._store_binary(
+            connection,
+            url,
+            command,
+            data,
+            block_size=block_size,
+        )
+
+        if err:
+            return (
+                data_connection,
+                None,
+                err,
+            )
+        
+        return (
+            data_connection,
+            result,
+            None,
+        )
+
+    async def _send_lines(
+        self,
+        connection: FTPConnection,
+        url: FTPUrl,
+        path: bytes,
+        data: bytes,
+        block_size: int = 8192,
+    ):
+        command = f'STOR {path}'.encode()
+
+        (
+            connection,
+            data_connection,
+            result,
+            err,
+        ) = await self._store_lines(
+            connection,
+            url,
+            command,
+            data,
+            block_size=block_size,
+        )
+        
+        if err:
+            return (
+                data_connection,
+                None,
+                err,
+            )
+        
+        return (
+            data_connection,
+            result,
+            None,
+        )
+    
+    async def _size(
+        self,
+        connection: FTPConnection,
+        path: str,
+    ):
+        command = f'SIZE {path}{CRLF}'.encode()
+        connection.write(command)
+
+        (
+            result,
+            err,
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                None,
+                err,
+            )
+        
+        size = 0
+        if result[:3] == b'213':
+            size_bytes = result[3:].strip()
+            size = int(size_bytes)
+
+        return (
+            size,
+            None,
+        )
+    
+    async def _quit(
+        self,
+        connection: FTPConnection
+    ):
+        command = f'QUIT{CRLF}'.encode()
+        connection.write(command)
+
+        (
+            result,
+            err,
+        ) = await self._get_response(connection)
+
+        connection.close()
+
+        if err:
+            return (
+                None,
+                err,
+            )
+        
+        return (
+            result,
+            err,
+        )
+
+
+    async def _store_binary(
+        self,
+        connection: FTPConnection,
+        url: FTPUrl,
+        command: bytes,
+        data: bytes,
+        block_size: int = 8192,
+    ):
+        connection.write(b'TYPE I' + CRLF)
+
+        (
+            _,
+            err
+        ) = await self._get_response(connection)  
+
+        if err:
+            return (
+                connection,
+                None,
+                None,
+                err,
+            )
+        
+        (
+            data_connection,
+            _,
+            err
+        ) = await self._initiate_transfer(
+            connection,
+            url,
+            command,
+        )
+
+        if err:
+            return (
+                connection,
+                data_connection,
+                None,
+                err,
+            )
+
+        total_bytes = len(data)
+        for offset in range(0, total_bytes, block_size):
+            chunk = data[offset: offset + block_size]
+            data_connection.write(chunk)
+
+        (
+            line,
+            err,
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                connection,
+                data_connection,
+                None,
+                err,
+            )
+        
+        if line and line[:1] != b'2':
+            return (
+                connection,
+                data_connection,
+                None,
+                Exception(line.decode())
+            )
+        
+        return (
+            connection,
+            data_connection,
+            line,
+            None,
+        )
+
+    async def _store_lines(
+        self,
+        connection: FTPConnection,
+        url: FTPUrl,
+        command: bytes,
+        data: bytes,
+        block_size: int = 8192,
+    ):
+        connection.write(b'TYPE A' + CRLF)
+
+        (
+            _,
+            err
+        ) = await self._get_response(connection)  
+
+        if err:
+            return (
+                connection,
+                None,
+                None,
+                err,
+            )
+        
+        (
+            data_connection,
+            _,
+            err
+        ) = await self._initiate_transfer(
+            connection,
+            url,
+            command,
+        )
+
+        if err:
+            return (
+                connection,
+                data_connection,
+                None,
+                err,
+            )
+        
+        if data[-2:] != b'\r\n':
+            data = data[:-1] if data[-1] in b'\r\n' else data
+            data += b'\r\n'
+        
+
+        total_bytes = len(data)
+        for offset in range(0, total_bytes, block_size):
+            chunk = data[offset: offset + block_size]
+            data_connection.write(chunk)
+
+        (
+            line,
+            err,
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                connection,
+                data_connection,
+                None,
+                err,
+            )
+        
+        if line and line[:1] != b'2':
+            return (
+                connection,
+                data_connection,
+                None,
+                Exception(line.decode())
+            )
+        
+        return (
+            connection,
+            data_connection,
+            line,
+            None,
+        )   
+    
+    async def _return_binary(
+        self,
+        connection: FTPConnection,
+        url: FTPUrl,
+        command: bytes,
+        block_size: int = 8192,
+    ):
+        connection.write(b'TYPE I' + CRLF)
+
+        (
+            _,
+            err
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                connection,
+                None,
+                None,
+                err,
+            )
+        
+        (
+            data_connection,
+            _,
+            err
+        ) = await self._initiate_transfer(
+            connection,
+            url,
+            command,
+        )
+
+        if err:
+            return (
+                connection,
+                data_connection,
+                None,
+                err,
+            )
+        
+        file_bytes = bytearray()
+        while data := await data_connection.read(block_size):
+            file_bytes.extend(data)
+
+        (
+            line,
+            err,
+        ) = await self._get_response(connection)
+
+        if err:
+            return (
+                connection,
+                data_connection,
+                None,
+                err,
+            )
+        
+        if line and line[:1] != b'2':
+            return (
+                connection,
+                data_connection,
+                None,
+                Exception(line.decode())
+            )
+        
+        return (
+            connection,
+            data_connection,
+            line,
+            None,
         )
 
     async def _return(
@@ -697,7 +1288,7 @@ class MercurySyncFTPConnection:
         return_type: Literal['TYPE A', 'TYPE I'],
         connection: FTPConnection,
         url: FTPUrl,
-        command: str,
+        command: bytes,
         block_size: int = 8192
     ):
         """Retrieve data in line mode.  A new port is created for you.
@@ -721,6 +1312,7 @@ class MercurySyncFTPConnection:
 
         if err:
             return (
+                connection,
                 None,
                 None,
                 err,
@@ -738,10 +1330,12 @@ class MercurySyncFTPConnection:
 
         if err:
             return (
+                connection,
                 data_connection,
                 None,
                 err,
             )
+        
         lines: list[bytes] = []
         raw_bytes = bytearray()
 
@@ -758,6 +1352,7 @@ class MercurySyncFTPConnection:
 
                     if len(line) > MAXLINE:
                         return (
+                            connection,
                             data_connection,
                             None,
                             Exception("got more than %d bytes" % MAXLINE),
@@ -781,8 +1376,6 @@ class MercurySyncFTPConnection:
                 ):
                     raw_bytes.extend(data)
 
-            data_connection.close()
-
             (
                 response,
                 err
@@ -791,6 +1384,7 @@ class MercurySyncFTPConnection:
 
             if err:
                 return (
+                    connection,
                     data_connection,
                     None,
                     err
@@ -798,6 +1392,7 @@ class MercurySyncFTPConnection:
             
             if response[0] != 50:
                 return (
+                    connection,
                     data_connection,
                     None,
                     Exception(response)
@@ -805,12 +1400,14 @@ class MercurySyncFTPConnection:
             
             if return_type == 'TYPE A':
                 return (
+                    connection,
                     data_connection,
                     lines,
                     None,
                 )
             
             return (
+                connection,
                 data_connection,
                 raw_bytes,
                 None,
@@ -818,6 +1415,7 @@ class MercurySyncFTPConnection:
         
         except Exception as err:
             return (
+                connection,
                 data_connection,
                 None,
                 err,
@@ -1051,7 +1649,7 @@ class MercurySyncFTPConnection:
             None,
         )
     
-    async def get_passive_port(
+    async def _get_passive_port(
         self,
         connection: FTPConnection,
         trust_foreign_host: bool = False
