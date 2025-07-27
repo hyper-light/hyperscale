@@ -103,7 +103,9 @@ class MercurySyncFTPConnection:
         self,
         url: str | URL,
         password: str,
+        auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
+        secure_connection: bool = False,
 
     ):
         async with self._semaphore:
@@ -113,7 +115,9 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action='CREATE_ACCOUNT',
+                        auth=auth,
                         data=password,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -129,7 +133,9 @@ class MercurySyncFTPConnection:
         self,
         url: str | URL,
         path: str,
+        auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
             try:
@@ -138,7 +144,9 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action='CHANGE_DIRECTORY',
+                        auth=auth,
                         destination_path=path,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -154,7 +162,9 @@ class MercurySyncFTPConnection:
         self,
         url: str | URL,
         path: str,
+        auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
             try:
@@ -163,7 +173,9 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action='LIST',
+                        auth=auth,
                         destination_path=path,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -179,7 +191,9 @@ class MercurySyncFTPConnection:
         self,
         url: str | URL,
         path: str,
+        auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
             try:
@@ -188,7 +202,9 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action='LIST_DIRECTORY',
+                        auth=auth,
                         destination_path=path,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -204,7 +220,9 @@ class MercurySyncFTPConnection:
         self,
         url: str | URL,
         path: str,
+        auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
             try:
@@ -213,7 +231,9 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action='LIST_DETAILS',
+                        auth=auth,
                         destination_path=path,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -229,7 +249,9 @@ class MercurySyncFTPConnection:
         self,
         url: str | URL,
         path: str,
+        auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
             try:
@@ -238,7 +260,9 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action='MAKE_DIRECTORY',
+                        auth=auth,
                         destination_path=path,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -253,7 +277,9 @@ class MercurySyncFTPConnection:
     async def pwd(
         self,
         url: str | URL,
+        auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
             try:
@@ -262,6 +288,8 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action='PWD',
+                        auth=auth,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -277,9 +305,11 @@ class MercurySyncFTPConnection:
         self,
         url: str | URL,
         path: str,
+        auth: tuple[str, str, str] | None = None,
         filetype: Literal['BINARY', 'LINES'] = 'BINARY',
         chunk_size: int = 8192,
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
 
@@ -293,8 +323,10 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action=action,
+                        auth=auth,
                         destination_path=path,
                         chunk_size=chunk_size,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -310,8 +342,10 @@ class MercurySyncFTPConnection:
         self,
         url: str | URL,
         path: str,
+        auth: tuple[str, str, str] | None = None,
         filetype: Literal['FILE', 'DIRECTORY'] = 'FILE',
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
 
@@ -325,7 +359,9 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action=action,
+                        auth=auth,
                         destination_path=path,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -342,7 +378,9 @@ class MercurySyncFTPConnection:
         url: str | URL,
         from_name: str,
         to_name: str,
+        auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
 
@@ -352,8 +390,10 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action='RENAME',
+                        auth=auth,
                         source_path=from_name,
                         destination_path=to_name,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -370,8 +410,10 @@ class MercurySyncFTPConnection:
         url: str | URL,
         path: str,
         data: str | Data | File | None = None,
+        auth: tuple[str, str, str] | None = None,
         filetype: Literal['BINARY', 'LINES'] = 'BINARY',
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
 
@@ -384,9 +426,11 @@ class MercurySyncFTPConnection:
                 return await asyncio.wait_for(
                     self._execute(
                         url,
+                        auth=auth,
                         destination_path=path,
                         data=data,
                         action=action,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -402,7 +446,9 @@ class MercurySyncFTPConnection:
         self,
         url: str | URL,
         path: str,
+        auth: tuple[str, str, str] | None = None,
         timeout: int | float | None = None,
+        secure_connection: bool = False,
     ):
          async with self._semaphore:
 
@@ -412,7 +458,9 @@ class MercurySyncFTPConnection:
                     self._execute(
                         url,
                         action='SIZE',
+                        auth=auth,
                         destination_path=path,
+                        secure_connection=secure_connection,
                     ),
                     timeout=timeout,
                 )
@@ -579,8 +627,9 @@ class MercurySyncFTPConnection:
                     timings=timings,
                 )
             
-            if control_connection.logged_in is False:
-                await control_connection.login_lock.acquire()
+            await control_connection.login_lock.acquire()
+            if control_connection.check_logged_in(auth) is False:
+                
                 (
                     control_connection,
                     err
@@ -589,7 +638,7 @@ class MercurySyncFTPConnection:
                     auth=auth,
                 )
                 
-                control_connection.login_lock.release()
+            control_connection.login_lock.release()
 
             if err:
                 timings["connect_end"] = time.monotonic()
@@ -603,13 +652,15 @@ class MercurySyncFTPConnection:
                     timings=timings,
                 )
             
-            if secure_connection and control_connection.secure is False:
+            if secure_connection:
                 await control_connection.secure_lock.acquire()
 
-                (
-                    control_connection,
-                    err
-                ) = await self._secure_connection(control_connection)
+                if control_connection.check_is_secure() is False:
+
+                    (
+                        control_connection,
+                        err
+                    ) = await self._secure_connection(control_connection)
             
                 control_connection.secure_lock.release()
             

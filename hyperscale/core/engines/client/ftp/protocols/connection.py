@@ -31,8 +31,8 @@ class FTPConnection:
         "server_name",
         "socket_family",
         "host",
-        "logged_in",
-        "secure",
+        "_current_auth",
+        "_secure_locations",
         "login_lock",
         "secure_lock",
     )
@@ -62,13 +62,31 @@ class FTPConnection:
         self.server_name: str | None = None
         self.socket_family: int = None
         self.host: str | None = None
-        self._logged_in_locations: dict[str, bool] = {}
+        self._current_auth: tuple[
+            str | None, 
+            str | None, 
+            str | None,
+        ] = (None, None, None)
+
         self._secure_locations: dict[str, bool] = {}
         self.secure_lock = asyncio.Lock()
         self.login_lock = asyncio.Lock()
 
-    async def check_logged_in(self, url: str):
-        pass    
+    async def check_logged_in(
+        self,
+        auth: tuple[str, str, str],
+    ):
+        current_user, current_password, current_host = self._current_auth
+        request_user, request_password, request_host = auth
+
+        return (
+            current_user == request_user
+            and current_password == request_password
+            and current_host == request_host 
+        )
+    
+    def check_is_secure(self, url: str):
+        return self._secure_locations.get(url) is not None
     
     async def make_connection(
         self,
