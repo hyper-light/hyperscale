@@ -112,7 +112,7 @@ class MercurySyncSMTPConnection:
                 email_document = self._emails.get(subject)
 
                 if email_document is None:
-                    email_document = await self.create(
+                    email_document = await self.create_email(
                         sender,
                         recipients,
                         subject,
@@ -140,7 +140,7 @@ class MercurySyncSMTPConnection:
                     timings={},
                 )
         
-    async def create(
+    async def create_email(
         self,
         sender: str,
         recipients: str | list[str],
