@@ -11,9 +11,7 @@ from pydantic import (
 
 from hyperscale.core.engines.client.shared.models import (
     CallResult,
-    Cookies,
     RequestType,
-    URLMetadata,
 )
 from hyperscale.core.engines.client.tracing import Span
 
