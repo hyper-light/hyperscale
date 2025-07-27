@@ -1,8 +1,6 @@
-import gzip
 import re
 from typing import Dict, Literal, List, TypeVar, Tuple
 
-import orjson
 from pydantic import (
     BaseModel, 
     StrictStr, 
@@ -13,9 +11,7 @@ from pydantic import (
 
 from hyperscale.core.engines.client.shared.models import (
     CallResult,
-    Cookies,
     RequestType,
-    URLMetadata,
 )
 from hyperscale.core.engines.client.tracing import Span
 

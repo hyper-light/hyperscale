@@ -42,7 +42,7 @@ class MercurySyncPlaywrightConnection:
         pages: int = 1,
         timeouts: Timeouts = Timeouts(),
     ) -> None:
-        self.pool_size = pool_size
+        self._concurrency = pool_size
         self._max_pages = pages
         self.config = {}
         self.context: Optional[BrowserContext] = None
@@ -103,7 +103,7 @@ class MercurySyncPlaywrightConnection:
         self.sessions.extend(
             [
                 BrowserSession(playwright, self._max_pages, self.timeouts)
-                for _ in range(self.pool_size)
+                for _ in range(self._concurrency)
             ]
         )
 

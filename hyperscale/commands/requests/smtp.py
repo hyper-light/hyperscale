@@ -44,7 +44,7 @@ async def make_smtp_request(
         if quiet is False:
             await terminal.render(
                 horizontal_padding=4,
-                vertical_padding=1
+                vertical_padding=1,
             )
 
         recipients_list = recipients.split(',')
@@ -59,9 +59,6 @@ async def make_smtp_request(
             email=email,
             auth=auth_data,
         )
-
-        import traceback
-        traceback.print_tb(response.error.__traceback__)
 
         if quiet is False:
 
@@ -105,7 +102,7 @@ async def make_smtp_request(
                 update_status(response_status),
                 update_text(response_text),
                 update_elapsed(elapsed),
-                update_params({},params),
+                update_params({}, params),
             ]
             
             await asyncio.sleep(0.5)

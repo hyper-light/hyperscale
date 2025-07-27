@@ -1,0 +1,1 @@
+MAXLINE = 8192 # more than 8 times larger than RFC 821, 4.5.3

@@ -1,10 +1,14 @@
 import asyncio
 import re
 import ssl
+from concurrent.futures import ThreadPoolExecutor
 from random import randrange
 from typing import Optional, TypeVar
 
 from hyperscale.core.engines.client.tracing import HTTPTrace
+
+from .ftp import MercurySyncFTPConnection
+from .ftp.protocols import FTPConnection
 from .graphql import MercurySyncGraphQLConnection
 from .graphql_http2 import MercurySyncGraphQLHTTP2Connection
 from .grpc import MercurySyncGRPCConnection
@@ -39,15 +43,43 @@ def setup_client(
     key_path: Optional[str] = None,
     reset_connections: bool = False,
 ) -> T:
-    client._concurrency = vus
-
+    
     if isinstance(
+        client,
+        (
+            MercurySyncFTPConnection,
+        ),
+    ):
+        client._concurrency = vus
+        client.reset_connections = reset_connections
+        client._control_connections = [
+            FTPConnection(
+                reset_connections=reset_connections,
+            ) for _ in range(vus)
+        ]
+
+        client._data_connections = [
+            FTPConnection(
+                reset_connections=reset_connections,
+            ) for _ in range(vus)
+        ]
+
+
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        client._ssl_context = ctx
+        client._semaphore = asyncio.Semaphore(vus)
+
+    elif isinstance(
         client,
         (
             MercurySyncGraphQLConnection,
             MercurySyncHTTPConnection,
         ),
     ):
+        client._concurrency = vus
         client.reset_connections = reset_connections
         client._connections = [
             HTTPConnection(
@@ -77,6 +109,7 @@ def setup_client(
             MercurySyncGraphQLHTTP2Connection,
         ),
     ):
+        client._concurrency = vus
         client._reset_connections = reset_connections
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -116,6 +149,7 @@ def setup_client(
         client._semaphore = asyncio.Semaphore(vus)
 
     elif isinstance(client, MercurySyncGRPCConnection):
+        client._concurrency = vus
         client._reset_connections = reset_connections
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -155,13 +189,14 @@ def setup_client(
         client._semaphore = asyncio.Semaphore(vus)
 
     elif isinstance(client, MercurySyncHTTP3Connection):
+        client._concurrency = vus
         client.reset_connections = reset_connections
 
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        client._udp_ssl_context = ctx
+        client._client_ssl_context = ctx
 
         client._connections = [
             HTTP3Connection(reset_connections=reset_connections) for _ in range(vus)
@@ -170,6 +205,7 @@ def setup_client(
         client._semaphore = asyncio.Semaphore(vus)
 
     elif isinstance(client, MercurySyncPlaywrightConnection):
+        client._concurrency = vus
         client._semaphore = asyncio.Semaphore(vus)
         client._max_pages = pages
 
@@ -183,6 +219,7 @@ def setup_client(
         client._OLDSTYLE_AUTH = re.compile(r"auth=(.*)", re.I)
         
         client._semaphore = asyncio.Semaphore(vus)
+        client._executor = ThreadPoolExecutor(vus)
         client._connections = [
             SMTPConnection(
                 reset_connections=reset_connections,
@@ -190,6 +227,7 @@ def setup_client(
         ]
 
     elif isinstance(client, MercurySyncTCPConnection):
+        client._concurrency = vus
         client.reset_connections = reset_connections
         client._connections = [
             TCPConnection(
@@ -206,6 +244,7 @@ def setup_client(
         client._semaphore = asyncio.Semaphore(vus)
 
     elif isinstance(client, MercurySyncUDPConnection):
+        client._concurrency = vus
         if cert_path is None:
             cert_path = client._cert_path
 
@@ -236,6 +275,7 @@ def setup_client(
         client._semaphore = asyncio.Semaphore(vus)
 
     elif isinstance(client, MercurySyncWebsocketConnection):
+        client._concurrency = vus
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE

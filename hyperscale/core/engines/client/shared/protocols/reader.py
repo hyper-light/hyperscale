@@ -167,11 +167,19 @@ class Reader:
         self._maybe_resume_transport()
         return bytes(chunk)
 
-    async def readline(self):
+    async def readline(
+        self, 
+        num_bytes: int | None = None,
+        exit_on_eof: bool = False,
+    ):
         sep = b"\n"
         seplen = len(sep)
         try:
-            line = await self.readuntil(sep)
+            line = await self.readuntil(
+                sep, 
+                num_bytes=num_bytes,
+                exit_on_eof=exit_on_eof,
+            )
         except asyncio.IncompleteReadError as e:
             return e.partial
         except asyncio.LimitOverrunError as e:
@@ -183,7 +191,12 @@ class Reader:
             raise ValueError(e.args[0])
         return line
 
-    async def readuntil(self, separator=b"\n"):
+    async def readuntil(
+        self, 
+        separator=b"\n",
+        num_bytes: int | None = None,
+        exit_on_eof: bool = False
+    ):
         """Read data from the stream until ``separator`` is found.
         On success, the data and separator will be removed from the
         internal buffer (consumed). Returned data will include the
@@ -246,12 +259,21 @@ class Reader:
                     raise LimitOverrunError(
                         "Separator is not found, and chunk exceed the limit", offset
                     )
+                
+            if num_bytes and len(self._buffer) > num_bytes:
+                chunk = bytes(self._buffer[:num_bytes])
+                self._buffer = self._buffer[num_bytes:]
+
+                return chunk
 
             # Complete message (with full separator) may be present in buffer
             # even when EOF flag is set. This may happen when the last chunk
             # adds data which makes separator be found. That's why we check for
             # EOF *ater* inspecting the buffer.
-            if self._eof:
+            if self._eof and exit_on_eof:
+                return b''
+
+            elif self._eof:
                 chunk = bytes(self._buffer)
                 self._buffer.clear()
                 raise Exception("Connection closed.")
@@ -270,7 +292,7 @@ class Reader:
         self._maybe_resume_transport()
         return bytes(chunk)
 
-    async def read_headers(self, separator=b"\n"):
+    async def read_headers(self, separatchunkor=b"\n"):
         """Read data from the stream until ``separator`` is found.
         On success, the data and separator will be removed from the
         internal buffer (consumed). Returned data will include the

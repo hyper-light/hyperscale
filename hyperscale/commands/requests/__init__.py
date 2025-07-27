@@ -1,3 +1,4 @@
+from .ftp import make_ftp_request as make_ftp_request
 from .graphql import make_graphql_request as make_graphql_request
 from .graphql_http2 import make_graphqlh2_request as make_graphqlh2_request
 from .http import make_http_request as make_http_request

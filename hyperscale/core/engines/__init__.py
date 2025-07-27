@@ -1,3 +1,4 @@
+from .client.ftp import FTPResponse as FTPResponse
 from .client.graphql import GraphQLResponse as GraphQLResponse
 from .client.graphql_http2 import GraphQLHTTP2Response as GraphQLHTTP2Response
 from .client.grpc import GRPCResponse as GRPCResponse
