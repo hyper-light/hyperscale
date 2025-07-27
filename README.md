@@ -227,6 +227,7 @@ Below find a tables of Hyperscale's supported client and reporting options, as w
 
 | Client           | Additional Install Option                                       |  Dependencies                 |
 | -----------      | -----------                                                     |------------                   |
+| FTP              | N/A                                                             | N/A                           |
 | HTTP             | N/A                                                             | N/A                           |
 | HTTP2            | N/A                                                             | N/A                           |
 | HTTP3 (unstable) | pip install hyperscale[http3]                                   | aioquic                       |
