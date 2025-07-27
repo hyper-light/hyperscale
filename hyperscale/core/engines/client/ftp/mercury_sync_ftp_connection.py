@@ -221,6 +221,7 @@ class MercurySyncFTPConnection:
         url: str | URL,
         path: str,
         auth: tuple[str, str, str] | None = None,
+        options: list[str] | None = None,
         timeout: int | float | None = None,
         secure_connection: bool = False,
     ):
@@ -233,6 +234,7 @@ class MercurySyncFTPConnection:
                         action='LIST_DETAILS',
                         auth=auth,
                         destination_path=path,
+                        options=options,
                         secure_connection=secure_connection,
                     ),
                     timeout=timeout,
@@ -555,7 +557,7 @@ class MercurySyncFTPConnection:
         destination_path: str | None = None,
         data: str | Data | None = None,
         auth: tuple[str, str, str] = None,
-        options: list[str] = [],
+        options: list[str] | None = None,
         chunk_size: int = 8192,
         secure_connection: bool = True,
     ):
@@ -1196,7 +1198,7 @@ class MercurySyncFTPConnection:
         connection: FTPConnection,
         url: FTPUrl,
         path: str | None = None,
-        options: list[str] = [],
+        options: list[str] | None = None,
         timings: dict[
             Literal[
                 "request_start",
