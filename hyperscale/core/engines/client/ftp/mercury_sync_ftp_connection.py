@@ -81,7 +81,7 @@ class MercurySyncFTPConnection:
             re.IGNORECASE | re.ASCII,
         )
 
-    async def load(
+    async def load_file(
         self,
         path: str,
     ):
