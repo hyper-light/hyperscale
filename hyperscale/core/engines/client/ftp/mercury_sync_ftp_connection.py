@@ -429,6 +429,9 @@ class MercurySyncFTPConnection:
             self._quit(control_connection) for control_connection in self._control_connections
         ])
 
+        for data_connection in self._data_connections:
+            data_connection.close()
+
         for _, err in results:
             if err:
                 return err
