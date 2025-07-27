@@ -28,6 +28,7 @@ from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from hyperscale.core.testing.models import (
     URL,
     Email,
+    Data,
 )
 from .models.smtp import (
     EmailAttachment,
@@ -208,7 +209,7 @@ class MercurySyncSMTPConnection:
         
     async def _optimize(
         self,
-        optimized_param: URL | Email,
+        optimized_param: URL | Data | Email,
     ):
         if isinstance(optimized_param, URL):
             await self._optimize_url(optimized_param)

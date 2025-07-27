@@ -41,7 +41,7 @@ class Data(OptimizedArg, Generic[T]):
             case RequestType.HTTP | RequestType.HTTP2 | RequestType.WEBSOCKET:
                 self._optimize_http()
 
-            case RequestType.TCP | RequestType.WEBSOCKET:
+            case RequestType.FTP | RequestType.TCP | RequestType.WEBSOCKET:
                 self._optimize_raw()
 
             case _:

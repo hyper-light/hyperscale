@@ -1,5 +1,5 @@
 from pydantic import BaseModel, StrictStr
 
 
-class File(BaseModel):
+class FileValidator(BaseModel):
     path: StrictStr

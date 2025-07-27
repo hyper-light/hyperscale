@@ -14,12 +14,13 @@ from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from hyperscale.core.testing.models import (
     URL,
     Auth,
-    Data
+    Data,
+    File,
 )
 from hyperscale.core.engines.client.ftp.models.ftp import ConnectionType, CRLF
 from hyperscale.core.engines.client.ftp.protocols import FTPConnection
 from hyperscale.core.engines.client.ftp.protocols.tcp import MAXLINE
-from .models.ftp import FTPResponse, FTPActionType, File
+from .models.ftp import FTPResponse, FTPActionType
 
 
 
@@ -368,7 +369,7 @@ class MercurySyncFTPConnection:
         self,
         url: str | URL,
         path: str,
-        data: str | Data | None = None,
+        data: str | Data | File | None = None,
         filetype: Literal['BINARY', 'LINES'] = 'BINARY',
         timeout: int | float | None = None,
     ):
@@ -431,6 +432,53 @@ class MercurySyncFTPConnection:
         for _, err in results:
             if err:
                 return err
+
+    async def _optimize(
+        self,
+        optimized_param: URL | Data | File,
+    ):
+        if isinstance(optimized_param, URL):
+            await self._optimize_url(optimized_param)
+
+        else:
+            self._optimized[optimized_param.call_name] = optimized_param
+
+    async def _optimize_url(self, url: URL):
+        try:
+            upgrade_ssl: bool = False
+            if url:
+                (
+                    _,
+                    connection,
+                    url,
+                ) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+                self._control_connections.append(connection)
+
+            if upgrade_ssl:
+                url.data = url.data.replace("http://", "https://")
+
+                await url.optimize()
+
+                (
+                    _,
+                    connection,
+                    url,
+                ) = await asyncio.wait_for(
+                    self._connect_to_url_location(url),
+                    timeout=self.timeouts.connect_timeout,
+                )
+
+                self._control_connections.append(connection)
+
+            self._url_cache[url.optimized.hostname] = url
+            self._optimized[url.call_name] = url
+
+        except Exception:
+            pass
 
     async def _execute(
         self,
