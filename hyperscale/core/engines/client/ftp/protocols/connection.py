@@ -63,10 +63,10 @@ class FTPConnection:
         self.socket_family: int = None
         self.host: str | None = None
         self._current_auth: tuple[
-            str | None, 
-            str | None, 
-            str | None,
-        ] = (None, None, None)
+            str, 
+            str, 
+            str,
+        ] = ('', '', '')
 
         self._secure_locations: dict[str, bool] = {}
         self.login_lock = asyncio.Lock()
@@ -76,13 +76,13 @@ class FTPConnection:
         self,
         auth: tuple[str, str, str],
     ):
-        current_user, current_password, current_host = self._current_auth
-        request_user, request_password, request_host = auth
+        current_user, current_password, current_account = self._current_auth
+        request_user, request_password, request_account = auth
 
         return (
             current_user == request_user
             and current_password == request_password
-            and current_host == request_host 
+            and current_account == request_account 
         )
     
     def check_is_secure(self, url: str):

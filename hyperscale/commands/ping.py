@@ -156,11 +156,19 @@ async def ping():
     '''
 
 
-@ping.command()
+@ping.command(
+    shortnames={
+        'user': 'U',
+    }
+)
 async def ftp(
     url: str,
     timeout: str = "1m",
     filepath: str = get_default_output_filepath,
+    user: str | None = None,
+    password: str | None = None,
+    account: str | None = None,
+    secure: bool = False,
     lookup: bool = False,
     wait: bool = False,
     quiet: bool = False,
@@ -171,6 +179,9 @@ async def ftp(
     @param url The url to use for the request
     @param timeout The request timeout
     @param filepath Output the request results to the specified filepath
+    @param user The user required by authentication
+    @param password The password associated with the user
+    @param account The account associated with the user
     @param lookup Execute only the IP address lookup and output matches
     @param wait Don't exit once the request completes or fails
     @param quiet Mutes all terminal output
@@ -184,9 +195,15 @@ async def ftp(
         )
     
     timeout_seconds = TimeParser(timeout).time
+    auth: tuple[str, str, str] | None = None
+    if user and password and account:
+        auth = (user, password, account)
+    
 
     return await make_ftp_request(
         url,
+        auth=auth,
+        secure_connection=secure,
         timeout=timeout_seconds,
         output_file=filepath,
         wait=wait,

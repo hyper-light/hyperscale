@@ -15,6 +15,8 @@ from .terminal_ui import (
 async def make_ftp_request(
     url: str,
     timeout: int | float,
+    auth: tuple[str, str, str] | None = None,
+    secure_connection: bool = False,
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
@@ -38,7 +40,11 @@ async def make_ftp_request(
                 vertical_padding=1,
             )
 
-        response = await ftp.pwd(url)
+        response = await ftp.pwd(
+            url,
+            auth=auth,
+            secure_connection=secure_connection,
+        )
 
         if quiet is False:
 
