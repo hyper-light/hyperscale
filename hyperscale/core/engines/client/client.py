@@ -7,6 +7,7 @@ from typing import (
     Unpack,
 )
 
+from .ftp import MercurySyncFTPConnection
 from .graphql import MercurySyncGraphQLConnection
 from .graphql_http2 import MercurySyncGraphQLHTTP2Connection
 from .grpc import MercurySyncGRPCConnection
@@ -31,6 +32,7 @@ class Client(Generic[Unpack[T]]):
 
         self.next_name = None
 
+        self.ftp = MercurySyncFTPConnection()
         self.graphql = MercurySyncGraphQLConnection()
         self.graphqlh2 = MercurySyncGraphQLHTTP2Connection()
         self.grpc = MercurySyncGRPCConnection()

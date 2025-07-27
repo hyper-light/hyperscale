@@ -3,6 +3,7 @@ import ssl
 import re
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from typing import Tuple, Literal, Any
 
@@ -18,7 +19,7 @@ from hyperscale.core.testing.models import (
 from hyperscale.core.engines.client.ftp.models.ftp import ConnectionType, CRLF
 from hyperscale.core.engines.client.ftp.protocols import FTPConnection
 from hyperscale.core.engines.client.ftp.protocols.tcp import MAXLINE
-from .models.ftp import FTPResponse, FTPActionType
+from .models.ftp import FTPResponse, FTPActionType, File
 
 
 
@@ -57,6 +58,7 @@ class MercurySyncFTPConnection:
         self._connections_count: dict[str, list[asyncio.Transport]] = defaultdict(list)
 
         self._semaphore: asyncio.Semaphore = None
+        self._executor: ThreadPoolExecutor | None = None
 
         self._url_cache: dict[str, FTPUrl] = {}
 
@@ -77,6 +79,24 @@ class MercurySyncFTPConnection:
             r"150 .* \((\d+) bytes\)", 
             re.IGNORECASE | re.ASCII,
         )
+
+    async def load(
+        self,
+        path: str,
+    ):
+        return await self._loop.run_in_executor(
+            self._executor,
+            self._upload_file,
+            path,
+        )
+
+    def _upload_file(
+        self,
+        path: str,
+    ):
+        with open(path) as data:
+            return data.read()
+        
 
     async def create_account(
         self,

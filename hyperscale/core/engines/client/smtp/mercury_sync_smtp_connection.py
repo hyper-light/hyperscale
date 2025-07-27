@@ -1,14 +1,13 @@
 import asyncio
 import base64
-import email.charset
+import functools
 import email.utils
-import email.message
-import email.generator
 import hmac
 import re
 import ssl
 import time
 from base64 import encodebytes as _bencode
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -85,6 +84,7 @@ class MercurySyncSMTPConnection:
         self.address_family = address_family
         self.address_protocol = protocol
         self._OLDSTYLE_AUTH: Pattern[str] | None = None
+        self._executor: ThreadPoolExecutor | None = None
 
         self._ehlo_command = f"ehlo [127.0.0.1]{CRLF}".encode('ascii') 
         self._check_start_tls_command = f"STARTTLS{CRLF}".encode('ascii')
@@ -164,9 +164,13 @@ class MercurySyncSMTPConnection:
 
         if attachments:
             attachment_parts = await asyncio.gather(*[
-                self._attach_file(
-                    attachment.path,
-                    mime_type=attachment.mime_type,
+                self._loop.run_in_executor(
+                    self._executor,
+                    functools.partial(
+                        self._attach_file,
+                        attachment.path,
+                        mime_type=attachment.mime_type,
+                    )
                 ) for attachment in attachments
             ])
 
@@ -175,48 +179,33 @@ class MercurySyncSMTPConnection:
 
         return email.as_string()
          
-    async def _attach_file(
+    def _attach_file(
         self,
         filepath: str,
         mime_type: str = 'application/octet-stream'
     ):
-        mime_base, mime_subtype = mime_type.split('/', maxsplit=1)
-        part = MIMEBase(mime_base, mime_subtype)
+        with open(filepath, 'rb') as attachment_file:  
+            mime_base, mime_subtype = mime_type.split('/', maxsplit=1)
+            part = MIMEBase(mime_base, mime_subtype)
 
-        attachment_file = await self._loop.run_in_executor(
-            None,
-            open,
-            filepath,
-            'rb'
-        )
+            part.set_payload(attachment_file.read())
 
-        part.set_payload(
-            await self._loop.run_in_executor(
-                None,
-                attachment_file.read
+            encoders.encode_base64(part)
+
+            orig = part.get_payload(decode=True)
+            encdata = str(_bencode(orig), 'ascii')
+            part.set_payload(encdata)
+            part['Content-Transfer-Encoding'] = 'base64'
+
+            path = Path(filepath)
+
+            part.add_header(
+                'Content-Disposition',
+                f'attachment; filename={path.name}'
             )
-        )
 
-        encoders.encode_base64(part)
-
-        orig = part.get_payload(decode=True)
-        encdata = str(_bencode(orig), 'ascii')
-        part.set_payload(encdata)
-        part['Content-Transfer-Encoding'] = 'base64'
-
-        path = await self._loop.run_in_executor(
-            None,
-            Path,
-            filepath
-        )
-
-        part.add_header(
-            'Content-Disposition',
-            f'attachment; filename={path.name}'
-        )
-
-        return part
-    
+            return part
+        
     async def _optimize(
         self,
         optimized_param: URL | Email,
@@ -1198,5 +1187,9 @@ class MercurySyncSMTPConnection:
         )
 
     def close(self):
+
+        if self._executor:
+            self._executor.shutdown(cancel_futures=True)
+
         for connection in self._connections:
             connection.close()
