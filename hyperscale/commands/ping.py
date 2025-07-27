@@ -4,6 +4,7 @@ from ipaddress import IPv4Address, IPv6Address
 from typing import Literal, Any
 from hyperscale.core.engines.client.time_parser import TimeParser
 from .requests import (
+    make_ftp_request,
     make_graphql_request,
     make_graphqlh2_request,
     make_http_request,
@@ -155,6 +156,45 @@ async def ping():
     '''
 
 
+@ping.command()
+async def ftp(
+    url: str,
+    timeout: str = "1m",
+    filepath: str = get_default_output_filepath,
+    lookup: bool = False,
+    wait: bool = False,
+    quiet: bool = False,
+):
+    '''
+    Run a one-off GraphQL request
+
+    @param url The url to use for the request
+    @param timeout The request timeout
+    @param filepath Output the request results to the specified filepath
+    @param lookup Execute only the IP address lookup and output matches
+    @param wait Don't exit once the request completes or fails
+    @param quiet Mutes all terminal output
+    '''
+    
+    if lookup:
+        return await lookup_url(
+            url,
+            wait=wait,
+            quiet=quiet,
+        )
+    
+    timeout_seconds = TimeParser(timeout).time
+
+    return await make_ftp_request(
+        url,
+        timeout=timeout_seconds,
+        output_file=filepath,
+        wait=wait,
+        quiet=quiet,
+
+    )
+
+
 @ping.command(
     shortnames={
         'headers': 'H',
@@ -203,7 +243,6 @@ async def graphql(
         )
     
     timeout_seconds = TimeParser(timeout).time
-
     method_name = method.data.lower()
     
     return await make_graphql_request(
@@ -268,7 +307,6 @@ async def graphqlh2(
         )
     
     timeout_seconds = TimeParser(timeout).time
-
     method_name = method.data.lower()
     
     return await make_graphqlh2_request(
@@ -342,7 +380,6 @@ async def http(
         )
     
     timeout_seconds = TimeParser(timeout).time
-
     method_name = method.data.lower()
     
     try:
@@ -430,7 +467,6 @@ async def http2(
         )
     
     timeout_seconds = TimeParser(timeout).time
-
     method_name = method.data.lower()
     
     return await make_http2_request(
@@ -509,7 +545,6 @@ async def http3(
         )
     
     timeout_seconds = TimeParser(timeout).time
-
     method_name = method.data.lower()
     
     return await make_http3_request(
@@ -633,7 +668,6 @@ async def tcp(
         )
     
     timeout_seconds = TimeParser(timeout).time
-
     method_name = method.data.lower()
     
     return await make_tcp_request(
@@ -688,7 +722,6 @@ async def udp(
         )
     
     timeout_seconds = TimeParser(timeout).time
-
     method_name = method.data.lower()
     
     return await make_udp_request(
@@ -766,7 +799,6 @@ async def websocket(
         )
     
     timeout_seconds = TimeParser(timeout).time
-
     method_name = method.data.lower()
     
     return await make_websocket_request(
