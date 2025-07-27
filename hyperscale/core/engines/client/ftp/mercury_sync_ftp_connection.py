@@ -507,13 +507,12 @@ class MercurySyncFTPConnection:
         options: list[str] = [],
         chunk_size: int = 8192,
         secure_connection: bool = True,
+    ):
         timings: dict[
             Literal[
                 "request_start",
                 "connect_start",
                 "connect_end",
-                "data_connect_start",
-                "data_connect_end",
                 "write_start",
                 "write_end",
                 "read_start",
@@ -521,8 +520,17 @@ class MercurySyncFTPConnection:
                 "request_end",
             ],
             float | None,
-        ] = None,
-    ):
+        ] = {
+            "request_start": None,
+            "connect_start": None,
+            "connect_end": None,
+            "write_start": None,
+            "write_end": None,
+            "read_start": None,
+            "read_end": None,
+            "request_end": None,
+        }
+        timings["request_start"] = time.monotonic()
         
         control_connection: FTPConnection | None = None
         data_connection: FTPConnection | None = None
@@ -795,7 +803,9 @@ class MercurySyncFTPConnection:
                         None,
                         Exception('Unsupported action')
                     )
-                
+              
+            timings["request_end"] = time.monotonic()  
+
             if data_connection:
                 self._data_connections.append(
                     FTPConnection(reset_connections=self.reset_connections)
@@ -818,6 +828,8 @@ class MercurySyncFTPConnection:
             )
         
         except Exception as err:
+            timings["request_end"] = time.monotonic()
+            
             if data_connection:
                 self._data_connections.append(
                     FTPConnection(reset_connections=self.reset_connections)
