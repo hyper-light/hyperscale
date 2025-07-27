@@ -150,7 +150,7 @@ class MercurySyncFTPConnection:
                     timings={},
                 )
     
-    async def list(
+    async def list_path(
         self,
         url: str | URL,
         path: str,
