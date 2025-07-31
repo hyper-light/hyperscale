@@ -1,5 +1,6 @@
 import asyncio
 import posixpath
+import sys
 from pathlib import PurePath
 from typing import (
     Optional, 
@@ -8,71 +9,68 @@ from typing import (
     AsyncIterator,
     overload,
     cast,
+    Callable,
+    Awaitable,
 )
-from .record import Record
+from .async_context_manager import async_context_manager
+from .config import SFTPLimits, SFTPName
+from .constants import (
+    ACE4_READ_DATA,
+    ACE4_READ_ATTRIBUTES,
+    ACE4_APPEND_DATA,
+    FILEXFER_ATTR_DEFINED_V4,
+    FILEXFER_TYPE_DIRECTORY,
+    FILEXFER_TYPE_REGULAR,
+    FILEXFER_TYPE_SYMLINK,
+    FILEXFER_TYPE_UNKNOWN,
+    FXF_READ,
+    FXF_APPEND,
+    FXF_OPEN_EXISTING,
+    FXF_APPEND_DATA,
+    FXRP_NO_CHECK,
+    FXRP_STAT_IF_EXISTS,
+    MAX_SFTP_REQUESTS,
+    MAX_SFTP_READ_LEN,
+)
+from .error import (
+    SFTPEOFError,
+    SFTPFailure,
+    SFTPFileAlreadyExists,
+    SFTPFileIsADirectory,
+    SFTPNoSuchFile,
+    SFTPNoSuchPath,
+    SFTPNotADirectory,
+    SFTPOpUnsupported,
+
+    SFTPPermissionDenied,
+)
+from .files import mode_to_pflags
+from .local_fs import LocalFS
+from .sftp_attrs import (
+    SFTPAttrs,
+    valid_attr_flags,
+    utime_to_attrs,
+)
+from .sftp_client_file import SFTPClientFile
+from .sftp_glob import SFTPGlob
+from .sftpfs_protocol import SFTPFSProtocol
+from .sftpvfs_attrs import SFTPVFSAttrs
+from .sftp_io import SFTPFileCopier
+from .types import (
+    SFTPPath,
+    SFTPErrorHandler,
+    SFTPProgressHandler,
+    SFTPOnErrorHandler,
+)
+from .units import (
+    tuple_to_float_sec,
+    tuple_to_nsec,
+)
+
+SFTPStatFunc = Callable[[SFTPPath], Awaitable['SFTPAttrs']]
+SFTPClientFileOrPath = SFTPClientFile | SFTPPath
 
 
-class SFTPLimits(Record):
-    """SFTP server limits
-
-       SFTPLimits is a simple record class with the following fields:
-
-         ================= ========================================= ======
-         Field             Description                               Type
-         ================= ========================================= ======
-         max_packet_len    Max allowed size of an SFTP packet        uint64
-         max_read_len      Max allowed size of an SFTP read request  uint64
-         max_write_len     Max allowed size of an SFTP write request uint64
-         max_open_handles  Max allowed number of open file handles   uint64
-         ================= ========================================= ======
-
-    """
-
-    max_packet_len: int
-    max_read_len: int
-    max_write_len: int
-    max_open_handles: int
-
-    def encode(self) -> bytes:
-        """Encode SFTP server limits in an SSH packet"""
-
-        return (UInt64(self.max_packet_len) + UInt64(self.max_read_len) +
-                UInt64(self.max_write_len) + UInt64(self.max_open_handles))
-    
-
-
-class SFTPName(Record):
-    """SFTP file name and attributes
-
-       SFTPName is a simple record class with the following fields:
-
-         ========= ================================== ==================
-         Field     Description                        Type
-         ========= ================================== ==================
-         filename  Filename                           `str` or `bytes`
-         longname  Expanded form of filename & attrs  `str` or `bytes`
-         attrs     File attributes                    :class:`SFTPAttrs`
-         ========= ================================== ==================
-
-       A list of these is returned by :meth:`readdir() <SFTPClient.readdir>`
-       in :class:`SFTPClient` when retrieving the contents of a directory.
-
-    """
-
-    filename: bytes | str = ''
-    longname: bytes | str = ''
-    attrs: SFTPAttrs = SFTPAttrs()
-
-    def _format(self, k: str, v: object) -> Optional[str]:
-        """Convert name fields to more readable values"""
-
-        if k == 'longname' and not v:
-            return None
-
-        if isinstance(v, bytes):
-            v = v.decode('utf-8', 'backslashreplace')
-
-        return str(v) or None
 
 class SFTPClient:
     """SFTP client
@@ -84,12 +82,17 @@ class SFTPClient:
 
     """
 
-    def __init__(self, handler: SFTPClientHandler,
-                 path_encoding: Optional[str], path_errors: str):
+    def __init__(
+        self,
+        handler: SFTPClientHandler,
+        path_encoding: str | None, 
+        path_errors: str,
+    ):
         self._handler = handler
         self._path_encoding = path_encoding
         self._path_errors = path_errors
-        self._cwd: Optional[bytes] = None
+        self._cwd: bytes | None = None
+        self.local_fs = LocalFS()
 
     @property
     def version(self) -> int:
@@ -150,7 +153,7 @@ class SFTPClient:
         return path
 
     def compose_path(self, path: bytes | str | PurePath,
-                     parent: Optional[bytes] = None) -> bytes:
+                     parent: bytes | None = None) -> bytes:
         """Compose a path
 
            If parent is not specified, return a path relative to the
@@ -165,8 +168,11 @@ class SFTPClient:
 
         return posixpath.join(parent, path) if parent else path
 
-    async def _type(self, path: bytes | str | PurePath,
-                    statfunc: Optional[_SFTPStatFunc] = None) -> int:
+    async def _type(
+        self, 
+        path: bytes | str | PurePath,
+        statfunc: SFTPStatFunc | None = None,
+    ) -> int:
         """Return the file type of a remote path, or FILEXFER_TYPE_UNKNOWN
            if it can't be accessed"""
 
@@ -178,13 +184,23 @@ class SFTPClient:
         except (SFTPNoSuchFile, SFTPNoSuchPath, SFTPPermissionDenied):
             return FILEXFER_TYPE_UNKNOWN
 
-    async def _copy(self, srcfs: _SFTPFSProtocol, dstfs: _SFTPFSProtocol,
-                    srcpath: bytes, dstpath: bytes, srcattrs: SFTPAttrs,
-                    preserve: bool, recurse: bool, follow_symlinks: bool,
-                    sparse: bool, block_size: int, max_requests: int,
-                    progress_handler: SFTPProgressHandler,
-                    error_handler: ExceptionHandler,
-                    remote_only: bool) -> None:
+    async def _copy(
+        self,
+        srcfs: SFTPFSProtocol,
+        dstfs: SFTPFSProtocol,
+        srcpath: bytes,
+        dstpath: bytes,
+        srcattrs: SFTPAttrs,
+        preserve: bool,
+        recurse: bool,
+        follow_symlinks: bool,
+        sparse: bool,
+        block_size: int,
+        max_requests: int,
+        progress_handler: SFTPProgressHandler,
+        error_handler: SFTPErrorHandler,
+        remote_only: bool,
+    ) -> None:
         """Copy a file, directory, or symbolic link"""
 
         try:
@@ -201,9 +217,6 @@ class SFTPClient:
 
                     raise exc(srcpath.decode('utf-8', 'backslashreplace') +
                               ' is a directory')
-
-                self.logger.info('  Starting copy of directory %s to %s',
-                                 srcpath, dstpath)
 
                 if not await dstfs.isdir(dstpath):
                     await dstfs.mkdir(dstpath)
@@ -223,23 +236,16 @@ class SFTPClient:
                                      max_requests, progress_handler,
                                      error_handler, remote_only)
 
-                self.logger.info('  Finished copy of directory %s to %s',
-                                 srcpath, dstpath)
-
             elif filetype == FILEXFER_TYPE_SYMLINK:
                 targetpath = await srcfs.readlink(srcpath)
 
-                self.logger.info('  Copying symlink %s to %s', srcpath, dstpath)
-                self.logger.info('    Target path: %s', targetpath)
-
                 await dstfs.symlink(targetpath, dstpath)
             else:
-                self.logger.info('  Copying file %s to %s', srcpath, dstpath)
 
                 if remote_only and not self.supports_remote_copy:
                     raise SFTPOpUnsupported('Remote copy not supported')
 
-                await _SFTPFileCopier(block_size, max_requests,
+                await SFTPFileCopier(block_size, max_requests,
                                       srcattrs.size or 0, sparse,
                                       srcfs, dstfs, srcpath, dstpath,
                                       progress_handler).run()
@@ -257,9 +263,8 @@ class SFTPClient:
                                         follow_symlinks=follow_symlinks or
                                         filetype != FILEXFER_TYPE_SYMLINK)
 
-                    self.logger.info('    Preserved attrs: %s', attrs)
                 except SFTPOpUnsupported:
-                    self.logger.info('    Preserving symlink attrs unsupported')
+                    pass
 
         except (OSError, Exception) as exc:
             setattr(exc, 'srcpath', srcpath)
@@ -270,14 +275,24 @@ class SFTPClient:
             else:
                 raise
 
-    async def _begin_copy(self, srcfs: _SFTPFSProtocol, dstfs: _SFTPFSProtocol,
-                          srcpaths: bytes | str | PurePath, dstpath: Optional[bytes | str | PurePath],
-                          copy_type: str, expand_glob: bool, preserve: bool,
-                          recurse: bool, follow_symlinks: bool, sparse: bool,
-                          block_size: int, max_requests: int,
-                          progress_handler: SFTPProgressHandler,
-                          error_handler: ExceptionHandler,
-                          remote_only: bool = False) -> None:
+    async def _begin_copy(
+        self, 
+        srcfs: SFTPFSProtocol,
+        dstfs: SFTPFSProtocol,
+        srcpaths: SFTPPath,
+        dstpath: Optional[SFTPPath],
+        copy_type: str,
+        expand_glob: bool,
+        preserve: bool,
+        recurse: bool,
+        follow_symlinks: bool,
+        sparse: bool,
+        block_size: int,
+        max_requests: int,
+        progress_handler: SFTPProgressHandler,
+        error_handler: SFTPErrorHandler,
+        remote_only: bool = False,
+    ) -> None:
         """Begin a new file upload, download, or copy"""
 
         if block_size <= 0:
@@ -292,10 +307,8 @@ class SFTPClient:
         elif not isinstance(srcpaths, list):
             srcpaths = list(srcpaths)
 
-        self.logger.info('Starting SFTP %s of %s to %s',
-                         copy_type, srcpaths, dstpath)
 
-        srcnames: List[SFTPName] = []
+        srcnames: list[SFTPName] = []
 
         if expand_glob:
             glob = SFTPGlob(srcfs, len(srcpaths) > 1)
@@ -313,7 +326,7 @@ class SFTPClient:
         if dstpath:
             dstpath = dstfs.encode(dstpath)
 
-        dstpath: Optional[bytes]
+        dstpath: bytes | None
 
         dst_isdir = dstpath is None or (await dstfs.isdir(dstpath))
 
@@ -335,18 +348,37 @@ class SFTPClient:
             else:
                 dstfile = dstpath
 
-            await self._copy(srcfs, dstfs, srcfile, dstfile, srcname.attrs,
-                             preserve, recurse, follow_symlinks, sparse,
-                             block_size, max_requests, progress_handler,
-                             error_handler, remote_only)
+            await self._copy(
+                srcfs,
+                dstfs,
+                srcfile,
+                dstfile,
+                srcname.attrs,
+                preserve,
+                recurse,
+                follow_symlinks,
+                sparse,
+                block_size,
+                max_requests,
+                progress_handler,
+                error_handler,
+                remote_only,
+            )
 
-    async def get(self, remotepaths: bytes | str | PurePath,
-                  localpath: Optional[bytes | str | PurePath] = None, *,
-                  preserve: bool = False, recurse: bool = False,
-                  follow_symlinks: bool = False, sparse: bool = True,
-                  block_size: int = -1, max_requests: int = -1,
-                  progress_handler: SFTPProgressHandler = None,
-                  error_handler: ExceptionHandler = None) -> None:
+    async def get(
+        self,
+        remotepaths: SFTPPath,
+        localpath: Optional[SFTPPath] = None,
+        *,
+        preserve: bool = False,
+        recurse: bool = False,
+        follow_symlinks: bool = False,
+        sparse: bool = True,
+        block_size: int = -1,
+        max_requests: int = -1,
+        progress_handler: SFTPProgressHandler = None,
+        error_handler: SFTPErrorHandler = None,
+    ) -> None:
         """Download remote files
 
            This method downloads one or more files or directories from
@@ -446,18 +478,37 @@ class SFTPClient:
 
         """
 
-        await self._begin_copy(self, local_fs, remotepaths, localpath, 'get',
-                               False, preserve, recurse, follow_symlinks,
-                               sparse, block_size, max_requests,
-                               progress_handler, error_handler)
+        await self._begin_copy(
+            self,
+            self.local_fs,
+            remotepaths,
+            localpath,
+            'get',
+            False,
+            preserve,
+            recurse,
+            follow_symlinks,
+            sparse,
+            block_size,
+            max_requests,
+            progress_handler,
+            error_handler,
+        )
 
-    async def put(self, localpaths: bytes | str | PurePath,
-                  remotepath: Optional[bytes | str | PurePath] = None, *,
-                  preserve: bool = False, recurse: bool = False,
-                  follow_symlinks: bool = False, sparse: bool = True,
-                  block_size: int = -1, max_requests: int = -1,
-                  progress_handler: SFTPProgressHandler = None,
-                  error_handler: ExceptionHandler = None) -> None:
+    async def put(
+        self,
+        localpaths: SFTPPath,
+        remotepath: Optional[SFTPPath] = None,
+        *,
+        preserve: bool = False,
+        recurse: bool = False,
+        follow_symlinks: bool = False,
+        sparse: bool = True,
+        block_size: int = -1,
+        max_requests: int = -1,
+        progress_handler: SFTPProgressHandler = None,
+        error_handler: SFTPErrorHandler = None,
+    ) -> None:
         """Upload local files
 
            This method uploads one or more files or directories to the
@@ -557,19 +608,38 @@ class SFTPClient:
 
         """
 
-        await self._begin_copy(local_fs, self, localpaths, remotepath, 'put',
-                               False, preserve, recurse, follow_symlinks,
-                               sparse, block_size, max_requests,
-                               progress_handler, error_handler)
+        await self._begin_copy(
+            self.local_fs,
+            self,
+            localpaths,
+            remotepath,
+            'put',
+            False,
+            preserve,
+            recurse,
+            follow_symlinks,
+            sparse,
+            block_size,
+            max_requests,
+            progress_handler,
+            error_handler,
+        )
 
-    async def copy(self, srcpaths: bytes | str | PurePath,
-                   dstpath: Optional[bytes | str | PurePath] = None, *,
-                   preserve: bool = False, recurse: bool = False,
-                   follow_symlinks: bool = False, sparse: bool = True,
-                   block_size: int = -1, max_requests: int = -1,
-                   progress_handler: SFTPProgressHandler = None,
-                   error_handler: ExceptionHandler = None,
-                   remote_only: bool = False) -> None:
+    async def copy(
+        self,
+        srcpaths: SFTPPath,
+        dstpath: Optional[SFTPPath] = None,
+        *,
+        preserve: bool = False,
+        recurse: bool = False,
+        follow_symlinks: bool = False,
+        sparse: bool = True,
+        block_size: int = -1,
+        max_requests: int = -1,
+        progress_handler: SFTPProgressHandler = None,
+        error_handler: SFTPErrorHandler = None,
+        remote_only: bool = False,
+    ) -> None:
         """Copy remote files to a new location
 
            This method copies one or more files or directories on the
@@ -683,7 +753,7 @@ class SFTPClient:
                    follow_symlinks: bool = False, sparse: bool = True,
                    block_size: int = -1, max_requests: int = -1,
                    progress_handler: SFTPProgressHandler = None,
-                   error_handler: ExceptionHandler = None) -> None:
+                   error_handler: SFTPErrorHandler = None) -> None:
         """Download remote files with glob pattern match
 
            This method downloads files and directories from the remote
@@ -695,7 +765,7 @@ class SFTPClient:
 
         """
 
-        await self._begin_copy(self, local_fs, remotepaths, localpath, 'mget',
+        await self._begin_copy(self, self.local_fs, remotepaths, localpath, 'mget',
                                True, preserve, recurse, follow_symlinks,
                                sparse, block_size, max_requests,
                                progress_handler, error_handler)
@@ -706,7 +776,7 @@ class SFTPClient:
                    follow_symlinks: bool = False, sparse: bool = True,
                    block_size: int = -1, max_requests: int = -1,
                    progress_handler: SFTPProgressHandler = None,
-                   error_handler: ExceptionHandler = None) -> None:
+                   error_handler: SFTPErrorHandler = None) -> None:
         """Upload local files with glob pattern match
 
            This method uploads files and directories to the remote
@@ -718,7 +788,7 @@ class SFTPClient:
 
         """
 
-        await self._begin_copy(local_fs, self, localpaths, remotepath, 'mput',
+        await self._begin_copy(self.local_fs, self, localpaths, remotepath, 'mput',
                                True, preserve, recurse, follow_symlinks,
                                sparse, block_size, max_requests,
                                progress_handler, error_handler)
@@ -729,7 +799,7 @@ class SFTPClient:
                     follow_symlinks: bool = False, sparse: bool = True,
                     block_size: int = -1, max_requests: int = -1,
                     progress_handler: SFTPProgressHandler = None,
-                    error_handler: ExceptionHandler = None,
+                    error_handler: SFTPErrorHandler = None,
                     remote_only: bool = False) -> None:
         """Copy remote files with glob pattern match
 
@@ -747,8 +817,8 @@ class SFTPClient:
                                sparse, block_size, max_requests,
                                progress_handler, error_handler, remote_only)
 
-    async def remote_copy(self, src: _SFTPClientFileOrPath,
-                          dst: _SFTPClientFileOrPath, src_offset: int = 0,
+    async def remote_copy(self, src: SFTPClientFileOrPath,
+                          dst: SFTPClientFileOrPath, src_offset: int = 0,
                           src_length: int = 0, dst_offset: int = 0) -> None:
         """Copy data between remote files
 
@@ -787,7 +857,7 @@ class SFTPClient:
                                       dst.handle, dst_offset)
 
     async def glob(self, patterns: bytes | str | PurePath,
-                   error_handler: ExceptionHandler = None) -> \
+                   error_handler: SFTPErrorHandler = None) -> \
             Sequence[str | bytes]:
         """Match remote files against glob patterns
 
@@ -834,7 +904,7 @@ class SFTPClient:
                 await self.glob_sftpname(patterns, error_handler)]
 
     async def glob_sftpname(self, patterns: bytes | str | PurePath,
-                            error_handler: ExceptionHandler = None) -> \
+                            error_handler: SFTPErrorHandler = None) -> \
             Sequence[SFTPName]:
         """Match glob patterns and return SFTPNames
 
@@ -847,7 +917,7 @@ class SFTPClient:
             patterns = [patterns]
 
         glob = SFTPGlob(self, len(patterns) > 1)
-        matches: List[SFTPName] = []
+        matches: list[SFTPName] = []
 
         for pattern in patterns:
             new_matches = await glob.match(self.encode(pattern),
@@ -923,7 +993,7 @@ class SFTPClient:
                       ' already exists')
 
     async def rmtree(self, path: bytes | str | PurePath, ignore_errors: bool = False,
-                     onerror: _SFTPOnErrorHandler = None) -> None:
+                     onerror: SFTPOnErrorHandler = None) -> None:
         """Recursively delete a directory tree
 
            This method removes all the files in a directory tree.
@@ -1011,7 +1081,7 @@ class SFTPClient:
         assert onerror is not None
 
         path = self.encode(path)
-        sem = asyncio.Semaphore(_MAX_SFTP_REQUESTS)
+        sem = asyncio.Semaphore(MAX_SFTP_REQUESTS)
 
         try:
             if await self.islink(path):
@@ -1025,9 +1095,9 @@ class SFTPClient:
 
     @async_context_manager
     async def open(self, path: bytes | str | PurePath,
-                   pflags_or_mode: Union[int, str] = FXF_READ,
+                   pflags_or_mode: int | str = FXF_READ,
                    attrs: SFTPAttrs = SFTPAttrs(),
-                   encoding: Optional[str] = 'utf-8', errors: str = 'strict',
+                   encoding: str | None = 'utf-8', errors: str = 'strict',
                    block_size: int = -1,
                    max_requests: int = -1) -> SFTPClientFile:
         """Open a remote file
@@ -1142,7 +1212,7 @@ class SFTPClient:
         """
 
         if isinstance(pflags_or_mode, str):
-            pflags, binary = _mode_to_pflags(pflags_or_mode)
+            pflags, binary = mode_to_pflags(pflags_or_mode)
 
             if binary:
                 encoding = None
@@ -1161,7 +1231,7 @@ class SFTPClient:
                                            ACE4_READ_ATTRIBUTES,
                      flags: int = FXF_OPEN_EXISTING,
                      attrs: SFTPAttrs = SFTPAttrs(),
-                     encoding: Optional[str] = 'utf-8', errors: str = 'strict',
+                     encoding: str | None = 'utf-8', errors: str = 'strict',
                      block_size: int = -1,
                      max_requests: int = -1) -> SFTPClientFile:
         """Open a remote file using SFTP v5/v6 flags
@@ -1455,8 +1525,8 @@ class SFTPClient:
                            follow_symlinks=follow_symlinks)
 
     async def utime(self, path: bytes | str | PurePath,
-                    times: Optional[Tuple[float, float]] = None,
-                    ns: Optional[Tuple[int, int]] = None, *,
+                    times: Optional[tuple[float, float]] = None,
+                    ns: Optional[tuple[int, int]] = None, *,
                     follow_symlinks: bool = True) -> None:
         """Change the timestamps of a remote file, directory, or symlink
 
@@ -1486,7 +1556,7 @@ class SFTPClient:
 
         """
 
-        await self.setstat(path, _utime_to_attrs(times, ns),
+        await self.setstat(path, utime_to_attrs(times, ns),
                            follow_symlinks=follow_symlinks)
 
     async def exists(self, path: bytes | str | PurePath) -> bool:
@@ -1516,7 +1586,7 @@ class SFTPClient:
         return await self._type(path, statfunc=self.lstat) != \
             FILEXFER_TYPE_UNKNOWN
 
-    async def getatime(self, path: bytes | str | PurePath) -> Optional[float]:
+    async def getatime(self, path: bytes | str | PurePath) -> float | None:
         """Return the last access time of a remote file or directory
 
            :param path:
@@ -1529,10 +1599,10 @@ class SFTPClient:
 
         attrs = await self.stat(path)
 
-        return _tuple_to_float_sec(attrs.atime, attrs.atime_ns) \
+        return tuple_to_float_sec(attrs.atime, attrs.atime_ns) \
             if attrs.atime is not None else None
 
-    async def getatime_ns(self, path: bytes | str | PurePath) -> Optional[int]:
+    async def getatime_ns(self, path: bytes | str | PurePath) -> int | None:
         """Return the last access time of a remote file or directory
 
            The time returned is nanoseconds since the epoch.
@@ -1547,10 +1617,10 @@ class SFTPClient:
 
         attrs = await self.stat(path)
 
-        return _tuple_to_nsec(attrs.atime, attrs.atime_ns) \
+        return tuple_to_nsec(attrs.atime, attrs.atime_ns) \
             if attrs.atime is not None else None
 
-    async def getcrtime(self, path: bytes | str | PurePath) -> Optional[float]:
+    async def getcrtime(self, path: bytes | str | PurePath) -> float | None:
         """Return the creation time of a remote file or directory (SFTPv4 only)
 
            :param path:
@@ -1563,10 +1633,10 @@ class SFTPClient:
 
         attrs = await self.stat(path)
 
-        return _tuple_to_float_sec(attrs.crtime, attrs.crtime_ns) \
+        return tuple_to_float_sec(attrs.crtime, attrs.crtime_ns) \
             if attrs.crtime is not None else None
 
-    async def getcrtime_ns(self, path: bytes | str | PurePath) -> Optional[int]:
+    async def getcrtime_ns(self, path: bytes | str | PurePath) -> int | None:
         """Return the creation time of a remote file or directory
 
            The time returned is nanoseconds since the epoch.
@@ -1581,10 +1651,10 @@ class SFTPClient:
 
         attrs = await self.stat(path)
 
-        return _tuple_to_nsec(attrs.crtime, attrs.crtime_ns) \
+        return tuple_to_nsec(attrs.crtime, attrs.crtime_ns) \
             if attrs.crtime is not None else None
 
-    async def getmtime(self, path: bytes | str | PurePath) -> Optional[float]:
+    async def getmtime(self, path: bytes | str | PurePath) -> float | None:
         """Return the last modification time of a remote file or directory
 
            :param path:
@@ -1597,10 +1667,10 @@ class SFTPClient:
 
         attrs = await self.stat(path)
 
-        return _tuple_to_float_sec(attrs.mtime, attrs.mtime_ns) \
+        return tuple_to_float_sec(attrs.mtime, attrs.mtime_ns) \
             if attrs.mtime is not None else None
 
-    async def getmtime_ns(self, path: bytes | str | PurePath) -> Optional[int]:
+    async def getmtime_ns(self, path: bytes | str | PurePath) -> int | None:
         """Return the last modification time of a remote file or directory
 
            The time returned is nanoseconds since the epoch.
@@ -1615,10 +1685,10 @@ class SFTPClient:
 
         attrs = await self.stat(path)
 
-        return _tuple_to_nsec(attrs.mtime, attrs.mtime_ns) \
+        return tuple_to_nsec(attrs.mtime, attrs.mtime_ns) \
             if attrs.mtime is not None else None
 
-    async def getsize(self, path: bytes | str | PurePath) -> Optional[int]:
+    async def getsize(self, path: bytes | str | PurePath) -> int | None:
         """Return the size of a remote file or directory
 
            :param path:
@@ -1964,7 +2034,7 @@ class SFTPClient:
                 try:
                     names[0].attrs = await self._handler.stat(
                         self.encode(names[0].filename),
-                        _valid_attr_flags[self.version])
+                        valid_attr_flags[self.version])
                 except Exception:
                     if check == FXRP_STAT_IF_EXISTS:
                         names[0].attrs = SFTPAttrs(type=FILEXFER_TYPE_UNKNOWN)
