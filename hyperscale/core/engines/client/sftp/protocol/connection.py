@@ -7507,7 +7507,7 @@ class SSHConnectionOptions(Options, Generic[_Options]):
         self.rekey_seconds = cast(float, rekey_seconds)
         self.connect_timeout = connect_timeout or None
         self.login_timeout = login_timeout
-        self.keepalive_interval = SSHConnectionOptionskeepalive_interval
+        self.keepalive_interval = keepalive_interval
         self.keepalive_count_max = keepalive_count_max
 
 
