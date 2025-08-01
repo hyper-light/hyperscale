@@ -21,11 +21,9 @@
 """GSSAPI wrapper for UNIX"""
 
 from typing import Optional, Sequence, SupportsBytes, cast
-
 from gssapi import Credentials, Name, NameType, OID
 from gssapi import RequirementFlag, SecurityContext
 from gssapi.exceptions import GSSError
-
 from .asn1 import OBJECT_IDENTIFIER
 from .misc import BytesOrStrDict
 

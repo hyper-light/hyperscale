@@ -31,9 +31,8 @@ from .constants import EXTENDED_DATA_STDERR
 from .logging import SSHLogger
 from .misc import MaybeAwait, BreakReceived, SignalReceived
 from .misc import SoftEOFReceived, TerminalSizeChanged
-from .session import DataType, SSHClientSession, SSHServerSession
+from .session import DataType, SSHClientSession
 from .session import SSHTCPSession, SSHUNIXSession, SSHTunTapSession
-from .sftp import SFTPServer, run_sftp_server
 from .scp import run_scp_server
 
 
@@ -57,13 +56,6 @@ _DrainWaiters = Dict[DataType, Set[_WaiterFuture]]
 SSHSocketSessionFactory = Callable[['SSHReader', 'SSHWriter'],
                                     MaybeAwait[None]]
 _OptSocketSessionFactory = Optional[SSHSocketSessionFactory]
-
-SSHServerSessionFactory = Callable[['SSHReader', 'SSHWriter',
-                                    'SSHWriter'], MaybeAwait[None]]
-_OptServerSessionFactory = Optional[SSHServerSessionFactory]
-
-SFTPServerFactory = Callable[['SSHChannel[bytes]'], MaybeAwait[SFTPServer]]
-_OptSFTPServerFactory = Optional[SFTPServerFactory]
 
 
 _NEWLINE = object()
@@ -689,118 +681,6 @@ class SSHStreamSession(Generic[AnyStr]):
 class SSHClientStreamSession(SSHStreamSession[AnyStr],
                              SSHClientSession[AnyStr]):
     """SSH client stream session handler"""
-
-
-class SSHServerStreamSession(SSHStreamSession[AnyStr],
-                             SSHServerSession[AnyStr]):
-    """SSH server stream session handler"""
-
-    def __init__(self, session_factory: _OptServerSessionFactory,
-                 sftp_factory: _OptSFTPServerFactory = None,
-                 sftp_version = 0, allow_scp = False):
-        super().__init__()
-
-        self._session_factory = session_factory
-        self._sftp_factory = sftp_factory
-        self._sftp_version = sftp_version
-        self._allow_scp = allow_scp and bool(sftp_factory)
-
-    def _init_sftp_server(self) -> MaybeAwait[SFTPServer]:
-        """Initialize an SFTP server for this stream to use"""
-
-        assert self._chan is not None
-
-        self._chan.set_encoding(None)
-        self._encoding = None
-
-        assert self._sftp_factory is not None
-        return self._sftp_factory(cast('SSHChannel[bytes]', self._chan))
-
-    def shell_requested(self) -> bool:
-        """Return whether a shell can be requested"""
-
-        return bool(self._session_factory)
-
-    def exec_requested(self, command: str) -> bool:
-        """Return whether execution of a command can be requested"""
-
-        # Avoid incorrect pylint suggestion to use ternary
-        # pylint: disable=consider-using-ternary
-
-        return ((self._allow_scp and command.startswith('scp ')) or
-                bool(self._session_factory))
-
-    def subsystem_requested(self, subsystem: str) -> bool:
-        """Return whether starting a subsystem can be requested"""
-
-        if subsystem == 'sftp':
-            return bool(self._sftp_factory)
-        else:
-            return bool(self._session_factory)
-
-    def session_started(self) -> None:
-        """Start a session for this newly opened server channel"""
-
-        assert self._chan is not None
-
-        command = self._chan.get_command()
-
-        stdin = SSHReader[AnyStr](self, self._chan)
-        stdout = SSHWriter[AnyStr](self, self._chan)
-        stderr = SSHWriter[AnyStr](self, self._chan, EXTENDED_DATA_STDERR)
-
-        handler: MaybeAwait[None]
-
-        if self._chan.get_subsystem() == 'sftp':
-            stdin_bytes = cast(SSHReader[bytes], stdin)
-            stdout_bytes = cast(SSHWriter[bytes], stdout)
-
-            handler = run_sftp_server(self._init_sftp_server(),
-                                      stdin_bytes, stdout_bytes,
-                                      self._sftp_version)
-        elif self._allow_scp and command and command.startswith('scp '):
-            stdin_bytes = cast(SSHReader[bytes], stdin)
-            stdout_bytes = cast(SSHWriter[bytes], stdout)
-            stderr_bytes = cast(SSHWriter[bytes], stderr)
-
-            handler = run_scp_server(self._init_sftp_server(), command,
-                                     stdin_bytes, stdout_bytes, stderr_bytes)
-        else:
-            assert self._session_factory is not None
-            handler = self._session_factory(stdin, stdout, stderr)
-
-        if inspect.isawaitable(handler):
-            assert self._conn is not None
-            self._conn.create_task(handler, stdin.logger)
-
-    def exception_received(self, exc: Exception) -> None:
-        """Handle an incoming exception on the channel"""
-
-        self._recv_buf[None].append(exc)
-        self._unblock_read(None)
-
-    def break_received(self, msec: int) -> bool:
-        """Handle an incoming break on the channel"""
-
-        self.exception_received(BreakReceived(msec))
-        return True
-
-    def signal_received(self, signal: str) -> None:
-        """Handle an incoming signal on the channel"""
-
-        self.exception_received(SignalReceived(signal))
-
-    def soft_eof_received(self) -> None:
-        """Handle an incoming soft EOF on the channel"""
-
-        self.exception_received(SoftEOFReceived())
-
-    def terminal_size_changed(self, width: int, height: int,
-                              pixwidth: int, pixheight: int) -> None:
-        """Handle an incoming terminal size change on the channel"""
-
-        self.exception_received(TerminalSizeChanged(width, height,
-                                                    pixwidth, pixheight))
 
 
 class SSHSocketStreamSession(SSHStreamSession[AnyStr]):

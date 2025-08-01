@@ -56,10 +56,7 @@ class AgentWriter(Protocol):
         """Wait for the connection to the SSH agent to close"""
 
 
-if sys.platform == 'win32': # pragma: no cover
-    from .agent_win32 import open_agent
-else:
-    from .agent_unix import open_agent
+from .agent_unix import open_agent
 
 
 class _SupportsOpenAgentConnection(Protocol):
@@ -122,7 +119,7 @@ class SSHAgentKeyPair(SSHKeyPair):
 
         # Neither Pageant nor the Win10 OpenSSH agent seems to support the
         # ssh-agent protocol flags used to request RSA SHA2 signatures yet
-        if sig_algorithm == b'ssh-rsa' and sys.platform != 'win32':
+        if sig_algorithm == b'ssh-rsa':
             sig_algorithms: Sequence[bytes] = \
                 (b'rsa-sha2-256', b'rsa-sha2-512', b'ssh-rsa')
         else:

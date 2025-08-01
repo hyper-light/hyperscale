@@ -29,11 +29,12 @@ from .misc import BytesOrStrDict
 
 try:
     # pylint: disable=unused-import
-
-    if sys.platform == 'win32': # pragma: no cover
-        from .gss_win32 import GSSBase, GSSClient, GSSServer, GSSError
-    else:
-        from .gss_unix import GSSBase, GSSClient, GSSServer, GSSError
+    from .gss_unix import (
+        GSSBase as GSSBase, 
+        GSSClient as GSSClient, 
+        GSSServer as GSSServer, 
+        GSSError as GSSError,
+    )
 
     gss_available = True
 except ImportError: # pragma: no cover

@@ -35,7 +35,7 @@ from typing import Iterable, List, Mapping, Optional, Set, TextIO
 from typing import Tuple, Type, TypeVar, Union, cast
 from typing_extensions import Protocol, Self
 
-from .channel import SSHChannel, SSHClientChannel, SSHServerChannel
+from .channel import SSHChannel, SSHClientChannel
 
 from .constants import DEFAULT_LANG, EXTENDED_DATA_STDERR
 
@@ -48,8 +48,7 @@ from .misc import BreakReceived, SignalReceived, TerminalSizeChanged
 from .session import DataType
 
 from .stream import SSHReader, SSHWriter, SSHStreamSession
-from .stream import SSHClientStreamSession, SSHServerStreamSession
-from .stream import SFTPServerFactory
+from .stream import SSHClientStreamSession
 
 _AnyStrContra = TypeVar('_AnyStrContra', bytes, str, contravariant=True)
 
@@ -60,9 +59,6 @@ ProcessSource = Union[int, str, socket.socket, PurePath, SSHReader[bytes],
 
 ProcessTarget = Union[int, str, socket.socket, PurePath, SSHWriter[bytes],
                       asyncio.StreamWriter, _File]
-
-SSHServerProcessFactory = Callable[['SSHServerProcess[AnyStr]'],
-                                   MaybeAwait[None]]
 
 
 _QUEUE_LOW_WATER = 8
@@ -432,12 +428,6 @@ class _PipeWriter(_UnicodeWriter[AnyStr], asyncio.BaseProtocol):
         """Handle a newly opened pipe"""
 
         self._transport = cast(asyncio.WriteTransport, transport)
-
-        pipe = transport.get_extra_info('pipe')
-
-        if isinstance(self._process, SSHServerProcess) and pipe.isatty():
-            self._tty = pipe
-            set_terminal_size(pipe, *self._process.term_size)
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
         """Handle closing of the pipe"""
@@ -1578,292 +1568,3 @@ class SSHClientProcess(SSHProcess[AnyStr], SSHClientStreamSession[AnyStr]):
                                        self.returncode, stdout_data,
                                        stderr_data)
 
-
-class SSHServerProcess(SSHProcess[AnyStr], SSHServerStreamSession[AnyStr]):
-    """SSH server process handler"""
-
-    _chan: SSHServerChannel[AnyStr]
-    channel: SSHServerChannel[AnyStr]
-
-    def __init__(self, process_factory: SSHServerProcessFactory,
-                 sftp_factory: Optional[SFTPServerFactory],
-                 sftp_version: int, allow_scp: bool):
-        super().__init__(self._start_process, sftp_factory,
-                         sftp_version, allow_scp)
-
-        self._process_factory = process_factory
-
-        self._stdin: Optional[SSHReader[AnyStr]] = None
-        self._stdout: Optional[SSHWriter[AnyStr]] = None
-        self._stderr: Optional[SSHWriter[AnyStr]] = None
-
-    def _start_process(self, stdin: SSHReader[AnyStr],
-                       stdout: SSHWriter[AnyStr],
-                       stderr: SSHWriter[AnyStr]) -> MaybeAwait[None]:
-        """Start a new server process"""
-
-        self._stdin = stdin
-        self._stdout = stdout
-        self._stderr = stderr
-
-        return self._process_factory(self)
-
-    @property
-    def term_type(self) -> Optional[str]:
-        """The terminal type set by the client
-
-           If the client didn't request a pseudo-terminal, this
-           property will be set to `None`.
-
-        """
-
-        return self._chan.get_terminal_type()
-
-    @property
-    def term_size(self) -> TermSize:
-        """The terminal size set by the client
-
-           This property contains a tuple of four `int` values
-           representing the width and height of the terminal in
-           characters followed by the width and height of the
-           terminal in pixels. If the client hasn't set terminal
-           size information, the values will be set to zero.
-
-        """
-
-        return self._chan.get_terminal_size()
-
-    @property
-    def term_modes(self) -> TermModes:
-        """A mapping containing the TTY modes set by the client
-
-           If the client didn't request a pseudo-terminal, this
-           property will be set to an empty mapping.
-
-        """
-
-        return self._chan.get_terminal_modes()
-
-    @property
-    def stdin(self) -> SSHReader[AnyStr]:
-        """The :class:`SSHReader` to use to read from stdin of the process"""
-
-        assert self._stdin is not None
-        return self._stdin
-
-    @property
-    def stdout(self) -> SSHWriter[AnyStr]:
-        """The :class:`SSHWriter` to use to write to stdout of the process"""
-
-        assert self._stdout is not None
-        return self._stdout
-
-    @property
-    def stderr(self) -> SSHWriter[AnyStr]:
-        """The :class:`SSHWriter` to use to write to stderr of the process"""
-
-        assert self._stderr is not None
-        return self._stderr
-
-    def exception_received(self, exc: Exception) -> None:
-        """Handle an incoming exception on the channel"""
-
-        writer = self._writers.get(None)
-
-        if writer:
-            writer.write_exception(exc)
-        else:
-            super().exception_received(exc)
-
-    async def redirect(self, stdin: Optional[ProcessTarget] = None,
-                       stdout: Optional[ProcessSource] = None,
-                       stderr: Optional[ProcessSource] = None,
-                       bufsize: int = io.DEFAULT_BUFFER_SIZE,
-                       send_eof: bool = True, recv_eof: bool = True) -> None:
-        """Perform I/O redirection for the process
-
-           This method redirects data going to or from any or all of
-           standard input, standard output, and standard error for
-           the process.
-
-           The `stdin` argument can be any of the following:
-
-               * An :class:`SSHWriter` object
-               * An :class:`asyncio.StreamWriter` object
-               * A file object open for write
-               * An `int` file descriptor open for write
-               * A connected socket object
-               * A string or :class:`PurePath <pathlib.PurePath>` containing
-                 the name of a file or device to open
-               * `DEVNULL` to discard standard error output
-               * `PIPE` to interactively read standard error output
-
-           The `stdout` and `stderr` arguments can be any of the following:
-
-               * An :class:`SSHReader` object
-               * An :class:`asyncio.StreamReader` object
-               * A file object open for read
-               * An `int` file descriptor open for read
-               * A connected socket object
-               * A string or :class:`PurePath <pathlib.PurePath>` containing
-                 the name of a file or device to open
-               * `DEVNULL` to provide no input to standard input
-               * `PIPE` to interactively write standard input
-
-           File objects passed in can be associated with plain files, pipes,
-           sockets, or ttys.
-
-           The default value of `None` means to not change redirection
-           for that stream.
-
-           .. note:: When passing in asyncio streams, it is the responsibility
-                     of the caller to close the associated transport when it
-                     is no longer needed.
-
-           :param stdin:
-               Target to feed data from standard input to
-           :param stdout:
-               Source of data to feed to standard output
-           :param stderr:
-               Source of data to feed to standard error
-           :param bufsize:
-               Buffer size to use when forwarding data from a file
-           :param send_eof:
-               Whether or not to send EOF to the channel when EOF is
-               received from stdout or stderr, defaulting to `True`. If
-               set to `False`, the channel will remain open after EOF is
-               received on stdout or stderr, and multiple sources can be
-               redirected to the channel.
-           :param recv_eof:
-               Whether or not to send EOF to stdin when EOF is received
-               on the channel, defaulting to `True`. If set to `False`,
-               the redirect target of stdin will remain open after EOF
-               is received on the channel and can be used for multiple
-               redirects.
-           :type bufsize: `int`
-           :type send_eof: `bool`
-           :type recv_eof: `bool`
-
-        """
-
-        if stdin:
-            await self._create_writer(stdin, bufsize, send_eof, recv_eof)
-
-        if stdout:
-            await self._create_reader(stdout, bufsize, send_eof, recv_eof)
-
-        if stderr:
-            await self._create_reader(stderr, bufsize, send_eof, recv_eof,
-                                      EXTENDED_DATA_STDERR)
-
-    async def redirect_stdin(self, target: ProcessTarget,
-                             bufsize: int = io.DEFAULT_BUFFER_SIZE,
-                             recv_eof: bool = True) -> None:
-        """Redirect standard input of the process"""
-
-        await self.redirect(target, None, None, bufsize, True, recv_eof)
-
-    async def redirect_stdout(self, source: ProcessSource,
-                              bufsize: int = io.DEFAULT_BUFFER_SIZE,
-                              send_eof: bool = True) -> None:
-        """Redirect standard output of the process"""
-
-        await self.redirect(None, source, None, bufsize, send_eof, True)
-
-    async def redirect_stderr(self, source: ProcessSource,
-                              bufsize: int = io.DEFAULT_BUFFER_SIZE,
-                              send_eof: bool = True) -> None:
-        """Redirect standard error of the process"""
-
-        await self.redirect(None, None, source, bufsize, send_eof, True)
-
-    def get_terminal_type(self) -> Optional[str]:
-        """Return the terminal type set by the client for the process
-
-           This method returns the terminal type set by the client
-           when the process was started. If the client didn't request
-           a pseudo-terminal, this method will return `None`.
-
-           :returns: A `str` containing the terminal type or `None` if
-                     no pseudo-terminal was requested
-
-        """
-
-        return self.term_type
-
-    def get_terminal_size(self) -> Tuple[int, int, int, int]:
-        """Return the terminal size set by the client for the process
-
-           This method returns the latest terminal size information set
-           by the client. If the client didn't set any terminal size
-           information, all values returned will be zero.
-
-           :returns: A tuple of four `int` values containing the width and
-                     height of the terminal in characters and the width
-                     and height of the terminal in pixels
-
-        """
-
-        return self.term_size
-
-    def get_terminal_mode(self, mode: int) -> Optional[int]:
-        """Return the requested TTY mode for this session
-
-           This method looks up the value of a POSIX terminal mode
-           set by the client when the process was started. If the client
-           didn't request a pseudo-terminal or didn't set the requested
-           TTY mode opcode, this method will return `None`.
-
-           :param mode:
-               POSIX terminal mode taken from :ref:`POSIX terminal modes
-               <PTYModes>` to look up
-           :type mode: `int`
-
-           :returns: An `int` containing the value of the requested
-                     POSIX terminal mode or `None` if the requested
-                     mode was not set
-
-        """
-
-        return self.term_modes.get(mode)
-
-    def exit(self, status: int) -> None:
-        """Send exit status and close the channel
-
-           This method can be called to report an exit status for the
-           process back to the client and close the channel.
-
-           :param status:
-               The exit status to report to the client
-           :type status: `int`
-
-        """
-
-        self._chan.exit(status)
-
-    def exit_with_signal(self, signal: str, core_dumped: bool = False,
-                         msg: str = '', lang: str = DEFAULT_LANG) -> None:
-        """Send exit signal and close the channel
-
-           This method can be called to report that the process
-           terminated abnormslly with a signal. A more detailed
-           error message may also provided, along with an indication
-           of whether or not the process dumped core. After
-           reporting the signal, the channel is closed.
-
-           :param signal:
-               The signal which caused the process to exit
-           :param core_dumped: (optional)
-               Whether or not the process dumped core
-           :param msg: (optional)
-               Details about what error occurred
-           :param lang: (optional)
-               The language the error message is in
-           :type signal: `str`
-           :type core_dumped: `bool`
-           :type msg: `str`
-           :type lang: `str`
-
-        """
-
-        return self._chan.exit_with_signal(signal, core_dumped, msg, lang)

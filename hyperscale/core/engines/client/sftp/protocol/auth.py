@@ -21,7 +21,7 @@
 """SSH authentication handlers"""
 
 from typing import TYPE_CHECKING, Awaitable, Dict, List, Optional
-from typing import Sequence, Tuple, Type, Union, cast
+from typing import Sequence, Tuple, Type, Union, cast, Any
 
 from .constants import DEFAULT_LANG
 from .gss import GSSBase, GSSError
@@ -38,7 +38,6 @@ if TYPE_CHECKING:
 
     # pylint: disable=cyclic-import
     from .connection import SSHConnection, SSHClientConnection
-    from .connection import SSHServerConnection
 
 
 KbdIntPrompts = Sequence[Tuple[str, bool]]
@@ -522,9 +521,9 @@ class _ClientPasswordAuth(ClientAuth):
 class ServerAuth(Auth):
     """Parent class for server authentication"""
 
-    _conn: 'SSHServerConnection'
+    _conn: 'Any'
 
-    def __init__(self, conn: 'SSHServerConnection', username: str,
+    def __init__(self, conn: 'Any', username: str,
                  method: bytes, packet: SSHPacket):
         self._username = username
         self._method = method
@@ -532,7 +531,7 @@ class ServerAuth(Auth):
         super().__init__(conn, self._start(packet))
 
     @classmethod
-    def supported(cls, conn: 'SSHServerConnection') -> bool:
+    def supported(cls, conn: 'Any') -> bool:
         """Return whether this authentication method is supported"""
 
         raise NotImplementedError
@@ -558,7 +557,7 @@ class _ServerNullAuth(ServerAuth):
     """Server side implementation of null auth"""
 
     @classmethod
-    def supported(cls, conn: 'SSHServerConnection') -> bool:
+    def supported(cls, conn: 'Any') -> bool:
         """Return that null authentication is never a supported auth mode"""
 
         return False
@@ -570,14 +569,14 @@ class _ServerNullAuth(ServerAuth):
 class _ServerGSSKexAuth(ServerAuth):
     """Server side implementation of GSS key exchange auth"""
 
-    def __init__(self, conn: 'SSHServerConnection', username: str,
+    def __init__(self, conn: 'Any', username: str,
                  method: bytes, packet: SSHPacket):
         super().__init__(conn, username, method, packet)
 
         self._gss = conn.get_gss_context()
 
     @classmethod
-    def supported(cls, conn: 'SSHServerConnection') -> bool:
+    def supported(cls, conn: 'Any') -> bool:
         """Return whether GSS key exchange authentication is supported"""
 
         return conn.gss_kex_auth_supported()
@@ -606,14 +605,14 @@ class _ServerGSSMICAuth(ServerAuth):
 
     _handler_names = get_symbol_names(globals(), 'MSG_USERAUTH_GSSAPI_')
 
-    def __init__(self, conn: 'SSHServerConnection', username: str,
+    def __init__(self, conn: 'Any', username: str,
                  method: bytes, packet: SSHPacket) -> None:
         super().__init__(conn, username, method, packet)
 
         self._gss = conn.get_gss_context()
 
     @classmethod
-    def supported(cls, conn: 'SSHServerConnection') -> bool:
+    def supported(cls, conn: 'Any') -> bool:
         """Return whether GSS MIC authentication is supported"""
 
         return conn.gss_mic_auth_supported()
@@ -726,7 +725,7 @@ class _ServerHostBasedAuth(ServerAuth):
     """Server side implementation of host based auth"""
 
     @classmethod
-    def supported(cls, conn: 'SSHServerConnection') -> bool:
+    def supported(cls, conn: 'Any') -> bool:
         """Return whether host based authentication is supported"""
 
         return conn.host_based_auth_supported()
@@ -766,7 +765,7 @@ class _ServerPublicKeyAuth(ServerAuth):
     """Server side implementation of public key auth"""
 
     @classmethod
-    def supported(cls, conn: 'SSHServerConnection') -> bool:
+    def supported(cls, conn: 'Any') -> bool:
         """Return whether public key authentication is supported"""
 
         return conn.public_key_auth_supported()
@@ -809,7 +808,7 @@ class _ServerKbdIntAuth(ServerAuth):
     _handler_names = get_symbol_names(globals(), 'MSG_USERAUTH_INFO_')
 
     @classmethod
-    def supported(cls, conn: 'SSHServerConnection') -> bool:
+    def supported(cls, conn: 'Any') -> bool:
         """Return whether keyboard interactive authentication is supported"""
 
         return conn.kbdint_auth_supported()
@@ -889,7 +888,7 @@ class _ServerPasswordAuth(ServerAuth):
     """Server side implementation of password auth"""
 
     @classmethod
-    def supported(cls, conn: 'SSHServerConnection') -> bool:
+    def supported(cls, conn: 'Any') -> bool:
         """Return whether password authentication is supported"""
 
         return conn.password_auth_supported()
@@ -956,7 +955,7 @@ def lookup_client_auth(conn: 'SSHClientConnection',
         return None
 
 
-def get_supported_server_auth_methods(conn: 'SSHServerConnection') -> \
+def get_supported_server_auth_methods(conn: 'Any') -> \
         Sequence[bytes]:
     """Return a list of supported server auth methods"""
 
@@ -969,7 +968,7 @@ def get_supported_server_auth_methods(conn: 'SSHServerConnection') -> \
     return auth_methods
 
 
-def lookup_server_auth(conn: 'SSHServerConnection', username: str,
+def lookup_server_auth(conn: 'Any', username: str,
                        method: bytes, packet: SSHPacket) -> \
         Optional[ServerAuth]:
     """Look up the server authentication method to use"""

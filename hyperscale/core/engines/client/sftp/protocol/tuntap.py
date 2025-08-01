@@ -29,9 +29,7 @@ import sys
 import threading
 
 from typing import Callable, Optional, Tuple, cast
-
-if sys.platform != 'win32': # pragma: no branch
-    import fcntl
+import fcntl
 
 
 SSH_TUN_MODE_POINTTOPOINT = 1   # layer 3 IP packets

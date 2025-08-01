@@ -59,11 +59,7 @@ _datetime_min = datetime.fromtimestamp(0, timezone.utc).replace(microsecond=1)
 
 _datetime_32bit_max = datetime.fromtimestamp(2**31 - 1, timezone.utc)
 
-if sys.platform == 'win32': # pragma: no cover
-    # Windows' datetime.max is year 9999, but timestamps that large don't work
-    _datetime_max = datetime.max.replace(year=2999, tzinfo=timezone.utc)
-else:
-    _datetime_max = datetime.max.replace(tzinfo=timezone.utc)
+_datetime_max = datetime.max.replace(tzinfo=timezone.utc)
 
 
 def _to_generalized_time(t: int) -> datetime:

@@ -40,14 +40,13 @@ from .constants import FILEXFER_TYPE_REGULAR, FILEXFER_TYPE_DIRECTORY
 from .logging import SSHLogger
 from .misc import BytesOrStr, FilePath, HostPort, MaybeAwait
 from .misc import async_context_manager, plural
-from .sftp import SFTPAttrs, SFTPGlob, SFTPName, SFTPServer, SFTPServerFS
+from .sftp import SFTPAttrs, SFTPGlob, SFTPName
 from .sftp import SFTPError, SFTPFailure, SFTPBadMessage, SFTPConnectionLost
 from .sftp import SFTPErrorHandler, SFTPProgressHandler, local_fs
 
 
 if TYPE_CHECKING:
     # pylint: disable=cyclic-import
-    from .channel import SSHServerChannel
     from .connection import SSHClientConnection
     from .stream import SSHReader, SSHWriter
 
@@ -163,10 +162,6 @@ async def _parse_path(path: _SCPConnPath, **kwargs) -> \
 
     if isinstance(path, tuple):
         conn, path = cast(Tuple[_SCPConn, _SCPPath], path)
-    elif isinstance(path, str) and sys.platform == 'win32' and \
-            path[:1] in string.ascii_letters and \
-            path[1:2] == ':': # pragma: no cover (win32)
-        conn = None
     elif isinstance(path, str) and ':' in path:
         conn, path = path.split(':', 1)
     elif isinstance(path, bytes) and b':' in path:
@@ -420,10 +415,7 @@ class _SCPHandler:
         if cancelled:
             self._writer.channel.abort()
         else:
-            if self._server:
-                cast('SSHServerChannel', self._writer.channel).exit(0)
-            else:
-                self._writer.close()
+            self._writer.close()
 
             await self._writer.wait_closed()
 
@@ -1086,52 +1078,3 @@ async def scp(srcpaths: Union[_SCPConnPath, Sequence[_SCPConnPath]],
             dstconn.close()
             await dstconn.wait_closed()
 
-
-async def _scp_handler(sftp_server: MaybeAwait[SFTPServer],
-                       args: _SCPArgs, reader: 'SSHReader[bytes]',
-                       writer: 'SSHWriter[bytes]') -> None:
-    """Run an SCP server to handle this request"""
-
-    if inspect.isawaitable(sftp_server):
-        sftp_server = await sftp_server
-
-    fs = SFTPServerFS(sftp_server)
-
-    handler: Union[_SCPSource, _SCPSink]
-
-    if args.source:
-        handler = _SCPSource(fs, reader, writer, args.preserve,
-                             args.recurse, error_handler=False, server=True)
-    else:
-        handler = _SCPSink(fs, reader, writer, args.must_be_dir,
-                           args.preserve, args.recurse,
-                           error_handler=False, server=True)
-
-    try:
-        await handler.run(args.path)
-    finally:
-        result = sftp_server.exit()
-
-        if inspect.isawaitable(result):
-            await result
-
-
-def run_scp_server(sftp_server: MaybeAwait[SFTPServer], command: str,
-                   stdin: 'SSHReader[bytes]', stdout: 'SSHWriter[bytes]',
-                   stderr: 'SSHWriter[bytes]') -> MaybeAwait[None]:
-    """Return a handler for an SCP server session"""
-
-    try:
-        args = _SCPArgParser().parse(command)
-    except ValueError as exc:
-        if inspect.iscoroutine(sftp_server):
-            sftp_server.close()
-
-        stdin.logger.info('Error starting SCP server: %s', str(exc))
-        stderr.write(b'scp: ' + str(exc).encode('utf-8') + b'\n')
-        cast('SSHServerChannel', stderr.channel).exit(1)
-        return None
-
-    stdin.logger.info('Starting SCP server, args: %s', command[4:].strip())
-
-    return _scp_handler(sftp_server, args, stdin, stdout)

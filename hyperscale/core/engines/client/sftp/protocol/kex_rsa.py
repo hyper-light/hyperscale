@@ -35,7 +35,6 @@ from .rsa import RSAKey
 if TYPE_CHECKING:
     # pylint: disable=cyclic-import
     from .connection import SSHConnection, SSHClientConnection
-    from .connection import SSHServerConnection
 
 
 # SSH KEXRSA message values
@@ -66,19 +65,7 @@ class _KexRSA(Kex):
 
     async def start(self) -> None:
         """Start RSA key exchange"""
-
-        if self._conn.is_server():
-            server_conn = cast('SSHServerConnection', self._conn)
-            host_key = server_conn.get_server_host_key()
-            assert host_key is not None
-            self._host_key_data = host_key.public_data
-
-            self._trans_key = generate_private_key(
-                'ssh-rsa', key_size=self._key_size)
-            self._trans_key_data = self._trans_key.public_data
-
-            self.send_packet(MSG_KEXRSA_PUBKEY, String(self._host_key_data),
-                             String(self._trans_key_data))
+        pass
 
     def _compute_hash(self) -> bytes:
         """Compute a hash of key information associated with the connection"""
@@ -117,33 +104,8 @@ class _KexRSA(Kex):
     def _process_secret(self, _pkttype: int, _pktid: int,
                         packet: SSHPacket) -> None:
         """Process a KEXRSA secret message"""
-
-        if self._conn.is_client():
-            raise ProtocolError('Unexpected KEXRSA secret msg')
-
-        self._encrypted_k = packet.get_string()
-        packet.check_end()
-
-        trans_key = cast(RSAKey, self._trans_key)
-        decrypted_k = trans_key.decrypt(self._encrypted_k, self.algorithm)
-        if not decrypted_k:
-            raise KeyExchangeFailed('Key exchange decryption failed')
-
-        packet = SSHPacket(decrypted_k)
-        self._k = packet.get_mpint()
-        packet.check_end()
-
-        server_conn = cast('SSHServerConnection', self._conn)
-        host_key = server_conn.get_server_host_key()
-        assert host_key is not None
-
-        h = self._compute_hash()
-        sig = host_key.sign(h)
-
-        self.send_packet(MSG_KEXRSA_DONE, String(sig))
-
-        self._conn.send_newkeys(MPInt(self._k), h)
-
+        pass
+    
     def _process_done(self, _pkttype: int, _pktid: int,
                       packet: SSHPacket) -> None:
         """Process a KEXRSA done message"""
