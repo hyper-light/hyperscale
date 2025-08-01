@@ -35,7 +35,7 @@ from collections import OrderedDict
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, AnyStr, Awaitable, Callable, Dict
-from typing import Generic, List, Mapping, Optional, Sequence, Set, Tuple, Protocol, Self
+from typing import Generic, List, Optional, Sequence, Set, Tuple, Protocol, Self
 from typing import Type, TypeVar, Union, cast
 
 from .agent import SSHAgentClient
@@ -43,8 +43,6 @@ from .agent import SSHAgentClient
 from .auth import Auth, ClientAuth, KbdIntPrompts
 from .auth import KbdIntResponse, PasswordChangeResponse
 from .auth import get_supported_client_auth_methods, lookup_client_auth
-
-from .auth_keys import SSHAuthorizedKeys
 
 from .channel import SSHChannel, SSHClientChannel
 from .channel import SSHTCPChannel, SSHUNIXChannel, SSHTunTapChannel
@@ -143,9 +141,6 @@ from .session import DataType, SSHClientSession
 from .session import SSHTCPSession, SSHUNIXSession, SSHTunTapSession
 from .session import SSHClientSessionFactory, SSHTCPSessionFactory
 from .session import SSHUNIXSessionFactory, SSHTunTapSessionFactory
-
-from .sftp import MIN_SFTP_VERSION, SFTPClient
-from .sftp import start_sftp_client
 
 from .stream import SSHReader, SSHWriter
 from .stream import SSHSocketSessionFactory
@@ -5143,70 +5138,6 @@ class SSHClientConnection(SSHConnection):
 
         return cast(SSHForwarder, peer)
 
-    @async_context_manager
-    async def start_sftp_client(self, env: DefTuple[Optional[Env]] = (),
-                                send_env: DefTuple[Optional[EnvSeq]] = (),
-                                path_encoding: Optional[str] = 'utf-8',
-                                path_errors = 'strict',
-                                sftp_version = MIN_SFTP_VERSION) -> SFTPClient:
-        """Start an SFTP client
-
-           This method is a coroutine which attempts to start a secure
-           file transfer session. If it succeeds, it returns an
-           :class:`SFTPClient` object which can be used to copy and
-           access files on the remote host.
-
-           An optional Unicode encoding can be specified for sending and
-           receiving pathnames, defaulting to UTF-8 with strict error
-           checking. If an encoding of `None` is specified, pathnames
-           will be left as bytes rather than being converted to & from
-           strings.
-
-           :param env: (optional)
-               The environment variables to set for this SFTP session. Keys
-               and values passed in here will be converted to Unicode
-               strings encoded as UTF-8 (ISO 10646) for transmission.
-
-                   .. note:: Many SSH servers restrict which environment
-                             variables a client is allowed to set. The
-                             server's configuration may need to be edited
-                             before environment variables can be
-                             successfully set in the remote environment.
-           :param send_env: (optional)
-               A list of environment variable names to pull from
-               `os.environ` and set for this SFTP session. Wildcards
-               patterns using `'*'` and `'?'` are allowed, and all variables
-               with matching names will be sent with whatever value is set
-               in the local environment. If a variable is present in both
-               env and send_env, the value from env will be used.
-           :param path_encoding:
-               The Unicode encoding to apply when sending and receiving
-               remote pathnames
-           :param path_errors:
-               The error handling strategy to apply on encode/decode errors
-           :param sftp_version: (optional)
-               The maximum version of the SFTP protocol to support, currently
-               either 3 or 4, defaulting to 3.
-           :type env: `dict` with `str` keys and values
-           :type send_env: `list` of `str`
-           :type path_encoding: `str` or `None`
-           :type path_errors: `str`
-           :type sftp_version: `int`
-
-           :returns: :class:`SFTPClient`
-
-           :raises: :exc:`SFTPError` if the session can't be opened
-
-        """
-
-        writer, reader, _ = await self.open_session(subsystem='sftp',
-                                                    env=env, send_env=send_env,
-                                                    encoding=None)
-
-        return await start_sftp_client(self, self._loop, reader, writer,
-                                       path_encoding, path_errors,
-                                       sftp_version)
-
 
 class SSHConnectionOptions(Options, Generic[_Options]):
     """SSH connection options"""
@@ -6378,7 +6309,6 @@ async def run_client(sock: socket.socket, config: DefTuple[ConfigPaths] = (),
         timeout=new_options.connect_timeout)
 
 
-@async_context_manager
 async def connect(host = '', port: DefTuple[int] = (), *,
                   tunnel: DefTuple[_TunnelConnector] = (),
                   family: DefTuple[int] = (), flags: int = 0,

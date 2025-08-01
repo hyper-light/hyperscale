@@ -56,8 +56,6 @@ from .known_hosts import match_known_hosts
 
 from .listener import SSHListener
 
-from .logging import logger, set_log_level, set_sftp_log_level, set_debug_level
-
 from .misc import BytesOrStr
 from .misc import Error, DisconnectError, ChannelOpenError, ChannelListenError
 from .misc import ConnectionLost, CompressionError, HostKeyNotVerifiable
@@ -87,26 +85,8 @@ from .public_key import load_resident_keys
 
 from .rsa import set_default_skip_rsa_key_validation
 
-from .scp import scp
-
 from .session import DataType, SSHClientSession
 from .session import SSHTCPSession, SSHUNIXSession, SSHTunTapSession
-
-from .sftp import SFTPClient, SFTPClientFile, SFTPError
-from .sftp import SFTPEOFError, SFTPNoSuchFile, SFTPPermissionDenied
-from .sftp import SFTPFailure, SFTPBadMessage, SFTPNoConnection
-from .sftp import SFTPInvalidHandle, SFTPNoSuchPath, SFTPFileAlreadyExists
-from .sftp import SFTPWriteProtect, SFTPNoMedia, SFTPNoSpaceOnFilesystem
-from .sftp import SFTPQuotaExceeded, SFTPUnknownPrincipal, SFTPLockConflict
-from .sftp import SFTPDirNotEmpty, SFTPNotADirectory, SFTPInvalidFilename
-from .sftp import SFTPLinkLoop, SFTPCannotDelete, SFTPInvalidParameter
-from .sftp import SFTPFileIsADirectory, SFTPByteRangeLockConflict
-from .sftp import SFTPByteRangeLockRefused, SFTPDeletePending
-from .sftp import SFTPFileCorrupt, SFTPOwnerInvalid, SFTPGroupInvalid
-from .sftp import SFTPNoMatchingByteRangeLock
-from .sftp import SFTPConnectionLost, SFTPOpUnsupported
-from .sftp import SFTPAttrs, SFTPVFSAttrs, SFTPName, SFTPLimits
-from .sftp import SEEK_SET, SEEK_CUR, SEEK_END
 
 from .stream import SSHSocketSessionFactory
 from .stream import SSHReader, SSHWriter
@@ -135,20 +115,8 @@ __all__ = [
     'KeyExchangeFailed', 'KeyExportError', 'KeyGenerationError',
     'KeyImportError', 'MACError', 'PIPE', 'PasswordChangeRequired',
     'PermissionDenied', 'ProcessError', 'ProtocolError',
-    'ProtocolNotSupported', 'SEEK_CUR', 'SEEK_END', 'SEEK_SET',
-    'SFTPAttrs', 'SFTPBadMessage', 'SFTPByteRangeLockConflict',
-    'SFTPByteRangeLockRefused', 'SFTPCannotDelete', 'SFTPClient',
-    'SFTPClientFile', 'SFTPConnectionLost', 'SFTPDeletePending',
-    'SFTPDirNotEmpty', 'SFTPEOFError', 'SFTPError', 'SFTPFailure',
-    'SFTPFileAlreadyExists', 'SFTPFileCorrupt', 'SFTPFileIsADirectory',
-    'SFTPGroupInvalid', 'SFTPInvalidFilename', 'SFTPInvalidHandle',
-    'SFTPInvalidParameter', 'SFTPLimits', 'SFTPLinkLoop', 'SFTPLockConflict',
-    'SFTPName', 'SFTPNoConnection', 'SFTPNoMatchingByteRangeLock',
-    'SFTPNoMedia', 'SFTPNoSpaceOnFilesystem', 'SFTPNoSuchFile',
-    'SFTPNoSuchPath', 'SFTPNotADirectory', 'SFTPOpUnsupported',
-    'SFTPOwnerInvalid', 'SFTPPermissionDenied', 'SFTPQuotaExceeded',
-    'SFTPUnknownPrincipal', 'SFTPVFSAttrs',
-    'SFTPWriteProtect', 'SSHAcceptHandler', 'SSHAcceptor', 'SSHAgentClient',
+    'ProtocolNotSupported',
+    'SSHAcceptHandler', 'SSHAcceptor', 'SSHAgentClient',
     'SSHAgentKeyPair', 'SSHAuthorizedKeys', 'SSHCertificate', 'SSHClient',
     'SSHClientChannel', 'SSHClientConnection', 'SSHClientConnectionOptions',
     'SSHClientProcess', 'SSHClientSession', 'SSHCompletedProcess',
@@ -165,10 +133,10 @@ __all__ = [
     'import_authorized_keys', 'import_certificate', 'import_known_hosts',
     'import_private_key', 'import_public_key', 'listen', 'listen_reverse',
     'load_certificates', 'load_keypairs', 'load_pkcs11_keys',
-    'load_public_keys', 'load_resident_keys', 'logger', 'match_known_hosts',
+    'load_public_keys', 'load_resident_keys', 'match_known_hosts',
     'read_authorized_keys', 'read_certificate', 'read_certificate_list',
     'read_known_hosts', 'read_private_key', 'read_private_key_list',
     'read_public_key', 'read_public_key_list', 'run_client',
-    'scp', 'set_debug_level', 'set_default_skip_rsa_key_validation',
-    'set_log_level', 'set_sftp_log_level', 'get_server_host_key', 'get_server_auth_methods'
+    'set_debug_level', 'set_default_skip_rsa_key_validation',
+    'get_server_host_key', 'get_server_auth_methods'
 ]

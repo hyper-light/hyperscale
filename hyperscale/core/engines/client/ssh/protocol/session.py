@@ -21,7 +21,7 @@
 """SSH session handlers"""
 
 from typing import TYPE_CHECKING, Any, AnyStr, Callable, Generic
-from typing import Mapping, Optional, Tuple
+from typing import Optional
 
 
 if TYPE_CHECKING:

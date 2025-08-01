@@ -32,27 +32,27 @@ from typing import TYPE_CHECKING, AsyncIterator, List, NoReturn, Optional
 from typing import Sequence, Tuple, Type, Union, cast
 from typing_extensions import Protocol, Self
 
-from .constants import DEFAULT_LANG
-from .constants import FILEXFER_TYPE_REGULAR, FILEXFER_TYPE_DIRECTORY
-from .misc import BytesOrStr, FilePath, HostPort
-from .misc import async_context_manager
-from .sftp import SFTPAttrs, SFTPGlob, SFTPName
-from .sftp import SFTPError, SFTPFailure, SFTPBadMessage, SFTPConnectionLost
-from .sftp import SFTPErrorHandler, SFTPProgressHandler, local_fs
+from hyperscale.core.engines.client.ssh.protocol.constants import DEFAULT_LANG
+from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_REGULAR, FILEXFER_TYPE_DIRECTORY
+from hyperscale.core.engines.client.ssh.protocol.misc import BytesOrStr, FilePath, HostPort
+from hyperscale.core.engines.client.ssh.protocol.misc import async_context_manager
+from hyperscale.core.engines.client.sftp.protocol.sftp import SFTPAttrs, SFTPGlob, SFTPName
+from hyperscale.core.engines.client.sftp.protocol.sftp import SFTPError, SFTPFailure, SFTPBadMessage, SFTPConnectionLost
+from hyperscale.core.engines.client.sftp.protocol.sftp import SFTPErrorHandler, SFTPProgressHandler
 
 
 if TYPE_CHECKING:
     # pylint: disable=cyclic-import
-    from .connection import SSHClientConnection
-    from .stream import SSHReader, SSHWriter
+    from hyperscale.core.engines.client.ssh.protocol.connection import SSHClientConnection
+    from hyperscale.core.engines.client.ssh.protocol.stream import SSHReader, SSHWriter
 
 
 _SCPConn = Union[None, bytes, str, HostPort, 'SSHClientConnection']
 _SCPPath = Union[bytes, FilePath]
-_SCPConnPath = Union[Tuple[_SCPConn, _SCPPath], _SCPConn, _SCPPath]
+SCPConnPath = Union[Tuple[_SCPConn, _SCPPath], _SCPConn, _SCPPath]
 
 
-_SCP_BLOCK_SIZE = 256*1024    # 256 KiB
+SCP_BLOCK_SIZE = 256*1024    # 256 KiB
 
 
 class _SCPFileProtocol(Protocol):
@@ -147,7 +147,7 @@ def _parse_t_args(args: bytes) -> Tuple[int, int]:
         raise _scp_error(SFTPBadMessage, 'Invalid time request') from None
 
 
-async def _parse_path(path: _SCPConnPath, **kwargs) -> \
+async def parse_path(path: SCPConnPath, **kwargs) -> \
         Tuple[Optional['SSHClientConnection'], _SCPPath, bool]:
     """Convert an SCP path into an SSHClientConnection and path"""
 
@@ -182,7 +182,7 @@ async def _parse_path(path: _SCPConnPath, **kwargs) -> \
             cast(_SCPPath, path), close_conn)
 
 
-async def _start_remote(conn: 'SSHClientConnection', source: bool,
+async def start_remote(conn: 'SSHClientConnection', source: bool,
                         must_be_dir: bool, preserve: bool,
                         recurse: bool, path: _SCPPath) -> \
         Tuple['SSHReader[bytes]', 'SSHWriter[bytes]']:
@@ -381,12 +381,12 @@ class _SCPHandler:
             await self._writer.wait_closed()
 
 
-class _SCPSource(_SCPHandler):
+class SCPSource(_SCPHandler):
     """SCP handler for sending files"""
 
     def __init__(self, fs: _SCPFSProtocol, reader: 'SSHReader[bytes]',
                  writer: 'SSHWriter[bytes]', preserve: bool, recurse: bool,
-                 block_size: int = _SCP_BLOCK_SIZE,
+                 block_size: int = SCP_BLOCK_SIZE,
                  progress_handler: SFTPProgressHandler = None,
                  error_handler: SFTPErrorHandler = None, server: bool = False):
         super().__init__(reader, writer, error_handler, server)
@@ -531,12 +531,12 @@ class _SCPSource(_SCPHandler):
             await self.close(cancelled)
 
 
-class _SCPSink(_SCPHandler):
+class SCPSink(_SCPHandler):
     """SCP handler for receiving files"""
 
     def __init__(self, fs: _SCPFSProtocol, reader: 'SSHReader[bytes]',
                  writer: 'SSHWriter[bytes]', must_be_dir: bool, preserve: bool,
-                 recurse: bool, block_size: int = _SCP_BLOCK_SIZE,
+                 recurse: bool, block_size: int = SCP_BLOCK_SIZE,
                  progress_handler: SFTPProgressHandler = None,
                  error_handler: SFTPErrorHandler = None, server: bool = False):
         super().__init__(reader, writer, error_handler, server)
@@ -690,14 +690,14 @@ class _SCPSink(_SCPHandler):
             await self.close(cancelled)
 
 
-class _SCPCopier:
+class SCPCopier:
     """SCP handler for remote-to-remote copies"""
 
     def __init__(self, src_reader: 'SSHReader[bytes]',
                  src_writer: 'SSHWriter[bytes]',
                  dst_reader: 'SSHReader[bytes]',
                  dst_writer: 'SSHWriter[bytes]',
-                 block_size: int = _SCP_BLOCK_SIZE,
+                 block_size: int = SCP_BLOCK_SIZE,
                  progress_handler: SFTPProgressHandler = None,
                  error_handler: SFTPErrorHandler = None):
         self._source = _SCPHandler(src_reader, src_writer)
@@ -837,171 +837,3 @@ class _SCPCopier:
         finally:
             await self._source.close(cancelled)
             await self._sink.close(cancelled)
-
-
-async def scp(srcpaths: Union[_SCPConnPath, Sequence[_SCPConnPath]],
-              dstpath: _SCPConnPath = None, *, preserve: bool = False,
-              recurse: bool = False, block_size: int = _SCP_BLOCK_SIZE,
-              progress_handler: SFTPProgressHandler = None,
-              error_handler: SFTPErrorHandler = None, **kwargs) -> None:
-    """Copy files using SCP
-
-       This function is a coroutine which copies one or more files or
-       directories using the SCP protocol. Source and destination paths
-       can be `str` or `bytes` values to reference local files or can be
-       a tuple of the form `(conn, path)` where `conn` is an open
-       :class:`SSHClientConnection` to reference files and directories
-       on a remote system.
-
-       For convenience, a host name or tuple of the form `(host, port)`
-       can be provided in place of the :class:`SSHClientConnection` to
-       request that a new SSH connection be opened to a host using
-       default connect arguments. A `str` or `bytes` value of the form
-       `'host:path'` may also be used in place of the `(conn, path)`
-       tuple to make a new connection to the requested host on the
-       default SSH port.
-
-       Either a single source path or a sequence of source paths can be
-       provided, and each path can contain '*' and '?' wildcard characters
-       which can be used to match multiple source files or directories.
-
-       When copying a single file or directory, the destination path
-       can be either the full path to copy data into or the path to an
-       existing directory where the data should be placed. In the latter
-       case, the base file name from the source path will be used as the
-       destination name.
-
-       When copying multiple files, the destination path must refer to
-       a directory. If it doesn't already exist, a directory will be
-       created with that name.
-
-       If the destination path is an :class:`SSHClientConnection` without
-       a path or the path provided is empty, files are copied into the
-       default destination working directory.
-
-       If preserve is `True`, the access and modification times and
-       permissions of the original files and directories are set on the
-       copied files. However, do to the timing of when this information
-       is sent, the preserved access time will be what was set on the
-       source file before the copy begins. So, the access time on the
-       source file will no longer match the destination after the
-       transfer completes.
-
-       If recurse is `True` and the source path points at a directory,
-       the entire subtree under that directory is copied.
-
-       Symbolic links found on the source will have the contents of their
-       target copied rather than creating a destination symbolic link.
-       When using this option during a recursive copy, one needs to watch
-       out for links that result in loops. SCP does not provide a
-       mechanism for preserving links. If you need this, consider using
-       SFTP instead.
-
-       The block_size value controls the size of read and write operations
-       issued to copy the files. It defaults to 256 KB.
-
-       If progress_handler is specified, it will be called after each
-       block of a file is successfully copied. The arguments passed to
-       this handler will be the relative path of the file being copied,
-       bytes copied so far, and total bytes in the file being copied. If
-       multiple source paths are provided or recurse is set to `True`,
-       the progress_handler will be called consecutively on each file
-       being copied.
-
-       If error_handler is specified and an error occurs during the copy,
-       this handler will be called with the exception instead of it being
-       raised. This is intended to primarily be used when multiple source
-       paths are provided or when recurse is set to `True`, to allow
-       error information to be collected without aborting the copy of the
-       remaining files. The error handler can raise an exception if it
-       wants the copy to completely stop. Otherwise, after an error, the
-       copy will continue starting with the next file.
-
-       If any other keyword arguments are specified, they will be passed
-       to the AsyncSSH connect() call when attempting to open any new SSH
-       connections needed to perform the file transfer.
-
-       :param srcpaths:
-           The paths of the source files or directories to copy
-       :param dstpath: (optional)
-           The path of the destination file or directory to copy into
-       :param preserve: (optional)
-           Whether or not to preserve the original file attributes
-       :param recurse: (optional)
-           Whether or not to recursively copy directories
-       :param block_size: (optional)
-           The block size to use for file reads and writes
-       :param progress_handler: (optional)
-           The function to call to report copy progress
-       :param error_handler: (optional)
-           The function to call when an error occurs
-       :type preserve: `bool`
-       :type recurse: `bool`
-       :type block_size: `int`
-       :type progress_handler: `callable`
-       :type error_handler: `callable`
-
-       :raises: | :exc:`OSError` if a local file I/O error occurs
-                | :exc:`SFTPError` if the server returns an error
-                | :exc:`ValueError` if both source and destination are local
-
-    """
-
-    if (isinstance(srcpaths, (bytes, str, PurePath)) or
-            (isinstance(srcpaths, tuple) and len(srcpaths) == 2)):
-        srcpaths = [srcpaths] # type: ignore
-
-    srcpaths: Sequence[_SCPConnPath]
-
-    must_be_dir = len(srcpaths) > 1
-
-    dstconn, dstpath, close_dst = await _parse_path(dstpath, **kwargs)
-
-    try:
-        for srcpath in srcpaths:
-            srcconn, srcpath, close_src = await _parse_path(srcpath, **kwargs)
-
-            try:
-                if srcconn and dstconn:
-                    src_reader, src_writer = await _start_remote(
-                        srcconn, True, must_be_dir, preserve, recurse, srcpath)
-
-                    dst_reader, dst_writer = await _start_remote(
-                        dstconn, False, must_be_dir, preserve, recurse, dstpath)
-
-                    copier = _SCPCopier(src_reader, src_writer, dst_reader,
-                                        dst_writer, block_size,
-                                        progress_handler, error_handler)
-
-                    await copier.run()
-                elif srcconn:
-                    reader, writer = await _start_remote(
-                        srcconn, True, must_be_dir, preserve, recurse, srcpath)
-
-                    sink = _SCPSink(local_fs, reader, writer, must_be_dir,
-                                    preserve, recurse, block_size,
-                                    progress_handler, error_handler)
-
-                    await sink.run(dstpath)
-                elif dstconn:
-                    reader, writer = await _start_remote(
-                        dstconn, False, must_be_dir, preserve, recurse, dstpath)
-
-                    source = _SCPSource(local_fs, reader, writer,
-                                        preserve, recurse, block_size,
-                                        progress_handler, error_handler)
-
-                    await source.run(srcpath)
-                else:
-                    raise ValueError('Local copy not supported')
-            finally:
-                if close_src:
-                    assert srcconn is not None
-                    srcconn.close()
-                    await srcconn.wait_closed()
-    finally:
-        if close_dst:
-            assert dstconn is not None
-            dstconn.close()
-            await dstconn.wait_closed()
-
