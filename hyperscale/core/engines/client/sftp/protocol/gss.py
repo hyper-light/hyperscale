@@ -32,7 +32,6 @@ try:
     from .gss_unix import (
         GSSBase as GSSBase, 
         GSSClient as GSSClient, 
-        GSSServer as GSSServer, 
         GSSError as GSSError,
     )
 
@@ -59,10 +58,4 @@ except ImportError: # pragma: no cover
 
         def __init__(self, _host: str, _store: Optional[BytesOrStrDict],
                      _delegate_creds: bool):
-            raise GSSError(0, 0)
-
-    class GSSServer(GSSBase): # type: ignore
-        """Stub client class for reporting that GSS is not available"""
-
-        def __init__(self, _host: str, _store: Optional[BytesOrStrDict]):
             raise GSSError(0, 0)

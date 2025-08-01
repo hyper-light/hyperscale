@@ -30,7 +30,7 @@ from pathlib import PurePath
 import socket
 import stat
 from types import TracebackType
-from typing import Any, AnyStr, Awaitable, Callable, Dict, Generic, IO
+from typing import Any, AnyStr, Awaitable, Dict, Generic, IO
 from typing import Iterable, List, Mapping, Optional, Set, TextIO
 from typing import Tuple, Type, TypeVar, Union, cast
 from typing_extensions import Protocol, Self
@@ -39,9 +39,7 @@ from .channel import SSHChannel, SSHClientChannel
 
 from .constants import DEFAULT_LANG, EXTENDED_DATA_STDERR
 
-from .logging import SSHLogger
-
-from .misc import BytesOrStr, Error, MaybeAwait, TermModes, TermSize
+from .misc import BytesOrStr, Error
 from .misc import ProtocolError, Record, open_file, set_terminal_size
 from .misc import BreakReceived, SignalReceived, TerminalSizeChanged
 
@@ -826,13 +824,6 @@ class SSHProcess(SSHStreamSession, Generic[AnyStr]):
 
         assert self._chan is not None
         return self._chan
-
-    @property
-    def logger(self) -> SSHLogger:
-        """The logger associated with the process"""
-
-        assert self._chan is not None
-        return self._chan.logger
 
     @property
     def command(self) -> Optional[str]:

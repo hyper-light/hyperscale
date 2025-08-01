@@ -332,7 +332,6 @@ async def create_tcp_local_listener(
 
         if listen_port == 0:
             listen_port = sock.getsockname()[1]
-            conn.logger.debug1('Assigning dynamic port %d', listen_port)
 
         server = await loop.create_server(protocol_factory, sock=sock)
         servers.append(server)

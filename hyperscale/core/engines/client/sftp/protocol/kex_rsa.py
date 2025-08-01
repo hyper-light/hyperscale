@@ -28,7 +28,7 @@ from .misc import HashType, KeyExchangeFailed, ProtocolError
 from .misc import get_symbol_names, randrange
 from .packet import MPInt, String, SSHPacket
 from .public_key import KeyImportError, SSHKey
-from .public_key import decode_ssh_public_key, generate_private_key
+from .public_key import decode_ssh_public_key
 from .rsa import RSAKey
 
 
@@ -82,9 +82,6 @@ class _KexRSA(Kex):
                         packet: SSHPacket) -> None:
         """Process a KEXRSA pubkey message"""
 
-        if self._conn.is_server():
-            raise ProtocolError('Unexpected KEXRSA pubkey msg')
-
         self._host_key_data = packet.get_string()
         self._trans_key_data = packet.get_string()
         packet.check_end()
@@ -105,13 +102,10 @@ class _KexRSA(Kex):
                         packet: SSHPacket) -> None:
         """Process a KEXRSA secret message"""
         pass
-    
+
     def _process_done(self, _pkttype: int, _pktid: int,
                       packet: SSHPacket) -> None:
         """Process a KEXRSA done message"""
-
-        if self._conn.is_server():
-            raise ProtocolError('Unexpected KEXRSA done msg')
 
         sig = packet.get_string()
         packet.check_end()

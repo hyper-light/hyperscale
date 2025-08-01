@@ -166,17 +166,3 @@ class GSSClient(GSSBase):
         self._ctx = SecurityContext(name=self._host, creds=self._creds,
                                     flags=self._flags)
 
-
-class GSSServer(GSSBase):
-    """GSS server"""
-
-    @property
-    def _creds(self) -> Credentials:
-        """Abstract method to construct GSS credentials"""
-
-        return Credentials(name=self._host, usage='accept', store=self._store)
-
-    def _init_context(self) -> None:
-        """Construct GSS server security context"""
-
-        self._ctx = SecurityContext(creds=self._creds)

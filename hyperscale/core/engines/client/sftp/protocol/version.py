@@ -20,10 +20,10 @@
 
 """AsyncSSH version information"""
 
-__author__ = 'Ron Frederick'
+__author__ = 'Ada Lundhe'
 
-__author_email__ = 'ronf@timeheart.net'
+__author_email__ = 'adalundhe@lundhe.audio'
 
-__url__ = 'http://asyncssh.timeheart.net'
+__url__ = ''
 
-__version__ = '2.21.0'
+__version__ = '0.1.0'

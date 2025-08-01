@@ -39,7 +39,6 @@ from .public_key import SigningKey, VerifyingKey
 if TYPE_CHECKING:
     # pylint: disable=cyclic-import
     from .connection import SSHConnection, SSHClientConnection
-    from .connection import SSHServerConnection
 
 
 class DHKey(Protocol):
@@ -246,25 +245,11 @@ class _KexDHBase(Kex):
     def _process_init(self, _pkttype: int, _pktid: int,
                       packet: SSHPacket) -> None:
         """Process a DH init message"""
-
-        if self._conn.is_client():
-            raise ProtocolError('Unexpected kex init msg')
-
-        self._parse_client_key(packet)
-        packet.check_end()
-
-        server_conn = cast('SSHServerConnection', self._conn)
-        host_key = server_conn.get_server_host_key()
-        assert host_key is not None
-
-        self._perform_reply(host_key, host_key.public_data)
+        raise ProtocolError('Unexpected kex init msg')
 
     def _process_reply(self, _pkttype: int, _pktid: int,
                        packet: SSHPacket) -> None:
         """Process a DH reply message"""
-
-        if self._conn.is_server():
-            raise ProtocolError('Unexpected kex reply msg')
 
         host_key_data = packet.get_string()
         self._parse_server_key(packet)
@@ -277,9 +262,7 @@ class _KexDHBase(Kex):
 
     async def start(self) -> None:
         """Start DH key exchange"""
-
-        if self._conn.is_client():
-            self._perform_init()
+        self._perform_init()
 
 
 class _KexDH(_KexDHBase):
@@ -340,45 +323,11 @@ class _KexDHGex(_KexDHBase):
                          packet: SSHPacket) -> None:
         """Process a DH gex request message"""
 
-        if self._conn.is_client():
-            raise ProtocolError('Unexpected kex request msg')
-
-        if self._p:
-            raise ProtocolError('Kex DH group already requested')
-
-        self._gex_data = packet.get_remaining_payload()
-
-        if pkttype == MSG_KEX_DH_GEX_REQUEST_OLD:
-            preferred_size = packet.get_uint32()
-            max_size = KEX_DH_GEX_MAX_SIZE
-        else:
-            _ = packet.get_uint32()
-            preferred_size = packet.get_uint32()
-            max_size = packet.get_uint32()
-
-        packet.check_end()
-
-        g, p = _group1_g, _group1_p
-
-        for gex_size, gex_g, gex_p in _dh_gex_groups:
-            if gex_size > max_size:
-                break
-            else:
-                g, p = gex_g, gex_p
-
-                if gex_size >= preferred_size:
-                    break
-
-        self._init_group(g, p)
-        self._gex_data += MPInt(p) + MPInt(g)
-        self.send_packet(self._group_type, MPInt(p), MPInt(g))
-
+        raise ProtocolError('Unexpected kex request msg')
+    
     def _process_group(self, _pkttype: int, _pktid: int,
                        packet: SSHPacket) -> None:
         """Process a DH gex group message"""
-
-        if self._conn.is_server():
-            raise ProtocolError('Unexpected kex group msg')
 
         if self._p:
             raise ProtocolError('Kex DH group already sent')
@@ -393,9 +342,7 @@ class _KexDHGex(_KexDHBase):
 
     async def start(self) -> None:
         """Start DH group exchange"""
-
-        if self._conn.is_client():
-            self._send_request()
+        self._send_request()
 
     _packet_handlers: Mapping[int, Callable] = {
         MSG_KEX_DH_GEX_REQUEST_OLD: _process_request,
@@ -421,11 +368,8 @@ class _KexECDH(_KexDHBase):
         self._priv = ecdh_class(*args)
         pub = self._priv.get_public()
 
-        if conn.is_client():
-            self._client_pub = pub
-        else:
-            self._server_pub = pub
-
+        self._client_pub = pub
+        
     def _parse_client_key(self, packet: SSHPacket) -> None:
         """Parse an ECDH client key"""
 
@@ -464,9 +408,7 @@ class _KexECDH(_KexDHBase):
 
     async def start(self) -> None:
         """Start ECDH key exchange"""
-
-        if self._conn.is_client():
-            self._send_init()
+        self._send_init()
 
     _packet_handlers: Mapping[int, Callable] = {
         MSG_KEX_ECDH_INIT:  _KexDHBase._process_init,
@@ -483,9 +425,8 @@ class _KexHybridECDH(_KexECDH):
 
         self._pq = PQDH(pq_alg_name)
 
-        if conn.is_client():
-            pq_pub, self._pq_priv = self._pq.keypair()
-            self._client_pub = pq_pub + self._client_pub
+        pq_pub, self._pq_priv = self._pq.keypair()
+        self._client_pub = pq_pub + self._client_pub
 
     def _compute_client_shared(self) -> bytes:
         """Compute client shared key"""
@@ -579,11 +520,6 @@ class _KexGSSBase(_KexDHBase):
         try:
             self._token = await run_in_executor(self._gss.step, token)
         except GSSError as exc:
-            if self._conn.is_server():
-                self.send_packet(MSG_KEXGSS_ERROR, UInt32(exc.maj_code),
-                                 UInt32(exc.min_code), String(str(exc)),
-                                 String(DEFAULT_LANG))
-
             if exc.token:
                 self.send_packet(MSG_KEXGSS_CONTINUE, String(exc.token))
 
@@ -592,58 +528,20 @@ class _KexGSSBase(_KexDHBase):
     async def _process_gss_init(self, _pkttype: int, _pktid: int,
                                 packet: SSHPacket) -> None:
         """Process a GSS init message"""
-
-        if self._conn.is_client():
-            raise ProtocolError('Unexpected kexgss init msg')
-
-        token = packet.get_string()
-        self._parse_client_key(packet)
-        packet.check_end()
-
-        server_conn = cast('SSHServerConnection', self._conn)
-        host_key = server_conn.get_server_host_key()
-
-        if host_key:
-            self._host_key_data = host_key.public_data
-            self.send_packet(MSG_KEXGSS_HOSTKEY, String(self._host_key_data))
-        else:
-            self._host_key_data = b''
-
-        await self._process_token(token)
-
-        if self._gss.complete:
-            self._check_secure()
-            self._perform_reply(self._gss, self._host_key_data)
-            self._conn.enable_gss_kex_auth()
-        else:
-            self._send_continue()
+        raise ProtocolError('Unexpected kexgss init msg')
 
     async def _process_continue(self, _pkttype: int, _pktid: int,
                                 packet: SSHPacket) -> None:
         """Process a GSS continue message"""
 
-        token = packet.get_string()
         packet.check_end()
 
-        if self._conn.is_client() and self._gss.complete:
+        if self._gss.complete:
             raise ProtocolError('Unexpected kexgss continue msg')
-
-        self._host_key_msg_ok = False
-
-        await self._process_token(token)
-
-        if self._conn.is_server() and self._gss.complete:
-            self._check_secure()
-            self._perform_reply(self._gss, self._host_key_data)
-        else:
-            self._send_continue()
-
+        
     async def _process_complete(self, _pkttype: int, _pktid: int,
                                 packet: SSHPacket) -> None:
         """Process a GSS complete message"""
-
-        if self._conn.is_server():
-            raise ProtocolError('Unexpected kexgss complete msg')
 
         self._host_key_msg_ok = False
 
@@ -684,25 +582,18 @@ class _KexGSSBase(_KexDHBase):
                        packet: SSHPacket) -> None:
         """Process a GSS error message"""
 
-        if self._conn.is_server():
-            raise ProtocolError('Unexpected kexgss error msg')
-
         _ = packet.get_uint32()         # major_status
         _ = packet.get_uint32()         # minor_status
         msg = packet.get_string()
         _ = packet.get_string()         # lang
         packet.check_end()
-
-        self._conn.logger.debug1('GSS error: %s',
-                                 msg.decode('utf-8', errors='ignore'))
-
+        
     async def start(self) -> None:
         """Start GSS key exchange"""
 
-        if self._conn.is_client():
-            self._host_key_msg_ok = True
-            await self._process_token()
-            await super().start()
+        self._host_key_msg_ok = True
+        await self._process_token()
+        await super().start()
 
 
 class _KexGSS(_KexGSSBase, _KexDH):

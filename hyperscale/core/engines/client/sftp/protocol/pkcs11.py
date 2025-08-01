@@ -33,6 +33,12 @@ try:
 except (ImportError, ModuleNotFoundError): # pragma: no cover
     pkcs11_available = False
 
+    class Attribute:
+        pass
+
+    class ObjectClass:
+        pass
+
 from .misc import BytesOrStr
 from .packet import MPInt, String
 from .public_key import SSHCertificate, SSHKey, SSHKeyPair

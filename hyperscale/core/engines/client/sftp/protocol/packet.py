@@ -20,14 +20,12 @@
 
 """SSH packet encoding and decoding functions"""
 
-from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 from typing import Sequence, Union
 
-from .logging import SSHLogger
-from .misc import MaybeAwait, plural
+from .misc import MaybeAwait
 
 
-_LoggedPacket = Union[bytes, 'SSHPacket']
 _PacketHandler = Callable[[Any, int, int, 'SSHPacket'], MaybeAwait[None]]
 
 
@@ -174,61 +172,10 @@ class SSHPacket:
         return namelist.split(b',') if namelist else []
 
 
-class SSHPacketLogger:
-    """Parent class for SSH packet loggers"""
-
-    _handler_names: Mapping[int, str] = {}
-
-    @property
-    def logger(self) -> SSHLogger:
-        """The logger to use for packet logging"""
-
-        raise NotImplementedError
-
-    def _log_packet(self, msg: str, pkttype: int, pktid: Optional[int],
-                    packet: _LoggedPacket, note: str) -> None:
-        """Log a sent/received packet"""
-
-        if isinstance(packet, SSHPacket):
-            packet = packet.get_full_payload()
-
-        try:
-            name = f'{self._handler_names[pkttype]} ({pkttype})'
-        except KeyError:
-            name = f'packet type {pkttype}'
-
-        count = plural(len(packet), 'byte')
-
-        if note:
-            note = f' ({note})'
-
-        self.logger.packet(pktid, packet, '%s %s, %s%s',
-                           msg, name, count, note)
-
-    def log_sent_packet(self, pkttype: int, pktid: Optional[int],
-                        packet: _LoggedPacket, note: str = '') -> None:
-        """Log a sent packet"""
-
-        self._log_packet('Sent', pkttype, pktid, packet, note)
-
-
-    def log_received_packet(self, pkttype: int, pktid: Optional[int],
-                            packet: _LoggedPacket, note: str = '') -> None:
-        """Log a received packet"""
-
-        self._log_packet('Received', pkttype, pktid, packet, note)
-
-
-class SSHPacketHandler(SSHPacketLogger):
+class SSHPacketHandler:
     """Parent class for SSH packet handlers"""
 
     _packet_handlers: Mapping[int, _PacketHandler] = {}
-
-    @property
-    def logger(self) -> SSHLogger:
-        """The logger associated with this packet handler"""
-
-        raise NotImplementedError
 
     def process_packet(self, pkttype: int, pktid: int,
                        packet: SSHPacket) -> Union[bool, Awaitable[None]]:

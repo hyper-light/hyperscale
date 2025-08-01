@@ -24,7 +24,6 @@ import binascii
 from hashlib import md5
 from typing import TYPE_CHECKING, Dict, List, Sequence, Tuple, Type
 
-from .logging import SSHLogger
 from .misc import HashType
 from .packet import SSHPacketHandler
 
@@ -54,7 +53,6 @@ class Kex(SSHPacketHandler):
         self.algorithm = alg
 
         self._conn = conn
-        self._logger = conn.logger
         self._hash_alg = hash_alg
 
 
@@ -67,12 +65,6 @@ class Kex(SSHPacketHandler):
         """Send a kex packet"""
 
         self._conn.send_packet(pkttype, *args, handler=self)
-
-    @property
-    def logger(self) -> SSHLogger:
-        """A logger associated with this connection"""
-
-        return self._logger
 
     def compute_key(self, k: bytes, h: bytes, x: bytes,
                     session_id: bytes, keylen: int) -> bytes:

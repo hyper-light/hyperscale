@@ -33,7 +33,6 @@ from typing import Callable, Dict, List, NoReturn, Optional, Sequence
 from typing import Set, Tuple, Union, cast
 
 from .constants import DEFAULT_PORT
-from .logging import logger
 from .misc import DefTuple, FilePath, ip_address
 from .pattern import HostPatternList, WildcardPatternList
 
@@ -147,9 +146,6 @@ class SSHConfig:
                 path = self._default_path
 
             paths = list(path.glob(pattern))
-
-            if not paths:
-                logger.debug1(f'Config pattern "{pattern}" matched no files')
 
             for path in paths:
                 self.parse(path)
@@ -367,8 +363,6 @@ class SSHConfig:
         self._line_no = 0
         self._matching = True
         self._tokens = {'%': '%'}
-
-        logger.debug1('Reading config from "%s"', path)
 
         with open(path) as file:
             for line in file:

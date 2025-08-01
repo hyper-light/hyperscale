@@ -25,7 +25,6 @@
 import asyncio
 import errno
 from fnmatch import fnmatch
-import inspect
 import os
 from os import SEEK_SET, SEEK_CUR, SEEK_END
 from pathlib import PurePath
@@ -35,7 +34,7 @@ import sys
 import time
 from types import TracebackType
 from typing import TYPE_CHECKING, AnyStr, AsyncIterator, Awaitable, Callable
-from typing import Dict, Generic, IO, Iterable, List, Mapping, Optional, Literal, Protocol, Self
+from typing import Dict, Generic, IO, List, Mapping, Optional, Literal, Protocol, Self
 from typing import Sequence, Set, Tuple, Type, TypeVar, Union, cast, overload
 
 from . import constants
@@ -101,15 +100,13 @@ from .constants import FILEXFER_TYPE_UNKNOWN, FILEXFER_TYPE_SOCKET
 from .constants import FILEXFER_TYPE_CHAR_DEVICE, FILEXFER_TYPE_BLOCK_DEVICE
 from .constants import FILEXFER_TYPE_FIFO
 
-from .logging import SSHLogger
-
 from .misc import BytesOrStr, Error, FilePath, OptExcInfo, Record
 from .misc import ConnectionLost
 from .misc import async_context_manager, get_symbol_names, hide_empty
 from .misc import make_sparse_file, plural
 
 from .packet import Boolean, Byte, String, UInt32, UInt64
-from .packet import PacketDecodeError, SSHPacket, SSHPacketLogger
+from .packet import PacketDecodeError, SSHPacket
 
 from .version import __author__, __version__
 
@@ -155,7 +152,6 @@ MAX_SFTP_WRITE_LEN = 4*1024*1024                    # 4 MiB
 MAX_SFTP_PACKET_LEN = MAX_SFTP_WRITE_LEN + 1024
 
 _MAX_SFTP_REQUESTS = 128
-_MAX_SPARSE_RANGES = 128
 
 _NSECS_IN_SEC = 1_000_000_000
 
@@ -2101,15 +2097,6 @@ class SFTPLimits(Record):
         return cls(max_packet_len, max_read_len,
                    max_write_len, max_open_handles)
 
-    def log(self, logger: SSHLogger, label: str) -> None:
-        """Log sending or receiving SFTP limits"""
-
-        logger.debug1('%s erver limits:', label)
-        logger.debug1('  Max packet len: %d', self.max_packet_len)
-        logger.debug1('  Max read len: %d', self.max_read_len)
-        logger.debug1('  Max write len: %d', self.max_write_len)
-        logger.debug1('  Max open handles: %d', self.max_open_handles)
-
 
 class SFTPRanges(Record):
     """SFTP sparse file ranges"""
@@ -2135,16 +2122,6 @@ class SFTPRanges(Record):
         at_end = packet.get_boolean()
 
         return cls(ranges, at_end)
-
-    def log(self, logger: SSHLogger, label: str) -> None:
-        """Log sending or receiving sparse file ranges"""
-
-        logger.debug1('%s %s%s', label,
-                      plural(len(self.ranges), 'sparse file range'),
-                      ' (at end)' if self.at_end else '')
-
-        for offset, length in self.ranges:
-            logger.debug1('  offset %d, length %d', offset, length)
 
 
 class SFTPGlob:
@@ -2333,7 +2310,7 @@ class SFTPGlob:
         return self._new_matches
 
 
-class SFTPHandler(SSHPacketLogger):
+class SFTPHandler:
     """SFTP session handler"""
 
     _data_pkttypes = {FXP_WRITE, FXP_DATA}
@@ -2365,15 +2342,8 @@ class SFTPHandler(SSHPacketLogger):
     def __init__(self, reader: 'SSHReader[bytes]', writer: 'SSHWriter[bytes]'):
         self._reader: Optional['SSHReader[bytes]'] = reader
         self._writer: Optional['SSHWriter[bytes]'] = writer
-        self._logger = reader.logger.get_child('sftp')
 
         self.limits = SFTPLimits(0, SAFE_SFTP_READ_LEN, SAFE_SFTP_WRITE_LEN, 0)
-
-    @property
-    def logger(self) -> SSHLogger:
-        """A logger associated with this SFTP handler"""
-
-        return self._logger
 
     async def _cleanup(self, exc: Optional[Exception]) -> None:
         """Clean up this SFTP session"""
@@ -2384,70 +2354,6 @@ class SFTPHandler(SSHPacketLogger):
             self._writer.close()
             self._reader = None
             self._writer = None
-
-    def _log_extensions(self, extensions: Sequence[Tuple[bytes, bytes]]):
-        """Dump a formatted list of extensions to the debug log"""
-
-        for name, data in extensions:
-            if name == b'acl-supported':
-                capabilities = _parse_acl_supported(data)
-
-                self.logger.debug1('  acl-supported:')
-                self.logger.debug1('    capabilities: 0x%08x', capabilities)
-            elif name == b'supported':
-                attr_mask, attrib_mask, open_flags, access_mask, \
-                    max_read_size, ext_names = _parse_supported(data)
-
-                self.logger.debug1('  supported:')
-                self.logger.debug1('    attr_mask: 0x%08x', attr_mask)
-                self.logger.debug1('    attrib_mask: 0x%08x', attrib_mask)
-                self.logger.debug1('    open_flags: 0x%08x', open_flags)
-                self.logger.debug1('    access_mask: 0x%08x', access_mask)
-                self.logger.debug1('    max_read_size: %d', max_read_size)
-
-                if ext_names:
-                    self.logger.debug1('    extensions:')
-
-                    for ext_name in ext_names:
-                        self.logger.debug1('      %s', ext_name)
-            elif name == b'supported2':
-                attr_mask, attrib_mask, open_flags, access_mask, \
-                    max_read_size, open_block_vector, block_vector, \
-                    attrib_ext_names, ext_names = _parse_supported2(data)
-
-                self.logger.debug1('  supported2:')
-                self.logger.debug1('    attr_mask: 0x%08x', attr_mask)
-                self.logger.debug1('    attrib_mask: 0x%08x', attrib_mask)
-                self.logger.debug1('    open_flags: 0x%08x', open_flags)
-                self.logger.debug1('    access_mask: 0x%08x', access_mask)
-                self.logger.debug1('    max_read_size: %d', max_read_size)
-                self.logger.debug1('    open_block_vector: 0x%04x',
-                    open_block_vector)
-                self.logger.debug1('    block_vector: 0x%04x', block_vector)
-
-                if attrib_ext_names:
-                    self.logger.debug1('    attrib_extensions:')
-
-                    for attrib_ext_name in attrib_ext_names:
-                        self.logger.debug1('      %s', attrib_ext_name)
-
-                if ext_names:
-                    self.logger.debug1('    extensions:')
-
-                    for ext_name in ext_names:
-                        self.logger.debug1('      %s', ext_name)
-            elif name == b'vendor-id':
-                vendor_name, product_name, product_version, product_build = \
-                    _parse_vendor_id(data)
-
-                self.logger.debug1('  vendor-id:')
-                self.logger.debug1('    vendor_name: %s', vendor_name)
-                self.logger.debug1('    product_name: %s', product_name)
-                self.logger.debug1('    product_version: %s', product_version)
-                self.logger.debug1('    product_build: %d', product_build)
-            else:
-                self.logger.debug1('  %s%s%s', name,
-                                   ': ' if data else '', data)
 
     async def _process_packet(self, pkttype: int, pktid: int,
                               packet: SSHPacket) -> None:
@@ -2469,8 +2375,6 @@ class SFTPHandler(SSHPacketLogger):
         except ConnectionError as exc:
             raise SFTPConnectionLost(str(exc)) from None
 
-        self.log_sent_packet(pkttype, pktid, payload)
-
     async def recv_packet(self) -> SSHPacket:
         """Receive an SFTP packet"""
 
@@ -2491,8 +2395,6 @@ class SFTPHandler(SSHPacketLogger):
 
                 pkttype = packet.get_byte()
                 pktid = packet.get_uint32()
-
-                self.log_received_packet(pkttype, pktid, packet)
 
                 await self._process_packet(pkttype, pktid, packet)
         except PacketDecodeError as exc:
@@ -2548,8 +2450,6 @@ class SFTPClientHandler(SFTPHandler):
                 waiter.set_exception(req_exc)
 
         self._requests = {}
-
-        self.logger.info('SFTP client exited%s', ': ' + str(exc) if exc else '')
 
         await super()._cleanup(exc)
 
@@ -2612,8 +2512,6 @@ class SFTPClientHandler(SFTPHandler):
 
         if exc:
             raise exc
-        else:
-            self.logger.debug1('Received OK')
 
     def _process_handle(self, packet: SSHPacket) -> bytes:
         """Process an incoming SFTP handle response"""
@@ -2622,8 +2520,6 @@ class SFTPClientHandler(SFTPHandler):
 
         if self._version < 6:
             packet.check_end()
-
-        self.logger.debug1('Received handle %s', handle.hex())
 
         return handle
 
@@ -2636,9 +2532,6 @@ class SFTPClientHandler(SFTPHandler):
 
         if self._version < 6:
             packet.check_end()
-
-        self.logger.debug1('Received %s%s', plural(len(data), 'data byte'),
-                           ' (at end)' if at_end else '')
 
         return data, at_end
 
@@ -2653,12 +2546,6 @@ class SFTPClientHandler(SFTPHandler):
         if self._version < 6:
             packet.check_end()
 
-        self.logger.debug1('Received %s%s', plural(count, 'name'),
-                           ' (at end)' if at_end else '')
-
-        for name in names:
-            self.logger.debug1('  %s', name)
-
         return names, at_end
 
     def _process_attrs(self, packet: SSHPacket) -> SFTPAttrs:
@@ -2668,8 +2555,6 @@ class SFTPClientHandler(SFTPHandler):
 
         if self._version < 6:
             packet.check_end()
-
-        self.logger.debug1('Received %s', attrs)
 
         return attrs
 
@@ -2695,16 +2580,12 @@ class SFTPClientHandler(SFTPHandler):
 
         assert self._reader is not None
 
-        self.logger.debug1('Sending init, version=%d', self._version)
-
         self.send_packet(FXP_INIT, None, UInt32(self._version))
 
         try:
             resp = await self.recv_packet()
 
             resptype = resp.get_byte()
-
-            self.log_received_packet(resptype, None, resp)
 
             if resptype != FXP_VERSION:
                 raise SFTPBadMessage('Expected version message')
@@ -2729,10 +2610,6 @@ class SFTPClientHandler(SFTPHandler):
         except (asyncio.IncompleteReadError, Error) as exc:
             raise SFTPConnectionLost(str(exc)) from None
 
-        self.logger.debug1('Received version=%d%s', version,
-                           ', extensions:' if rcvd_extensions else '')
-
-        self._log_extensions(rcvd_extensions)
 
         self._version = version
 
@@ -2764,8 +2641,6 @@ class SFTPClientHandler(SFTPHandler):
 
             if any(name in server_version
                    for name in self._nonstandard_symlink_impls):
-                self.logger.debug1('Adjusting for non-standard symlink '
-                                   'implementation')
                 self._nonstandard_symlink = True
 
     async def request_limits(self) -> None:
@@ -2777,8 +2652,6 @@ class SFTPClientHandler(SFTPHandler):
 
             limits = SFTPLimits.decode(packet)
             packet.check_end()
-
-            limits.log(self.logger, 'Received')
 
             if limits.max_read_len:
                 self.limits.max_read_len = limits.max_read_len
@@ -2793,17 +2666,10 @@ class SFTPClientHandler(SFTPHandler):
         if self._version >= 5:
             desired_access, flags = _pflags_to_flags(pflags)
 
-            self.logger.debug1('Sending open for %s, desired_access=0x%08x, '
-                               'flags=0x%08x%s', filename, desired_access,
-                               flags, hide_empty(attrs))
-
             return cast(bytes, await self._make_request(
                 FXP_OPEN, String(filename), UInt32(desired_access),
                 UInt32(flags), attrs.encode(self._version)))
         else:
-            self.logger.debug1('Sending open for %s, mode 0x%02x%s',
-                               filename, pflags, hide_empty(attrs))
-
             return cast(bytes, await self._make_request(
                 FXP_OPEN, String(filename), UInt32(pflags),
                 attrs.encode(self._version)))
@@ -2811,10 +2677,6 @@ class SFTPClientHandler(SFTPHandler):
     async def open56(self, filename: bytes, desired_access: int,
                      flags: int, attrs: SFTPAttrs) -> bytes:
         """Make an SFTPv5/v6 open request"""
-
-        self.logger.debug1('Sending open for %s, desired_access=0x%08x, '
-                           'flags=0x%08x%s', filename, desired_access,
-                           flags, hide_empty(attrs))
 
         if self._version >= 5:
             return cast(bytes, await self._make_request(
@@ -2825,28 +2687,17 @@ class SFTPClientHandler(SFTPHandler):
 
     async def close(self, handle: bytes) -> None:
         """Make an SFTP close request"""
-
-        self.logger.debug1('Sending close for handle %s', handle.hex())
-
         if self._writer:
             await self._make_request(FXP_CLOSE, String(handle))
 
     async def read(self, handle: bytes, offset: int,
                    length: int) -> Tuple[bytes, bool]:
         """Make an SFTP read request"""
-
-        self.logger.debug1('Sending read for %s at offset %d in handle %s',
-                           plural(length, 'byte'), offset, handle.hex())
-
         return cast(Tuple[bytes, bool], await self._make_request(
             FXP_READ, String(handle), UInt64(offset), UInt32(length)))
 
     async def write(self, handle: bytes, offset: int, data: bytes) -> int:
         """Make an SFTP write request"""
-
-        self.logger.debug1('Sending write for %s at offset %d in handle %s',
-                           plural(len(data), 'byte'), offset, handle.hex())
-
         return cast(int, await self._make_request(
             FXP_WRITE, String(handle), UInt64(offset), String(data)))
 
@@ -2862,13 +2713,9 @@ class SFTPClientHandler(SFTPHandler):
             flag_text = ''
 
         if follow_symlinks:
-            self.logger.debug1('Sending stat for %s%s', path, flag_text)
-
             return cast(SFTPAttrs,  await self._make_request(
                 FXP_STAT, String(path), flag_bytes))
         else:
-            self.logger.debug1('Sending lstat for %s%s', path, flag_text)
-
             return cast(SFTPAttrs,  await self._make_request(
                 FXP_LSTAT, String(path), flag_bytes))
 
@@ -2877,12 +2724,8 @@ class SFTPClientHandler(SFTPHandler):
 
         if self._version >= 4:
             flag_bytes = UInt32(flags)
-            flag_text = f', flags 0x{flags:08x}'
         else:
             flag_bytes = b''
-            flag_text = ''
-
-        self.logger.debug1('Sending lstat for %s%s', path, flag_text)
 
         return cast(SFTPAttrs, await self._make_request(
             FXP_LSTAT, String(path), flag_bytes))
@@ -2892,13 +2735,8 @@ class SFTPClientHandler(SFTPHandler):
 
         if self._version >= 4:
             flag_bytes = UInt32(flags)
-            flag_text = f', flags 0x{flags:08x}'
         else:
             flag_bytes = b''
-            flag_text = ''
-
-        self.logger.debug1('Sending fstat for handle %s%s',
-                           handle.hex(), flag_text)
 
         return cast(SFTPAttrs, await self._make_request(
             FXP_FSTAT, String(handle), flag_bytes))
@@ -2908,15 +2746,9 @@ class SFTPClientHandler(SFTPHandler):
         """Make an SFTP setstat or lsetstat request"""
 
         if follow_symlinks:
-            self.logger.debug1('Sending setstat for %s%s',
-                               path, hide_empty(attrs))
-
             await self._make_request(FXP_SETSTAT, String(path),
                                      attrs.encode(self._version))
         elif self._supports_lsetstat:
-            self.logger.debug1('Sending lsetstat for %s%s',
-                               path, hide_empty(attrs))
-
             await self._make_request(b'lsetstat@openssh.com', String(path),
                                      attrs.encode(self._version))
         else:
@@ -2924,10 +2756,6 @@ class SFTPClientHandler(SFTPHandler):
 
     async def fsetstat(self, handle: bytes, attrs: SFTPAttrs) -> None:
         """Make an SFTP fsetstat request"""
-
-        self.logger.debug1('Sending fsetstat for handle %s%s',
-                           handle.hex(), hide_empty(attrs))
-
         await self._make_request(FXP_FSETSTAT, String(handle),
                                  attrs.encode(self._version))
 
@@ -2935,15 +2763,11 @@ class SFTPClientHandler(SFTPHandler):
         """Make an SFTP statvfs request"""
 
         if self._supports_statvfs:
-            self.logger.debug1('Sending statvfs for %s', path)
-
             packet = cast(SSHPacket, await self._make_request(
                 b'statvfs@openssh.com', String(path)))
 
             vfsattrs = SFTPVFSAttrs.decode(packet, self._version)
             packet.check_end()
-
-            self.logger.debug1('Received %s', vfsattrs)
 
             return vfsattrs
         else:
@@ -2953,15 +2777,11 @@ class SFTPClientHandler(SFTPHandler):
         """Make an SFTP fstatvfs request"""
 
         if self._supports_fstatvfs:
-            self.logger.debug1('Sending fstatvfs for handle %s', handle.hex())
-
             packet = cast(SSHPacket, await self._make_request(
                 b'fstatvfs@openssh.com', String(handle)))
 
             vfsattrs = SFTPVFSAttrs.decode(packet, self._version)
             packet.check_end()
-
-            self.logger.debug1('Received %s', vfsattrs)
 
             return vfsattrs
         else:
@@ -2969,31 +2789,18 @@ class SFTPClientHandler(SFTPHandler):
 
     async def remove(self, path: bytes) -> None:
         """Make an SFTP remove request"""
-
-        self.logger.debug1('Sending remove for %s', path)
-
         await self._make_request(FXP_REMOVE, String(path))
 
     async def rename(self, oldpath: bytes, newpath: bytes, flags: int) -> None:
         """Make an SFTP rename request"""
 
         if self._version >= 5:
-            self.logger.debug1('Sending rename request from %s to %s%s',
-                               oldpath, newpath, f', flags=0x{flags:x}'
-                               if flags else '')
-
             await self._make_request(FXP_RENAME, String(oldpath),
                                      String(newpath), UInt32(flags))
         elif flags and self._supports_posix_rename:
-            self.logger.debug1('Sending OpenSSH POSIX rename request '
-                               'from %s to %s', oldpath, newpath)
-
             await self._make_request(b'posix-rename@openssh.com',
                                      String(oldpath), String(newpath))
         elif not flags:
-            self.logger.debug1('Sending rename request from %s to %s',
-                               oldpath, newpath)
-
             await self._make_request(FXP_RENAME, String(oldpath),
                                      String(newpath))
         else:
@@ -3003,15 +2810,9 @@ class SFTPClientHandler(SFTPHandler):
         """Make an SFTP POSIX rename request"""
 
         if self._supports_posix_rename:
-            self.logger.debug1('Sending OpenSSH POSIX rename request '
-                               'from %s to %s', oldpath, newpath)
-
             await self._make_request(b'posix-rename@openssh.com',
                                      String(oldpath), String(newpath))
         elif self._version >= 5:
-            self.logger.debug1('Sending rename request from %s to %s '
-                               'with overwrite', oldpath, newpath)
-
             await self._make_request(FXP_RENAME, String(oldpath),
                                      String(newpath), UInt32(FXR_OVERWRITE))
         else:
@@ -3019,50 +2820,26 @@ class SFTPClientHandler(SFTPHandler):
 
     async def opendir(self, path: bytes) -> bytes:
         """Make an SFTP opendir request"""
-
-        self.logger.debug1('Sending opendir for %s', path)
-
         return cast(bytes, await self._make_request(
             FXP_OPENDIR, String(path)))
 
     async def readdir(self, handle: bytes) -> _SFTPNames:
         """Make an SFTP readdir request"""
-
-        self.logger.debug1('Sending readdir for handle %s', handle.hex())
-
         return  cast(_SFTPNames, await self._make_request(
             FXP_READDIR, String(handle)))
 
     async def mkdir(self, path: bytes, attrs: SFTPAttrs) -> None:
         """Make an SFTP mkdir request"""
-
-        self.logger.debug1('Sending mkdir for %s', path)
-
         await self._make_request(FXP_MKDIR, String(path),
                                  attrs.encode(self._version))
 
     async def rmdir(self, path: bytes) -> None:
         """Make an SFTP rmdir request"""
-
-        self.logger.debug1('Sending rmdir for %s', path)
-
         await self._make_request(FXP_RMDIR, String(path))
 
     async def realpath(self, path: bytes, *compose_paths: bytes,
                        check: int = FXRP_NO_CHECK) -> _SFTPNames:
         """Make an SFTP realpath request"""
-
-        if check == FXRP_NO_CHECK:
-            checkmsg = ''
-        else:
-            try:
-                checkmsg = f', check={self._realpath_check_names[check]}'
-            except KeyError:
-                checkmsg = f', check={check}'
-
-        self.logger.debug1('Sending realpath of %s%s%s', path,
-                           b', compose_path: ' + b', '.join(compose_paths)
-                           if compose_paths else b'', checkmsg)
 
         if self._version >= 6:
             return cast(_SFTPNames, await self._make_request(
@@ -3074,18 +2851,11 @@ class SFTPClientHandler(SFTPHandler):
 
     async def readlink(self, path: bytes) -> _SFTPNames:
         """Make an SFTP readlink request"""
-
-        self.logger.debug1('Sending readlink for %s', path)
-
         return cast(_SFTPNames, await self._make_request(
             FXP_READLINK, String(path)))
 
     async def symlink(self, oldpath: bytes, newpath: bytes) -> None:
         """Make an SFTP symlink request"""
-
-        self.logger.debug1('Sending symlink request from %s to %s',
-                           oldpath, newpath)
-
         if self._version >= 6:
             await self._make_request(FXP_LINK, String(newpath),
                                      String(oldpath), Boolean(True))
@@ -3101,9 +2871,6 @@ class SFTPClientHandler(SFTPHandler):
         """Make an SFTP hard link request"""
 
         if self._version >= 6 or self._supports_hardlink:
-            self.logger.debug1('Sending hardlink request from %s to %s',
-                               oldpath, newpath)
-
             if self._version >= 6:
                 await self._make_request(FXP_LINK, String(newpath),
                                          String(oldpath), Boolean(False))
@@ -3118,11 +2885,6 @@ class SFTPClientHandler(SFTPHandler):
         """Make an SFTP byte range lock request"""
 
         if self._version >= 6:
-            self.logger.debug1('Sending byte range lock request for '
-                               'handle %s, offset %d, length %d, '
-                               'flags 0x%04x', handle.hex(), offset,
-                               length, flags)
-
             await self._make_request(FXP_BLOCK, String(handle),
                                      UInt64(offset), UInt64(length),
                                      UInt32(flags))
@@ -3133,10 +2895,6 @@ class SFTPClientHandler(SFTPHandler):
         """Make an SFTP byte range unlock request"""
 
         if self._version >= 6:
-            self.logger.debug1('Sending byte range unlock request for '
-                               'handle %s, offset %d, length %d',
-                               handle.hex(), offset, length)
-
             await self._make_request(FXP_UNBLOCK, String(handle),
                                      UInt64(offset), UInt64(length))
         else:
@@ -3146,8 +2904,6 @@ class SFTPClientHandler(SFTPHandler):
         """Make an SFTP fsync request"""
 
         if self._supports_fsync:
-            self.logger.debug1('Sending fsync for handle %s', handle.hex())
-
             await self._make_request(b'fsync@openssh.com', String(handle))
         else:
             raise SFTPOpUnsupported('fsync not supported')
@@ -3158,12 +2914,6 @@ class SFTPClientHandler(SFTPHandler):
         """Make an SFTP copy data request"""
 
         if self._supports_copy_data:
-            self.logger.debug1('Sending copy-data from handle %s, '
-                               'offset %d, length %d to handle %s, '
-                               'offset %d', read_from_handle.hex(),
-                               read_from_offset, read_from_length,
-                               write_to_handle.hex(), write_to_offset)
-
             await self._make_request(b'copy-data', String(read_from_handle),
                                      UInt64(read_from_offset),
                                      UInt64(read_from_length),
@@ -3177,18 +2927,12 @@ class SFTPClientHandler(SFTPHandler):
         """Request file ranges containing data in a remote file"""
 
         if self._supports_ranges:
-            self.logger.debug1('Sending ranges request for handle %s, '
-                               'offset %d, length %d', handle.hex(),
-                               offset, length)
-
             packet = cast(SSHPacket, await self._make_request(
                 b'ranges@asyncssh.com', String(handle),
                 UInt64(offset), UInt64(length)))
 
             result = SFTPRanges.decode(packet)
             packet.check_end()
-
-            result.log(self.logger, 'Received')
 
             return result
         else:
@@ -3759,12 +3503,6 @@ class SFTPClient:
         return False
 
     @property
-    def logger(self) -> SSHLogger:
-        """A logger associated with this SFTP client"""
-
-        return self._handler.logger
-
-    @property
     def version(self) -> int:
         """SFTP version associated with this SFTP session"""
 
@@ -3875,9 +3613,6 @@ class SFTPClient:
                     raise exc(srcpath.decode('utf-8', 'backslashreplace') +
                               ' is a directory')
 
-                self.logger.info('  Starting copy of directory %s to %s',
-                                 srcpath, dstpath)
-
                 if not await dstfs.isdir(dstpath):
                     await dstfs.mkdir(dstpath)
 
@@ -3896,19 +3631,11 @@ class SFTPClient:
                                      max_requests, progress_handler,
                                      error_handler, remote_only)
 
-                self.logger.info('  Finished copy of directory %s to %s',
-                                 srcpath, dstpath)
-
             elif filetype == FILEXFER_TYPE_SYMLINK:
                 targetpath = await srcfs.readlink(srcpath)
-
-                self.logger.info('  Copying symlink %s to %s', srcpath, dstpath)
-                self.logger.info('    Target path: %s', targetpath)
-
                 await dstfs.symlink(targetpath, dstpath)
-            else:
-                self.logger.info('  Copying file %s to %s', srcpath, dstpath)
 
+            else:
                 if remote_only and not self.supports_remote_copy:
                     raise SFTPOpUnsupported('Remote copy not supported')
 
@@ -3929,10 +3656,8 @@ class SFTPClient:
                     await dstfs.setstat(dstpath, attrs,
                                         follow_symlinks=follow_symlinks or
                                         filetype != FILEXFER_TYPE_SYMLINK)
-
-                    self.logger.info('    Preserved attrs: %s', attrs)
                 except SFTPOpUnsupported:
-                    self.logger.info('    Preserving symlink attrs unsupported')
+                    pass
 
         except (OSError, SFTPError) as exc:
             setattr(exc, 'srcpath', srcpath)
@@ -3964,9 +3689,6 @@ class SFTPClient:
             srcpaths = [srcpaths]
         elif not isinstance(srcpaths, list):
             srcpaths = list(srcpaths)
-
-        self.logger.info('Starting SFTP %s of %s to %s',
-                         copy_type, srcpaths, dstpath)
 
         srcnames: List[SFTPName] = []
 
@@ -6027,11 +5749,9 @@ async def start_sftp_client(conn: 'SSHClientConnection',
 
     handler = SFTPClientHandler(loop, reader, writer, sftp_version)
 
-    handler.logger.info('Starting SFTP client')
-
     await handler.start()
 
-    conn.create_task(handler.recv_packets(), handler.logger)
+    conn.create_task(handler.recv_packets())
 
     await handler.request_limits()
 

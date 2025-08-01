@@ -27,13 +27,10 @@ from typing import TYPE_CHECKING, Any, AnyStr, AsyncIterator
 from typing import Callable, Dict, Generic, Iterable, List
 from typing import Optional, Pattern, Set, Tuple, Union, cast
 
-from .constants import EXTENDED_DATA_STDERR
-from .logging import SSHLogger
-from .misc import MaybeAwait, BreakReceived, SignalReceived
-from .misc import SoftEOFReceived, TerminalSizeChanged
+from .misc import MaybeAwait
+from .misc import SoftEOFReceived
 from .session import DataType, SSHClientSession
 from .session import SSHTCPSession, SSHUNIXSession, SSHTunTapSession
-from .scp import run_scp_server
 
 
 if TYPE_CHECKING:
@@ -81,12 +78,6 @@ class SSHReader(Generic[AnyStr]):
         """The SSH channel associated with this stream"""
 
         return self._chan
-
-    @property
-    def logger(self) -> SSHLogger:
-        """The SSH logger associated with this stream"""
-
-        return self._chan.logger
 
     def get_extra_info(self, name: str, default: Any = None) -> Any:
         """Return additional information about this stream
@@ -260,12 +251,6 @@ class SSHWriter(Generic[AnyStr]):
         """The SSH channel associated with this stream"""
 
         return self._chan
-
-    @property
-    def logger(self) -> SSHLogger:
-        """The SSH logger associated with this stream"""
-
-        return self._chan.logger
 
     def get_extra_info(self, name: str, default: Any = None) -> Any:
         """Return additional information about this stream
@@ -703,7 +688,7 @@ class SSHSocketStreamSession(SSHStreamSession[AnyStr]):
 
             if inspect.isawaitable(handler):
                 assert self._conn is not None
-                self._conn.create_task(handler, reader.logger)
+                self._conn.create_task(handler)
 
 
 class SSHTCPStreamSession(SSHSocketStreamSession[AnyStr],

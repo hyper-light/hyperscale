@@ -31,7 +31,6 @@ from typing import NamedTuple, Optional, Sequence, Set, Tuple
 from .constants import OPEN_CONNECT_FAILED
 from .forward import SSHForwarder, SSHForwarderCoro
 from .listener import SSHListener, create_tcp_forward_listener
-from .logging import logger
 from .misc import ChannelOpenError
 from .session import DataType
 
@@ -39,8 +38,6 @@ from .session import DataType
 if TYPE_CHECKING:
     # pylint: disable=cyclic-import
     from .channel import SSHChannel
-    from .connection import SSHServerConnection
-
 
 _RecvHandler = Optional[Callable[[bytes], None]]
 
@@ -456,7 +453,6 @@ async def lookup_xauth(loop: asyncio.AbstractEventLoop,
         if match:
             return entry.proto, entry.data
 
-    logger.debug1('No xauth entry found for display: using random auth')
     return XAUTH_PROTO_COOKIE, os.urandom(XAUTH_COOKIE_LEN)
 
 
@@ -519,30 +515,3 @@ async def create_x11_client_listener(loop: asyncio.AbstractEventLoop,
     return SSHX11ClientListener(loop, host, dpynum, auth_proto, auth_data)
 
 
-async def create_x11_server_listener(conn: 'SSHServerConnection',
-                                     loop: asyncio.AbstractEventLoop,
-                                     auth_path: Optional[str],
-                                     auth_proto: bytes, auth_data: bytes) -> \
-        Optional[SSHX11ServerListener]:
-    """Create a listener to forward X11 connections over SSH"""
-
-    for dpynum in range(X11_DISPLAY_START, X11_MAX_DISPLAYS):
-        try:
-            tcp_listener = await create_tcp_forward_listener(
-                conn, loop, conn.create_x11_connection,
-                X11_LISTEN_HOST, X11_BASE_PORT + dpynum)
-        except OSError:
-            continue
-
-        display = f'{X11_LISTEN_HOST}:{dpynum}'
-
-        try:
-            await update_xauth(auth_path, X11_LISTEN_HOST, str(dpynum),
-                               auth_proto, auth_data)
-        except ValueError:
-            tcp_listener.close()
-            break
-
-        return SSHX11ServerListener(tcp_listener, display)
-
-    return None
