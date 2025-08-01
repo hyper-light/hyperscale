@@ -64,11 +64,6 @@ if TYPE_CHECKING:
     # pylint: disable=cyclic-import
     from .connection import SSHConnection, SSHClientConnection
 
-
-_const_dict: Mapping[str, int] = constants.__dict__
-_pty_mode_names = get_symbol_names(_const_dict, 'PTY_', 4)
-_data_type_names = get_symbol_names(_const_dict, 'EXTENDED_DATA_', 14)
-
 _signal_regex = re.compile(r'SIG[^_]')
 _signal_numbers = {k[3:]: int(v) for (k, v) in vars(_signal).items()
                    if _signal_regex.match(k)}

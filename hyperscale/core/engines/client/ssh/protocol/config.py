@@ -96,7 +96,7 @@ class SSHConfig:
 
         raise NotImplementedError
 
-    def _expand_token(self, match):
+    def _expand_token(self, match: re.Match):
         """Expand a percent token reference"""
 
         try:
@@ -637,77 +637,4 @@ class SSHClientConfig(SSHConfig):
         ('TCPKeepAlive',                    SSHConfig._set_bool),
         ('User',                            SSHConfig._set_string),
         ('UserKnownHostsFile',              SSHConfig._set_string_list)
-    )}
-
-
-class SSHServerConfig(SSHConfig):
-    """Settings from an OpenSSH server config file"""
-
-    def __init__(self, last_config: 'SSHConfig', reload: bool,
-                 canonical: bool, final: bool, local_addr: str,
-                 local_port: int, user: str, host: str, addr: str) -> None:
-        super().__init__(last_config, reload, canonical, final)
-
-        self._local_addr = local_addr
-        self._local_port = local_port
-        self._user = user
-        self._host = host or addr
-        self._addr = addr
-
-    def _match_val(self, match: str) -> object:
-        """Return the value to match against in a match condition"""
-
-        if match == 'localaddress':
-            return self._local_addr
-        elif match == 'localport':
-            return str(self._local_port)
-        elif match == 'user':
-            return self._user
-        elif match == 'host':
-            return self._host
-        elif match == 'address':
-            return self._addr
-        else:
-            return None
-
-    def _set_tokens(self) -> None:
-        """Set the tokens available for percent expansion"""
-
-        self._tokens.update({'u': self._user})
-
-    _handlers = {option.lower(): (option, handler) for option, handler in (
-        ('Match',                           SSHConfig._match),
-        ('Include',                         SSHConfig._include),
-
-        ('AddressFamily',                   SSHConfig._set_address_family),
-        ('AuthorizedKeysFile',              SSHConfig._set_string_list),
-        ('AllowAgentForwarding',            SSHConfig._set_bool),
-        ('BindAddress',                     SSHConfig._set_string),
-        ('CanonicalDomains',                SSHConfig._set_string_list),
-        ('CanonicalizeFallbackLocal',       SSHConfig._set_bool),
-        ('CanonicalizeHostname',            SSHConfig._set_canonicalize_host),
-        ('CanonicalizeMaxDots',             SSHConfig._set_int),
-        ('CanonicalizePermittedCNAMEs',     SSHConfig._set_string_list),
-        ('CASignatureAlgorithms',           SSHConfig._set_string),
-        ('ChallengeResponseAuthentication', SSHConfig._set_bool),
-        ('Ciphers',                         SSHConfig._set_string),
-        ('ClientAliveCountMax',             SSHConfig._set_int),
-        ('ClientAliveInterval',             SSHConfig._set_int),
-        ('Compression',                     SSHConfig._set_bool),
-        ('GSSAPIAuthentication',            SSHConfig._set_bool),
-        ('GSSAPIKeyExchange',               SSHConfig._set_bool),
-        ('HostbasedAuthentication',         SSHConfig._set_bool),
-        ('HostCertificate',                 SSHConfig._append_string),
-        ('HostKey',                         SSHConfig._append_string),
-        ('KbdInteractiveAuthentication',    SSHConfig._set_bool),
-        ('KexAlgorithms',                   SSHConfig._set_string),
-        ('LoginGraceTime',                  SSHConfig._set_int),
-        ('MACs',                            SSHConfig._set_string),
-        ('PasswordAuthentication',          SSHConfig._set_bool),
-        ('PermitTTY',                       SSHConfig._set_bool),
-        ('Port',                            SSHConfig._set_int),
-        ('PubkeyAuthentication',            SSHConfig._set_bool),
-        ('RekeyLimit',                      SSHConfig._set_rekey_limits),
-        ('TCPKeepAlive',                    SSHConfig._set_bool),
-        ('UseDNS',                          SSHConfig._set_bool)
     )}

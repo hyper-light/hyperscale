@@ -22,7 +22,6 @@
 
 import asyncio
 import os
-import sys
 from types import TracebackType
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Type, Union, Protocol, Self
 

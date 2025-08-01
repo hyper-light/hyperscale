@@ -21,15 +21,13 @@
 """SSH authentication handlers"""
 
 from typing import TYPE_CHECKING, Awaitable, Dict, List, Optional
-from typing import Sequence, Tuple, Type, Union, cast, Any
+from typing import Sequence, Tuple, Type, Union, cast
 
-from .constants import DEFAULT_LANG
 from .gss import GSSBase, GSSError
-from .misc import ProtocolError, PasswordChangeRequired, get_symbol_names
+from .misc import ProtocolError, get_symbol_names
 from .misc import run_in_executor
 from .packet import Boolean, String, UInt32, SSHPacket, SSHPacketHandler
 from .public_key import SigningKey
-from .saslprep import saslprep, SASLPrepError
 
 
 if TYPE_CHECKING:

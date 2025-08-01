@@ -93,8 +93,8 @@ class _PatternList:
     """
 
     def __init__(self, patterns: str):
-        self._pos_patterns = []
-        self._neg_patterns = []
+        self._pos_patterns: list[_AnyPattern] = []
+        self._neg_patterns: list[_AnyPattern] = []
 
         for pattern in patterns.split(','):
             if pattern.startswith('!'):
