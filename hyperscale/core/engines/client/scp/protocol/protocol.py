@@ -1,14 +1,14 @@
 import asyncio
+from pathlib import PurePath
 from typing import Sequence
 from hyperscale.core.engines.client.ssh.protocol.connection import SSHClientConnection
-from hyperscale.core.engines.client.sftp.protocol.sftp import SFTPErrorHandler, SFTPProgressHandler, local_fs
+from hyperscale.core.engines.client.sftp.protocol.sftp import SFTPErrorHandler, SFTPProgressHandler
 from .scp import (
     SCPConnPath,
     SCP_BLOCK_SIZE,
     parse_path,
-    SCPSource,
-    start_remote,
 )
+from .scp_connection_set import SCPConnectionSet
 
 
 
@@ -19,7 +19,7 @@ class SCPProtocol:
         "_dst_connection",
         "_dst_path",
         "_src_paths",
-        "connection",
+        "_connection_sets",
         "lock"
     )
 
@@ -27,7 +27,7 @@ class SCPProtocol:
         self.connected: bool = False
         self._dst_connection: SSHClientConnection | None = None
         self._dst_path: str | None = None
-        self.connection: SCPSource | None = None
+        self._connection_sets: dict[SCPConnPath, SCPConnectionSet] = {}
 
         self.lock = asyncio.Lock()
 
@@ -69,14 +69,38 @@ class SCPProtocol:
         self._dst_path = dstpath
         self._src_paths = srcpaths
 
-        dst_reader, dst_writer = await start_remote(
-            dstconn, False, must_be_dir, preserve, recurse, dstpath)
-        
-        self.connection = SCPSource(local_fs, dst_reader, dst_writer,
-                            preserve, recurse, block_size,
-                            progress_handler, error_handler)
+        for srcpath in srcpaths:
+            connection_set = SCPConnectionSet()
+            await connection_set.connect(
+                srcpath=srcpath,
+                dstconn=dstconn,
+                dstpath=dstpath,
+                preserve=preserve,
+                recurse=recurse,
+                must_be_dir=must_be_dir,
+                block_size=block_size,
+                progress_handler=progress_handler,
+                error_handler=error_handler,
+            )
+
+            self._connection_sets[srcpath] = connection_set
 
         self.connected = True
 
-    async def close(self):
-        await self.connection.close()
+    async def copy(
+        self,
+        local_source: SCPConnPath,
+    ):
+        await self._connection_sets[local_source].copier.run()
+
+    async def receive(
+        self,
+        local_source: SCPConnPath,
+    ):
+        await self._connection_sets[local_source].sink.run(self._dst_path)
+
+    async def send(
+        self,
+        local_source: SCPConnPath,
+    ):
+        await self._connection_sets[local_source].source.run(local_source)

@@ -28,8 +28,8 @@ from pathlib import PurePath
 import posixpath
 import shlex
 from types import TracebackType
-from typing import TYPE_CHECKING, AsyncIterator, NoReturn, Optional
-from typing import Tuple, Type, Union, cast
+from typing import TYPE_CHECKING, AsyncIterator, List, NoReturn, Optional
+from typing import Sequence, Tuple, Type, Union, cast
 from typing_extensions import Protocol, Self
 
 from hyperscale.core.engines.client.ssh.protocol.constants import DEFAULT_LANG
@@ -494,7 +494,7 @@ class SCPSource(_SCPHandler):
         except (OSError, SFTPError, ValueError) as exc:
             self.handle_error(exc)
 
-    async def send(self, srcpath: _SCPPath) -> None:
+    async def run(self, srcpath: _SCPPath) -> None:
         """Start SCP transfer"""
 
         cancelled = False
@@ -526,3 +526,311 @@ class SCPSource(_SCPHandler):
             self.handle_error(exc)
         finally:
             await self.close(cancelled)
+
+
+class SCPSink(_SCPHandler):
+    """SCP handler for receiving files"""
+
+    def __init__(self, fs: _SCPFSProtocol, reader: 'SSHReader[bytes]',
+                 writer: 'SSHWriter[bytes]', must_be_dir: bool, preserve: bool,
+                 recurse: bool, block_size: int = SCP_BLOCK_SIZE,
+                 progress_handler: SFTPProgressHandler = None,
+                 error_handler: SFTPErrorHandler = None, server: bool = False):
+        super().__init__(reader, writer, error_handler, server)
+
+        self._fs = fs
+        self._must_be_dir = must_be_dir
+        self._preserve = preserve
+        self._recurse = recurse
+        self._block_size = block_size
+        self._progress_handler = progress_handler
+
+    async def _recv_file(self, srcpath: bytes,
+                         dstpath: bytes, size: int) -> None:
+        """Receive a file via SCP"""
+
+        file_obj = await self._fs.open(dstpath, 'wb')
+        local_exc = None
+        offset = 0
+
+        try:
+            self.send_ok()
+
+            if self._progress_handler and size == 0:
+                self._progress_handler(srcpath, dstpath, 0, 0)
+
+            while offset < size:
+                blocklen = min(size - offset, self._block_size)
+                data = await self.recv_data(blocklen)
+
+                if not data:
+                    raise _scp_error(SFTPConnectionLost, 'Connection lost',
+                                     fatal=True, suppress_send=True)
+
+                if not local_exc:
+                    try:
+                        await file_obj.write(data, offset)
+                    except (OSError, SFTPError) as exc:
+                        local_exc = exc
+
+                offset += len(data)
+
+                if self._progress_handler:
+                    self._progress_handler(srcpath, dstpath, offset, size)
+        finally:
+            await file_obj.close()
+
+        remote_exc = await self.await_response()
+
+        if local_exc:
+            self.send_error(local_exc)
+            setattr(local_exc, 'suppress_send',True)
+        else:
+            self.send_ok()
+
+        final_exc = remote_exc or local_exc
+
+        if final_exc:
+            raise final_exc
+
+    async def _recv_dir(self, srcpath: bytes, dstpath: bytes) -> None:
+        """Receive a directory over SCP"""
+
+        if not self._recurse:
+            raise _scp_error(SFTPBadMessage,
+                             'Directory received without recurse')
+
+        if await self._fs.exists(dstpath):
+            if not await self._fs.isdir(dstpath):
+                raise _scp_error(SFTPFailure, 'Not a directory', dstpath)
+        else:
+            await self._fs.mkdir(dstpath)
+
+        await self._recv_files(srcpath, dstpath)
+
+    async def _recv_files(self, srcpath: bytes, dstpath: bytes) -> None:
+        """Receive files over SCP"""
+
+        self.send_ok()
+
+        attrs = SFTPAttrs()
+
+        while True:
+            action, args = await self.recv_request()
+
+            if not action:
+                break
+
+            assert args is not None
+
+            try:
+                if action in b'\x01\x02':
+                    raise _scp_error(SFTPFailure, args,
+                                     fatal=action != b'\x01',
+                                     suppress_send=True)
+                elif action == b'T':
+                    if self._preserve:
+                        attrs.atime, attrs.mtime = _parse_t_args(args)
+
+                    self.send_ok()
+                elif action == b'E':
+                    self.send_ok()
+                    break
+                elif action in b'CD':
+                    try:
+                        attrs.permissions, size, name = _parse_cd_args(args)
+
+                        new_srcpath = posixpath.join(srcpath, name)
+
+                        if await self._fs.isdir(dstpath):
+                            new_dstpath = posixpath.join(dstpath, name)
+                        else:
+                            new_dstpath = dstpath
+
+                        if action == b'D':
+                            await self._recv_dir(new_srcpath, new_dstpath)
+                        else:
+                            await self._recv_file(new_srcpath,
+                                                  new_dstpath, size)
+
+                        if self._preserve:
+                            await self._fs.setstat(new_dstpath, attrs)
+                    finally:
+                        attrs = SFTPAttrs()
+                else:
+                    raise _scp_error(SFTPBadMessage, 'Unknown request')
+            except (OSError, SFTPError) as exc:
+                self.handle_error(exc)
+
+    async def run(self, dstpath: _SCPPath) -> None:
+        """Start SCP file receive"""
+
+        cancelled = False
+
+        try:
+            if isinstance(dstpath, PurePath):
+                dstpath = str(dstpath)
+
+            if isinstance(dstpath, str):
+                dstpath = dstpath.encode('utf-8')
+
+            if self._must_be_dir and not await self._fs.isdir(dstpath):
+                self.handle_error(_scp_error(SFTPFailure, 'Not a directory',
+                                             dstpath))
+            else:
+                await self._recv_files(b'', dstpath)
+        except asyncio.CancelledError:
+            cancelled = True
+        except (OSError, SFTPError, ValueError) as exc:
+            self.handle_error(exc)
+        finally:
+            await self.close(cancelled)
+
+
+class SCPCopier:
+    """SCP handler for remote-to-remote copies"""
+
+    def __init__(self, src_reader: 'SSHReader[bytes]',
+                 src_writer: 'SSHWriter[bytes]',
+                 dst_reader: 'SSHReader[bytes]',
+                 dst_writer: 'SSHWriter[bytes]',
+                 block_size: int = SCP_BLOCK_SIZE,
+                 progress_handler: SFTPProgressHandler = None,
+                 error_handler: SFTPErrorHandler = None):
+        self._source = _SCPHandler(src_reader, src_writer)
+        self._sink = _SCPHandler(dst_reader, dst_writer)
+        self._block_size = block_size
+        self._progress_handler = progress_handler
+        self._error_handler = error_handler
+
+    def _handle_error(self, exc: Exception) -> None:
+        """Handle an SCP error"""
+
+        if isinstance(exc, BrokenPipeError):
+            exc = _scp_error(SFTPConnectionLost, 'Connection lost',
+                             fatal=True, suppress_send=True)
+
+        if self._error_handler and not getattr(exc, 'fatal', False):
+            self._error_handler(exc)
+        else:
+            raise exc
+
+    async def _forward_response(self, src: _SCPHandler,
+                                dst: _SCPHandler) -> Optional[Exception]:
+        """Forward an SCP response between two remote SCP servers"""
+
+        # pylint: disable=no-self-use
+
+        try:
+            exc = await src.await_response()
+
+            if exc:
+                dst.send_error(exc)
+                return exc
+            else:
+                dst.send_ok()
+                return None
+        except OSError as exc:
+            return exc
+
+    async def _copy_file(self, path: bytes, size: int) -> None:
+        """Copy a file from one remote SCP server to another"""
+
+        offset = 0
+
+        if self._progress_handler and size == 0:
+            self._progress_handler(path, path, 0, 0)
+
+        while offset < size:
+            blocklen = min(size - offset, self._block_size)
+            data = await self._source.recv_data(blocklen)
+
+            if not data:
+                raise _scp_error(SFTPConnectionLost, 'Connection lost',
+                                 fatal=True, suppress_send=True)
+
+            self._sink.writer.write(data)
+            offset += len(data)
+
+            if self._progress_handler:
+                self._progress_handler(path, path, offset, size)
+
+        source_exc = await self._forward_response(self._source, self._sink)
+        sink_exc = await self._forward_response(self._sink, self._source)
+
+        exc = sink_exc or source_exc
+
+        if exc:
+            self._handle_error(exc)
+
+    async def _copy_files(self) -> None:
+        """Copy files from one SCP server to another"""
+
+        exc = await self._forward_response(self._sink, self._source)
+
+        if exc:
+            self._handle_error(exc)
+
+        pathlist: List[bytes] = []
+        attrlist: List[SFTPAttrs] = []
+        attrs = SFTPAttrs()
+
+        while True:
+            action, args = await self._source.recv_request()
+
+            if not action:
+                break
+
+            assert args is not None
+
+            self._sink.send_request(action, args)
+
+            if action in b'\x01\x02':
+                exc = _scp_error(SFTPFailure, args, fatal=action != b'\x01')
+                self._handle_error(exc)
+                continue
+
+            exc = await self._forward_response(self._sink, self._source)
+
+            if exc:
+                self._handle_error(exc)
+                continue
+
+            if action in b'CD':
+                try:
+                    attrs.permissions, size, name = _parse_cd_args(args)
+
+                    if action == b'C':
+                        path = b'/'.join(pathlist + [name])
+                        await self._copy_file(path, size)
+                    else:
+                        pathlist.append(name)
+                        attrlist.append(attrs)
+                finally:
+                    attrs = SFTPAttrs()
+            elif action == b'E':
+                if pathlist:
+                    pathlist.pop()
+                    attrs = attrlist.pop()
+
+                else:
+                    break
+            elif action == b'T':
+                attrs.atime, attrs.mtime = _parse_t_args(args)
+            else:
+                raise _scp_error(SFTPBadMessage, 'Unknown SCP action')
+
+    async def run(self) -> None:
+        """Start SCP remote-to-remote transfer"""
+
+        cancelled = False
+
+        try:
+            await self._copy_files()
+        except asyncio.CancelledError:
+            cancelled = True
+        except (OSError, SFTPError) as exc:
+            self._handle_error(exc)
+        finally:
+            await self._source.close(cancelled)
+            await self._sink.close(cancelled)
