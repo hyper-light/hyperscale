@@ -649,7 +649,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         self._conn.send_packet(MSG_CHANNEL_OPEN, String(chantype),
                                UInt32(self._recv_chan),
                                UInt32(self._recv_window),
-                               UInt32(self._recv_pktsize), *args, handler=self)
+                               UInt32(self._recv_pktsize), *args)
 
         return await self._open_waiter
 
@@ -662,7 +662,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         payload = UInt32(self._send_chan) + b''.join(args)
 
         assert self._conn is not None
-        self._conn.send_packet(pkttype, payload, handler=self)
+        self._conn.send_packet(pkttype, payload)
 
     def _send_request(self, request: bytes, *args: bytes,
                       want_reply: bool = False) -> None:

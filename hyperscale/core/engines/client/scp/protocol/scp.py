@@ -69,14 +69,6 @@ SCP_BLOCK_SIZE = 256*1024    # 256 KiB
 class _SCPFileProtocol(Protocol):
     """Protocol for accessing a file during an SCP copy"""
 
-    async def __aenter__(self) -> Self:
-        """Allow _SCPFileProtocol to be used as an async context manager"""
-
-    async def __aexit__(self, _exc_type: Optional[Type[BaseException]],
-                        _exc_value: Optional[BaseException],
-                        _traceback: Optional[TracebackType]) -> bool:
-        """Wait for file close when used as an async context manager"""
-
     async def read(self, size: int, offset: int) -> bytes:
         """Read data from the local file"""
 
@@ -204,20 +196,6 @@ class _SCPHandler:
         self.writer = writer
         self._error_handler = error_handler
         self._server = server
-
-    async def __aenter__(self) -> Self: # pragma: no cover
-        """Allow _SCPHandler to be used as an async context manager"""
-
-        return self
-
-    async def __aexit__(self, _exc_type: Optional[Type[BaseException]],
-                        _exc_value: Optional[BaseException],
-                        _traceback: Optional[TracebackType]) -> \
-            bool: # pragma: no cover
-        """Wait for file close when used as an async context manager"""
-
-        await self.close()
-        return False
 
     async def await_response(self) -> Optional[Exception]:
         """Wait for an SCP response"""
@@ -374,6 +352,7 @@ class SCPClient:
         await asyncio.gather(*[
             self._connect_source(
                 srcpath,
+                dstpath,
                 dstconn,
                 **kwargs
             ) for srcpath in srcpaths
@@ -382,6 +361,7 @@ class SCPClient:
     async def _connect_source(
         self,
         srcpath: SCPConnPath,
+        dstpath: SCPConnPath,
         dstconn: 'SSHClientConnection',
         **kwargs: dict[str, Any],
     ):
@@ -394,7 +374,7 @@ class SCPClient:
         )
 
         src_command = b'scp -f '
-        dst_command = b'src -t '
+        dst_command = b'scp -t '
 
         if self._must_be_dir:
             src_command += b'-d '
@@ -408,12 +388,16 @@ class SCPClient:
             src_command += b'-r '
             dst_command += b'-r '
 
-        src_writer, src_reader, _ = await srcconn.open_session(src_command, encoding=None)
-        dst_writer, dst_reader, _ = await dstconn.open_session(dst_command, encoding=None)
-
-        self._source = _SCPHandler(src_reader, src_writer)
-        self._sink = _SCPHandler(dst_reader, dst_writer)
-
+        if srcconn:
+            src_command += srcpath.encode()
+            src_writer, src_reader, _ = await srcconn.open_session(src_command, encoding=None)
+            self._source = _SCPHandler(src_reader, src_writer)
+        
+        if dstconn:
+            dst_command += dstpath.encode()
+            dst_writer, dst_reader, _ = await dstconn.open_session(dst_command, encoding=None)
+            self._sink = _SCPHandler(dst_reader, dst_writer)
+        
     async def copy(self) -> None:
         """Start SCP remote-to-remote transfer"""
 

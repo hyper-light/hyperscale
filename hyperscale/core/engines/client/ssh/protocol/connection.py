@@ -2361,7 +2361,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         if chan:
             chan.process_open_confirmation(send_chan, send_window,
                                            send_pktsize, packet)
-
+        else:
             raise ProtocolError('Invalid channel number')
 
     def _process_channel_open_failure(self, _pkttype: int, _pktid: int,
@@ -6085,8 +6085,17 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
 
         self.server_host_keys_handler = server_host_keys_handler
 
-        self.username = saslprep(cast(str, username if username != () else
-                                      config.get('User', local_username)))
+        if (
+            username is None or username == ()
+        ) and (
+            config_user := config.get('User')
+        ):
+            username = config_user
+
+        elif username is None:
+            username = local_username
+
+        self.username = saslprep(username)
 
         self.password = password
 
