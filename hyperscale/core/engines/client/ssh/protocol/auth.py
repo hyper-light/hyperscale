@@ -20,8 +20,17 @@
 
 """SSH authentication handlers"""
 
-from typing import TYPE_CHECKING, Awaitable, Dict, List, Optional
-from typing import Sequence, Tuple, Type, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Awaitable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    Union,
+)
 
 from .gss import GSSBase, GSSError
 from .misc import ProtocolError, get_symbol_names
@@ -443,7 +452,7 @@ class _ClientPasswordAuth(ClientAuth):
             self._conn.try_next_auth(next_method=True)
             return
 
-        old_password, new_password = cast(PasswordChangeResponse, result)
+        old_password, new_password = result
 
         self._password_change = True
 

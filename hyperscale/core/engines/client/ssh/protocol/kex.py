@@ -64,7 +64,7 @@ class Kex(SSHPacketHandler):
     def send_packet(self, pkttype: int, *args: bytes) -> None:
         """Send a kex packet"""
 
-        self._conn.send_packet(pkttype, *args, handler=self)
+        self._conn.send_packet(pkttype, *args)
 
     def compute_key(self, k: bytes, h: bytes, x: bytes,
                     session_id: bytes, keylen: int) -> bytes:

@@ -1,6 +1,6 @@
 import asyncio
 from hyperscale.core.engines.client.ftp.mercury_sync_ftp_connection import MercurySyncFTPConnection, FTPConnection
-from hyperscale.core.engines.client.ftp.ftp import FTP
+
 
 async def run():
     ftp = MercurySyncFTPConnection()
@@ -22,8 +22,3 @@ async def run():
 
 asyncio.run(run())
 
-
-ftp = FTP('194.108.117.16', user='anonymous')
-
-for file in ftp.mlsd():
-    print(file)

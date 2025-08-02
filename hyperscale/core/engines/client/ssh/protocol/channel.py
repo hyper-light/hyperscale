@@ -30,9 +30,8 @@ import sys
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, AnyStr, Awaitable, Callable
 from typing import Dict, Generic, Iterable, List, Mapping, Optional
-from typing import Set, Tuple, Union, cast
+from typing import Set, Tuple, Union
 
-from . import constants
 from .constants import EXTENDED_DATA_STDERR
 from .constants import MSG_CHANNEL_OPEN, MSG_CHANNEL_WINDOW_ADJUST
 from .constants import MSG_CHANNEL_DATA, MSG_CHANNEL_EXTENDED_DATA
@@ -349,11 +348,11 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         if self._encoding:
             try:
                 assert self._decoder is not None
-                decoded_data = cast(AnyStr, self._decoder.decode(data))
+                decoded_data = self._decoder.decode(data)
             except UnicodeDecodeError as unicode_exc:
                 raise ProtocolError(str(unicode_exc)) from None
         else:
-            decoded_data = cast(AnyStr, data)
+            decoded_data = data
 
         if self._session is not None:
             self._session.data_received(decoded_data, datatype)
@@ -387,10 +386,10 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         request, packet, _ = self._request_queue[0]
 
         name = '_process_' + map_handler_name(request) + '_request'
-        handler = cast(_RequestHandler, getattr(self, name, None))
+        handler: _RequestHandler = getattr(self, name, None)
 
         if handler:
-            result = cast(Optional[bool], handler(packet))
+            result: bool | None = handler(packet)
         else:
             result = False
 
@@ -447,9 +446,9 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         try:
             if inspect.isawaitable(result):
-                session = await cast(Awaitable[SSHSession[AnyStr]], result)
+                session: Awaitable[SSHSession[AnyStr]] = result
             else:
-                session = cast(SSHSession[AnyStr], result)
+                session: SSHSession[AnyStr] = result
 
             if not self._conn:
                 raise ChannelOpenError(OPEN_CONNECT_FAILED,
@@ -862,9 +861,9 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         if self._encoding:
             assert self._encoder is not None
-            encoded_data = self._encoder.encode(cast(str, data))
+            encoded_data = self._encoder.encode(data)
         else:
-            encoded_data = cast(bytes, data)
+            encoded_data: bytes = data
 
         datalen = len(encoded_data)
 
@@ -895,9 +894,9 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         """
 
         if self._encoding:
-            data = cast(AnyStr, ''.join(cast(Iterable[str], list_of_data)))
+            data = ''.join(list_of_data)
         else:
-            data = cast(AnyStr, b''.join(cast(Iterable[bytes], list_of_data)))
+            data = b''.join(list_of_data)
 
         return self.write(data, datatype)
 
@@ -1082,11 +1081,11 @@ class SSHClientChannel(SSHChannel, Generic[AnyStr]):
             if not term_size:
                 width = height = pixwidth = pixheight = 0
             elif len(term_size) == 2:
-                width, height = cast(Tuple[int, int], term_size)
+                width, height = term_size
                 pixwidth = pixheight = 0
 
             elif len(term_size) == 4:
-                width, height, pixwidth, pixheight = cast(TermSize, term_size)
+                width, height, pixwidth, pixheight = term_size
 
             else:
                 raise ValueError('If set, terminal size must be a tuple of '
@@ -1406,11 +1405,10 @@ class SSHTCPChannel(SSHForwardChannel, Generic[AnyStr]):
                             local_peername=(orig_host, orig_port),
                             remote_peername=(host, port))
 
-        return cast(SSHTCPSession[AnyStr],
-                    await self._open_forward(session_factory, chantype,
+        return await self._open_forward(session_factory, chantype,
                                              String(host), UInt32(port),
                                              String(orig_host),
-                                             UInt32(orig_port)))
+                                             UInt32(orig_port))
 
     async def connect(self, session_factory: SSHTCPSessionFactory[AnyStr],
                      host: str, port: int, orig_host: str, orig_port: int) -> \
@@ -1447,9 +1445,8 @@ class SSHUNIXChannel(SSHForwardChannel, Generic[AnyStr]):
 
         self.set_extra_info(local_peername='', remote_peername=path)
 
-        return cast(SSHUNIXSession[AnyStr],
-                    await self._open_forward(session_factory, chantype,
-                                             String(path), *args))
+        return await self._open_forward(session_factory, chantype,
+                                             String(path), *args)
 
     async def connect(self, session_factory: SSHUNIXSessionFactory[AnyStr],
                       path: str) -> SSHUNIXSession[AnyStr]:
@@ -1513,10 +1510,9 @@ class SSHTunTapChannel(SSHForwardChannel[bytes]):
         if unit is None:
             unit = SSH_TUN_UNIT_ANY
 
-        return cast(SSHTunTapSession,
-                    await self._open_forward(session_factory,
+        return await self._open_forward(session_factory,
                                              b'tun@openssh.com',
-                                             UInt32(mode), UInt32(unit)))
+                                             UInt32(mode), UInt32(unit))
 
     def set_mode(self, mode: int) -> None:
         """Set mode for inbound connections"""
@@ -1534,10 +1530,9 @@ class SSHX11Channel(SSHForwardChannel[bytes]):
         self.set_extra_info(local_peername=(orig_host, orig_port),
                             remote_peername=('', 0))
 
-        return cast(SSHTCPSession[bytes],
-                    await self._open_forward(session_factory, b'x11',
+        return await self._open_forward(session_factory, b'x11',
                                              String(orig_host),
-                                             UInt32(orig_port)))
+                                             UInt32(orig_port))
 
     def set_inbound_peer_names(self, orig_host: str, orig_port: int) -> None:
         """Set local and remote peer name for inbound connections"""
@@ -1553,6 +1548,5 @@ class SSHAgentChannel(SSHForwardChannel[bytes]):
             SSHUNIXSession[bytes]:
         """Open an SSH agent channel"""
 
-        return cast(SSHUNIXSession[bytes],
-                    await self._open_forward(session_factory,
-                                             b'auth-agent@openssh.com'))
+        return await self._open_forward(session_factory,
+                                             b'auth-agent@openssh.com')

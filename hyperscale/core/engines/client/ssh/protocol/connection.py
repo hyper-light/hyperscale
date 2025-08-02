@@ -1581,8 +1581,6 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
                     skip_reason = 'invalid channel number'
                     exc_reason = f'Invalid channel number {recv_chan} received'
 
-        handler.log_received_packet(pkttype, seq, packet, skip_reason)
-
         if not skip_reason:
             try:
                 result = handler.process_packet(pkttype, seq, packet)
@@ -1695,9 +1693,6 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         if self._kex_complete:
             self._rekey_bytes_sent += pktlen
-
-        if not handler:
-            handler = self
 
     def _send_deferred_packets(self) -> None:
         """Send packets deferred due to key exchange or auth"""

@@ -32,9 +32,7 @@
 
 """
 
-from typing import Dict, FrozenSet, Sequence, Set, Tuple, Type, TypeVar, Union
-from typing import cast
-
+from typing import Dict, Sequence, Tuple, Type, TypeVar, Union
 
 _DERClass = Type['DERType']
 _DERClassVar = TypeVar('_DERClassVar', bound='_DERClass')
@@ -191,7 +189,7 @@ class RawDERObject:
     def encode(value: object) -> bytes:
         """Encode the content for this object as a DER byte string"""
 
-        return cast('RawDERObject', value).content
+        return value.content
 
 
 class TaggedDERObject:
@@ -237,7 +235,7 @@ class TaggedDERObject:
     def encode(value: object) -> bytes:
         """Encode the content for this object as a DER byte string"""
 
-        return der_encode(cast('TaggedDERObject', value).value)
+        return der_encode(value.value)
 
 @DERTag(BIT_STRING)
 class BitString(DERType):
@@ -311,7 +309,7 @@ class BitString(DERType):
     def encode(value: object) -> bytes:
         """Encode a DER bit string"""
 
-        bitstr_value = cast('BitString', value)
+        bitstr_value: BitString = value
         return bytes((bitstr_value.unused,)) + bitstr_value.value
 
     @classmethod
@@ -359,7 +357,7 @@ class IA5String(DERType):
         # string which has already done the appropriate encoding of any
         # non-ASCII characters.
 
-        return cast('IA5String', value).value
+        return value.value
 
     @classmethod
     def decode(cls, constructed: bool, content: bytes) -> 'IA5String':
@@ -425,7 +423,7 @@ class ObjectIdentifier(DERType):
 
             return bytes(result[::-1])
 
-        oid_value = cast('ObjectIdentifier', value)
+        oid_value: ObjectIdentifier = value
 
         try:
             components = [int(c) for c in oid_value.value.split('.')]
@@ -504,7 +502,7 @@ def der_encode(value: object) -> bytes:
 
     t = type(value)
     if t in (RawDERObject, TaggedDERObject):
-        value = cast(Union[RawDERObject, TaggedDERObject], value)
+        value: RawDERObject | TaggedDERObject = value
         identifier = value.encode_identifier()
         content = value.encode(value)
     elif t in _der_class_by_type:

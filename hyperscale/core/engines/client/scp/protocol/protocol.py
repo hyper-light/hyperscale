@@ -1,14 +1,12 @@
 import asyncio
-from pathlib import PurePath
-from typing import Sequence
-from hyperscale.core.engines.client.ssh.protocol.connection import SSHClientConnection
-from hyperscale.core.engines.client.sftp.protocol.sftp import SFTPErrorHandler, SFTPProgressHandler
+from typing import Sequence, Any
+from hyperscale.core.engines.client.ssh.protocol.known_hosts import KnownHostsArg
+from hyperscale.core.engines.client.sftp.protocol.sftp import SFTPErrorHandler, SFTPProgressHandler, local_fs
 from .scp import (
     SCPConnPath,
     SCP_BLOCK_SIZE,
-    parse_path,
+    SCPClient,
 )
-from .scp_connection_set import SCPConnectionSet
 
 
 
@@ -16,31 +14,33 @@ class SCPProtocol:
 
     __slots__ = (
         "connected",
-        "_dst_connection",
         "_dst_path",
         "_src_paths",
-        "_connection_sets",
+        "connection",
         "lock"
     )
 
     def __init__(self):
         self.connected: bool = False
-        self._dst_connection: SSHClientConnection | None = None
+        self._src_paths: list[SCPConnPath] = []
         self._dst_path: str | None = None
-        self._connection_sets: dict[SCPConnPath, SCPConnectionSet] = {}
+        self.connection: SCPClient | None = None
 
         self.lock = asyncio.Lock()
 
     async def connect(
         self,
-        srcpaths: SCPConnPath | Sequence[SCPConnPath] | None = None,
-        dstpath: SCPConnPath | None = None, *,
+        srcpaths: SCPConnPath | Sequence[SCPConnPath] | None,
+        dstpath: SCPConnPath | None,
+        username: str | None = None,
+        password: str | None = None,
         preserve: bool = False,
         recurse: bool = False,
         block_size: int = SCP_BLOCK_SIZE,
         progress_handler: SFTPProgressHandler = None,
         error_handler: SFTPErrorHandler = None, 
-        **kwargs,
+        known_hosts: KnownHostsArg = None,
+        **kwargs: dict[str, Any],
     ) -> None:
         
         if not isinstance(srcpaths, (list, set, tuple,)):
@@ -63,44 +63,26 @@ class SCPProtocol:
 
         must_be_dir = len(srcpaths) > 1
 
-        dstconn, dstpath, _ = await parse_path(dstpath, **kwargs)
+        self.connection = SCPClient(
+            local_fs,
+            preserve=preserve,
+            recurse=recurse,
+            must_be_dir=must_be_dir,
+            block_size=block_size,
+            progress_handler=progress_handler,
+            error_handler=error_handler,
+            known_hosts=known_hosts,
+            username=username,
+            password=password,
+        )
 
-        self._dst_connection = dstconn
-        self._dst_path = dstpath
+        await self.connection.connect(
+            srcpaths,
+            dstpath,
+            **kwargs,
+        )
+
         self._src_paths = srcpaths
-
-        for srcpath in srcpaths:
-            connection_set = SCPConnectionSet()
-            await connection_set.connect(
-                srcpath=srcpath,
-                dstconn=dstconn,
-                dstpath=dstpath,
-                preserve=preserve,
-                recurse=recurse,
-                must_be_dir=must_be_dir,
-                block_size=block_size,
-                progress_handler=progress_handler,
-                error_handler=error_handler,
-            )
-
-            self._connection_sets[srcpath] = connection_set
+        self._dst_path = dstpath
 
         self.connected = True
-
-    async def copy(
-        self,
-        local_source: SCPConnPath,
-    ):
-        await self._connection_sets[local_source].copier.run()
-
-    async def receive(
-        self,
-        local_source: SCPConnPath,
-    ):
-        await self._connection_sets[local_source].sink.run(self._dst_path)
-
-    async def send(
-        self,
-        local_source: SCPConnPath,
-    ):
-        await self._connection_sets[local_source].source.run(local_source)

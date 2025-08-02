@@ -30,7 +30,7 @@ from hashlib import sha1
 from pathlib import Path, PurePath
 from subprocess import DEVNULL
 from typing import Callable, Dict, List, NoReturn, Optional, Sequence
-from typing import Set, Tuple, Union, cast
+from typing import Set, Tuple, Union
 
 from .constants import DEFAULT_PORT
 from .misc import DefTuple, FilePath, ip_address
@@ -177,7 +177,7 @@ class SSHConfig:
             elif match == 'canonical':
                 result = self._canonical
             elif match == 'final':
-                result = cast(bool, self._final)
+                result: bool = self._final
             else:
                 match_val = self._match_val(match)
 
@@ -194,7 +194,7 @@ class SSHConfig:
                         result = _exec(arg)
                     elif match in ('address', 'localaddress'):
                         host_pat = HostPatternList(arg)
-                        ip = ip_address(cast(str, match_val)) \
+                        ip = ip_address(match_val) \
                             if match_val else None
                         result = host_pat.matches(None, match_val, ip)
                     else:
@@ -270,7 +270,7 @@ class SSHConfig:
 
         if value_str.lower() != 'none':
             if option in self._options:
-                cast(List[str], self._options[option]).append(value_str)
+                self._options[option].append(value_str)
             else:
                 self._options[option] = [value_str]
         else:
@@ -292,7 +292,7 @@ class SSHConfig:
         """Append whitespace-separated string config options to a list"""
 
         if option in self._options:
-            cast(List[str], self._options[option]).extend(args)
+            self._options[option].extend(args)
         else:
             self._options[option] = args[:]
 
@@ -532,8 +532,7 @@ class SSHClientConfig(SSHConfig):
         value = args.pop(0)
 
         if option not in self._options:
-            self._tokens['h'] = \
-                cast(str, self._options.get(option, self._orig_host))
+            self._tokens['h'] = self._options.get(option, self._orig_host)
             self._options[option] = self._expand_val(value)
 
     def _set_request_tty(self, option: str, args: List[str]) -> None:
@@ -561,9 +560,9 @@ class SSHClientConfig(SSHConfig):
         idx = local_host.find('.')
         short_local_host = local_host if idx < 0 else local_host[:idx]
 
-        host = cast(str, self._options.get('Hostname', self._orig_host))
+        host: str = self._options.get('Hostname', self._orig_host)
         port = str(self._options.get('Port', DEFAULT_PORT))
-        user = cast(str, self._options.get('User') or self._local_user)
+        user: str = self._options.get('User') or self._local_user
         home = os.path.expanduser('~')
 
         conn_info = ''.join((local_host, host, port, user))
