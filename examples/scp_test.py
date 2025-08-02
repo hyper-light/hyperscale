@@ -6,10 +6,12 @@ async def run():
     protocol = SCPProtocol()
 
     await protocol.connect(
-        ['./test.txt'],
-        'localhost:example.txt',
+        'localhost:simple_scp_server.py',
+        'localhost:simple_scp_server.py',
         port=8022,
     )
+
+    await protocol.connection.copy()
 
 
 asyncio.run(run())

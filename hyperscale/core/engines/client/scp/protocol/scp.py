@@ -335,6 +335,9 @@ class SCPClient:
         self._username = username
         self._password = password
 
+        self._source: _SCPHandler | None = None
+        self._sink: _SCPHandler | None = None
+
     async def connect(
         self,
         srcpaths: Iterable[SCPConnPath],
@@ -410,8 +413,11 @@ class SCPClient:
         except (OSError, SFTPError) as exc:
             self._handle_error(exc)
         finally:
-            await self._source.close(cancelled)
-            await self._sink.close(cancelled)
+            if self._source:
+                await self._source.close(cancelled)
+
+            if self._sink:
+                await self._sink.close(cancelled)
     
     async def send(self, srcpath: _SCPPath) -> None:
         """Start SCP transfer"""
@@ -426,13 +432,13 @@ class SCPClient:
             elif isinstance(srcpath, PurePath):
                 srcpath = str(srcpath).encode('utf-8')
 
-            exc = await self._source.await_response()
+            exc = await self._sink.await_response()
 
             if exc:
                 raise exc
             
             await asyncio.gather(*[
-                await self._send_files(
+                self._send_files(
                     name.filename,
                     b'',
                     name.attrs,
@@ -444,13 +450,13 @@ class SCPClient:
         except (OSError, SFTPError) as exc:
             self._handle_error(exc)
         finally:
-            await self._source.close(cancelled)
+            if self._sink:
+                await self._sink.close(cancelled)
 
     async def receive(self, dstpath: _SCPPath) -> None:
         """Start SCP file receive"""
 
         cancelled = False
-
         try:
             if isinstance(dstpath, PurePath):
                 dstpath = str(dstpath)
@@ -468,7 +474,7 @@ class SCPClient:
         except (OSError, SFTPError, ValueError) as exc:
             self._handle_error(exc)
         finally:
-            await self._sink.close(cancelled)
+            await self._source.close(cancelled)
     
 
     def _handle_error(self, exc: Exception) -> None:
@@ -597,14 +603,14 @@ class SCPClient:
         offset = 0
 
         try:
-            self._sink.send_ok()
+            self._source.send_ok()
 
             if self._progress_handler and size == 0:
                 self._progress_handler(srcpath, dstpath, 0, 0)
 
             while offset < size:
                 blocklen = min(size - offset, self._block_size)
-                data = await self._sink.recv_data(blocklen)
+                data = await self._source.recv_data(blocklen)
 
                 if not data:
                     raise _scp_error(SFTPConnectionLost, 'Connection lost',
@@ -623,13 +629,13 @@ class SCPClient:
         finally:
             await file_obj.close()
 
-        remote_exc = await self._sink.await_response()
+        remote_exc = await self._source.await_response()
 
         if local_exc:
-            self._sink.send_error(local_exc)
+            self._source.send_error(local_exc)
             setattr(local_exc, 'suppress_send',True)
         else:
-            self._sink.send_ok()
+            self._source.send_ok()
 
         final_exc = remote_exc or local_exc
 
@@ -654,13 +660,12 @@ class SCPClient:
     async def _recv_files(self, srcpath: bytes, dstpath: bytes) -> None:
         """Receive files over SCP"""
 
-        self._sink.send_ok()
+        self._source.send_ok()
 
         attrs = SFTPAttrs()
 
         while True:
-            action, args = await self._sink.recv_request()
-
+            action, args = await self._source.recv_request()
             if not action:
                 break
 
@@ -675,9 +680,9 @@ class SCPClient:
                     if self._preserve:
                         attrs.atime, attrs.mtime = _parse_t_args(args)
 
-                    self._sink.send_ok()
+                    self._source.send_ok()
                 elif action == b'E':
-                    self._sink.send_ok()
+                    self._source.send_ok()
                     break
                 elif action in b'CD':
                     try:
@@ -712,7 +717,7 @@ class SCPClient:
         assert attrs.permissions is not None
 
         args = f'{attrs.permissions & 0o7777:04o} {size} '
-        await self._source.make_request(action, args.encode('ascii'),
+        await self._sink.make_request(action, args.encode('ascii'),
                                 self._fs.basename(path))
 
     async def _make_t_request(self, attrs: SFTPAttrs) -> None:
@@ -722,7 +727,7 @@ class SCPClient:
         assert attrs.atime is not None
 
         args = f'{attrs.mtime} 0 {attrs.atime} 0'
-        await self._source.make_request(b'T', args.encode('ascii'))
+        await self._sink.make_request(b'T', args.encode('ascii'))
 
     async def _send_file(self, srcpath: bytes,
                          dstpath: bytes, attrs: SFTPAttrs) -> None:
@@ -755,7 +760,7 @@ class SCPClient:
                     except (OSError, SFTPError) as exc:
                         local_exc = exc
 
-                self._source.writer.write(data)
+                self._sink.writer.write(data)
                 offset += len(data)
 
                 if self._progress_handler:
@@ -764,12 +769,12 @@ class SCPClient:
             await file_obj.close()
 
         if local_exc:
-            self._source.send_error(local_exc)
+            self._sink.send_error(local_exc)
             setattr(local_exc, 'suppress_send', True)
         else:
-            self._source.send_ok()
+            self._sink.send_ok()
 
-        remote_exc = await self._source.await_response()
+        remote_exc = await self._sink.await_response()
         final_exc = remote_exc or local_exc
 
         if final_exc:
@@ -791,7 +796,7 @@ class SCPClient:
                                    posixpath.join(dstpath, name),
                                    entry.attrs)
 
-        await self._source.make_request(b'E')
+        await self._sink.make_request(b'E')
 
     async def _send_files(self, srcpath: bytes, dstpath: bytes,
                           attrs: SFTPAttrs) -> None:
