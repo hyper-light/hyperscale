@@ -32,8 +32,7 @@ import stat
 from types import TracebackType
 from typing import Any, AnyStr, Awaitable, Dict, Generic, IO
 from typing import Iterable, List, Mapping, Optional, Set, TextIO
-from typing import Tuple, Type, TypeVar, Union, cast
-from typing_extensions import Protocol, Self
+from typing import Tuple, Type, TypeVar, Union, cast, Protocol, Self
 
 from .channel import SSHChannel, SSHClientChannel
 

@@ -52,7 +52,6 @@ from hyperscale.core.testing.models import (
 
 from .models.http3 import HTTP3Response
 from .protocols import HTTP3Connection
-from .protocols.quic.quic.packet_builder import QuicPacketBuilderStop
 
 A = TypeVar("A")
 R = TypeVar("R")

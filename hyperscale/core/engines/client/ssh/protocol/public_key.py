@@ -31,8 +31,7 @@ from datetime import datetime
 from hashlib import md5, sha1, sha256, sha384, sha512
 from pathlib import Path, PurePath
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set
-from typing import Tuple, Type, Union, cast
-from typing_extensions import Protocol
+from typing import Tuple, Type, Union, cast, Protocol
 
 from .crypto import ed25519_available, ed448_available
 from .encryption import Encryption

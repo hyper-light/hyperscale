@@ -21,10 +21,8 @@
 """SSH Diffie-Hellman, ECDH, and Edwards DH key exchange handlers"""
 
 from hashlib import sha1, sha224, sha256, sha384, sha512
-from typing import TYPE_CHECKING, Callable, Mapping, Optional, cast
-from typing_extensions import Protocol
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, cast, Protocol
 
-from .constants import DEFAULT_LANG
 from .crypto import Curve25519DH, Curve448DH, DH, ECDH, PQDH
 from .crypto import curve25519_available, curve448_available
 from .crypto import mlkem_available, sntrup_available

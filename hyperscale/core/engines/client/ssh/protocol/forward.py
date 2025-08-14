@@ -23,9 +23,8 @@
 import asyncio
 import socket
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional, Self
 from typing import Type, cast
-from typing_extensions import Self
 
 from .misc import ChannelOpenError, SockAddr
 

@@ -5738,22 +5738,3 @@ class LocalFS:
 
 
 local_fs = LocalFS()
-
-async def start_sftp_client(conn: 'SSHClientConnection',
-                            loop: asyncio.AbstractEventLoop,
-                            reader: 'SSHReader[bytes]',
-                            writer: 'SSHWriter[bytes]',
-                            path_encoding: Optional[str],
-                            path_errors: str, sftp_version: int) -> SFTPClient:
-    """Start an SFTP client"""
-
-    handler = SFTPClientHandler(loop, reader, writer, sftp_version)
-
-    await handler.start()
-
-    conn.create_task(handler.recv_packets())
-
-    await handler.request_limits()
-
-    return SFTPClient(handler, path_encoding, path_errors)
-

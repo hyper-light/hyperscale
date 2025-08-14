@@ -7,7 +7,12 @@ from hyperscale.core.engines.client.ssh.protocol.connection import (
     SSHReader,
 )
 from hyperscale.core.engines.client.ssh.protocol.misc import DefTuple, Env, EnvSeq
-from .sftp import start_sftp_client, SFTPClient, MIN_SFTP_VERSION
+from .sftp import (
+    start_sftp_client, 
+    MIN_SFTP_VERSION,
+    SFTPClient, 
+    SFTPClientHandler,
+)
 
 
 class SFTPProtocol:
@@ -16,6 +21,7 @@ class SFTPProtocol:
         "port",
         "connected",
         "_ssh_connection",
+        "connection",
         "_reader",
         "_writer",
         "lock",
@@ -25,13 +31,13 @@ class SFTPProtocol:
         self.dns_address: str = None
         self.port: int = None
         self._ssh_connection: SSHClientConnection | None = None
-        self._client: SFTPClient | None = None
+        self.connection: SFTPClient | None = None
         self.connected = False
         self._writer: SSHWriter | None = None
         self._reader: SSHReader | None = None
         self.lock = asyncio.Lock()
 
-    async def connection(
+    async def connect(
         self,
         dns_address: str,
         port: int,
@@ -47,8 +53,6 @@ class SFTPProtocol:
                 port,
             )
 
-
-
             writer, reader, _ = await self._ssh_connection.open_session(
                 subsystem='sftp',
                 env=env,
@@ -60,16 +64,18 @@ class SFTPProtocol:
             self._reader = reader
 
 
-            self._client = await start_sftp_client(
-                self._ssh_connection,
-                self._ssh_connection._loop,
-                self._reader,
-                self._writer,
-                path_encoding=path_encoding,
-                path_errors=path_errors,
-                sftp_version=sftp_version,
-            )
+            handler = SFTPClientHandler(self._ssh_connection._loop, reader, writer, sftp_version)
+
+            await handler.start()
+
+            self._ssh_connection.create_task(handler.recv_packets())
+
+            await handler.request_limits()
+
+            self.connection = SFTPClient(handler, path_encoding, path_errors)
 
             self.connected = True
-            
-        
+
+        return self.connection
+
+

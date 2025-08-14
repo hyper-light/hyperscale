@@ -98,6 +98,74 @@ class URL:
         ]] = []
         self.address: Union[str, None] = None
 
+    async def lookup_scp(
+        self,
+        host: str,
+        port: int | None = None
+    ):
+        if port is None:
+            port = 22
+
+        self.port = port
+        if self.loop is None:
+            self.loop = get_event_loop()
+
+
+        if self.parsed.hostname is None:
+            try:
+
+                host = self.full
+                port = int(self.port)
+                address_info = (host, port)
+
+                if isinstance(ip_address(self.full), IPv6Address):
+                    socket_family = socket.AF_INET6
+                    address_info = (host, port, 0 , 0)
+
+                elif isinstance(ip_address(self.full), IPv4Address):
+                    socket_family = socket.AF_INET
+
+                address = (host, port)
+
+                
+                self.ip_addresses = [
+                    (
+                        socket_family,
+                        socket.SOCK_STREAM,
+                        0,
+                        "",
+                        address_info,
+                    )
+                ]
+
+
+            except Exception as parse_error:
+                raise parse_error
+
+        else:
+            resolved = await self.resolver.gethostbyname(
+                self.parsed.hostname, self.family
+            )
+
+            for address in resolved.addresses:
+                if isinstance(ip_address(address), IPv4Address):
+                    socket_family = socket.AF_INET
+                    address_info = (address, self.port)
+
+                else:
+                    socket_family = socket.AF_INET6
+                    address_info = (address, self.port, 0, 0)
+
+                self.ip_addresses.append(
+                    (
+                        socket_family,
+                        socket.SOCK_STREAM,
+                        0,
+                        "",
+                        address_info,
+                    )
+                )
+
     async def lookup_ftp(
         self,
         connection_type: Literal['control', 'data'] = 'control',

@@ -1,7 +1,7 @@
 import asyncio
 from typing import Sequence, Any
 from hyperscale.core.engines.client.ssh.protocol.known_hosts import KnownHostsArg
-from hyperscale.core.engines.client.sftp.protocol.sftp import SFTPErrorHandler, SFTPProgressHandler, local_fs
+from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPErrorHandler, SFTPProgressHandler
 from .scp import (
     SCPConnPath,
     SCP_BLOCK_SIZE,
@@ -41,7 +41,7 @@ class SCPProtocol:
         error_handler: SFTPErrorHandler = None, 
         known_hosts: KnownHostsArg = None,
         **kwargs: dict[str, Any],
-    ) -> None:
+    ):
         
         if not isinstance(srcpaths, (list, set, tuple,)):
             srcpaths = [srcpaths] # type: ignore
@@ -58,13 +58,12 @@ class SCPProtocol:
         # If we have no new paths to copy and are aleady connected,
         # abort.
         if path_diff_exists is False and self.connected is True:
-            return
+            return self.connection
         
 
         must_be_dir = len(srcpaths) > 1
 
         self.connection = SCPClient(
-            local_fs,
             preserve=preserve,
             recurse=recurse,
             must_be_dir=must_be_dir,
@@ -86,3 +85,5 @@ class SCPProtocol:
         self._dst_path = dstpath
 
         self.connected = True
+
+        return self.connection

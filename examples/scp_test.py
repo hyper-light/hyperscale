@@ -1,5 +1,5 @@
 import asyncio
-from hyperscale.core.engines.client.scp.protocol.protocol import SCPProtocol
+from hyperscale.core.engines.client.scp.protocols.protocol import SCPProtocol
 
 
 async def run():
