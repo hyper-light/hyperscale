@@ -2994,6 +2994,8 @@ class MercurySyncFTPConnection:
                     parsed_url.address = address_info
                     parsed_url.port = port
 
+                    break
+
                 except Exception as err:
                     connection_error = err
 

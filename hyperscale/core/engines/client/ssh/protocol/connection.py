@@ -175,13 +175,13 @@ _ServerHostKeysHandler = Optional[Callable[[List[SSHKey], List[SSHKey],
                                             List[SSHKey], List[SSHKey]],
                                            MaybeAwait[None]]]
 
-class _TunnelProtocol(Protocol):
+class TunnelProtocol(Protocol):
     """Base protocol for connections to tunnel SSH over"""
 
     def close(self) -> None:
         """Close this tunnel"""
 
-class _TunnelConnectorProtocol(_TunnelProtocol, Protocol):
+class TunnelConnectorProtocol(TunnelProtocol, Protocol):
     """Protocol to open a connection to tunnel an SSH connection over"""
 
     async def create_connection(
@@ -190,7 +190,7 @@ class _TunnelConnectorProtocol(_TunnelProtocol, Protocol):
                 Tuple[SSHTCPChannel[bytes], SSHTCPSession[bytes]]:
         """Create an outbound tunnel connection"""
 
-class _TunnelListenerProtocol(_TunnelProtocol, Protocol):
+class _TunnelListenerProtocol(TunnelProtocol, Protocol):
     """Protocol to open a listener to tunnel SSH connections over"""
 
     async def create_server(self, session_factory: TCPListenerFactory,
@@ -218,7 +218,7 @@ _RequestPTY = Union[bool, str]
 _TCPServerHandlerFactory = Callable[[str, int], SSHSocketSessionFactory]
 _UNIXServerHandlerFactory = Callable[[], SSHSocketSessionFactory]
 
-_TunnelConnector = Union[None, str, _TunnelConnectorProtocol]
+_TunnelConnector = Union[None, str, TunnelConnectorProtocol]
 _TunnelListener = Union[None, str, _TunnelListenerProtocol]
 
 _VersionArg = DefTuple[BytesOrStr]
@@ -250,7 +250,7 @@ _DEFAULT_WINDOW = 2*1024*1024       # 2 MiB
 _DEFAULT_MAX_PKTSIZE = 32768        # 32 kiB
 
 
-async def _canonicalize_host(loop: asyncio.AbstractEventLoop,
+async def canonicalize_host(loop: asyncio.AbstractEventLoop,
                              options: 'SSHConnectionOptions') -> Optional[str]:
     """Canonicalize a host name"""
 
@@ -295,7 +295,7 @@ async def _canonicalize_host(loop: asyncio.AbstractEventLoop,
     return None
 
 
-async def _open_proxy(
+async def open_proxy(
         loop: asyncio.AbstractEventLoop, command: Sequence[str],
         conn_factory: Callable[[], _Conn]) -> _Conn:
     """Open a tunnel running a proxy command"""
@@ -370,7 +370,7 @@ async def _open_proxy(
     return cast(_Conn, cast(_ProxyCommandTunnel, tunnel).get_conn())
 
 
-async def _open_tunnel(tunnels: object, options: _Options,
+async def open_tunnel(tunnels: object, options: _Options,
                        config: DefTuple[ConfigPaths]) -> \
         Optional['SSHClientConnection']:
     """Parse and open connection to tunnel over"""
@@ -407,7 +407,7 @@ async def _open_tunnel(tunnels: object, options: _Options,
         return None
 
 
-async def _connect(options: _Options, config: DefTuple[ConfigPaths],
+async def connect_with_options(options: _Options, config: DefTuple[ConfigPaths],
                    loop: asyncio.AbstractEventLoop, flags: int,
                    sock: Optional[socket.socket],
                    conn_factory: Callable[[], _Conn], msg: str) -> _Conn:
@@ -415,7 +415,7 @@ async def _connect(options: _Options, config: DefTuple[ConfigPaths],
 
     options.waiter = loop.create_future()
 
-    canon_host = await _canonicalize_host(loop, options)
+    canon_host = await canonicalize_host(loop, options)
 
     host = canon_host if canon_host else options.host
     canonical = bool(canon_host)
@@ -426,14 +426,13 @@ async def _connect(options: _Options, config: DefTuple[ConfigPaths],
 
     host = options.host
     port = options.port
-    tunnel = options.tunnel
+    tunnel: TunnelConnectorProtocol = options.tunnel
     family = options.family
     local_addr = options.local_addr
     proxy_command = options.proxy_command
     free_conn = True
 
-    new_tunnel = await _open_tunnel(tunnel, options, config)
-    tunnel: _TunnelConnectorProtocol
+    new_tunnel = await open_tunnel(tunnel, options, config)
 
     try:
         if sock:
@@ -463,7 +462,7 @@ async def _connect(options: _Options, config: DefTuple[ConfigPaths],
 
             conn = cast(_Conn, tunnel_session)
         elif proxy_command:
-            conn = await _open_proxy(loop, proxy_command, conn_factory)
+            conn = await open_proxy(loop, proxy_command, conn_factory)
         else:
             _, session = await loop.create_connection(
                 conn_factory, host, port, family=family,
@@ -504,7 +503,7 @@ async def _listen(options: _Options, config: DefTuple[ConfigPaths],
     tunnel = options.tunnel
     family = options.family
 
-    new_tunnel = await _open_tunnel(tunnel, options, config)
+    new_tunnel = await open_tunnel(tunnel, options, config)
     tunnel: _TunnelListenerProtocol
 
     if sock:
@@ -904,7 +903,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._keepalive_interval = options.keepalive_interval
         self._keepalive_timer: Optional[asyncio.TimerHandle] = None
 
-        self._tunnel: Optional[_TunnelProtocol] = None
+        self._tunnel: Optional[TunnelProtocol] = None
 
         self._enc_alg_cs = b''
         self._enc_alg_sc = b''
@@ -1150,7 +1149,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
                          String(self._client_kexinit),
                          String(self._server_kexinit)))
 
-    def set_tunnel(self, tunnel: Optional[_TunnelProtocol]) -> None:
+    def set_tunnel(self, tunnel: Optional[TunnelProtocol]) -> None:
         """Set tunnel used to open this connection"""
 
         self._tunnel = tunnel
@@ -5306,21 +5305,21 @@ class SSHConnectionOptions(Options, Generic[_Options]):
             cast(bool, password_auth if password_auth != () else
                 config.get('PasswordAuthentication', True))
 
-        if x509_trusted_certs is not None:
-            certs = load_certificates(x509_trusted_certs)
+        # if x509_trusted_certs is not None:
+        #     certs = load_certificates(x509_trusted_certs)
 
-            for cert in certs:
-                if not cert.is_x509:
-                    raise ValueError('OpenSSH certificates not allowed '
-                                    'in X.509 trusted certs')
+        #     for cert in certs:
+        #         if not cert.is_x509:
+        #             raise ValueError('OpenSSH certificates not allowed '
+        #                             'in X.509 trusted certs')
 
-            x509_trusted_certs = cast(Sequence[SSHX509Certificate], certs)
+        #     x509_trusted_certs = cast(Sequence[SSHX509Certificate], certs)
 
-        if x509_trusted_cert_paths:
-            for path in x509_trusted_cert_paths:
-                if not Path(path).is_dir():
-                    raise ValueError('X.509 trusted certificate path not '
-                                     f'a directory: {path}')
+        # if x509_trusted_cert_paths:
+        #     for path in x509_trusted_cert_paths:
+        #         if not Path(path).is_dir():
+        #             raise ValueError('X.509 trusted certificate path not '
+        #                              f'a directory: {path}')
 
         self.x509_trusted_certs = x509_trusted_certs
         self.x509_trusted_cert_paths = x509_trusted_cert_paths
@@ -6308,7 +6307,7 @@ async def run_client(sock: socket.socket, config: DefTuple[ConfigPaths] = (),
         options, config=config, **kwargs)
 
     return await asyncio.wait_for(
-        _connect(new_options, config, loop, 0, sock, conn_factory,
+        connect_with_options(new_options, config, loop, 0, sock, conn_factory,
                  'Starting SSH client on'),
         timeout=new_options.connect_timeout)
 
@@ -6426,7 +6425,7 @@ async def connect(host = '', port: DefTuple[int] = (), *,
         family=family, local_addr=local_addr, **kwargs)
 
     return await asyncio.wait_for(
-        _connect(new_options, config, loop, flags, sock, conn_factory,
+        connect_with_options(new_options, config, loop, flags, sock, conn_factory,
                  'Opening SSH connection to'),
         timeout=new_options.connect_timeout)
 
@@ -6726,7 +6725,7 @@ async def get_server_host_key(
         client_version=client_version)
 
     conn = await asyncio.wait_for(
-        _connect(new_options, config, loop, flags, sock, conn_factory,
+        connect_with_optionsf(new_options, config, loop, flags, sock, conn_factory,
                  'Fetching server host key from'),
         timeout=new_options.connect_timeout)
 
@@ -6870,7 +6869,7 @@ async def get_server_auth_methods(
         client_version=client_version)
 
     conn = await asyncio.wait_for(
-        _connect(new_options, config, loop, flags, sock, conn_factory,
+        connect_with_options(new_options, config, loop, flags, sock, conn_factory,
                  'Fetching server auth methods from'),
         timeout=new_options.connect_timeout)
 

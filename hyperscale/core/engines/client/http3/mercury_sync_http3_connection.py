@@ -878,6 +878,8 @@ class MercurySyncHTTP3Connection:
                     url.address = address
                     url.socket_config = ip_info
 
+                    break
+
                 except Exception as err:
                     if "server_hostname is only meaningful with ssl" in str(err):
                         return (

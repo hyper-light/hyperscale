@@ -3471,6 +3471,246 @@ class SFTPClientFile:
             self._handle = None
 
 
+class LocalFile:
+    """An async wrapper around local file I/O"""
+
+    def __init__(self, file: _SFTPFileObj):
+        self._file = file
+
+    async def __aenter__(self) -> Self: # pragma: no cover
+        """Allow LocalFile to be used as an async context manager"""
+
+        return self
+
+    async def __aexit__(self, _exc_type: Optional[Type[BaseException]],
+                        _exc_value: Optional[BaseException],
+                        _traceback: Optional[TracebackType]) -> \
+            bool: # pragma: no cover
+        """Wait for file close when used as an async context manager"""
+
+        await self.close()
+        return False
+
+    def request_ranges(self, offset: int, length: int) -> \
+            AsyncIterator[Tuple[int, int]]:
+        """Return data ranges containing data in a local file"""
+
+        return _request_ranges(self._file, offset, length)
+
+    async def read(self, size: int, offset: int) -> bytes:
+        """Read data from the local file"""
+
+        self._file.seek(offset)
+        return self._file.read(size)
+
+    async def write(self, data: bytes, offset: int) -> int:
+        """Write data to the local file"""
+
+        self._file.seek(offset)
+        return self._file.write(data)
+
+    async def close(self) -> None:
+        """Close the local file"""
+
+        self._file.close()
+
+
+
+class LocalFS:
+    """An async wrapper around local filesystem access"""
+
+    limits = SFTPLimits(0, MAX_SFTP_READ_LEN, MAX_SFTP_WRITE_LEN, 0)
+
+    @staticmethod
+    def basename(path: bytes) -> bytes:
+        """Return the final component of a local file path"""
+
+        return os.path.basename(path)
+
+    def encode(self, path: _SFTPPath) -> bytes:
+        """Encode path name using filesystem native encoding
+
+           This method has no effect if the path is already bytes.
+
+        """
+
+        # pylint: disable=no-self-use
+
+        return os.fsencode(path)
+
+    def compose_path(self, path: bytes,
+                     parent: Optional[bytes] = None) -> bytes:
+        """Compose a path
+
+           If parent is not specified, just encode the path.
+
+        """
+
+        path = self.encode(path)
+
+        return posixpath.join(parent, path) if parent else path
+
+    async def stat(self, path: bytes, *,
+                   follow_symlinks: bool = True) -> 'SFTPAttrs':
+        """Get attributes of a local file, directory, or symlink"""
+
+        return SFTPAttrs.from_local(os.stat(_to_local_path(path),
+                                            follow_symlinks=follow_symlinks))
+
+    async def setstat(self, path: bytes, attrs: 'SFTPAttrs', *,
+                      follow_symlinks: bool = True) -> None:
+        """Set attributes of a local file, directory, or symlink"""
+
+        _setstat(_to_local_path(path), attrs, follow_symlinks=follow_symlinks)
+
+    async def exists(self, path: bytes) -> bool:
+        """Return if the local path exists and isn't a broken symbolic link"""
+
+        return os.path.exists(_to_local_path(path))
+
+    async def isdir(self, path: bytes) -> bool:
+        """Return if the local path refers to a directory"""
+
+        return os.path.isdir(_to_local_path(path))
+
+    async def scandir(self, path: bytes) -> AsyncIterator[SFTPName]:
+        """Return names and attributes of the files in a local directory"""
+
+        with os.scandir(_to_local_path(path)) as entries:
+            for entry in entries:
+                filename = entry.name
+
+                attrs = SFTPAttrs.from_local(entry.stat(follow_symlinks=False))
+                yield SFTPName(filename, attrs=attrs)
+
+    async def mkdir(self, path: bytes) -> None:
+        """Create a local directory with the specified attributes"""
+
+        os.mkdir(_to_local_path(path))
+
+    async def readlink(self, path: bytes) -> bytes:
+        """Return the target of a local symbolic link"""
+
+        path = os.readlink(_to_local_path(path))
+        return _from_local_path(path)
+
+    async def symlink(self, oldpath: bytes, newpath: bytes) -> None:
+        """Create a local symbolic link"""
+
+        os.symlink(_to_local_path(oldpath), _to_local_path(newpath))
+
+    @async_context_manager
+    async def open(self, path: bytes, mode: str,
+                   block_size: int = -1) -> LocalFile:
+        """Open a local file"""
+
+        # pylint: disable=unused-argument
+
+        file_obj = open(_to_local_path(path), mode)
+
+        if mode[0] in 'wx':
+            make_sparse_file(file_obj)
+
+        return LocalFile(file_obj)
+
+class LocalFS:
+    """An async wrapper around local filesystem access"""
+
+    limits = SFTPLimits(0, MAX_SFTP_READ_LEN, MAX_SFTP_WRITE_LEN, 0)
+
+    @staticmethod
+    def basename(path: bytes) -> bytes:
+        """Return the final component of a local file path"""
+
+        return os.path.basename(path)
+
+    def encode(self, path: _SFTPPath) -> bytes:
+        """Encode path name using filesystem native encoding
+
+           This method has no effect if the path is already bytes.
+
+        """
+
+        # pylint: disable=no-self-use
+
+        return os.fsencode(path)
+
+    def compose_path(self, path: bytes,
+                     parent: Optional[bytes] = None) -> bytes:
+        """Compose a path
+
+           If parent is not specified, just encode the path.
+
+        """
+
+        path = self.encode(path)
+
+        return posixpath.join(parent, path) if parent else path
+
+    async def stat(self, path: bytes, *,
+                   follow_symlinks: bool = True) -> 'SFTPAttrs':
+        """Get attributes of a local file, directory, or symlink"""
+
+        return SFTPAttrs.from_local(os.stat(_to_local_path(path),
+                                            follow_symlinks=follow_symlinks))
+
+    async def setstat(self, path: bytes, attrs: 'SFTPAttrs', *,
+                      follow_symlinks: bool = True) -> None:
+        """Set attributes of a local file, directory, or symlink"""
+
+        _setstat(_to_local_path(path), attrs, follow_symlinks=follow_symlinks)
+
+    async def exists(self, path: bytes) -> bool:
+        """Return if the local path exists and isn't a broken symbolic link"""
+
+        return os.path.exists(_to_local_path(path))
+
+    async def isdir(self, path: bytes) -> bool:
+        """Return if the local path refers to a directory"""
+
+        return os.path.isdir(_to_local_path(path))
+
+    async def scandir(self, path: bytes) -> AsyncIterator[SFTPName]:
+        """Return names and attributes of the files in a local directory"""
+
+        with os.scandir(_to_local_path(path)) as entries:
+            for entry in entries:
+                filename = entry.name
+
+                attrs = SFTPAttrs.from_local(entry.stat(follow_symlinks=False))
+                yield SFTPName(filename, attrs=attrs)
+
+    async def mkdir(self, path: bytes) -> None:
+        """Create a local directory with the specified attributes"""
+
+        os.mkdir(_to_local_path(path))
+
+    async def readlink(self, path: bytes) -> bytes:
+        """Return the target of a local symbolic link"""
+
+        path = os.readlink(_to_local_path(path))
+
+        return _from_local_path(path)
+
+    async def symlink(self, oldpath: bytes, newpath: bytes) -> None:
+        """Create a local symbolic link"""
+
+        os.symlink(_to_local_path(oldpath), _to_local_path(newpath))
+
+    @async_context_manager
+    async def open(self, path: bytes, mode: str,
+                   block_size: int = -1) -> LocalFile:
+        """Open a local file"""
+
+        # pylint: disable=unused-argument
+
+        file_obj = open(_to_local_path(path), mode)
+
+        if mode[0] in 'wx':
+            make_sparse_file(file_obj)
+
+        return LocalFile(file_obj)
+
 class SFTPClient:
     """SFTP client
 
@@ -3481,9 +3721,19 @@ class SFTPClient:
 
     """
 
-    def __init__(self, handler: SFTPClientHandler,
-                 path_encoding: Optional[str], path_errors: str):
+    def __init__(
+        self, 
+        handler: SFTPClientHandler,
+        path_encoding: Optional[str],
+        path_errors: str,
+        local_fs: LocalFS | None = None
+    ):
+        
+        if local_fs is None:
+            local_fs = LocalFS()
+
         self._handler = handler
+        self._local_fs = local_fs
         self._path_encoding = path_encoding
         self._path_errors = path_errors
         self._cwd: Optional[bytes] = None
@@ -3841,7 +4091,7 @@ class SFTPClient:
 
         """
 
-        await self._begin_copy(self, local_fs, remotepaths, localpath, 'get',
+        await self._begin_copy(self, self._local_fs, remotepaths, localpath, 'get',
                                False, preserve, recurse, follow_symlinks,
                                sparse, block_size, max_requests,
                                progress_handler, error_handler)
@@ -3952,7 +4202,7 @@ class SFTPClient:
 
         """
 
-        await self._begin_copy(local_fs, self, localpaths, remotepath, 'put',
+        await self._begin_copy(self._local_fs, self, localpaths, remotepath, 'put',
                                False, preserve, recurse, follow_symlinks,
                                sparse, block_size, max_requests,
                                progress_handler, error_handler)
@@ -4090,7 +4340,7 @@ class SFTPClient:
 
         """
 
-        await self._begin_copy(self, local_fs, remotepaths, localpath, 'mget',
+        await self._begin_copy(self, self._local_fs, remotepaths, localpath, 'mget',
                                True, preserve, recurse, follow_symlinks,
                                sparse, block_size, max_requests,
                                progress_handler, error_handler)
@@ -4113,7 +4363,7 @@ class SFTPClient:
 
         """
 
-        await self._begin_copy(local_fs, self, localpaths, remotepath, 'mput',
+        await self._begin_copy(self._local_fs, self, localpaths, remotepath, 'mput',
                                True, preserve, recurse, follow_symlinks,
                                sparse, block_size, max_requests,
                                progress_handler, error_handler)
@@ -5496,245 +5746,3 @@ class SFTPClient:
         """Wait for this SFTP client session to close"""
 
         await self._handler.wait_closed()
-
-class LocalFile:
-    """An async wrapper around local file I/O"""
-
-    def __init__(self, file: _SFTPFileObj):
-        self._file = file
-
-    async def __aenter__(self) -> Self: # pragma: no cover
-        """Allow LocalFile to be used as an async context manager"""
-
-        return self
-
-    async def __aexit__(self, _exc_type: Optional[Type[BaseException]],
-                        _exc_value: Optional[BaseException],
-                        _traceback: Optional[TracebackType]) -> \
-            bool: # pragma: no cover
-        """Wait for file close when used as an async context manager"""
-
-        await self.close()
-        return False
-
-    def request_ranges(self, offset: int, length: int) -> \
-            AsyncIterator[Tuple[int, int]]:
-        """Return data ranges containing data in a local file"""
-
-        return _request_ranges(self._file, offset, length)
-
-    async def read(self, size: int, offset: int) -> bytes:
-        """Read data from the local file"""
-
-        self._file.seek(offset)
-        return self._file.read(size)
-
-    async def write(self, data: bytes, offset: int) -> int:
-        """Write data to the local file"""
-
-        self._file.seek(offset)
-        return self._file.write(data)
-
-    async def close(self) -> None:
-        """Close the local file"""
-
-        self._file.close()
-
-
-class LocalFS:
-    """An async wrapper around local filesystem access"""
-
-    limits = SFTPLimits(0, MAX_SFTP_READ_LEN, MAX_SFTP_WRITE_LEN, 0)
-
-    @staticmethod
-    def basename(path: bytes) -> bytes:
-        """Return the final component of a local file path"""
-
-        return os.path.basename(path)
-
-    def encode(self, path: _SFTPPath) -> bytes:
-        """Encode path name using filesystem native encoding
-
-           This method has no effect if the path is already bytes.
-
-        """
-
-        # pylint: disable=no-self-use
-
-        return os.fsencode(path)
-
-    def compose_path(self, path: bytes,
-                     parent: Optional[bytes] = None) -> bytes:
-        """Compose a path
-
-           If parent is not specified, just encode the path.
-
-        """
-
-        path = self.encode(path)
-
-        return posixpath.join(parent, path) if parent else path
-
-    async def stat(self, path: bytes, *,
-                   follow_symlinks: bool = True) -> 'SFTPAttrs':
-        """Get attributes of a local file, directory, or symlink"""
-
-        return SFTPAttrs.from_local(os.stat(_to_local_path(path),
-                                            follow_symlinks=follow_symlinks))
-
-    async def setstat(self, path: bytes, attrs: 'SFTPAttrs', *,
-                      follow_symlinks: bool = True) -> None:
-        """Set attributes of a local file, directory, or symlink"""
-
-        _setstat(_to_local_path(path), attrs, follow_symlinks=follow_symlinks)
-
-    async def exists(self, path: bytes) -> bool:
-        """Return if the local path exists and isn't a broken symbolic link"""
-
-        return os.path.exists(_to_local_path(path))
-
-    async def isdir(self, path: bytes) -> bool:
-        """Return if the local path refers to a directory"""
-
-        return os.path.isdir(_to_local_path(path))
-
-    async def scandir(self, path: bytes) -> AsyncIterator[SFTPName]:
-        """Return names and attributes of the files in a local directory"""
-
-        with os.scandir(_to_local_path(path)) as entries:
-            for entry in entries:
-                filename = entry.name
-
-                attrs = SFTPAttrs.from_local(entry.stat(follow_symlinks=False))
-                yield SFTPName(filename, attrs=attrs)
-
-    async def mkdir(self, path: bytes) -> None:
-        """Create a local directory with the specified attributes"""
-
-        os.mkdir(_to_local_path(path))
-
-    async def readlink(self, path: bytes) -> bytes:
-        """Return the target of a local symbolic link"""
-
-        path = os.readlink(_to_local_path(path))
-        return _from_local_path(path)
-
-    async def symlink(self, oldpath: bytes, newpath: bytes) -> None:
-        """Create a local symbolic link"""
-
-        os.symlink(_to_local_path(oldpath), _to_local_path(newpath))
-
-    @async_context_manager
-    async def open(self, path: bytes, mode: str,
-                   block_size: int = -1) -> LocalFile:
-        """Open a local file"""
-
-        # pylint: disable=unused-argument
-
-        file_obj = open(_to_local_path(path), mode)
-
-        if mode[0] in 'wx':
-            make_sparse_file(file_obj)
-
-        return LocalFile(file_obj)
-
-class LocalFS:
-    """An async wrapper around local filesystem access"""
-
-    limits = SFTPLimits(0, MAX_SFTP_READ_LEN, MAX_SFTP_WRITE_LEN, 0)
-
-    @staticmethod
-    def basename(path: bytes) -> bytes:
-        """Return the final component of a local file path"""
-
-        return os.path.basename(path)
-
-    def encode(self, path: _SFTPPath) -> bytes:
-        """Encode path name using filesystem native encoding
-
-           This method has no effect if the path is already bytes.
-
-        """
-
-        # pylint: disable=no-self-use
-
-        return os.fsencode(path)
-
-    def compose_path(self, path: bytes,
-                     parent: Optional[bytes] = None) -> bytes:
-        """Compose a path
-
-           If parent is not specified, just encode the path.
-
-        """
-
-        path = self.encode(path)
-
-        return posixpath.join(parent, path) if parent else path
-
-    async def stat(self, path: bytes, *,
-                   follow_symlinks: bool = True) -> 'SFTPAttrs':
-        """Get attributes of a local file, directory, or symlink"""
-
-        return SFTPAttrs.from_local(os.stat(_to_local_path(path),
-                                            follow_symlinks=follow_symlinks))
-
-    async def setstat(self, path: bytes, attrs: 'SFTPAttrs', *,
-                      follow_symlinks: bool = True) -> None:
-        """Set attributes of a local file, directory, or symlink"""
-
-        _setstat(_to_local_path(path), attrs, follow_symlinks=follow_symlinks)
-
-    async def exists(self, path: bytes) -> bool:
-        """Return if the local path exists and isn't a broken symbolic link"""
-
-        return os.path.exists(_to_local_path(path))
-
-    async def isdir(self, path: bytes) -> bool:
-        """Return if the local path refers to a directory"""
-
-        return os.path.isdir(_to_local_path(path))
-
-    async def scandir(self, path: bytes) -> AsyncIterator[SFTPName]:
-        """Return names and attributes of the files in a local directory"""
-
-        with os.scandir(_to_local_path(path)) as entries:
-            for entry in entries:
-                filename = entry.name
-
-                attrs = SFTPAttrs.from_local(entry.stat(follow_symlinks=False))
-                yield SFTPName(filename, attrs=attrs)
-
-    async def mkdir(self, path: bytes) -> None:
-        """Create a local directory with the specified attributes"""
-
-        os.mkdir(_to_local_path(path))
-
-    async def readlink(self, path: bytes) -> bytes:
-        """Return the target of a local symbolic link"""
-
-        path = os.readlink(_to_local_path(path))
-
-        return _from_local_path(path)
-
-    async def symlink(self, oldpath: bytes, newpath: bytes) -> None:
-        """Create a local symbolic link"""
-
-        os.symlink(_to_local_path(oldpath), _to_local_path(newpath))
-
-    @async_context_manager
-    async def open(self, path: bytes, mode: str,
-                   block_size: int = -1) -> LocalFile:
-        """Open a local file"""
-
-        # pylint: disable=unused-argument
-
-        file_obj = open(_to_local_path(path), mode)
-
-        if mode[0] in 'wx':
-            make_sparse_file(file_obj)
-
-        return LocalFile(file_obj)
-
-
-local_fs = LocalFS()

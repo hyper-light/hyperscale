@@ -15,6 +15,7 @@ class ProtocolMap:
             RequestType.GRAPHQL: SocketType.DEFAULT,
             RequestType.GRAPHQL_HTTP2: SocketType.HTTP2,
             RequestType.GRPC: SocketType.HTTP2,
+            RequestType.SCP: SocketType.SSH,
             RequestType.UDP: SocketType.UDP,
             RequestType.PLAYWRIGHT: SocketType.NONE,
         }
@@ -27,6 +28,7 @@ class ProtocolMap:
             RequestType.GRAPHQL: SocketProtocol.DEFAULT,
             RequestType.GRAPHQL_HTTP2: SocketType.HTTP2,
             RequestType.GRPC: SocketProtocol.HTTP2,
+            RequestType.SCP: SocketProtocol.SSH,
             RequestType.UDP: SocketProtocol.UDP,
             RequestType.PLAYWRIGHT: SocketProtocol.NONE,
         }

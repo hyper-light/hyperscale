@@ -477,6 +477,8 @@ class MercurySyncUDPConnection:
                     url.address = address
                     url.socket_config = ip_info
 
+                    break
+
                 except Exception:
                     pass
 

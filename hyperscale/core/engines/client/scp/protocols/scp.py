@@ -75,7 +75,7 @@ class SCPFileProtocol(Protocol):
         """Close the local file"""
 
 
-def _scp_error(exc_class: Type[Exception], reason: BytesOrStr,
+def scp_error(exc_class: Type[Exception], reason: BytesOrStr,
                path: Optional[bytes] = None, fatal: bool = False,
                suppress_send: bool = False,
                lang: str = DEFAULT_LANG) -> Exception:
@@ -95,25 +95,25 @@ def _scp_error(exc_class: Type[Exception], reason: BytesOrStr,
     return exc
 
 
-def _parse_cd_args(args: bytes) -> Tuple[int, int, bytes]:
+def parse_cd_args(args: bytes) -> Tuple[int, int, bytes]:
     """Parse arguments to an SCP copy or dir request"""
 
     try:
         permissions, size, name = args.split(None, 2)
         return int(permissions, 8), int(size), name
     except ValueError:
-        raise _scp_error(SFTPBadMessage,
+        raise scp_error(SFTPBadMessage,
                          'Invalid copy or dir request') from None
 
 
-def _parse_t_args(args: bytes) -> Tuple[int, int]:
+def parse_time_args(args: bytes) -> Tuple[int, int]:
     """Parse argument to an SCP time request"""
 
     try:
         mtime, _, atime, _ = args.split()
         return int(atime), int(mtime)
     except ValueError:
-        raise _scp_error(SFTPBadMessage, 'Invalid time request') from None
+        raise scp_error(SFTPBadMessage, 'Invalid time request') from None
 
 
 async def parse_path(path: SCPConnPath, **kwargs) -> \
@@ -172,13 +172,13 @@ class SCPHandler:
             reason = await self._reader.readline()
 
             if not result or not reason.endswith(b'\n'):
-                raise _scp_error(SFTPConnectionLost, 'Connection lost',
+                raise scp_error(SFTPConnectionLost, 'Connection lost',
                                  fatal=True, suppress_send=True)
 
             if result not in b'\x01\x02':
                 reason = result + reason
 
-            return _scp_error(SFTPFailure, reason[:-1],
+            return scp_error(SFTPFailure, reason[:-1],
                               fatal=result != b'\x01', suppress_send=True)
 
         return None
@@ -249,7 +249,7 @@ class SCPHandler:
         """Handle an SCP error"""
 
         if isinstance(exc, BrokenPipeError):
-            exc = _scp_error(SFTPConnectionLost, 'Connection lost',
+            exc = scp_error(SFTPConnectionLost, 'Connection lost',
                              fatal=True, suppress_send=True)
 
         if not getattr(exc, 'suppress_send', False):
