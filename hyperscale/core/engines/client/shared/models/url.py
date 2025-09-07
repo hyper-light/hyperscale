@@ -98,31 +98,37 @@ class URL:
         ]] = []
         self.address: Union[str, None] = None
 
-    async def lookup_scp(
-        self,
-        host: str,
-        port: int | None = None
-    ):
-        if port is None:
+    async def lookup_ssh(self):
+
+        port = self.parsed.port
+
+        if port:
             port = 22
 
         self.port = port
+
         if self.loop is None:
             self.loop = get_event_loop()
-
 
         if self.parsed.hostname is None:
             try:
 
                 host = self.full
-                port = int(self.port)
+                if ":" in host:
+                    host, port = self.full.split(':', maxsplit=1)
+                    port = int(port)
+                    self.port = port
+
                 address_info = (host, port)
 
-                if isinstance(ip_address(self.full), IPv6Address):
+                if host == 'localhost':
+                    socket_family = socket.AF_INET
+
+                if isinstance(ip_address(host), IPv6Address):
                     socket_family = socket.AF_INET6
                     address_info = (host, port, 0 , 0)
 
-                elif isinstance(ip_address(self.full), IPv4Address):
+                elif isinstance(ip_address(host), IPv4Address):
                     socket_family = socket.AF_INET
 
                 address = (host, port)
@@ -130,17 +136,41 @@ class URL:
                 
                 self.ip_addresses = [
                     (
-                        socket_family,
-                        socket.SOCK_STREAM,
-                        0,
-                        "",
-                        address_info,
+                        address,
+                        (
+                            socket_family,
+                            socket.SOCK_STREAM,
+                            0,
+                            "",
+                            address_info,
+                        ),
                     )
                 ]
 
 
-            except Exception as parse_error:
-                raise parse_error
+            except Exception:
+
+                
+                host = self.full
+                if ":" in host:
+                    host, port = self.full.split(':', maxsplit=1)
+                    port = int(port)
+                    self.port = port
+                    
+                address = (host, port)
+
+                self.ip_addresses = [
+                    (
+                        address,
+                        (
+                            socket.AF_INET,
+                            socket.SOCK_STREAM,
+                            0,
+                            "",
+                            address_info,
+                        ),
+                    )
+                ]
 
         else:
             resolved = await self.resolver.gethostbyname(
@@ -158,11 +188,14 @@ class URL:
 
                 self.ip_addresses.append(
                     (
-                        socket_family,
-                        socket.SOCK_STREAM,
-                        0,
-                        "",
-                        address_info,
+                        address,
+                        (
+                            socket_family,
+                            socket.SOCK_STREAM,
+                            0,
+                            "",
+                            address_info,
+                        ),
                     )
                 )
 
@@ -202,11 +235,14 @@ class URL:
                 
                 self.ip_addresses = [
                     (
-                        socket_family,
-                        socket.SOCK_STREAM,
-                        0,
-                        "",
-                        address_info,
+                        address,
+                        (
+                            socket_family,
+                            socket.SOCK_STREAM,
+                            0,
+                            "",
+                            address_info,
+                        ),
                     )
                 ]
 
@@ -230,11 +266,14 @@ class URL:
 
                 self.ip_addresses.append(
                     (
-                        socket_family,
-                        socket.SOCK_STREAM,
-                        0,
-                        "",
-                        address_info,
+                        address,
+                        (
+                            socket_family,
+                            socket.SOCK_STREAM,
+                            0,
+                            "",
+                            address_info,
+                        ),
                     )
                 )
 

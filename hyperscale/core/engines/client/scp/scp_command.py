@@ -1,7 +1,14 @@
-
+import asyncio
+import datetime
+import pathlib
 import posixpath
+from typing import Literal
+
+
+from pydantic import BaseModel, StrictInt, StrictFloat, StrictStr
+
 from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_REGULAR, FILEXFER_TYPE_DIRECTORY
-from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPAttrs, LocalFS
+from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPAttrs, LocalFS, SFTPGlob, SFTPName
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPError, SFTPFailure, SFTPBadMessage, SFTPConnectionLost
 from .protocols import (
     SCPHandler,
@@ -11,7 +18,127 @@ from .protocols import (
     SCP_BLOCK_SIZE,
 )
 
+from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_REGULAR, FILEXFER_TYPE_DIRECTORY
+from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_SYMLINK, FILEXFER_TYPE_SPECIAL
+from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_UNKNOWN, FILEXFER_TYPE_SOCKET
+from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_CHAR_DEVICE, FILEXFER_TYPE_BLOCK_DEVICE
+from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_FIFO
 
+
+FileType = Literal[
+    "REGULAR",
+    "DIRECTORY",
+]
+
+
+class FileAttributes(BaseModel):
+    size: StrictInt | None = None
+    alloc_size: StrictInt | None = None
+    uid: StrictInt | None = None
+    gid: StrictInt | None = None
+    owner: StrictStr | None = None
+    group: StrictStr | None = None
+    permissions: StrictInt | None = None
+    atime: StrictInt | None = None
+    atime_ns: StrictInt | StrictFloat | None = None
+    crtime: StrictInt | None = None
+    crtime_ns: StrictInt | StrictFloat | None = None
+    mtime: StrictInt | None = None
+    mtime_ns: StrictInt | StrictFloat | None = None
+    ctime: StrictInt | None = None
+    ctime_ns: StrictInt | StrictFloat | None = None
+    mime_type: StrictStr | None = None
+    nlink: StrictInt | None = None
+
+
+class FileResult:
+
+    def __init__(
+        self,
+        result_path: bytes,
+        result_type: Literal["FILE", "DIRECTORY"] | str = "FILE",
+        result_data: bytes | bytearray | None = None,
+        result_attributes: FileAttributes | None = None,
+    ):
+        self.path = result_path
+        self.type = result_type
+        self.data = result_data
+        self.attributes = result_attributes
+
+class File:
+
+    def __init__(
+        self,
+        path: bytes,
+        data:bytes,
+        file_type: FileType = "REGULAR",
+        user_id: int = 1000,
+        group_id: int = 1000,
+        owner: str = "test",
+        group: str = "test",
+        permissions: int = 644,
+        file_time: int = 0,
+        links_count: int = 1,
+    ):
+        self.path = path
+        self.data = data
+
+        file_type_value = FILEXFER_TYPE_REGULAR
+        if file_type == FILEXFER_TYPE_DIRECTORY:
+            file_type_value = FILEXFER_TYPE_DIRECTORY
+
+        self.file_type = file_type_value
+        self.user_id = user_id
+        self.group_id = group_id
+        self.owner = owner
+        self.group = group
+        self.permissions = permissions
+        self.size = len(data)
+
+        if file_time is None:  
+            file_time = datetime.datetime.now(
+                datetime.timezone.utc,
+            ).timestamp()
+
+        file_time_ns = file_time * 10**9
+
+        self.atime = file_time
+        self.atime_ns = file_time_ns
+
+        self.crtime = file_time
+        self.crtime_ns = file_time_ns
+
+        self.mtime = file_time
+        self.mtime_ns = file_time_ns
+        self.ctime = file_time
+        self.ctime_ns = file_time_ns
+        self.nlink = links_count
+
+        self.attrs = SFTPAttrs(
+            type=self.file_type,
+            size=self.size,
+            alloc_size=self.size,
+            uid=self.user_id,
+            gid=self.group_id,
+            owner=self.owner,
+            group=self.group,
+            permissions=self.permissions,
+            atime=self.atime,
+            atime_ns=self.atime_ns,
+            crtime=self.crtime,
+            crtime_ns=self.crtime_ns,
+            mtime=self.mtime,
+            mtime_ns=self.mtime_ns,
+            ctime=self.ctime,
+            ctime_ns=self.ctime_ns,
+            nlink=self.nlink,
+        )
+
+        self.sftp_named_file = SFTPName(
+            pathlib.Path(str(path)).name.encode(),
+            self.path,
+            self.attrs,
+        )
 
 class SCPCommand:
 
@@ -20,30 +147,107 @@ class SCPCommand:
         self,
         source: SCPHandler,
         dest: SCPHandler,
-        filesystem: LocalFS,
         block_size: int = SCP_BLOCK_SIZE,
         recurse: bool = False,
         preserve: bool = False,
+        must_be_dir: bool = False,
 
     ):
         self._source = source
         self._dest = dest
-        self._filesystem = filesystem
+        self._filesystem: dict[str, FileResult] = {}
 
         self._block_size = block_size
         self._recurse = recurse
         self._preserve = preserve
+        self._must_be_dir = must_be_dir
 
-    def handle_error(self, exc: Exception) -> None:
-        """Handle an SCP error"""
+    async def copy(self) -> None:
+        """Copy files from one SCP server to another"""
 
-        if isinstance(exc, BrokenPipeError):
-            exc = scp_error(SFTPConnectionLost, 'Connection lost',
-                             fatal=True, suppress_send=True)
+        exc = await self._forward_response(self._dest, self._source)
 
-        raise exc
+        if exc:
+            raise exc
 
-    async def forward_response(
+        pathlist: list[bytes] = []
+        attrlist: list[SFTPAttrs] = []
+        attrs = SFTPAttrs()
+
+        while True:
+            action, args = await self._source.recv_request()
+
+            if not action:
+                break
+
+            assert args is not None
+
+            self._dest.send_request(action, args)
+
+            exc: Exception | None = None
+            if action in b'\x01\x02':
+                exc = scp_error(SFTPFailure, args, fatal=action != b'\x01')
+             
+            if exc:
+                raise exc
+
+            exc = await self._forward_response(self._dest, self._source)
+
+            if exc:
+                raise exc
+
+            if action in b'CD':
+                try:
+                    attrs.permissions, size, name = parse_cd_args(args)
+
+                    if action == b'C':
+                        await self._copy_file(size)
+                    else:
+                        pathlist.append(name)
+                        attrlist.append(attrs)
+                finally:
+                    attrs = SFTPAttrs()
+            elif action == b'E':
+                if pathlist:
+                    pathlist.pop()
+                    attrs = attrlist.pop()
+
+                else:
+                    break
+            elif action == b'T':
+                attrs.atime, attrs.mtime = parse_time_args(args)
+            else:
+                raise scp_error(SFTPBadMessage, 'Unknown SCP action')
+
+    async def receive(
+        self,
+        dstpath: str | pathlib.PurePath,
+    ) -> None:
+
+        if isinstance(dstpath, pathlib.PurePath):
+            dstpath = str(dstpath)
+
+        if isinstance(dstpath, str):
+            dstpath = dstpath.encode('utf-8')
+
+        await self._recv_files(dstpath)
+    
+    async def send(
+        self,
+        srcpath: bytes,
+        data: bytes | File | list[bytes | File],
+    ) -> None:
+
+        exc = await self._dest.await_response()
+        if exc:
+            raise exc
+        
+        await self._send_files(
+            srcpath,
+            data,
+        )
+    
+    async def _forward_response(
         self, 
         src: SCPHandler,
         dst: SCPHandler,
@@ -62,10 +266,11 @@ class SCPCommand:
         except OSError as exc:
             return exc
 
-    async def copy_file(self, path: bytes, size: int) -> None:
+    async def _copy_file(self, size: int) -> None:
         """Copy a file from one remote SCP server to another"""
 
         offset = 0
+        buffer = bytearray()
 
         while offset < size:
             blocklen = min(size - offset, self._block_size)
@@ -75,106 +280,50 @@ class SCPCommand:
                 raise scp_error(SFTPConnectionLost, 'Connection lost',
                                  fatal=True, suppress_send=True)
 
+            buffer.extend(data)
             self._dest.writer.write(data)
+
             offset += len(data)
 
-        source_exc = await self.forward_response(self._source, self._dest)
-        sink_exc = await self.forward_response(self._dest, self._source)
+        source_exc = await self._forward_response(self._source, self._dest)
+        sink_exc = await self._forward_response(self._dest, self._source)
 
         exc = sink_exc or source_exc
 
         if exc:
-            self.handle_error(exc)
+            raise exc
 
-    async def copy_files(self) -> None:
-        """Copy files from one SCP server to another"""
+    async def _recv_file(
+        self,
+        dstpath: bytes,
+        size: int,
+    ) -> None:
 
-        exc = await self.forward_response(self._dest, self._source)
-
-        if exc:
-            self.handle_error(exc)
-
-        pathlist: list[bytes] = []
-        attrlist: list[SFTPAttrs] = []
-        attrs = SFTPAttrs()
-
-        while True:
-            action, args = await self._source.recv_request()
-
-            if not action:
-                break
-
-            assert args is not None
-
-            self._dest.send_request(action, args)
-
-            if action in b'\x01\x02':
-                exc = scp_error(SFTPFailure, args, fatal=action != b'\x01')
-                self.handle_error(exc)
-                continue
-
-            exc = await self.forward_response(self._dest, self._source)
-
-            if exc:
-                self.handle_error(exc)
-                continue
-
-            if action in b'CD':
-                try:
-                    attrs.permissions, size, name = parse_cd_args(args)
-
-                    if action == b'C':
-                        path = b'/'.join(pathlist + [name])
-                        await self.copy_file(path, size)
-                    else:
-                        pathlist.append(name)
-                        attrlist.append(attrs)
-                finally:
-                    attrs = SFTPAttrs()
-            elif action == b'E':
-                if pathlist:
-                    pathlist.pop()
-                    attrs = attrlist.pop()
-
-                else:
-                    break
-            elif action == b'T':
-                attrs.atime, attrs.mtime = parse_time_args(args)
-            else:
-                raise scp_error(SFTPBadMessage, 'Unknown SCP action')
-
-    async def recv_file(self, srcpath: bytes,
-                         dstpath: bytes, size: int) -> None:
-        """Receive a file via SCP"""
-
-        file_obj = await self._filesystem.open(dstpath, 'wb')
+        buffer = bytearray()
         local_exc = None
         offset = 0
 
-        try:
-            self._source.send_ok()
+        self._source.send_ok()
 
-            while offset < size:
-                blocklen = min(size - offset, self._block_size)
-                data = await self._source.recv_data(blocklen)
+        while offset < size:
+            blocklen = min(size - offset, self._block_size)
+            data = await self._source.recv_data(blocklen)
 
-                if not data:
-                    raise scp_error(SFTPConnectionLost, 'Connection lost',
-                                     fatal=True, suppress_send=True)
+            if not data:
+                raise scp_error(SFTPConnectionLost, 'Connection lost',
+                                    fatal=True, suppress_send=True)
 
-                if not local_exc:
-                    try:
-                        await file_obj.write(data, offset)
-                    except (OSError, SFTPError) as exc:
-                        local_exc = exc
+            if not local_exc:
+                try:
+                    buffer.extend(data)
+                except (OSError, SFTPError) as exc:
+                    local_exc = exc
 
-                offset += len(data)
+            offset += len(data)
 
-        finally:
-            await file_obj.close()
 
         remote_exc = await self._source.await_response()
-
+      
         if local_exc:
             self._source.send_error(local_exc)
             setattr(local_exc, 'suppress_send',True)
@@ -185,23 +334,32 @@ class SCPCommand:
 
         if final_exc:
             raise final_exc
+        
+        self._filesystem[dstpath] = FileResult(
+            dstpath,
+            result_data=buffer,
+            result_type="FILE",
+        )
 
-    async def recv_dir(self, srcpath: bytes, dstpath: bytes) -> None:
+    async def _recv_dir(self, dstpath: bytes) -> None:
         """Receive a directory over SCP"""
 
         if not self._recurse:
             raise scp_error(SFTPBadMessage,
                              'Directory received without recurse')
 
-        if await self._filesystem.exists(dstpath):
-            if not await self._filesystem.isdir(dstpath):
-                raise scp_error(SFTPFailure, 'Not a directory', dstpath)
+        if self._filesystem.get(dstpath) and pathlib.Path(str(dstpath)).suffix:
+            raise scp_error(SFTPFailure, 'Not a directory', dstpath)
+        
         else:
-            await self._filesystem.mkdir(dstpath)
+            self._filesystem[dstpath] = FileResult(
+                dstpath,
+                result_type="DIRECTORY",
+            )
 
-        await self.recv_files(srcpath, dstpath)
+        await self._recv_files(dstpath)
 
-    async def recv_files(self, srcpath: bytes, dstpath: bytes) -> None:
+    async def _recv_files(self, dstpath: bytes) -> None:
         """Receive files over SCP"""
 
         self._source.send_ok()
@@ -215,56 +373,72 @@ class SCPCommand:
 
             assert args is not None
 
-            try:
-                if action in b'\x01\x02':
-                    raise scp_error(SFTPFailure, args,
-                                     fatal=action != b'\x01',
-                                     suppress_send=True)
-                elif action == b'T':
-                    if self._preserve:
-                        attrs.atime, attrs.mtime = parse_time_args(args)
+            if action in b'\x01\x02':
+                raise scp_error(SFTPFailure, args,
+                                    fatal=action != b'\x01',
+                                    suppress_send=True)
+            elif action == b'T':
+                if self._preserve:
+                    attrs.atime, attrs.mtime = parse_time_args(args)
 
-                    self._source.send_ok()
-                elif action == b'E':
-                    self._source.send_ok()
-                    break
-                elif action in b'CD':
-                    try:
-                        attrs.permissions, size, name = parse_cd_args(args)
+                self._source.send_ok()
+            elif action == b'E':
+                self._source.send_ok()
+                break
+            elif action in b'CD':
+                try:
+                    attrs.permissions, size, name = parse_cd_args(args)
 
-                        new_srcpath = posixpath.join(srcpath, name)
+                    if not pathlib.Path(str(dstpath)).suffix:
+                        new_dstpath = posixpath.join(dstpath, name)
+                    else:
+                        new_dstpath = dstpath
 
-                        if await self._filesystem.isdir(dstpath):
-                            new_dstpath = posixpath.join(dstpath, name)
-                        else:
-                            new_dstpath = dstpath
+                    if action == b'D':
+                        await self._recv_dir(new_dstpath)
+                    else:
+                        await self._recv_file(new_dstpath, size)
 
-                        if action == b'D':
-                            await self.recv_dir(new_srcpath, new_dstpath)
-                        else:
-                            await self.recv_file(new_srcpath,
-                                                  new_dstpath, size)
 
-                        if self._preserve:
-                            await self._filesystem.setstat(new_dstpath, attrs)
-                    finally:
-                        attrs = SFTPAttrs()
-                else:
-                    raise scp_error(SFTPBadMessage, 'Unknown request')
-            except (OSError, SFTPError) as exc:
-                self.handle_error(exc)
+                    if (
+                        result := self._filesystem.get(new_dstpath)
+                    ) and self._preserve:
+                        result.attributes = FileAttributes(
+                            size=attrs.size,
+                            alloc_size=attrs.alloc_size,
+                            atime=attrs.atime,
+                            atime_ns=attrs.atime_ns,
+                            crtime=attrs.crtime,
+                            crtime_ns=attrs.crtime_ns,
+                            mime_type=attrs.mime_type,
+                            mtime=attrs.mtime,
+                            mtime_ns=attrs.mtime_ns,
+                            ctime=attrs.ctime,
+                            ctime_ns=attrs.ctime_ns,
+                            nlink=attrs.nlink,
+                            
+                        )
 
-    async def make_cd_request(self, action: bytes, attrs: SFTPAttrs,
+
+                finally:
+                    attrs = SFTPAttrs()
+            else:
+                raise scp_error(SFTPBadMessage, 'Unknown request')
+
+    async def _make_cd_request(self, action: bytes, attrs: SFTPAttrs,
                                size: int, path: bytes) -> None:
         """Make an SCP copy or dir request"""
 
         assert attrs.permissions is not None
 
         args = f'{attrs.permissions & 0o7777:04o} {size} '
-        await self._dest.make_request(action, args.encode('ascii'),
-                                self._filesystem.basename(path))
+        await self._dest.make_request(
+            action,
+            args.encode('ascii'),
+            pathlib.Path(str(path)).name.encode(),
+        )
 
-    async def make_transfer_request(self, attrs: SFTPAttrs) -> None:
+    async def _make_transfer_request(self, attrs: SFTPAttrs) -> None:
         """Make an SCP time request"""
 
         assert attrs.mtime is not None
@@ -273,89 +447,99 @@ class SCPCommand:
         args = f'{attrs.mtime} 0 {attrs.atime} 0'
         await self._dest.make_request(b'T', args.encode('ascii'))
 
-    async def send_file(
+    async def _send_file(
         self,
         srcpath: bytes,
-        dstpath: bytes,
+        data: bytes,
         attrs: SFTPAttrs,
     ) -> None:
+        
+        await self._make_cd_request(b'C', attrs, len(data), srcpath)
 
-        assert attrs.size is not None
-
-        file_obj = await self._filesystem.open(srcpath, 'rb')
-        size = attrs.size
-        local_exc = None
-        offset = 0
-
-        try:
-            await self.make_cd_request(b'C', attrs, size, srcpath)
-
-            while offset < size:
-                blocklen = min(size - offset, self._block_size)
-
-                if local_exc:
-                    data = blocklen * b'\0'
-                else:
-                    try:
-                        data = await file_obj.read(blocklen, offset)
-
-                        if not data:
-                            raise scp_error(SFTPFailure, 'Unexpected EOF')
-                    except (OSError, SFTPError) as exc:
-                        local_exc = exc
-
-                self._dest.writer.write(data)
-                offset += len(data)
-
-        finally:
-            await file_obj.close()
-
-        if local_exc:
-            self._dest.send_error(local_exc)
-            setattr(local_exc, 'suppress_send', True)
-        else:
-            self._dest.send_ok()
+        self._dest.writer.write(data)
+        self._dest.send_ok()
 
         remote_exc = await self._dest.await_response()
-        final_exc = remote_exc or local_exc
 
-        if final_exc:
-            raise final_exc
+        if remote_exc:
+            raise remote_exc
 
-    async def send_dir(
+    async def _send_dir(
         self,
         srcpath: bytes,
-        dstpath: bytes,
+        data: dict[bytes, bytes | File],
         attrs: SFTPAttrs,
     ) -> None:
 
-        await self.make_cd_request(b'D', attrs, 0, srcpath)
+        await self._make_cd_request(b'D', attrs, 0, srcpath)
 
-        async for entry in self._filesystem.scandir(srcpath):
-            name: bytes = entry.filename
-
-            if name in (b'.', b'..'):
-                continue
-
-            await self.send_files(posixpath.join(srcpath, name),
-                                   posixpath.join(dstpath, name),
-                                   entry.attrs)
+        files = {
+            filename: File(
+                filename,
+                file_data,
+            ) if isinstance(
+                file_data,
+                bytes,
+            ) else file_data for filename, file_data in data.items()
+             if filename not in [b'.', b'..']
+        }
+        
+        await asyncio.gather(*[
+            self._send_file(
+                posixpath.join(srcpath, file_item.file_name_short),
+                file_item.data,
+                file_item.attrs,
+                
+            ) for file_item in files.values()
+        ])
 
         await self._dest.make_request(b'E')
 
-    async def send_files(self, srcpath: bytes, dstpath: bytes,
-                          attrs: SFTPAttrs) -> None:
-        """Send files via SCP"""
+    async def _send_files(
+        self,
+        srcpath: bytes,
+        data: bytes | File | list[File | bytes],
+    ) -> None:
 
-        try:
-            if self._preserve:
-                await self.make_transfer_request(attrs)
+        if isinstance(data, File) and data.file_type == FILEXFER_TYPE_DIRECTORY:
+            await self._make_cd_request(
+                b'D',
+                data.attrs,
+                0,
+                srcpath,
+            )
+             
+        elif isinstance(data, File):
+             await self._send_file(
+                srcpath,
+                data.data,
+                data.attrs,
+            )
 
-            if self._recurse and attrs.type == FILEXFER_TYPE_DIRECTORY:
-                await self.send_dir(srcpath, dstpath, attrs)
-            elif attrs.type == FILEXFER_TYPE_REGULAR:
-                await self.send_file(srcpath, dstpath, attrs)
-            else:
-                raise scp_error(SFTPFailure, 'Not a regular file', srcpath)
-        except (OSError, SFTPError, ValueError) as exc:
-            self.handle_error(exc)
+             
+        elif isinstance(data, list):
+            await asyncio.gather(*[
+                self._send_file(
+                    srcpath,
+                    file.data,
+                    file.attrs,
+                ) if isinstance(
+                    file,
+                    File,
+                ) else File(
+                    srcpath,
+                    file,
+                ) for file in data
+            ])
+
+        else:
+            file = File(
+                srcpath,
+                data,
+            )
+
+            await self._send_file(
+                srcpath,
+                file.data,
+                file.attrs,
+            )

@@ -594,7 +594,6 @@ class MercurySyncFTPConnection:
             
             if timings["connect_start"] is None:
                 timings["connect_start"] = time.monotonic()
-
                 
             (
                 err,
@@ -2979,19 +2978,21 @@ class MercurySyncFTPConnection:
         connection_error: Exception | None = None
 
         if url.address is None:
-            for address_info in url:
+            for address, ip_info in url:
                 try:
                     port = await connection.make_connection(
                         control_url.hostname if control_url else url.hostname, 
-                        address_info,
+                        ip_info,
                         url.port,
                         ssl=self._ssl_context if use_ssl else None,
                         timeout=self.timeouts.connect_timeout,
                     )
 
-                    connection.host = address_info[-1][0]
+                    host, _ = address
+
+                    connection.host = host
                     connection.socket_family = url.family
-                    parsed_url.address = address_info
+                    parsed_url.address = address
                     parsed_url.port = port
 
                     break
@@ -3004,7 +3005,7 @@ class MercurySyncFTPConnection:
             try:
                 await connection.make_connection(
                     control_url.hostname if control_url else url.hostname,
-                    address_info,
+                    ip_info,
                     url.port,
                     ssl=self._ssl_context if use_ssl else None,
                     timeout=self.timeouts.connect_timeout,

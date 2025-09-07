@@ -1016,7 +1016,6 @@ class MercurySyncHTTP2Connection:
 
                     url.address = address
                     url.socket_config = ip_info
-                    break
 
                 except Exception as err:
                     if "server_hostname is only meaningful with ssl" in str(err):
@@ -1040,8 +1039,6 @@ class MercurySyncHTTP2Connection:
                     else None,
                     ssl_upgrade=ssl_redirect_url is not None,
                 )
-
-                break
 
             except Exception as err:
                 if "server_hostname is only meaningful with ssl" in str(err):

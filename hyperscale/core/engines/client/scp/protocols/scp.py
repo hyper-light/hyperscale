@@ -20,24 +20,15 @@
 #     Jonathan Slenders - proposed changes to allow SFTP server callbacks
 #                         to be coroutines
 
-"""SCP handlers"""
 
-import asyncio
 from pathlib import PurePath
-import posixpath
-from types import TracebackType
 from typing import (
     TYPE_CHECKING, 
-    AsyncIterator, 
-    List,
     Optional,
-    Iterable,
     Tuple, 
     Type, 
     Union, 
-    Any,
     Protocol, 
-    Self,
 )
 
 
@@ -156,8 +147,13 @@ async def parse_path(path: SCPConnPath, **kwargs) -> \
 class SCPHandler:
     """SCP handler"""
 
-    def __init__(self, reader: 'SSHReader[bytes]', writer: 'SSHWriter[bytes]',
-                 error_handler: SFTPErrorHandler = None, server: bool = False):
+    def __init__(
+        self,
+        reader: 'SSHReader[bytes]',
+        writer: 'SSHWriter[bytes]',
+        error_handler: SFTPErrorHandler = None,
+        server: bool = False,
+    ):
         self._reader = reader
         self.writer = writer
         self._error_handler = error_handler
@@ -189,6 +185,10 @@ class SCPHandler:
         request = b''.join(args)
 
         self.writer.write(request + b'\n')
+    
+    def send_data(self, data: bytes) -> None:
+        """Send SCP file data"""
+        self.writer.write(data)
 
     async def make_request(self, *args: bytes) -> None:
         """Send an SCP request and wait for a response"""

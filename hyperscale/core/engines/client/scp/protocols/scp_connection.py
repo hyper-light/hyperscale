@@ -14,6 +14,7 @@ class SCPConnection:
     __slots__ = (
         "connected",
         "connection",
+        "handler",
         "lock",
         "_path",
         "_command",
@@ -24,6 +25,7 @@ class SCPConnection:
     def __init__(self):
         self.connected: bool = False
         self.connection: SSHClientConnection | None = None
+        self.handler: SCPHandler | None = None
 
         self.lock = asyncio.Lock()
         self._path: str| pathlib.Path | None = None
@@ -40,18 +42,21 @@ class SCPConnection:
     ) -> SCPHandler:
         """Convert an SCP path into an SSHClientConnection and path"""
 
-        if not self.connected or self._command != command:
+        if not self.connected:
 
 
-            conn = await self._factory.connect(
+            self.connection = await self._factory.connect(
                 socket_config,
                 config=config,
                 **kwargs,
             )
-           
-            writer, reader, _ = await conn.open_session(command, encoding=None)
 
-            self.connection = SCPHandler(writer, reader)
             self.connected = True
 
-        return self.connection
+        if self._command != command:
+            writer, reader, _ = await self.connection.open_session(command, encoding=None)
+            self._command = command
+
+            self.handler = SCPHandler(reader, writer)
+
+        return self.handler

@@ -171,7 +171,7 @@ _ProtocolFactory = _ClientFactory
 _Conn = TypeVar('_Conn', bound='SSHConnection')
 _Options = TypeVar('_Options', bound='SSHConnectionOptions')
 
-_ServerHostKeysHandler = Optional[Callable[[List[SSHKey], List[SSHKey],
+ServerHostKeysHandler = Optional[Callable[[List[SSHKey], List[SSHKey],
                                             List[SSHKey], List[SSHKey]],
                                            MaybeAwait[None]]]
 
@@ -5175,16 +5175,6 @@ class SSHConnectionOptions(Options, Generic[_Options]):
         last_config = options.config if options else None
         super().__init__(options=options, last_config=last_config, **kwargs)
 
-    @classmethod
-    async def construct(cls, options: Optional[_Options] = None,
-                        **kwargs: object) -> _Options:
-        """Construct a new options object from within an async task"""
-
-        loop = asyncio.get_event_loop()
-
-        return cast(_Options, await loop.run_in_executor(
-            None, functools.partial(cls, options, loop=loop, **kwargs)))
-
     # pylint: disable=arguments-differ
     def prepare(self, config: SSHConfig, # type: ignore
                 protocol_factory: _ProtocolFactory, version: _VersionArg,
@@ -5885,7 +5875,7 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
     known_hosts: KnownHostsArg
     host_key_alias: Optional[str]
     server_host_key_algs: Union[str, Sequence[str]]
-    server_host_keys_handler: _ServerHostKeysHandler
+    server_host_keys_handler: ServerHostKeysHandler
     username: str
     password: Optional[str]
     client_host_keysign: Optional[str]
@@ -5960,7 +5950,7 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
                 known_hosts: KnownHostsArg = (),
                 host_key_alias: DefTuple[Optional[str]] = (),
                 server_host_key_algs: _AlgsArg = (),
-                server_host_keys_handler: _ServerHostKeysHandler = None,
+                server_host_keys_handler: ServerHostKeysHandler = None,
                 username: DefTuple[str] = (), password: Optional[str] = None,
                 client_host_keysign: DefTuple[KeySignPath] = (),
                 client_host_keys: Optional[_ClientKeysArg] = None,

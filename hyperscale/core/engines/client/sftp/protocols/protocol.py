@@ -8,7 +8,6 @@ from hyperscale.core.engines.client.ssh.protocol.connection import (
 )
 from hyperscale.core.engines.client.ssh.protocol.misc import DefTuple, Env, EnvSeq
 from .sftp import (
-    start_sftp_client, 
     MIN_SFTP_VERSION,
     SFTPClient, 
     SFTPClientHandler,

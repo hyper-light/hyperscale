@@ -35,9 +35,9 @@ class SSHConnection:
         
         family, _, _, _, address = socket_config
         host, port = address
-
+        
         options = SSHClientConnectionOptions(
-            None,
+            options=None,
             **kwargs,
         )
 
@@ -45,7 +45,7 @@ class SSHConnection:
 
         canon_host = await canonicalize_host(self._loop, options)
 
-        host = canon_host if canon_host else options.host
+        host = canon_host if canon_host else host
         canonical = bool(canon_host)
         final = options.config.has_match_final()
 
@@ -53,37 +53,36 @@ class SSHConnection:
             options.update(host=host, reload=True, canonical=canonical, final=final)
 
         tunnel: TunnelConnectorProtocol | None = options.tunnel
+        family = options.family
         local_addr = options.local_addr
         proxy_command = options.proxy_command
         free_conn = True
 
+
         new_tunnel = await open_tunnel(tunnel, options, config)
 
         try:
-
+            
             if new_tunnel:
-
                 # pylint: disable=broad-except
                 try:
-                    _, conn = await new_tunnel.create_connection(
+                    _, tunnel_session = await new_tunnel.create_connection(
                         lambda: SSHClientConnection(
                             self._loop,
                             options,
                             wait='auth',
                         ),
                         host, port)
-                except Exception as err:
+                except Exception:
                     new_tunnel.close()
                     await new_tunnel.wait_closed()
-                    raise err
-                
+                    raise
                 else:
-                    conn: SSHClientConnection = conn
+                    conn: SSHClientConnection = tunnel_session
                     conn.set_tunnel(new_tunnel)
-
             elif tunnel:
 
-                _, conn = await tunnel.create_connection(
+                _, tunnel_session = await tunnel.create_connection(
                     lambda: SSHClientConnection(
                         self._loop,
                         options,
@@ -91,19 +90,20 @@ class SSHConnection:
                     ),
                     host, port)
 
+                conn: SSHClientConnection = tunnel_session
             elif proxy_command:
                 conn = await open_proxy(
                     self._loop,
-                    proxy_command,
+                    proxy_command, 
                     lambda: SSHClientConnection(
                         self._loop,
                         options,
                         wait='auth',
                     ),
-                )
-
+                    )
             else:
-                _, conn = await self._loop.create_connection(
+
+                _, session = await self._loop.create_connection(
                     lambda: SSHClientConnection(
                         self._loop,
                         options,
@@ -116,6 +116,7 @@ class SSHConnection:
                     local_addr=local_addr,
                 )
 
+                conn: SSHClientConnection = session
         except asyncio.CancelledError:
             options.waiter.cancel()
             raise
@@ -123,12 +124,9 @@ class SSHConnection:
         conn.set_extra_info(host=host, port=port)
 
         try:
-
             await options.waiter
             free_conn = False
-            
             return conn
-        
         finally:
             if free_conn:
                 conn.abort()

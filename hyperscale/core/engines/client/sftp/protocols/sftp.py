@@ -25,6 +25,7 @@
 import asyncio
 import errno
 from fnmatch import fnmatch
+import io
 import os
 from os import SEEK_SET, SEEK_CUR, SEEK_END
 from pathlib import PurePath
@@ -3474,7 +3475,7 @@ class SFTPClientFile:
 class LocalFile:
     """An async wrapper around local file I/O"""
 
-    def __init__(self, file: _SFTPFileObj):
+    def __init__(self, file: io.BytesIO):
         self._file = file
 
     async def __aenter__(self) -> Self: # pragma: no cover
@@ -3488,7 +3489,6 @@ class LocalFile:
             bool: # pragma: no cover
         """Wait for file close when used as an async context manager"""
 
-        await self.close()
         return False
 
     def request_ranges(self, offset: int, length: int) -> \
@@ -3497,22 +3497,17 @@ class LocalFile:
 
         return _request_ranges(self._file, offset, length)
 
-    async def read(self, size: int, offset: int) -> bytes:
+    def read(self, size: int, offset: int) -> bytes:
         """Read data from the local file"""
 
         self._file.seek(offset)
         return self._file.read(size)
 
-    async def write(self, data: bytes, offset: int) -> int:
+    def write(self, data: bytes, offset: int) -> int:
         """Write data to the local file"""
 
         self._file.seek(offset)
         return self._file.write(data)
-
-    async def close(self) -> None:
-        """Close the local file"""
-
-        self._file.close()
 
 
 
@@ -3704,7 +3699,7 @@ class LocalFS:
 
         # pylint: disable=unused-argument
 
-        file_obj = open(_to_local_path(path), mode)
+        file_obj = io.BytesIO()
 
         if mode[0] in 'wx':
             make_sparse_file(file_obj)
