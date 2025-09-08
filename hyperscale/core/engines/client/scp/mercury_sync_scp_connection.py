@@ -16,20 +16,22 @@ from hyperscale.core.engines.client.shared.protocols import (
     ProtocolMap,
 )
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
-from hyperscale.core.engines.client.ssh.protocol.connection import SSHClientConnectionOptions
+from hyperscale.core.engines.client.ssh.protocol.connection import SSHClientConnectionOptions, SSHClientConnection
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPGlob, LocalFS
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPError, SFTPFailure, SFTPConnectionLost
-from .models import SCPOptions, SCPResponse
+from .models.scp import SCPOptions, SCPResponse, FileResult
 from .scp_command import SCPCommand
 from .protocols import (
     SCPConnection,
     SCPHandler,
     scp_error,
+    ConnectionType
 )
+from .file import File
 
 
-ConnectionType = Literal["SOURCE", "DEST"] 
 CommandType = Literal["COPY", "SEND", "RECEIVE"]
+DataType = str | list[str] | File | list[File]
 
 
 class MercurySyncSCPConnction:
@@ -150,6 +152,7 @@ class MercurySyncSCPConnction:
         command_type: CommandType,
         source_url: str | URL,
         destination_url: str | URL,
+        data: DataType,
         local_path: str | None = None,
         dest_path: str | None = None,
         username: str | None = None,
@@ -165,6 +168,8 @@ class MercurySyncSCPConnction:
                 "request_start",
                 "connect_start",
                 "connect_end",
+                "initialization_start",
+                "initialization_end",
                 "transfer_start",
                 "transfer_end",
                 "request_end",
@@ -174,6 +179,8 @@ class MercurySyncSCPConnction:
             "request_start": None,
             "connect_start": None,
             "connect_end": None,
+            "initialization_start": None,
+            "initialization_end": None,
             "transfer_start": None,
             "transfer_end": None,
             "request_end": None,
@@ -191,8 +198,6 @@ class MercurySyncSCPConnction:
             connections = await self._create_connections(
                 source_url,
                 destination_url,
-                local_path=local_path,
-                destination_path=dest_path,
                 username=username,
                 password=password,
                 options=options,
@@ -205,55 +210,105 @@ class MercurySyncSCPConnction:
                 source,
                 dest,
                 source_url,
-                dest_url,
+                destination_url,
             ) = connections
 
-            if src_err or source is None or dest_err or dest is None:
+            if src_err:
                 timings["connect_end"] = time.monotonic()
 
-                self._source_connections.append(SCPConnection())
-                self._destination_connections.append(SCPConnection())
+                self._source_connections.append(SCPConnection(source.connection_type))
+                self._destination_connections.append(dest)
+
+                return SCPResponse(
+
+                )
+            
+            elif dest_err:
+                timings["connect_end"] = time.monotonic()
+
+                self._source_connections.append(source)
+                self._destination_connections.append(SCPConnection(dest.connection_type))
 
                 return SCPResponse(
 
                 )
             
             timings["connect_end"] = time.monotonic()
+            timings["initialization_start"] = time.monotonic()
+
+            
+            handlers = await asyncio.gather(*[
+                source.create_session(
+                    local_path.encode(),
+                ),
+                dest.create_session(
+                    dest_path.encode(),
+                )
+            ])
+
+            handlers: dict[ConnectionType, SCPHandler] = {
+                session_type: handler for handler, session_type in handlers
+            }
+
+            timings["initialization_end"] = time.monotonic()
             timings["transfer_start"] = time.monotonic()
 
             command = SCPCommand(
-                source,
-                dest,
+                handlers["SOURCE"],
+                handlers["DEST"],
                 self._local_fs,
                 recurse=recurse,
                 preserve=preserve,
                 must_be_dir=must_be_dir,
             )
 
+            filesystem: dict[str, FileResult] = {}
+
             match command_type:
                 case "COPY":
-                    await command.copy()
+                    filesystem = await command.copy()
 
                 case "RECEIVE":
-                    await command.receive(dest_path)
+                    filesystem = await command.receive(dest_path)
 
                 case "SEND":
-                    await command.send(local_path)
+                    
+                    if isinstance(data, list):
+                        prepared_data =[
+                            File(
+                                local_path.encode(),
+                                item.encode(),
+                            )
+                            if isinstance(item, str)
+                            else item
+                            for item in data
+                        ]
+
+                    elif isinstance(data, str):
+                        prepared_data = File(
+                            local_path.encode(),
+                            data.encode(),
+                        )
+
+                    else:
+                        prepared_data = data
 
 
+                    filesystem = await command.send(prepared_data)
 
+            
 
         except Exception as err:
             timings["request_end"] = time.monotonic()
 
             if source_connection:
                 self._source_connections.append(
-                    SCPConnection()
+                    SCPConnection("SOURCE")
                 )
 
             if destination_connection:
                 self._destination_connections.append(
-                    SCPConnection()
+                    SCPConnection("DEST")
                 )
 
             return SCPResponse()
@@ -272,8 +327,6 @@ class MercurySyncSCPConnction:
         self,
         source_url: str | URL,
         destination_url: str | URL,
-        local_path: str | pathlib.Path,
-        destination_path: str | pathlib.Path,
         username: str | None = None,
         password: str | None = None,
         options: SCPOptions | None = None,
@@ -284,8 +337,8 @@ class MercurySyncSCPConnction:
     ) -> tuple[
         Exception | None,
         Exception | None,
-        SCPHandler | None,
-        SCPHandler | None,
+        SCPConnection,
+        SCPConnection,
         SFTPUrl | None,
         SFTPUrl | None,
     ]:
@@ -307,7 +360,6 @@ class MercurySyncSCPConnction:
         connections = await asyncio.gather(*[
             self._connect(
                 source_url,
-                local_path,
                 connection_type='SOURCE',
                 must_be_dir=must_be_dir,
                 preserve=preserve,
@@ -316,7 +368,6 @@ class MercurySyncSCPConnction:
             ),
             self._connect(
                 destination_url,
-                destination_path,
                 connection_type='DEST',
                 must_be_dir=must_be_dir,
                 preserve=preserve,
@@ -326,11 +377,11 @@ class MercurySyncSCPConnction:
         ])
 
         source_err: Exception | None = None
-        connected_source: SCPHandler | None = None
+        connected_source: SCPConnection | None = None
         connected_source_url: SFTPUrl | None = None
         
         dest_err: Exception | None = None
-        connected_dest: SCPHandler | None = None
+        connected_dest: SCPConnection | None = None
         connected_dest_url: SFTPUrl | None = None
 
         for connection_set in connections:
@@ -363,11 +414,9 @@ class MercurySyncSCPConnction:
 
         )
 
-
     async def _connect(
         self,
         request_url: str | URL,
-        path: str | pathlib.Path,
         must_be_dir: bool = False,
         preserve: bool = False,
         recurse: bool = False,
@@ -376,7 +425,7 @@ class MercurySyncSCPConnction:
 
     ) -> tuple[
         Exception | None,
-        SCPHandler | None,
+        SCPConnection,
         SFTPUrl | None,
         ConnectionType,
     ]:
@@ -431,26 +480,15 @@ class MercurySyncSCPConnction:
 
         connection_error: Exception | None = None
 
-        if must_be_dir:
-            command += b'-d '
-
-        if preserve:
-            command += b'-p '
-
-        if recurse:
-            command += b'-r '
-
-        
-        command += path.encode()
-
-        connection: SCPHandler | None = None
-
         if url.address is None:
             for address, ip_info in url:
                 try:
-                    connection = await ssh_connection.make_connection(
+                    await ssh_connection.make_connection(
                         command,
                         ip_info,
+                        must_be_dir=must_be_dir,
+                        preserve=preserve,
+                        recurse=recurse,
                         **kwargs,
                     )
 
@@ -463,9 +501,12 @@ class MercurySyncSCPConnction:
 
         else:
             try:
-                connection = await ssh_connection.make_connection(
+                await ssh_connection.make_connection(
                     command,
                     url.socket_config,
+                    must_be_dir=must_be_dir,
+                    preserve=preserve,
+                    recurse=recurse,
                     **kwargs,
                 )
 
@@ -475,7 +516,7 @@ class MercurySyncSCPConnction:
 
         return (
             connection_error,
-            connection,
+            ssh_connection,
             parsed_url,
             connection_type,
         )

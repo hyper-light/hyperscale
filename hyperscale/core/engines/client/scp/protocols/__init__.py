@@ -1,4 +1,5 @@
 from .scp_connection import SCPConnection as SCPConnection
+from .scp_connection import ConnectionType as ConnectionType
 from .scp import (
     SCPHandler as SCPHandler,
     parse_cd_args as parse_cd_args,
