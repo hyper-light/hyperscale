@@ -1,30 +1,17 @@
 import datetime
 import pathlib
-from typing import Literal
+from types import TracebackType
 
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPAttrs, SFTPName
-from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_REGULAR, FILEXFER_TYPE_DIRECTORY
-from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_SYMLINK, FILEXFER_TYPE_SPECIAL
-from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_UNKNOWN, FILEXFER_TYPE_SOCKET
-from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_CHAR_DEVICE, FILEXFER_TYPE_BLOCK_DEVICE
-from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_FIFO
+from hyperscale.core.engines.client.ssh.protocol.ssh.constants import FILEXFER_TYPE_DIRECTORY
+from .file import File
 
 
-
-FileType = Literal[
-    "REGULAR",
-    "DIRECTORY",
-]
-
-
-
-class File:
+class Directory:
 
     def __init__(
         self,
         path: bytes,
-        data: bytes,
-        file_type: FileType = "REGULAR",
         user_id: int = 1000,
         group_id: int = 1000,
         owner: str = "test",
@@ -35,19 +22,15 @@ class File:
     ):
         
         self.path = path
-        self.data = data
+        self.files: dict[str, File | Directory] = {}
 
-        file_type_value = FILEXFER_TYPE_REGULAR
-        if file_type == FILEXFER_TYPE_DIRECTORY:
-            file_type_value = FILEXFER_TYPE_DIRECTORY
-
-        self.file_type = file_type_value
+        self.file_type_name = "DIRECTORY"
+        self.file_type = FILEXFER_TYPE_DIRECTORY
         self.user_id = user_id
         self.group_id = group_id
         self.owner = owner
         self.group = group
         self.permissions = permissions
-        self.size = len(data)
 
         if file_time is None:  
             file_time = datetime.datetime.now(
@@ -68,10 +51,32 @@ class File:
         self.ctime_ns = file_time_ns
         self.nlink = links_count
 
-        self.attrs = SFTPAttrs(
+        self.name = pathlib.Path(str(path)).name.encode()
+    
+
+    @property
+    def named_file(self):
+        return SFTPName(
+            self.name,
+            self.path,
+            self.to_attrs(),
+        )
+    
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(
+        self, 
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ): 
+        return False
+    
+    def to_attrs(self) -> SFTPAttrs:
+        return SFTPAttrs(
             type=self.file_type,
-            size=self.size,
-            alloc_size=self.size,
             uid=self.user_id,
             gid=self.group_id,
             owner=self.owner,
@@ -86,12 +91,4 @@ class File:
             ctime=self.ctime,
             ctime_ns=self.ctime_ns,
             nlink=self.nlink,
-        )
-
-        self.name = pathlib.Path(str(path)).name.encode()
-
-        self.sftp_named_file = SFTPName(
-            self.name,
-            self.path,
-            self.attrs,
         )

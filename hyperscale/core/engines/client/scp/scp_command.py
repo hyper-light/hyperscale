@@ -16,9 +16,9 @@ from .protocols import (
     SCP_BLOCK_SIZE,
 )
 
-from hyperscale.core.engines.client.ssh.protocol.constants import FILEXFER_TYPE_DIRECTORY
-from .file import File
-from .models.scp import FileResult, FileAttributes
+from hyperscale.core.engines.client.ssh.protocol.ssh.constants import FILEXFER_TYPE_DIRECTORY
+from hyperscale.core.engines.client.sftp.protocols.file import File
+from hyperscale.core.engines.client.sftp.models import TransferResult, FileAttributes
 
 
 TransferType = Literal["FILE", "DIRECTORY"]
@@ -39,7 +39,7 @@ class SCPCommand:
     ):
         self._source = source
         self._dest = dest
-        self._filesystem: dict[str, FileResult] = {}
+        self._filesystem: dict[str, TransferResult] = {}
 
         self._block_size = block_size
         self._recurse = recurse
@@ -137,7 +137,7 @@ class SCPCommand:
         if exc:
             self._handle_error(exc)
 
-        return buffer
+        return bytes(buffer)
 
     async def _copy_files(self) -> None:
         """Copy files from one SCP server to another"""
@@ -180,7 +180,7 @@ class SCPCommand:
                     attrs.permissions, size, name = parse_cd_args(args)
 
                     transfer_type: TransferType = "FILE"
-                    data: bytearray | None = None
+                    data: bytes | None = None
 
                     if action == b'C':
                         path = b'/'.join(pathlist + [name])
@@ -194,12 +194,12 @@ class SCPCommand:
 
                         path = b'/'.join(pathlist)
                         
-                    self._filesystem[path] = FileResult(
+                    self._filesystem[path] = TransferResult(
                         file_path=path,
                         file_type=transfer_type,
                         file_data=data,
                         file_transfer_elapsed=time.monotonic() - start,
-                        file_attribues=FileResult.to_attributes(attrs),
+                        file_attribues=TransferResult.to_attributes(attrs),
                     )
 
                 finally:
@@ -256,7 +256,7 @@ class SCPCommand:
         if final_exc:
             raise final_exc
         
-        return buffer
+        return bytes(buffer)
         
     async def _recv_dir(self, dstpath: bytes) -> None:
         """Receive a directory over SCP"""
@@ -311,7 +311,7 @@ class SCPCommand:
                             new_dstpath = dstpath
 
                         transfer_type: TransferType = "FILE"
-                        data: bytearray | None = None    
+                        data: bytes | None = None    
 
                         if action == b'D':
                             await self._recv_dir(new_dstpath)
@@ -324,10 +324,10 @@ class SCPCommand:
                         
                         file_attrs: FileAttributes | None = None
                         if self._preserve:
-                            file_attrs = FileResult.to_attributes(attrs)
+                            file_attrs = TransferResult.to_attributes(attrs)
 
                         
-                        self._filesystem[dstpath] = FileResult(
+                        self._filesystem[dstpath] = TransferResult(
                             file_path=dstpath,
                             file_type=transfer_type,
                             file_data=data,
@@ -405,7 +405,7 @@ class SCPCommand:
             self._send_file(
                 posixpath.join(srcpath, file_item.name),
                 file_item.data,
-                file_item.attrs,
+                file_item.to_attrs(),
                 
             ) for file_item in files.values()
         ])
@@ -428,7 +428,7 @@ class SCPCommand:
                 self._send_file(
                     item.path,
                     item.data,
-                    item.attrs,
+                    item.to_attrs(),
                 ) for item in file
             ])
 
@@ -436,7 +436,7 @@ class SCPCommand:
         elif file.file_type == FILEXFER_TYPE_DIRECTORY:
             await self._make_cd_request(
                 b'D',
-                file.attrs,
+                file.to_attrs(),
                 0,
                 file.path,
             )
@@ -447,18 +447,20 @@ class SCPCommand:
             await self._send_file(
                 file.path,
                 file.data,
-                file.attrs,
+                file.to_attrs(),
             )
 
             data = file.data
              
 
-        result = FileResult(
+        result = TransferResult(
             file_path=file.path,
             file_type=transfer_type,
             file_data=data,
             file_transfer_elapsed=time.monotonic() - start,
-            file_attribues=FileResult.to_attributes(file.attrs),
+            file_attribues=TransferResult.to_attributes(
+                file.to_attrs(),
+            ),
         )
 
         self._filesystem[file.path] = result

@@ -15,19 +15,18 @@ from hyperscale.core.testing.models import (
 from hyperscale.core.engines.client.shared.protocols import (
     ProtocolMap,
 )
+
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
-from hyperscale.core.engines.client.ssh.protocol.connection import SSHClientConnectionOptions, SSHClientConnection
-from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPGlob, LocalFS
-from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPError, SFTPFailure, SFTPConnectionLost
-from .models.scp import SCPOptions, SCPResponse, FileResult
+from hyperscale.core.engines.client.ssh.protocol.ssh.connection import SSHClientConnectionOptions
+from hyperscale.core.engines.client.sftp.models import TransferResult
+from hyperscale.core.engines.client.sftp.protocols.file import File
+from .models.scp import SCPOptions, SCPResponse
 from .scp_command import SCPCommand
 from .protocols import (
     SCPConnection,
     SCPHandler,
-    scp_error,
     ConnectionType
 )
-from .file import File
 
 
 CommandType = Literal["COPY", "SEND", "RECEIVE"]
@@ -35,7 +34,6 @@ DataType = str | list[str] | File | list[File]
 
 
 class MercurySyncSCPConnction:
-    """SCP handler for remote-to-remote copies"""
 
     def __init__(
         self,
@@ -69,84 +67,176 @@ class MercurySyncSCPConnction:
 
         self.address_family = address_family
         self.address_protocol = protocol
-        self._local_fs = LocalFS()
 
         
-    async def copy(self) -> None:
-        """Start SCP remote-to-remote transfer"""
-
-        cancelled = False
-
-        try:
-            await self._copy_files()
-        except asyncio.CancelledError:
-            cancelled = True
-        except (OSError, SFTPError) as exc:
-            self._handle_error(exc)
-        finally:
-            if self._source:
-                await self._source.close(cancelled)
-
-            if self._sink:
-                await self._sink.close(cancelled)
-    
-    async def send(self, srcpath: str | pathlib.PurePath) -> None:
-        """Start SCP transfer"""
-
-        cancelled = False
-
-        try:
-
-            if isinstance(srcpath, str):
-                srcpath = srcpath.encode('utf-8')
-
-            elif isinstance(srcpath, pathlib.PurePath):
-                srcpath = str(srcpath).encode('utf-8')
-
-            exc = await self._sink.await_response()
-
-            if exc:
-                raise exc
+    async def copy(
+        self,
+        source_url: str | URL,
+        destination_url: str | URL,
+        source_path: str | pathlib.Path,
+        destination_path: str | pathlib.Path,
+        username: str | None = None,
+        password: str | None = None,
+        connection_options: SCPOptions | None = None,
+        disable_host_check: bool = False,
+        enforce_path_as_directory: bool = False,
+        preserve_file_attributes: bool = False,
+        recurse: bool = False,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "COPY",
+                        source_url,
+                        destination_url,
+                        data=None,
+                        local_path=source_path,
+                        dest_path=destination_path,
+                        username=username,
+                        password=password,
+                        options=connection_options,
+                        disable_host_check=disable_host_check,
+                        must_be_dir=enforce_path_as_directory,
+                        preserve=preserve_file_attributes,
+                        recurse=recurse,
+                    ),
+                    timeout=timeout,
+                )
             
-            await asyncio.gather(*[
-                self._send_files(
-                    name.filename,
-                    b'',
-                    name.attrs,
-                ) for name in await SFTPGlob(self._fs).match(srcpath)
-            ])
+            except asyncio.TimeoutError as err:
 
-        except asyncio.CancelledError:
-            cancelled = True
-        except (OSError, SFTPError) as exc:
-            self._handle_error(exc)
-        finally:
-            if self._sink:
-                await self._sink.close(cancelled)
+                if not isinstance(source_url, str):
+                    source_url = source_url.data
 
-    async def receive(self, dstpath: str | pathlib.PurePath) -> None:
-        """Start SCP file receive"""
+                if not isinstance(destination_url, str):
+                    destination_url = destination_url.data
 
-        cancelled = False
-        try:
-            if isinstance(dstpath, pathlib.PurePath):
-                dstpath = str(dstpath)
+                if isinstance(source_path, pathlib.Path):
+                    source_path = str(source_path)
 
-            if isinstance(dstpath, str):
-                dstpath = dstpath.encode('utf-8')
+                if isinstance(destination_path, pathlib.Path):
+                    destination_path = str(destination_path)
 
-            if self._must_be_dir and not await self._fs.isdir(dstpath):
-                self._handle_error(scp_error(SFTPFailure, 'Not a directory',
-                                             dstpath))
-            else:
-                await self._recv_files(b'', dstpath)
-        except asyncio.CancelledError:
-            cancelled = True
-        except (OSError, SFTPError, ValueError) as exc:
-            self._handle_error(exc)
-        finally:
-            await self._source.close(cancelled)
+                return SCPResponse(
+                    source_url=source_url,
+                    source_path=source_path,
+                    destination_url=destination_url,
+                    destination_path=destination_path,
+                    operation="COPY",
+                    error=err,
+                    timings={},
+                )
     
+    async def send(
+        self,
+        url: str | URL,
+        path: str | pathlib.Path,
+        data: DataType,
+        username: str | None = None,
+        password: str | None = None,
+        connection_options: SCPOptions | None = None,
+        disable_host_check: bool = False,
+        enforce_path_as_directory: bool = False,
+        preserve_file_attributes: bool = False,
+        recurse: bool = False,
+        timeout: int | float | None = None,
+    ):
+        
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "SEND",
+                        url,
+                        url,
+                        data=data,
+                        local_path=path,
+                        dest_path=path,
+                        username=username,
+                        password=password,
+                        options=connection_options,
+                        disable_host_check=disable_host_check,
+                        must_be_dir=enforce_path_as_directory,
+                        preserve=preserve_file_attributes,
+                        recurse=recurse,
+                    ),
+                    timeout=timeout,
+                )
+            
+            except asyncio.TimeoutError as err:
+
+                if isinstance(url, URL):
+                    url = url.data
+
+                if isinstance(path, pathlib.Path):
+                    path = str(path)
+
+                return SCPResponse(
+                    source_url=url,
+                    source_path=path,
+                    destination_url=url,
+                    destination_path=path,
+                    operation="SEND",
+                    error=err,
+                    timings={},
+                )
+
+    async def receive(
+        self,
+        url: str | URL,
+        path: str | pathlib.Path,
+        username: str | None = None,
+        password: str | None = None,
+        connection_options: SCPOptions | None = None,
+        disable_host_check: bool = False,
+        enforce_path_as_directory: bool = False,
+        preserve_file_attributes: bool = False,
+        recurse: bool = False,
+        timeout: int | float | None = None,
+    ):
+        
+        async with self._semaphore:
+            try:
+
+                return await asyncio.wait_for(
+                    self._execute(
+                        "RECEIVE",
+                        url,
+                        url,
+                        data=None,
+                        local_path=path,
+                        dest_path=path,
+                        username=username,
+                        password=password,
+                        options=connection_options,
+                        disable_host_check=disable_host_check,
+                        must_be_dir=enforce_path_as_directory,
+                        preserve=preserve_file_attributes,
+                        recurse=recurse,
+                    ),
+                    timeout=timeout,
+                )
+            
+            except asyncio.TimeoutError as err:
+
+                if isinstance(url, URL):
+                    url = url.data
+
+                if isinstance(path, pathlib.Path):
+                    path = str(path)
+
+                return SCPResponse(
+                    source_url=url,
+                    source_path=path,
+                    destination_url=url,
+                    destination_path=path,
+                    operation="RECEIVE",
+                    error=err,
+                    timings={},
+                )
+            
     async def _execute(
         self,
         command_type: CommandType,
@@ -188,8 +278,8 @@ class MercurySyncSCPConnction:
 
         timings["request_start"] = time.monotonic()
 
-        source_connection: SCPConnection | None = None
-        destination_connection: SCPConnection | None= None
+        source: SCPConnection | None = None
+        dest: SCPConnection | None= None
 
         try:
             
@@ -209,8 +299,8 @@ class MercurySyncSCPConnction:
                 dest_err,
                 source,
                 dest,
-                source_url,
-                destination_url,
+                source_url_parsed,
+                destination_url_parsed,
             ) = connections
 
             if src_err:
@@ -220,7 +310,13 @@ class MercurySyncSCPConnction:
                 self._destination_connections.append(dest)
 
                 return SCPResponse(
-
+                    source_url=source_url if isinstance(source_url, str) else source_url_parsed.full,
+                    source_path=local_path,
+                    destination_url=destination_url if isinstance(destination_url, str) else destination_url_parsed.full,
+                    destination_path=dest_path,
+                    operation=command_type,
+                    error=src_err,
+                    timings=timings,
                 )
             
             elif dest_err:
@@ -230,7 +326,13 @@ class MercurySyncSCPConnction:
                 self._destination_connections.append(SCPConnection(dest.connection_type))
 
                 return SCPResponse(
-
+                    source_url=source_url if isinstance(source_url, str) else source_url_parsed.full,
+                    source_path=local_path,
+                    destination_url=destination_url if isinstance(destination_url, str) else destination_url_parsed.full,
+                    destination_path=dest_path,
+                    operation=command_type,
+                    error=dest_err,
+                    timings=timings,
                 )
             
             timings["connect_end"] = time.monotonic()
@@ -256,13 +358,12 @@ class MercurySyncSCPConnction:
             command = SCPCommand(
                 handlers["SOURCE"],
                 handlers["DEST"],
-                self._local_fs,
                 recurse=recurse,
                 preserve=preserve,
                 must_be_dir=must_be_dir,
             )
 
-            filesystem: dict[str, FileResult] = {}
+            filesystem: dict[str, TransferResult] = {}
 
             match command_type:
                 case "COPY":
@@ -296,32 +397,45 @@ class MercurySyncSCPConnction:
 
                     filesystem = await command.send(prepared_data)
 
+            timings["transfer_end"] = time.monotonic()
+            self._source_connections.append(source)
+            self._destination_connections.append(dest)
+
+            timings["request_end"] = time.monotonic()
+
+            return SCPResponse(
+                source_url=source_url if isinstance(source_url, str) else source_url_parsed.full,
+                source_path=local_path,
+                destination_url=destination_url if isinstance(destination_url, str) else destination_url_parsed.full,
+                destination_path=dest_path,
+                operation=command_type,
+                data=filesystem,
+                timings=timings,
+            )
             
 
         except Exception as err:
             timings["request_end"] = time.monotonic()
 
-            if source_connection:
+            if source:
                 self._source_connections.append(
                     SCPConnection("SOURCE")
                 )
 
-            if destination_connection:
+            if dest:
                 self._destination_connections.append(
                     SCPConnection("DEST")
                 )
 
-            return SCPResponse()
-
-        
-    def _handle_error(self, exc: Exception) -> None:
-        """Handle an SCP error"""
-
-        if isinstance(exc, BrokenPipeError):
-            exc = scp_error(SFTPConnectionLost, 'Connection lost',
-                             fatal=True, suppress_send=True)
-
-        raise exc
+            return SCPResponse(
+                source_url=source_url if isinstance(source_url, str) else source_url.data,
+                source_path=local_path,
+                destination_url=destination_url if isinstance(destination_url, str) else destination_url.data,
+                destination_path=dest_path,
+                operation=command_type,
+                error=err,
+                timings=timings,
+            )
         
     async def _create_connections(
         self,

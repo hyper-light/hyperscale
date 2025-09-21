@@ -32,17 +32,17 @@ from typing import (
 )
 
 
-from hyperscale.core.engines.client.ssh.protocol.constants import DEFAULT_LANG
-from hyperscale.core.engines.client.ssh.protocol.connection import connect
-from hyperscale.core.engines.client.ssh.protocol.misc import BytesOrStr, FilePath, HostPort
+from hyperscale.core.engines.client.ssh.protocol.ssh.constants import DEFAULT_LANG
+from hyperscale.core.engines.client.ssh.protocol.ssh.connection import connect
+from hyperscale.core.engines.client.ssh.protocol.ssh.misc import BytesOrStr, FilePath, HostPort
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPError, SFTPFailure, SFTPBadMessage, SFTPConnectionLost
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPErrorHandler
 
 
 if TYPE_CHECKING:
     # pylint: disable=cyclic-import
-    from hyperscale.core.engines.client.ssh.protocol.connection import SSHClientConnection
-    from hyperscale.core.engines.client.ssh.protocol.stream import SSHReader, SSHWriter
+    from hyperscale.core.engines.client.ssh.protocol.ssh.connection import SSHClientConnection
+    from hyperscale.core.engines.client.ssh.protocol.ssh.stream import SSHReader, SSHWriter
 
 
 _SCPConn = Union[None, bytes, str, HostPort, 'SSHClientConnection']

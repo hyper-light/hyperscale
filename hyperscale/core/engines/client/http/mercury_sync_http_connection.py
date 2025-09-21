@@ -1066,8 +1066,6 @@ class MercurySyncHTTPConnection:
 
                 all_chunks_read = True
 
-            self._connections.append(connection)
-
             if status >= 300 and status < 400:
                 timings["read_end"] = time.monotonic()
                 self._connections.append(connection)
@@ -1092,6 +1090,7 @@ class MercurySyncHTTPConnection:
                 )
 
             timings["read_end"] = time.monotonic()
+            self._connections.append(connection)
 
             if span and self.trace.enabled:
                 span = await self.trace.on_request_end(

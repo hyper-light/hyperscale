@@ -1,86 +1,54 @@
 import asyncio
+import os
 import time
 from hyperscale.core.engines.client.scp.scp_command import SCPCommand
 from hyperscale.core.engines.client.scp.mercury_sync_scp_connection import MercurySyncSCPConnction
 from hyperscale.core.engines.client.scp.protocols.scp_connection import SCPConnection
 
+data = str(os.urandom(5000000))
+
 
 async def run():
-
-    start_a = time.monotonic()
+    
     conn = MercurySyncSCPConnction()
 
 
-    src_conn = SCPConnection()
-    dst_conn = SCPConnection()
+    conn._semaphore = asyncio.Semaphore(value=4000)
 
-    conn._source_connections.append(src_conn)
-    conn._destination_connections.append(dst_conn)
 
-    connections = await conn._create_connections(
-        'eu-central-1.sftpcloud.io:22',
-        'eu-central-1.sftpcloud.io:22',
-        username="987f4d3a00de410c8f25aa5e4cc2d539",
-        password="Tjtv5y81Jj8KfziBBaACG84Eh3gMaB3X",
-        local_path="test.txt",
-        destination_path="test.txt",
-        disable_host_check=True,
-    )
+    for _ in range(1000):
+        src_conn = SCPConnection("SOURCE")
+        dst_conn = SCPConnection("DEST")
 
-    (
-        _,
-        _,
-        source,
-        dest,
-        _,
-        _,
-    ) = connections
+        conn._source_connections.append(src_conn)
+        conn._destination_connections.append(dst_conn)
 
-    command = SCPCommand(
-        source,
-        dest,
-    )
 
-    await command.copy()
+    start_a = time.monotonic()
 
+    res = await asyncio.gather(*[
+        conn.send(
+            'eu-central-1.sftpcloud.io:22',
+            "test.txt",
+            "Hello!",
+            username="201af83015af4081abb6e84645314607",
+            password="NALy5B6KGrCX77ve5CuHQWVshiQydSXT",
+            disable_host_check=True,
+        ) for _ in range(100000)
+    ])
+
+    # res = await conn.copy(
+    #     'eu-central-1.sftpcloud.io:22',
+    #     'eu-central-1.sftpcloud.io:22',
+    #     "test.txt",
+    #     "test.txt",
+    #     username="ca1b158d4b864cae8c44257a118f1c02",
+    #     password="LO4hoT35ItUry3m5AFUVuua2iBqT2wyL",
+    #     disable_host_check=True,
+    # )
     stop_a = time.monotonic() - start_a
 
-    conn._source_connections.append(src_conn)
-    conn._destination_connections.append(dst_conn)
-
     print('TOOK', stop_a)
-
-    start_b = time.monotonic()
-
-    connections = await conn._create_connections(
-        'eu-central-1.sftpcloud.io:22',
-        'eu-central-1.sftpcloud.io:22',
-        username="987f4d3a00de410c8f25aa5e4cc2d539",
-        password="Tjtv5y81Jj8KfziBBaACG84Eh3gMaB3X",
-        local_path="test.txt",
-        destination_path="test.txt",
-        disable_host_check=True,
-    )
-
-    (
-        _,
-        _,
-        source,
-        dest,
-        _,
-        _,
-    ) = connections
-
-    command = SCPCommand(
-        source,
-        dest,
-    )
-
-    await command.copy()
-
-    stop_b = time.monotonic() - start_b
-
-    print("TOOK", stop_b)
 
 
 

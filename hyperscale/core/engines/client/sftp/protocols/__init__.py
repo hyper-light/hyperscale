@@ -1,1 +1,1 @@
-from .protocol import SFTPProtocol as SFTPProtocol
+from .sftp_connection import SFTPConnection as SFTPConnection

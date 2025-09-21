@@ -1,11 +1,11 @@
 import asyncio
 import pathlib
 from typing import Any, Literal
-from hyperscale.core.engines.client.ssh.protocol.connection import (
+from hyperscale.core.engines.client.ssh.protocol.ssh.connection import (
     SSHClientConnection,
 )
 from .scp import SCPHandler
-from .ssh_connection import SSHConnection
+from hyperscale.core.engines.client.ssh.protocol.ssh_connection import SSHConnection
 
 
 ConnectionType = Literal["SOURCE", "DEST"]
@@ -16,7 +16,6 @@ class SCPConnection:
     __slots__ = (
         "connected",
         "connection",
-        "handler",
         "lock",
         "_path",
         "_loop",
@@ -31,7 +30,6 @@ class SCPConnection:
     ):
         self.connected: bool = False
         self.connection: SSHClientConnection | None = None
-        self.handler: SCPHandler | None = None
 
         self.lock = asyncio.Lock()
         self._path: str| pathlib.Path | None = None

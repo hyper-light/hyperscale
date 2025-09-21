@@ -8,7 +8,7 @@ from pydantic import (
     StrictFloat,
     ConfigDict,
 )
-from hyperscale.core.engines.client.ssh.protocol.connection import ServerHostKeysHandler
+from hyperscale.core.engines.client.ssh.protocol.ssh.connection import ServerHostKeysHandler
 
 
 class SCPOptions(BaseModel):

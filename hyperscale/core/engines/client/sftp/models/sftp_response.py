@@ -7,6 +7,8 @@ from hyperscale.core.engines.client.shared.models import (
     URLMetadata,
 )
 
+from .command_type import CommandType
+
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -15,16 +17,17 @@ SFTPTimings = Literal[
     "request_start",
     "connect_start",
     "connect_end",
-    "write_start",
-    "write_end",
-    "read_start",
-    "read_end",
+    "initialization_start",
+    "initialization_end",
+    "command_start",
+    "command_end",
     "request_end",
 ]
 
 
 class SFTPResponse(CallResult):
     url: URLMetadata
+    path: CommandType
     action: str | None = None
     error: Exception | None = None
     status: int | None = None

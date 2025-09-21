@@ -2,7 +2,7 @@ import asyncio
 import pathlib
 from typing import Any
 
-from hyperscale.core.engines.client.ssh.protocol.connection import (
+from hyperscale.core.engines.client.ssh.protocol.ssh.connection import (
     TunnelConnectorProtocol,
     open_tunnel,
     open_proxy,

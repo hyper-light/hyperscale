@@ -98,6 +98,10 @@ class SSHPacket:
 
     def __bool__(self) -> bool:
         return self._idx != self._len
+    
+    @property
+    def data(self):
+        return self._packet
 
     def check_end(self) -> None:
         """Confirm that all of the data in the packet has been consumed"""
