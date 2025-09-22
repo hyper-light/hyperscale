@@ -666,148 +666,6 @@ class _SFTPFileWriter(_SFTPParallelIO[int]):
 
         return self._data
 
-class SFTPFileCopier(_SFTPParallelIO[int]):
-    """SFTP file copier
-
-       This class parforms an SFTP file copy, initiating multiple
-       read and write requests to copy chunks of the file in parallel.
-
-    """
-
-    def __init__(
-        self,
-        block_size: int,
-        max_requests: int,
-        total_bytes: int,
-        sparse: bool,
-        srcfs: SFTPCommand | LocalFS,
-        dstfs: SFTPCommand | LocalFS,
-        srcpath: bytes,
-        dstpath: bytes,
-    ):
-        super().__init__(block_size, max_requests, 0, 0)
-
-        self._sparse = sparse
-
-        self._srcfs = srcfs
-        self._dstfs = dstfs
-
-        self._srcpath = srcpath
-        self._dstpath = dstpath
-
-        self._src: SFTPClientFile | File | None = None
-        self._dst: SFTPClientFile | File | None = None
-
-        self._bytes_copied = 0
-        self._total_bytes = total_bytes
-        self._buffer = io.BytesIO()
-
-    async def run_task(self, offset: int, size: int) -> Tuple[int, int]:
-        """Copy a block of the source file"""
-
-        assert self._src is not None
-        assert self._dst is not None
-
-        data = await self._src.read(size, offset)
-        await self._dst.write(data, offset)
-        datalen = len(data)
-
-        self._buffer.seek(offset)
-        self._buffer.write(data)
-
-        return datalen, datalen
-
-    async def run(self):
-        """Perform parallel file copy"""
-
-        result: TransferResult | None = None
-
-        async def _request_nonsparse_range(offset: int, length: int) -> \
-                AsyncIterator[Tuple[int, int]]:
-            """Return the entire file as the range to copy"""
-
-            yield offset, length
-
-        start = time.monotonic()
-
-        try:
-            self._src = await self._srcfs.open(self._srcpath, 'rb',
-                                               block_size=0)
-            self._dst = await self._dstfs.open(self._dstpath, 'wb',
-                                               block_size=0)
-
-            if self._sparse:
-                ranges = self._src.request_ranges(0, self._total_bytes)
-            else:
-                ranges = _request_nonsparse_range(0, self._total_bytes)
-
-            if self._srcfs == self._dstfs and self._srcfs.supports_remote_copy:
-
-                transfer: Transfer = {
-                    "file_path": self._dst.path,
-                    "file_transfer_at_end": False,
-                }
-
-                async for offset, length in ranges:
-                    transfer = await self._srcfs.remote_copy(
-                        self._src,
-                        self._dst,
-                        transfer,
-                        offset,
-                        length,
-                        offset,
-                    )
-                    
-                    self._bytes_copied += length
-
-                result = TransferResult(
-                    **transfer,
-                    file_transfer_elapsed=time.monotonic() - start
-                )
-
-            else:
-                async for self._offset, self._bytes_left in ranges:
-                    async for _, datalen in self.iter():
-                        self._bytes_copied += datalen
-
-                attrs: SFTPAttrs | None = None
-                if isinstance(self._dst, File):
-                    attrs = self._dst.to_attrs()
-
-                elif isinstance(self._dst, SFTPClientFile) and isinstance(self._src, File):
-                    attrs = self._src.to_attrs()
-
-                else:
-                    # We can't magically infer the attributes
-                    # for a remote -> remote copy so let's
-                    # ask the source
-                    attrs = await self._src.stat()
-
-                if self._bytes_copied != self._total_bytes and not self._sparse:
-                    exc = SFTPFailure('Unexpected EOF during file copy')
-
-                    setattr(exc, 'filename', self._srcpath)
-                    setattr(exc, 'offset', self._bytes_copied)
-
-                    raise exc
-                
-                result = TransferResult(
-                    file_path=self._dstpath,
-                    file_data=self._buffer,
-                    file_type=attrs.type,
-                    file_attribues=FileAttributes.from_sftp_attrs(attrs),
-                    file_transfer_elapsed=time.monotonic() - start,       
-                )
-
-        finally:
-            if self._src: # pragma: no branch
-                await self._src.close()
-
-            if self._dst: # pragma: no branch
-                await self._dst.close()
-
-        return result
-
 
 class SFTPError(Error):
     """SFTP error
@@ -2083,7 +1941,7 @@ class SFTPRanges(Record):
 class SFTPGlob:
     """SFTP glob matcher"""
 
-    def __init__(self, fs: _SFTPGlobProtocol, multiple=False):
+    def __init__(self, fs: SFTPClientHandler, multiple=False):
         self._fs = fs
         self._multiple = multiple
         self._prev_matches: Set[bytes] = set()
@@ -2154,13 +2012,9 @@ class SFTPGlob:
     async def _scandir(self, path) -> AsyncIterator[SFTPName]:
         """Cache results of calls to scandir"""
 
-        try:
-            for entry in self._scandir_cache[path]:
+        if cached := self._scandir_cache.get(path):
+            for entry in cached:
                 yield entry
-
-            return
-        except KeyError:
-            pass
 
         entries: List[SFTPName] = []
 
@@ -2651,6 +2505,21 @@ class SFTPClientHandler(SFTPHandler):
                 UInt32(flags), attrs.encode(self._version)))
         else:
             raise SFTPOpUnsupported('SFTPv5/v6 open not supported by server')
+        
+    
+    async def scandir(
+        self,
+        dirpath: bytes,
+    ):
+        handle = await self.opendir(dirpath)
+        at_end = False
+
+
+        while not at_end:
+            names, at_end = await self.readdir(handle)
+
+            for entry in names:
+                yield entry
 
     async def close(self, handle: bytes) -> None:
         """Make an SFTP close request"""

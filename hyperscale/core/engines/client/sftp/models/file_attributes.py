@@ -11,13 +11,13 @@ class FileAttributes(BaseModel):
     owner: StrictStr | None = None
     group: StrictStr | None = None
     permissions: StrictInt | None = None
-    atime: StrictInt | None = None
+    atime: StrictInt | StrictFloat | None = None
     atime_ns: StrictInt | StrictFloat | None = None
-    crtime: StrictInt | None = None
+    crtime: StrictInt | StrictFloat | None = None
     crtime_ns: StrictInt | StrictFloat | None = None
-    mtime: StrictInt | None = None
+    mtime: StrictInt | StrictFloat | None = None
     mtime_ns: StrictInt | StrictFloat | None = None
-    ctime: StrictInt | None = None
+    ctime: StrictInt | StrictFloat | None = None
     ctime_ns: StrictInt | StrictFloat | None = None
     mime_type: StrictStr | None = None
     nlink: StrictInt | None = None

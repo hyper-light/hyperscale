@@ -209,7 +209,7 @@ class MercurySyncSFTPConnction:
                     await command.link(path, *command_args)
 
                 case "listdir":
-                    await command.listdir(path)
+                    await command.scandir(path)
 
                 case "lstat":
                     await command.lstat(path, **command_options)
@@ -229,13 +229,6 @@ class MercurySyncSFTPConnction:
                 case "mput":
                     await command.mput(path, *command_args, **command_options)
 
-                case "open":
-
-                    if sftp_version > 4 or sftp_version < 6:
-                        await command.open56(path, **command_options)
-                    else:
-                        await command.open(path, **command_options)
-
                 case "posix_rename":
                     await command.posix_rename(path, *command_args)
 
@@ -243,16 +236,13 @@ class MercurySyncSFTPConnction:
                     await command.put(path, *command_args, **command_options)
 
                 case "readdir":
-                    await command.readdir(path)
+                    await command.scandir(path)
 
                 case "readlink":
                     await command.readlink(path)
 
                 case "realpath":
                     await command.realpath(path)
-
-                case "remote_copy":
-                    await command.remote_copy(path, *command_args, **command_options)
 
                 case "remove":
                     await command.remove(path)

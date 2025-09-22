@@ -4,7 +4,9 @@ from typing import Literal
 from pydantic import BaseModel, StrictBytes, StrictInt, StrictFloat, StrictBool
 
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPAttrs
+from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPVFSAttrs
 from .file_attributes import FileAttributes
+from .filesystem_attributes import FilesystemAttributes
 
 
 ResultFileType = Literal[
@@ -20,15 +22,18 @@ ResultFileType = Literal[
     "PACKET",
     "DATA",
     "OTHER",
+    "STATS",
+    "HARDLINK",
 ]
 
 class TransferResult(BaseModel):
     file_path: StrictBytes
-    file_type: ResultFileType = "FILE"
+    file_type: ResultFileType | None = "FILE"
     file_listing: list[TransferResult] | None = None
     file_data: StrictBytes | None = None
     file_transfer_elapsed: StrictInt | StrictFloat = 0
     file_attribues: FileAttributes | None = None
+    filesystem_attributes: FilesystemAttributes | None = None
     file_transfer_at_end: StrictBool = True
 
     @classmethod
@@ -49,6 +54,25 @@ class TransferResult(BaseModel):
             ctime=attrs.ctime,
             ctime_ns=attrs.ctime_ns,
             nlink=attrs.nlink,
+        )
+    
+    @classmethod
+    def to_filesystem_attributes(
+        cls,
+        attrs: SFTPVFSAttrs
+    ):
+        return FilesystemAttributes(
+            bavail=attrs.bavail,
+            bfree=attrs.bfree,
+            blocks=attrs.blocks,
+            bsize=attrs.bsize,
+            favail=attrs.favail,
+            ffree=attrs.ffree,
+            files=attrs.files,
+            flags=attrs.flags,
+            frsize=attrs.frsize,
+            fsid=attrs.fsid,
+            namemax=attrs.namemax,
         )
     
     @classmethod
