@@ -16,7 +16,7 @@ from hyperscale.core.engines.client.shared.protocols import (
     ProtocolMap,
 )
 
-from .models import CommandType
+from .models import CommandType, TransferResult
 from .protocols import SFTPConnection
 from .protocols.sftp import MIN_SFTP_VERSION, LocalFS
 from .sftp_command import SFTPCommand
@@ -61,15 +61,15 @@ class MercurySyncSFTPConnction:
         self,
         command_type: CommandType,
         request_url: str | URL,
-        path: str,
+        *command_args: tuple[Any, ...],
         sftp_version: int = MIN_SFTP_VERSION,
-        path_encoding: str = 'utf-8',
+        path_encoding: str = 'utf-8',   
         username: str | None = None,
         password: str | None = None,
         env: dict[str, str] | None = None,
         remote_env: dict[str, str] | None = None,
-        command_args: tuple[Any, ...] | None = None,
         connection_options: dict[str, Any] | None = None,
+        **command_options: dict[str, Any],
     ):
         timings: dict[
             Literal[
@@ -144,144 +144,150 @@ class MercurySyncSFTPConnction:
 
             timings["command_start"] = time.monotonic()
 
+            result: tuple[
+                float,
+                dict[bytes, TransferResult]
+            ] = (0, {})
+
             match command_type:
                 case "chdir":
-                    await command.chdir(path)
+                    result = await command.chdir(*command_args)
 
                 case "chmod":
-                    await command.chmod(path, *command_args, **command_options)
+                    result = await command.chmod(*command_args, **command_options)
 
                 case "chown":
-                    await command.chown(path, **command_options)
+                    result = await command.chown(*command_args, **command_options)
 
                 case "copy":
-                    await command.copy(path, *command_args, **command_options)
+                    result = await command.copy(*command_args, **command_options)
 
                 case "exists":
-                    await command.exists(path)
+                    result = await command.exists(*command_args)
 
                 case "get":
-                    await command.get(path, *command_args, **command_options)
+                    result = await command.get(*command_args, **command_options)
 
                 case "getatime":
-                    await command.getatime(path)
+                    result = await command.getatime(*command_args)
 
                 case "getatime_ns":
-                    await command.getatime_ns(path)
+                    result = await command.getatime_ns(*command_args)
 
                 case "getcrtime":
-                    await command.getcrtime(path)
+                    result = await command.getcrtime(*command_args)
 
                 case "getcrtime_ns":
-                    await command.getcrtime_ns(path)
+                    result = await command.getcrtime_ns(*command_args)
 
                 case "getcwd":
-                    await command.getcwd()
+                    result = await command.getcwd()
 
                 case "getmtime":
-                    await command.getmtime(path)
+                    result = await command.getmtime(*command_args)
 
                 case "getmtime_ns":
-                    await command.getmtime_ns(path)
+                    result = await command.getmtime_ns(*command_args)
 
                 case "getsize":
-                    await command.getsize(path)
+                    result = await command.getsize(*command_args)
 
                 case "glob":
-                    await command.glob(path)
+                    result = await command.glob(*command_args)
 
                 case "glob_sftpname":
-                    await command.glob_sftpname(path)
+                    result = await command.glob_sftpname(*command_args)
 
                 case "isdir":
-                    await command.isdir(path)
+                    result = await command.isdir(*command_args)
 
                 case "isfile":
-                    await command.isfile(path)
+                    result = await command.isfile(*command_args)
 
                 case "islink":
-                    await command.islink(path)
+                    result = await command.islink(*command_args)
 
                 case "lexists":
-                    await command.lexists(path)
+                    result = await command.lexists(*command_args)
 
                 case "link":
-                    await command.link(path, *command_args)
+                    result = await command.link(*command_args)
 
                 case "listdir":
-                    await command.scandir(path)
+                    result = await command.scandir(*command_args)
 
                 case "lstat":
-                    await command.lstat(path, **command_options)
+                    result = await command.lstat(*command_args, **command_options)
                 
                 case "makedirs":
-                    await command.makedirs(path, **command_options)
+                    result = await command.makedirs(*command_args,**command_options)
 
                 case "mcopy":
-                    await command.mcopy(path, *command_args, **command_options)
+                    result = await command.mcopy(*command_args, **command_options)
 
                 case "mget":
-                    await command.mget(path, *command_args, **command_options)
+                    result = await command.mget(*command_args, **command_options)
 
                 case "mkdir":
-                    await command.mkdir(path, **command_options)
+                    result = await command.mkdir(*command_args, **command_options)
 
                 case "mput":
-                    await command.mput(path, *command_args, **command_options)
+                    result = await command.mput(*command_args, **command_options)
 
                 case "posix_rename":
-                    await command.posix_rename(path, *command_args)
+                    result = await command.posix_rename(*command_args)
 
                 case "put":
-                    await command.put(path, *command_args, **command_options)
+                    result = await command.put(*command_args, **command_options)
 
                 case "readdir":
-                    await command.scandir(path)
+                    result = await command.scandir(*command_args)
 
                 case "readlink":
-                    await command.readlink(path)
+                    result = await command.readlink(*command_args)
 
                 case "realpath":
-                    await command.realpath(path)
+                    result = await command.realpath(*command_args)
 
                 case "remove":
-                    await command.remove(path)
+                    result = await command.remove(*command_args)
 
                 case "rename":
-                    await command.rename(path, *command_args, **command_options)
+                    result = await command.rename(*command_args, **command_options)
 
                 case "rmdir":
-                    await command.rmdir(path)
+                    result = await command.rmdir(*command_args)
 
                 case "rmtree":
-                    await command.rmtree(path)
+                    result = await command.rmtree(*command_args)
 
                 case "scandir":
-                    await command.scandir(path)
+                    result = await command.scandir(*command_args)
 
                 case "setstat":
-                    await command.setstat(path, *command_args, **command_options)
+                    result = await command.setstat(*command_args, **command_options)
 
                 case "stat":
-                    await command.stat(path, *command_args, **command_options)
+                    result = await command.stat(*command_args, **command_options)
 
                 case "statvfs":
-                    await command.statvfs(path)
+                    result = await command.statvfs(*command_args)
 
                 case "symlink":
-                    await command.symlink(path, *command_args)
+                    result = await command.symlink(*command_args)
 
                 case "truncate":
-                    await command.truncate(path, *command_args)
+                    result = await command.truncate(*command_args)
 
                 case "unlink":
-                    await command.unlink(path)
+                    result = await command.unlink(*command_args)
 
                 case "utime":
-                    await command.utime(path, *command_args, **command_options)
+                    result = await command.utime(*command_args, **command_options)
 
+            elapsed, operations = result
             
-            timings["command_end"] = time.monotonic()
+            timings["command_end"] = elapsed
             self._connections.append(connection)
 
             timings["request_end"] = time.monotonic()

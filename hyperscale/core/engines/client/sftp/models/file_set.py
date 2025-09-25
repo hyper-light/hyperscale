@@ -13,20 +13,21 @@ from .file_attributes import FileAttributes
 from .transfer_result import TransferResult
 
 
-class FileSet(BaseModel):
-    attributes: FileAttributes
-    path: StrictStr | pathlib.Path
+class FileGlob(BaseModel):
     pattern: StrictStr
 
     async def load(
         self,
         loop: asyncio.AbstractEventLoop,
+        path: StrictStr | pathlib.Path,
+        attributes: FileAttributes,
         encoding: str,
     ):
         with ThreadPoolExecutor() as exc:
             paths = await loop.run_in_executor(
                 exc,
                 self._find_files,
+                path,
             )
 
             return await asyncio.gather(*[
@@ -35,20 +36,25 @@ class FileSet(BaseModel):
                     functools.partial(
                         self._load_file,
                         path,
+                        attributes,
                         encoding,
                     )
                 ) for path in paths
             ])
 
-    def _find_files(self):
-        if isinstance(self.path, pathlib.Path):
-            return self.path.rglob(self.pattern)
+    def _find_files(
+        self,
+        path: str | pathlib.Path,
+    ):
+        if isinstance(path, pathlib.Path):
+            return path.rglob(self.pattern)
         
-        return pathlib.Path(self.path).rglob(self.pattern)
+        return pathlib.Path(path).rglob(self.pattern)
     
     def _load_file(
         self,
         path: pathlib.Path,
+        attributes: FileAttributes,
         encoding: str,
     ) -> tuple[bytes, FileAttributes, bytes | None]:
         path_str = str(path)
@@ -57,7 +63,7 @@ class FileSet(BaseModel):
             destination = str(path.resolve()).encode(encoding=encoding)
             dstpath: bytes = str(path).encode(encoding=encoding)
 
-            attributes = self.attributes.model_copy(update={
+            attributes = attributes.model_copy(update={
                 "type": FILEXFER_TYPE_SYMLINK
             })
             
@@ -68,7 +74,7 @@ class FileSet(BaseModel):
             )
         
         elif path.is_dir():
-            attributes = self.attributes.model_copy(update={
+            attributes = attributes.model_copy(update={
                 "type": FILEXFER_TYPE_DIRECTORY
             })
 
@@ -81,7 +87,7 @@ class FileSet(BaseModel):
             )
             
 
-        attributes = self.attributes.model_copy(update={
+        attributes = attributes.model_copy(update={
             "type": FILEXFER_TYPE_REGULAR
         })
         

@@ -1,5 +1,4 @@
 import asyncio
-import io
 import pathlib
 import posixpath
 import time
@@ -10,9 +9,7 @@ from hyperscale.core.engines.client.ssh.protocol.ssh.constants import (
     ACE4_READ_DATA,
     ACE4_APPEND_DATA,
     ACE4_READ_ATTRIBUTES,
-    FXF_READ,
     FXF_APPEND,
-    FXF_OPEN_EXISTING,
     FXF_APPEND_DATA,
     FILEXFER_ATTR_DEFINED_V4,
     FILEXFER_TYPE_SYMLINK,
@@ -25,15 +22,11 @@ from hyperscale.core.engines.client.ssh.protocol.ssh.constants import (
 
 from .models import (
     FileAttributes,
-    FileSet,
+    FileGlob,
     TransferResult,
-    FilesystemAttributes,
 )
 from .protocols.sftp import (
     SFTPStatFunc,
-    SFTPClientFileOrPath,
-    SFTPAttrs,
-    SFTPName,
     SFTPGlob,
     SFTPBadMessage,
     SFTPNoSuchFile,
@@ -46,7 +39,6 @@ from .protocols.sftp import (
     SFTPNotADirectory,
     SFTPLimits,
     SFTPVFSAttrs,
-    MAX_SFTP_READ_LEN,
     mode_to_pflags,
     utime_to_attrs,
     tuple_to_float_sec,
@@ -54,7 +46,6 @@ from .protocols.sftp import (
     valid_attr_flags,
     SFTPClientHandler,
     LocalFS,
-    SSHPacket,
 )
 
 
@@ -172,23 +163,23 @@ class SFTPCommand:
 
     async def get(
         self,
-        files: list[str | pathlib.PurePath],
+        path: str | pathlib.PurePath,
         recurse: bool = False,
         follow_symlinks: bool = False,
         min_version: int = 4,
         flags: int = FILEXFER_ATTR_DEFINED_V4,
         desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
     ):
-
+        
         transferred: dict[bytes, TransferResult] = {}
         
-        found = await asyncio.gather(*[
-            self._stat_remote_paths(
-                path,
-                flags=flags,
-            ) for path in files
-        ])
+        operation_start = time.monotonic()
+        remote_path = await self._stat_remote_paths(
+            path,
+            flags=flags,
+        )
 
+        found: Deque[tuple[bytes, FileAttributes]] = deque([remote_path])
 
         while len(found):
             (
@@ -299,130 +290,119 @@ class SFTPCommand:
                     file_transfer_elapsed=time.monotonic() - start,
                 )
             
-        return transferred
+        return (
+            time.monotonic() - operation_start,
+            transferred,
+        )
 
     async def put(
         self,
-        files: list[
-            tuple[
-                str | pathlib.PurePath, 
-                FileAttributes,
-                bytes | None,
-            ],
-        ],
+        path: str | pathlib.PurePath,
+        attributes: FileAttributes,
+        data: bytes,
         follow_symlinks: bool = False,
         flags: int = FILEXFER_ATTR_DEFINED_V4,
         min_version: int = 4,
         desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
     ):
+        
+        if isinstance(path, pathlib.Path):
+            path = str(path)
 
-        filepath_data_tuples: list[tuple[bytes, FileAttributes, bytes | None]] = []
+        dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-        for path, attrs, data in files:
+        if self._base_directory and self._base_directory not in dstpath:
+            dstpath = posixpath.join(self._base_directory, dstpath)
 
-            if isinstance(path, pathlib.Path):
-                path = str(path)
+        filetype = attributes.type
+        start = time.monotonic()
+        
+        if filetype == FILEXFER_TYPE_DIRECTORY:
+            await self._make_directories(
+                dstpath,
+                attributes,
+            )
 
-            dstpath: bytes = path.encode(encoding=self._path_encoding)
+            result = TransferResult(
+                file_path=dstpath,
+                file_type="DIRECTORY",
+                file_attribues=attributes,
+                file_transfer_elapsed=time.monotonic() - start
+            )
 
-            if self._base_directory and self._base_directory not in dstpath:
-                dstpath = posixpath.join(self._base_directory, dstpath)
-
-            filepath_data_tuples.append((
-                dstpath, 
-                attrs,
-                data,
-            ))
-
-        transferred: dict[bytes, TransferResult] = {}
-
-        for dstpath, attrs, data in filepath_data_tuples:
-
-            start = time.monotonic()
-
-            filetype = attrs.type
+        elif filetype == FILEXFER_TYPE_SYMLINK:
             
-            if filetype == FILEXFER_TYPE_DIRECTORY:
-                await self._make_directories(
+            srcattrs = await self._handler.stat(
+                dstpath,
+                flags,
+                follow_symlinks=follow_symlinks,
+            )
+
+
+            await self._handler.symlink(data, dstpath)
+
+            result = TransferResult(
+                file_path=dstpath,
+                file_type="SYMLINK",
+                file_attribues=TransferResult.to_attributes(srcattrs),
+                file_transfer_elapsed=time.monotonic() - start
+            )
+
+        else:
+            pflags, _ = mode_to_pflags('wb')
+
+            if min_version < 5:
+                handle = await self._handler.open(dstpath, flags, attributes)
+                dst = SFTPClientFile(
                     dstpath,
-                    attrs.to_sftp_attrs(),
-                )
-
-                transferred[dstpath] = TransferResult(
-                    file_path=dstpath,
-                    file_type="DIRECTORY",
-                    file_attribues=attrs,
-                    file_transfer_elapsed=time.monotonic() - start
-                )
-
-            elif filetype == FILEXFER_TYPE_SYMLINK:
-                
-                attrs = await self._handler.stat(
-                    dstpath,
-                    flags,
-                    follow_symlinks=follow_symlinks,
-                )
-
-
-                await self._handler.symlink(data, dstpath)
-
-                transferred[dstpath] = TransferResult(
-                    file_path=dstpath,
-                    file_type="SYMLINK",
-                    file_attribues=attrs,
-                    file_transfer_elapsed=time.monotonic() - start
+                    self._handler,
+                    handle,
+                    bool(pflags & FXF_APPEND),
+                    None,
+                    'strict',
+                    0,
+                    -1,
                 )
 
             else:
-                pflags, _ = mode_to_pflags('wb')
-
-                if min_version < 5:
-                    handle = await self._handler.open(dstpath, flags, attrs)
-                    dst = SFTPClientFile(
-                        dstpath,
-                        self._handler,
-                        handle,
-                        bool(pflags & FXF_APPEND),
-                        None,
-                        'strict',
-                        0,
-                        -1,
-                    )
-
-                else:
-                    handle = await self._handler.open56(dstpath, desired_access, flags, attrs)
-                    dst = SFTPClientFile(
-                        dstpath,
-                        self._handler,
-                        handle,
-                        bool(
-                            desired_access 
-                            & ACE4_APPEND_DATA 
-                            or
-                            pflags & FXF_APPEND_DATA,
-                        ),
-                        None,
-                        'strict',
-                        0,
-                        -1,
-                    )
-
-                await dst.write(data, 0)
-                await dst.close()
-
-                transferred[dstpath] = TransferResult(
-                    file_path=dstpath,
-                    file_type="FILE",
-                    file_data=data,
-                    file_attribues=attrs,
-                    file_transfer_elapsed=time.monotonic() - start
+                handle = await self._handler.open56(dstpath, desired_access, flags, attributes)
+                dst = SFTPClientFile(
+                    dstpath,
+                    self._handler,
+                    handle,
+                    bool(
+                        desired_access 
+                        & ACE4_APPEND_DATA 
+                        or
+                        pflags & FXF_APPEND_DATA,
+                    ),
+                    None,
+                    'strict',
+                    0,
+                    -1,
                 )
 
-        return transferred
+            await dst.write(data, 0)
+            await dst.close()
+
+            result = TransferResult(
+                file_path=dstpath,
+                file_type="FILE",
+                file_data=data,
+                file_attribues=attributes,
+                file_transfer_elapsed=time.monotonic() - start
+            )
+    
+        return (
+            time.monotonic() - start,
+            {
+                dstpath: result
+            },
+        )
 
     async def copy(
         self,
-        files: list[str | pathlib.PurePath],
+        path: str | pathlib.PurePath,
         recurse: bool = False,
         follow_symlinks: bool = False,
         flags: int = FILEXFER_ATTR_DEFINED_V4,
@@ -430,16 +410,14 @@ class SFTPCommand:
         desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
     ):
 
-
         transferred: dict[bytes, TransferResult] = {}
-        found = await asyncio.gather(*[
-            self._stat_remote_paths(
-                source_path,
-                flags=flags,
-            )
-            for source_path in files
-        ])
+        operation_start = time.monotonic()
+        remote_path = await self._stat_remote_paths(
+            path,
+            flags=flags,
+        )
 
+        found: Deque[tuple[bytes, FileAttributes]] = deque([remote_path])
 
         while len(found):
             (
@@ -465,7 +443,7 @@ class SFTPCommand:
 
                 await self._make_directories(
                     srcpath,
-                    attributes.to_sftp_attrs(),
+                    attributes,
                 )
 
                 async for srcname in self._scandir(srcpath):
@@ -493,7 +471,7 @@ class SFTPCommand:
 
                 await self._make_directories(
                     srcpath,
-                    attributes.to_sftp_attrs(),
+                    attributes,
                 )
 
                 transferred[srcpath] = TransferResult(
@@ -601,11 +579,14 @@ class SFTPCommand:
                     file_transfer_elapsed=time.monotonic() - start,
                 )
             
-        return transferred
+        return (
+            time.monotonic() - operation_start,
+            transferred
+        )
     
     async def mget(
         self,
-        files: list[str | pathlib.PurePath],
+        pattern: str | pathlib.PurePath,
         recurse: bool = False,
         follow_symlinks: bool = False,
         flags: int = FILEXFER_ATTR_DEFINED_V4,
@@ -623,18 +604,13 @@ class SFTPCommand:
 
         """
 
-        glob = SFTPGlob(self._handler, len(files) > 1)
-        discovered = await asyncio.gather(*[
-            self._glob_remote_paths(
-                path,
-                glob,
-            ) for path in files
-        ])
+        operation_start = time.monotonic()
 
-        found: list[tuple[bytes, FileAttributes]] = []
-
-        for discovered_paths in discovered:
-            found.extend(discovered_paths)
+        glob = SFTPGlob(self._handler, False)
+        found = await self._glob_remote_paths(
+            pattern,
+            glob,
+        )
 
         transferred: dict[bytes, TransferResult] = {}
 
@@ -747,29 +723,50 @@ class SFTPCommand:
                     file_transfer_elapsed=time.monotonic() - start,
                 )
             
-        return transferred
+        return (
+            time.monotonic() - operation_start,
+            transferred
+        )
 
     async def mput(
         self,
-        files: list[FileSet],
+        path: str | pathlib.PurePath,
+        attributes: FileAttributes,
+        data: bytes | FileGlob,
         follow_symlinks: bool = False,
         flags: int = FILEXFER_ATTR_DEFINED_V4,
         min_version: int = 4,
         desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
      ):
 
-        loaded = await asyncio.gather(*[
-            file_set.load(
-                self._loop,
-                self._path_encoding,
-            ) for file_set in files
-        ])
-
-        found: list[tuple[bytes, FileAttributes, bytes | None]] = []
-        for file_set in loaded:
-            found.extend(file_set)
 
         transferred: dict[bytes, TransferResult] = {}
+
+        if isinstance(data, FileGlob):
+            found = await data.load(
+                self._loop,
+                path,
+                attributes,
+                self._path_encoding,
+            )
+
+        else:
+
+            if isinstance(path, pathlib.Path):
+                path = str(path)
+
+            dstpath: bytes = path.encode(encoding=self._path_encoding)
+
+            if self._base_directory and self._base_directory not in dstpath:
+                dstpath = posixpath.join(self._base_directory, dstpath)
+
+            found = [(
+                dstpath,
+                attributes,
+                data,
+            )]
+            
+        operation_start = time.monotonic()
 
         for dstpath, attrs, data in found:
 
@@ -780,7 +777,7 @@ class SFTPCommand:
             if filetype == FILEXFER_TYPE_DIRECTORY:
                 await self._make_directories(
                     dstpath,
-                    attrs.to_sftp_attrs(),
+                    attrs,
                 )
 
                 transferred[dstpath] = TransferResult(
@@ -859,33 +856,29 @@ class SFTPCommand:
                     file_transfer_elapsed=time.monotonic() - start
                 )
 
-        return transferred
+        return (
+            time.monotonic() - operation_start,
+            transferred
+        )
 
     async def mcopy(
         self,
-        files: list[str | pathlib.PurePath],
+        path: str | pathlib.PurePath,
         recurse: bool = False,
         follow_symlinks: bool = False,
         flags: int = FILEXFER_ATTR_DEFINED_V4,
         min_version: int = 4,
         desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
     ):
-        
-        glob = SFTPGlob(self._handler, len(files) > 1)
-        discovered = await asyncio.gather(*[
-            self._glob_remote_paths(
-                source_path,
-                glob,
-            )
-            for source_path in files
-        ])
-
-        found: list[tuple[bytes, FileAttributes]] = []
-
-        for discovered_set in discovered:
-            found.extend(discovered_set)
-
+      
         transferred: dict[bytes, TransferResult] = {}
+        glob = SFTPGlob(self._handler, False)
+        found = await self._glob_remote_paths(
+            path,
+            glob,
+        )
+
+        operation_start = time.monotonic()
 
         while len(found):
             (
@@ -911,7 +904,7 @@ class SFTPCommand:
 
                 await self._make_directories(
                     srcpath,
-                    attributes.to_sftp_attrs(),
+                    attributes,
                 )
 
                 async for srcname in self._scandir(srcpath):
@@ -939,7 +932,7 @@ class SFTPCommand:
 
                 await self._make_directories(
                     srcpath,
-                    attributes.to_sftp_attrs(),
+                    attributes,
                 )
 
                 transferred[srcpath] = TransferResult(
@@ -1047,134 +1040,125 @@ class SFTPCommand:
                     file_transfer_elapsed=time.monotonic() - start,
                 )
             
-        return transferred
+        return (
+            time.monotonic() - operation_start,
+            transferred
+        )
     
     async def glob(
         self,
-        patterns: list[str],
+        pattern: str | pathlib.Path,
     ):
-        glob = SFTPGlob(self._handler, len(patterns) > 1)
+        glob = SFTPGlob(self._handler, False)
 
         start = time.monotonic()
 
-        discovered = await asyncio.gather(*[
-            self._glob_remote_paths(
-                pattern,
-                glob,
-            )
-            for pattern in patterns
-        ])
-        
-        
-        found: list[TransferResult] = []
+        discovered = await self._glob_remote_paths(
+            pattern,
+            glob,
+        )
+    
+        elapsed = time.monotonic() - start
+        transferred: dict[bytes, TransferResult] = {}
 
         for discovered_set in discovered:
-            found.extend([
-                TransferResult(
+            transferred.update({
+                srcpath: TransferResult(
                     file_path=srcpath,
                     file_attribues=attrs,
                     file_type=TransferResult.to_file_type(attrs.type),
-                    file_transfer_elapsed=time.monotonic() - start,
+                    file_transfer_elapsed=elapsed,
                 )
                 for srcpath, attrs in discovered_set
-            ])
+            })
 
-        return found
+        return (
+            time.monotonic() - start,
+            transferred,
+        )
 
     async def glob_sftpname(
         self,
-        patterns: str | pathlib.PurePath,
+        pattern: str | pathlib.PurePath,
     ):
-        glob = SFTPGlob(self._handler, len(patterns) > 1)
+        glob = SFTPGlob(self._handler, False)
 
         start = time.monotonic()
 
-        discovered = await asyncio.gather(*[
-            self._glob_remote_paths(
-                pattern,
-                glob,
-            )
-            for pattern in patterns
-        ])
+        discovered = await self._glob_remote_paths(
+            pattern,
+            glob,
+        )
 
-        found: list[TransferResult] = []
+        elapsed = time.monotonic() - start
+        transferred: dict[bytes, TransferResult] = {}
 
         for discovered_set in discovered:
-            found.extend([
-                TransferResult(
+            transferred.update({
+                srcpath: TransferResult(
                     file_path=srcpath,
                     file_attribues=attrs,
                     file_type=TransferResult.to_file_type(attrs.type),
-                    file_transfer_elapsed=time.monotonic() - start,
+                    file_transfer_elapsed=elapsed,
                 )
                 for srcpath, attrs in discovered_set
-            ])
+            })
 
-        return found
+        return (
+            elapsed,
+            transferred,
+        )
 
     async def makedirs(
         self,
-        files: list[
-            tuple[
-                str | pathlib.PurePath, 
-                FileAttributes,
-            ],
-        ],
+        path: str | pathlib.PurePath,
+        attributes: FileAttributes,
         exist_ok: bool = False,
     ):
 
-        filepath_data_tuples: list[tuple[bytes, FileAttributes, bytes | None]] = []
+        if isinstance(path, pathlib.Path):
+            path = str(path)
 
-        for path, attrs in files:
+        dstpath: bytes = path.encode(encoding=self._path_encoding)
 
-            if isinstance(path, pathlib.Path):
-                path = str(path)
-
-            dstpath: bytes = path.encode(encoding=self._path_encoding)
-
-            if self._base_directory and self._base_directory not in dstpath:
-                dstpath = posixpath.join(self._base_directory, dstpath)
-
-            filepath_data_tuples.append((
-                dstpath, 
-                attrs,
-            ))
+        if self._base_directory and self._base_directory not in dstpath:
+            dstpath = posixpath.join(self._base_directory, dstpath)
 
         transferred: dict[bytes, TransferResult] = {}
+        operation_start = time.monotonic() - start
 
-        for dstpath, attrs in filepath_data_tuples:
 
-            sftp_attrs = attrs.to_sftp_attrs()
-            start = time.monotonic()
+        sftp_attrs = attributes
+        start = time.monotonic()
 
-            await self._make_directories(
-                dstpath,
-                sftp_attrs,
-                exist_ok=exist_ok,
-            )
-            transferred[dstpath] = TransferResult(
-                file_path=dstpath,
-                file_attribues=attrs,
-                file_transfer_elapsed=time.monotonic() - start,
-            )
+        await self._make_directories(
+            dstpath,
+            sftp_attrs,
+            exist_ok=exist_ok,
+        )
+        transferred[dstpath] = TransferResult(
+            file_path=dstpath,
+            file_attribues=attributes,
+            file_transfer_elapsed=time.monotonic() - start,
+        )
         
-        return path
+        return (
+            time.monotonic() - operation_start,
+            transferred,
+        )
 
     async def rmtree(
         self, 
-        patterns: list[str],
+        pattern: str | pathlib.Path,
     ):
-        glob = SFTPGlob(self._handler, len(patterns) > 1)
+        glob = SFTPGlob(self._handler, False)
 
         start = time.monotonic()
 
-        discovered = await asyncio.gather(*[
-            self._glob_remote_paths(
-                pattern,
-                glob,
-            )
-            for pattern in patterns
-        ])
+        discovered = await self._glob_remote_paths(
+            pattern,
+            glob,
+        )
 
         found: Deque[tuple[bytes, FileAttributes]] = deque()
         for discovered_set in discovered:
@@ -1237,13 +1221,17 @@ class SFTPCommand:
             if isinstance(res, Exception):
                 raise res
             
-        return [
-            TransferResult(
-                file_path=path,
-                file_attribues=attrs,
-                file_transfer_elapsed=time.monotonic() - start,
-            ) for path, attrs in candidates
-        ]
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                path: TransferResult(
+                    file_path=path,
+                    file_attribues=attrs,
+                    file_transfer_elapsed=elapsed,
+                ) for path, attrs in candidates
+            }
+        )
     
     async def _stat_remote_paths(
         self,
@@ -1316,7 +1304,7 @@ class SFTPCommand:
     async def _make_directories(
         self,
         path: bytes,
-        attrs: SFTPAttrs,
+        attrs: FileAttributes,
         exist_ok: bool = False,
     ):
         curpath = b'/' if posixpath.isabs(path) else b''
@@ -1377,12 +1365,18 @@ class SFTPCommand:
             follow_symlinks=follow_symlinks,
         )
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=TransferResult.to_attributes(attrs),
-            file_transfer_elapsed=time.monotonic() - start,
-        )
+        elapsed = time.monotonic() - start
+        return {
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=TransferResult.to_attributes(attrs),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
+        }
 
     async def lstat(
         self,
@@ -1402,18 +1396,24 @@ class SFTPCommand:
 
         attrs = await self._handler.lstat(dstpath, flags)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=TransferResult.to_attributes(attrs),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=TransferResult.to_attributes(attrs),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
 
     async def setstat(
         self,
         path: str | pathlib.PurePath,
-        attrs: SFTPAttrs,
+        attributes: FileAttributes,
         *,
         follow_symlinks: bool = True,
     ):
@@ -1430,15 +1430,21 @@ class SFTPCommand:
 
         await self._handler.setstat(
             path,
-            attrs,
+            attributes,
             follow_symlinks=follow_symlinks,
         )
         
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=TransferResult.to_attributes(attrs),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=attributes,
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def statvfs(
@@ -1457,11 +1463,17 @@ class SFTPCommand:
         start = time.monotonic()
         sftpvfs_attrs = await self._handler.statvfs(path)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=TransferResult.to_filesystem_attributes(sftpvfs_attrs),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=TransferResult.to_filesystem_attributes(sftpvfs_attrs),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def truncate(
@@ -1469,8 +1481,7 @@ class SFTPCommand:
         path: str | pathlib.PurePath,
         size: int,
     ):
-
-        return await self.setstat(path, SFTPAttrs(size=size))
+        return await self.setstat(path, FileAttributes(size=size))
 
     async def chown(
         self, 
@@ -1483,7 +1494,7 @@ class SFTPCommand:
     ):
         return await self.setstat(
             path,
-            SFTPAttrs(
+            FileAttributes(
                 uid=uid,
                 gid=gid,
                 owner=owner,
@@ -1500,7 +1511,7 @@ class SFTPCommand:
     ):
         return await self.setstat(
             path,
-            SFTPAttrs(permissions=mode),
+            FileAttributes(permissions=mode),
             follow_symlinks=follow_symlinks,
         )
 
@@ -1540,11 +1551,17 @@ class SFTPCommand:
             follow_symlinks=follow_symlinks,
         )
 
-        return  TransferResult(
-            file_path=dstpath,
-            file_type=TransferResult.to_file_type(attrs.type) if attrs.type != FILEXFER_TYPE_UNKNOWN else None,
-            file_attribues=TransferResult.to_attributes(attrs),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type=TransferResult.to_file_type(attrs.type) if attrs.type != FILEXFER_TYPE_UNKNOWN else None,
+                    file_attribues=TransferResult.to_attributes(attrs),
+                    file_transfer_elapsed=elapsed,
+                ),
+            }
         )
 
     async def lexists(
@@ -1568,11 +1585,17 @@ class SFTPCommand:
             flags=flags,
         )
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type=TransferResult.to_file_type(attrs.type) if attrs.type != FILEXFER_TYPE_UNKNOWN else None,
-            file_attribues=TransferResult.to_attributes(attrs),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type=TransferResult.to_file_type(attrs.type) if attrs.type != FILEXFER_TYPE_UNKNOWN else None,
+                    file_attribues=TransferResult.to_attributes(attrs),
+                    file_transfer_elapsed=elapsed,
+                ),
+            }
         )
 
 
@@ -1603,13 +1626,19 @@ class SFTPCommand:
         if attrs.atime is not None:
             atime = tuple_to_float_sec(attrs.atime, attrs.atime_ns)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=FileAttributes(
-                atime=atime,
-            ),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=FileAttributes(
+                        atime=atime,
+                    ),
+                    file_transfer_elapsed=elapsed,
+                ),
+            }
         )
 
     async def getatime_ns(
@@ -1639,13 +1668,19 @@ class SFTPCommand:
         if attrs.atime is not None:
             atime_ns = tuple_to_nsec(attrs.atime, attrs.atime_ns)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=FileAttributes(
-                atime_ns=atime_ns,
-            ),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=FileAttributes(
+                        atime_ns=atime_ns,
+                    ),
+                    file_transfer_elapsed=elapsed,
+                ),
+            }
         )
 
 
@@ -1676,13 +1711,19 @@ class SFTPCommand:
         if attrs.crtime is not None:
             crtime = tuple_to_float_sec(attrs.crtime, attrs.crtime_ns)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=FileAttributes(
-                crtime=crtime,
-            ),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=FileAttributes(
+                        crtime=crtime,
+                    ),
+                    file_transfer_elapsed=elapsed,
+                ),
+            }
         )
 
     async def getcrtime_ns(
@@ -1712,13 +1753,19 @@ class SFTPCommand:
         if attrs.atime is not None:
             crtime_ns = tuple_to_nsec(attrs.crtime, attrs.crtime_ns)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=FileAttributes(
-                crtime_ns=crtime_ns,
-            ),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=FileAttributes(
+                        crtime_ns=crtime_ns,
+                    ),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
     
     async def getmtime(
@@ -1748,13 +1795,19 @@ class SFTPCommand:
         if attrs.crtime is not None:
             mtime = tuple_to_float_sec(attrs.mtime, attrs.mtime_ns)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=FileAttributes(
-                mtime=mtime,
-            ),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=FileAttributes(
+                        mtime=mtime,
+                    ),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
     
     async def getmtime_ns(
@@ -1771,25 +1824,29 @@ class SFTPCommand:
         if self._base_directory and self._base_directory not in dstpath:
             dstpath = posixpath.join(self._base_directory, dstpath)
 
+        start = time.monotonic()
+
         attrs = await self._handler.stat(
             dstpath,
             flags=flags,
             follow_symlinks=follow_symlinks,
         )
 
-        start = time.monotonic()
-
         mtime_ns: float | None = None
         if attrs.atime is not None:
             mtime_ns = tuple_to_nsec(attrs.mtime, attrs.mtime_ns)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=FileAttributes(
-                mtime_ns=mtime_ns,
-            ),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            TransferResult(
+                file_path=dstpath,
+                file_type="STATS",
+                file_attribues=FileAttributes(
+                    mtime_ns=mtime_ns,
+                ),
+                file_transfer_elapsed=elapsed,
+            )
         )
 
     async def getsize(
@@ -1813,13 +1870,19 @@ class SFTPCommand:
             follow_symlinks=follow_symlinks,
         )
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="STATS",
-            file_attribues=FileAttributes(
-                size=attrs.size,
-            ),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=FileAttributes(
+                        size=attrs.size,
+                    ),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def isdir(
@@ -1843,11 +1906,17 @@ class SFTPCommand:
             follow_symlinks=follow_symlinks,
         )
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="DIRECTORY" if attrs.type == FILEXFER_TYPE_DIRECTORY else None,
-            file_attribues=TransferResult.to_attributes(attrs),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="DIRECTORY" if attrs.type == FILEXFER_TYPE_DIRECTORY else None,
+                    file_attribues=TransferResult.to_attributes(attrs),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def isfile(
@@ -1871,11 +1940,17 @@ class SFTPCommand:
             follow_symlinks=follow_symlinks,
         )
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="FILE" if attrs.type == FILEXFER_TYPE_REGULAR else None,
-            file_attribues=TransferResult.to_attributes(attrs),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="FILE" if attrs.type == FILEXFER_TYPE_REGULAR else None,
+                    file_attribues=TransferResult.to_attributes(attrs),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def islink(
@@ -1899,11 +1974,17 @@ class SFTPCommand:
             follow_symlinks=follow_symlinks,
         )
 
-        return TransferResult(
-            file_path=dstpath,
-            file_type="SYMLINK" if attrs.type == FILEXFER_TYPE_SYMLINK else None,
-            file_attribues=TransferResult.to_attributes(attrs),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="SYMLINK" if attrs.type == FILEXFER_TYPE_SYMLINK else None,
+                    file_attribues=TransferResult.to_attributes(attrs),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def remove(
@@ -1921,9 +2002,15 @@ class SFTPCommand:
         start = time.monotonic()
         await self._handler.remove(dstpath)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_transfer_elapsed=elapsed
+                )
+            }
         )
 
     async def unlink(
@@ -1958,10 +2045,16 @@ class SFTPCommand:
         start = time.monotonic()
         await self._handler.rename(srcpath, dstpath, flags)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_data=srcpath,
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_data=srcpath,
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def posix_rename(
@@ -1988,10 +2081,16 @@ class SFTPCommand:
 
         await self._handler.posix_rename(oldpath, newpath)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_data=srcpath,
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_data=srcpath,
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def scandir(
@@ -2005,7 +2104,7 @@ class SFTPCommand:
         if self._base_directory and self._base_directory not in dirpath:
             dirpath = posixpath.join(self._base_directory, dirpath)
 
-        entries: list[TransferResult] = []
+        entries: dict[bytes, TransferResult] = {}
         
         start = time.monotonic()
         async for entry in self._scandir(dirpath):
@@ -2020,15 +2119,17 @@ class SFTPCommand:
             elif entry.longname:
                 filename = entry.longname
 
-            entries.append(
-                TransferResult(
-                    file_path=filename,
-                    file_attribues=TransferResult.to_attributes(entry.attrs),
-                    file_transfer_elapsed=time.monotonic() - start
-                )
+            entries[filename] = TransferResult(
+                file_path=filename,
+                file_attribues=TransferResult.to_attributes(entry.attrs),
+                file_transfer_elapsed=time.monotonic() - start
             )
 
-        return entries
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            entries
+        )
 
 
     async def _scandir(
@@ -2060,10 +2161,16 @@ class SFTPCommand:
         start = time.monotonic()   
         await self._handler.mkdir(path, attributes)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_attribues=attributes,
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_attribues=attributes,
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def rmdir(
@@ -2080,21 +2187,30 @@ class SFTPCommand:
         start = time.monotonic()   
         await self._handler.rmdir(path)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def realpath(
         self,
         path: str | pathlib.PurePath,
-        *compose_paths: str | pathlib.PurePath,
+        compose_paths: list[str | pathlib.PurePath] | None = None,
         check: int = FXRP_NO_CHECK,
     ):
 
         if compose_paths and isinstance(compose_paths[-1], int):
             check = compose_paths[-1]
             compose_paths = compose_paths[:-1]
+
+        elif compose_paths is None:
+            compose_paths = []
 
         if isinstance(path, pathlib.Path):
             path = str(path)
@@ -2118,9 +2234,21 @@ class SFTPCommand:
             )
 
         else:
-            compose_paths = self._create_compose_paths(compose_paths)
-            for cpath in compose_paths:
-                dstpath = posixpath.join(cpath, dstpath)
+
+            composed_paths: list[bytes] = []
+
+            for composed in compose_paths:
+                if isinstance(composed, pathlib.Path):
+                    composed = str(composed)
+
+                composed_path_bytes: bytes = composed.encode(encoding=self._path_encoding)
+                if self._base_directory and self._base_directory not in composed_path_bytes:
+                    composed_path_bytes = posixpath.join(self._base_directory, composed_path_bytes)
+
+                composed_paths.append(composed_path_bytes)
+
+            for composed_path in composed_paths:
+                dstpath = posixpath.join(composed_path, dstpath)
 
             names, _ = await self._handler.realpath(dstpath)
 
@@ -2141,7 +2269,7 @@ class SFTPCommand:
                     if check != FXRP_STAT_IF_EXISTS:
                         raise err
                     
-                    names[0].attrs = SFTPAttrs(type=FILEXFER_TYPE_UNKNOWN)
+                    names[0].attrs = FileAttributes(type=FILEXFER_TYPE_UNKNOWN)
 
             selected_sftp_name = names[0]
 
@@ -2155,7 +2283,7 @@ class SFTPCommand:
             elif selected_sftp_name.longname:
                 filepath = selected_sftp_name.longname
 
-            return TransferResult(
+            result = TransferResult(
                 file_path=filepath,
                 file_attribues=TransferResult.to_attributes(selected_sftp_name.attrs),
                 file_transfer_elapsed=time.monotonic() - start,
@@ -2169,13 +2297,24 @@ class SFTPCommand:
             if isinstance(filepath, str):
                 filepath = filepath.encode(encoding=self._path_encoding)
             
-            return TransferResult(
+            result = TransferResult(
                 file_path=filepath,
                 file_attribues=TransferResult.to_attributes(selected_sftp_name.attrs),
                 file_transfer_elapsed=time.monotonic() - start,
             )
+
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: result,
+            },
+        )
         
-    def _create_compose_paths(self, compose_paths: list[str | pathlib.Path]) -> list[bytes]:
+    def _create_compose_paths(
+        self,
+        compose_paths: list[str | pathlib.Path],
+    ) -> list[bytes]:
 
         composed_paths: list[bytes] = []
 
@@ -2193,16 +2332,25 @@ class SFTPCommand:
 
 
     async def getcwd(self):
-        return await self.realpath('.')
+        (elapsed, result) = await self.realpath('.')
+        return (
+            elapsed,
+            result,
+        )
 
     async def chdir(
         self,
         path: str | pathlib.PurePath,
     ):
-        result = await self.realpath(path)
-        self._base_directory = result.file_path
+        (elapsed, result) = await self.realpath(path)
 
-        return result
+        for res in result.values():
+            self._base_directory = res.file_path
+
+        return (
+            elapsed,
+            result,
+        )
 
     async def readlink(
         self,
@@ -2228,10 +2376,16 @@ class SFTPCommand:
         if isinstance(filepath, str):
             filepath = filepath.encode(encoding=self._path_encoding)
         
-        return TransferResult(
-            file_path=filepath,
-            file_attribues=TransferResult.to_attributes(selected_sftp_name.attrs),
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                linkpath: TransferResult(
+                    file_path=filepath,
+                    file_attribues=TransferResult.to_attributes(selected_sftp_name.attrs),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def symlink(
@@ -2255,11 +2409,17 @@ class SFTPCommand:
         start = time.monotonic()
         await self._handler.symlink(srcpath, dstpath)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_data=srcpath,
-            file_type="SYMLINK",
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_data=srcpath,
+                    file_type="SYMLINK",
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def link(
@@ -2285,11 +2445,17 @@ class SFTPCommand:
         start = time.monotonic()
         await self._handler.link(srcpath, dstpath)
 
-        return TransferResult(
-            file_path=dstpath,
-            file_data=srcpath,
-            file_type="HARDLINK",
-            file_transfer_elapsed=time.monotonic() - start,
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_data=srcpath,
+                    file_type="HARDLINK",
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     def exit(self) -> None:
