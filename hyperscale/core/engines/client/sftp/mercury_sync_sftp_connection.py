@@ -18,7 +18,7 @@ from hyperscale.core.engines.client.shared.protocols import (
 
 from .models import CommandType, TransferResult
 from .protocols import SFTPConnection
-from .protocols.sftp import MIN_SFTP_VERSION, LocalFS
+from .protocols.sftp import MIN_SFTP_VERSION
 from .sftp_command import SFTPCommand
 
 
@@ -138,7 +138,6 @@ class MercurySyncSFTPConnction:
 
             command = SFTPCommand(
                 handler,
-                LocalFS(),
                 path_encoding=path_encoding,
             )
 

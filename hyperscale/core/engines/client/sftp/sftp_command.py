@@ -23,14 +23,12 @@ from hyperscale.core.engines.client.ssh.protocol.ssh.constants import (
 from .models import (
     FileAttributes,
     FileGlob,
+    SFTPOptions,
     TransferResult,
 )
 from .protocols.sftp import (
-    SFTPStatFunc,
     SFTPGlob,
     SFTPBadMessage,
-    SFTPNoSuchFile,
-    SFTPNoSuchPath,
     SFTPPermissionDenied,
     SFTPFileAlreadyExists,
     SFTPFailure,
@@ -45,7 +43,6 @@ from .protocols.sftp import (
     tuple_to_nsec,
     valid_attr_flags,
     SFTPClientHandler,
-    LocalFS,
 )
 
 
@@ -55,7 +52,6 @@ class SFTPCommand:
     def __init__(
         self,
         handler: SFTPClientHandler,
-        local_fs: LocalFS,
         loop: asyncio.AbstractEventLoop,
         base_directory: str | None = None,
         path_encoding: str = 'utf-8',
@@ -70,7 +66,6 @@ class SFTPCommand:
         self._handler = handler
         self._path_encoding = path_encoding
         self._depth_sem = asyncio.Semaphore(value=128)
-        self._local_fs = local_fs
         self._loop = loop
         self._copy_handler = copy_handler
 
@@ -98,77 +93,10 @@ class SFTPCommand:
 
         return posixpath.basename(path)
 
-    def encode(self, path: str | pathlib.PurePath) -> bytes:
-        """Encode path name using configured path encoding
-
-           This method has no effect if the path is already bytes.
-
-        """
-
-        if isinstance(path, pathlib.PurePath):
-            path = str(path)
-
-        if isinstance(path, str):
-            path = path.encode(self._path_encoding)
-
-        return path
-
-    def decode(self, path: bytes, want_string: bool = True) -> bytes | str:
-        """Decode path name using configured path encoding
-
-           This method has no effect if want_string is set to `False`.
-
-        """
-
-        if want_string:
-            return path.decode(self._path_encoding)
-        
-        return path
-
-    def compose_path(
-        self,
-        path: str | pathlib.PurePath,
-        parent: bytes | None = None,
-    ) -> bytes:
-        """Compose a path
-
-           If parent is not specified, return a path relative to the
-           current remote working directory.
-
-        """
-
-        if parent is None and self._base_directory:
-            parent = self._base_directory
-
-
-        path = self.encode(path)
-
-        return posixpath.join(parent, path) if parent else path
-
-    async def _type(
-        self,
-        path: str | pathlib.PurePath,
-        statfunc: SFTPStatFunc | None = None,
-    ) -> int:
-        """Return the file type of a remote path, or FILEXFER_TYPE_UNKNOWN
-           if it can't be accessed"""
-
-        if statfunc is None:
-            statfunc = self.stat
-
-        try:
-            return (await statfunc(path)).type
-        except (SFTPNoSuchFile, SFTPNoSuchPath, SFTPPermissionDenied):
-            return FILEXFER_TYPE_UNKNOWN
-
     async def get(
         self,
         path: str | pathlib.PurePath,
-        recurse: bool = False,
-        follow_symlinks: bool = False,
-        min_version: int = 4,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
-        desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
+        options: SFTPOptions
     ):
         
         transferred: dict[bytes, TransferResult] = {}
@@ -176,7 +104,7 @@ class SFTPCommand:
         operation_start = time.monotonic()
         remote_path = await self._stat_remote_paths(
             path,
-            flags=flags,
+            flags=options.flags,
         )
 
         found: Deque[tuple[bytes, FileAttributes]] = deque([remote_path])
@@ -191,18 +119,18 @@ class SFTPCommand:
 
             filetype = attributes.type
 
-            if follow_symlinks and filetype == FILEXFER_TYPE_SYMLINK:
+            if options.follow_symlinks and filetype == FILEXFER_TYPE_SYMLINK:
 
                 srcattrs = await self._handler.stat(
                     srcpath,
-                    flags,
-                    follow_symlinks=follow_symlinks,
+                    options.flags,
+                    follow_symlinks=options.follow_symlinks,
                 )
 
                 attributes = FileAttributes.from_sftp_attrs(srcattrs)
                 filetype = srcattrs.type
 
-            if filetype == FILEXFER_TYPE_DIRECTORY and recurse:
+            if filetype == FILEXFER_TYPE_DIRECTORY and options.recurse:
 
                 async for srcname in self._scandir(srcpath):
                     filename: bytes = srcname.filename
@@ -247,8 +175,13 @@ class SFTPCommand:
      
                 pflags, _ = mode_to_pflags('rb')
 
-                if min_version < 5:
-                    handle = await self._handler.open(srcpath, flags, attributes)
+                if self._handler.version < 5:
+                    handle = await self._handler.open(
+                        srcpath, 
+                        options.flags,
+                        attributes,
+                    )
+
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
@@ -262,13 +195,19 @@ class SFTPCommand:
 
                 else:
 
-                    handle = await self._handler.open56(srcpath, desired_access, flags, attributes)
+                    handle = await self._handler.open56(
+                        srcpath, 
+                        options.desired_access, 
+                        options.flags, 
+                        attributes,
+                    )
+
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
                         handle,
                         bool(
-                            desired_access 
+                            options.desired_access 
                             & ACE4_APPEND_DATA 
                             or
                             pflags & FXF_APPEND_DATA,
@@ -300,10 +239,7 @@ class SFTPCommand:
         path: str | pathlib.PurePath,
         attributes: FileAttributes,
         data: bytes,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
-        min_version: int = 4,
-        desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
+        options: SFTPOptions,
     ):
         
         if isinstance(path, pathlib.Path):
@@ -334,8 +270,8 @@ class SFTPCommand:
             
             srcattrs = await self._handler.stat(
                 dstpath,
-                flags,
-                follow_symlinks=follow_symlinks,
+                options.flags,
+                follow_symlinks=options.follow_symlinks,
             )
 
 
@@ -351,8 +287,13 @@ class SFTPCommand:
         else:
             pflags, _ = mode_to_pflags('wb')
 
-            if min_version < 5:
-                handle = await self._handler.open(dstpath, flags, attributes)
+            if self._handler.version < 5:
+                handle = await self._handler.open(
+                    dstpath, 
+                    options.flags,
+                    attributes,
+                )
+
                 dst = SFTPClientFile(
                     dstpath,
                     self._handler,
@@ -365,13 +306,19 @@ class SFTPCommand:
                 )
 
             else:
-                handle = await self._handler.open56(dstpath, desired_access, flags, attributes)
+                handle = await self._handler.open56(
+                    dstpath, 
+                    options.desired_access,
+                    options.flags, 
+                    attributes,
+                )
+
                 dst = SFTPClientFile(
                     dstpath,
                     self._handler,
                     handle,
                     bool(
-                        desired_access 
+                        options.desired_access 
                         & ACE4_APPEND_DATA 
                         or
                         pflags & FXF_APPEND_DATA,
@@ -403,18 +350,14 @@ class SFTPCommand:
     async def copy(
         self,
         path: str | pathlib.PurePath,
-        recurse: bool = False,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
-        min_version: int = 4,
-        desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
+        options: SFTPOptions,
     ):
 
         transferred: dict[bytes, TransferResult] = {}
         operation_start = time.monotonic()
         remote_path = await self._stat_remote_paths(
             path,
-            flags=flags,
+            flags=options.flags,
         )
 
         found: Deque[tuple[bytes, FileAttributes]] = deque([remote_path])
@@ -429,17 +372,17 @@ class SFTPCommand:
 
             filetype = attributes.type
 
-            if follow_symlinks and filetype == FILEXFER_TYPE_SYMLINK:
+            if options.follow_symlinks and filetype == FILEXFER_TYPE_SYMLINK:
                 srcattrs = await self._handler.stat(
                     srcpath,
-                    flags,
-                    follow_symlinks=follow_symlinks,
+                    options.flags,
+                    follow_symlinks=options.follow_symlinks,
                 )
 
                 attributes = FileAttributes.from_sftp_attrs(srcattrs)
                 filetype = attributes.type
 
-            if filetype == FILEXFER_TYPE_DIRECTORY and recurse:
+            if filetype == FILEXFER_TYPE_DIRECTORY and options.recurse:
 
                 await self._make_directories(
                     srcpath,
@@ -496,8 +439,13 @@ class SFTPCommand:
      
                 pflags, _ = mode_to_pflags('rb')
 
-                if min_version < 5:
-                    handle = await self._handler.open(srcpath, flags, attributes)
+                if self._handler.version < 5:
+                    handle = await self._handler.open(
+                        srcpath,
+                        options.flags,
+                        attributes,
+                    )
+
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
@@ -511,13 +459,19 @@ class SFTPCommand:
 
                 else:
 
-                    handle = await self._handler.open56(srcpath, desired_access, flags, attributes)
+                    handle = await self._handler.open56(
+                        srcpath, 
+                        options.desired_access,
+                        options.flags, 
+                        attributes,
+                    )
+
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
                         handle,
                         bool(
-                            desired_access 
+                            options.desired_access 
                             & ACE4_APPEND_DATA 
                             or
                             pflags & FXF_APPEND_DATA,
@@ -537,8 +491,13 @@ class SFTPCommand:
                 
                 pflags, _ = mode_to_pflags('wb')
 
-                if min_version < 5:
-                    handle = await self._handler.open(srcpath, flags, attributes)
+                if self._handler.version < 5:
+                    handle = await self._handler.open(
+                        srcpath,
+                        options.flags,
+                        attributes,
+                    )
+
                     dst = SFTPClientFile(
                         srcpath,
                         copy_handler,
@@ -551,13 +510,19 @@ class SFTPCommand:
                     )
 
                 else:
-                    handle = await self._handler.open56(srcpath, desired_access, flags, attributes)
+                    handle = await self._handler.open56(
+                        srcpath, 
+                        options.desired_access, 
+                        options.flags,
+                        attributes,
+                    )
+                    
                     dst = SFTPClientFile(
                         srcpath,
                         copy_handler,
                         handle,
                         bool(
-                            desired_access 
+                            options.desired_access 
                             & ACE4_APPEND_DATA 
                             or
                             pflags & FXF_APPEND_DATA,
@@ -587,22 +552,8 @@ class SFTPCommand:
     async def mget(
         self,
         pattern: str | pathlib.PurePath,
-        recurse: bool = False,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
-        min_version: int = 4,
-        desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
+        options: SFTPOptions,
     ):
-        """Download remote files with glob pattern match
-
-           This method downloads files and directories from the remote
-           system matching one or more glob patterns.
-
-           The arguments to this method are identical to the :meth:`get`
-           method, except that the remote paths specified can contain
-           wildcard patterns.
-
-        """
 
         operation_start = time.monotonic()
 
@@ -624,18 +575,18 @@ class SFTPCommand:
 
             filetype = attributes.type
 
-            if follow_symlinks and filetype == FILEXFER_TYPE_SYMLINK:
+            if options.follow_symlinks and filetype == FILEXFER_TYPE_SYMLINK:
 
                 srcattrs = await self._handler.stat(
                     srcpath,
-                    flags,
-                    follow_symlinks=follow_symlinks,
+                    options.flags,
+                    follow_symlinks=options.follow_symlinks,
                 )
 
                 attributes = FileAttributes.from_sftp_attrs(srcattrs)
                 filetype = srcattrs.type
 
-            if filetype == FILEXFER_TYPE_DIRECTORY and recurse:
+            if filetype == FILEXFER_TYPE_DIRECTORY and options.recurse:
 
                 async for srcname in self._scandir(srcpath):
                     filename: bytes = srcname.filename
@@ -680,8 +631,8 @@ class SFTPCommand:
      
                 pflags, _ = mode_to_pflags('rb')
 
-                if min_version < 5:
-                    handle = await self._handler.open(srcpath, flags, attributes)
+                if self._handler.version < 5:
+                    handle = await self._handler.open(srcpath, options.flags, attributes)
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
@@ -695,13 +646,19 @@ class SFTPCommand:
 
                 else:
 
-                    handle = await self._handler.open56(srcpath, desired_access, flags, attributes)
+                    handle = await self._handler.open56(
+                        srcpath,
+                        options.desired_access,
+                        options.flags,
+                        attributes,
+                    )
+
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
                         handle,
                         bool(
-                            desired_access 
+                            options.desired_access 
                             & ACE4_APPEND_DATA 
                             or
                             pflags & FXF_APPEND_DATA,
@@ -733,10 +690,7 @@ class SFTPCommand:
         path: str | pathlib.PurePath,
         attributes: FileAttributes,
         data: bytes | FileGlob,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
-        min_version: int = 4,
-        desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
+        options: SFTPOptions,
      ):
 
 
@@ -791,8 +745,8 @@ class SFTPCommand:
                 
                 attrs = await self._handler.stat(
                     dstpath,
-                    flags,
-                    follow_symlinks=follow_symlinks,
+                    options.flags,
+                    follow_symlinks=options.follow_symlinks,
                 )
 
 
@@ -814,8 +768,8 @@ class SFTPCommand:
                 )
 
 
-                if min_version < 5:
-                    handle = await self._handler.open(dstpath, flags, attrs)
+                if self._handler.version < 5:
+                    handle = await self._handler.open(dstpath, options.flags, attrs)
                     dst = SFTPClientFile(
                         dstpath,
                         self._handler,
@@ -828,13 +782,19 @@ class SFTPCommand:
                     )
 
                 else:
-                    handle = await self._handler.open56(dstpath, desired_access, flags, attrs)
+                    handle = await self._handler.open56(
+                        dstpath,
+                        options.desired_access,
+                        options.flags,
+                        attrs,
+                    )
+
                     dst = SFTPClientFile(
                         dstpath,
                         self._handler,
                         handle,
                         bool(
-                            desired_access 
+                            options.desired_access 
                             & ACE4_APPEND_DATA 
                             or
                             pflags & FXF_APPEND_DATA,
@@ -864,11 +824,7 @@ class SFTPCommand:
     async def mcopy(
         self,
         path: str | pathlib.PurePath,
-        recurse: bool = False,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
-        min_version: int = 4,
-        desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
+        options: SFTPOptions,
     ):
       
         transferred: dict[bytes, TransferResult] = {}
@@ -890,17 +846,17 @@ class SFTPCommand:
 
             filetype = attributes.type
 
-            if follow_symlinks and filetype == FILEXFER_TYPE_SYMLINK:
+            if options.follow_symlinks and filetype == FILEXFER_TYPE_SYMLINK:
                 srcattrs = await self._handler.stat(
                     srcpath,
-                    flags,
-                    follow_symlinks=follow_symlinks,
+                    options.flags,
+                    follow_symlinks=options.follow_symlinks,
                 )
 
                 attributes = FileAttributes.from_sftp_attrs(srcattrs)
                 filetype = attributes.type
 
-            if filetype == FILEXFER_TYPE_DIRECTORY and recurse:
+            if filetype == FILEXFER_TYPE_DIRECTORY and options.recurse:
 
                 await self._make_directories(
                     srcpath,
@@ -957,8 +913,8 @@ class SFTPCommand:
      
                 pflags, _ = mode_to_pflags('rb')
 
-                if min_version < 5:
-                    handle = await self._handler.open(srcpath, flags, attributes)
+                if self._handler.version < 5:
+                    handle = await self._handler.open(srcpath, options.flags, attributes)
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
@@ -972,13 +928,19 @@ class SFTPCommand:
 
                 else:
 
-                    handle = await self._handler.open56(srcpath, desired_access, flags, attributes)
+                    handle = await self._handler.open56(
+                        srcpath,
+                        options.desired_access,
+                        options.flags,
+                        attributes,
+                    )
+
                     src = SFTPClientFile(
                         srcpath,
                         self._handler,
                         handle,
                         bool(
-                            desired_access 
+                            options.desired_access 
                             & ACE4_APPEND_DATA 
                             or
                             pflags & FXF_APPEND_DATA,
@@ -998,8 +960,8 @@ class SFTPCommand:
                 
                 pflags, _ = mode_to_pflags('wb')
 
-                if min_version < 5:
-                    handle = await self._handler.open(srcpath, flags, attributes)
+                if self._handler.version < 5:
+                    handle = await self._handler.open(srcpath, options.flags, attributes)
                     dst = SFTPClientFile(
                         srcpath,
                         copy_handler,
@@ -1012,13 +974,19 @@ class SFTPCommand:
                     )
 
                 else:
-                    handle = await self._handler.open56(srcpath, desired_access, flags, attributes)
+                    handle = await self._handler.open56(
+                        srcpath,
+                        options.desired_access,
+                        options.flags,
+                        attributes,
+                    )
+
                     dst = SFTPClientFile(
                         srcpath,
                         copy_handler,
                         handle,
                         bool(
-                            desired_access 
+                            options.desired_access 
                             & ACE4_APPEND_DATA 
                             or
                             pflags & FXF_APPEND_DATA,
@@ -1113,7 +1081,7 @@ class SFTPCommand:
         self,
         path: str | pathlib.PurePath,
         attributes: FileAttributes,
-        exist_ok: bool = False,
+        options: SFTPOptions,
     ):
 
         if isinstance(path, pathlib.Path):
@@ -1134,7 +1102,7 @@ class SFTPCommand:
         await self._make_directories(
             dstpath,
             sftp_attrs,
-            exist_ok=exist_ok,
+            exist_ok=options.exist_ok,
         )
         transferred[dstpath] = TransferResult(
             file_path=dstpath,
@@ -1160,13 +1128,10 @@ class SFTPCommand:
             glob,
         )
 
-        found: Deque[tuple[bytes, FileAttributes]] = deque()
-        for discovered_set in discovered:
-            found.extend([
-                (path, attrs)
-                for path, attrs in discovered_set
-                if attrs.type != FILEXFER_TYPE_SYMLINK
-            ])
+        found: Deque[tuple[bytes, FileAttributes]] = deque([
+            (path, attrs)
+            for path, attrs in discovered if attrs.type != FILEXFER_TYPE_SYMLINK
+        ])
 
         candidates: list[tuple[bytes, FileAttributes]] = []
 
@@ -1279,7 +1244,7 @@ class SFTPCommand:
         matches = await glob.match(
             srcpath,
             None,
-            self.version,
+            sftp_version=self._handler.version,
         )
 
         srcpaths: list[tuple[bytes, FileAttributes]] = []
@@ -1305,7 +1270,7 @@ class SFTPCommand:
         self,
         path: bytes,
         attrs: FileAttributes,
-        exist_ok: bool = False,
+        options: SFTPOptions,
     ):
         curpath = b'/' if posixpath.isabs(path) else b''
         parts = path.split(b'/')
@@ -1317,17 +1282,20 @@ class SFTPCommand:
             curpath = posixpath.join(curpath, part)
 
             try:
-                path = self.compose_path(path)
                 await self._handler.mkdir(path, attrs)
                 exists = False
 
             except (SFTPFailure, SFTPFileAlreadyExists):
-                filetype = await self._type(curpath)
+                filetype = await self._handler.stat(
+                    curpath,
+                    options.flags,
+                    follow_symlinks=options.follow_symlinks,
+                )
 
                 if filetype != FILEXFER_TYPE_DIRECTORY:
                     curpath_str = curpath.decode('utf-8', 'backslashreplace')
 
-                    exc = SFTPNotADirectory if self.version >= 6 \
+                    exc = SFTPNotADirectory if self._handler.version >= 6 \
                         else SFTPFailure
 
                     raise exc(f'{curpath_str} is not a directory') from None
@@ -1335,8 +1303,8 @@ class SFTPCommand:
                 if i == last:
                     raise
 
-            if exists and not exist_ok:
-                exc = SFTPFileAlreadyExists if self.version >= 6 else SFTPFailure
+            if exists and not options.exist_ok:
+                exc = SFTPFileAlreadyExists if self._handler.version >= 6 else SFTPFailure
 
                 raise exc(curpath.decode('utf-8', 'backslashreplace') +
                         ' already exists')
@@ -1346,8 +1314,7 @@ class SFTPCommand:
     async def stat(
         self,
         path: str | pathlib.PurePath,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
-        follow_symlinks: bool = True,
+        options: SFTPOptions,
     ):
         if isinstance(path, pathlib.Path):
             path = str(path)
@@ -1361,8 +1328,8 @@ class SFTPCommand:
 
         attrs = await self._handler.stat(
             dstpath,
-            flags,
-            follow_symlinks=follow_symlinks,
+            options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         elapsed = time.monotonic() - start
@@ -1381,7 +1348,7 @@ class SFTPCommand:
     async def lstat(
         self,
         path: str | pathlib.PurePath,
-        flags = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
 
         if isinstance(path, pathlib.Path):
@@ -1394,7 +1361,7 @@ class SFTPCommand:
 
         start = time.monotonic()
 
-        attrs = await self._handler.lstat(dstpath, flags)
+        attrs = await self._handler.lstat(dstpath, options.flags)
 
         elapsed = time.monotonic() - start
         return (
@@ -1414,8 +1381,7 @@ class SFTPCommand:
         self,
         path: str | pathlib.PurePath,
         attributes: FileAttributes,
-        *,
-        follow_symlinks: bool = True,
+        options: SFTPOptions,
     ):
 
         if isinstance(path, pathlib.Path):
@@ -1431,7 +1397,7 @@ class SFTPCommand:
         await self._handler.setstat(
             path,
             attributes,
-            follow_symlinks=follow_symlinks,
+            follow_symlinks=options.follow_symlinks,
         )
         
         elapsed = time.monotonic() - start
@@ -1486,53 +1452,45 @@ class SFTPCommand:
     async def chown(
         self, 
         path: str | pathlib.PurePath,
-        uid: int = None,
-        gid: int = None,
-        owner: str = None,
-        group: str = None,
-        follow_symlinks: bool = True,
+        options: SFTPOptions,
     ):
         return await self.setstat(
             path,
             FileAttributes(
-                uid=uid,
-                gid=gid,
-                owner=owner,
-                group=group,
+                uid=options.uid,
+                gid=options.gid,
+                owner=options.owner,
+                group=options.group,
             ),
-            follow_symlinks=follow_symlinks,
+            follow_symlinks=options.follow_symlinks,
         )
 
     async def chmod(
         self,
         path: str | pathlib.PurePath,
-        mode: int,
-        follow_symlinks: bool = True,
+        options: SFTPOptions,
     ):
         return await self.setstat(
             path,
-            FileAttributes(permissions=mode),
-            follow_symlinks=follow_symlinks,
+            FileAttributes(permissions=options.permissions),
+            follow_symlinks=options.follow_symlinks,
         )
 
     async def utime(
         self,
         path: str | pathlib.PurePath,
-        times: tuple[float, float] | None = None,
-        ns: tuple[int, int] | None = None,
-        follow_symlinks: bool = True,
+        options: SFTPOptions,
     ):
         return await self.setstat(
             path,
-            utime_to_attrs(times, ns),
-            follow_symlinks=follow_symlinks,
+            utime_to_attrs(options.times, options.nanoseconds),
+            follow_symlinks=options.follow_symlinks,
         )
 
     async def exists(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         
         if isinstance(path, pathlib.Path):
@@ -1547,8 +1505,8 @@ class SFTPCommand:
         
         attrs = await self._handler.stat(
             dstpath,
-            flags=flags,
-            follow_symlinks=follow_symlinks,
+            flags=options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         elapsed = time.monotonic() - start
@@ -1567,7 +1525,7 @@ class SFTPCommand:
     async def lexists(
         self,
         path: str | pathlib.PurePath,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         
         if isinstance(path, pathlib.Path):
@@ -1582,7 +1540,7 @@ class SFTPCommand:
         
         attrs = await self._handler.lstat(
             dstpath,
-            flags=flags,
+            flags=options.flags,
         )
 
         elapsed = time.monotonic() - start
@@ -1602,8 +1560,7 @@ class SFTPCommand:
     async def getatime(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         
         if isinstance(path, pathlib.Path):
@@ -1618,8 +1575,8 @@ class SFTPCommand:
 
         attrs = await self._handler.stat(
             dstpath,
-            flags=flags,
-            follow_symlinks=follow_symlinks,
+            flags=options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         atime: float | None = None
@@ -1644,8 +1601,7 @@ class SFTPCommand:
     async def getatime_ns(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         
         if isinstance(path, pathlib.Path):
@@ -1658,8 +1614,8 @@ class SFTPCommand:
 
         attrs = await self._handler.stat(
             dstpath,
-            flags=flags,
-            follow_symlinks=follow_symlinks,
+            flags=options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         start = time.monotonic()
@@ -1687,8 +1643,7 @@ class SFTPCommand:
     async def getcrtime(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         
         if isinstance(path, pathlib.Path):
@@ -1703,8 +1658,8 @@ class SFTPCommand:
 
         attrs = await self._handler.stat(
             dstpath,
-            flags=flags,
-            follow_symlinks=follow_symlinks,
+            flags=options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         crtime: float | None = None
@@ -1729,8 +1684,7 @@ class SFTPCommand:
     async def getcrtime_ns(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         
         if isinstance(path, pathlib.Path):
@@ -1743,8 +1697,8 @@ class SFTPCommand:
 
         attrs = await self._handler.stat(
             dstpath,
-            flags=flags,
-            follow_symlinks=follow_symlinks,
+            flags=options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         start = time.monotonic()
@@ -1771,8 +1725,7 @@ class SFTPCommand:
     async def getmtime(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         
         if isinstance(path, pathlib.Path):
@@ -1787,8 +1740,8 @@ class SFTPCommand:
 
         attrs = await self._handler.stat(
             dstpath,
-            flags=flags,
-            follow_symlinks=follow_symlinks,
+            flags=options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         mtime: float | None = None
@@ -1813,8 +1766,7 @@ class SFTPCommand:
     async def getmtime_ns(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         if isinstance(path, pathlib.Path):
             path = str(path)
@@ -1828,8 +1780,8 @@ class SFTPCommand:
 
         attrs = await self._handler.stat(
             dstpath,
-            flags=flags,
-            follow_symlinks=follow_symlinks,
+            flags=options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         mtime_ns: float | None = None
@@ -1852,8 +1804,7 @@ class SFTPCommand:
     async def getsize(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         if isinstance(path, pathlib.Path):
             path = str(path)
@@ -1866,8 +1817,8 @@ class SFTPCommand:
         start = time.monotonic()
         attrs = await self._handler.stat(
             dstpath,
-            flags,
-            follow_symlinks=follow_symlinks,
+            options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         elapsed = time.monotonic() - start
@@ -1888,8 +1839,7 @@ class SFTPCommand:
     async def isdir(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         if isinstance(path, pathlib.Path):
             path = str(path)
@@ -1902,8 +1852,8 @@ class SFTPCommand:
         start = time.monotonic()
         attrs = await self._handler.stat(
             dstpath,
-            flags,
-            follow_symlinks=follow_symlinks,
+            options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         elapsed = time.monotonic() - start
@@ -1922,8 +1872,7 @@ class SFTPCommand:
     async def isfile(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ):
         if isinstance(path, pathlib.Path):
             path = str(path)
@@ -1936,8 +1885,8 @@ class SFTPCommand:
         start = time.monotonic()
         attrs = await self._handler.stat(
             dstpath,
-            flags,
-            follow_symlinks=follow_symlinks,
+            options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         elapsed = time.monotonic() - start
@@ -1956,8 +1905,7 @@ class SFTPCommand:
     async def islink(
         self,
         path: str | pathlib.PurePath,
-        follow_symlinks: bool = False,
-        flags: int = FILEXFER_ATTR_DEFINED_V4,
+        options: SFTPOptions,
     ) -> bool:
         if isinstance(path, pathlib.Path):
             path = str(path)
@@ -1970,8 +1918,8 @@ class SFTPCommand:
         start = time.monotonic()
         attrs = await self._handler.stat(
             dstpath,
-            flags,
-            follow_symlinks=follow_symlinks,
+            options.flags,
+            follow_symlinks=options.follow_symlinks,
         )
 
         elapsed = time.monotonic() - start
@@ -2201,16 +2149,15 @@ class SFTPCommand:
     async def realpath(
         self,
         path: str | pathlib.PurePath,
-        compose_paths: list[str | pathlib.PurePath] | None = None,
-        check: int = FXRP_NO_CHECK,
+        options: SFTPOptions,
     ):
+
+        compose_paths = options.compose_paths
+        check = options.check
 
         if compose_paths and isinstance(compose_paths[-1], int):
             check = compose_paths[-1]
             compose_paths = compose_paths[:-1]
-
-        elif compose_paths is None:
-            compose_paths = []
 
         if isinstance(path, pathlib.Path):
             path = str(path)
@@ -2222,7 +2169,7 @@ class SFTPCommand:
 
         start = time.monotonic()
 
-        if self.version >= 6:
+        if self._handler.version >= 6:
             compose_paths = [
                 compose_path.encode() for compose_path in compose_paths
             ]
@@ -2256,13 +2203,16 @@ class SFTPCommand:
             raise SFTPBadMessage('Too many names returned')
 
         if check != FXRP_NO_CHECK:
-            if self.version < 6:
+            if self._handler.version < 6:
+
+                filename = names[0].filename
+                if isinstance(filename, str):
+                    filename = filename.encode(encoding=self._path_encoding)
+
                 try:
                     names[0].attrs = await self._handler.stat(
-                        self.encode(
-                            names[0].filename,
-                        ),
-                        valid_attr_flags[self.version],
+                        filename,
+                        valid_attr_flags[self._handler.version],
                     )
                     
                 except SFTPError as err:
