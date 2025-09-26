@@ -40,7 +40,7 @@ class MercurySyncSFTPConnction:
         self._concurrency = pool_size
         self.timeouts = timeouts
         self.reset_connections = reset_connections
-        self._loop = asyncio.get_event_loop()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         self._connection_options = connection_options
 
