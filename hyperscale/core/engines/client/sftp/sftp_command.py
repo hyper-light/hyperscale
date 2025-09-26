@@ -1027,18 +1027,14 @@ class SFTPCommand:
         )
     
         elapsed = time.monotonic() - start
-        transferred: dict[bytes, TransferResult] = {}
-
-        for discovered_set in discovered:
-            transferred.update({
+        transferred: dict[bytes, TransferResult] = {
                 srcpath: TransferResult(
                     file_path=srcpath,
                     file_attribues=attrs,
                     file_type=TransferResult.to_file_type(attrs.type),
                     file_transfer_elapsed=elapsed,
-                )
-                for srcpath, attrs in discovered_set
-            })
+                ) for srcpath, attrs in discovered
+            }
 
         return (
             time.monotonic() - start,
@@ -1059,18 +1055,14 @@ class SFTPCommand:
         )
 
         elapsed = time.monotonic() - start
-        transferred: dict[bytes, TransferResult] = {}
-
-        for discovered_set in discovered:
-            transferred.update({
-                srcpath: TransferResult(
-                    file_path=srcpath,
-                    file_attribues=attrs,
-                    file_type=TransferResult.to_file_type(attrs.type),
-                    file_transfer_elapsed=elapsed,
-                )
-                for srcpath, attrs in discovered_set
-            })
+        transferred: dict[bytes, TransferResult] = {
+            srcpath: TransferResult(
+                file_path=srcpath,
+                file_attribues=attrs,
+                file_type=TransferResult.to_file_type(attrs.type),
+                file_transfer_elapsed=elapsed,
+            )  for srcpath, attrs in discovered
+        }
 
         return (
             elapsed,
@@ -1333,7 +1325,7 @@ class SFTPCommand:
         )
 
         elapsed = time.monotonic() - start
-        return {
+        return (
             elapsed,
             {
                 dstpath: TransferResult(
@@ -1343,7 +1335,7 @@ class SFTPCommand:
                     file_transfer_elapsed=elapsed,
                 )
             }
-        }
+        )
 
     async def lstat(
         self,
@@ -1416,7 +1408,7 @@ class SFTPCommand:
     async def statvfs(
         self,
         path: str | pathlib.PurePath,
-    ) -> SFTPVFSAttrs:
+    ):
 
         if isinstance(path, pathlib.Path):
             path = str(path)
@@ -1446,8 +1438,13 @@ class SFTPCommand:
         self,
         path: str | pathlib.PurePath,
         size: int,
+        options: SFTPOptions,
     ):
-        return await self.setstat(path, FileAttributes(size=size))
+        return await self.setstat(
+            path,
+            FileAttributes(size=size),
+            options,
+        )
 
     async def chown(
         self, 
@@ -1462,7 +1459,7 @@ class SFTPCommand:
                 owner=options.owner,
                 group=options.group,
             ),
-            follow_symlinks=options.follow_symlinks,
+            options,
         )
 
     async def chmod(
@@ -1473,7 +1470,7 @@ class SFTPCommand:
         return await self.setstat(
             path,
             FileAttributes(permissions=options.permissions),
-            follow_symlinks=options.follow_symlinks,
+            options,
         )
 
     async def utime(
@@ -1483,8 +1480,10 @@ class SFTPCommand:
     ):
         return await self.setstat(
             path,
-            utime_to_attrs(options.times, options.nanoseconds),
-            follow_symlinks=options.follow_symlinks,
+            TransferResult.to_attributes(
+                utime_to_attrs(options.times, options.nanoseconds),
+            ),
+            options,
         )
 
     async def exists(
@@ -1791,14 +1790,16 @@ class SFTPCommand:
         elapsed = time.monotonic() - start
         return (
             elapsed,
-            TransferResult(
-                file_path=dstpath,
-                file_type="STATS",
-                file_attribues=FileAttributes(
-                    mtime_ns=mtime_ns,
-                ),
-                file_transfer_elapsed=elapsed,
-            )
+            {
+                dstpath: TransferResult(
+                    file_path=dstpath,
+                    file_type="STATS",
+                    file_attribues=FileAttributes(
+                        mtime_ns=mtime_ns,
+                    ),
+                    file_transfer_elapsed=elapsed,
+                )
+            }
         )
 
     async def getsize(
@@ -1906,7 +1907,7 @@ class SFTPCommand:
         self,
         path: str | pathlib.PurePath,
         options: SFTPOptions,
-    ) -> bool:
+    ):
         if isinstance(path, pathlib.Path):
             path = str(path)
 
@@ -1973,7 +1974,7 @@ class SFTPCommand:
         self,
         oldpath: str | pathlib.PurePath,
         newpath: str | pathlib.PurePath,
-        flags: int = 0,
+        options: SFTPOptions,
     ):
         
         if isinstance(oldpath, pathlib.Path):
@@ -1991,7 +1992,7 @@ class SFTPCommand:
             dstpath = posixpath.join(self._base_directory, dstpath)
 
         start = time.monotonic()
-        await self._handler.rename(srcpath, dstpath, flags)
+        await self._handler.rename(srcpath, dstpath, options.flags)
 
         elapsed = time.monotonic() - start
         return (
@@ -2281,8 +2282,11 @@ class SFTPCommand:
         return composed_paths
 
 
-    async def getcwd(self):
-        (elapsed, result) = await self.realpath('.')
+    async def getcwd(
+        self,
+        options: SFTPOptions,
+    ):
+        (elapsed, result) = await self.realpath('.', options)
         return (
             elapsed,
             result,
@@ -2291,8 +2295,9 @@ class SFTPCommand:
     async def chdir(
         self,
         path: str | pathlib.PurePath,
+        options: SFTPOptions,
     ):
-        (elapsed, result) = await self.realpath(path)
+        (elapsed, result) = await self.realpath(path, options)
 
         for res in result.values():
             self._base_directory = res.file_path
@@ -2342,7 +2347,7 @@ class SFTPCommand:
         self,
         oldpath: str | pathlib.PurePath,
         newpath: str | pathlib.PurePath,
-    ) -> None:
+    ):
 
         if isinstance(oldpath, pathlib.PurePath):
             oldpath = str(oldpath)
@@ -2376,7 +2381,7 @@ class SFTPCommand:
         self,
         oldpath: str | pathlib.PurePath,
         newpath: str | pathlib.PurePath,
-    ) -> None:
+    ):
 
         if isinstance(oldpath, pathlib.PurePath):
             oldpath = str(oldpath)

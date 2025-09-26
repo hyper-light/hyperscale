@@ -16,7 +16,12 @@ from hyperscale.core.engines.client.shared.protocols import (
     ProtocolMap,
 )
 
-from .models import CommandType, TransferResult
+from .models import (
+    CommandType,
+    SFTPConnectionOptions,
+    SFTPOptions,
+    TransferResult,
+)
 from .protocols import SFTPConnection
 from .protocols.sftp import MIN_SFTP_VERSION
 from .sftp_command import SFTPCommand
@@ -30,10 +35,14 @@ class MercurySyncSFTPConnction:
         pool_size: int | None = None,
         timeouts: Timeouts = Timeouts(),
         reset_connections: bool = False,
+        connection_options: SFTPConnectionOptions | None = None,
     ):
         self._concurrency = pool_size
         self.timeouts = timeouts
         self.reset_connections = reset_connections
+        self._loop = asyncio.get_event_loop()
+
+        self._connection_options = connection_options
 
         self._dns_lock: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: dict[str, asyncio.Future] = defaultdict(asyncio.Future)
@@ -61,15 +70,10 @@ class MercurySyncSFTPConnction:
         self,
         command_type: CommandType,
         request_url: str | URL,
-        *command_args: tuple[Any, ...],
-        sftp_version: int = MIN_SFTP_VERSION,
-        path_encoding: str = 'utf-8',   
+        command_args: tuple[Any, ...],
+        options: SFTPOptions,
         username: str | None = None,
         password: str | None = None,
-        env: dict[str, str] | None = None,
-        remote_env: dict[str, str] | None = None,
-        connection_options: dict[str, Any] | None = None,
-        **command_options: dict[str, Any],
     ):
         timings: dict[
             Literal[
@@ -94,9 +98,6 @@ class MercurySyncSFTPConnction:
             "request_end": None,
         }
 
-        if connection_options is None:
-            connection_options = {}
-
         if command_args is None:
             command_args = ()
 
@@ -118,7 +119,7 @@ class MercurySyncSFTPConnction:
                 request_url,
                 username=username,
                 password=password,
-                **connection_options,
+                **self._connection_options.options,
             )
 
             if err:
@@ -129,67 +130,68 @@ class MercurySyncSFTPConnction:
             timings["initialization_start"] = time.monotonic()
 
             handler = await connection.create_session(
-                env=env or (),
-                send_env=remote_env or (),
-                sftp_version=sftp_version,
+                env=self._connection_options.env or (),
+                send_env=self._connection_options.remote_env or (),
+                sftp_version=self._connection_options.sftp_version,
             )
 
             timings["initialization_end"] = time.monotonic()
 
             command = SFTPCommand(
                 handler,
-                path_encoding=path_encoding,
+                self._loop,
+                path_encoding=self._connection_options.path_encoding,
             )
 
             timings["command_start"] = time.monotonic()
 
             result: tuple[
                 float,
-                dict[bytes, TransferResult]
+                dict[bytes | Any, TransferResult]
             ] = (0, {})
 
             match command_type:
                 case "chdir":
-                    result = await command.chdir(*command_args)
+                    result = await command.chdir(*command_args, options)
 
                 case "chmod":
-                    result = await command.chmod(*command_args, **command_options)
+                    result = await command.chmod(*command_args, options)
 
                 case "chown":
-                    result = await command.chown(*command_args, **command_options)
+                    result = await command.chown(*command_args, options)
 
                 case "copy":
-                    result = await command.copy(*command_args, **command_options)
+                    result = await command.copy(*command_args, options)
 
                 case "exists":
-                    result = await command.exists(*command_args)
+                    result = await command.exists(*command_args, options)
 
                 case "get":
-                    result = await command.get(*command_args, **command_options)
+                    result = await command.get(*command_args, options)
 
                 case "getatime":
-                    result = await command.getatime(*command_args)
+                    result = await command.getatime(*command_args, options)
 
                 case "getatime_ns":
-                    result = await command.getatime_ns(*command_args)
+                    result = await command.getatime_ns(*command_args, options)
 
                 case "getcrtime":
-                    result = await command.getcrtime(*command_args)
+                    result = await command.getcrtime(*command_args, options)
 
                 case "getcrtime_ns":
-                    result = await command.getcrtime_ns(*command_args)
+                    result = await command.getcrtime_ns(*command_args, options)
 
                 case "getcwd":
-                    result = await command.getcwd()
+                    result = await command.getcwd(options)
 
                 case "getmtime":
-                    result = await command.getmtime(*command_args)
+                    result = await command.getmtime(*command_args, options)
 
                 case "getmtime_ns":
-                    result = await command.getmtime_ns(*command_args)
+                    result = await command.getmtime_ns(*command_args, options)
 
                 case "getsize":
-                    result = await command.getsize(*command_args)
+                    result = await command.getsize(*command_args, options)
 
                 case "glob":
                     result = await command.glob(*command_args)
@@ -198,61 +200,61 @@ class MercurySyncSFTPConnction:
                     result = await command.glob_sftpname(*command_args)
 
                 case "isdir":
-                    result = await command.isdir(*command_args)
+                    result = await command.isdir(*command_args, options)
 
                 case "isfile":
-                    result = await command.isfile(*command_args)
+                    result = await command.isfile(*command_args, options)
 
                 case "islink":
-                    result = await command.islink(*command_args)
+                    result = await command.islink(*command_args, options)
 
                 case "lexists":
-                    result = await command.lexists(*command_args)
+                    result = await command.lexists(*command_args, options)
 
                 case "link":
-                    result = await command.link(*command_args)
+                    result = await command.link(*command_args, options)
 
                 case "listdir":
-                    result = await command.scandir(*command_args)
+                    result = await command.scandir(path=command_args[0])
 
                 case "lstat":
-                    result = await command.lstat(*command_args, **command_options)
+                    result = await command.lstat(*command_args, options)
                 
                 case "makedirs":
-                    result = await command.makedirs(*command_args,**command_options)
+                    result = await command.makedirs(*command_args, options)
 
                 case "mcopy":
-                    result = await command.mcopy(*command_args, **command_options)
+                    result = await command.mcopy(*command_args, options)
 
                 case "mget":
-                    result = await command.mget(*command_args, **command_options)
+                    result = await command.mget(*command_args, options)
 
                 case "mkdir":
-                    result = await command.mkdir(*command_args, **command_options)
+                    result = await command.mkdir(*command_args)
 
                 case "mput":
-                    result = await command.mput(*command_args, **command_options)
+                    result = await command.mput(*command_args, options)
 
                 case "posix_rename":
                     result = await command.posix_rename(*command_args)
 
                 case "put":
-                    result = await command.put(*command_args, **command_options)
+                    result = await command.put(*command_args, options)
 
                 case "readdir":
-                    result = await command.scandir(*command_args)
+                    result = await command.scandir(path=command_args[0])
 
                 case "readlink":
                     result = await command.readlink(*command_args)
 
                 case "realpath":
-                    result = await command.realpath(*command_args)
+                    result = await command.realpath(*command_args, options)
 
                 case "remove":
                     result = await command.remove(*command_args)
 
                 case "rename":
-                    result = await command.rename(*command_args, **command_options)
+                    result = await command.rename(*command_args, options)
 
                 case "rmdir":
                     result = await command.rmdir(*command_args)
@@ -261,13 +263,13 @@ class MercurySyncSFTPConnction:
                     result = await command.rmtree(*command_args)
 
                 case "scandir":
-                    result = await command.scandir(*command_args)
+                    result = await command.scandir(path=command_args[0])
 
                 case "setstat":
-                    result = await command.setstat(*command_args, **command_options)
+                    result = await command.setstat(*command_args, options)
 
                 case "stat":
-                    result = await command.stat(*command_args, **command_options)
+                    result = await command.stat(*command_args, options)
 
                 case "statvfs":
                     result = await command.statvfs(*command_args)
@@ -282,7 +284,7 @@ class MercurySyncSFTPConnction:
                     result = await command.unlink(*command_args)
 
                 case "utime":
-                    result = await command.utime(*command_args, **command_options)
+                    result = await command.utime(*command_args, options)
 
             elapsed, operations = result
             
