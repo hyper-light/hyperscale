@@ -7,14 +7,8 @@ class Test(Workflow):
     duration = "1m"
 
     @step()
-    async def login(
+    async def get_hey(
         self,
-        url: URL = 'https://qandle.store',
+        url: URL = 'https://www.hey.com/',
     ) -> HTTP2Response:
-        return await self.client.smtp.send(
-            url,
-            'test@test.com',
-            'info@qandle.store',
-            'Mowing the Lawn',
-            'Are we touching grass yet?',
-        )
+        return await self.client.http.get(url)

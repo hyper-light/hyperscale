@@ -16,7 +16,7 @@ from hyperscale.core.engines.client.custom import CustomResult
 from hyperscale.core.engines.client.graphql import GraphQLResponse
 from hyperscale.core.engines.client.graphql_http2 import GraphQLHTTP2Response
 from hyperscale.core.engines.client.grpc import GRPCResponse
-from hyperscale.core.engines.client.http import HTTPRequest
+from hyperscale.core.engines.client.http import HTTPResponse
 from hyperscale.core.engines.client.http2 import HTTP2Request
 from hyperscale.core.engines.client.http3 import HTTP3Request
 from hyperscale.core.engines.client.playwright import PlaywrightResult
@@ -61,7 +61,7 @@ class Results:
             | Type[GraphQLResponse]
             | Type[GraphQLHTTP2Response]
             | Type[GRPCResponse]
-            | Type[HTTPRequest]
+            | Type[HTTPResponse]
             | Type[HTTP2Request]
             | Type[HTTP3Request]
             | Type[PlaywrightResult]
@@ -78,7 +78,7 @@ class Results:
                     | List[GraphQLResponse]
                     | List[GraphQLHTTP2Response]
                     | List[GRPCResponse]
-                    | List[HTTPRequest]
+                    | List[HTTPResponse]
                     | List[HTTP2Request]
                     | List[HTTP3Request]
                     | List[PlaywrightResult]
@@ -313,7 +313,7 @@ class Results:
         results: List[GraphQLResponse]
         | List[GraphQLHTTP2Response]
         | List[GRPCResponse]
-        | List[HTTPRequest]
+        | List[HTTPResponse]
         | List[HTTP2Request]
         | List[HTTP3Request]
         | List[PlaywrightResult]
@@ -803,7 +803,7 @@ class Results:
         result: GraphQLResponse
         | GraphQLHTTP2Response
         | GRPCResponse
-        | HTTPRequest
+        | HTTPResponse
         | HTTP2Request
         | HTTP3Request
         | TCPResponse

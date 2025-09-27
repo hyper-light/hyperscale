@@ -1,13 +1,12 @@
-import orjson
-from typing import Literal, TypeVar, Type
-from pydantic import BaseModel
+from typing import Literal, TypeVar
+from pydantic import BaseModel, AnyUrl
 from hyperscale.core.engines.client.shared.models import (
     CallResult,
     RequestType,
-    URLMetadata,
 )
 
 from .command_type import CommandType
+from .transfer_result import TransferResult
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -26,13 +25,10 @@ SFTPTimings = Literal[
 
 
 class SFTPResponse(CallResult):
-    url: URLMetadata
-    path: CommandType
-    action: str | None = None
+    url: AnyUrl
+    action: CommandType | None = None
     error: Exception | None = None
-    status: int | None = None
-    status_message: str | None = None
-    content: bytes = b""
+    transferred: dict[bytes, TransferResult] | None = None
     timings: dict[
         SFTPTimings,
         float | None,
@@ -42,18 +38,6 @@ class SFTPResponse(CallResult):
     @classmethod
     def response_type(cls):
         return RequestType.SFTP
-    
-    def json(self):
-        if self.content:
-            return orjson.loads(self.content)
-
-        return {}
-
-    def text(self):
-        return self.content.decode()
-
-    def to_model(self, model: Type[T]) -> T:
-        return model(**orjson.loads(self.content))
     
     @property
     def successful(self) -> bool:

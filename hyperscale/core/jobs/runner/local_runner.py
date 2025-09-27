@@ -257,6 +257,8 @@ class LocalRunner:
                 asyncio.CancelledError,
                 BrokenProcessPool,
             ) as err:
+                import traceback
+                print(traceback.format_exc())
                 if isinstance(err, asyncio.CancelledError):
                     await ctx.log_prepared(
                         f"Encountered interrupt while running test {test_name} - aborting",

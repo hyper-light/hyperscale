@@ -1,4 +1,5 @@
 import asyncio
+import pathlib
 import time
 from collections import defaultdict
 from typing import Any, Literal
@@ -21,9 +22,12 @@ from .models import (
     SFTPConnectionOptions,
     SFTPOptions,
     TransferResult,
+    SFTPResponse,
+    AttributeFlags,
+    CheckType,
+    DesiredAccess,
 )
 from .protocols import SFTPConnection
-from .protocols.sftp import MIN_SFTP_VERSION
 from .sftp_command import SFTPCommand
 
 
@@ -65,6 +69,13 @@ class MercurySyncSFTPConnction:
 
         self.address_family = address_family
         self.address_protocol = protocol
+
+    async def get(
+        self,
+        path: str | pathlib.PurePath,
+        
+    ):
+        pass
 
     async def _execute(
         self,
@@ -114,7 +125,7 @@ class MercurySyncSFTPConnction:
             (
                 err,
                 connection,
-                url,
+                _,
             ) = await self._connect(
                 request_url,
                 username=username,
@@ -125,6 +136,13 @@ class MercurySyncSFTPConnction:
             if err:
                 timings["connect_end"] = time.monotonic()
                 self._connections.append(SFTPConnection())
+                
+                return SFTPResponse(
+                    url=request_url,
+                    action=command_type,
+                    timings=timings,
+                    error=err,
+                )
 
             timings["connect_end"] = time.monotonic()
             timings["initialization_start"] = time.monotonic()
@@ -286,18 +304,33 @@ class MercurySyncSFTPConnction:
                 case "utime":
                     result = await command.utime(*command_args, options)
 
-            elapsed, operations = result
+            elapsed, transferred = result
             
             timings["command_end"] = elapsed
             self._connections.append(connection)
 
             timings["request_end"] = time.monotonic()
 
+            return SFTPResponse(
+                url=request_url,
+                action=command_type,
+                transferred=transferred,
+                timings=timings,
+
+            )
+
         except Exception as err:
             timings["request_end"] = time.monotonic()
 
             self._connections.append(
                 SFTPConnection()
+            )
+
+            return SFTPResponse(
+                url=request_url,
+                action=command_type,
+                timings=timings,
+                error=err,
             )
 
 
