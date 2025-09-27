@@ -1,5 +1,5 @@
 from hyperscale.graph import Workflow, step
-from hyperscale.testing import URL, HTTP2Response
+from hyperscale.testing import URL, HTTPResponse
 
 
 class Test(Workflow):
@@ -9,12 +9,6 @@ class Test(Workflow):
     @step()
     async def login(
         self,
-        url: URL = 'https://qandle.store',
-    ) -> HTTP2Response:
-        return await self.client.smtp.send(
-            url,
-            'test@test.com',
-            'info@qandle.store',
-            'Mowing the Lawn',
-            'Are we touching grass yet?',
-        )
+        url: URL = 'https://httpbin.or/get',
+    ) -> HTTPResponse:
+        return await self.client.http.get(url)

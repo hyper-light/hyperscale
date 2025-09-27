@@ -42,7 +42,7 @@ class MercurySyncFTPConnection:
         self._key_path = key_path
         self._ssl_context: ssl.SSLContext | None = None
 
-        self._loop = asyncio.get_event_loop()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
 
         self._dns_lock: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -71,15 +71,8 @@ class MercurySyncFTPConnection:
         self.address_protocol = protocol
         self._is_secured: bool = False
         
-        self._227_re = re.compile(
-            r'(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)', 
-            re.ASCII,
-        )
-
-        self._150_re = re.compile(
-            r"150 .* \((\d+) bytes\)", 
-            re.IGNORECASE | re.ASCII,
-        )
+        self._227_re: re.Pattern = None
+        self._150_re: re.Pattern = None
 
     async def load_file(
         self,
