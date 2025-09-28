@@ -23,11 +23,9 @@ class SFTPConnectionOptions:
         path_encoding: str = 'utf-8',   
         env: dict[str, str] | None = None,
         remote_env: dict[str, str] | None = None,
-        options: dict[str, Any] | None = None,
+        connection_options: dict[str, Any] | None = None,
     ):
         
-        if options is None:
-            options = {}
         
         self._sftp_version: dict[SFTPVersion, int] = {
             "v3": MIN_SFTP_VERSION,
@@ -41,5 +39,8 @@ class SFTPConnectionOptions:
         self.env = env
         self.remote_env = remote_env
 
-        connection_options = ConnectionOptions(**options)
-        self.options = connection_options.to_dict()
+        if connection_options is None:
+            connection_options = {}
+            
+        options = ConnectionOptions(**connection_options)
+        self.options = options.to_dict()

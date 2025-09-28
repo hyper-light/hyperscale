@@ -49,9 +49,6 @@ class MercurySyncSFTPConnction:
         self._concurrency = pool_size
         self.timeouts = timeouts
         self.reset_connections = reset_connections
-        self._loop: asyncio.AbstractEventLoop | None = None
-
-        self._connection_options: SFTPConnectionOptions | None = None
 
         self._dns_lock: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: dict[str, asyncio.Future] = defaultdict(asyncio.Future)
@@ -63,14 +60,14 @@ class MercurySyncSFTPConnction:
         self._hosts: dict[str, tuple[str, int]] = {}
 
         self._semaphore: asyncio.Semaphore = None
-        self._connection_waiters: list[asyncio.Future] = []
 
         self._url_cache: dict[str, SFTPUrl] = {}
         self._optimized: dict[str, URL | Auth | Data ] = {}
 
-
         protocols = ProtocolMap()
         address_family, protocol = protocols[RequestType.SFTP]
+
+        self._connection_options: SFTPConnectionOptions | None = None
 
         self.address_family = address_family
         self.address_protocol = protocol
@@ -2132,7 +2129,6 @@ class MercurySyncSFTPConnction:
 
             command = SFTPCommand(
                 handler,
-                self._loop,
                 path_encoding=self._connection_options.path_encoding,
             )
 

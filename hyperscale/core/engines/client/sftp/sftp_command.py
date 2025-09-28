@@ -53,7 +53,6 @@ class SFTPCommand:
     def __init__(
         self,
         handler: SFTPClientHandler,
-        loop: asyncio.AbstractEventLoop,
         base_directory: str | None = None,
         path_encoding: str = 'utf-8',
         copy_handler: SFTPClientHandler | None = None,
@@ -67,7 +66,6 @@ class SFTPCommand:
         self._handler = handler
         self._path_encoding = path_encoding
         self._depth_sem = asyncio.Semaphore(value=128)
-        self._loop = loop
         self._copy_handler = copy_handler
 
     @property
