@@ -1,6 +1,4 @@
 from .command_type import CommandType as CommandType
-from .file import File as File
-from .file_glob import FileGlob as FileGlob
 from .filesystem_attributes import FilesystemAttributes as FilesystemAttributes
 from .transfer_result import TransferResult as TransferResult
 from .transfer_result import ResultFileType as ResultFileType

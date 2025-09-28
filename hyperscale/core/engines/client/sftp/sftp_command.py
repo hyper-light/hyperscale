@@ -21,9 +21,9 @@ from hyperscale.core.testing.models import (
     File,
     FileGlob,
 )
+from hyperscale.core.testing.models.file.file_attributes import FileAttributes
 
 from .models import (
-    FileAttributes,
     SFTPOptions,
     TransferResult,
 )
@@ -37,6 +37,7 @@ from .protocols.sftp import (
     SFTPError,
     SFTPNotADirectory,
     SFTPLimits,
+    SFTPAttrs,
     mode_to_pflags,
     utime_to_attrs,
     tuple_to_float_sec,
@@ -127,7 +128,7 @@ class SFTPCommand:
                     follow_symlinks=options.follow_symlinks,
                 )
 
-                attributes = FileAttributes.from_sftp_attrs(srcattrs)
+                attributes = srcattrs.to_file_attributes()
                 filetype = srcattrs.type
 
             if filetype == FILEXFER_TYPE_DIRECTORY and options.recurse:
@@ -142,7 +143,7 @@ class SFTPCommand:
 
                     found.append((
                         srcfile,
-                        FileAttributes.from_sftp_attrs(srcname.attrs),
+                        srcname.attrs.to_file_attributes(),
                     ))
 
                 transferred[srcpath] = TransferResult(
@@ -222,7 +223,7 @@ class SFTPCommand:
                 await src.close()
                 
                 transferred[srcpath] = TransferResult(
-                    file_data=srcpath,
+                    file_path=srcpath,
                     file_type="FILE",
                     file_data=data,
                     file_attribues=attributes,
@@ -392,7 +393,7 @@ class SFTPCommand:
                     follow_symlinks=options.follow_symlinks,
                 )
 
-                attributes = FileAttributes.from_sftp_attrs(srcattrs)
+                attributes = srcattrs.to_file_attributes()
                 filetype = attributes.type
 
             if filetype == FILEXFER_TYPE_DIRECTORY and options.recurse:
@@ -412,7 +413,7 @@ class SFTPCommand:
 
                     found.append((
                         srcfile,
-                        FileAttributes.from_sftp_attrs(srcname.attrs),
+                        srcname.attrs.to_file_attributes(),
                     ))
                 
                 transferred[srcpath] = TransferResult(
@@ -550,7 +551,7 @@ class SFTPCommand:
                 await dst.close()
                 
                 transferred[srcpath] = TransferResult(
-                    file_data=srcpath,
+                    file_path=srcpath,
                     file_type="FILE",
                     file_data=data,
                     file_attribues=attributes,
@@ -596,7 +597,7 @@ class SFTPCommand:
                     follow_symlinks=options.follow_symlinks,
                 )
 
-                attributes = FileAttributes.from_sftp_attrs(srcattrs)
+                attributes = srcattrs.to_file_attributes()
                 filetype = srcattrs.type
 
             if filetype == FILEXFER_TYPE_DIRECTORY and options.recurse:
@@ -611,7 +612,7 @@ class SFTPCommand:
 
                     found.append((
                         srcfile,
-                        FileAttributes.from_sftp_attrs(srcname.attrs),
+                        srcname.attrs.to_file_attributes(),
                     ))
 
                 transferred[srcpath] = TransferResult(
@@ -686,7 +687,7 @@ class SFTPCommand:
                 await src.close()
                 
                 transferred[srcpath] = TransferResult(
-                    file_data=srcpath,
+                    file_path=srcpath,
                     file_type="FILE",
                     file_data=data,
                     file_attribues=attributes,
@@ -865,7 +866,7 @@ class SFTPCommand:
                     follow_symlinks=options.follow_symlinks,
                 )
 
-                attributes = FileAttributes.from_sftp_attrs(srcattrs)
+                attributes = srcattrs.to_file_attributes()
                 filetype = attributes.type
 
             if filetype == FILEXFER_TYPE_DIRECTORY and options.recurse:
@@ -885,7 +886,7 @@ class SFTPCommand:
 
                     found.append((
                         srcfile,
-                        FileAttributes.from_sftp_attrs(srcname.attrs),
+                        srcname.attrs.to_file_attributes(),
                     ))
                 
                 transferred[srcpath] = TransferResult(
@@ -1013,7 +1014,7 @@ class SFTPCommand:
                 await dst.close()
                 
                 transferred[srcpath] = TransferResult(
-                    file_data=srcpath,
+                    file_path=srcpath,
                     file_type="FILE",
                     file_data=data,
                     file_attribues=attributes,
@@ -1163,7 +1164,7 @@ class SFTPCommand:
 
                     candidates.append((
                         filepath,
-                        FileAttributes.from_sftp_attrs(entry.attrs),
+                        entry.attrs.to_file_attributes(),
                     ))
 
             else:
@@ -1217,13 +1218,13 @@ class SFTPCommand:
         if self._base_directory and self._base_directory not in srcpath:
             srcpath = posixpath.join(self._base_directory, srcpath)
 
-        attributes = FileAttributes.from_sftp_attrs(
+        attributes = (
             await self._handler.stat(
                 srcpath,
                 flags,
                 follow_symlinks=True,
             )
-        )
+        ).to_file_attributes()
 
         return (
             srcpath,
@@ -1264,7 +1265,7 @@ class SFTPCommand:
 
             srcpaths.append((
                 srcpath,
-                FileAttributes.from_sftp_attrs(match.attrs)
+                match.attrs.to_file_attributes()
             ))
 
         return srcpaths

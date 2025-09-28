@@ -36,7 +36,6 @@ from hyperscale.core.engines.client.ssh.protocol.ssh.constants import DEFAULT_LA
 from hyperscale.core.engines.client.ssh.protocol.ssh.connection import connect
 from hyperscale.core.engines.client.ssh.protocol.ssh.misc import BytesOrStr, FilePath, HostPort
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPError, SFTPFailure, SFTPBadMessage, SFTPConnectionLost
-from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPErrorHandler
 
 
 if TYPE_CHECKING:
@@ -151,12 +150,10 @@ class SCPHandler:
         self,
         reader: 'SSHReader[bytes]',
         writer: 'SSHWriter[bytes]',
-        error_handler: SFTPErrorHandler = None,
         server: bool = False,
     ):
         self._reader = reader
         self.writer = writer
-        self._error_handler = error_handler
         self._server = server
 
     async def await_response(self) -> Optional[Exception]:
@@ -255,8 +252,6 @@ class SCPHandler:
         if not getattr(exc, 'suppress_send', False):
             self.send_error(exc)
 
-        if self._error_handler and not getattr(exc, 'fatal', False):
-            self._error_handler(exc)
         elif not self._server:
             raise exc
 

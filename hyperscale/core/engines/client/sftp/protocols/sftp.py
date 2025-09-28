@@ -109,7 +109,7 @@ from hyperscale.core.engines.client.ssh.protocol.ssh.packet import PacketDecodeE
 
 from hyperscale.core.engines.client.ssh.protocol.ssh.version import __author__, __version__
 
-from hyperscale.core.engines.client.sftp.models import TransferResult, FileAttributes
+from hyperscale.core.testing.models.file.file_attributes import FileAttributes
 
 
 if TYPE_CHECKING:
@@ -1443,6 +1443,26 @@ class SFTPAttrs(Record):
     nlink: Optional[int]
     untrans_name: Optional[bytes]
     extended: Sequence[Tuple[bytes, bytes]] = ()
+
+    def to_file_attributes(self):
+        return FileAttributes(
+            type=self.type,
+            size=self.size,
+            alloc_size=self.alloc_size,
+            uid=self.uid,
+            gid=self.gid,
+            owner=self.owner,
+            group=self.group,
+            permissions=self.permissions,
+            atime=self.atime,
+            atime_ns=self.atime_ns,
+            crtime=self.crtime,
+            crtime_ns=self.crtime_ns,
+            mime_type=self.mime_type,
+            mtime=self.mtime,
+            mtime_ns=self.mtime_ns,
+            nlink=self.nlink,
+        )
 
     def _format_ns(self, k: str):
         """Convert epoch seconds & nanoseconds to a string date & time"""

@@ -2,8 +2,7 @@ from __future__ import annotations
 import msgspec
 from typing import Literal
 
-from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPAttrs
-from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPVFSAttrs
+from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPAttrs, SFTPVFSAttrs
 from hyperscale.core.testing.models.file.file_attributes import FileAttributes
 from .filesystem_attributes import FilesystemAttributes
 
@@ -111,7 +110,7 @@ class TransferResult(msgspec.Struct):
             case _:
                 return "OTHER"
             
-    @classmethod()
+    @classmethod
     def to_file_type_int(
         cls,
         file_type: ResultFileType,

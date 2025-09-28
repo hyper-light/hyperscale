@@ -1,0 +1,3 @@
+FILEXFER_TYPE_REGULAR               = 1
+FILEXFER_TYPE_DIRECTORY             = 2
+FILEXFER_TYPE_SYMLINK               = 3

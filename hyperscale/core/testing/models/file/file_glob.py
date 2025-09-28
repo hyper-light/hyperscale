@@ -2,13 +2,14 @@ import asyncio
 import pathlib
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypeVar, Generic
-from hyperscale.core.engines.client.ssh.protocol.ssh.constants import (
+
+from hyperscale.core.testing.models.base import OptimizedArg, FrozenDict
+
+from .constants import (
     FILEXFER_TYPE_SYMLINK,
     FILEXFER_TYPE_REGULAR,
     FILEXFER_TYPE_DIRECTORY,
 )
-
-from hyperscale.core.testing.models.base import OptimizedArg, FrozenDict
 from .file_attributes import FileAttributes
 from .file_glob_validator import FileGlobValidator
 

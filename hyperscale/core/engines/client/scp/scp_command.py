@@ -18,7 +18,8 @@ from .protocols import (
 )
 
 from hyperscale.core.engines.client.ssh.protocol.ssh.constants import FILEXFER_TYPE_DIRECTORY
-from hyperscale.core.engines.client.sftp.models import TransferResult, FileAttributes
+from hyperscale.core.engines.client.sftp.models import TransferResult
+from hyperscale.core.testing.models.file.file_attributes import FileAttributes
 
 
 TransferType = Literal["FILE", "DIRECTORY"]
