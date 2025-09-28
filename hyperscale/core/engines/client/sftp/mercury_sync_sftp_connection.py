@@ -80,7 +80,7 @@ class MercurySyncSFTPConnction:
         self.sftp_version: Literal[3, 4, 5, 6] = MIN_SFTP_VERSION
 
         self.path_encoding: str = 'utf-8'
-        self.env: dict[str, str] | None = None
+        self.env: dict[str, str] = {}
 
     async def get(
         self,
@@ -2313,7 +2313,7 @@ class MercurySyncSFTPConnction:
             timings["initialization_start"] = time.monotonic()
 
             handler = await connection.create_session(
-                env=self.env or (),
+                env=self.env,
                 sftp_version=self.sftp_version,
             )
 
