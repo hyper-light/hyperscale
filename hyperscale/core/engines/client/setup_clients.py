@@ -26,7 +26,6 @@ from .scp import MercurySyncSCPConnection
 from .scp.protocols import SCPConnection
 from .sftp import MercurySyncSFTPConnction
 from .sftp.protocols import SFTPConnection
-from .sftp.models import SFTPConnectionOptions
 from .ssh.models import ConnectionOptions
 from .smtp import MercurySyncSMTPConnection
 from .smtp.protocols import SMTPConnection
@@ -250,7 +249,7 @@ def setup_client(
             for _ in range(vus)
         ]
 
-        client._connection_options = SFTPConnectionOptions()
+        client._connection_options = ConnectionOptions()
 
     elif isinstance(client, MercurySyncSMTPConnection):
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)

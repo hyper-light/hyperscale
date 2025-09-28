@@ -61,14 +61,13 @@ class SFTPConnection:
     async def create_session(
         self,
         env: DefTuple[Env | None] = (),
-        send_env: DefTuple[EnvSeq | None] = (),
         sftp_version: int = MIN_SFTP_VERSION
     ) -> SFTPClientHandler:
 
         writer, reader, _ = await self.connection.open_session(
             subsystem='sftp',
             env=env,
-            send_env=send_env,
+            send_env=env,
             encoding=None,
         )
 

@@ -79,6 +79,7 @@ class MercurySyncSCPConnection:
         destination_url: str | URL,
         source_path: str | pathlib.Path,
         destination_path: str | pathlib.Path,
+        connection_options: ConnectionOptions | None = None,
         username: str | None = None,
         password: str | None = None,
         disable_host_check: bool = False,
@@ -96,6 +97,7 @@ class MercurySyncSCPConnection:
                         destination_url,
                         source_path,
                         destination_path,
+                        connection_options=connection_options,
                         data=None,
                         username=username,
                         password=password,
@@ -142,6 +144,7 @@ class MercurySyncSCPConnection:
         path: str | pathlib.Path,
         data: DataType,
         attributes: FileAttributes | None = None,
+        connection_options: ConnectionOptions | None = None,
         username: str | None = None,
         password: str | None = None,
         disable_host_check: bool = False,
@@ -161,6 +164,7 @@ class MercurySyncSCPConnection:
                         path,
                         path,
                         attributes=attributes,
+                        connection_options=connection_options,
                         data=data,
                         username=username,
                         password=password,
@@ -200,6 +204,7 @@ class MercurySyncSCPConnection:
         self,
         url: str | URL,
         path: str | pathlib.Path,
+        connection_options: ConnectionOptions | None = None,
         username: str | None = None,
         password: str | None = None,
         disable_host_check: bool = False,
@@ -220,6 +225,7 @@ class MercurySyncSCPConnection:
                         path,
                         path,
                         data=None,
+                        connection_options=connection_options,
                         username=username,
                         password=password,
                         disable_host_check=disable_host_check,
@@ -260,6 +266,7 @@ class MercurySyncSCPConnection:
         destination_url: str | URL,
         local_path: str | pathlib.Path | pathlib.PurePath,
         dest_path: str | pathlib.Path| pathlib.PurePath,
+        connection_options: ConnectionOptions | None = None,
         data: str | bytes | File | FileGlob | None = None,
         attributes: FileAttributes | None = None,
         username: str | None = None,
@@ -295,7 +302,7 @@ class MercurySyncSCPConnection:
             connections = await self._create_connections(
                 source_url,
                 destination_url,
-                self._connection_options,
+                connection_options=connection_options,
                 username=username,
                 password=password,
                 disable_host_check=disable_host_check,
@@ -518,7 +525,7 @@ class MercurySyncSCPConnection:
         self,
         source_url: str | URL,
         destination_url: str | URL,
-        options: ConnectionOptions,
+        options: ConnectionOptions | None = None,
         username: str | None = None,
         password: str | None = None,
         disable_host_check: bool = False,
@@ -534,7 +541,10 @@ class MercurySyncSCPConnection:
         SFTPUrl | None,
     ]:
         
-        connection_options: dict[str, Any] = options.to_dict()
+        connection_options = self._connection_options.to_dict()
+        if options:
+            connection_options.update(options.to_dict())
+        
         if username:
             connection_options["username"] = username
 

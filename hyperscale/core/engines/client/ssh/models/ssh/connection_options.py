@@ -1,10 +1,17 @@
 import msgspec
 import pathlib
-from typing import Literal
+from typing import Literal, Any
 from hyperscale.core.engines.client.ssh.protocol.ssh.connection import ServerHostKeysHandler
 
 
+SFTPVersion = Literal["v3", "v4", "v5", "v6"]
+
 class ConnectionOptions(msgspec.Struct):
+    sftp_version: SFTPVersion = "v3",
+    path_encoding: str = 'utf-8',   
+    env: dict[str, str] | None = None,
+    remote_env: dict[str, str] | None = None,
+    connection_options: dict[str, Any] | None = None,
     known_hosts: tuple[str] | list[str] | None = None
     kex_algs: tuple[str] | list[str] | None = None
     proxy_command: str | list[str] | None = None

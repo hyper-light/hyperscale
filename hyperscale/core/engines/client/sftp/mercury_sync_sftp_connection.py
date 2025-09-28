@@ -3,7 +3,7 @@ import pathlib
 import time
 from collections import defaultdict
 from urllib.parse import urlparse, ParseResult
-from typing import Any
+from typing import Any, Literal
 from hyperscale.core.engines.client.shared.models import (
     URL as SFTPUrl,
     RequestType,
@@ -15,6 +15,8 @@ from hyperscale.core.testing.models import (
     File,
     FileGlob,
 )
+
+from hyperscale.core.engines.client.sftp.protocols.sftp import MIN_SFTP_VERSION
 from hyperscale.core.testing.models.file.file_attributes import FileAttributes
 from hyperscale.core.engines.client.shared.models import URLMetadata
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
@@ -24,7 +26,6 @@ from hyperscale.core.engines.client.shared.protocols import (
 
 from .models import (
     CommandType,
-    SFTPConnectionOptions,
     SFTPOptions,
     TransferResult,
     SFTPResponse,
@@ -33,9 +34,13 @@ from .models import (
     DesiredAccess,
     SFTPTimings,
 )
+
+from hyperscale.core.engines.client.ssh.models import ConnectionOptions
 from .protocols import SFTPConnection
 from .sftp_command import SFTPCommand
 
+
+SFTPVersion = Literal["v3", "v4", "v5", "v6"]
 
 
 class MercurySyncSFTPConnction:
@@ -67,16 +72,23 @@ class MercurySyncSFTPConnction:
         protocols = ProtocolMap()
         address_family, protocol = protocols[RequestType.SFTP]
 
-        self._connection_options: SFTPConnectionOptions | None = None
+        self._connection_options: ConnectionOptions = None
 
         self.address_family = address_family
         self.address_protocol = protocol
+
+        self.sftp_version: Literal[3, 4, 5, 6] = MIN_SFTP_VERSION
+
+        self.path_encoding: str = 'utf-8'
+        self.env: dict[str, str] | None = None
 
     async def get(
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
         desired_access: DesiredAccess | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         preserve: bool = False,
@@ -101,6 +113,8 @@ class MercurySyncSFTPConnction:
                             preserve=preserve,
                             recurse=recurse,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -130,9 +144,11 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
-        attriutes: FileAttributes,
         data: bytes | str | File,
+        attriutes: FileAttributes | None = None,
+        connection: ConnectionOptions | None = None,
         desired_access: DesiredAccess | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         username: str | None = None,
         password: str | None = None,
@@ -153,6 +169,8 @@ class MercurySyncSFTPConnction:
                             desired_access=desired_access,
                             flags=flags,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -183,7 +201,9 @@ class MercurySyncSFTPConnction:
         url: str | URL,
         path: str | pathlib.PurePath,
         follow_symlinks: bool = False,
+        connection: ConnectionOptions | None = None,
         desired_access: DesiredAccess | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         preserve: bool = False,
         recurse: bool = False,
@@ -207,6 +227,8 @@ class MercurySyncSFTPConnction:
                             preserve=preserve,
                             recurse=recurse,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -236,7 +258,9 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         pattern: str,
+        connection: ConnectionOptions | None = None,
         desired_access: DesiredAccess | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         preserve: bool = False,
@@ -261,6 +285,8 @@ class MercurySyncSFTPConnction:
                             preserve=preserve,
                             recurse=recurse,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -291,7 +317,9 @@ class MercurySyncSFTPConnction:
         url: str | URL,
         pattern: str,
         data: bytes | str | FileGlob,
+        connection: ConnectionOptions | None = None,
         attriutes: FileAttributes | None = None,
+        disable_host_check: bool = False,
         desired_access: DesiredAccess | None = None,
         flags: list[AttributeFlags] | None = None,
         username: str | None = None,
@@ -313,6 +341,8 @@ class MercurySyncSFTPConnction:
                             desired_access=desired_access,
                             flags=flags,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -342,7 +372,9 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         pattern: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
         desired_access: DesiredAccess | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         preserve: bool = False,
@@ -367,6 +399,8 @@ class MercurySyncSFTPConnction:
                             preserve=preserve,
                             recurse=recurse,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -396,6 +430,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         pattern: str,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -409,6 +445,8 @@ class MercurySyncSFTPConnction:
                         command_args=(
                             pattern,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -438,6 +476,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         pattern: str,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -451,6 +491,8 @@ class MercurySyncSFTPConnction:
                         command_args=(
                             pattern,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -481,6 +523,8 @@ class MercurySyncSFTPConnction:
         url: str | URL,
         path: str | pathlib.PurePath,
         attributes: FileAttributes | None = None,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         exist_ok: bool = False,
         username: str | None = None,
         password: str | None = None,
@@ -499,6 +543,8 @@ class MercurySyncSFTPConnction:
                         options=SFTPOptions(
                             exist_ok=exist_ok,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -528,6 +574,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -541,6 +589,8 @@ class MercurySyncSFTPConnction:
                         command_args=(
                             path,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -570,6 +620,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -589,6 +641,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -618,6 +672,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -637,6 +693,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -666,6 +724,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         attributes: FileAttributes | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -685,6 +745,8 @@ class MercurySyncSFTPConnction:
                         options=SFTPOptions(
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -715,6 +777,8 @@ class MercurySyncSFTPConnction:
         url: str | URL,
         path: str | pathlib.PurePath,
         size: int,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         follow_symlinks: bool = False,
         username: str | None = None,
         password: str | None = None,
@@ -733,6 +797,8 @@ class MercurySyncSFTPConnction:
                         options=SFTPOptions(
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -762,6 +828,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         uid: int | None = None,
         gid: int | None = None,
         owner: str | None = None,
@@ -785,6 +853,8 @@ class MercurySyncSFTPConnction:
                             owner=owner,
                             group=group,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -814,6 +884,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -827,6 +899,8 @@ class MercurySyncSFTPConnction:
                         command_args=(
                             path,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -856,6 +930,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         nanoseconds: tuple[int, int]  | None = None,
         times: tuple[float, float] | None = None,
         username: str | None = None,
@@ -875,6 +951,8 @@ class MercurySyncSFTPConnction:
                             nanoseconds=nanoseconds,
                             times=times,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -904,6 +982,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -923,6 +1003,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -952,6 +1034,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -971,6 +1055,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1000,6 +1086,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -1019,6 +1107,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1048,6 +1138,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -1067,6 +1159,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1096,6 +1190,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -1115,6 +1211,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1144,6 +1242,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -1163,6 +1263,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1192,6 +1294,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -1211,6 +1315,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1240,6 +1346,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -1259,6 +1367,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1288,6 +1398,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -1307,6 +1419,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1336,6 +1450,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -1355,6 +1471,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1384,6 +1502,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -1403,6 +1523,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1432,6 +1554,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
@@ -1451,6 +1575,8 @@ class MercurySyncSFTPConnction:
                             flags=flags,
                             follow_symlinks=follow_symlinks,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1480,6 +1606,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -1493,6 +1621,8 @@ class MercurySyncSFTPConnction:
                         command_args=(
                             path,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1522,6 +1652,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -1535,6 +1667,8 @@ class MercurySyncSFTPConnction:
                         command_args=(
                             path,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1565,6 +1699,8 @@ class MercurySyncSFTPConnction:
         url: str | URL,
         from_path: str | pathlib.PurePath,
         to_path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         username: str | None = None,
         password: str | None = None,
@@ -1583,6 +1719,8 @@ class MercurySyncSFTPConnction:
                         options=SFTPOptions(
                             flags=flags,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1613,6 +1751,8 @@ class MercurySyncSFTPConnction:
         url: str | URL,
         from_path: str | pathlib.PurePath,
         to_path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         flags: list[AttributeFlags] | None = None,
         username: str | None = None,
         password: str | None = None,
@@ -1631,6 +1771,8 @@ class MercurySyncSFTPConnction:
                         options=SFTPOptions(
                             flags=flags,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1660,6 +1802,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -1673,6 +1817,8 @@ class MercurySyncSFTPConnction:
                         command_args=(
                             path,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1703,6 +1849,8 @@ class MercurySyncSFTPConnction:
         url: str | URL,
         path: str | pathlib.PurePath,
         attributes: FileAttributes | None = None,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -1717,6 +1865,8 @@ class MercurySyncSFTPConnction:
                             path,
                             attributes,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1746,6 +1896,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -1759,6 +1911,8 @@ class MercurySyncSFTPConnction:
                         command_args=(
                             path,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1790,6 +1944,8 @@ class MercurySyncSFTPConnction:
         path: str | pathlib.PurePath,
         check: CheckType = "none",
         compose_paths: list[str | pathlib.PurePath] | None = None,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -1807,6 +1963,8 @@ class MercurySyncSFTPConnction:
                           check=check,
                           compose_paths=compose_paths,  
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1837,6 +1995,8 @@ class MercurySyncSFTPConnction:
         url: str | URL,
         check: CheckType = "none",
         compose_paths: list[str | pathlib.PurePath] | None = None,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -1851,6 +2011,8 @@ class MercurySyncSFTPConnction:
                           check=check,
                           compose_paths=compose_paths,  
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -1880,6 +2042,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
+        connection: ConnectionOptions | None = None,
+        disable_host_check: bool = False,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -1893,6 +2057,8 @@ class MercurySyncSFTPConnction:
                         command_args=(
                             path,
                         ),
+                        connection_options=connection,
+                        disable_host_check=disable_host_check,
                         username=username,
                         password=password,
                     ),
@@ -2058,10 +2224,12 @@ class MercurySyncSFTPConnction:
         self,
         command_type: CommandType,
         request_url: str | URL,
+        connection_options: ConnectionOptions | None = None,
         command_args: tuple[Any, ...]  | None = None,
         options: SFTPOptions | None = None,
         username: str | None = None,
         password: str | None = None,
+        disable_host_check: bool = False,
     ):
         timings: dict[
             SFTPTimings,
@@ -2089,15 +2257,28 @@ class MercurySyncSFTPConnction:
         try:
             timings["connect_start"] = time.monotonic()
 
+            default_connection_options = self._connection_options.to_dict()
+            if connection_options:
+                default_connection_options.update(
+                    connection_options.to_dict(),
+                )
+
+            if username:
+                default_connection_options["username"] = username
+
+            if password:
+                default_connection_options["password"] = password
+
+            if disable_host_check:
+                default_connection_options['known_hosts'] = None
+
             (
                 err,
                 connection,
                 url,
             ) = await self._connect(
                 request_url,
-                username=username,
-                password=password,
-                **self._connection_options.options,
+                **default_connection_options,
             )
 
             if err:
@@ -2120,16 +2301,15 @@ class MercurySyncSFTPConnction:
             timings["initialization_start"] = time.monotonic()
 
             handler = await connection.create_session(
-                env=self._connection_options.env or (),
-                send_env=self._connection_options.remote_env or (),
-                sftp_version=self._connection_options.sftp_version,
+                env=self.env or (),
+                sftp_version=self.sftp_version,
             )
 
             timings["initialization_end"] = time.monotonic()
 
             command = SFTPCommand(
                 handler,
-                path_encoding=self._connection_options.path_encoding,
+                path_encoding=self.path_encoding,
             )
 
             timings["execution_start"] = time.monotonic()

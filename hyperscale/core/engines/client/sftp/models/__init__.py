@@ -2,7 +2,6 @@ from .command_type import CommandType as CommandType
 from .filesystem_attributes import FilesystemAttributes as FilesystemAttributes
 from .transfer_result import TransferResult as TransferResult
 from .transfer_result import ResultFileType as ResultFileType
-from .sftp_connection_options import SFTPConnectionOptions as SFTPConnectionOptions
 from .sftp_options import SFTPOptions as SFTPOptions
 from .sftp_options import AttributeFlags as AttributeFlags
 from .sftp_options import CheckType as CheckType
