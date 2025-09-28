@@ -19,7 +19,7 @@ from hyperscale.core.engines.client.shared.protocols import (
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from hyperscale.core.engines.client.ssh.protocol.ssh.connection import SSHClientConnectionOptions
 from hyperscale.core.engines.client.sftp.models import TransferResult
-from hyperscale.core.engines.client.sftp.protocols.file import File
+from hyperscale.core.engines.client.sftp.protocols.scp_file import SCPFile
 from .models.scp import SCPOptions, SCPResponse, SCPTimings
 from .scp_command import SCPCommand
 from .protocols import (
@@ -30,7 +30,7 @@ from .protocols import (
 
 
 CommandType = Literal["COPY", "SEND", "RECEIVE"]
-DataType = str | list[str] | File | list[File]
+DataType = str | list[str] | SCPFile | list[SCPFile]
 
 
 class MercurySyncSCPConnction:
@@ -367,7 +367,7 @@ class MercurySyncSCPConnction:
                     
                     if isinstance(data, list):
                         prepared_data =[
-                            File(
+                            SCPFile(
                                 local_path.encode(),
                                 item.encode(),
                             )
@@ -377,7 +377,7 @@ class MercurySyncSCPConnction:
                         ]
 
                     elif isinstance(data, str):
-                        prepared_data = File(
+                        prepared_data = SCPFile(
                             local_path.encode(),
                             data.encode(),
                         )

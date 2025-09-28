@@ -4,7 +4,7 @@ from types import TracebackType
 
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPAttrs, SFTPName
 from hyperscale.core.engines.client.ssh.protocol.ssh.constants import FILEXFER_TYPE_DIRECTORY
-from .file import File
+from .file import SCPFile
 
 
 class Directory:
@@ -22,7 +22,7 @@ class Directory:
     ):
         
         self.path = path
-        self.files: dict[str, File | Directory] = {}
+        self.files: dict[str, SCPFile | Directory] = {}
 
         self.file_type_name = "DIRECTORY"
         self.file_type = FILEXFER_TYPE_DIRECTORY

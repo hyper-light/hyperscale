@@ -17,7 +17,7 @@ from .protocols import (
 )
 
 from hyperscale.core.engines.client.ssh.protocol.ssh.constants import FILEXFER_TYPE_DIRECTORY
-from hyperscale.core.engines.client.sftp.protocols.file import File
+from hyperscale.core.engines.client.sftp.protocols.scp_file import SCPFile
 from hyperscale.core.engines.client.sftp.models import TransferResult, FileAttributes
 
 
@@ -69,7 +69,7 @@ class SCPCommand:
     
     async def send(
         self,
-        data: File | list[File],
+        data: SCPFile | list[SCPFile],
     ):
 
         exc = await self._dest.await_response()
@@ -384,14 +384,14 @@ class SCPCommand:
     async def _send_dir(
         self,
         srcpath: bytes,
-        data: dict[bytes, bytes | File],
+        data: dict[bytes, bytes | SCPFile],
         attrs: SFTPAttrs,
     ) -> None:
 
         await self._make_cd_request(b'D', attrs, 0, srcpath)
 
         files = {
-            filename: File(
+            filename: SCPFile(
                 filename,
                 file_data,
             ) if isinstance(
@@ -414,7 +414,7 @@ class SCPCommand:
 
     async def _send_files(
         self,
-        file: File | list[File],
+        file: SCPFile | list[SCPFile],
     ) -> None:
         
 

@@ -18,7 +18,7 @@ FileType = Literal[
 
 
 
-class File:
+class SCPFile:
 
     def __init__(
         self,
