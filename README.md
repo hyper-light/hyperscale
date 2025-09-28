@@ -8,7 +8,7 @@
 
 | Package     | Hyperscale                                                      |
 | ----------- | -----------                                                     |
-| Version     | 0.6.1                                                           |
+| Version     | 0.6.2                                                           |
 | Download    | https://pypi.org/project/hyperscale/                            | 
 | Source      | https://github.com/hyper-light/hyperscale                       |
 | Keywords    | performance, testing, async, distributed, graph, DAG, workflow  |
@@ -227,6 +227,7 @@ Below find a tables of Hyperscale's supported client and reporting options, as w
 
 | Client           | Additional Install Option                                       |  Dependencies                 |
 | -----------      | -----------                                                     |------------                   |
+| FTP              | N/A                                                             | N/A                           |
 | HTTP             | N/A                                                             | N/A                           |
 | HTTP2            | N/A                                                             | N/A                           |
 | HTTP3 (unstable) | pip install hyperscale[http3]                                   | aioquic                       |

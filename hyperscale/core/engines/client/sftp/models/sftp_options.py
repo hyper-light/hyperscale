@@ -80,6 +80,7 @@ class SFTPOptions:
         "nanoseconds",
         "owner",
         "permissions",
+        "preserve",
         "recurse",
         "times",
         "uid",
@@ -92,7 +93,6 @@ class SFTPOptions:
         self,
         recurse: bool = False,
         follow_symlinks: bool = False,
-        # desired_access: int = ACE4_READ_DATA | ACE4_READ_ATTRIBUTES,
         exist_ok: bool = False,
         check: CheckType = "none",
         desired_access: list[DesiredAccess] | None = None,
@@ -102,6 +102,7 @@ class SFTPOptions:
         owner: str | None = None,
         group: str | None = None,
         permissions: int = 644,
+        preserve: BrokenPipeError = False,
         times: tuple[float, float] | None = None,
         nanoseconds: tuple[int, int] | None = None,
         compose_paths: list[str | pathlib.PurePath] | None = None
@@ -116,6 +117,7 @@ class SFTPOptions:
         self.uid = uid
         self.nanoseconds = nanoseconds
         self.times = times
+        self.preserve = preserve
 
         if compose_paths is None:
             compose_paths = []

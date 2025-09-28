@@ -6,7 +6,7 @@ def run():
     start = time.monotonic()
 
     [
-        x for x in range(iters) for y in range(iters)
+        x for x in range(iters)
     ]
 
     elapsed = time.monotonic() - start

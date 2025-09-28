@@ -2,6 +2,7 @@ import asyncio
 import pathlib
 import time
 from collections import defaultdict
+from urllib.parse import urlparse, ParseResult
 from typing import Any, Literal
 from hyperscale.core.engines.client.shared.models import (
     URL as SFTPUrl,
@@ -12,6 +13,7 @@ from hyperscale.core.testing.models import (
     Auth,
     Data,
 )
+from hyperscale.core.engines.client.shared.models import URLMetadata
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from hyperscale.core.engines.client.shared.protocols import (
     ProtocolMap,
@@ -23,6 +25,7 @@ from .models import (
     SFTPOptions,
     TransferResult,
     SFTPResponse,
+    FileAttributes,
     AttributeFlags,
     CheckType,
     DesiredAccess,
@@ -72,17 +75,1992 @@ class MercurySyncSFTPConnction:
 
     async def get(
         self,
+        url: str | URL,
         path: str | pathlib.PurePath,
-        
+        desired_access: DesiredAccess | None = None,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        preserve: bool = False,
+        recurse: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
     ):
-        pass
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "get",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            desired_access=desired_access,
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                            preserve=preserve,
+                            recurse=recurse,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
 
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="get",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+
+    async def put(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        attriutes: FileAttributes,
+        data: bytes,
+        desired_access: DesiredAccess | None = None,
+        flags: list[AttributeFlags] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "put",
+                        url,
+                        command_args=(
+                            path,
+                            attriutes,
+                            data,
+                        ),
+                        options=SFTPOptions(
+                            desired_access=desired_access,
+                            flags=flags,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="put",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def copy(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        follow_symlinks: bool = False,
+        desired_access: DesiredAccess | None = None,
+        flags: list[AttributeFlags] | None = None,
+        preserve: bool = False,
+        recurse: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "copy",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            desired_access=desired_access,
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                            preserve=preserve,
+                            recurse=recurse,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="copy",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def mget(
+        self,
+        url: str | URL,
+        pattern: str,
+        desired_access: DesiredAccess | None = None,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        preserve: bool = False,
+        recurse: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "mget",
+                        url,
+                        command_args=(
+                            pattern,
+                        ),
+                        options=SFTPOptions(
+                            desired_access=desired_access,
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                            preserve=preserve,
+                            recurse=recurse,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="mget",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def mput(
+        self,
+        url: str | URL,
+        pattern: str,
+        attriutes: FileAttributes,
+        data: bytes,
+        desired_access: DesiredAccess | None = None,
+        flags: list[AttributeFlags] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "mput",
+                        url,
+                        command_args=(
+                            pattern,
+                            attriutes,
+                            data,
+                        ),
+                        options=SFTPOptions(
+                            desired_access=desired_access,
+                            flags=flags,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="mput",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def mcopy(
+        self,
+        url: str | URL,
+        pattern: str | pathlib.PurePath,
+        desired_access: DesiredAccess | None = None,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        preserve: bool = False,
+        recurse: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "mcopy",
+                        url,
+                        command_args=(
+                            pattern,
+                        ),
+                        options=SFTPOptions(
+                            desired_access=desired_access,
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                            preserve=preserve,
+                            recurse=recurse,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="mcopy",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def glob(
+        self,
+        url: str | URL,
+        pattern: str,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "glob",
+                        url,
+                        command_args=(
+                            pattern,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="glob",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def glob_sftpname(
+        self,
+        url: str | URL,
+        pattern: str,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "glob_sftpname",
+                        url,
+                        command_args=(
+                            pattern,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="glob_sftpname",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def makedirs(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        attributes: FileAttributes,
+        exist_ok: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "makedirs",
+                        url,
+                        command_args=(
+                            path,
+                            attributes,
+                        ),
+                        options=SFTPOptions(
+                            exist_ok=exist_ok,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="makedirs",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def rmtree(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "rmtree",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="rmtree",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def stat(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "stat",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="stat",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+    
+    async def lstat(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "lstat",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="lstat",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def setstat(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        attributes: FileAttributes,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "setstat",
+                        url,
+                        command_args=(
+                            path,
+                            attributes,
+                        ),
+                        options=SFTPOptions(
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="setstat",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def truncate(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        size: int,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "truncate",
+                        url,
+                        command_args=(
+                            path,
+                            size,
+                        ),
+                        options=SFTPOptions(
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="truncate",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def chown(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        uid: int | None = None,
+        gid: int | None = None,
+        owner: str | None = None,
+        group: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "chown",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            uid=uid,
+                            gid=gid,
+                            owner=owner,
+                            group=group,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="chown",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def statvfs(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "statvfs",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="statvfs",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def utime(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        nanoseconds: tuple[int, int]  | None = None,
+        times: tuple[float, float] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "utime",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            nanoseconds=nanoseconds,
+                            times=times,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="utime",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def exists(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "exists",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="exists",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def lexists(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "lexists",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="lexists",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def getatime(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "getatime",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="getatime",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def getatime_ns(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "getatime_ns",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="getatime_ns",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def getcrtime(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "getcrtime",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="getcrtime",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def getcrtime_ns(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "getcrtime_ns",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="getcrtime_ns",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def getmtime(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "getmtime",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="getmtime",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def getmtime_ns(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "getmtime_ns",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="getmtime_ns",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def getsize(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "getsize",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="getsize",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def isdir(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "isdir",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="isdir",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def isfile(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "isfile",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="isfile",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def islink(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        follow_symlinks: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "islink",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                            follow_symlinks=follow_symlinks,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="islink",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def remove(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "remove",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="remove",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def unlink(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "unlink",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="unlink",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def rename(
+        self,
+        url: str | URL,
+        from_path: str | pathlib.PurePath,
+        to_path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "rename",
+                        url,
+                        command_args=(
+                            from_path,
+                            to_path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="rename",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def posix_rename(
+        self,
+        url: str | URL,
+        from_path: str | pathlib.PurePath,
+        to_path: str | pathlib.PurePath,
+        flags: list[AttributeFlags] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "posix_rename",
+                        url,
+                        command_args=(
+                            from_path,
+                            to_path,
+                        ),
+                        options=SFTPOptions(
+                            flags=flags,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="posix_rename",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def scandir(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "scandir",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="scandir",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def mkdir(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        attributes: FileAttributes,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "mkdir",
+                        url,
+                        command_args=(
+                            path,
+                            attributes,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="mkdir",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def rmdir(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "rmdir",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="rmdir",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def realpath(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        check: bool = FileAttributes,
+        compose_paths: list[str | pathlib.PurePath] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "realpath",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                          check=check,
+                          compose_paths=compose_paths,  
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="realpath",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def getcwd(
+        self,
+        url: str | URL,
+        check: bool = FileAttributes,
+        compose_paths: list[str | pathlib.PurePath] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "getcwd",
+                        url,
+                        options=SFTPOptions(
+                          check=check,
+                          compose_paths=compose_paths,  
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="getcwd",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def readlink(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "readlink",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="readlink",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def symlink(
+        self,
+        url: str | URL,
+        from_path: str | pathlib.Path,
+        to_path: str | pathlib.Path,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "symlink",
+                        url,
+                        command_args=(
+                            from_path,
+                            to_path,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="symlink",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def link(
+        self,
+        url: str | URL,
+        from_path: str | pathlib.Path,
+        to_path: str | pathlib.Path,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "link",
+                        url,
+                        command_args=(
+                            from_path,
+                            to_path,
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="link",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
+    async def chdir(
+        self,
+        url: str | URL,
+        path: str | pathlib.PurePath,
+        check: bool = FileAttributes,
+        compose_paths: list[str | pathlib.PurePath] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: int | float | None = None,
+    ):
+        async with self._semaphore:
+            try:
+                return await asyncio.wait_for(
+                    self._execute(
+                        "chdir",
+                        url,
+                        command_args=(
+                            path,
+                        ),
+                        options=SFTPOptions(
+                          check=check,
+                          compose_paths=compose_paths,  
+                        ),
+                        username=username,
+                        password=password,
+                    ),
+                    timeout=timeout,
+                )
+
+            except asyncio.TimeoutError:
+                if isinstance(url, str):
+                    url_data = urlparse(url)
+
+                else:
+                    url_data = url.optimized.parsed
+
+                return SFTPResponse(
+                    url=URLMetadata(
+                        host=url_data.hostname,
+                        path=url_data.path,
+                        params=url_data.params,
+                        query=url_data.query,
+                    ),
+                    action="chdir",
+                    error=asyncio.TimeoutError('Timed out.'),
+                    timings={},
+                )
+            
     async def _execute(
         self,
         command_type: CommandType,
         request_url: str | URL,
-        command_args: tuple[Any, ...],
-        options: SFTPOptions,
+        command_args: tuple[Any, ...]  | None = None,
+        options: SFTPOptions | None = None,
         username: str | None = None,
         password: str | None = None,
     ):
@@ -112,9 +2090,6 @@ class MercurySyncSFTPConnction:
         if command_args is None:
             command_args = ()
 
-        if command_options is None:
-            command_options = {}
-
         timings["request_start"] = time.monotonic()
 
         connection: SFTPConnection | None = None
@@ -125,7 +2100,7 @@ class MercurySyncSFTPConnction:
             (
                 err,
                 connection,
-                _,
+                url,
             ) = await self._connect(
                 request_url,
                 username=username,
@@ -138,7 +2113,12 @@ class MercurySyncSFTPConnction:
                 self._connections.append(SFTPConnection())
                 
                 return SFTPResponse(
-                    url=request_url,
+                    url=URLMetadata(
+                        host=url.hostname,
+                        path=url.path,
+                        params=url.params,
+                        query=url.query,
+                    ),
                     action=command_type,
                     timings=timings,
                     error=err,
@@ -311,8 +2291,15 @@ class MercurySyncSFTPConnction:
 
             timings["request_end"] = time.monotonic()
 
+            command.exit()
+
             return SFTPResponse(
-                url=request_url,
+                url=URLMetadata(
+                    host=url.hostname,
+                    path=url.path,
+                    params=url.params,
+                    query=url.query,
+                ),
                 action=command_type,
                 transferred=transferred,
                 timings=timings,
@@ -326,8 +2313,21 @@ class MercurySyncSFTPConnction:
                 SFTPConnection()
             )
 
+
+            if isinstance(request_url, str):
+                request_url: ParseResult = urlparse(request_url)
+
+            elif isinstance(request_url, URL) and request_url.optimized:
+                request_url: ParseResult = request_url.optimized.parsed
+
+
             return SFTPResponse(
-                url=request_url,
+                url=URLMetadata(
+                    host=request_url.hostname,
+                    path=request_url.path,
+                    params=request_url.params,
+                    query=request_url.query,
+                ),
                 action=command_type,
                 timings=timings,
                 error=err,
@@ -420,3 +2420,7 @@ class MercurySyncSFTPConnction:
             sftp_connection,
             parsed_url,
         )
+    
+    def close(self):
+        for connection in self._connections:
+            connection.close()

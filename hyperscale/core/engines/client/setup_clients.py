@@ -51,6 +51,7 @@ def setup_client(
         ),
     ):
         client._concurrency = vus
+        client._loop = asyncio.get_event_loop()
         client.reset_connections = reset_connections
         client._control_connections = [
             FTPConnection(
@@ -71,6 +72,16 @@ def setup_client(
 
         client._ssl_context = ctx
         client._semaphore = asyncio.Semaphore(vus)
+
+        client._227_re = re.compile(
+            r'(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)', 
+            re.ASCII,
+        )
+
+        client._150_re = re.compile(
+            r"150 .* \((\d+) bytes\)", 
+            re.IGNORECASE | re.ASCII,
+        )
 
     elif isinstance(
         client,

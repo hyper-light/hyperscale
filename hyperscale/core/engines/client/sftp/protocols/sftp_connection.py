@@ -91,5 +91,9 @@ class SFTPConnection:
         await handler.request_limits()
 
         return handler
+    
+    def close(self):
+        if self.connection:
+            self.connection.close()
 
 

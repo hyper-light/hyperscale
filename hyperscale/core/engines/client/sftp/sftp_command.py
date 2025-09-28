@@ -22,6 +22,7 @@ from hyperscale.core.engines.client.ssh.protocol.ssh.constants import (
 
 from .models import (
     FileAttributes,
+    File,
     FileGlob,
     SFTPOptions,
     TransferResult,
@@ -238,12 +239,27 @@ class SFTPCommand:
         self,
         path: str | pathlib.PurePath,
         attributes: FileAttributes,
-        data: bytes,
+        data: bytes | str | File,
         options: SFTPOptions,
     ):
         
         if isinstance(path, pathlib.Path):
             path = str(path)
+
+        if isinstance(data, str):
+            data = await data.encode()
+
+        elif isinstance(data, File):
+            (
+                _,
+                data,
+                attributes,
+            ) = await data.load(
+                self._loop,
+                path,
+                attributes,
+                self._path_encoding,
+            )
 
         dstpath: bytes = path.encode(encoding=self._path_encoding)
 
@@ -551,7 +567,7 @@ class SFTPCommand:
     
     async def mget(
         self,
-        pattern: str | pathlib.PurePath,
+        pattern: str,
         options: SFTPOptions,
     ):
 
@@ -687,7 +703,7 @@ class SFTPCommand:
 
     async def mput(
         self,
-        path: str | pathlib.PurePath,
+        path: str,
         attributes: FileAttributes,
         data: bytes | FileGlob,
         options: SFTPOptions,
@@ -823,14 +839,14 @@ class SFTPCommand:
 
     async def mcopy(
         self,
-        path: str | pathlib.PurePath,
+        pattern: str,
         options: SFTPOptions,
     ):
       
         transferred: dict[bytes, TransferResult] = {}
         glob = SFTPGlob(self._handler, False)
         found = await self._glob_remote_paths(
-            path,
+            pattern,
             glob,
         )
 
@@ -1637,7 +1653,6 @@ class SFTPCommand:
                 ),
             }
         )
-
 
     async def getcrtime(
         self,
