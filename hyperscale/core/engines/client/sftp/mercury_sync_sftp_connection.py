@@ -12,7 +12,10 @@ from hyperscale.core.testing.models import (
     URL,
     Auth,
     Data,
+    File,
+    FileGlob,
 )
+from hyperscale.core.testing.models.file.file_attributes import FileAttributes
 from hyperscale.core.engines.client.shared.models import URLMetadata
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from hyperscale.core.engines.client.shared.protocols import (
@@ -25,7 +28,6 @@ from .models import (
     SFTPOptions,
     TransferResult,
     SFTPResponse,
-    FileAttributes,
     AttributeFlags,
     CheckType,
     DesiredAccess,
@@ -108,7 +110,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -123,7 +125,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="get",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
 
@@ -132,7 +134,7 @@ class MercurySyncSFTPConnction:
         url: str | URL,
         path: str | pathlib.PurePath,
         attriutes: FileAttributes,
-        data: bytes,
+        data: bytes | str | File,
         desired_access: DesiredAccess | None = None,
         flags: list[AttributeFlags] | None = None,
         username: str | None = None,
@@ -160,7 +162,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -175,7 +177,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="put",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -214,7 +216,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -229,7 +231,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="copy",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -268,7 +270,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -283,7 +285,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="mget",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -291,8 +293,8 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         pattern: str,
-        attriutes: FileAttributes,
-        data: bytes,
+        data: bytes | str | FileGlob,
+        attriutes: FileAttributes | None = None,
         desired_access: DesiredAccess | None = None,
         flags: list[AttributeFlags] | None = None,
         username: str | None = None,
@@ -320,7 +322,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -335,7 +337,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="mput",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -374,7 +376,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -389,7 +391,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="mcopy",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -416,7 +418,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -431,7 +433,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="glob",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -458,7 +460,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -473,7 +475,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="glob_sftpname",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -481,7 +483,7 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
-        attributes: FileAttributes,
+        attributes: FileAttributes | None = None,
         exist_ok: bool = False,
         username: str | None = None,
         password: str | None = None,
@@ -506,7 +508,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -521,7 +523,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="makedirs",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -548,7 +550,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -563,7 +565,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="rmtree",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -596,7 +598,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -611,7 +613,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="stat",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
     
@@ -644,7 +646,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -659,7 +661,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="lstat",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -667,7 +669,7 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
-        attributes: FileAttributes,
+        attributes: FileAttributes | None = None,
         follow_symlinks: bool = False,
         username: str | None = None,
         password: str | None = None,
@@ -692,7 +694,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -707,7 +709,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="setstat",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -740,7 +742,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -755,7 +757,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="truncate",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -792,7 +794,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -807,7 +809,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="chown",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -834,7 +836,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -849,7 +851,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="statvfs",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -882,7 +884,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -897,7 +899,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="utime",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -930,7 +932,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -945,7 +947,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="exists",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -978,7 +980,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -993,7 +995,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="lexists",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1026,7 +1028,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1041,7 +1043,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="getatime",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1074,7 +1076,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1089,7 +1091,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="getatime_ns",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1122,7 +1124,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1137,7 +1139,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="getcrtime",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1170,7 +1172,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1185,7 +1187,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="getcrtime_ns",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1218,7 +1220,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1233,7 +1235,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="getmtime",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1266,7 +1268,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1281,7 +1283,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="getmtime_ns",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1314,7 +1316,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1329,7 +1331,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="getsize",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1362,7 +1364,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1377,7 +1379,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="isdir",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1410,7 +1412,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1425,7 +1427,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="isfile",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1458,7 +1460,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1473,7 +1475,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="islink",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1500,7 +1502,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1515,7 +1517,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="remove",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1542,7 +1544,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1557,7 +1559,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="unlink",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1590,7 +1592,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1605,7 +1607,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="rename",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1638,7 +1640,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1653,7 +1655,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="posix_rename",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1680,7 +1682,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1695,7 +1697,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="scandir",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1703,7 +1705,7 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
-        attributes: FileAttributes,
+        attributes: FileAttributes | None = None,
         username: str | None = None,
         password: str | None = None,
         timeout: int | float | None = None,
@@ -1724,7 +1726,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1739,7 +1741,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="mkdir",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1766,7 +1768,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1781,7 +1783,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="rmdir",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1814,7 +1816,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1829,7 +1831,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="realpath",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1858,7 +1860,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1873,7 +1875,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="getcwd",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1900,7 +1902,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1915,7 +1917,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="readlink",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1944,7 +1946,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -1959,7 +1961,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="symlink",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -1988,7 +1990,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -2003,7 +2005,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="link",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -2036,7 +2038,7 @@ class MercurySyncSFTPConnction:
                     timeout=timeout,
                 )
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as err:
                 if isinstance(url, str):
                     url_data = urlparse(url)
 
@@ -2051,7 +2053,7 @@ class MercurySyncSFTPConnction:
                         query=url_data.query,
                     ),
                     action="chdir",
-                    error=asyncio.TimeoutError('Timed out.'),
+                    error=err,
                     timings={},
                 )
             
@@ -2112,7 +2114,7 @@ class MercurySyncSFTPConnction:
                         params=url.params,
                         query=url.query,
                     ),
-                    action=command_type,
+                    operation=command_type,
                     timings=timings,
                     error=err,
                 )
@@ -2298,7 +2300,7 @@ class MercurySyncSFTPConnction:
                     params=url.params,
                     query=url.query,
                 ),
-                action=command_type,
+                operation=command_type,
                 transferred=transferred,
                 timings=timings,
 
@@ -2326,7 +2328,7 @@ class MercurySyncSFTPConnction:
                     params=request_url.params,
                     query=request_url.query,
                 ),
-                action=command_type,
+                operation=command_type,
                 timings=timings,
                 error=err,
             )

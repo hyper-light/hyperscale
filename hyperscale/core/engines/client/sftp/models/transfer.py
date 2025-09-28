@@ -1,5 +1,5 @@
 from typing import Literal
-from .file_attributes import FileAttributes
+from hyperscale.core.testing.models.file.file_attributes import FileAttributes
 
 
 Listing = dict[

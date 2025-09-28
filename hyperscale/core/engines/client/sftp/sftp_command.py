@@ -6,9 +6,7 @@ from collections import deque
 from typing import Deque
 
 from hyperscale.core.engines.client.ssh.protocol.ssh.constants import (
-    ACE4_READ_DATA,
     ACE4_APPEND_DATA,
-    ACE4_READ_ATTRIBUTES,
     FXF_APPEND,
     FXF_APPEND_DATA,
     FILEXFER_ATTR_DEFINED_V4,
@@ -19,11 +17,13 @@ from hyperscale.core.engines.client.ssh.protocol.ssh.constants import (
     FXRP_NO_CHECK,
     FXRP_STAT_IF_EXISTS,
 )
+from hyperscale.core.testing.models import (
+    File,
+    FileGlob,
+)
 
 from .models import (
     FileAttributes,
-    File,
-    FileGlob,
     SFTPOptions,
     TransferResult,
 )
@@ -37,7 +37,6 @@ from .protocols.sftp import (
     SFTPError,
     SFTPNotADirectory,
     SFTPLimits,
-    SFTPVFSAttrs,
     mode_to_pflags,
     utime_to_attrs,
     tuple_to_float_sec,
@@ -238,7 +237,7 @@ class SFTPCommand:
     async def put(
         self,
         path: str | pathlib.PurePath,
-        attributes: FileAttributes,
+        attributes: FileAttributes | None,
         data: bytes | str | File,
         options: SFTPOptions,
     ):
@@ -246,25 +245,23 @@ class SFTPCommand:
         if isinstance(path, pathlib.Path):
             path = str(path)
 
+        dstpath: bytes = path.encode(encoding=self._path_encoding)
+
         if isinstance(data, str):
-            data = await data.encode()
+            data: bytes = await data.encode()
 
         elif isinstance(data, File):
             (
-                _,
+                dstpath,
                 data,
                 attributes,
-            ) = await data.load(
-                self._loop,
-                path,
-                attributes,
-                self._path_encoding,
-            )
-
-        dstpath: bytes = path.encode(encoding=self._path_encoding)
+            ) = await data.optimized
 
         if self._base_directory and self._base_directory not in dstpath:
             dstpath = posixpath.join(self._base_directory, dstpath)
+
+        if attributes is None:
+            attributes = self._create_default_attributes(encoded_data=data)
 
         filetype = attributes.type
         start = time.monotonic()
@@ -704,21 +701,14 @@ class SFTPCommand:
     async def mput(
         self,
         path: str,
-        attributes: FileAttributes,
-        data: bytes | FileGlob,
+        attributes: FileAttributes | None,
+        data: bytes | str | FileGlob,
         options: SFTPOptions,
      ):
-
-
         transferred: dict[bytes, TransferResult] = {}
 
         if isinstance(data, FileGlob):
-            found = await data.load(
-                self._loop,
-                path,
-                attributes,
-                self._path_encoding,
-            )
+            found = await data.optimized
 
         else:
 
@@ -727,18 +717,24 @@ class SFTPCommand:
 
             dstpath: bytes = path.encode(encoding=self._path_encoding)
 
+            if isinstance(data, str):
+                data = data.encode()
+
             if self._base_directory and self._base_directory not in dstpath:
                 dstpath = posixpath.join(self._base_directory, dstpath)
 
+            if attributes is None:
+                attributes = self._create_default_attributes(encoded_data=data)
+
             found = [(
                 dstpath,
-                attributes,
                 data,
+                attributes,
             )]
             
         operation_start = time.monotonic()
 
-        for dstpath, attrs, data in found:
+        for dstpath, data, attrs in found:
 
             start = time.monotonic()
 
@@ -1088,7 +1084,7 @@ class SFTPCommand:
     async def makedirs(
         self,
         path: str | pathlib.PurePath,
-        attributes: FileAttributes,
+        attributes: FileAttributes | None,
         options: SFTPOptions,
     ):
 
@@ -1103,13 +1099,14 @@ class SFTPCommand:
         transferred: dict[bytes, TransferResult] = {}
         operation_start = time.monotonic() - start
 
+        if attributes is None:
+            attributes = self._create_default_attributes()
 
-        sftp_attrs = attributes
         start = time.monotonic()
 
         await self._make_directories(
             dstpath,
-            sftp_attrs,
+            attributes,
             exist_ok=options.exist_ok,
         )
         transferred[dstpath] = TransferResult(
@@ -1220,15 +1217,13 @@ class SFTPCommand:
         if self._base_directory and self._base_directory not in srcpath:
             srcpath = posixpath.join(self._base_directory, srcpath)
 
-        attributes: FileAttributes | None = None
-
-        srcattrs = await self._handler.stat(
-            srcpath,
-            flags,
-            follow_symlinks=True,
+        attributes = FileAttributes.from_sftp_attrs(
+            await self._handler.stat(
+                srcpath,
+                flags,
+                follow_symlinks=True,
+            )
         )
-        
-        attributes = FileAttributes.from_sftp_attrs(srcattrs)
 
         return (
             srcpath,
@@ -1388,7 +1383,7 @@ class SFTPCommand:
     async def setstat(
         self,
         path: str | pathlib.PurePath,
-        attributes: FileAttributes,
+        attributes: FileAttributes | None,
         options: SFTPOptions,
     ):
 
@@ -1399,6 +1394,9 @@ class SFTPCommand:
 
         if self._base_directory and self._base_directory not in dstpath:
             dstpath = posixpath.join(self._base_directory, dstpath)
+
+        if attributes is None:
+            attributes = self._create_default_attributes()
 
         start = time.monotonic()
 
@@ -2113,7 +2111,7 @@ class SFTPCommand:
     async def mkdir(
         self,
         path: str | pathlib.PurePath,
-        attributes: FileAttributes,
+        attributes: FileAttributes | None,
     ):
         if isinstance(path, pathlib.Path):
             path = str(path)
@@ -2121,6 +2119,9 @@ class SFTPCommand:
         dstpath: bytes = path.encode(encoding=self._path_encoding)
         if self._base_directory and self._base_directory not in dstpath:
             dstpath = posixpath.join(self._base_directory, dstpath)
+
+        if attributes is None:
+            attributes = self._create_default_attributes()
 
         start = time.monotonic()   
         await self._handler.mkdir(path, attributes)
@@ -2426,6 +2427,31 @@ class SFTPCommand:
                     file_transfer_elapsed=elapsed,
                 )
             }
+        )
+    
+    def _create_default_attributes(
+        self,
+        encoded_data: bytes | None = None,
+    ):
+
+        created = time.monotonic()
+        created_ns = time.monotonic_ns()
+
+        return FileAttributes(
+            type=TransferResult.to_file_type_int("FILE"),
+            size=len(encoded_data) if encoded_data else 0,
+            uid=1000,
+            gid=1000,
+            permissions=644,
+            crtime=created,
+            crtime_ns=created_ns,
+            atime=created,
+            atime_ns=created_ns,
+            ctime=created,
+            ctime_ns=created_ns,
+            created=created,
+            mtime_ns=created_ns,
+            mime_type="application/octet-stream",
         )
 
     def exit(self) -> None:

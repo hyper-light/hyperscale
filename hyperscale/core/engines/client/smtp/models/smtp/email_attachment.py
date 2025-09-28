@@ -1,6 +1,6 @@
-from pydantic import BaseModel, StrictStr
+import msgspec
 
 
-class EmailAttachment(BaseModel):
-    path: StrictStr
-    mime_type: StrictStr
+class EmailAttachment(msgspec.Struct):
+    path: str
+    mime_type: str

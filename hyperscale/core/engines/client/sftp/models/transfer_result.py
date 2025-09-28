@@ -1,11 +1,10 @@
 from __future__ import annotations
+import msgspec
 from typing import Literal
-
-from pydantic import BaseModel, StrictBytes, StrictInt, StrictFloat, StrictBool
 
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPAttrs
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPVFSAttrs
-from .file_attributes import FileAttributes
+from hyperscale.core.testing.models.file.file_attributes import FileAttributes
 from .filesystem_attributes import FilesystemAttributes
 
 
@@ -26,15 +25,15 @@ ResultFileType = Literal[
     "HARDLINK",
 ]
 
-class TransferResult(BaseModel):
-    file_path: StrictBytes
+class TransferResult(msgspec.Struct):
+    file_path: bytes
     file_type: ResultFileType | None = "FILE"
     file_listing: list[TransferResult] | None = None
-    file_data: StrictBytes | None = None
-    file_transfer_elapsed: StrictInt | StrictFloat = 0
+    file_data: bytes | None = None
+    file_transfer_elapsed: int | float = 0
     file_attribues: FileAttributes | None = None
     filesystem_attributes: FilesystemAttributes | None = None
-    file_transfer_at_end: StrictBool = True
+    file_transfer_at_end: bool = True
 
     @classmethod
     def to_attributes(

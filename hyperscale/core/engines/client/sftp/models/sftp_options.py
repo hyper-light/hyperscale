@@ -107,6 +107,9 @@ class SFTPOptions:
         nanoseconds: tuple[int, int] | None = None,
         compose_paths: list[str | pathlib.PurePath] | None = None
     ):
+        
+        
+
         self.recurse = recurse
         self.follow_symlinks = follow_symlinks
         self.exist_ok = exist_ok

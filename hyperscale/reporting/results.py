@@ -18,11 +18,12 @@ from hyperscale.core.engines.client.graphql import GraphQLResponse
 from hyperscale.core.engines.client.graphql_http2 import GraphQLHTTP2Response
 from hyperscale.core.engines.client.grpc import GRPCResponse
 from hyperscale.core.engines.client.http import HTTPResponse
-from hyperscale.core.engines.client.http2 import HTTP2Request
-from hyperscale.core.engines.client.http3 import HTTP3Request
+from hyperscale.core.engines.client.http2 import HTTP2Response
+from hyperscale.core.engines.client.http3 import HTTP3Response
 from hyperscale.core.engines.client.playwright import PlaywrightResult
 from hyperscale.core.engines.client.shared.models import RequestType
-from hyperscale.core.engines.client.scp import SCPResponse, SCPTimings
+from hyperscale.core.engines.client.scp import SCPResponse
+from hyperscale.core.engines.client.scp.models.scp.scp_response import SCPTimings
 from hyperscale.core.engines.client.smtp import SMTPResponse, SMTPTimings
 from hyperscale.core.engines.client.sftp import SFTPResponse, SFTPTimings
 from hyperscale.core.engines.client.tcp import TCPResponse
@@ -66,8 +67,8 @@ class Results:
             | Type[GraphQLHTTP2Response]
             | Type[GRPCResponse]
             | Type[HTTPResponse]
-            | Type[HTTP2Request]
-            | Type[HTTP3Request]
+            | Type[HTTP2Response]
+            | Type[HTTP3Response]
             | Type[PlaywrightResult]
             | Type[SCPResponse]
             | Type[SFTPResponse]
@@ -86,8 +87,8 @@ class Results:
                     | List[GraphQLHTTP2Response]
                     | List[GRPCResponse]
                     | List[HTTPResponse]
-                    | List[HTTP2Request]
-                    | List[HTTP3Request]
+                    | List[HTTP2Response]
+                    | List[HTTP3Response]
                     | List[PlaywrightResult]
                     | List[SMTPResponse]
                     | List[SFTPResponse]
@@ -323,8 +324,8 @@ class Results:
         | List[GraphQLHTTP2Response]
         | List[GRPCResponse]
         | List[HTTPResponse]
-        | List[HTTP2Request]
-        | List[HTTP3Request]
+        | List[HTTP2Response]
+        | List[HTTP3Response]
         | List[PlaywrightResult]
         | List[SCPResponse]
         | List[SFTPResponse]
@@ -867,8 +868,8 @@ class Results:
         | GraphQLHTTP2Response
         | GRPCResponse
         | HTTPResponse
-        | HTTP2Request
-        | HTTP3Request
+        | HTTP2Response
+        | HTTP3Response
         | TCPResponse
         | UDPResponse
         | WebsocketResponse,

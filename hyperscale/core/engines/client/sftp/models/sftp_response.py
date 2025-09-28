@@ -1,5 +1,4 @@
-from typing import Literal, TypeVar
-from pydantic import BaseModel, AnyUrl
+from typing import Literal
 from hyperscale.core.engines.client.shared.models import (
     CallResult,
     RequestType,
@@ -9,8 +8,6 @@ from hyperscale.core.engines.client.shared.models import (
 from .command_type import CommandType
 from .transfer_result import TransferResult
 
-
-T = TypeVar("T", bound=BaseModel)
 
 
 SFTPTimings = Literal[
@@ -30,7 +27,7 @@ SFTPTimings = Literal[
 
 class SFTPResponse(CallResult):
     url: URLMetadata
-    action: CommandType | None = None
+    operation: CommandType | None = None
     error: Exception | None = None
     transferred: dict[bytes, TransferResult] | None = None
     timings: dict[

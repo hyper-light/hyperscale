@@ -17,6 +17,8 @@ from .core.testing import Auth as Auth
 from .core.testing import Cookies as Cookies
 from .core.testing import Data as Data
 from .core.testing import Email as Email
+from .core.testing import File as File
+from .core.testing import FileGlob as FileGlob
 from .core.testing import Headers as Headers
 from .core.testing import Mutation as Mutation
 from .core.testing import Params as Params

@@ -1,7 +1,7 @@
-from pydantic import StrictStr
 from hyperscale.core.engines.client.shared.models import (
     CallResult,
     RequestType,
+    URLMetadata,
 )
 
 from typing import Literal
@@ -23,13 +23,11 @@ SCPTimings = Literal[
 
 
 class SCPResponse(CallResult):
-    source_url: StrictStr
-    destination_url: StrictStr
-    source_path: StrictStr
-    destination_path: StrictStr
+    source_url: URLMetadata
+    destination_url: URLMetadata
     operation: Literal["COPY", "SEND", "RECEIVE"]
     error: Exception | None = None
-    data: dict[StrictStr, TransferResult] | None = None
+    transferred: dict[bytes, TransferResult] | None = None
     timings: dict[
         SCPTimings,
         float | None,

@@ -1,6 +1,7 @@
 from typing import Literal, Any
 
 from hyperscale.core.engines.client.sftp.protocols.sftp import MIN_SFTP_VERSION
+from hyperscale.core.engines.client.ssh.models import ConnectionOptions
 
 
 SFTPVersion = Literal["v3", "v4", "v5", "v6"]
@@ -39,4 +40,6 @@ class SFTPConnectionOptions:
         self.path_encoding = path_encoding
         self.env = env
         self.remote_env = remote_env
-        self.options = options
+
+        connection_options = ConnectionOptions(**options)
+        self.options = connection_options.to_dict()

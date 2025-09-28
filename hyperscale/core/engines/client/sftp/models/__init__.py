@@ -1,5 +1,4 @@
 from .command_type import CommandType as CommandType
-from .file_attributes import FileAttributes as FileAttributes
 from .file import File as File
 from .file_glob import FileGlob as FileGlob
 from .filesystem_attributes import FilesystemAttributes as FilesystemAttributes

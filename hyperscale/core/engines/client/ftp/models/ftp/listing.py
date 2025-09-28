@@ -1,9 +1,9 @@
-from pydantic import BaseModel, StrictInt
+import msgspec
 from typing import Literal
 
 
-class Listing(BaseModel):
+class Listing(msgspec.Struct):
     type: Literal['dir', 'file']
-    modify: StrictInt
-    create: StrictInt
-    size: StrictInt | None = None
+    modify: int
+    create: int
+    size: int | None = None

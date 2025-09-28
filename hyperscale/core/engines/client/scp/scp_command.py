@@ -1,5 +1,6 @@
 import asyncio
 import time
+import io
 import pathlib
 import posixpath
 
@@ -17,7 +18,6 @@ from .protocols import (
 )
 
 from hyperscale.core.engines.client.ssh.protocol.ssh.constants import FILEXFER_TYPE_DIRECTORY
-from hyperscale.core.engines.client.sftp.protocols.scp_file import SCPFile
 from hyperscale.core.engines.client.sftp.models import TransferResult, FileAttributes
 
 
@@ -31,10 +31,12 @@ class SCPCommand:
         self,
         source: SCPHandler,
         dest: SCPHandler,
+        loop: asyncio.AbstractEventLoop,
         block_size: int = SCP_BLOCK_SIZE,
         recurse: bool = False,
         preserve: bool = False,
         must_be_dir: bool = False,
+        path_encoding: str = 'utf-8'
 
     ):
         self._source = source
@@ -45,40 +47,42 @@ class SCPCommand:
         self._recurse = recurse
         self._preserve = preserve
         self._must_be_dir = must_be_dir
+        self._loop = loop
+        self._path_encoding = path_encoding
 
-    async def copy(self) -> None:
-        await self._copy_files()
-
-        return self._filesystem
+    async def copy(self):
+        return await self._copy_files()
 
     async def receive(
         self,
         dstpath: str | pathlib.PurePath,
-    ) -> None:
+    ):
 
         if isinstance(dstpath, pathlib.PurePath):
-            dstpath = str(dstpath)
+            dstpath = str(dstpath).encode()
 
-        if isinstance(dstpath, str):
-            dstpath = dstpath.encode('utf-8')
+        elif isinstance(dstpath, str):
+            dstpath = dstpath.encode()
 
 
-        await self._recv_files(dstpath)
-
-        return self._filesystem
+        return await self._recv_files(dstpath)
     
     async def send(
         self,
-        data: SCPFile | list[SCPFile],
+        files: list[
+            tuple[
+                bytes,
+                bytes,
+                FileAttributes,
+            ]
+        ],
     ):
 
         exc = await self._dest.await_response()
         if exc:
             raise exc
         
-        await self._send_files(data)
-
-        return self._filesystem
+        return await self._send_files(files)
 
     def _handle_error(self, exc: Exception) -> None:
 
@@ -139,7 +143,7 @@ class SCPCommand:
 
         return bytes(buffer)
 
-    async def _copy_files(self) -> None:
+    async def _copy_files(self):
         """Copy files from one SCP server to another"""
 
         exc = await self._forward_response(self._dest, self._source)
@@ -150,6 +154,10 @@ class SCPCommand:
         pathlist: list[bytes] = []
         attrlist: list[SFTPAttrs] = []
         attrs = SFTPAttrs()
+
+        transferred: dict[bytes, TransferResult] = {}
+
+        operation_start = time.monotonic()
 
         while True:
 
@@ -194,7 +202,7 @@ class SCPCommand:
 
                         path = b'/'.join(pathlist)
                         
-                    self._filesystem[path] = TransferResult(
+                    transferred[path] = TransferResult(
                         file_path=path,
                         file_type=transfer_type,
                         file_data=data,
@@ -204,6 +212,7 @@ class SCPCommand:
 
                 finally:
                     attrs = SFTPAttrs()
+
             elif action == b'E':
                 if pathlist:
                     pathlist.pop()
@@ -215,6 +224,12 @@ class SCPCommand:
                 attrs.atime, attrs.mtime = parse_time_args(args)
             else:
                 raise scp_error(SFTPBadMessage, 'Unknown SCP action')
+        
+        elapsed = time.monotonic() - operation_start
+        return (
+            elapsed,
+            transferred,
+        )
 
     async def _recv_file(
         self,
@@ -259,8 +274,6 @@ class SCPCommand:
         return bytes(buffer)
         
     async def _recv_dir(self, dstpath: bytes) -> None:
-        """Receive a directory over SCP"""
-
         if not self._recurse:
             raise scp_error(SFTPBadMessage,
                              'Directory received without recurse')
@@ -271,12 +284,17 @@ class SCPCommand:
 
         await self._recv_files(dstpath)
 
-    async def _recv_files(self, dstpath: bytes) -> None:
-        """Receive files over SCP"""
+    async def _recv_files(
+        self,
+        dstpath: bytes,
+    ):
 
         self._source.send_ok()
 
         attrs = SFTPAttrs()
+        transferred: dict[bytes, TransferResult] = {}
+
+        operation_start = time.monotonic()
 
         while True:
 
@@ -327,7 +345,7 @@ class SCPCommand:
                             file_attrs = TransferResult.to_attributes(attrs)
 
                         
-                        self._filesystem[dstpath] = TransferResult(
+                        transferred[dstpath] = TransferResult(
                             file_path=dstpath,
                             file_type=transfer_type,
                             file_data=data,
@@ -342,9 +360,22 @@ class SCPCommand:
             except (OSError, SFTPError) as exc:
                 self._handle_error(exc)
 
-    async def _make_cd_request(self, action: bytes, attrs: SFTPAttrs,
-                               size: int, path: bytes) -> None:
+        elapsed = time.monotonic() - operation_start
+        return (
+            elapsed,
+            transferred,
+        )
+
+    async def _make_cd_request(
+        self,
+        action: Literal[b"C", b"D"],
+        attrs: FileAttributes,
+        size: int,
+        path: bytes,
+    ):
         """Make an SCP copy or dir request"""
+
+        start = time.monotonic()
 
         assert attrs.permissions is not None
 
@@ -353,6 +384,13 @@ class SCPCommand:
             action,
             args.encode('ascii'),
             pathlib.Path(str(path)).name.encode(),
+        )
+
+        return TransferResult(
+            file_path=path,
+            file_type="DIRECTORY" if action == b"D" else "FILE",
+            file_attribues=attrs,
+            file_transfer_elapsed=time.monotonic() - start
         )
 
     async def _make_transfer_request(self, attrs: SFTPAttrs) -> None:
@@ -368,8 +406,10 @@ class SCPCommand:
         self,
         srcpath: bytes,
         data: bytes,
-        attrs: SFTPAttrs,
-    ) -> None:
+        attrs: FileAttributes,
+    ):
+        
+        start = time.monotonic()
         
         await self._make_cd_request(b'C', attrs, len(data), srcpath)
 
@@ -380,88 +420,78 @@ class SCPCommand:
 
         if remote_exc:
             raise remote_exc
+        
+        return TransferResult(
+            file_path=srcpath,
+            file_data=data,
+            file_type="FILE",
+            file_attribues=attrs,
+            file_transfer_elapsed=time.monotonic() - start,
+        )
 
     async def _send_dir(
         self,
         srcpath: bytes,
-        data: dict[bytes, bytes | SCPFile],
-        attrs: SFTPAttrs,
+        data: dict[bytes, tuple[bytes, FileAttributes]],
+        attributes: FileAttributes,
     ) -> None:
 
-        await self._make_cd_request(b'D', attrs, 0, srcpath)
+        await self._make_cd_request(b'D', attributes, 0, srcpath)
 
-        files = {
-            filename: SCPFile(
-                filename,
+        files = [
+             (
+                posixpath.join(srcpath, filename),
                 file_data,
-            ) if isinstance(
+                file_attrs,
+            ) for filename, (
                 file_data,
-                bytes,
-            ) else file_data for filename, file_data in data.items()
+                file_attrs
+            ) in data.items()
              if filename not in [b'.', b'..']
-        }
+        ]
         
         await asyncio.gather(*[
             self._send_file(
-                posixpath.join(srcpath, file_item.name),
-                file_item.data,
-                file_item.to_attrs(),
-                
-            ) for file_item in files.values()
+                path,
+                data,
+                attrs,
+            ) for path, data, attrs in files
         ])
 
         await self._dest.make_request(b'E')
 
     async def _send_files(
         self,
-        file: SCPFile | list[SCPFile],
-    ) -> None:
+        files: list[
+            tuple[bytes, bytes, FileAttributes]
+        ],
+    ):
         
+        transferred: dict[bytes, TransferResult] = {}
 
-        transfer_type: TransferType = "FILE"
-        data: bytes | None = None
-             
         start = time.monotonic()
 
-        if isinstance(file, list):
-            await asyncio.gather(*[
-                self._send_file(
-                    item.path,
-                    item.data,
-                    item.to_attrs(),
-                ) for item in file
-            ])
+        for path, data, attrs, in files:
 
-        
-        elif file.file_type == FILEXFER_TYPE_DIRECTORY:
-            await self._make_cd_request(
-                b'D',
-                file.to_attrs(),
-                0,
-                file.path,
-            )
+            if attrs.type == FILEXFER_TYPE_DIRECTORY:
+                result = await self._make_cd_request(
+                    b'D',
+                    attrs,
+                    0,
+                    path,
+                )
 
-            transfer_type = "DIRECTORY"
-             
-        else:
-            await self._send_file(
-                file.path,
-                file.data,
-                file.to_attrs(),
-            )
+            else:
+                result = await self._send_file(
+                    path,
+                    data,
+                    attrs,
+                )
 
-            data = file.data
-             
+            transferred[path] = result
 
-        result = TransferResult(
-            file_path=file.path,
-            file_type=transfer_type,
-            file_data=data,
-            file_transfer_elapsed=time.monotonic() - start,
-            file_attribues=TransferResult.to_attributes(
-                file.to_attrs(),
-            ),
+        elapsed = time.monotonic() - start
+        return (
+            elapsed,
+            transferred,
         )
-
-        self._filesystem[file.path] = result
-

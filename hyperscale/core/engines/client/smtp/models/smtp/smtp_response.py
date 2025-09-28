@@ -1,13 +1,6 @@
 import re
 from typing import Dict, Literal, List, TypeVar, Tuple
 
-from pydantic import (
-    BaseModel, 
-    StrictStr, 
-    StrictBytes, 
-    StrictInt, 
-    StrictFloat,
-)
 
 from hyperscale.core.engines.client.shared.models import (
     CallResult,
@@ -16,9 +9,6 @@ from hyperscale.core.engines.client.shared.models import (
 from hyperscale.core.engines.client.tracing import Span
 
 space_pattern = re.compile(r"\s+")
-
-
-T = TypeVar("T", bound=BaseModel)
 
 
 SMTPTimings = dict[
@@ -47,18 +37,18 @@ SMTPTimings = dict[
 
 
 class SMTPResponse(CallResult):
-    recipients: StrictStr | List[StrictStr]
-    sender: StrictStr
-    server: StrictStr
-    email: StrictStr
+    recipients: str | List[str]
+    sender: str
+    server: str
+    email: str
     recipient_responses: Dict[str, Tuple[int, str, Exception | None]] = None
     last_smtp_code: int | None = None,
-    last_smtp_message: StrictStr | StrictBytes | None = None
+    last_smtp_message: str | bytes | None = None
     last_smtp_options: dict[
-        StrictStr | StrictBytes,
-        StrictStr | StrictBytes | StrictInt | StrictFloat | None,
+        str | bytes,
+        str | bytes | int | float | None,
     ]  | None = None
-    encoding: StrictStr | None = None
+    encoding: str | None = None
     error: Exception | None = None
     timings:SMTPTimings | None = None
     trace: Span | None = None

@@ -1,19 +1,19 @@
-from pydantic import BaseModel, StrictInt
+import msgspec
 from hyperscale.core.engines.client.sftp.protocols.sftp import SFTPVFSAttrs
 
 
-class FilesystemAttributes(BaseModel):
-    bsize: StrictInt = 0
-    frsize: StrictInt = 0
-    blocks: StrictInt = 0
-    bfree: StrictInt = 0
-    bavail: StrictInt = 0
-    files: StrictInt = 0
-    ffree: StrictInt = 0
-    favail: StrictInt = 0
-    fsid: StrictInt = 0
-    flags: StrictInt = 0
-    namemax: StrictInt = 0
+class FilesystemAttributes(msgspec.Struct):
+    bsize: int = 0
+    frsize: int = 0
+    blocks: int = 0
+    bfree: int = 0
+    bavail: int = 0
+    files: int = 0
+    ffree: int = 0
+    favail: int = 0
+    fsid: int = 0
+    flags: int = 0
+    namemax: int = 0
 
 
     @classmethod

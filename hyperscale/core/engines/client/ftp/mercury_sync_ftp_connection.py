@@ -550,7 +550,7 @@ class MercurySyncFTPConnection:
         ],
         source_path: str | None = None,
         destination_path: str | None = None,
-        data: str | Data | None = None,
+        data: str | Data | File | None = None,
         auth: tuple[str, str, str] = None,
         options: list[str] | None = None,
         chunk_size: int = 8192,
@@ -671,6 +671,21 @@ class MercurySyncFTPConnection:
                     error=err,
                     timings=timings,
                 )
+            
+            if isinstance(data, Data):
+                data: bytes = data.optimized
+
+            elif isinstance(data, File):
+                (
+                    _,
+                    data,
+                    _,
+                ) = data.optimized
+
+
+            elif isinstance(data, str):
+                data = data.encode()
+
 
             result: Any | None = None
 
@@ -1082,7 +1097,7 @@ class MercurySyncFTPConnection:
     async def _create_account(
         self,
         connection: FTPConnection,
-        password: str,
+        password: bytes,
         timings: dict[
             Literal[
                 "request_start",
@@ -1103,7 +1118,7 @@ class MercurySyncFTPConnection:
         if timings['write_start'] is None:
             timings['write_start'] = time.monotonic()
 
-        command = f'ACCT {password}'
+        command = b'ACCT ' + password
         connection.write(command + CRLF)
 
         timings['write_end'] = time.monotonic()

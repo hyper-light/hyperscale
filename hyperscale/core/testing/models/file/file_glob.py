@@ -10,28 +10,29 @@ from hyperscale.core.engines.client.ssh.protocol.ssh.constants import (
 
 from hyperscale.core.testing.models.base import OptimizedArg, FrozenDict
 from .file_attributes import FileAttributes
-from .file_validator import FileValidator
+from .file_glob_validator import FileGlobValidator
+
 
 T = TypeVar('T')
 
 
-class File(OptimizedArg, Generic[T]):
+class FileGlob(OptimizedArg, Generic[T]):
 
     def __init__(
         self,
-        path: str | pathlib.Path,
+        files: tuple[str | pathlib.Path, str],
     ):
         super(
-            File,
+            FileGlob,
             self,
         ).__init__()
 
-        validated_file = FileValidator(path=path)
+        validated_files = FileGlobValidator(files=files)
 
         self.call_name: str | None = None
-        self.data: dict[str, str] = FrozenDict(validated_file.model_dump(exclude_none=True))
-        self.optimized: tuple[bytes, bytes | None, FileAttributes] = None
-        self._path = path
+        self.data: dict[str, tuple[str, str]] = FrozenDict(validated_files.model_dump(exclude_none=True))
+        self.optimized: list[tuple[bytes, bytes | None, FileAttributes]] = None
+        self._files = files
 
     async def optimize(
         self,
@@ -39,34 +40,51 @@ class File(OptimizedArg, Generic[T]):
     ):
         loop = asyncio.get_event_loop()
 
-        with ThreadPoolExecutor() as executor:
-            self.optimized = await loop.run_in_executor(
-                executor,
-                self._load_file,
-                encoding,
+        with ThreadPoolExecutor() as exc:
+
+            files = await loop.run_in_executor(
+                exc,
+                self._find_files,
             )
+
+            return await asyncio.gather(*[
+                loop.run_in_executor(
+                    exc,
+                    self._load_file,
+                    file,
+                    attributes,
+                    encoding,
+                ) for file, attributes in files
+            ])
+
+    def _find_files(self):
+
+        filepath, pattern = self._files
+
+        if isinstance(filepath, pathlib.Path):
+            return [
+                (
+                    path,
+                    FileAttributes.from_stat(path)
+                ) for path in filepath.rglob(pattern)
+            ]
+        
+        
+        return [
+            (
+                path,
+                FileAttributes.from_stat(path)
+            )
+            for path in pathlib.Path(filepath).rglob(pattern)
+        ]
     
-   
     def _load_file(
         self,
+        path: pathlib.Path,
+        attributes: FileAttributes,
         encoding: str,
     ):
-        
-        if isinstance(self._path, str):
-            path = pathlib.Path(self._path)
-
-        else:
-            path = self._path
-        
-        attributes = FileAttributes.from_stat(path)
-        
-        if isinstance(self._path, str):
-            path = pathlib.Path(self._path)
-            path_str = self._path
-
-        else:
-            path = self._path
-            path_str = str(self._path)
+        path_str = str(path)
 
         if path.is_symlink():
             destination = str(path.resolve()).encode(encoding=encoding)
@@ -90,10 +108,10 @@ class File(OptimizedArg, Generic[T]):
                 None,
                 attributes,
             )
-
-        else:  
+            
+        else:
             attributes.type = FILEXFER_TYPE_REGULAR
-        
+            
         dstpath: bytes = str(path).encode(encoding=encoding)
         with open(path_str, 'rb') as data_file:
             return (

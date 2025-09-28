@@ -3,6 +3,7 @@ from .cookies import Cookies as Cookies
 from .data import Data as Data
 from .email import Email as Email
 from .file import File as File
+from .file import FileGlob as FileGlob
 from .headers import Headers as Headers
 from .mutation import Mutation as Mutation
 from .params import Params as Params
