@@ -20,7 +20,7 @@ from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from hyperscale.core.engines.client.ssh.protocol.ssh.connection import SSHClientConnectionOptions
 from hyperscale.core.engines.client.sftp.models import TransferResult
 from hyperscale.core.engines.client.sftp.protocols.file import File
-from .models.scp import SCPOptions, SCPResponse
+from .models.scp import SCPOptions, SCPResponse, SCPTimings
 from .scp_command import SCPCommand
 from .protocols import (
     SCPConnection,
@@ -254,16 +254,7 @@ class MercurySyncSCPConnction:
         recurse: bool = False,
     ) -> SCPResponse:
         timings: dict[
-            Literal[
-                "request_start",
-                "connect_start",
-                "connect_end",
-                "initialization_start",
-                "initialization_end",
-                "transfer_start",
-                "transfer_end",
-                "request_end",
-            ],
+            SCPTimings,
             float | None,
         ] = {
             "request_start": None,

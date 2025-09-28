@@ -3,7 +3,7 @@ import pathlib
 import time
 from collections import defaultdict
 from urllib.parse import urlparse, ParseResult
-from typing import Any, Literal
+from typing import Any
 from hyperscale.core.engines.client.shared.models import (
     URL as SFTPUrl,
     RequestType,
@@ -29,6 +29,7 @@ from .models import (
     AttributeFlags,
     CheckType,
     DesiredAccess,
+    SFTPTimings,
 )
 from .protocols import SFTPConnection
 from .sftp_command import SFTPCommand
@@ -42,14 +43,13 @@ class MercurySyncSFTPConnction:
         pool_size: int | None = None,
         timeouts: Timeouts = Timeouts(),
         reset_connections: bool = False,
-        connection_options: SFTPConnectionOptions | None = None,
     ):
         self._concurrency = pool_size
         self.timeouts = timeouts
         self.reset_connections = reset_connections
         self._loop: asyncio.AbstractEventLoop | None = None
 
-        self._connection_options = connection_options
+        self._connection_options: SFTPConnectionOptions | None = None
 
         self._dns_lock: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._dns_waiters: dict[str, asyncio.Future] = defaultdict(asyncio.Future)
@@ -1789,7 +1789,7 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
-        check: bool = FileAttributes,
+        check: CheckType = "none",
         compose_paths: list[str | pathlib.PurePath] | None = None,
         username: str | None = None,
         password: str | None = None,
@@ -1836,7 +1836,7 @@ class MercurySyncSFTPConnction:
     async def getcwd(
         self,
         url: str | URL,
-        check: bool = FileAttributes,
+        check: CheckType = "none",
         compose_paths: list[str | pathlib.PurePath] | None = None,
         username: str | None = None,
         password: str | None = None,
@@ -2011,7 +2011,7 @@ class MercurySyncSFTPConnction:
         self,
         url: str | URL,
         path: str | pathlib.PurePath,
-        check: bool = FileAttributes,
+        check: CheckType = "none",
         compose_paths: list[str | pathlib.PurePath] | None = None,
         username: str | None = None,
         password: str | None = None,
@@ -2065,16 +2065,7 @@ class MercurySyncSFTPConnction:
         password: str | None = None,
     ):
         timings: dict[
-            Literal[
-                "request_start",
-                "connect_start",
-                "connect_end",
-                "initialization_start",
-                "initialization_end",
-                "command_start",
-                "command_end",
-                "request_end",
-            ],
+            SFTPTimings,
             float | None,
         ] = {
             "request_start": None,
@@ -2082,8 +2073,10 @@ class MercurySyncSFTPConnction:
             "connect_end": None,
             "initialization_start": None,
             "initialization_end": None,
-            "command_start": None,
-            "command_end": None,
+            "execution_start": None,
+            "execution_end": None,
+            "close_start": None,
+            "close_end": None,
             "request_end": None,
         }
 
@@ -2141,7 +2134,7 @@ class MercurySyncSFTPConnction:
                 path_encoding=self._connection_options.path_encoding,
             )
 
-            timings["command_start"] = time.monotonic()
+            timings["execution_start"] = time.monotonic()
 
             result: tuple[
                 float,
@@ -2286,12 +2279,17 @@ class MercurySyncSFTPConnction:
 
             elapsed, transferred = result
             
-            timings["command_end"] = elapsed
+            timings["exectution_end"] = elapsed
+            timings["close_start"] = time.monotonic()
+
+            command.exit()
+            await command.wait_closed()
+
+            timings["close_end"] = time.monotonic()
+            
             self._connections.append(connection)
 
             timings["request_end"] = time.monotonic()
-
-            command.exit()
 
             return SFTPResponse(
                 url=URLMetadata(

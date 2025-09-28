@@ -6,6 +6,8 @@ from .core.engines import HTTP3Response as HTTP3Response
 from .core.engines import HTTPResponse as HTTPResponse
 from .core.engines import PlaywrightResult as PlaywrightResult
 from .core.engines import EmailAttachment as EmailAttachment
+from .core.engines import SCPResponse as SCPResponse
+from .core.engines import SFTPResponse as SFTPResponse
 from .core.engines import SMTPResponse as SMTPResponse
 from .core.engines import TCPResponse as TCPResponse
 from .core.engines import UDPResponse as UDPResponse

@@ -16,11 +16,14 @@ T = TypeVar("T", bound=BaseModel)
 SFTPTimings = Literal[
     "request_start",
     "connect_start",
+    "connect_start",
     "connect_end",
     "initialization_start",
     "initialization_end",
-    "command_start",
-    "command_end",
+    "execution_start",
+    "exectution_end",
+    "close_start",
+    "close_end",
     "request_end",
 ]
 

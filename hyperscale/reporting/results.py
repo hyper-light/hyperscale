@@ -13,6 +13,7 @@ from typing import (
 import numpy as np
 
 from hyperscale.core.engines.client.custom import CustomResult
+from hyperscale.core.engines.client.ftp import FTPResponse
 from hyperscale.core.engines.client.graphql import GraphQLResponse
 from hyperscale.core.engines.client.graphql_http2 import GraphQLHTTP2Response
 from hyperscale.core.engines.client.grpc import GRPCResponse
@@ -21,7 +22,9 @@ from hyperscale.core.engines.client.http2 import HTTP2Request
 from hyperscale.core.engines.client.http3 import HTTP3Request
 from hyperscale.core.engines.client.playwright import PlaywrightResult
 from hyperscale.core.engines.client.shared.models import RequestType
-from hyperscale.core.engines.client.smtp import SMTPResponse
+from hyperscale.core.engines.client.scp import SCPResponse, SCPTimings
+from hyperscale.core.engines.client.smtp import SMTPResponse, SMTPTimings
+from hyperscale.core.engines.client.sftp import SFTPResponse, SFTPTimings
 from hyperscale.core.engines.client.tcp import TCPResponse
 from hyperscale.core.engines.client.udp import UDPResponse
 from hyperscale.core.engines.client.websocket import WebsocketResponse
@@ -58,6 +61,7 @@ class Results:
     ) -> None:
         self._result_type: Dict[
             Type[CustomResult]
+            | Type[FTPResponse]
             | Type[GraphQLResponse]
             | Type[GraphQLHTTP2Response]
             | Type[GRPCResponse]
@@ -65,6 +69,8 @@ class Results:
             | Type[HTTP2Request]
             | Type[HTTP3Request]
             | Type[PlaywrightResult]
+            | Type[SCPResponse]
+            | Type[SFTPResponse]
             | Type[SMTPResponse]
             | Type[TCPResponse]
             | Type[UDPResponse]
@@ -75,6 +81,7 @@ class Results:
                 [
                     str,
                     List[CustomResult]
+                    | List[FTPResponse]
                     | List[GraphQLResponse]
                     | List[GraphQLHTTP2Response]
                     | List[GRPCResponse]
@@ -83,6 +90,7 @@ class Results:
                     | List[HTTP3Request]
                     | List[PlaywrightResult]
                     | List[SMTPResponse]
+                    | List[SFTPResponse]
                     | List[TCPResponse]
                     | List[UDPResponse]
                     | List[WebsocketResponse]
@@ -310,13 +318,16 @@ class Results:
         workflow: str,
         step_name: str,
         result_type: RequestType | str,
-        results: List[GraphQLResponse]
+        results: List[FTPResponse]
+        | List[GraphQLResponse]
         | List[GraphQLHTTP2Response]
         | List[GRPCResponse]
         | List[HTTPResponse]
         | List[HTTP2Request]
         | List[HTTP3Request]
         | List[PlaywrightResult]
+        | List[SCPResponse]
+        | List[SFTPResponse]
         | List[SMTPResponse]
         | List[TCPResponse]
         | List[UDPResponse]
@@ -326,43 +337,108 @@ class Results:
 
         results = [result for result in results if result not in errors]
 
-        if result_type == RequestType.PLAYWRIGHT:
-            timing_results_set = [
-                self._process_playwright_timings(result)
-                for result in results
-                if result not in errors
-            ]
+        match result_type:
 
-            timing_stats: Dict[
-                Literal["total"],
-                Dict[StatTypes, int | float],
-            ] = {}
+            case RequestType.PLAYWRIGHT:
+                timing_results_set = [
+                    self._process_playwright_timings(result)
+                    for result in results
+                    if result not in errors
+                ]
 
-            results_types = ["total"]
+                timing_stats: Dict[
+                    Literal["total"],
+                    Dict[StatTypes, int | float],
+                ] = {}
 
-        elif result_type == RequestType.CUSTOM:
-            timing_results_set = [
-                result.process_timings()
-                for result in results
-                if isinstance(result, CustomResult)
-            ]
+                results_types = ["total"]
 
-            timing_stats: dict[
-                str,
-                dict[StatTypes, int | float]
-            ] = {}
+            case RequestType.CUSTOM:
+                timing_results_set = [
+                    result.process_timings()
+                    for result in results
+                    if isinstance(result, CustomResult)
+                ]
 
-            results_types = list(timing_results_set[0].keys())
+                timing_stats: dict[
+                    str,
+                    dict[StatTypes, int | float]
+                ] = {}
 
-        elif result_type == RequestType.SMTP:
-            timing_results_set = [
-                self._process_smtp_timings(result)
-                for result in results
-                if result not in errors
-            ]
+                results_types = list(timing_results_set[0].keys())
 
-            timing_stats: Dict[
-                Literal[
+            case RequestType.SCP:
+                timing_results_set = [
+                    self._process_scp_timings(result)
+                    for result in results
+                    if result not in errors
+                ]
+
+                timing_stats: Dict[
+                    Literal[
+                        "total",
+                        "connecting",
+                        "initialzing",
+                        "transferring",
+                    ],
+                    Dict[StatTypes, int | float],
+                ] = {}
+
+                results_types = [
+                    "total",
+                    "connecting",
+                    "initialzing",
+                    "transferring",
+                ]
+
+            case RequestType.SFTP:
+                timing_results_set = [
+                    self._process_sftp_timings(result)
+                    for result in results
+                    if result not in errors
+                ]
+
+                timing_stats: Dict[
+                    Literal[
+                        "total",
+                        "connecting",
+                        "initializing",
+                        "executing",
+                        "closing",
+                    ],
+                    Dict[StatTypes, int | float],
+                ] = {}
+
+                results_types = [
+                    "total",
+                    "connecting",
+                    "initializing",
+                    "executing",
+                    "closing",
+                ]
+
+            case RequestType.SMTP:
+                timing_results_set = [
+                    self._process_smtp_timings(result)
+                    for result in results
+                    if result not in errors
+                ]
+
+                timing_stats: Dict[
+                    Literal[
+                        "total",
+                        "connecting",
+                        "ehlo",
+                        "tls_check",
+                        "tls_upgrade",
+                        "ehlo_tls",
+                        "login",
+                        "send_mail",
+                    ],
+                    Dict[StatTypes, int | float],
+                ] = {}
+
+                results_types = [
                     "total",
                     "connecting",
                     "ehlo",
@@ -371,45 +447,32 @@ class Results:
                     "ehlo_tls",
                     "login",
                     "send_mail",
-                ],
-                Dict[StatTypes, int | float],
-            ] = {}
-
-            results_types = [
-                "total",
-                "connecting",
-                "ehlo",
-                "tls_check",
-                "tls_upgrade",
-                "ehlo_tls",
-                "login",
-                "send_mail",
-            ]
+                ]
 
 
-        else:
-            timing_results_set = [
-                self._process_http_or_udp_timings(result)
-                for result in results
-                if result not in errors
-            ]
+            case _:
+                timing_results_set = [
+                    self._process_http_or_udp_timings(result)
+                    for result in results
+                    if result not in errors
+                ]
 
-            timing_stats: Dict[
-                Literal[
+                timing_stats: Dict[
+                    Literal[
+                        "total",
+                        "connecting",
+                        "writing",
+                        "reading",
+                    ],
+                    Dict[StatTypes, int | float],
+                ] = {}
+
+                results_types = [
                     "total",
                     "connecting",
                     "writing",
                     "reading",
-                ],
-                Dict[StatTypes, int | float],
-            ] = {}
-
-            results_types = [
-                "total",
-                "connecting",
-                "writing",
-                "reading",
-            ]
+                ]
 
         for result_type in results_types:
             results_set = [
@@ -779,7 +842,7 @@ class Results:
         if (tls_upgrade_end := timings.get('tls_upgrade_end')) and (
             tls_upgrade_start := timings.get('tls_upgrade_start')
         ):
-            timing_results['tls_upgrade'] = tls_upgrade_end - tls_check_start
+            timing_results['tls_upgrade'] = tls_upgrade_end - tls_upgrade_start
 
         if (ehlo_tls_end := timings.get('ehlo_tls_end')) and (
             ehlo_tls_start := timings.get('ehlo_tls_start')
@@ -853,5 +916,103 @@ class Results:
             write_start := timings.get("write_start")
         ):
             timing_results["writing"] = write_end - write_start
+
+        return timing_results
+    
+    def _process_scp_timings(
+        self,
+        result: SCPResponse,
+    ) -> dict[
+        Literal[
+            "total",
+            "connecting",
+            "initialzing",
+            "transferring",
+        ],
+        int | float
+    ]:
+        timings = result.timings
+        timing_results: Dict[
+            Literal[
+                "total",
+                "connecting",
+                "initialzing",
+                "transferring",
+            ],
+            int | float,
+        ] = {}
+
+        if (request_end := timings.get("read_end")) and (
+            request_start := timings.get("request_start")
+        ):
+            timing_results["total"] = request_end - request_start
+
+        if (connect_end := timings.get("connect_end")) and (
+            connect_start := timings.get("connect_start")
+        ):
+            timing_results["connecting"] = connect_end - connect_start
+
+        if (initialization_end := timings.get("initialization_end")) and (
+            initialization_start := timings.get("initialization_start")
+        ):
+            timing_results["initialzing"] = initialization_end - initialization_start
+
+        if (transfer_end := timings.get("transfer_end")) and (
+            transfer_start := timings.get("transfer_start")
+        ):
+            timings["transferring"] = transfer_end - transfer_start
+
+        return timing_results
+    
+    def _process_sftp_timings(
+        self,
+        result: SFTPResponse,
+    ) -> dict[
+        Literal[
+            "total",
+            "connecting",
+            "initializing",
+            "executing",
+            "closing",
+        ],
+        int | float
+    ]:
+        
+        timings = result.timings
+        timing_results: Dict[
+            Literal[
+                "total",
+                "connecting",
+                "initializing",
+                "executing",
+                "closing",
+            ],
+            int | float,
+        ] = {}
+
+        if (request_end := timings.get("read_end")) and (
+            request_start := timings.get("request_start")
+        ):
+            timing_results["total"] = request_end - request_start
+
+        if (connect_end := timings.get("connect_end")) and (
+            connect_start := timings.get("connect_start")
+        ):
+            timing_results["connecting"] = connect_end - connect_start
+            
+        if (initialization_end := timings.get("initialization_end")) and (
+            initialization_start := timings.get("initialization_start")
+        ):
+            timing_results["initialzing"] = initialization_end - initialization_start
+
+        if (execution_end := timings.get("exectution_end")) and (
+            execution_start := timings.get("execution_start")
+        ):
+            timing_results["executing"] = execution_end - execution_start
+
+        if (close_end := timings.get("close_end")) and (
+            close_start := timings.get("close_start")
+        ):
+            timing_results["closing"] = close_end - close_start
 
         return timing_results
