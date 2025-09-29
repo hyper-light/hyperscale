@@ -147,7 +147,7 @@ class Command(Generic[T]):
 
         elif len(errors) > 0:
             await self._print_group_help_message(
-                error=[0],
+                error=errors[0],
             )
 
             return (
