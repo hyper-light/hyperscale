@@ -22,6 +22,7 @@ class FileAttributes(msgspec.Struct):
     ctime_ns: int | float | None = None
     mime_type: str | None = None
     nlink: int | None = None
+    encoding: str | None = None
 
     
     @classmethod
@@ -31,7 +32,7 @@ class FileAttributes(msgspec.Struct):
     ):
         
         result = path.stat()
-        mime_type, _ = mimetypes.guess_file_type(path)
+        mime_type, encoding = mimetypes.guess_file_type(path)
 
         path_type = 1
 
@@ -68,5 +69,6 @@ class FileAttributes(msgspec.Struct):
             mtime_ns=result.st_mtime_ns,
             mime_type=mime_type,
             nlink=result.st_nlink,
+            encoding=encoding,
         )
         

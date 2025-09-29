@@ -32,6 +32,7 @@ class File(OptimizedArg, Generic[T]):
         self.data: dict[str, str] = FrozenDict(validated_file.model_dump(exclude_none=True))
         self.optimized: tuple[bytes, bytes | None, FileAttributes] = None
         self._path = path
+        self.encoding: str = "application/octet-stream"
 
     async def optimize(
         self,
@@ -59,6 +60,7 @@ class File(OptimizedArg, Generic[T]):
             path = self._path
         
         attributes = FileAttributes.from_stat(path)
+        self.encoding = attributes.encoding if attributes.encoding else self.encoding
         
         if isinstance(self._path, str):
             path = pathlib.Path(self._path)
