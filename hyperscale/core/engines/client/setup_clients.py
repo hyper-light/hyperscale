@@ -22,6 +22,11 @@ from .http2.settings import Settings
 from .http3 import MercurySyncHTTP3Connection
 from .http3.protocols import HTTP3Connection
 from .playwright import MercurySyncPlaywrightConnection
+from .scp import MercurySyncSCPConnection
+from .scp.protocols import SCPConnection
+from .sftp import MercurySyncSFTPConnction
+from .sftp.protocols import SFTPConnection
+from .ssh.models import ConnectionOptions
 from .smtp import MercurySyncSMTPConnection
 from .smtp.protocols import SMTPConnection
 from .tcp import MercurySyncTCPConnection
@@ -219,6 +224,32 @@ def setup_client(
         client._concurrency = vus
         client._semaphore = asyncio.Semaphore(vus)
         client._max_pages = pages
+
+    elif isinstance(client, MercurySyncSCPConnection):
+        client._concurrency = vus
+        client._semaphore = asyncio.Semaphore(vus)
+        client._destination_connections = [
+            SCPConnection("DEST")
+            for _ in range(vus)
+        ]
+
+        client._source_connections = [
+            SCPConnection("SOURCE")
+            for _ in range(vus)
+        ]
+
+        client._connection_options = ConnectionOptions()
+
+    elif isinstance(client, MercurySyncSFTPConnction):
+        client._concurrency = vus
+        client._semaphore = asyncio.Semaphore(vus)
+
+        client._connections = [
+            SFTPConnection()
+            for _ in range(vus)
+        ]
+
+        client._connection_options = ConnectionOptions()
 
     elif isinstance(client, MercurySyncSMTPConnection):
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)

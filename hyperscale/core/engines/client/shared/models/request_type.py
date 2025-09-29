@@ -11,6 +11,8 @@ class RequestType(Enum):
     HTTP2 = "HTTP2"
     HTTP3 = "HTTP3"
     PLAYWRIGHT = "PLAYWRIGHT"
+    SCP = "SCP"
+    SFTP = "SFTP"
     SMTP = "SMTP"
     TCP = "TCP"
     UDP = "UDP"

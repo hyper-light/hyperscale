@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import ssl
 import time
 from collections import defaultdict, deque
@@ -52,7 +53,6 @@ from hyperscale.core.testing.models import (
 
 from .models.http3 import HTTP3Response
 from .protocols import HTTP3Connection
-from .protocols.quic.quic.packet_builder import QuicPacketBuilderStop
 
 A = TypeVar("A")
 R = TypeVar("R")
@@ -128,7 +128,6 @@ class MercurySyncHTTP3Connection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="HEAD",
                     status=408,
                     status_message="Request timed out.",
@@ -174,7 +173,6 @@ class MercurySyncHTTP3Connection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="OPTIONS",
                     status=408,
                     status_message="Request timed out.",
@@ -221,7 +219,6 @@ class MercurySyncHTTP3Connection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="GET",
                     status=408,
                     status_message="Request timed out.",
@@ -269,7 +266,6 @@ class MercurySyncHTTP3Connection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="POST",
                     status=408,
                     status_message="Request timed out.",
@@ -317,7 +313,6 @@ class MercurySyncHTTP3Connection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="PUT",
                     status=408,
                     status_message="Request timed out.",
@@ -365,7 +360,6 @@ class MercurySyncHTTP3Connection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="PATCH",
                     status=408,
                     status_message="Request timed out.",
@@ -411,7 +405,6 @@ class MercurySyncHTTP3Connection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="DELETE",
                     status=408,
                     status_message="Request timed out.",
@@ -666,6 +659,7 @@ class MercurySyncHTTP3Connection:
             encoded_headers = self._encode_headers(
                 url,
                 method,
+                auth=auth,
                 params=params,
                 headers=headers,
             )
@@ -914,6 +908,7 @@ class MercurySyncHTTP3Connection:
         self,
         url: HTTPUrl | URL,
         method: str,
+        auth: tuple[str, str] | Auth | None = None,
         params: Optional[Dict[str, str] | Params] = None,
         headers: Optional[Dict[str, str] | Headers] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
@@ -930,24 +925,26 @@ class MercurySyncHTTP3Connection:
             url_params = urlencode(params)
             url_path += f"?{url_params}"
 
-        if isinstance(headers, Headers):
-            encoded_headers: List[Tuple[bytes, bytes]] = [
-                (b":method", method.encode()),
-                (b":authority", url.hostname.encode()),
-                (b":scheme", url.scheme.encode()),
-                (b":path", url_path.encode()),
-            ]
+        
+        encoded_headers: List[Tuple[bytes, bytes]] = [
+            (b":method", method.encode()),
+            (b":authority", url.hostname.encode()),
+            (b":scheme", url.scheme.encode()),
+            (b":path", url_path.encode()),
+        ]
 
+        if isinstance(auth, Auth):
+            encoded_headers.append(auth.optimized)
+
+        elif auth is not None:
+            encoded_headers.append(
+                self._encode_auth_headers(auth),
+            )
+
+        if isinstance(headers, Headers):
             encoded_headers.extend(headers.optimized)
 
         elif headers:
-            encoded_headers: List[Tuple[bytes, bytes]] = [
-                (b":method", method.encode()),
-                (b":authority", url.hostname.encode()),
-                (b":scheme", url.scheme.encode()),
-                (b":path", url_path.encode()),
-            ]
-
             encoded_headers.extend(
                 [
                     (k.lower().encode(), v.encode())
@@ -1021,6 +1018,27 @@ class MercurySyncHTTP3Connection:
             encoded_data = data
 
         return encoded_data
+    
+    def _encode_auth_headers(
+        self,
+        auth: tuple[str, str] | tuple[str],
+    ):
+        if len(auth) > 1:
+            credentials_string = f"{auth[0]}:{auth[1]}"
+            return (
+                b"authorization",
+                base64.b64encode(
+                    credentials_string.encode()
+                )
+            )
+
+        else:
+            return (
+                b"authorization",
+                base64.b64encode(
+                    auth[0].encode()
+                )
+            )
 
     def close(self):
         for connection in self._connections:

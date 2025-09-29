@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import time
 from collections import defaultdict
 from typing import (
@@ -124,7 +125,6 @@ class MercurySyncWebsocketConnection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="PUT",
                     status=408,
                     status_message="Request timed out.",
@@ -172,53 +172,11 @@ class MercurySyncWebsocketConnection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="PUT",
                     status=408,
                     status_message="Request timed out.",
                     timings={},
                 )
-
-    async def _optimize(self, url: Optional[URL] = None):
-        if isinstance(url, URL):
-            await self._optimize_url(url)
-
-    async def _optimize_url(self, url: URL):
-        try:
-            upgrade_ssl: bool = False
-            if url:
-                (
-                    _,
-                    connection,
-                    url,
-                    upgrade_ssl,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-                self._connections.append(connection)
-
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
-
-                await url.optimize()
-
-                (
-                    _,
-                    connection,
-                    url,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                self._connections.append(connection)
-
-            self._url_cache[url.optimized.hostname] = url
-
-        except Exception:
-            pass
 
     async def _optimize(
         self,
@@ -446,7 +404,6 @@ class MercurySyncWebsocketConnection:
                         method=method,
                         status=400,
                         status_message=str(error) if error else None,
-                        headers=headers,
                         timings=timings,
                     ),
                     False,
@@ -467,6 +424,7 @@ class MercurySyncWebsocketConnection:
             encoded_headers = self._encode_headers(
                 url,
                 method,
+                auth=auth,
                 params=params,
                 headers=headers,
                 cookies=cookies,
@@ -497,6 +455,15 @@ class MercurySyncWebsocketConnection:
             status_string: List[bytes] = response_code.split()
             status = int(status_string[1])
 
+            response_headers: dict[bytes, bytes] = {}
+
+            raw_headers = b""
+            async for key, value, header_line in connection.reader.iter_headers(
+                connection
+            ):
+                response_headers[key] = value
+                raw_headers += header_line
+
             if status >= 300 and status < 400:
                 timings["read_end"] = time.monotonic()
                 self._connections.append(connection)
@@ -507,26 +474,17 @@ class MercurySyncWebsocketConnection:
                             host=url.hostname,
                             path=url.path,
                         ),
+                        headers=response_headers,
                         method=method,
                         status=status,
-                        headers=headers,
                         timings=timings,
                     ),
                     True,
                     timings,
                 )
 
-            headers: Dict[bytes, bytes] = {}
-
-            raw_headers = b""
-            async for key, value, header_line in connection.reader.iter_headers(
-                connection
-            ):
-                headers[key] = value
-                raw_headers += header_line
-
             cookies: Union[HTTPCookies, None] = None
-            cookies_data: Union[bytes, None] = headers.get(b"set-cookie")
+            cookies_data: Union[bytes, None] = response_headers.get(b"set-cookie")
             if cookies_data:
                 cookies = HTTPCookies()
                 cookies.update(cookies_data)
@@ -554,7 +512,7 @@ class MercurySyncWebsocketConnection:
                     ),
                     method=method,
                     status=status,
-                    headers=headers,
+                    headers=response_headers,
                     content=body,
                     timings=timings,
                 ),
@@ -739,6 +697,7 @@ class MercurySyncWebsocketConnection:
         self,
         url: HTTPUrl | URL,
         method: str,
+        auth: tuple[str, str] | Auth | None = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
@@ -764,7 +723,19 @@ class MercurySyncWebsocketConnection:
             encoded_headers = headers.optimized
 
         else:
-            encoded_headers = self._encode_dynamic_headers(url, method, headers=headers)
+            encoded_headers = self._encode_dynamic_headers(
+                url,
+                method,
+                headers=headers,
+            )
+
+        if isinstance(auth, Auth):
+            encoded_headers.append(auth.optimized)
+
+        elif auth is not None :
+            encoded_headers.append(
+                self._serialize_auth(auth),
+            )
 
         size: int = 0
 
@@ -889,6 +860,25 @@ class MercurySyncWebsocketConnection:
         )
 
         return encoded_headers
+    
+
+    def _serialize_auth(
+        self,
+        auth: tuple[str, str] | tuple[str],
+    ):
+        if len(auth) > 1:
+            credentials_string = f"{auth[0]}:{auth[1]}"
+            encoded_credentials = base64.b64encode(
+                credentials_string.encode(),
+            ).decode()
+
+        else:
+
+            encoded_credentials = base64.b64encode(
+                auth[0].encode()
+            ).decode()
+
+        return f'Authorization: Basic {encoded_credentials}'
 
     def close(self):
         for connection in self._connections:

@@ -31,11 +31,43 @@ from .inspect_wrapped import inspect_wrapped, assemble_exanded_args, is_context_
 T = TypeVar("T", bound=dict)
 K = TypeVar("K")
 
+def group(
+    *commands: list[Group | Command],
+    styling: CLIStyle | None = None,
+    shortnames: dict[str, str] | None = None,
+    display_help_on_error: bool = True,
+    error_exit_code: int = 1,
+):
+    if shortnames is None:
+        shortnames = {}
+
+    def wrap(command):
+        group = create_group(
+            command,
+            styling=styling,
+            shortnames=shortnames,
+            display_help_on_error=display_help_on_error,
+            error_exit_code=error_exit_code,
+        )
+
+        for command in commands:
+            if isinstance(command, Group):
+                group.subgroups[command.group_name] = command
+
+            elif isinstance(command, Command):
+                group.subcommands[command.command_name] = command
+
+        return group
+
+    return wrap
+
 
 def create_group(
     command_call: Callable[..., Any],
     styling: CLIStyle | None = None,
     shortnames: dict[str, str] | None = None,
+    display_help_on_error: bool = True,
+    error_exit_code: int = 1,
 ):
     indentation = 0
     if styling:
@@ -53,11 +85,13 @@ def create_group(
     )
 
     return Group(
-        command_call.__name__,
+        command_call.__name__.replace('_', '-'),
         command_call,
         help_message,
         positional_args=positional_args_map,
         keyword_args_map=keyword_args_map,
+        display_help_on_error=display_help_on_error,
+        error_exit_code=error_exit_code,
     )
 
 
@@ -69,6 +103,8 @@ class Group(Generic[T]):
         help_message: HelpMessage,
         positional_args: dict[str, PositionalArg] | None = None,
         keyword_args_map: dict[str, KeywordArg] | None = None,
+        display_help_on_error: bool = True,
+        error_exit_code: int = 1,
     ):
         if positional_args is None:
             positional_args = {}
@@ -95,6 +131,9 @@ class Group(Generic[T]):
         self.keyword_args_map = keyword_args_map
         self.keyword_args_count = len(keyword_args_map)
         self.positional_args_count = len(positional_args)
+        self.display_help_on_error = display_help_on_error
+        self.error_exit_code = error_exit_code
+
         self._loop = asyncio.get_event_loop()
 
     def update_command(
@@ -105,6 +144,8 @@ class Group(Generic[T]):
         global_styles: CLIStyle | None = None,
         positional_args: dict[str, PositionalArg] | None = None,
         keyword_args_map: dict[str, KeywordArg] | None = None,
+        display_help_on_error: bool = True,
+        error_exit_code: int = 1,
     ):
         self._global_styles = global_styles
 
@@ -129,12 +170,14 @@ class Group(Generic[T]):
         self.keyword_args_map = keyword_args_map
         self.keyword_args_count = len(keyword_args_map)
         self.positional_args_count = len(positional_args)
+        self.display_help_on_error = display_help_on_error
+        self.error_exit_code = error_exit_code
 
     async def run(
         self,
         args: list[str],
         context: Context[str, Any],
-    ) -> tuple[Any | None, list[str]]:
+    ) -> tuple[Any | None, list[str], int | None]:
         subcommands: list[str] | None = None
         if len(self.subgroups) > 0 or len(self.subcommands) > 0:
             subcommands = list(self.subgroups.keys())
@@ -143,7 +186,11 @@ class Group(Generic[T]):
         if len(args) < 1:
             await self._print_group_help_message(subcommands)
 
-            return (None, [])
+            return (
+                None,
+                [],
+                self.error_exit_code,
+            )
 
         (
             positional_args,
@@ -156,7 +203,11 @@ class Group(Generic[T]):
         if positional_args is None and keyword_args is None:
             await self._print_group_help_message(subcommands)
 
-            return (None, errors)
+            return (
+                None,
+                errors,
+                self.error_exit_code,
+            )
 
         elif len(errors) > 0:
             await self._print_group_help_message(
@@ -164,19 +215,46 @@ class Group(Generic[T]):
                 subcommands=subcommands,
             )
 
-            return (None, errors)
+            return (
+                None,
+                errors,
+                self.error_exit_code,
+            )
 
         result: Any | None = None
         if len(positional_args) > 0 or len(keyword_args) > 0:
-            result = await self._command_call(*positional_args, **keyword_args)
+            try:
+                result = await self._command_call(*positional_args, **keyword_args)
 
+            except Exception as err:
+                if self.display_help_on_error:
+                    raise err
+
+
+                await self._print_group_help_message(
+                    error=err,
+                    subcommands=subcommands,
+                )
+
+                return (
+                    None,
+                    [err],
+                    self.error_exit_code,
+                )
+
+        exit_code: int | None = None
         if subcommand:
             subcommand._global_styles = self._global_styles
-            result, errors = await subcommand.run(subcommand_args, context)
+            (
+                result,
+                errors,
+                exit_code,
+            ) = await subcommand.run(subcommand_args, context)
 
         return (
             result,
             errors,
+            exit_code,
         )
 
     @property
@@ -186,16 +264,41 @@ class Group(Generic[T]):
 
     def group(
         self,
+        *commands: list[Group | Command],
         styling: CLIStyle | None = None,
         shortnames: dict[str, str] | None = None,
+        display_help_on_error: bool = True,
+        error_exit_code: int = 1,
     ):
         if shortnames is None:
             shortnames = {}
 
         def wrap(command):
-            group = create_group(command, styling=styling, shortnames=shortnames)
+            group = create_group(
+                command,
+                styling=styling,
+                shortnames=shortnames,
+                display_help_on_error=display_help_on_error,
+                error_exit_code=error_exit_code,
+            )
+            
+            group_name = group.group_name.replace('_', '-')
+            self.subgroups[group_name] = group
 
-            self.subgroups[group.group_name] = group
+            for command in commands:
+                if isinstance(command, Group):
+                    command._global_styles = self._global_styles
+                    group.subgroups[command.group_name] = command
+
+                    for subcommand in command.subcommands.values():
+                        subcommand._global_styles = self._global_styles
+
+                    for subgroup in command.subgroups.values():
+                        subgroup._global_styles = self._global_styles
+
+                elif isinstance(command, Command):
+                    command._global_styles = self._global_styles
+                    group.subcommands[command.command_name] = command
 
             return group
 
@@ -205,6 +308,8 @@ class Group(Generic[T]):
         self,
         styling: CLIStyle | None = None,
         shortnames: dict[str, str] | None = None,
+        display_help_on_error: bool = True,
+        error_exit_code: int = 1,
     ):
         if shortnames is None:
             shortnames = {}
@@ -214,9 +319,12 @@ class Group(Generic[T]):
                 command_call,
                 styling=styling,
                 shortnames=shortnames,
+                display_help_on_error=display_help_on_error,
+                error_exit_code=error_exit_code,
             )
 
-            self.subcommands[cmd.command_name] = cmd
+            command_name = cmd.command_name.replace('_', '-')
+            self.subcommands[command_name] = cmd
 
             return command_call
 
@@ -234,7 +342,6 @@ class Group(Generic[T]):
         return await loop.run_in_executor(
             None, functools.partial(os.fdopen, stdout_dup, mode=sys.stdout.mode)
         )
-
 
     async def _print_group_help_message(
         self,
@@ -451,6 +558,11 @@ class Group(Generic[T]):
                 positional_idx += 1
 
                 consumed_idxs.add(idx)
+
+            else:
+                errors.append(
+                    f'{arg} is not a recognized option or command'
+                )
 
             if error:
                 errors.append(error)

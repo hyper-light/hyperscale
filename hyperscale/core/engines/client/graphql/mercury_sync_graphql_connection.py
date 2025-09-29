@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import time
 import uuid
 from typing import (
@@ -120,7 +121,6 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="GET",
                     status=408,
                     status_message="Request timed out.",
@@ -177,7 +177,6 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="POST",
                     status=408,
                     status_message="Request timed out.",
@@ -438,7 +437,6 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                         method=method,
                         status=400,
                         status_message=str(error) if error else None,
-                        headers=headers,
                         timings=timings,
                     ),
                     False,
@@ -455,6 +453,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     url,
                     method,
                     data,
+                    auth=auth,
                     headers=headers,
                     cookies=cookies,
                     params=params,
@@ -469,6 +468,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     url,
                     method,
                     data,
+                    auth=auth,
                     headers=headers,
                     params=params,
                     cookies=cookies,
@@ -488,8 +488,9 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                 connection.reader.readline(), timeout=self.timeouts.read_timeout
             )
 
-            headers: Dict[bytes, bytes] = await asyncio.wait_for(
-                connection.read_headers(), timeout=self.timeouts.read_timeout
+            response_headers: Dict[bytes, bytes] = await asyncio.wait_for(
+                connection.read_headers(),
+                timeout=self.timeouts.read_timeout,
             )
 
             status_string: List[bytes] = response_code.split()
@@ -505,20 +506,20 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                             host=url.hostname,
                             path=url.path,
                         ),
+                        headers=response_headers,
                         method=method,
                         status=status,
-                        headers=headers,
                         timings=timings,
                     ),
                     True,
                     timings,
                 )
 
-            content_length = headers.get(b"content-length")
-            transfer_encoding = headers.get(b"transfer-encoding")
+            content_length = response_headers.get(b"content-length")
+            transfer_encoding = response_headers.get(b"transfer-encoding")
 
             cookies: Union[HTTPCookies, None] = None
-            cookies_data: Union[bytes, None] = headers.get(b"set-cookie")
+            cookies_data: Union[bytes, None] = response_headers.get(b"set-cookie")
             if cookies_data:
                 cookies = HTTPCookies()
                 cookies.update(cookies_data)
@@ -576,7 +577,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
                     cookies=cookies,
                     method=method,
                     status=status,
-                    headers=headers,
+                    headers=response_headers,
                     content=body,
                     timings=timings,
                 ),
@@ -654,6 +655,7 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         self,
         url: HTTPUrl | URL,
         method: Literal["GET", "POST"],
+        auth: tuple[str, str] | Auth | None = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[List[HTTPCookie]] = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
@@ -699,6 +701,14 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
         header_items = (
             f"{method} {url_path} HTTP/1.1{NEW_LINE}HOST: {hostname}{NEW_LINE}"
         )
+
+
+        if isinstance(auth, Auth):
+            header_items += auth.optimized
+
+        elif auth:
+            header_items += self._serialize_auth(auth)
+
         if isinstance(headers, Headers):
             header_items += headers.optimized
         elif headers:
@@ -745,6 +755,24 @@ class MercurySyncGraphQLConnection(MercurySyncHTTPConnection):
 
         return f"{header_items}{NEW_LINE}".encode()
 
+    def _serialize_auth(
+        self,
+        auth: tuple[str, str] | tuple[str],
+    ):
+        if len(auth) > 1:
+            credentials_string = f"{auth[0]}:{auth[1]}"
+            encoded_credentials = base64.b64encode(
+                credentials_string.encode(),
+            ).decode()
+
+        else:
+
+            encoded_credentials = base64.b64encode(
+                auth[0].encode()
+            ).decode()
+
+        return f'Authorization: Basic {encoded_credentials}{NEW_LINE}'
+    
     def close(self):
         for connection in self._connections:
             connection.close()

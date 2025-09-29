@@ -14,8 +14,8 @@ from pydantic import BaseModel, StrictStr
 class BrowserMetadata(BaseModel):
     browser_type: Optional[
         Literal["safari", "webkit", "firefox", "chrome", "chromium"]
-    ] = (None,)
-    device_type: Optional[StrictStr] = (None,)
+    ] = None
+    device_type: Optional[StrictStr] = None
     locale: Optional[StrictStr] = None
     geolocation: Optional[Geolocation] = None
     permissions: Optional[List[StrictStr]] = None

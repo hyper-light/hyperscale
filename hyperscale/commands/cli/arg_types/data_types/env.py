@@ -39,7 +39,13 @@ class Env(Generic[T]):
     def data_type(self):
         return self._data_types
 
-    async def parse(self, _: str | None = None):
+    async def parse(self, arg: str | None = None):
+        
+        if arg:
+            self.data = arg
+
+            return self
+
         result = await self._load_envar()
         if isinstance(result, Exception):
             return result
@@ -50,7 +56,7 @@ class Env(Generic[T]):
 
     async def _load_envar(self):
         value = await self._load()
-        if isinstance(value, None):
+        if value is None:
             return Exception(f"no envar matching {self._envar.upper()} found")
 
         for conversion_type in self._types:

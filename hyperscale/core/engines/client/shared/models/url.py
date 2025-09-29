@@ -98,6 +98,107 @@ class URL:
         ]] = []
         self.address: Union[str, None] = None
 
+    async def lookup_ssh(self):
+
+        port = self.parsed.port
+
+        if port:
+            port = 22
+
+        self.port = port
+
+        if self.loop is None:
+            self.loop = get_event_loop()
+
+        if self.parsed.hostname is None:
+            try:
+
+                host = self.full
+                if ":" in host:
+                    host, port = self.full.split(':', maxsplit=1)
+                    port = int(port)
+                    self.port = port
+
+                address_info = (host, port)
+
+                if host == 'localhost':
+                    socket_family = socket.AF_INET
+
+                if isinstance(ip_address(host), IPv6Address):
+                    socket_family = socket.AF_INET6
+                    address_info = (host, port, 0 , 0)
+
+                elif isinstance(ip_address(host), IPv4Address):
+                    socket_family = socket.AF_INET
+
+                address = (host, port)
+
+                
+                self.ip_addresses = [
+                    (
+                        address,
+                        (
+                            socket_family,
+                            socket.SOCK_STREAM,
+                            0,
+                            "",
+                            address_info,
+                        ),
+                    )
+                ]
+
+
+            except Exception:
+
+                
+                host = self.full
+                if ":" in host:
+                    host, port = self.full.split(':', maxsplit=1)
+                    port = int(port)
+                    self.port = port
+                    
+                address = (host, port)
+
+                self.ip_addresses = [
+                    (
+                        address,
+                        (
+                            socket.AF_INET,
+                            socket.SOCK_STREAM,
+                            0,
+                            "",
+                            address_info,
+                        ),
+                    )
+                ]
+
+        else:
+            resolved = await self.resolver.gethostbyname(
+                self.parsed.hostname, self.family
+            )
+
+            for address in resolved.addresses:
+                if isinstance(ip_address(address), IPv4Address):
+                    socket_family = socket.AF_INET
+                    address_info = (address, self.port)
+
+                else:
+                    socket_family = socket.AF_INET6
+                    address_info = (address, self.port, 0, 0)
+
+                self.ip_addresses.append(
+                    (
+                        address,
+                        (
+                            socket_family,
+                            socket.SOCK_STREAM,
+                            0,
+                            "",
+                            address_info,
+                        ),
+                    )
+                )
+
     async def lookup_ftp(
         self,
         connection_type: Literal['control', 'data'] = 'control',
@@ -134,11 +235,14 @@ class URL:
                 
                 self.ip_addresses = [
                     (
-                        socket_family,
-                        socket.SOCK_STREAM,
-                        0,
-                        "",
-                        address_info,
+                        address,
+                        (
+                            socket_family,
+                            socket.SOCK_STREAM,
+                            0,
+                            "",
+                            address_info,
+                        ),
                     )
                 ]
 
@@ -162,11 +266,14 @@ class URL:
 
                 self.ip_addresses.append(
                     (
-                        socket_family,
-                        socket.SOCK_STREAM,
-                        0,
-                        "",
-                        address_info,
+                        address,
+                        (
+                            socket_family,
+                            socket.SOCK_STREAM,
+                            0,
+                            "",
+                            address_info,
+                        ),
                     )
                 )
 

@@ -8,7 +8,7 @@ from .terminal_ui import (
     update_params,
     update_text,
     create_ping_ui,
-    colorize_ftp,
+    colorize_ftp_or_scp_or_sftp,
 )
 
 
@@ -30,7 +30,7 @@ async def make_ftp_request(
     terminal = create_ping_ui(
         url,
         'PWD',
-        override_status_colorizer=colorize_ftp
+        override_status_colorizer=colorize_ftp_or_scp_or_sftp
     )
 
     try:
@@ -44,6 +44,7 @@ async def make_ftp_request(
             url,
             auth=auth,
             secure_connection=secure_connection,
+            timeout=timeout,
         )
 
         if quiet is False:

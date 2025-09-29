@@ -1,7 +1,7 @@
 import asyncio
 import json
 from ipaddress import IPv4Address, IPv6Address
-from typing import Literal, Any
+from typing import Literal
 from hyperscale.core.engines.client.time_parser import TimeParser
 from .requests import (
     make_ftp_request,
@@ -10,6 +10,8 @@ from .requests import (
     make_http_request,
     make_http2_request,
     make_http3_request,
+    make_scp_request,
+    make_sftp_request,
     make_smtp_request,
     make_tcp_request,
     make_udp_request,
@@ -581,7 +583,113 @@ async def http3(
         wait=wait,
         quiet=quiet,
     )
-        
+
+@ping.command()
+async def scp(
+    url: str,
+    filepath: str,
+    timeout: str = "1m",
+    user: str | None = None,
+    password: str | None = None,
+    insecure: bool = False,
+    recurse: bool = False,
+    lookup: bool = False,
+    wait: bool = False,
+    quiet:bool= False,
+):
+    '''
+    Run a one-off SCP request
+
+    @param url The url to use for the email server
+    @param filepath The remote path to download the file from
+    @param timeout The request timeout
+    @param user The user required by authentication
+    @param password The password associated with the user
+    @param insecure Bypass SSH cert validation
+    @param recurse Recurse the remote path and download all files
+    @param lookup Execute only the IP address lookup and output matches
+    @param wait Don't exit once the request completes or fails
+    @param quiet Mutes all terminal output
+    '''
+    
+    if lookup:
+        return await lookup_url(
+            url,
+            as_smtp=True,
+            wait=wait,
+            quiet=quiet,
+        )
+    
+    timeout_seconds = TimeParser(timeout).time
+    
+    return await make_scp_request(
+        url,
+        filepath,
+        timeout=timeout_seconds,
+        auth=(user, password) if user and password else None,
+        insecure=insecure,
+        recurse=recurse,
+        wait=wait,
+        quiet=quiet,
+
+    )
+
+@ping.command(
+    shortnames={
+        'path_encoding': 'P',
+    }
+)
+async def sftp(
+    url: str,
+    timeout: str = "1m",
+    user: str | None = None,
+    password: str | None = None,
+    path_encoding: str = 'utf-8',
+    filepath: str = get_default_output_filepath,
+    insecure: bool = False,
+    lookup: bool = False,
+    version: int = 3,
+    wait: bool = False,
+    quiet:bool= False,
+):
+    '''
+    Run a one-off SCP request
+
+    @param url The url to use for the email server
+    @param filepath The path to download the file to
+    @param timeout The request timeout
+    @param user The user required by authentication
+    @param password The password associated with the user
+    @param insecure Bypass SSH cert validation
+    @param path-encoding The path encoding to use
+    @param version The SFTP version to use
+    @param lookup Execute only the IP address lookup and output matches
+    @param wait Don't exit once the request completes or fails
+    @param quiet Mutes all terminal output
+    '''
+    
+    if lookup:
+        return await lookup_url(
+            url,
+            as_smtp=True,
+            wait=wait,
+            quiet=quiet,
+        )
+    
+    timeout_seconds = TimeParser(timeout).time
+    
+    return await make_sftp_request(
+        url,
+        timeout=timeout_seconds,
+        auth=(user, password) if user and password else None,
+        insecure=insecure,
+        path_encoding=path_encoding,
+        version=version,
+        output_file=filepath,
+        wait=wait,
+        quiet=quiet,
+
+    )  
 
 @ping.command(     
     shortnames={
@@ -605,7 +713,6 @@ async def smtp(
     Run a one-off SMTP request
 
     @param url The url to use for the email server
-    @param auth A colon-delimited tuple "<USERNAME>:<PASSWORD>" to use when authenticating
     @param email The string email body to send
     @param sender The sender of the email
     @param subject The title/subject of the email
