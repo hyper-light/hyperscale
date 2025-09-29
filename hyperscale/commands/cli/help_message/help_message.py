@@ -30,7 +30,7 @@ class HelpMessage(BaseModel):
             styles = global_styles
 
         indentation = self.indentation
-        if global_styles:
+        if global_styles and global_styles.indentation:
             indentation = global_styles.indentation
 
         lines: list[str] = []

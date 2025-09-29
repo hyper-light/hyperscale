@@ -1,14 +1,20 @@
-from __future__ import annotations
-
 import inspect
-
-from typing import Any, Callable
-
+from typing import (
+    Any, 
+    Callable, 
+    get_args, 
+    get_origin, 
+    Literal,
+)
+from types import UnionType
 from .arg_types import (
     Context,
     KeywordArg,
     PositionalArg,
+    KeywordArgType,
+    
 )
+from .arg_types.data_types.check_if_multiarg import check_if_multiarg
 from .help_message import create_help_string, CLIStyle
 
 
@@ -67,6 +73,11 @@ def inspect_wrapped(
     position_index: int = 0
 
     for arg_name, arg_attrs in call_args.parameters.items():
+        is_multiarg = check_if_multiarg(arg_attrs.annotation, [
+            *KeywordArg.complex_types,
+            *PositionalArg.complex_types
+        ])
+
         if (
             arg_attrs.default == inspect._empty
             and arg_attrs.annotation == inspect._empty
@@ -80,6 +91,7 @@ def inspect_wrapped(
                 arg_name,
                 position_index,
                 arg_attrs.annotation,
+                is_multiarg=is_multiarg,
                 is_context_arg=Context == arg_attrs.annotation,
             )
 
@@ -88,13 +100,29 @@ def inspect_wrapped(
         else:
             arg_type: KeywordArgType = "keyword"
             arg_default = arg_attrs.default
-            if isinstance(arg_attrs.default, bool) or arg_attrs.annotation == bool:
+            if isinstance(arg_attrs.default, bool) or arg_attrs.annotation is bool:
                 arg_type = "flag"
 
             if arg_type == "flag" and arg_attrs.default is None:
                 arg_default = False
 
-            required = True if arg_attrs.default is None else False
+            args_types = []
+            if get_origin(arg_attrs.annotation) is UnionType:
+                args_types.extend(get_args(arg_attrs.annotation))
+
+            elif get_origin(arg_attrs.annotation) is Literal:
+                args_types.extend(get_args(arg_attrs.annotation))
+
+            else:
+                args_types.append(arg_attrs.annotation)
+
+            no_default = arg_attrs.default is None
+            none_not_preset = len([
+                arg_type for arg_type in args_types if arg_type is type(None)
+            ]) == 0
+
+            required = no_default and none_not_preset
+
 
             keyword_arg = KeywordArg(
                 arg_name,
@@ -103,6 +131,7 @@ def inspect_wrapped(
                 required=required,
                 default=arg_default,
                 arg_type=arg_type,
+                is_multiarg=is_multiarg,
                 is_context_arg=Context == arg_attrs.annotation,
             )
 

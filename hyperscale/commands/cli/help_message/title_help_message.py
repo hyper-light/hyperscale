@@ -27,14 +27,14 @@ class TitleHelpMessage(BaseModel):
         global_styles: CLIStyle | None = None,
     ):
         indentation = self.indentation
-        if global_styles.indentation:
+        if global_styles and global_styles.indentation:
             indentation = global_styles.indentation
 
         styles = self.styling
         if styles is None:
             styles = global_styles
 
-        command_name = self.command
+        command_name = self.command.replace('_', '-')
 
         if styles and styles.has_header_styles():
             command_name = await stylize(
@@ -44,8 +44,6 @@ class TitleHelpMessage(BaseModel):
                 attrs=get_style(styles.header_attributes),
                 mode=styles.to_mode(),
             )
-
-        options_string: str | None = str(None)
 
         left_char = await self._style_text("[", styles)
 

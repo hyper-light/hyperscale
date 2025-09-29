@@ -1,21 +1,22 @@
 from __future__ import annotations
+
 import asyncio
+import importlib
 import importlib.util
+import ntpath
 import pathlib
 import sys
-import importlib
-import ntpath
-from typing import Generic, TypeVar, Any
-from .reduce_pattern_type import reduce_pattern_type
+from typing import Any, Generic, TypeVar
 
+from .reduce_pattern_type import reduce_pattern_type
 
 T = TypeVar("T")
 
 
-class ImportFile(Generic[T]):
+class ImportInstance(Generic[T]):
     def __init__(
         self,
-        data_type: ImportFile[T],
+        data_type: ImportInstance[T],
     ):
         super().__init__()
         self.data: dict[str, T] | None = None
@@ -40,7 +41,7 @@ class ImportFile(Generic[T]):
         return ", ".join(self._data_types)
 
     async def parse(self, arg: str | None = None):
-        result = await self._import_file_objects(arg)
+        result = await self._import_instance(arg)
         if isinstance(result, Exception):
             return result
 
@@ -48,58 +49,40 @@ class ImportFile(Generic[T]):
 
         return self
 
-    async def _import_file_objects(self, arg: str | None):
+    async def _import_instance(self, arg: str):
         try:
-            if arg is None:
-                return Exception("no argument passed for filepath")
+            path = pathlib.Path(arg).absolute().resolve()
+            path_str = str(path)
 
-            path = await self._loop.run_in_executor(None, pathlib.Path, arg)
-
-            resolved_path = await self._loop.run_in_executor(None, path.resolve)
-
-            package_dir = resolved_path.parent
+            package_dir = path.parent
             package_dir_path = str(package_dir)
             package_dir_module = package_dir_path.split("/")[-1]
 
             package = ntpath.basename(path)
             package_slug = package.split(".")[0]
 
-            spec = await self._loop.run_in_executor(
-                None,
-                importlib.util.spec_from_file_location,
-                f"{package_dir_module}.{package_slug}",
-                arg,
+            spec = importlib.util.spec_from_file_location(
+                f"{package_dir_module}.{package_slug}", path_str
             )
 
-            if arg not in sys.path:
-                await self._loop.run_in_executor(
-                    None, sys.path.append, str(package_dir.parent)
-                )
+            if path_str not in sys.path:
+                sys.path.append(str(package_dir.parent))
 
-            module = await self._loop.run_in_executor(
-                None,
-                importlib.util.module_from_spec,
-                spec,
-            )
-
+            module = importlib.util.module_from_spec(spec)
             sys.modules[module.__name__] = module
 
-            await self._loop.run_in_executor(
-                None,
-                spec.loader.exec_module,
-                module,
-            )
+            spec.loader.exec_module(module)
 
             imported_types: dict[str, T] = {}
 
             for conversion_type in self._types:
-                discovered = list(
+                imported_types.update(
                     {
-                        cls.__name__: cls for cls in conversion_type.__subclasses__()
-                    }.values()
+                        name: value
+                        for name, value in module.__dict__.items()
+                        if isinstance(value, conversion_type)
+                    }
                 )
-
-                imported_types.update({item.__name__: item for item in discovered})
 
             return imported_types
 

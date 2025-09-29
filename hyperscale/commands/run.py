@@ -23,7 +23,7 @@ from hyperscale.logging import LoggingConfig, LogLevelName
 from .cli import (
     CLI,
     AssertSet,
-    ImportFile,
+    ImportType,
     JsonFile,
 )
 
@@ -65,7 +65,7 @@ def get_default_config():
 
 @CLI.command()
 async def run(
-    path: ImportFile[Workflow],
+    path: ImportType[Workflow],
     config: JsonFile[HyperscaleConfig] = get_default_config,
     log_level: AssertSet[LogLevelName] = "fatal",
     workers: int = get_default_workers,

@@ -1,6 +1,6 @@
 import asyncio
 from hyperscale.core.engines.client.setup_clients import setup_client
-from hyperscale.core.engines.client.ftp import MercurySyncFTPConnection
+from hyperscale.core.engines.client.scp import MercurySyncSCPConnection
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from .terminal_ui import (
     update_status,
@@ -12,26 +12,32 @@ from .terminal_ui import (
 )
 
 
-async def make_ftp_request(
+async def make_scp_request(
     url: str,
+    path: str,
     timeout: int | float,
-    auth: tuple[str, str, str] | None = None,
-    secure_connection: bool = False,
-    output_file: str | None = None,
+    auth: tuple[str, str] | None = None,
+    insecure: bool = False,
+    recurse: bool = False,
     wait: bool = False,
     quiet:bool= False,
 ):
     
     timeouts = Timeouts(request_timeout=timeout)
 
-    ftp = MercurySyncFTPConnection(timeouts=timeouts)
-    ftp = setup_client(ftp, 1)
+    scp = MercurySyncSCPConnection(timeouts=timeouts)
+    scp = setup_client(scp, 1)
 
     terminal = create_ping_ui(
         url,
-        'PWD',
+        'RECIEVE',
         override_status_colorizer=colorize_ftp_or_scp_or_sftp
     )
+
+    username: str | None = None
+    password: str | None = None
+    if auth:
+        username, password = auth
 
     try:
         if quiet is False:
@@ -40,17 +46,21 @@ async def make_ftp_request(
                 vertical_padding=1,
             )
 
-        response = await ftp.pwd(
+        response = await scp.receive(
             url,
-            auth=auth,
-            secure_connection=secure_connection,
+            path,
+            username=username,
+            password=password,
+            disable_host_check=insecure,
+            preserve_file_attributes=True,
+            recurse=recurse,
             timeout=timeout,
         )
 
         if quiet is False:
 
             response_status = 'OK'
-            response_text = response.data
+            response_text = f'Got: {len(response.transferred)} files'
             if response.error:
                 response_status = 'FAILED'
                 response_text = str(response.error)

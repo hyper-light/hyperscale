@@ -37,6 +37,8 @@ def create_command(
     command_call: Callable[..., Any],
     styling: CLIStyle | None = None,
     shortnames: dict[str, str] | None = None,
+    display_help_on_error: bool = True,
+    error_exit_code: int = 1,
 ):
     indentation = 0
     if styling:
@@ -53,15 +55,40 @@ def create_command(
     )
 
     return Command(
-        command_call.__name__,
+        command_call.__name__.replace('_', '-'),
         command_call,
         help_message,
         positional_args=positional_args_map,
         keyword_args_map=keyword_args_map,
+        display_help_on_error=display_help_on_error,
+        error_exit_code=error_exit_code,
     )
 
 
+def command(
+    styling: CLIStyle | None = None,
+    shortnames: dict[str, str] | None = None,
+    display_help_on_error: bool = True,
+    error_exit_code: int = 1,
+):
+    if shortnames is None:
+        shortnames = {}
+
+    def wrap(command_call):
+
+        return create_command(
+            command_call,
+            styling=styling,
+            shortnames=shortnames,
+            display_help_on_error=display_help_on_error,
+            error_exit_code=error_exit_code,
+        )
+
+    return wrap
+
+
 class Command(Generic[T]):
+
     def __init__(
         self,
         command: str,
@@ -69,6 +96,8 @@ class Command(Generic[T]):
         help_message: HelpMessage,
         positional_args: dict[str, PositionalArg] | None = None,
         keyword_args_map: dict[str, KeywordArg] | None = None,
+        display_help_on_error: bool = True,
+        error_exit_code: int = 1,
     ):
         if positional_args is None:
             positional_args = {}
@@ -86,6 +115,10 @@ class Command(Generic[T]):
         self.keyword_args_map = keyword_args_map
         self.keyword_args_count = len(keyword_args_map)
         self.positional_args_count = len(positional_args)
+        self.display_help_on_error = display_help_on_error
+        self.error_exit_code = error_exit_code
+
+        self._consumed_keywords: list[str] = []
         self._loop = asyncio.get_event_loop()
 
     @property
@@ -97,35 +130,62 @@ class Command(Generic[T]):
         self,
         args: list[str],
         context: Context[str, Any],
-    ) -> tuple[Any | None, list[str]]:
+    ) -> tuple[
+        Any | None,
+        list[str], int | None,
+    ]:
         (positional_args, keyword_args, errors) = await self._find_args(args, context)
 
         if positional_args is None and keyword_args is None:
             await self._print_group_help_message()
 
-            return (None, errors)
+            return (
+                None,
+                errors,
+                self.error_exit_code,
+            )
 
         elif len(errors) > 0:
             await self._print_group_help_message(
-                error=errors[0],
+                error=[0],
             )
 
             return (
                 None,
                 errors,
+                self.error_exit_code,
             )
 
-        result = await self._command_call(*positional_args, **keyword_args)
+        try:
+            result = await self._command_call(*positional_args, **keyword_args)
 
-        return (
-            result,
-            errors,
-        )
+            return (
+                result,
+                errors,
+                self.error_exit_code,
+            )
+        
+        except Exception as err:
+
+            if self.display_help_on_error is False:
+                raise err
+
+            await self._print_group_help_message(
+                error=err,
+            )
+
+            return (
+                None,
+                [err],
+                self.error_exit_code,
+            )
     
     def command(
         self,
         styling: CLIStyle | None = None,
         shortnames: dict[str, str] | None = None,
+        display_help_on_error: bool = True,
+        error_exit_code: int = 1,
     ):
         if shortnames is None:
             shortnames = {}
@@ -135,6 +195,8 @@ class Command(Generic[T]):
                 command_call,
                 styling=styling,
                 shortnames=shortnames,
+                display_help_on_error=display_help_on_error,
+                error_exit_code=error_exit_code,
             )
 
             return command_call
@@ -322,7 +384,11 @@ class Command(Generic[T]):
 
             elif (
                 positional_arg := positional_args_map.get(positional_idx)
-            ) and idx not in consumed_idxs:
+            ) and (
+                idx not in consumed_idxs
+            ) and (
+                positional_arg.is_multiarg is False
+            ):
                 positional_args, error = await self._consume_positional_value(
                     arg,
                     positional_arg,
@@ -332,6 +398,35 @@ class Command(Generic[T]):
                 positional_idx += 1
 
                 consumed_idxs.add(idx)
+
+            elif (
+                positional_arg := positional_args_map.get(positional_idx)
+            ) and (
+                idx not in consumed_idxs
+            ) and (
+                positional_arg.is_multiarg
+            ):
+                (
+                    positional_args, 
+                    error,
+                    consumed,
+                ) = await self._consume_multiarg_positional_value(
+                    positional_arg,
+                    positional_args,
+                    keyword_args_map,
+                    cli_args[idx:],
+                    idx,
+                )
+
+                positional_idx += len(consumed)
+
+                for consumed_idx in consumed:
+                    consumed_idxs.add(consumed_idx)
+
+            elif idx not in consumed_idxs:
+                errors.append(
+                    f'{arg} is not a recognized option'
+                )
 
             if error:
                 errors.append(error)
@@ -381,6 +476,46 @@ class Command(Generic[T]):
             positional_args,
             None,
         )
+    
+    async def _consume_multiarg_positional_value(
+        self,
+        positional_arg: PositionalArg,
+        positional_args: list[Any],
+        keyword_args_map: dict[str, KeywordArg],
+        args: list[str],
+        idx: int,
+    ):
+        consumed = set()
+        values: list[Any] = []
+
+        error: Exception | None = None
+
+        for arg_idx, arg in enumerate(args):
+            if keyword_args_map.get(arg):
+                break
+            
+            values, error = await self._consume_positional_value(
+                arg,
+                positional_arg,
+                list(values),
+            )
+
+            if error:
+                return (
+                    positional_args,
+                    error,
+                    consumed,
+                )
+
+            consumed.add(idx + arg_idx)
+
+        positional_args.append(values)
+
+        return (
+            positional_args,
+            error,
+            consumed,
+        )
 
     async def _consume_keyword_value(
         self,
@@ -389,12 +524,68 @@ class Command(Generic[T]):
         keyword_arg: KeywordArg,
         consumed_idxs: set[int],
     ):
+        if keyword_arg.is_multiarg is False and keyword_arg.name in self._consumed_keywords:
+            return (
+                None,
+                Exception(f'{keyword_arg.full_flag} may only be specified once'),
+                consumed_idxs,
+            )
+
         if keyword_arg.arg_type == "flag":
             return (
                 True,
                 None,
                 consumed_idxs,
             )
+        
+        if keyword_arg.is_multiarg:
+            values: list[Any] = []
+            
+            for idx, arg in enumerate(args):
+                if arg.startswith('-'):
+                    break
+
+                (
+                    value,
+                    error,
+                    consumed_idxs,
+                ) = await self._parse_keyword_value(
+                    current_idx + idx,
+                    [arg],
+                    keyword_arg,
+                    consumed_idxs,
+                )
+
+                if error:
+                    return (
+                        None,
+                        error,
+                        consumed_idxs,
+                    )
+
+                values.append(value)
+
+            return (
+                values,
+                None,
+                consumed_idxs,
+            )
+            
+        return await self._parse_keyword_value(
+            current_idx,
+            args,
+            keyword_arg,
+            consumed_idxs,
+        )
+        
+    
+    async def _parse_keyword_value(
+        self,
+        current_idx: int,
+        args: list[str],
+        keyword_arg: KeywordArg,
+        consumed_idxs: set[int],
+    ):
 
         value: Any | None = None
         value_idx = 0
@@ -421,6 +612,7 @@ class Command(Generic[T]):
         if value is None and keyword_arg.loads_from_envar:
             result = await keyword_arg.parse()
             value, last_error = self._return_value_and_error(result)
+            
 
         if value is None and isinstance(last_error, Exception):
             return (

@@ -1,6 +1,7 @@
 import asyncio
 from hyperscale.core.engines.client.setup_clients import setup_client
-from hyperscale.core.engines.client.ftp import MercurySyncFTPConnection
+from hyperscale.core.engines.client.sftp import MercurySyncSFTPConnction
+from hyperscale.core.engines.client.ssh.models.ssh import ConnectionOptions
 from hyperscale.core.engines.client.shared.timeouts import Timeouts
 from .terminal_ui import (
     update_status,
@@ -12,11 +13,13 @@ from .terminal_ui import (
 )
 
 
-async def make_ftp_request(
+async def make_sftp_request(
     url: str,
     timeout: int | float,
-    auth: tuple[str, str, str] | None = None,
-    secure_connection: bool = False,
+    auth: tuple[str, str] | None = None,
+    insecure: bool = False,
+    path_encoding: str = 'utf-8',
+    version: int = 3,
     output_file: str | None = None,
     wait: bool = False,
     quiet:bool= False,
@@ -24,14 +27,22 @@ async def make_ftp_request(
     
     timeouts = Timeouts(request_timeout=timeout)
 
-    ftp = MercurySyncFTPConnection(timeouts=timeouts)
-    ftp = setup_client(ftp, 1)
+    sftp = MercurySyncSFTPConnction(timeouts=timeouts)
+    sftp = setup_client(sftp, 1)
+
+    sftp.sftp_version = version
+    sftp.path_encoding = path_encoding
 
     terminal = create_ping_ui(
         url,
-        'PWD',
+        'GETCWD',
         override_status_colorizer=colorize_ftp_or_scp_or_sftp
     )
+
+    username: str | None = None
+    password: str | None = None
+    if auth:
+        username, password = auth
 
     try:
         if quiet is False:
@@ -40,17 +51,23 @@ async def make_ftp_request(
                 vertical_padding=1,
             )
 
-        response = await ftp.pwd(
+        response = await sftp.getcwd(
             url,
-            auth=auth,
-            secure_connection=secure_connection,
+            username=username,
+            password=password,
+            insecure=insecure,
             timeout=timeout,
         )
+
+        assert len(response.transferred) == 1, "Err. - Too many results returned for GETCWD"
+
+        result = list(response.transferred.values()).pop()
+        result_path = result.file_path.decode(encoding=path_encoding)
 
         if quiet is False:
 
             response_status = 'OK'
-            response_text = response.data
+            response_text = f'Current dir: {result_path}'
             if response.error:
                 response_status = 'FAILED'
                 response_text = str(response.error)
