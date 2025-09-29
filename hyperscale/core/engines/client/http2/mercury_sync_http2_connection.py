@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import ssl
 import time
 import uuid
@@ -693,6 +694,7 @@ class MercurySyncHTTP2Connection:
             encoded_headers = self._encode_headers(
                 url,
                 method,
+                auth=auth,
                 params=params,
                 headers=headers,
                 cookies=cookies,
@@ -854,6 +856,7 @@ class MercurySyncHTTP2Connection:
         self,
         url: HTTPUrl,
         method: str,
+        auth: tuple[str, str] | Auth | None = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
@@ -870,24 +873,26 @@ class MercurySyncHTTP2Connection:
             url_params = urlencode(params)
             url_path += f"?{url_params}"
 
-        if isinstance(headers, Headers):
-            encoded_headers: List[Tuple[bytes, bytes]] = [
-                (b":method", method.encode()),
-                (b":authority", url.hostname.encode()),
-                (b":scheme", url.scheme.encode()),
-                (b":path", url_path.encode()),
-            ]
 
+        encoded_headers: List[Tuple[bytes, bytes]] = [
+            (b":method", method.encode()),
+            (b":authority", url.hostname.encode()),
+            (b":scheme", url.scheme.encode()),
+            (b":path", url_path.encode()),
+        ]
+
+        if isinstance(auth, Auth):
+            encoded_headers.append(auth.optimized)
+
+        elif auth is not None:
+            encoded_headers.append(
+                self._encode_auth_headers(auth),
+            )
+
+        if isinstance(headers, Headers):
             encoded_headers.extend(headers.optimized)
 
         elif headers:
-            encoded_headers: List[Tuple[bytes, bytes]] = [
-                (b":method", method.encode()),
-                (b":authority", url.hostname.encode()),
-                (b":scheme", url.scheme.encode()),
-                (b":path", url_path.encode()),
-            ]
-
             encoded_headers.extend(
                 [
                     (k.lower().encode(), v.encode())
@@ -1059,7 +1064,28 @@ class MercurySyncHTTP2Connection:
             parsed_url,
             False,
         )
+    
+    def _encode_auth_headers(
+        self,
+        auth: tuple[str, str] | tuple[str],
+    ):
+        if len(auth) > 1:
+            credentials_string = f"{auth[0]}:{auth[1]}"
+            return (
+                b"authorization",
+                base64.b64encode(
+                    credentials_string.encode()
+                )
+            )
 
+        else:
+            return (
+                b"authorization",
+                base64.b64encode(
+                    auth[0].encode()
+                )
+            )
+        
     def close(self):
         for connection in self._connections:
             connection.close()

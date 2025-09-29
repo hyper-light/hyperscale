@@ -1442,7 +1442,7 @@ class MercurySyncHTTPConnection:
         self,
         url: URL | HTTPUrl,
         method: str,
-        auth: tuple[str, str] | Auth = None,
+        auth: tuple[str, str] | Auth | None = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str] | Headers] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
