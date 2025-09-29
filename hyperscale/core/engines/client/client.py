@@ -17,6 +17,8 @@ from .http3 import MercurySyncHTTP3Connection
 from .playwright import MercurySyncPlaywrightConnection
 from .shared.models import RequestType
 from .smtp import MercurySyncSMTPConnection
+from .scp import MercurySyncSCPConnection
+from .sftp import MercurySyncSFTPConnction
 from .tcp import MercurySyncTCPConnection
 from .udp import MercurySyncUDPConnection
 from .websocket import MercurySyncWebsocketConnection
@@ -40,6 +42,8 @@ class Client(Generic[Unpack[T]]):
         self.http2 = MercurySyncHTTP2Connection()
         self.http3 = MercurySyncHTTP3Connection()
         self.playwright = MercurySyncPlaywrightConnection()
+        self.scp = MercurySyncSCPConnection()
+        self.sftp = MercurySyncSFTPConnction()
         self.smtp = MercurySyncSMTPConnection()
         self.tcp = MercurySyncTCPConnection()
         self.udp = MercurySyncUDPConnection()
@@ -50,19 +54,23 @@ class Client(Generic[Unpack[T]]):
     ) -> Generator[
         Any,
         None,
-        MercurySyncGraphQLConnection
+        MercurySyncFTPConnection
+        | MercurySyncGraphQLConnection
         | MercurySyncGraphQLHTTP2Connection
         | MercurySyncGRPCConnection
         | MercurySyncHTTPConnection
         | MercurySyncHTTP2Connection
         | MercurySyncHTTP3Connection
         | MercurySyncPlaywrightConnection
+        | MercurySyncSCPConnection
+        | MercurySyncSFTPConnction
         | MercurySyncSMTPConnection
         | MercurySyncTCPConnection
         | MercurySyncUDPConnection
         | MercurySyncWebsocketConnection,
     ]:
         clients = [
+            self.ftp,
             self.graphql,
             self.graphqlh2,
             self.grpc,
@@ -70,6 +78,8 @@ class Client(Generic[Unpack[T]]):
             self.http2,
             self.http3,
             self.playwright,
+            self.scp,
+            self.sftp,
             self.smtp,
             self.tcp,
             self.udp,
@@ -84,6 +94,9 @@ class Client(Generic[Unpack[T]]):
         key: RequestType,
     ):
         match key:
+            case RequestType.FTP:
+                return self.ftp
+
             case RequestType.GRAPHQL:
                 return self.graphql
 
@@ -105,6 +118,12 @@ class Client(Generic[Unpack[T]]):
             case RequestType.PLAYWRIGHT:
                 return self.playwright
             
+            case RequestType.SCP:
+                return self.scp
+            
+            case RequestType.SFTP:
+                return self.sftp
+            
             case RequestType.SMTP:
                 return self.smtp
             
@@ -122,17 +141,22 @@ class Client(Generic[Unpack[T]]):
 
     def close(self):
         clients: list[
-            MercurySyncGraphQLConnection
+            MercurySyncFTPConnection
+            | MercurySyncGraphQLConnection
             | MercurySyncGraphQLHTTP2Connection
             | MercurySyncGRPCConnection
             | MercurySyncHTTPConnection
             | MercurySyncHTTP2Connection
             | MercurySyncHTTP3Connection
             | MercurySyncPlaywrightConnection
+            | MercurySyncSCPConnection
+            | MercurySyncSFTPConnction
+            | MercurySyncSMTPConnection
             | MercurySyncTCPConnection
             | MercurySyncUDPConnection
             | MercurySyncWebsocketConnection,
         ] = [
+            self.ftp,
             self.graphql,
             self.graphqlh2,
             self.grpc,
@@ -140,6 +164,8 @@ class Client(Generic[Unpack[T]]):
             self.http2,
             self.http3,
             self.playwright,
+            self.scp,
+            self.sftp,
             self.smtp,
             self.tcp,
             self.udp,
