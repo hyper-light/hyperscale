@@ -73,6 +73,7 @@ class MercurySyncSCPConnection:
 
         self.address_family = address_family
         self.address_protocol = protocol
+        self.disable_host_check = True
         
     async def copy(
         self,
@@ -259,6 +260,17 @@ class MercurySyncSCPConnection:
                     error=err,
                     timings={},
                 )
+                
+    async def _optimize(
+        self,
+        optimized_param: URL | Data | File,
+    ):
+        if isinstance(optimized_param, URL):
+            self._url_cache[optimized_param.optimized.hostname] = optimized_param
+            self._optimized[optimized_param.call_name] = optimized_param
+
+        else:
+            self._optimized[optimized_param.call_name] = optimized_param
             
     async def _execute(
         self,

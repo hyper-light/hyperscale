@@ -1,5 +1,6 @@
 from typing import Generic, Optional, TypeVar
 
+from hyperscale.core.engines.client.shared.models import RequestType
 from hyperscale.core.testing.models.base import OptimizedArg
 
 from .query_validator import QueryValidator
@@ -21,18 +22,26 @@ class Query(OptimizedArg, Generic[T]):
 
         self.optimized: Optional[str] = None
 
-    async def optimize(self):
+    async def optimize(
+        self,
+        request_type: RequestType,
+    ):
         if self.optimized is not None:
             return
+        
+        match request_type:
+            case RequestType.GRAPHQL | RequestType.GRAPHQL_HTTP2:
+                query_string = "".join(
+                    self.data.replace(
+                        "query",
+                        "",
+                    ).split()
+                )
+                self.optimized = f"?query={{{query_string}}}"
 
-        query_string = "".join(
-            self.data.replace(
-                "query",
-                "",
-            ).split()
-        )
-        self.optimized = f"?query={{{query_string}}}"
-
+            case _:
+                pass
+            
     def __str__(self) -> str:
         return self.data
 

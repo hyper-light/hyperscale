@@ -13,6 +13,7 @@ from typing import (
     Literal
 )
 
+from hyperscale.core.engines.client.shared.models import RequestType
 from hyperscale.core.testing.models.base import OptimizedArg, FrozenDict
 from .email_attachment import EmailAttachment
 from .email_validator import EmailValidator
@@ -78,47 +79,66 @@ class Email(OptimizedArg, Generic[T]):
         )
 
         self.call_name: str | None = None
-        self.data: Email = FrozenDict(validated_email.model_dump(exclude_none=True))
+        self.data: dict[
+            str,
+            str
+            | list[str]
+            | EmailAttachment
+            | list[EmailAttachment]
+        ] = FrozenDict(validated_email.model_dump(exclude_none=True))
+
         self.optimized: str | None = None
 
     async def optimize(
         self,
-        sender: str,
-        recipients: str | list[str],
-        subject: str,
-        body: str,
-        attachments: EmailAttachment | list[EmailAttachment] | None = None,
+        request_type: RequestType,
     ):
-        loop = asyncio.get_event_loop()
+        
+        if self.optimized is not None:
+            return
 
-        if isinstance(recipients, str):
-            recipients = [recipients]
+        match request_type:
 
-        email = MIMEMultipart()
-        email['From'] = sender
-        email['To'] = COMMASPACE.join(recipients)
-        email['Date'] = formatdate(localtime=True)
-        email['Subject'] = subject
+            case RequestType.SMTP:
+                loop = asyncio.get_event_loop()
 
-        email.attach(MIMEText(body))
+                recipients = self.data.get("recipients")
+                sender = self.data.get("sender")
+                subject = self.data.get("subject")
+                body = self.data.get("body")
+                attachments = self.data.get("attachments")
 
-        if isinstance(attachments, EmailAttachment):
-            attachments = [attachments]
+                if isinstance(recipients, str):
+                    recipients = [recipients]
 
-        if attachments:
-            attachment_parts = await asyncio.gather(*[
-                self._attach_file(
-                    attachment.path,
-                    loop,
-                    mime_type=attachment.mime_type,
-                ) for attachment in attachments
-            ])
+                email = MIMEMultipart()
+                email['From'] = sender
+                email['To'] = COMMASPACE.join(recipients)
+                email['Date'] = formatdate(localtime=True)
+                email['Subject'] = subject
 
-            for part in attachment_parts:
-                email.attach(part)
+                email.attach(MIMEText(body))
 
-        self.optimized =  email.as_string()
+                if isinstance(attachments, EmailAttachment):
+                    attachments = [attachments]
 
+                if attachments:
+                    attachment_parts = await asyncio.gather(*[
+                        self._attach_file(
+                            attachment.path,
+                            loop,
+                            mime_type=attachment.mime_type,
+                        ) for attachment in attachments
+                    ])
+
+                    for part in attachment_parts:
+                        email.attach(part)
+
+                self.optimized =  email.as_string()
+
+            case _:
+                pass
+            
     async def _attach_file(
         self,
         filepath: str,

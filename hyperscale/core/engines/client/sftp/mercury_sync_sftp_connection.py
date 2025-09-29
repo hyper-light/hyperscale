@@ -2232,7 +2232,18 @@ class MercurySyncSFTPConnction:
                     error=err,
                     timings={},
                 )
-            
+    
+    async def _optimize(
+        self,
+        optimized_param: URL | Data | File,
+    ):
+        if isinstance(optimized_param, URL):
+            self._url_cache[optimized_param.optimized.hostname] = optimized_param
+            self._optimized[optimized_param.call_name] = optimized_param
+
+        else:
+            self._optimized[optimized_param.call_name] = optimized_param
+
     async def _execute(
         self,
         command_type: CommandType,

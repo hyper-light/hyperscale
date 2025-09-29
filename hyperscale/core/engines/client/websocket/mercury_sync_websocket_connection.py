@@ -178,47 +178,6 @@ class MercurySyncWebsocketConnection:
                     timings={},
                 )
 
-    async def _optimize(self, url: Optional[URL] = None):
-        if isinstance(url, URL):
-            await self._optimize_url(url)
-
-    async def _optimize_url(self, url: URL):
-        try:
-            upgrade_ssl: bool = False
-            if url:
-                (
-                    _,
-                    connection,
-                    url,
-                    upgrade_ssl,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-                self._connections.append(connection)
-
-            if upgrade_ssl:
-                url.data = url.data.replace("http://", "https://")
-
-                await url.optimize()
-
-                (
-                    _,
-                    connection,
-                    url,
-                    _,
-                ) = await asyncio.wait_for(
-                    self._connect_to_url_location(url),
-                    timeout=self.timeouts.connect_timeout,
-                )
-
-                self._connections.append(connection)
-
-            self._url_cache[url.optimized.hostname] = url
-
-        except Exception:
-            pass
-
     async def _optimize(
         self,
         optimized_param: URL | Params | Headers | Cookies | Data | Auth,

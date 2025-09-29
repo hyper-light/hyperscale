@@ -29,24 +29,43 @@ class Cookies(OptimizedArg, Generic[T]):
         self.data = validated_cookies.value
         self.optimized: Optional[str | Tuple[str, str]] = None
 
-    async def optimize(self, request_type: RequestType):
+    async def optimize(
+        self,
+        request_type: RequestType,
+    ):
         if self.optimized is not None:
             return
 
         if request_type == RequestType.UDP:
             return
+        
+        encoded = ""
+        
+        match request_type:
+            case (
+                RequestType.GRAPHQL
+                | RequestType.GRAPHQL_HTTP2
+                | RequestType.HTTP
+                | RequestType.HTTP2
+                | RequestType.HTTP3
+                | RequestType.WEBSOCKET
+            ):
 
-        cookies = []
+                cookies = []
 
-        for cookie_data in self.data:
-            if len(cookie_data) == 1:
-                cookies.append(cookie_data[0])
+                for cookie_data in self.data:
+                    if len(cookie_data) == 1:
+                        cookies.append(cookie_data[0])
 
-            elif len(cookie_data) == 2:
-                cookie_name, cookie_value = cookie_data
-                cookies.append(f"{cookie_name}={cookie_value}")
+                    elif len(cookie_data) == 2:
+                        cookie_name, cookie_value = cookie_data
+                        cookies.append(f"{cookie_name}={cookie_value}")
 
-        encoded = "; ".join(cookies)
+                encoded = "; ".join(cookies)
+
+            case _:
+                pass
+
         match request_type:
             case RequestType.GRAPHQL | RequestType.HTTP | RequestType.WEBSOCKET:
                 self.optimized = f"cookie: {encoded}{NEW_LINE}"

@@ -74,6 +74,9 @@ class Auth(OptimizedArg, Generic[T]):
 
                 self.optimized = encoded_credentials
 
+            case _:
+                pass
+
     @property
     def user(self):
         if len(self.data) > 1:

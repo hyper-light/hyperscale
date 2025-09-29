@@ -12,6 +12,7 @@ from typing import (
 
 import orjson
 
+from hyperscale.core.engines.client.shared.models import RequestType
 from hyperscale.core.testing.models.base import OptimizedArg
 from hyperscale.core.testing.models.base.base_types import (
     HTTPEncodableValue,
@@ -55,13 +56,21 @@ class Mutation(OptimizedArg, Generic[T]):
         self.content_length: Optional[int] = None
         self.content_type = "application/graphql-response+json"
 
-    async def optimize(self):
+    async def optimize(
+        self,
+        request_type: RequestType,
+    ):
         if self.optimized is not None:
             return
 
-        self.optimized = orjson.dumps(self.data)
-        self.content_length = len(self.optimized)
+        match request_type:
+            case RequestType.GRAPHQL | RequestType.GRAPHQL_HTTP2:
+                self.optimized = orjson.dumps(self.data)
+                self.content_length = len(self.optimized)
 
+            case _:
+                pass
+            
     def __getitem__(
         self,
         key: Literal[

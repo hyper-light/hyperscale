@@ -45,4 +45,27 @@ class URL(OptimizedArg, Generic[T]):
             protocol=protocol,
         )
 
-        await self.optimized.lookup()
+        match request_type:
+            case (
+                RequestType.GRAPHQL
+                | RequestType.GRAPHQL_HTTP2
+                | RequestType.HTTP
+                | RequestType.HTTP2
+                | RequestType.HTTP3
+                | RequestType.TCP
+                | RequestType.UDP
+                | RequestType.WEBSOCKET
+            ):
+                await self.optimized.lookup()
+
+            case RequestType.FTP:
+                await self.optimized.lookup_ftp()
+
+            case RequestType.SCP | RequestType.SFTP:
+                await self.optimized.lookup_ssh()
+
+            case RequestType.SMTP:
+                await self.optimized.lookup_smtp()
+
+            case _:
+                pass
