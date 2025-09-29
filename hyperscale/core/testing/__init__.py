@@ -2,6 +2,7 @@ from .models import URL as URL
 from .models import Auth as Auth
 from .models import Cookies as Cookies
 from .models import Data as Data
+from .models import Directory as Directory
 from .models import Email as Email
 from .models import File as File
 from .models import FileGlob as FileGlob

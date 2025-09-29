@@ -18,6 +18,7 @@ from hyperscale.core.engines.client.ssh.protocol.ssh.constants import (
     FXRP_STAT_IF_EXISTS,
 )
 from hyperscale.core.testing.models import (
+    Directory,
     File,
     FileGlob,
 )
@@ -37,7 +38,6 @@ from .protocols.sftp import (
     SFTPError,
     SFTPNotADirectory,
     SFTPLimits,
-    SFTPAttrs,
     mode_to_pflags,
     utime_to_attrs,
     tuple_to_float_sec,
@@ -701,12 +701,12 @@ class SFTPCommand:
         self,
         path: str,
         attributes: FileAttributes | None,
-        data: bytes | str | FileGlob,
+        data: bytes | str | FileGlob | Directory,
         options: SFTPOptions,
      ):
         transferred: dict[bytes, TransferResult] = {}
 
-        if isinstance(data, FileGlob):
+        if isinstance(data, (FileGlob, Directory)):
             found = await data.optimized
 
         else:

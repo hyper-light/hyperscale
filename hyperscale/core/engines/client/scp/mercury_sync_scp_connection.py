@@ -14,6 +14,7 @@ from hyperscale.core.testing.models import (
     URL,
     Auth,
     Data,
+    Directory,
     File,
     FileGlob,
 )
@@ -36,7 +37,7 @@ from .protocols import (
 
 
 CommandType = Literal["COPY", "SEND", "RECEIVE"]
-DataType = str | list[str] | File | FileGlob
+DataType = str | list[str] | File | FileGlob | Directory
 
 
 class MercurySyncSCPConnection:
@@ -267,7 +268,7 @@ class MercurySyncSCPConnection:
         local_path: str | pathlib.Path | pathlib.PurePath,
         dest_path: str | pathlib.Path| pathlib.PurePath,
         connection_options: ConnectionOptions | None = None,
-        data: str | bytes | File | FileGlob | None = None,
+        data: DataType | None = None,
         attributes: FileAttributes | None = None,
         username: str | None = None,
         password: str | None = None,
@@ -425,12 +426,12 @@ class MercurySyncSCPConnection:
                             ),
                         ]
 
-                    elif isinstance(data, File):
+                    elif isinstance(data, Directory):
                         transfer_data = [
-                            data.optimized,
+
                         ]
 
-                    elif isinstance(data, FileGlob):
+                    elif isinstance(data, (FileGlob, Directory)):
                         transfer_data = data.optimized
 
                     elif isinstance(data, str):
