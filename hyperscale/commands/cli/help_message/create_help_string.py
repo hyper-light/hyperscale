@@ -4,6 +4,8 @@ from hyperscale.commands.cli.arg_types import KeywordArg
 from .cli_style import CLIStyle
 from .description_help_message import DescriptionHelpMessage
 from .help_message import HelpMessage
+from .metadata_help_message import MetadataHelpMessage
+from .project import find_caller_relative_path_to_pyproject, PyProjectToml
 from .options_help_message import OptionsHelpMessage
 from .title_help_message import TitleHelpMessage
 
@@ -38,6 +40,11 @@ def create_help_string(
             help_string=help_string,
             indentation=indentation,
             styling=styling,
+        ),
+        metadata=MetadataHelpMessage(
+            pyproject_toml=PyProjectToml(
+                **find_caller_relative_path_to_pyproject()
+            ),
         ),
         options=OptionsHelpMessage(
             options=options,
