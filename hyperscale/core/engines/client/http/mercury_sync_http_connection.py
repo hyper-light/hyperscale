@@ -958,7 +958,7 @@ class MercurySyncHTTPConnection:
                     headers,
                 )
 
-            if error or encoded_data is None:
+            if files and (error or encoded_data is None):
                 timings["write_end"] = time.monotonic()
 
                 if span and self.trace.enabled:
