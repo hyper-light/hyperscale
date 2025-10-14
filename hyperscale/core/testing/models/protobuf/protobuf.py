@@ -9,6 +9,7 @@ except Exception:
     class Message:
         pass
 
+from hyperscale.core.engines.client.shared.models import RequestType
 from hyperscale.core.testing.models.base import OptimizedArg
 
 from .protobuf_validator import ProtobufValidator
@@ -29,21 +30,30 @@ class Protobuf(OptimizedArg, Generic[T]):
         self.data = validated_protobuf.value
         self.optimized: Optional[bytes] = None
 
-    async def optimize(self):
+    async def optimize(
+        self,
+        request_type: RequestType,
+    ):
         if self.optimized is not None:
             return
 
-        encoded_protobuf = str(
-            binascii.b2a_hex(self.data.SerializeToString()),
-            encoding="raw_unicode_escape",
-        )
-        encoded_message_length = (
-            hex(int(len(encoded_protobuf) / 2)).lstrip("0x").zfill(8)
-        )
-        encoded_protobuf = f"00{encoded_message_length}{encoded_protobuf}"
 
-        self.optimized = binascii.a2b_hex(encoded_protobuf)
+        match request_type:
+            case RequestType.GRPC:
 
+                encoded_protobuf = str(
+                    binascii.b2a_hex(self.data.SerializeToString()),
+                    encoding="raw_unicode_escape",
+                )
+                encoded_message_length = (
+                    hex(int(len(encoded_protobuf) / 2)).lstrip("0x").zfill(8)
+                )
+                encoded_protobuf = f"00{encoded_message_length}{encoded_protobuf}"
+                self.optimized = binascii.a2b_hex(encoded_protobuf)
+
+            case _:
+                pass
+            
     def __str__(self) -> str:
         return self.data.SerializeToString()
 

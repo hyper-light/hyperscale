@@ -36,21 +36,19 @@ class Params(OptimizedArg, Generic[T]):
         self.call_name: Optional[str] = None
         self.data: FrozenDict = FrozenDict(validated_params.value)
         self.optimized: Optional[str] = None
-        self._params_types = [
-            RequestType.HTTP,
-            RequestType.HTTP2,
-            RequestType.HTTP3,
-            RequestType.WEBSOCKET,
-        ]
 
     async def optimize(self, request_type: RequestType):
         if self.optimized is not None:
             return
+        
+        match request_type:
+            case RequestType.HTTP | RequestType.HTTP2 | RequestType.HTTP3 | RequestType.WEBSOCKET:
+                url_params = urlencode(self.data)
+                self.optimized = f"?{url_params}"
 
-        if request_type in self._params_types:
-            url_params = urlencode(self.data)
-            self.optimized = f"?{url_params}"
-
+            case _:
+                pass
+            
     def __getitem__(self, key: str) -> HTTPEncodableValue:
         return self.data[key]
 

@@ -8,12 +8,14 @@ from hyperscale.ui.styling import get_style, stylize
 
 from .cli_style import CLIStyle
 from .description_help_message import DescriptionHelpMessage
+from .metadata_help_message import MetadataHelpMessage
 from .options_help_message import OptionsHelpMessage
 from .title_help_message import TitleHelpMessage
 
 
 class HelpMessage(BaseModel):
     title: TitleHelpMessage
+    metadata: MetadataHelpMessage
     options: OptionsHelpMessage | None = None
     description: DescriptionHelpMessage
     indentation: StrictInt = 0
@@ -30,7 +32,7 @@ class HelpMessage(BaseModel):
             styles = global_styles
 
         indentation = self.indentation
-        if global_styles:
+        if global_styles and global_styles.indentation:
             indentation = global_styles.indentation
 
         lines: list[str] = []
@@ -42,6 +44,13 @@ class HelpMessage(BaseModel):
             )
 
             lines.append(f"{header_text}\n")
+
+        if styles:
+            lines.append(
+                await self.metadata.to_message(
+                    global_styles=styles,
+                )
+            )
 
         error_header = "error"
 

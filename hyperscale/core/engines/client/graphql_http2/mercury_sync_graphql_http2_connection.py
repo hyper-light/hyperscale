@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import time
 import uuid
 from random import randrange
@@ -9,7 +10,6 @@ from typing import (
     Optional,
     Tuple,
     TypeVar,
-    Union,
 )
 from urllib.parse import (
     ParseResult,
@@ -122,7 +122,6 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="POST",
                     status=408,
                     status_message="Request timed out.",
@@ -179,7 +178,6 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="POST",
                     status=408,
                     status_message="Request timed out.",
@@ -432,12 +430,6 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                         method=method,
                         status=400,
                         status_message=str(error),
-                        headers={
-                            key.encode(): value.encode()
-                            for key, value in headers.items()
-                        }
-                        if headers
-                        else {},
                         timings=timings,
                     ),
                     False,
@@ -457,6 +449,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                 encoded_headers = self._encode_headers(
                     url,
                     method,
+                    auth=auth,
                     cookies=cookies,
                     data=data,
                     headers=headers,
@@ -481,6 +474,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                 encoded_headers = self._encode_headers(
                     url,
                     method,
+                    auth=auth,
                     cookies=cookies,
                     data=data,
                     headers=headers,
@@ -498,8 +492,9 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             if timings["read_start"] is None:
                 timings["read_start"] = time.monotonic()
 
-            (status, headers, body, error) = await asyncio.wait_for(
-                pipe.receive_response(connection), timeout=self.timeouts.read_timeout
+            (status, response_headers, body, error) = await asyncio.wait_for(
+                pipe.receive_response(connection),
+                timeout=self.timeouts.read_timeout,
             )
 
             if status >= 300 and status < 400:
@@ -521,7 +516,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                         ),
                         method=method,
                         status=status,
-                        headers=headers,
+                        headers=response_headers,
                         timings=timings,
                     ),
                     True,
@@ -531,10 +526,10 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             if error:
                 raise error
 
-            cookies: Union[Cookies, None] = None
-            cookies_data: Union[bytes, None] = headers.get("set-cookie")
+            cookies: HTTPCookies | None = None
+            cookies_data: bytes | None = response_headers.get(b"set-cookie")
             if cookies_data:
-                cookies = Cookies()
+                cookies = HTTPCookies()
                 cookies.update(cookies_data)
 
             self._connections.append(connection)
@@ -551,7 +546,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
                     cookies=cookies,
                     method=method,
                     status=status,
-                    headers=headers,
+                    headers=response_headers,
                     content=body,
                     timings=timings,
                 ),
@@ -641,6 +636,7 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
         self,
         url: HTTPUrl,
         method: Literal["GET", "POST"],
+        auth: tuple[str, str] | Auth | None = None,
         cookies: Optional[List[HTTPCookie] | HTTPCookies] = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         data: (
@@ -678,25 +674,25 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
             url_params = urlencode(params)
             url_path += f"?{url_params}"
 
-        if isinstance(headers, Headers):
-            encoded_headers: List[Tuple[bytes, bytes]] = [
-                (b":method", method.encode()),
-                (b":authority", url.hostname.encode()),
-                (b":scheme", url.scheme.encode()),
-                (b":path", url_path.encode()),
-            ]
+        encoded_headers: List[Tuple[bytes, bytes]] = [
+            (b":method", method.encode()),
+            (b":authority", url.hostname.encode()),
+            (b":scheme", url.scheme.encode()),
+            (b":path", url_path.encode()),
+        ]
 
+        if isinstance(auth, Auth):
+            encoded_headers.append(auth.optimized)
+
+        elif auth is not None:
+            encoded_headers.append(
+                self._encode_auth_headers(auth),
+            )
+
+        if isinstance(headers, Headers):
             encoded_headers.extend(headers.optimized)
 
         elif headers:
-            encoded_headers: List[Tuple[bytes, bytes]] = [
-                (b":method", method.encode()),
-                (b":authority", url.hostname.encode()),
-                (b":scheme", url.scheme.encode()),
-                (b":path", url_path.encode()),
-                (b"User-Agent", b"hyperscale/client"),
-            ]
-
             encoded_headers.extend(
                 [
                     (k.lower().encode(), v.encode())
@@ -750,6 +746,27 @@ class MercurySyncGraphQLHTTP2Connection(MercurySyncHTTP2Connection):
         ]
 
         return encoded_headers[0]
+    
+    def _encode_auth_headers(
+        self,
+        auth: tuple[str, str] | tuple[str],
+    ):
+        if len(auth) > 1:
+            credentials_string = f"{auth[0]}:{auth[1]}"
+            return (
+                b"authorization",
+                base64.b64encode(
+                    credentials_string.encode()
+                )
+            )
+
+        else:
+            return (
+                b"authorization",
+                base64.b64encode(
+                    auth[0].encode()
+                )
+            )
 
     def close(self):
         for connection in self._connections:

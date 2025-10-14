@@ -1,6 +1,4 @@
-from typing import Dict, Generic, Union
-
-from typing_extensions import TypeVarTuple, Unpack
+from typing import Dict, Generic, Union, TypeVarTuple, Unpack
 
 from hyperscale.core.engines.client.config import Config
 from hyperscale.core.experiments.mutations.types.base.mutation import Mutation

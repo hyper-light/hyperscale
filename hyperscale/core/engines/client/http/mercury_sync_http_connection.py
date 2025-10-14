@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import binascii
 import base64
+import mimetypes
 import ssl
+import secrets
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from typing import (
     Any,
@@ -48,6 +52,7 @@ from hyperscale.core.testing.models import (
     Auth,
     Cookies,
     Data,
+    File,
     Headers,
     Params,
 )
@@ -92,10 +97,14 @@ class MercurySyncHTTPConnection:
         protocols = ProtocolMap()
         address_family, protocol = protocols[RequestType.HTTP]
         self._optimized: Dict[str, URL | Params | Headers | Auth | Data | Cookies] = {}
+        self._loop: asyncio.AbstractEventLoop = None
 
         self.address_family = address_family
         self.address_protocol = protocol
         self.trace: HTTPTrace | None = None
+
+        self._boundary = binascii.hexlify(secrets.token_bytes(16)).decode()
+        self._boundary_break = f"--{self._boundary}".encode("latin-1")
 
     async def head(
         self,
@@ -162,7 +171,6 @@ class MercurySyncHTTPConnection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="HEAD",
                     status=408,
                     status_message="Request timed out.",
@@ -235,7 +243,6 @@ class MercurySyncHTTPConnection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="OPTIONS",
                     status=408,
                     status_message="Request timed out.",
@@ -326,6 +333,7 @@ class MercurySyncHTTPConnection:
         data: Optional[
             str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
+        files: str | File | list[File | str] | None = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
         trace_request: bool = False,
@@ -355,6 +363,7 @@ class MercurySyncHTTPConnection:
                         headers=headers,
                         params=params,
                         data=data,
+                        files=files,
                         redirects=redirects,
                         span=span,
                     ),
@@ -385,7 +394,6 @@ class MercurySyncHTTPConnection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="POST",
                     status=408,
                     status_message="Request timed out.",
@@ -404,6 +412,7 @@ class MercurySyncHTTPConnection:
         data: Optional[
             str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
+        files: str | File | list[File | str] | None = None,
         redirects: int = 3,
         trace_request: bool = False,
     ):
@@ -432,6 +441,7 @@ class MercurySyncHTTPConnection:
                         headers=headers,
                         params=params,
                         data=data,
+                        files=files,
                         redirects=redirects,
                         span=span,
                     ),
@@ -462,7 +472,6 @@ class MercurySyncHTTPConnection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="PUT",
                     status=408,
                     status_message="Request timed out.",
@@ -480,6 +489,7 @@ class MercurySyncHTTPConnection:
         data: Optional[
             str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
+        files: str | File | list[File | str] | None = None,
         timeout: Optional[int | float] = None,
         redirects: int = 3,
         trace_request: bool = False,
@@ -509,6 +519,7 @@ class MercurySyncHTTPConnection:
                         headers=headers,
                         params=params,
                         data=data,
+                        files=files,
                         redirects=redirects,
                         span=span,
                     ),
@@ -539,7 +550,6 @@ class MercurySyncHTTPConnection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="PATCH",
                     status=408,
                     status_message="Request timed out.",
@@ -612,7 +622,6 @@ class MercurySyncHTTPConnection:
                         params=url_data.params,
                         query=url_data.query,
                     ),
-                    headers=headers,
                     method="DELETE",
                     status=408,
                     status_message="Request timed out.",
@@ -673,6 +682,7 @@ class MercurySyncHTTPConnection:
         data: Optional[
             str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
         ] = None,
+        files: str | File | list[File | str] | None = None,
         redirects: int = 3,
         span: Span | None = None,
     ):
@@ -713,6 +723,7 @@ class MercurySyncHTTPConnection:
             auth=auth,
             params=params,
             data=data,
+            files=files,
             timings=timings,
             span=span,
         )
@@ -764,6 +775,7 @@ class MercurySyncHTTPConnection:
                     auth=auth,
                     params=params,
                     data=data,
+                    files=files,
                     upgrade_ssl=upgrade_ssl,
                     redirect_url=location,
                     timings=timings,
@@ -805,6 +817,7 @@ class MercurySyncHTTPConnection:
             | BaseModel
             | Data
         ) = None,
+        files: str | File | list[File | str] | None = None,
         upgrade_ssl: bool = False,
         redirect_url: Optional[str] = None,
         timings: Dict[
@@ -914,7 +927,6 @@ class MercurySyncHTTPConnection:
                         method=method,
                         status=400,
                         status_message="Connection failed.",
-                        headers=headers,
                         timings=timings,
                         trace=span,
                     ),
@@ -933,6 +945,52 @@ class MercurySyncHTTPConnection:
 
             if data:
                 encoded_data, content_type = self._encode_data(data)
+
+            if files:
+                (
+                    headers,
+                    encoded_data,
+                    content_type,
+                    error,
+                ) = await self._upload_files(
+                    files,
+                    encoded_data,
+                    headers,
+                )
+
+            if files and (error or encoded_data is None):
+                timings["write_end"] = time.monotonic()
+
+                if span and self.trace.enabled:
+                    span = await self.trace.on_request_exception(
+                        span,
+                        url,
+                        method,
+                        error if error else Exception('Write failed.'),
+                        status=400,
+                        headers=headers,
+                    )
+
+                self._connections.append(connection)
+
+                return (
+                    HTTPResponse(
+                        url=URLMetadata(
+                            host=url.hostname,
+                            path=url.path,
+                            params=url.params,
+                            query=url.query,
+                        ),
+                        method=method,
+                        status=500,
+                        status_message=str(error) if error else "Write failed.",
+                        timings=timings,
+                        trace=span,
+                    ),
+                    False,
+                    timings,
+                    span,
+                )
 
             encoded_headers = self._encode_headers(
                 url,
@@ -990,7 +1048,7 @@ class MercurySyncHTTPConnection:
             status_string: List[bytes] = response_code.split()
             status = int(status_string[1])
 
-            headers: Dict[bytes, bytes] = await asyncio.wait_for(
+            response_headers: Dict[bytes, bytes] = await asyncio.wait_for(
                 connection.read_headers(),
                 timeout=self.timeouts.read_timeout,
             )
@@ -998,14 +1056,14 @@ class MercurySyncHTTPConnection:
             if span and self.trace.enabled:
                 span = await self.trace.on_response_headers_received(
                     span,
-                    headers,
+                    response_headers,
                 )
 
-            content_length = headers.get(b"content-length")
-            transfer_encoding = headers.get(b"transfer-encoding")
+            content_length = response_headers.get(b"content-length")
+            transfer_encoding = response_headers.get(b"transfer-encoding")
 
             cookies: Union[HTTPCookies, None] = None
-            cookies_data: Union[bytes, None] = headers.get(b"set-cookie")
+            cookies_data: Union[bytes, None] = response_headers.get(b"set-cookie")
             if cookies_data:
                 cookies = HTTPCookies()
                 cookies.update(cookies_data)
@@ -1066,8 +1124,6 @@ class MercurySyncHTTPConnection:
 
                 all_chunks_read = True
 
-            self._connections.append(connection)
-
             if status >= 300 and status < 400:
                 timings["read_end"] = time.monotonic()
                 self._connections.append(connection)
@@ -1082,7 +1138,7 @@ class MercurySyncHTTPConnection:
                         ),
                         method=method,
                         status=status,
-                        headers=headers,
+                        headers=response_headers,
                         timings=timings,
                         trace=span,
                     ),
@@ -1092,6 +1148,7 @@ class MercurySyncHTTPConnection:
                 )
 
             timings["read_end"] = time.monotonic()
+            self._connections.append(connection)
 
             if span and self.trace.enabled:
                 span = await self.trace.on_request_end(
@@ -1099,7 +1156,7 @@ class MercurySyncHTTPConnection:
                     url,
                     method,
                     status,
-                    headers=headers,
+                    headers=response_headers,
                 )
 
             return (
@@ -1113,7 +1170,7 @@ class MercurySyncHTTPConnection:
                     cookies=cookies,
                     method=method,
                     status=status,
-                    headers=headers,
+                    headers=response_headers,
                     content=body,
                     timings=timings,
                     trace=span,
@@ -1385,13 +1442,13 @@ class MercurySyncHTTPConnection:
         self,
         url: URL | HTTPUrl,
         method: str,
-        auth: tuple[str, str] | Auth = None,
+        auth: tuple[str, str] | Auth | None = None,
         params: Optional[Dict[str, HTTPEncodableValue] | Params] = None,
         headers: Optional[Dict[str, str] | Headers] = None,
         cookies: Optional[List[HTTPCookie] | Cookies] = None,
-        data: Optional[
-            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data
-        ] = None,
+        data: (
+            str | bytes | Iterator | Dict[str, Any] | List[str] | BaseModel | Data | None
+        ) = None,
         encoded_data: Optional[bytes | List[bytes]] = None,
         content_type: Optional[str] = None,
     ):
@@ -1486,6 +1543,156 @@ class MercurySyncHTTPConnection:
             ).decode()
 
         return f'Authorization: Basic {encoded_credentials}{NEW_LINE}'
+    
+    async def _upload_files(
+        self,
+        files: str | File | list[File | str],
+        body: bytes | None,
+        headers: dict[str, str] | Headers,
+    ):
+        
+        with ThreadPoolExecutor(max_workers=len(files)) as exc:
+
+            try:
+                uploaded: list[tuple[str, str, str | bytes] | tuple[None, None, Exception]] = []
+                uploading: list[tuple[str, str, str] | tuple[None, None, Exception]] = []
+
+                if isinstance(files, File):
+                    (
+                        _,
+                        file_data,
+                        attrs
+                    ) = files.optimized
+                    uploaded.append((
+                        attrs.mime_type,
+                        attrs.encoding,
+                        file_data,
+                    ))
+
+                elif isinstance(files, list):
+                    for file in files:
+                        if isinstance(file, File):
+                            uploaded.append(file.optimized)
+                        else:
+                            uploading.append(
+                                asyncio.create_task(
+                                    self._loop.run_in_executor(
+                                        exc,
+                                        self._load_file,
+                                        file,
+                                    )
+                                )
+                            )
+
+                else:
+                    uploading.append(
+                        asyncio.create_task(
+                            self._loop.run_in_executor(
+                                exc,
+                                self._load_file,
+                                files,
+                            )
+                        )
+                    )
+                    
+                if len(uploading) > 0:
+                    uploaded.extend(
+                        await asyncio.gather(*uploading)
+                    )
+
+                for _, _, result in uploaded:
+                    
+                    if isinstance(result, Exception):
+                        return (
+                            None,
+                            None,
+                            None,
+                            result,
+                        )    
+                    
+                
+                buffer = bytearray()
+
+                if body:
+                    buffer.extend(body)
+                    content_length = len(body)
+
+                for content_type, encoding, upload_data in uploaded:
+
+                    if isinstance(upload_data, str):
+                        upload_data = upload_data.encode(encoding=encoding)
+
+                    if isinstance(headers, Headers):
+
+                        upload_headers = str(headers.optimized)
+                        upload_headers += f"Content-Disposition: form/data{NEW_LINE}Content-Type: {content_type}{NEW_LINE}"
+                        
+                        buffer.extend(
+                            b'\r\n'.join([
+                                self._boundary_break,
+                                upload_headers.encode(),
+                                upload_data,
+                            ])
+                        )
+
+                    else:
+                        headers_data = dict(headers)
+                        headers_data.update({
+                            "Content-Dispostition": "form/data",
+                            "Content-Type": content_type,
+                        })
+
+                        joined_headers = ""
+
+                        for key, value in headers_data.items():
+                            joined_headers += f"{key}: {value}{NEW_LINE}"
+                        
+                        buffer.extend(
+                            b'\r\n'.join([
+                                self._boundary_break,
+                                joined_headers.encode(),
+                                upload_data,
+                            ])
+                        )
+
+                content_length = len(buffer)
+
+                if isinstance(headers, Headers):
+                   
+                    headers.optimized += (
+                        f'boundary: {self._boundary}{NEW_LINE}'
+                        f'Content-Length: {content_length}{NEW_LINE}'
+                    )
+
+                else:
+                    headers.update({
+                        "boundary": self._boundary,
+                        "Content-Length": content_length,
+                    })
+
+                return (
+                    headers,
+                    buffer,
+                    f"multipart/form-data; boundary={self._boundary}",
+                    None,
+                )
+                
+
+            except Exception as err:
+                return (
+                    None,
+                    None,
+                    None,
+                    err,
+                )
+            
+    def _load_file(
+        self,
+        path: str,
+        headers: dict[str, str],
+    ):
+        
+        mime_type, _ = mimetypes.guess_file_type(path)
 
     def close(self):
         for connection in self._connections:

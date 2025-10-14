@@ -91,7 +91,7 @@ def colorize_udp_or_tcp(status: str):
     
     return "hot_pink_3"
 
-def colorize_ftp(status: str):
+def colorize_ftp_or_scp_or_sftp(status: str):
     if status == 'OK':
         return 'aquamarine_2'
     

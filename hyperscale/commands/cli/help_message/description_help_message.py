@@ -17,7 +17,7 @@ class DescriptionHelpMessage(BaseModel):
         global_styles: CLIStyle | None = None,
     ):
         indentation = self.indentation
-        if global_styles.indentation:
+        if global_styles and global_styles.indentation:
             indentation = global_styles.indentation
 
         tabs = " " * indentation

@@ -292,7 +292,7 @@ class Reader:
         self._maybe_resume_transport()
         return bytes(chunk)
 
-    async def read_headers(self, separatchunkor=b"\n"):
+    async def read_headers(self, separator=b"\n"):
         """Read data from the stream until ``separator`` is found.
         On success, the data and separator will be removed from the
         internal buffer (consumed). Returned data will include the

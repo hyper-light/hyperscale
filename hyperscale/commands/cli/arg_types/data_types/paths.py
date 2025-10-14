@@ -6,7 +6,7 @@ import operator
 import os
 import pathlib
 
-from typing import Generic, TypeVarTuple, Any, get_args, TypeVar
+from typing import Generic, Any, get_args, TypeVar
 from .reduce_pattern_type import reduce_pattern_type
 
 

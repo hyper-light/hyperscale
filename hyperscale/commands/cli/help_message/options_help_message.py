@@ -4,7 +4,6 @@ from typing import List
 from pydantic import BaseModel, StrictStr, StrictInt
 from hyperscale.commands.cli.arg_types import KeywordArg, Context
 from hyperscale.ui.styling import stylize, get_style
-from hyperscale.ui.styling.attributes import Attributizer
 
 from .cli_style import CLIStyle
 from .line_parsing import is_arg_descriptor
@@ -49,7 +48,7 @@ class OptionsHelpMessage(BaseModel):
         global_styles: CLIStyle | None = None,
     ):
         indentation = self.indentation
-        if global_styles.indentation:
+        if global_styles and global_styles.indentation:
             indentation = global_styles.indentation
 
         styles = self.styling

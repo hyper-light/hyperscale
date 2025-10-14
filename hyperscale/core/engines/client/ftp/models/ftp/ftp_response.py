@@ -1,13 +1,4 @@
 from typing import Literal
-
-from pydantic import (
-    BaseModel,
-    StrictStr, 
-    StrictBytes, 
-    StrictInt, 
-    StrictFloat,   
-)
-
 from hyperscale.core.engines.client.shared.models import (
     CallResult,
     RequestType,
@@ -34,7 +25,7 @@ FTPActionType = Literal[
 
 class FTPResponse(CallResult):
     action: FTPActionType
-    data: StrictInt | StrictBytes | bytearray | memoryview | None = None
+    data: int | bytes | bytearray | memoryview | None = None
     error: Exception | None = None
     timings: dict[
         Literal[

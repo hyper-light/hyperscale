@@ -1,6 +1,6 @@
 import functools
 import operator
-from typing import Any, get_args, TypeVar, get_origin
+from typing import Any, get_args, TypeVar
 
 
 T = TypeVar("T", bound=list)

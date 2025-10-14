@@ -38,10 +38,23 @@ class Data(OptimizedArg, Generic[T]):
             return
 
         match request_type:
-            case RequestType.HTTP | RequestType.HTTP2 | RequestType.WEBSOCKET:
+            case (
+                RequestType.GRAPHQL
+                | RequestType.GRAPHQL_HTTP2
+                | RequestType.HTTP 
+                | RequestType.HTTP2 
+                | RequestType.HTTP3
+                | RequestType.WEBSOCKET
+            ):
                 self._optimize_http()
 
-            case RequestType.FTP | RequestType.TCP | RequestType.WEBSOCKET:
+            case (
+                RequestType.FTP
+                | RequestType.SCP
+                | RequestType.SFTP 
+                | RequestType.TCP
+                | RequestType.WEBSOCKET
+            ):
                 self._optimize_raw()
 
             case _:

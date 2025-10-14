@@ -6,6 +6,8 @@ from .core.engines import HTTP3Response as HTTP3Response
 from .core.engines import HTTPResponse as HTTPResponse
 from .core.engines import PlaywrightResult as PlaywrightResult
 from .core.engines import EmailAttachment as EmailAttachment
+from .core.engines import SCPResponse as SCPResponse
+from .core.engines import SFTPResponse as SFTPResponse
 from .core.engines import SMTPResponse as SMTPResponse
 from .core.engines import TCPResponse as TCPResponse
 from .core.engines import UDPResponse as UDPResponse
@@ -14,7 +16,10 @@ from .core.testing import URL as URL
 from .core.testing import Auth as Auth
 from .core.testing import Cookies as Cookies
 from .core.testing import Data as Data
+from .core.testing import Directory as Directory
 from .core.testing import Email as Email
+from .core.testing import File as File
+from .core.testing import FileGlob as FileGlob
 from .core.testing import Headers as Headers
 from .core.testing import Mutation as Mutation
 from .core.testing import Params as Params

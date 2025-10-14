@@ -168,9 +168,6 @@ class HTTP2Response(CallResult):
             case _:
                 return self.body
 
-    def check(self):
-        return self.status >= 200 and self.status < 300
-
     def context(self):
         return self.status_message
 
