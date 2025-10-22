@@ -369,7 +369,6 @@ class Terminal:
             await asyncio.sleep(self._interval)
 
     async def _show_cursor(self):
-        loop = asyncio.get_event_loop()
         if await self._loop.run_in_executor(None, self._stdout.isatty):
             # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
 
@@ -381,7 +380,6 @@ class Terminal:
                 self._stdout_lock.release()
 
     async def _hide_cursor(self):
-        loop = asyncio.get_event_loop()
         if await self._loop.run_in_executor(None, self._stdout.isatty):
             await self._stdout_lock.acquire()
             self._writer.write(b"\033[?25l")
