@@ -12,6 +12,7 @@ class Env(BaseModel):
     MERCURY_SYNC_API_VERISON: StrictStr = "0.0.1"
     MERCURY_SYNC_TASK_EXECUTOR_TYPE: Literal["thread", "process", "none"] = "thread"
     MERCURY_SYNC_TCP_CONNECT_RETRIES: StrictInt = 3
+    MERCURY_SYNC_UDP_CONNECT_RETRIES: StrictInt = 3
     MERCURY_SYNC_CLEANUP_INTERVAL: StrictStr = "0.25s"
     MERCURY_SYNC_MAX_CONCURRENCY: StrictInt = 2048
     MERCURY_SYNC_AUTH_SECRET: StrictStr = "hyperscale"
@@ -30,6 +31,7 @@ class Env(BaseModel):
             "MERCURY_SYNC_API_VERISON": str,
             "MERCURY_SYNC_TASK_EXECUTOR_TYPE": str,
             "MERCURY_SYNC_TCP_CONNECT_RETRIES": int,
+            "MERCURY_SYNC_UDP_CONNECT_RETRIES": int,
             "MERCURY_SYNC_CLEANUP_INTERVAL": str,
             "MERCURY_SYNC_MAX_CONCURRENCY": int,
             "MERCURY_SYNC_AUTH_SECRET": str,

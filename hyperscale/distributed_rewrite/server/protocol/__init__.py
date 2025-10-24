@@ -1,1 +1,2 @@
-from .mercury_sync_tcp_server_protocol import MercurySyncTCPServerProtocol as MercurySyncTCPServerProtocol
+from .mercury_sync_tcp_protocol import MercurySyncTCPProtocol as MercurySyncTCPProtocol
+from .mercury_sync_udp_protocol import MercurySyncUDPProtocol as MercurySyncUDPProtocol

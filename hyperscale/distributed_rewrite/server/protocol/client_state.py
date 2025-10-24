@@ -5,7 +5,7 @@ from typing import TypeVar, Generic
 T = TypeVar("T")
 
 
-class ServerState(Generic[T]):
+class ClientState(Generic[T]):
     """
     Shared servers state that is available between all protocol instances.
     """

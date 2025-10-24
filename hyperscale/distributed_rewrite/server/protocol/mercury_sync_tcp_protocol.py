@@ -1,7 +1,6 @@
 import asyncio
-import re
 from typing import TypeVar, Generic
-from typing import Callable, Literal, Tuple, TYPE_CHECKING
+from typing import Literal
 from .flow_control import FlowControl
 from .server_state import ServerState
 from .utils import (
@@ -9,31 +8,41 @@ from .utils import (
     get_remote_addr,
     is_ssl,
 )
+from .abstract_connection import AbstractConnection
 from .receive_buffer import ReceiveBuffer
 
-T = TypeVar("T")
+T = TypeVar("T", bound=AbstractConnection)
 
 
-class MercurySyncTCPServerProtocol(asyncio.Protocol, Generic[T]):
-    def __init__(self, conn: T):
+class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
+    def __init__(
+        self,
+        conn: T,
+        mode: Literal['client', 'server'] = 'client',
+    ):
         super().__init__()
         self.transport: asyncio.Transport = None
         self.loop = asyncio.get_event_loop()
         self.conn = conn
         self.flow: FlowControl = None
-        self.server_state = ServerState[MercurySyncTCPServerProtocol]()
+        self.server_state = ServerState[MercurySyncTCPProtocol]()
         self.connections = self.server_state.connections
+        self.mode: Literal['client', 'server']  = mode
 
         self.on_con_lost = self.loop.create_future()
         self.server: tuple[str, int] | None = None
         self.client: tuple[str, int] | None = None
-        self.scheme: Literal["mss", "ms"] | None = None
+        self.scheme: Literal["mtcps", "mtcp"] | None = None
         self.timeout_keep_alive_task: asyncio.TimerHandle | None = None
 
         self._receive_buffer = ReceiveBuffer()
         self._receive_buffer_closed = False
         self._active_requests: dict[bytes, bytes] = {}
         self._next_data: asyncio.Future = asyncio.Future()
+
+        self.read = self.conn.read_server_tcp
+        if self.mode == 'client':
+            self.read = self.conn.read_client_tcp
 
     @property
     def trailing_data(self) -> tuple[bytes, bool]:
@@ -46,13 +55,13 @@ class MercurySyncTCPServerProtocol(asyncio.Protocol, Generic[T]):
         """
         return (bytes(self._receive_buffer), self._receive_buffer_closed)
 
-    def connection_made(self, transport: asyncio.Transport) -> str:
+    def connection_made(self, transport: asyncio.Transport):
         self.connections.add(self)
         self.transport = transport
         self.flow = FlowControl(transport)
         self.server = get_local_addr(transport)
         self.client = get_remote_addr(transport)
-        self.scheme = "mss" if is_ssl(transport) else "ms"
+        self.scheme = "mtcps" if is_ssl(transport) else "mtcp"
 
     def data_received(self, data: bytes):
         if data:
@@ -62,12 +71,15 @@ class MercurySyncTCPServerProtocol(asyncio.Protocol, Generic[T]):
         else:
             self._receive_buffer_closed = True
 
-        if self.conn.waiting_for_data.is_set() is False or (self._next_data.done()):
-            self.conn.read(
+        if (
+            self.conn.waiting_for_data.is_set() is False or self._next_data.done()
+        ):
+            self.read(
                 self._receive_buffer,
                 self.transport,
                 self._next_data,
             )
+
         else:
             self._next_data.set_result(self._receive_buffer)
 
