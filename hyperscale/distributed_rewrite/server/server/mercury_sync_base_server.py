@@ -508,11 +508,11 @@ class MercurySyncBaseServer:
 
             decrypted = self._decompressor.decompress(
                 self._encryptor.decrypt(response),
-            )
+            ).strip(b'<END')
 
             handler_name, payload = decrypted.split(b'\r\n', maxsplit=1)
 
-            self._tcp_client_data[address][handler_name].append(payload.strip(b'<END'))
+            self._tcp_client_data[address][handler_name].append(payload)
 
             self.tcp_client_waiting_for_data.set()
 
@@ -548,7 +548,7 @@ class MercurySyncBaseServer:
 
             decrypted = self._decompressor.decompress(
                 self._encryptor.decrypt(response),
-            )
+            ).strip(b'<END')
 
             handler_name, payload = decrypted.split(b'\r\n', maxsplit=1)
 
