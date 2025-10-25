@@ -7,14 +7,14 @@ from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 
 from .cancel import cancel
-from .task_hook import Task as MkfstTask
+from .task_hook import Task
 
 T = TypeVar("T")
 
 
 class TaskRunner:
     def __init__(self, instance_id: int, config: Env) -> None:
-        self.tasks: Dict[str, MkfstTask[Any]] = {}
+        self.tasks: Dict[str, Task[Any]] = {}
         self.results: Dict[str, Any]
         self._runner = ThreadPoolExecutor(
             max_workers=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
@@ -36,7 +36,7 @@ class TaskRunner:
         return self._snowflake_generator.generate()
 
     def add(self, task: Type[T]):
-        runnable = MkfstTask(task, self._snowflake_generator)
+        runnable = Task(task, self._snowflake_generator)
         self.tasks[runnable.name] = runnable
 
     def run(

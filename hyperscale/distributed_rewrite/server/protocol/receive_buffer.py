@@ -37,7 +37,7 @@ class ReceiveBuffer:
         """
         # Only search in buffer space that we've not already looked at.
         search_start_index = max(0, self._next_line_search - 1)
-        partial_idx = self.buffer.find(b"<END", search_start_index)
+        partial_idx = self.buffer.find(b"\r\n", search_start_index)
 
         if partial_idx == -1:
             self._next_line_search = len(self.buffer)

@@ -2,7 +2,7 @@ import secrets
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from mkfst.env import Env
+from hyperscale.distributed_rewrite.env import Env
 
 
 class AESGCMFernet:

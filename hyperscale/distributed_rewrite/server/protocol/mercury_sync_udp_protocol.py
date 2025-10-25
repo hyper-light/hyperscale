@@ -41,10 +41,6 @@ class MercurySyncUDPProtocol(asyncio.DatagramProtocol, Generic[T]):
         self._active_requests: dict[bytes, bytes] = {}
         self._next_data: asyncio.Future = asyncio.Future()
 
-        self.read = self.conn.read_server_udp
-        if self.mode == 'client':
-            self.read = self.conn.read_client_udp
-
     @property
     def trailing_data(self) -> tuple[bytes, bool]:
         """Data that has been received, but not yet processed, represented as
@@ -65,24 +61,10 @@ class MercurySyncUDPProtocol(asyncio.DatagramProtocol, Generic[T]):
         self.scheme = "mudps" if is_ssl(transport) else "mudp"
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
-        if data:
-            if self._receive_buffer_closed:
-                raise RuntimeError("received close, then received more data?")
-            self._receive_buffer += data
-        else:
-            self._receive_buffer_closed = True
-
-        waiter = self.conn.udp_server_waiting_for_data
-        if self.mode == 'client':
-            waiter = self.conn.udp_client_waiting_for_data
-
-        if (
-            waiter.is_set() is False or self._next_data.done()
-        ):
-            self.read(
-                self._receive_buffer,
-                self.transport,
-            )
+        self.conn.read_udp(
+            data,
+            self.transport,
+        )
 
     def connection_lost(self, exc: Exception | None) -> None:
         self.connections.discard(self)

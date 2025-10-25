@@ -10,15 +10,7 @@ class AbstractConnection(ABC):
     udp_server_waiting_for_data: asyncio.Event
 
     @abstractmethod
-    def read_client_udp(
-        self,
-        data: ReceiveBuffer,
-        transport: asyncio.Transport,
-    ):
-        pass
-
-    @abstractmethod
-    def read_server_udp(
+    def read_udp(
         self,
         data: ReceiveBuffer,
         transport: asyncio.Transport,

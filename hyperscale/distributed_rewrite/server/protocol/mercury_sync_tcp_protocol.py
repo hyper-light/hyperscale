@@ -70,18 +70,11 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
             self._receive_buffer += data
         else:
             self._receive_buffer_closed = True
-
-        waiter = self.conn.tcp_server_waiting_for_data
-        if self.mode == 'client':
-            waiter = self.conn.tcp_client_waiting_for_data
-
-        if (
-            waiter.is_set() is False or self._next_data.done()
-        ):
-            self.read(
-                self._receive_buffer,
-                self.transport,
-            )
+        
+        self.read(
+            data,
+            self.transport,
+        )
 
     def connection_lost(self, exc: Exception | None):
         self.connections.discard(self)
