@@ -2,9 +2,9 @@
 
 
 import asyncio
+import orjson
 import socket
 import ssl
-from abc import abstractmethod
 from collections import defaultdict, deque
 from typing import (
     Any,
@@ -14,9 +14,14 @@ from typing import (
     Optional,
     Tuple,
     Union,
+    Callable,
+    Awaitable,
+    TypeVar,
 )
 
+import cloudpickle
 import zstandard
+from pydantic import BaseModel
 
 from hyperscale.core.engines.client.udp.protocols.dtls import do_patch
 from hyperscale.distributed_rewrite.env import Env, TimeParser
@@ -24,11 +29,15 @@ from hyperscale.distributed_rewrite.encryption import AESGCMFernet
 from hyperscale.distributed_rewrite.server.protocol import (
     MercurySyncTCPProtocol,
     MercurySyncUDPProtocol,
+    ReceiveBuffer,
 )
 from hyperscale.distributed_rewrite.server.events import LamportClock
 
 
 do_patch()
+
+D = TypeVar("D", bound=BaseModel)
+R = TypeVar("R", bound=BaseModel)
 
 
 class MercurySyncBaseServer:
@@ -68,11 +77,15 @@ class MercurySyncBaseServer:
         self._udp_transport: asyncio.Transport = None
         self._tcp_transport: asyncio.Transport = None
 
-        self._tcp_waiters: Dict[str, Deque[asyncio.Future]] = defaultdict(deque)
-        self._udp_waiters: Dict[str, Deque[asyncio.Future]] = defaultdict(deque)
+        self._tcp_client_data: dict[
+            tuple[str, int], 
+            dict[bytes, Deque[bytes]]
+        ] = defaultdict(defaultdict(deque))
 
-        self._pending_tcp_client_responses: Deque[asyncio.Task] = deque()
-        self._pending_udp_client_responses: Deque[asyncio.Task] = deque()
+        self._udp_client_data: dict[
+            tuple[str, int], 
+            dict[bytes, Deque[bytes]]
+        ] = defaultdict(defaultdict(deque))
 
         self._pending_tcp_server_responses: Deque[asyncio.Task] = deque()
         self._pending_udp_server_responses: Deque[asyncio.Task] = deque()
@@ -80,11 +93,11 @@ class MercurySyncBaseServer:
         self._tcp_server_socket: socket.socket | None = None
         self._udp_server_socket: socket.socket | None = None
 
-        self._client_key_path: Union[str, None] = None
-        self._client_cert_path: Union[str, None] = None
+        self._client_key_path: str | None = None
+        self._client_cert_path: str | None = None
 
-        self._server_key_path: Union[str, None] = None
-        self._server_cert_path: Union[str, None] = None
+        self._server_key_path: str | None = None
+        self._server_cert_path: str | None = None
 
         self._client_tcp_ssl_context: Union[ssl.SSLContext, None] = None
         self._server_tcp_ssl_context: Union[ssl.SSLContext, None] = None
@@ -93,21 +106,22 @@ class MercurySyncBaseServer:
 
         self._encryptor = AESGCMFernet(env)
         
-        self._tcp_semaphore: Union[asyncio.Semaphore, None] = None
-        self._udp_semaphore: Union[asyncio.Semaphore, None] = None
+        self._tcp_semaphore: asyncio.Semaphore | None= None
+        self._udp_semaphore: asyncio.Semaphore | None= None
 
-        self._compressor: Union[zstandard.ZstdCompressor, None] = None
-        self._decompressor: Union[zstandard.ZstdDecompressor, None] = None
+        self._compressor: zstandard.ZstdCompressor | None = None
+        self._decompressor: zstandard.ZstdDecompressor| None = None
 
-        self._tcp_client_cleanup_task: Union[asyncio.Task, None] = None
-        self._tcp_server_cleanup_task: Union[asyncio.Task, None] = None
-        self._tcp_client_sleep_task: Union[asyncio.Task, None] = None
-        self._tcp_server_sleep_task: Union[asyncio.Task, None] = None
+        self._tcp_server_cleanup_task: asyncio.Task | None = None
+        self._tcp_server_sleep_task: asyncio.Task | None = None
 
-        self._udp_client_cleanup_task: Union[asyncio.Task, None] = None
-        self._udp_server_cleanup_task: Union[asyncio.Task, None] = None
-        self._udp_client_sleep_task: Union[asyncio.Task, None] = None
-        self._udp_server_sleep_task: Union[asyncio.Task, None] = None
+        self._udp_server_cleanup_task: asyncio.Task | None = None
+        self._udp_server_sleep_task: asyncio.Task | None = None
+
+        self.tcp_client_waiting_for_data: asyncio.Event = None
+        self.tcp_server_waiting_for_data: asyncio.Event = None
+        self.udp_client_waiting_for_data: asyncio.Event = None
+        self.udp_server_waiting_for_data: asyncio.Event = None
 
         self._cleanup_interval = TimeParser(env.MERCURY_SYNC_CLEANUP_INTERVAL).time
 
@@ -117,6 +131,22 @@ class MercurySyncBaseServer:
         self._tcp_connect_retries = env.MERCURY_SYNC_TCP_CONNECT_RETRIES
         self._udp_connect_retires = env.MERCURY_SYNC_UDP_CONNECT_RETRIES
         self._verify_cert = env.MERCURY_SYNC_VERIFY_SSL_CERT
+
+        self.tcp_handlers: dict[
+            bytes,
+            Callable[
+                [bytes],
+                Awaitable[BaseModel],
+            ]
+        ] = {}
+        
+        self.udp_handlers: dict[
+            bytes,
+            Callable[
+                [bytes],
+                Awaitable[BaseModel],
+            ]
+        ] = {}
 
     def from_env(self, env: Env):
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
@@ -133,6 +163,12 @@ class MercurySyncBaseServer:
         tcp_server_worker_server: asyncio.Server | None = None,
     ):
         
+        if self._client_cert_path is None:
+            self._client_cert_path = cert_path
+        
+        if self._client_key_path is None:
+            self._client_key_path = key_path
+        
         if self._server_cert_path is None:
             self._server_cert_path = cert_path
 
@@ -146,11 +182,16 @@ class MercurySyncBaseServer:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
         
-        self._semaphore = asyncio.Semaphore(self._max_concurrency)
+        self._tcp_semaphore = asyncio.Semaphore(self._max_concurrency)
+        self._udp_semaphore = asyncio.Semaphore(self._max_concurrency)
 
         self._compressor = zstandard.ZstdCompressor()
         self._decompressor = zstandard.ZstdDecompressor()
 
+        self.tcp_client_waiting_for_data = asyncio.Event()
+        self.tcp_server_waiting_for_data = asyncio.Event()
+        self.udp_client_waiting_for_data = asyncio.Event()
+        self.udp_server_waiting_for_data = asyncio.Event()
 
         await self._start_udp_server(
             cert_path=cert_path,
@@ -164,12 +205,6 @@ class MercurySyncBaseServer:
             worker_socket=tcp_server_worker_socket,
             worker_server=tcp_server_worker_server,
         )
-
-        if self._tcp_client_cleanup_task is None:
-            self._tcp_client_cleanup_task = self._loop.create_task(self._cleanup_tcp_client_tasks())
-                                                                   
-        if self._udp_client_cleanup_task is None:
-            self._udp_client_cleanup_task = self._loop.create_task(self._cleanup_udp_client_tasks())
 
         if self._tcp_server_cleanup_task is None:
             self._tcp_server_cleanup_task = self._loop.create_task(self._cleanup_tcp_server_tasks())
@@ -332,18 +367,11 @@ class MercurySyncBaseServer:
     async def _connect_tcp_client(
         self,
         address: Tuple[str, int],
-        cert_path: Optional[str] = None,
-        key_path: Optional[str] = None,
         worker_socket: Optional[socket.socket] = None,
     ) -> None:
-        if self._semaphore is None:
-            self._semaphore = asyncio.Semaphore(self._max_concurrency)
 
-        self._loop = asyncio.get_event_loop()
-        if cert_path and key_path:
-            self._client_ssl_context = self._create_tcp_client_ssl_context(
-                cert_path=cert_path, key_path=key_path
-            )
+        if self._client_cert_path and self._client_key_path:
+            self._client_ssl_context = self._create_tcp_client_ssl_context()
 
         if worker_socket is None:
             tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -377,106 +405,209 @@ class MercurySyncBaseServer:
         if last_error:
             raise last_error
         
-    def _create_tcp_client_ssl_context(
-        self,
-        cert_path: Optional[str] = None,
-        key_path: Optional[str] = None,
-    ) -> ssl.SSLContext:
-        if self._client_cert_path is None:
-            self._client_cert_path = cert_path
-
-        if self._client_key_path is None:
-            self._client_key_path = key_path
+    def _create_tcp_client_ssl_context(self) -> ssl.SSLContext:
 
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_ctx.options |= ssl.OP_NO_TLSv1
         ssl_ctx.options |= ssl.OP_NO_TLSv1_1
-        ssl_ctx.load_cert_chain(cert_path, keyfile=key_path)
-        ssl_ctx.load_verify_locations(cafile=cert_path)
+        ssl_ctx.load_cert_chain(self._client_cert_path, keyfile=self._client_key_path)
+        ssl_ctx.load_verify_locations(cafile=self._client_cert_path)
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.VerifyMode.CERT_REQUIRED
+
+
+        match self._verify_cert:
+            case "REQUIRED":
+                ssl_ctx.verify_mode = ssl.VerifyMode.CERT_REQUIRED
+
+            case "OPTIONAL":
+                ssl_ctx.verify_mode = ssl.VerifyMode.CERT_OPTIONAL
+
+            case _:
+                ssl_ctx.verify_mode = ssl.VerifyMode.CERT_NONE
+
         ssl_ctx.set_ciphers("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")
 
         return ssl_ctx
-
-    @abstractmethod
-    def read_client_udp(
-        self,
-        data: bytes,
-        transport: asyncio.Transport,
-        next_data: asyncio.Future,
-    ):
-        pass
-
-    @abstractmethod
-    def read_server_udp(
-        self,
-        data: bytes,
-        transport: asyncio.Transport,
-        next_data: asyncio.Future,
-    ):
-        pass
     
-    @abstractmethod
+    async def send_tcp_client_data(
+        self,
+        handler_name: bytes,
+        address: tuple[str, int],
+        data: D,
+        response: type[R],
+        timeout: int | float | None = None,
+    ) -> R:
+        
+        if timeout is None:
+            timeout = self._request_timeout
+        
+        async with self._tcp_semaphore:        
+            transport = self._tcp_client_transports.get(address)
+            if transport is None or transport.is_closing():
+                transport = await self._connect_tcp_client(address)
+
+            payload = orjson.dumps(data.model_dump(exclude_none=True))
+
+            transport.write(
+                self._encryptor.encrypt(
+                    self._compressor.compress(handler_name + b'\r\n' + payload + b'<END'),
+                ),
+            )
+
+            await asyncio.wait_for(
+                self.tcp_client_waiting_for_data.wait(),
+                timeout=timeout,
+            )
+
+            response_data = cloudpickle.loads(
+                self._tcp_client_data[address][handler_name].pop(),
+            )
+
+            return response(**response_data)
+
+    async def send_udp_client_data(
+        self,
+        handler_name: bytes,
+        address: tuple[str, int],
+        data: D,
+        response: type[R],
+        timeout: int | float | None = None,
+    ) -> bytes:
+        
+        if timeout is None:
+            timeout = self._request_timeout
+        
+        async with self._udp_semaphore:
+
+            payload = orjson.dumps(data.model_dump(exclude_none=True))
+
+            self._udp_transport.write(
+                self._encryptor.encrypt(
+                    self._compressor.compress(handler_name + b'\r\n' + payload + b'<END'),
+                ),
+            )
+            await asyncio.wait_for(
+                self.udp_client_waiting_for_data.wait(),
+                timeout=timeout,
+            )
+
+            response_data = cloudpickle.loads(
+                self._udp_client_data[address][handler_name].pop(),
+            )
+
+            return response(**response_data)
+    
     def read_client_tcp(
         self,
-        data: bytes,
+        data: ReceiveBuffer,
         transport: asyncio.Transport,
-        next_data: asyncio.Future,
     ):
-        pass
+        address = transport.get_extra_info("peername")
+        if response := data.maybe_extract_next():
 
-    @abstractmethod
+            decrypted = self._decompressor.decompress(
+                self._encryptor.decrypt(response),
+            )
+
+            handler_name, payload = decrypted.split(b'\r\n', maxsplit=1)
+
+            self._tcp_client_data[address][handler_name].append(payload.strip(b'<END'))
+
+            self.tcp_client_waiting_for_data.set()
+
     def read_server_tcp(
         self,
-        data: bytes,
+        data: ReceiveBuffer,
         transport: asyncio.Transport,
-        next_data: asyncio.Future,
     ):
-        pass
+        if request := data.maybe_extract_next():
+            decrypted = self._decompressor.decompress(
+                self._encryptor.decrypt(request),
+            ).strip(b'<END')
 
-    async def _cleanup_tcp_client_tasks(self):
-        while self._running:
-            self._tcp_client_sleep_task = asyncio.create_task(
-                asyncio.sleep(self._cleanup_interval)
+            handler_name, payload = decrypted.split(b'\r\n', maxsplit=1)
+
+            self._pending_tcp_server_responses.append(
+                asyncio.ensure_future(
+                    self.process_tcp_server_call(
+                        handler_name,
+                        payload,
+                        transport,
+                    ),
+                ),
             )
 
-            try:
-                await self._tcp_client_sleep_task
+    def read_client_udp(
+        self,
+        data: ReceiveBuffer,
+        transport: asyncio.Transport,
+    ):
+        address = transport.get_extra_info("peername")
+        if response := data.maybe_extract_next():
 
-            except (Exception, asyncio.CancelledError, KeyboardInterrupt):
-                pass
-
-            for pending in list(self._pending_tcp_client_responses):
-                if pending.done() or pending.cancelled():
-                    try:
-                        await pending
-
-                    except (Exception, socket.error):
-                        pass
-                    self._pending_tcp_client_responses.pop()
-
-
-    async def _cleanup_udp_client_tasks(self):
-        while self._running:
-            self._udp_client_sleep_task = asyncio.create_task(
-                asyncio.sleep(self._cleanup_interval)
+            decrypted = self._decompressor.decompress(
+                self._encryptor.decrypt(response),
             )
 
-            try:
-                await self._udp_client_sleep_task
+            handler_name, payload = decrypted.split(b'\r\n', maxsplit=1)
 
-            except (Exception, asyncio.CancelledError, KeyboardInterrupt):
-                pass
+            self._udp_client_data[address][handler_name].append(payload)
 
-            for pending in list(self._pending_udp_client_responses):
-                if pending.done() or pending.cancelled():
-                    try:
-                        await pending
+            self.udp_client_waiting_for_data.set()
 
-                    except (Exception, socket.error):
-                        pass
-                    self._pending_udp_client_responses.pop()
+    def read_server_udp(
+        self,
+        data: ReceiveBuffer,
+        transport: asyncio.Transport,
+    ):
+        if request := data.maybe_extract_next():
+
+            decrypted = self._decompressor.decompress(
+                self._encryptor.decrypt(request),
+            ).strip(b'<END')
+
+            handler_name, payload = decrypted.split(b'\r\n', maxsplit=1)
+
+            self._pending_udp_server_responses.append(
+                asyncio.ensure_future(
+                    self.process_udp_server_call(
+                        handler_name,
+                        payload,
+                        transport,
+                    ),
+                ),
+            )
+
+    async def process_tcp_server_call(
+        self,
+        handler_name: bytes,
+        data: bytearray,
+        transport: asyncio.Transport,
+    ):
+        handler = self.tcp_handlers[handler_name]
+
+        response = await handler(data)
+
+        response_payload = orjson.dumps(response.model_dump(exclude_none=True))
+
+        transport.write(response_payload + b'<END')
+        self.udp_server_waiting_for_data.set()
+
+    async def process_udp_server_call(
+        self,
+        handler_name: bytes,
+        data: bytearray,
+        transport: asyncio.Transport,
+    ):
+        handler = self.udp_handlers[handler_name]
+
+        response = await handler(data)
+
+        response_payload = orjson.dumps(response.model_dump(exclude_none=True))
+
+        transport.write(response_payload + b'<END')
+        self.udp_server_waiting_for_data.set()
 
     async def _cleanup_tcp_server_tasks(self):
         while self._running:
@@ -531,49 +662,9 @@ class MercurySyncBaseServer:
             client.abort()
 
         await asyncio.gather(*[
-            self._cleanup_tcp_client_tasks(),
-            self._cleanup_udp_client_tasks(),
             self._cleanup_tcp_server_tasks(),
             self._cleanup_udp_server_tasks(),
         ])
-
-    async def _cleanup_tcp_client_tasks(self):
-
-        if self._tcp_client_cleanup_task:
-            self._tcp_client_cleanup_task.cancel()
-            if self._tcp_client_cleanup_task.cancelled() is False:
-                try:
-                    self._tcp_client_sleep_task.cancel()
-                    if not self._tcp_client_sleep_task.cancelled():
-                        await self._tcp_client_sleep_task
-
-                except (Exception, socket.error):
-                    pass
-
-                try:
-                    await self._tcp_client_cleanup_task
-
-                except Exception:
-                    pass
-
-    async def _cleanup_udp_client_tasks(self):
-
-        if self._udp_client_cleanup_task:
-            self._udp_client_cleanup_task.cancel()
-            if self._udp_client_cleanup_task.cancelled() is False:
-                try:
-                    self._udp_client_sleep_task.cancel()
-                    if not self._udp_client_sleep_task.cancelled():
-                        await self._udp_client_sleep_task
-
-                except (Exception, socket.error):
-                    pass
-
-                try:
-                    await self._udp_client_cleanup_task
-
-                except Exception:
-                    pass
 
     async def _cleanup_tcp_server_tasks(self):
 
@@ -616,31 +707,6 @@ class MercurySyncBaseServer:
     def abort(self) -> None:
         self._running = False
 
-        if self._tcp_client_cleanup_task:
-            try:
-                self._tcp_client_sleep_task.cancel()
-
-            except (
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-                Exception,
-                socket.error,
-            ):
-                pass
-
-            try:
-                self._tcp_client_cleanup_task.cancel()
-
-            except (
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-                Exception,
-                socket.error,
-            ):
-                pass
-
         if self._tcp_server_cleanup_task:
             try:
                 self._tcp_server_sleep_task.cancel()
@@ -656,31 +722,6 @@ class MercurySyncBaseServer:
 
             try:
                 self._tcp_server_cleanup_task.cancel()
-
-            except (
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-                Exception,
-                socket.error,
-            ):
-                pass
-
-        if self._udp_client_cleanup_task:
-            try:
-                self._udp_client_sleep_task.cancel()
-
-            except (
-                asyncio.CancelledError,
-                asyncio.InvalidStateError,
-                asyncio.TimeoutError,
-                Exception,
-                socket.error,
-            ):
-                pass
-
-            try:
-                self._udp_client_cleanup_task.cancel()
 
             except (
                 asyncio.CancelledError,

@@ -4,40 +4,39 @@ from .receive_buffer import ReceiveBuffer
 
 
 class AbstractConnection(ABC):
-    waiting_for_data: asyncio.Event
+    tcp_client_waiting_for_data: asyncio.Event
+    tcp_server_waiting_for_data: asyncio.Event
+    udp_client_waiting_for_data: asyncio.Event
+    udp_server_waiting_for_data: asyncio.Event
 
     @abstractmethod
     def read_client_udp(
         self,
-        data: bytes,
+        data: ReceiveBuffer,
         transport: asyncio.Transport,
-        next_data: asyncio.Future,
     ):
         pass
 
     @abstractmethod
     def read_server_udp(
         self,
-        data: bytes,
+        data: ReceiveBuffer,
         transport: asyncio.Transport,
-        next_data: asyncio.Future,
     ):
         pass
     
     @abstractmethod
     def read_client_tcp(
         self,
-        data: bytes,
+        data: ReceiveBuffer,
         transport: asyncio.Transport,
-        next_data: asyncio.Future,
     ):
         pass
 
     @abstractmethod
     def read_server_tcp(
         self,
-        data: bytes,
+        data: ReceiveBuffer,
         transport: asyncio.Transport,
-        next_data: asyncio.Future,
     ):
         pass

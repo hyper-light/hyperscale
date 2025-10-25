@@ -72,17 +72,17 @@ class MercurySyncUDPProtocol(asyncio.DatagramProtocol, Generic[T]):
         else:
             self._receive_buffer_closed = True
 
+        waiter = self.conn.udp_server_waiting_for_data
+        if self.mode == 'client':
+            waiter = self.conn.udp_client_waiting_for_data
+
         if (
-            self.conn.waiting_for_data.is_set() is False or self._next_data.done()
+            waiter.is_set() is False or self._next_data.done()
         ):
             self.read(
                 self._receive_buffer,
                 self.transport,
-                self._next_data,
             )
-            
-        else:
-            self._next_data.set_result(self._receive_buffer)
 
     def connection_lost(self, exc: Exception | None) -> None:
         self.connections.discard(self)

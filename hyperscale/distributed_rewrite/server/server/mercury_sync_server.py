@@ -1,4 +1,6 @@
+import asyncio
 from hyperscale.distributed_rewrite.env import Env
+from hyperscale.distributed_rewrite.server.protocol import ReceiveBuffer
 
 from .mercury_sync_base_server import MercurySyncBaseServer
 
@@ -19,6 +21,19 @@ class MercurySyncServer(MercurySyncBaseServer):
             udp_port,
             env,
         )
+    
+    async def process_tcp_server_call(
+        self,
+        data: ReceiveBuffer,
+        transport: asyncio.Transport,
+        next_data: asyncio.Future
+    ):
+        pass
 
-    def read_client_tcp(self, data, transport, next_data):
-        return super().read_client_tcp(data, transport, next_data)
+    async def process_udp_server_call(
+        self,
+        data: ReceiveBuffer,
+        transport: asyncio.Transport,
+        next_data: asyncio.Future
+    ):
+        pass
