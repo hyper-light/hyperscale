@@ -2,6 +2,7 @@
 
 
 import asyncio
+import inspect
 import orjson
 import socket
 import ssl
@@ -17,6 +18,7 @@ from typing import (
     Callable,
     Awaitable,
     TypeVar,
+    get_type_hints,
 )
 
 import msgspec
@@ -28,9 +30,16 @@ from hyperscale.distributed_rewrite.encryption import AESGCMFernet
 from hyperscale.distributed_rewrite.server.protocol import (
     MercurySyncTCPProtocol,
     MercurySyncUDPProtocol,
-    ReceiveBuffer,
 )
 from hyperscale.distributed_rewrite.server.events import LamportClock
+from hyperscale.distributed_rewrite.server.hooks.tcp import (
+    TCPClientCall,
+    TCPServerCall,
+)
+from hyperscale.distributed_rewrite.server.hooks.udp import (
+    UDPClientCall,
+    UDPServerCall,
+)
 
 
 do_patch()
@@ -138,6 +147,7 @@ class MercurySyncBaseServer:
         self._udp_connect_retires = env.MERCURY_SYNC_UDP_CONNECT_RETRIES
         self._verify_cert = env.MERCURY_SYNC_VERIFY_SSL_CERT
 
+        self._model_handler_map: dict[bytes, bytes] = {}
         self.tcp_client_response_models: dict[bytes, type[msgspec.Struct]] = {}
         self.tcp_server_request_models: dict[bytes, type[msgspec.Struct]] = {}
         self.udp_client_response_models: dict[bytes, type[msgspec.Struct]] = {}
@@ -204,6 +214,9 @@ class MercurySyncBaseServer:
         self.udp_client_waiting_for_data = asyncio.Event()
         self.udp_server_waiting_for_data = asyncio.Event()
 
+        self._get_tcp_hooks()
+        self._get_udp_hooks()
+
         await self._start_udp_server(
             worker_socket=udp_server_worker_socket,
             worker_transport=udp_server_worker_transport,
@@ -218,7 +231,7 @@ class MercurySyncBaseServer:
             self._tcp_server_cleanup_task = self._loop.create_task(self._cleanup_tcp_server_tasks())
                                                                    
         if self._udp_server_cleanup_task is None:
-            self._udp_server_cleanup_task = self._loop.create_task(self._clanup_udp_server_tasks())
+            self._udp_server_cleanup_task = self._loop.create_task(self._cleanup_udp_server_tasks())
 
     async def _start_udp_server(
         self,
@@ -371,6 +384,74 @@ class MercurySyncBaseServer:
 
         return ssl_ctx
     
+    def _get_tcp_hooks(self):
+        hooks: Dict[str, TCPClientCall | TCPServerCall] = {
+            name: hook()
+            for name, hook in inspect.getmembers(
+                self,
+                predicate=lambda member: (
+                    hasattr(member, 'is_hook')
+                    and hasattr(member, 'type')
+                    and getattr(member, 'type') == 'tcp'
+                )
+            )
+        }
+
+        for hook in hooks.values():
+            hook.call = hook.call.__get__(self, self.__class__)
+            setattr(self, hook.name, hook.call)
+
+            signature = inspect.signature(hook.call)
+
+            for param in signature.parameters.values():
+                encoded_hook_name = hook.name.encode()
+
+                if param.annotation in msgspec.Struct.__subclasses__():
+                    self.tcp_server_request_models[encoded_hook_name] = param.annotation
+                    request_model_name = param.annotation.__name__.encode()
+
+                    self._model_handler_map[request_model_name] = encoded_hook_name
+
+            return_type = get_type_hints(hook.call).get("return")
+            self.tcp_client_response_models[encoded_hook_name] = return_type
+
+            if isinstance(hook, TCPServerCall):
+                self.tcp_handlers[encoded_hook_name] = hook.call
+    
+    def _get_udp_hooks(self):
+        hooks: Dict[str, UDPClientCall | UDPServerCall] = {
+            name: hook()
+            for name, hook in inspect.getmembers(
+                self,
+                predicate=lambda member: (
+                    hasattr(member, 'is_hook')
+                    and hasattr(member, 'type')
+                    and getattr(member, 'type') == 'udp'
+                )
+            )
+        }
+
+        for hook in hooks.values():
+            hook.call = hook.call.__get__(self, self.__class__)
+            setattr(self, hook.name, hook.call)
+
+            signature = inspect.signature(hook.call)
+
+            for param in signature.parameters.values():
+                encoded_hook_name = hook.name.encode()
+
+                if param.annotation in msgspec.Struct.__subclasses__():
+                    self.udp_server_request_models[encoded_hook_name] = param.annotation
+                    request_model_name = param.annotation.__name__.encode()
+
+                    self._model_handler_map[request_model_name] = encoded_hook_name
+
+            return_type = get_type_hints(hook.call).get("return")
+            self.udp_client_response_models[encoded_hook_name] = return_type
+
+            if isinstance(hook, UDPServerCall):
+                self.udp_handlers[encoded_hook_name] = hook.call
+    
     async def _connect_tcp_client(
         self,
         address: Tuple[str, int],
@@ -439,7 +520,6 @@ class MercurySyncBaseServer:
     
     async def send_tcp_client_data(
         self,
-        handler_name: bytes,
         address: tuple[str, int],
         data: D,
         timeout: int | float | None = None,
@@ -458,6 +538,8 @@ class MercurySyncBaseServer:
                 payload = orjson.dumps({
                     key: value for key, value in msgspec.structs.asdict(data).items() if value is not None
                 })
+
+                handler_name = data.__class__.__name__.encode()
 
                 transport.write(
                     self._encryptor.encrypt(
@@ -480,7 +562,6 @@ class MercurySyncBaseServer:
 
     async def send_udp_client_data(
         self,
-        handler_name: bytes,
         address: tuple[str, int],
         data: D,
         timeout: int | float | None = None,
@@ -495,6 +576,9 @@ class MercurySyncBaseServer:
                 payload = orjson.dumps({
                     key: value for key, value in msgspec.structs.asdict(data).items() if value is not None
                 })
+
+                model_name = data.__class__.__name__.encode()
+                handler_name = self._model_handler_map[model_name]
 
                 self._udp_transport.sendto(
                     self._encryptor.encrypt(
@@ -513,7 +597,7 @@ class MercurySyncBaseServer:
                 )
 
                 response_data = orjson.loads(response_bytes)
-                response_model = self.tcp_client_response_models[handler_name]
+                response_model = self.udp_client_response_models[handler_name]
                 
                 return response_model(**response_data)
             
@@ -604,8 +688,7 @@ class MercurySyncBaseServer:
             transport.write(response_payload)
 
         except Exception:
-            import traceback
-            print(traceback.format_exc())
+            pass
 
     async def process_udp_call(
         self,
@@ -652,7 +735,7 @@ class MercurySyncBaseServer:
                     self._pending_tcp_server_responses.pop()
 
 
-    async def _clanup_udp_server_tasks(self):
+    async def _cleanup_udp_server_tasks(self):
         while self._running:
             self._udp_server_sleep_task = asyncio.create_task(
                 asyncio.sleep(self._cleanup_interval)
