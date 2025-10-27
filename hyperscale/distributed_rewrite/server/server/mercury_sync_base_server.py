@@ -3,9 +3,10 @@
 
 import asyncio
 import inspect
-import orjson
 import socket
 import ssl
+import random
+import traceback
 from collections import defaultdict, deque
 from typing import (
     Any,
@@ -19,6 +20,8 @@ from typing import (
     Awaitable,
     TypeVar,
     get_type_hints,
+    Literal,
+    get_args,
 )
 
 import msgspec
@@ -27,6 +30,16 @@ import zstandard
 from hyperscale.core.engines.client.udp.protocols.dtls import do_patch
 from hyperscale.distributed_rewrite.env import Env, TimeParser
 from hyperscale.distributed_rewrite.encryption import AESGCMFernet
+from hyperscale.distributed_rewrite.models import (
+    Ack,
+    Eject,
+    Error,
+    Join,
+    Leave,
+    Message,
+    Nack,
+    Probe,
+)
 from hyperscale.distributed_rewrite.server.protocol import (
     MercurySyncTCPProtocol,
     MercurySyncUDPProtocol,
@@ -56,7 +69,8 @@ class MercurySyncBaseServer:
         udp_port: int,
         env: Env,
     ) -> None:
-        self._clock = LamportClock()
+        self._tcp_clock = LamportClock()
+        self._udp_clock = LamportClock()
         self.env = env
 
         self._host = host
@@ -83,8 +97,8 @@ class MercurySyncBaseServer:
         self._tcp_connected = False
         self._udp_connected = False
 
-        self._tcp_client_transports: Dict[str, asyncio.Transport] = {}
-        self._udp_client_transports: Dict[str, asyncio.Transport] = {}
+        self._tcp_client_transports: Dict[tuple[str, int], asyncio.Transport] = {}
+        self._udp_client_addrs: set[tuple[str, int]] = set()
 
         self._tcp_server: asyncio.Server = None
         self._udp_server: asyncio.Server = None
@@ -332,7 +346,6 @@ class MercurySyncBaseServer:
             self._tcp_server = server
             self._tcp_connected = True
 
-
     def _create_udp_ssl_context(self) -> ssl.SSLContext:
 
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS)
@@ -402,9 +415,9 @@ class MercurySyncBaseServer:
             setattr(self, hook.name, hook.call)
 
             signature = inspect.signature(hook.call)
+            encoded_hook_name = hook.name.encode()
 
             for param in signature.parameters.values():
-                encoded_hook_name = hook.name.encode()
 
                 if param.annotation in msgspec.Struct.__subclasses__():
                     self.tcp_server_request_models[encoded_hook_name] = param.annotation
@@ -436,13 +449,22 @@ class MercurySyncBaseServer:
             setattr(self, hook.name, hook.call)
 
             signature = inspect.signature(hook.call)
+            encoded_hook_name = hook.name.encode()
 
             for param in signature.parameters.values():
-                encoded_hook_name = hook.name.encode()
 
-                if param.annotation in msgspec.Struct.__subclasses__():
-                    self.udp_server_request_models[encoded_hook_name] = param.annotation
-                    request_model_name = param.annotation.__name__.encode()
+                subtypes = get_args(param.annotation)
+                annotation = param.annotation
+
+                if len(subtypes) > 0:
+                    for annotated in subtypes:
+                        if annotated in msgspec.Struct.__subclasses__():
+                            annotation = annotated
+                            break
+
+                if annotation in msgspec.Struct.__subclasses__():
+                    self.udp_server_request_models[encoded_hook_name] = annotation
+                    request_model_name = annotation.__name__.encode()
 
                     self._model_handler_map[request_model_name] = encoded_hook_name
 
@@ -518,15 +540,14 @@ class MercurySyncBaseServer:
 
         return ssl_ctx
     
-    async def send_tcp_client_data(
+    async def send_tcp(
         self,
         address: tuple[str, int],
         data: D,
         timeout: int | float | None = None,
-    ) -> R:
+    ) -> R | Error:
         try:
 
-        
             if timeout is None:
                 timeout = self._request_timeout
             
@@ -535,15 +556,25 @@ class MercurySyncBaseServer:
                 if transport is None or transport.is_closing():
                     transport = await self._connect_tcp_client(address)
 
-                payload = orjson.dumps({
-                    key: value for key, value in msgspec.structs.asdict(data).items() if value is not None
-                })
-
-                handler_name = data.__class__.__name__.encode()
+                model_name = data.__class__.__name__.encode()
+                handler_name = self._model_handler_map[model_name]
+                
+                message = Message(
+                    data={
+                        key: value for key, value in msgspec.structs.asdict(data).items() if value is not None
+                    },
+                    time=(
+                        await self._tcp_clock.increment()
+                    ),
+                    call=handler_name.decode(),
+                    protocol='tcp',
+                    sender=(self._host, self._tcp_port),
+                    recipient=address,
+                )
 
                 transport.write(
                     self._encryptor.encrypt(
-                        self._compressor.compress(handler_name + b'<|/|' + payload)
+                        self._compressor.compress(handler_name + b'<|/|' + self._tcp_addr_slug + b'<|/|' + message.dump_json())
                     ),
                 )
 
@@ -552,20 +583,86 @@ class MercurySyncBaseServer:
                     timeout=timeout,
                 )
 
-                response_data = orjson.loads(response_bytes)
+                response_message = Message.load_json(response_bytes)
+
+                await self._tcp_clock.ack(response_message.time)
+
+                if error_message := response_message.error:
+                    return error_message
+
                 response_model = self.tcp_client_response_models[handler_name]
-
-                return response_model(**response_data)
+                return response_model(**response_message.data)
             
-        except Exception:
-            pass
+        except Exception as error:
+            message = Message(
+                data={},
+                error=Error(
+                    message=str(error),
+                    traceback=traceback.format_exc(),
+                    node=(self._host, self._tcp_port),
+                ),
+                time=self._udp_clock.time,
+                call=handler_name.decode(),
+                protocol='tcp',
+                sender=(self._host, self._tcp_port),
+                recipient=address
+            )
 
-    async def send_udp_client_data(
+            return message.error
+
+    async def broadcast_tcp(
+        self,
+        data: D,
+        max_nodes: int | None = None,
+        selection_method: Literal["all", "random", "subset"] = "subset",
+        timeout: int | float | None = None,
+    ):
+        nodes = list(self._tcp_client_transports.keys())
+        node_max = len(nodes)
+
+        if max_nodes is None:
+            max_nodes = max(1, node_max/2)
+        
+        match selection_method:
+            case "random":
+                selection = [nodes[random.randrange(0, node_max)]]
+
+            case "subset":
+                selection = random.choices(nodes, k=max_nodes)
+
+            case "all":
+                selection = nodes
+
+        errors: list[Exception] = []
+        results: list[R] = []
+        
+        async for complete in asyncio.as_completed([
+            self.send_tcp(
+                addr,
+                data,
+                timeout=timeout,
+            ) for addr in selection
+        ]):
+            
+            result = await complete
+            
+            if isinstance(result, Error):
+                errors.append(result)
+
+            else:
+                results.append(result)
+
+        return (
+            results,
+            errors,
+        ) 
+
+    async def send_udp(
         self,
         address: tuple[str, int],
         data: D,
         timeout: int | float | None = None,
-    ) -> bytes:
+    ) -> R | Error:
         try:
 
             if timeout is None:
@@ -573,16 +670,25 @@ class MercurySyncBaseServer:
             
             async with self._udp_semaphore:
 
-                payload = orjson.dumps({
-                    key: value for key, value in msgspec.structs.asdict(data).items() if value is not None
-                })
-
                 model_name = data.__class__.__name__.encode()
                 handler_name = self._model_handler_map[model_name]
 
+                message = Message(
+                    data={
+                        key: value for key, value in msgspec.structs.asdict(data).items() if value is not None
+                    },
+                    time=(
+                        await self._tcp_clock.increment()
+                    ),
+                    call=handler_name.decode(),
+                    protocol='udp',
+                    sender=(self._host, self._udp_port),
+                    recipient=address,
+                )
+
                 self._udp_transport.sendto(
                     self._encryptor.encrypt(
-                        self._compressor.compress(b'c' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + payload)
+                        self._compressor.compress(b'c' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + message.dump_json())
                     ),
                     address,
                 )
@@ -596,14 +702,231 @@ class MercurySyncBaseServer:
                     timeout=timeout,
                 )
 
-                response_data = orjson.loads(response_bytes)
+                response_message = Message.load_json(response_bytes)
+
+                await self._tcp_clock.ack(response_message.time)
+
+                if error_message := response_message.error:
+                    return error_message
+
                 response_model = self.udp_client_response_models[handler_name]
-                
-                return response_model(**response_data)
+                return response_model(**response_message.data)
             
-        except Exception:
-            pass
+        except Exception as error:
+            message = Message(
+                data={},
+                error=Error(
+                    message=str(error),
+                    traceback=traceback.format_exc(),
+                    node=(self._host, self._udp_port),
+                ),
+                time=self._udp_clock.time,
+                call=handler_name.decode(),
+                protocol='udp',
+                sender=(self._host, self._udp_port),
+                recipient=address
+            )
+
+            return message.error
+        
+    async def send_udp_with_message(
+        self,
+        address: tuple[str, int],
+        data: D,
+        timeout: int | float | None = None,
+    ):
+        try:
+
+            if timeout is None:
+                timeout = self._request_timeout
+            
+            async with self._udp_semaphore:
+
+                model_name = data.__class__.__name__.encode()
+                handler_name = self._model_handler_map[model_name]
+
+                message = Message(
+                    data={
+                        key: value for key, value in msgspec.structs.asdict(data).items() if value is not None
+                    },
+                    time=(
+                        await self._tcp_clock.increment()
+                    ),
+                    call=handler_name.decode(),
+                    protocol='udp',
+                    sender=(self._host, self._udp_port),
+                    recipient=address,
+                    wraps=True,
+                )
+
+                self._udp_transport.sendto(
+                    self._encryptor.encrypt(
+                        self._compressor.compress(b'c' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + message.dump_json())
+                    ),
+                    address,
+                )
+
+                host, port = address
+
+                target = f'{host}:{port}'.encode()
+
+                response_bytes = await asyncio.wait_for(
+                    self._udp_client_data[target][handler_name].get(),
+                    timeout=timeout,
+                )
+
+                response_message = Message.load_json(response_bytes)
+
+                await self._tcp_clock.ack(response_message.time)
+
+                if response_message.error is None:
+                    response_model = self.udp_client_response_models[handler_name]
+                    response_message.data = response_model(**response_message.data)
+                    
+                return response_message
+            
+        except Exception as error:
+            return Message(
+                data={},
+                error=Error(
+                    message=str(error),
+                    traceback=traceback.format_exc(),
+                    node=(self._host, self._udp_port),
+                ),
+                time=self._udp_clock.time,
+                call=handler_name.decode(),
+                protocol='udp',
+                sender=(self._host, self._udp_port),
+                recipient=address,
+                wraps=True,
+            )
+        
+    async def broadcast_udp(
+        self,
+        data: D,
+        max_nodes: int | None = None,
+        selection_method: Literal["all", "random", "subset"] = "subset",
+        timeout: int | float | None = None,
+    ):
+        nodes = list(self._tcp_client_transports.keys())
+        node_max = len(nodes)
+
+        if max_nodes is None:
+            max_nodes = max(1, node_max/2)
+        
+        match selection_method:
+            case "random":
+                selection = [nodes[random.randrange(0, node_max)]]
+
+            case "subset":
+                selection = random.choices(nodes, k=max_nodes)
+
+            case "all":
+                selection = nodes
+
+        errors: list[Exception] = []
+        results: list[R] = []
+        
+        async for complete in asyncio.as_completed([
+            self.send_udp(
+                addr,
+                data,
+                timeout=timeout,
+            ) for addr in selection
+        ]):
+            
+            result = await complete
+            
+            if isinstance(result, Error):
+                errors.append(result)
+
+            else:
+                results.append(result)
+
+        return (
+            results,
+            errors,
+        )
     
+    async def broadcast_udp_with_message(
+        self,
+        data: D,
+        max_nodes: int | None = None,
+        selection_method: Literal["all", "random", "subset"] = "subset",
+        timeout: int | float | None = None,
+    ):
+        nodes = list(self._udp_client_addrs)
+        node_max = len(nodes)
+
+        if max_nodes is None:
+            max_nodes = max(1, node_max/2)
+        
+        match selection_method:
+            case "random":
+                selection = [nodes[random.randrange(0, node_max)]]
+
+            case "subset":
+                selection = random.choices(nodes, k=max_nodes)
+
+            case "all":
+                selection = nodes
+
+        errors: list[Message[Error]] = []
+        results: list[Message[R]] = []
+        
+        async for complete in asyncio.as_completed([
+            self.send_udp_with_message(
+                addr,
+                data,
+                timeout=timeout,
+            ) for addr in selection
+        ]):
+            
+            result = await complete
+            
+            if result.error:
+                errors.append(result)
+
+            else:
+                results.append(result)
+
+        return (
+            results,
+            errors,
+        )
+    
+    async def connect_tcp_client(
+        self,
+        host: str,
+        port: int,
+        timeout: int | float | None = None,
+    ) -> Error | None:
+        
+        if timeout is None:
+            timeout = self._request_timeout
+
+        error: Exception | None = None
+        trace: str | None = None
+
+        try:
+
+            self._tcp_client_transports[(host, port)] = await asyncio.wait_for(
+                self._connect_tcp_client(
+                    (host, port),
+                ),
+                timeout=timeout,
+            )
+
+        except Exception as err:
+            error = err
+            trace = traceback.format_exc()
+
+            return Error(
+                message=str(error),
+                traceback=trace,
+                node=(host, port)
+            )
+
     def read_client_tcp(
         self,
         data: bytes,
@@ -665,30 +988,65 @@ class MercurySyncBaseServer:
         data: bytes,
         transport: asyncio.Transport,
     ):
+
         try:
             decrypted = self._decompressor.decompress(
-                self._encryptor.decrypt(
+            self._encryptor.decrypt(
                     data,
                 )
             )
 
             handler_name, _, payload = decrypted.split(b'<|/|', maxsplit=2)
 
+            request_message = Message.load_json(payload)
+            next_time = await self._tcp_clock.update(request_message.time)
+
             handler = self.tcp_handlers[handler_name]
             request_model = self.tcp_server_request_models[handler_name]
 
-            response = await handler(request_model(**orjson.loads(payload)))
+            response = await handler(request_model(**request_message.data))
+
+            response_message = Message(
+                data={
+                    key: value for key, value in msgspec.structs.asdict(response).items() if value is not None
+                },
+                time=next_time,
+                call=handler_name.decode(),
+                protocol='tcp',
+                sender=(self._host, self._tcp_port),
+                recipient=request_message.sender,
+            )
+
+            response_message_bytes = response_message.dump_json()
 
             response_payload = self._encryptor.encrypt(
-                self._compressor.compress(handler_name + b'<|/|' + self._tcp_addr_slug + b'<|/|' + orjson.dumps({
-                    key: value for key, value in msgspec.structs.asdict(response).items() if value is not None
-                }),)
+                self._compressor.compress(handler_name + b'<|/|' + self._tcp_addr_slug + b'<|/|' + response_message_bytes)
             )
 
             transport.write(response_payload)
 
-        except Exception:
-            pass
+        except Exception as error:
+            response_message = Message(
+                data={},
+                error=Error(
+                    message=str(error),
+                    traceback=traceback.format_exc(),
+                    node=(self._host, self._tcp_port),
+                ),
+                time=next_time,
+                call=handler_name.decode(),
+                protocol='tcp',
+                sender=(self._host, self._tcp_port),
+                recipient=request_message.sender,
+            )
+
+            response_message_bytes = response_message.dump_json()
+
+            response_payload = self._encryptor.encrypt(
+                self._compressor.compress(b's' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + response_message_bytes)
+            )
+
+            transport.write(response_payload)
 
     async def process_udp_call(
         self,
@@ -698,20 +1056,68 @@ class MercurySyncBaseServer:
         transport: asyncio.DatagramTransport,
     ):
         
-        handler = self.udp_handlers[handler_name]
-        request_model = self.udp_server_request_models[handler_name]
+        try:
+            request_message = Message.load_json(payload)
+            next_time = await self._udp_clock.update(request_message.time)
 
-        response = await handler(request_model(**orjson.loads(payload)))
+            handler = self.udp_handlers[handler_name]
 
-        response_payload = self._encryptor.encrypt(
-            self._compressor.compress(b's' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + orjson.dumps({
-                key: value for key, value in msgspec.structs.asdict(response).items() if value is not None
-            }),)
-        )
+            if request_message.wraps:
+                response = await handler(request_message)
 
-        host, port = addr.decode().split(':', maxsplit=1)
+            else:
+                request_model = self.udp_server_request_models[handler_name]
+                response = await handler(request_model(**request_message.data))
 
-        transport.sendto(response_payload, (host, int(port)))
+            response_message = Message(
+                data={
+                    key: value for key, value in msgspec.structs.asdict(response).items() if value is not None
+                },
+                time=next_time,
+                call=handler_name.decode(),
+                protocol='udp',
+                sender=(self._host, self._udp_port),
+                recipient=request_message.sender,
+                wraps=request_message.wraps,
+            )
+
+            response_message_bytes = response_message.dump_json()
+
+            response_payload = self._encryptor.encrypt(
+                self._compressor.compress(b's' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + response_message_bytes)
+            )
+
+            host, port = addr.decode().split(':', maxsplit=1)
+
+            transport.sendto(response_payload, (host, int(port)))
+
+        except Exception as error:
+            import traceback
+            print(traceback.format_exc())
+
+            response_message = Message(
+                data={},
+                error=Error(
+                    message=str(error),
+                    traceback=traceback.format_exc(),
+                    node=(self._host, self._udp_port),
+                ),
+                time=next_time,
+                call=handler_name.decode(),
+                protocol='udp',
+                sender=(self._host, self._udp_port),
+                recipient=request_message.sender,
+            )
+
+            response_message_bytes = response_message.dump_json()
+
+            response_payload = self._encryptor.encrypt(
+                self._compressor.compress(b's' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + response_message_bytes)
+            )
+
+            host, port = addr.decode().split(':', maxsplit=1)
+
+            transport.sendto(response_payload, (host, int(port)))
 
     async def _cleanup_tcp_server_tasks(self):
         while self._running:
@@ -760,9 +1166,6 @@ class MercurySyncBaseServer:
         self._running = False
 
         for client in self._tcp_client_transports.values():
-            client.abort()
-
-        for client in self._udp_client_transports.values():
             client.abort()
 
         await asyncio.gather(*[
