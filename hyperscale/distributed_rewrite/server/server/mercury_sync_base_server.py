@@ -22,46 +22,51 @@ from typing import (
     get_type_hints,
     Literal,
     get_args,
+    Generic,
 )
 
 import msgspec
 import zstandard
 
 from hyperscale.core.engines.client.udp.protocols.dtls import do_patch
+from hyperscale.distributed_rewrite.server.context import Context, T
 from hyperscale.distributed_rewrite.env import Env, TimeParser
 from hyperscale.distributed_rewrite.encryption import AESGCMFernet
 from hyperscale.distributed_rewrite.models import (
-    Ack,
-    Eject,
     Error,
-    Join,
-    Leave,
     Message,
-    Nack,
-    Probe,
 )
+
 from hyperscale.distributed_rewrite.server.protocol import (
     MercurySyncTCPProtocol,
     MercurySyncUDPProtocol,
 )
 from hyperscale.distributed_rewrite.server.events import LamportClock
-from hyperscale.distributed_rewrite.server.hooks.tcp import (
-    TCPClientCall,
-    TCPServerCall,
-)
-from hyperscale.distributed_rewrite.server.hooks.udp import (
-    UDPClientCall,
-    UDPServerCall,
+from hyperscale.distributed_rewrite.server.hooks.task import (
+    TaskCall,
 )
 
+from hyperscale.distributed_rewrite.taskex import TaskRunner
+from hyperscale.distributed_rewrite.taskex.run import Run
 
 do_patch()
 
 D = TypeVar("D", bound=msgspec.Struct)
 R = TypeVar("R", bound=msgspec.Struct)
 
+Handler = Callable[
+    [
+        tuple[str, int],
+        bytes | msgspec.Struct,
+        int,
+    ],
+    Awaitable[
+        tuple[bytes, msgspec.Struct | bytes],
+    ]
+]
 
-class MercurySyncBaseServer:
+
+class MercurySyncBaseServer(Generic[T]):
     def __init__(
         self,
         host: str,
@@ -152,6 +157,8 @@ class MercurySyncBaseServer:
         self.udp_client_waiting_for_data: asyncio.Event = None
         self.udp_server_waiting_for_data: asyncio.Event = None
 
+        self._context: Context[T] = None
+
         self._cleanup_interval = TimeParser(env.MERCURY_SYNC_CLEANUP_INTERVAL).time
 
         self._request_timeout = TimeParser(env.MERCURY_SYNC_REQUEST_TIMEOUT).time
@@ -162,42 +169,93 @@ class MercurySyncBaseServer:
         self._verify_cert = env.MERCURY_SYNC_VERIFY_SSL_CERT
 
         self._model_handler_map: dict[bytes, bytes] = {}
-        self.tcp_client_response_models: dict[bytes, type[msgspec.Struct]] = {}
-        self.tcp_server_request_models: dict[bytes, type[msgspec.Struct]] = {}
-        self.udp_client_response_models: dict[bytes, type[msgspec.Struct]] = {}
-        self.udp_server_request_models: dict[bytes, type[msgspec.Struct]] = {}
+        self.tcp_client_response_models: dict[bytes, type[Message]] = {}
+        self.tcp_server_request_models: dict[bytes, type[Message]] = {}
+        self.udp_client_response_models: dict[bytes, type[Message]] = {}
+        self.udp_server_request_models: dict[bytes, type[Message]] = {}
 
         self.tcp_handlers: dict[
             bytes,
-            Callable[
-                [bytes],
-                Awaitable[msgspec.Struct],
-            ]
+            Handler,
         ] = {}
-        
+
+        self.tcp_client_processor: dict[
+            bytes,
+            Handler,
+        ] = {}
+
         self.udp_handlers: dict[
             bytes,
-            Callable[
-                [bytes],
-                Awaitable[msgspec.Struct],
-            ]
+            Handler,
         ] = {}
+
+        self.udp_client_handlers: dict[
+            bytes,
+            Handler,
+        ] = {}
+
+        self.task_handlers: dict[str, TaskCall] = {}
+
+        self._tasks: dict[
+            str,
+            TaskCall,
+        ] = {}
+
+        self._task_runner: TaskRunner | None = None
+        self._task_runs: dict[str, list[Run]] = defaultdict(list)
+
+    @property
+    def tcp_address(self):
+        return self._host, self._tcp_port
+    
+    @property
+    def udp_address(self):
+        return self._host, self._udp_port
+    
+    @property
+    def tcp_time(self):
+        return self._tcp_clock.time
+    
+    @property
+    def udp_time(self):
+        return self._udp_clock.time
+    
+    def tcp_target_is_self(self, addr: tuple[str, int]):
+        host, port = addr
+
+        return host == self._host and port == self._tcp_port
+
+    def udp_target_is_self(self, addr: tuple[str, int]):
+        host, port = addr
+
+        return host == self._host and port == self._udp_port
 
     def from_env(self, env: Env):
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
         self._tcp_connect_retries = env.MERCURY_SYNC_TCP_CONNECT_RETRIES
         self._verify_cert = env.MERCURY_SYNC_VERIFY_SSL_CERT
 
+
     async def start_server(
         self,
         cert_path: str | None = None,
         key_path: str | None = None,
+        init_context: T | None = None,
         udp_server_worker_socket: socket.socket | None = None,
         udp_server_worker_transport: asyncio.DatagramTransport | None = None,
         tcp_server_worker_socket: socket.socket | None = None,
         tcp_server_worker_server: asyncio.Server | None = None,
     ):
         
+        if init_context is None:
+            init_context = {}
+        
+        self.node_lock = asyncio.Lock()
+        self._context = Context[T](init_context=init_context)
+        
+        if self._task_runner is None:
+            self._task_runner = TaskRunner(0, self.env)
+
         if self._client_cert_path is None:
             self._client_cert_path = cert_path
         
@@ -230,6 +288,7 @@ class MercurySyncBaseServer:
 
         self._get_tcp_hooks()
         self._get_udp_hooks()
+        self._get_task_hooks()
 
         await self._start_udp_server(
             worker_socket=udp_server_worker_socket,
@@ -246,6 +305,26 @@ class MercurySyncBaseServer:
                                                                    
         if self._udp_server_cleanup_task is None:
             self._udp_server_cleanup_task = self._loop.create_task(self._cleanup_udp_server_tasks())
+
+        
+        for task_name, task in self._tasks.items():
+            if task.trigger == 'ON_START':
+                run = self._task_runner.run(
+                    task.call,
+                    *task.args,
+                    alias=task.alias,
+                    run_id=task.run_id,
+                    timeout=task.timeout,
+                    schedule=task.schedule,
+                    trigger=task.trigger,
+                    repeat=task.repeat,
+                    keep=task.keep,
+                    max_age=task.max_age,
+                    keep_policy=task.keep_policy,
+                    **task.kwargs,
+                )
+
+                self._task_runs[task_name].append(run)
 
     async def _start_udp_server(
         self,
@@ -398,8 +477,8 @@ class MercurySyncBaseServer:
         return ssl_ctx
     
     def _get_tcp_hooks(self):
-        hooks: Dict[str, TCPClientCall | TCPServerCall] = {
-            name: hook()
+        hooks: Dict[str, Handler] = {
+            name: hook
             for name, hook in inspect.getmembers(
                 self,
                 predicate=lambda member: (
@@ -428,12 +507,15 @@ class MercurySyncBaseServer:
             return_type = get_type_hints(hook.call).get("return")
             self.tcp_client_response_models[encoded_hook_name] = return_type
 
-            if isinstance(hook, TCPServerCall):
+            if hook.action == 'receiver':
                 self.tcp_handlers[encoded_hook_name] = hook.call
+
+            elif hook.action == 'handle':
+                self.tcp_client_processor[encoded_hook_name] = hook.call
     
     def _get_udp_hooks(self):
-        hooks: Dict[str, UDPClientCall | UDPServerCall] = {
-            name: hook()
+        hooks: Dict[str, Handler] = {
+            name: hook
             for name, hook in inspect.getmembers(
                 self,
                 predicate=lambda member: (
@@ -469,10 +551,35 @@ class MercurySyncBaseServer:
                     self._model_handler_map[request_model_name] = encoded_hook_name
 
             return_type = get_type_hints(hook.call).get("return")
-            self.udp_client_response_models[encoded_hook_name] = return_type
 
-            if isinstance(hook, UDPServerCall):
+            if return_type in msgspec.Struct.__subclasses__():
+                self.udp_client_response_models[encoded_hook_name] = return_type
+
+            if hook.action == 'receive':
                 self.udp_handlers[encoded_hook_name] = hook.call
+
+            elif hook.action == 'handle':
+                self.udp_client_handlers[encoded_hook_name] = hook.call
+
+    def _get_task_hooks(self):
+        hooks: Dict[str, Handler] = {
+            name: hook
+            for name, hook in inspect.getmembers(
+                self,
+                predicate=lambda member: (
+                    hasattr(member, 'is_hook')
+                    and hasattr(member, 'type')
+                    and getattr(member, 'type') == 'task'
+                )
+            )
+        }
+
+        for hook in hooks.values():
+            hook.call = hook.call.__get__(self, self.__class__)
+            setattr(self, hook.name, hook.call)
+
+            if isinstance(hook, TaskCall):
+                self.task_handlers[hook.name] = hook
     
     async def _connect_tcp_client(
         self,
@@ -673,6 +780,9 @@ class MercurySyncBaseServer:
                 model_name = data.__class__.__name__.encode()
                 handler_name = self._model_handler_map[model_name]
 
+                if isinstance(data, Message):
+                    data = data.dump()
+
                 message = Message(
                     data={
                         key: value for key, value in msgspec.structs.asdict(data).items() if value is not None
@@ -688,7 +798,7 @@ class MercurySyncBaseServer:
 
                 self._udp_transport.sendto(
                     self._encryptor.encrypt(
-                        self._compressor.compress(b'c' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + message.dump_json())
+                        b'c<' + self._udp_addr_slug + b'<' + handler_name + b'<' + message.dump_json()
                     ),
                     address,
                 )
@@ -729,12 +839,13 @@ class MercurySyncBaseServer:
 
             return message.error
         
-    async def send_udp_with_message(
+    async def send_udp(
         self,
         address: tuple[str, int],
-        data: D,
-        timeout: int | float | None = None,
-    ):
+        action: str,
+        data: bytes,
+        timeout: int | float | None = None
+    ) -> bytes:
         try:
 
             if timeout is None:
@@ -742,26 +853,17 @@ class MercurySyncBaseServer:
             
             async with self._udp_semaphore:
 
-                model_name = data.__class__.__name__.encode()
-                handler_name = self._model_handler_map[model_name]
+                clock = await self._udp_clock.increment()
 
-                message = Message(
-                    data={
-                        key: value for key, value in msgspec.structs.asdict(data).items() if value is not None
-                    },
-                    time=(
-                        await self._tcp_clock.increment()
-                    ),
-                    call=handler_name.decode(),
-                    protocol='udp',
-                    sender=(self._host, self._udp_port),
-                    recipient=address,
-                    wraps=True,
-                )
+                encoded_action = action.encode()
 
+                if isinstance(data, Message):
+                    data = data.dump()
+
+            
                 self._udp_transport.sendto(
                     self._encryptor.encrypt(
-                        self._compressor.compress(b'c' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + message.dump_json())
+                        b'c<' + self._udp_addr_slug + b'<' + encoded_action + b'<' + data + b'<' + clock.to_bytes(64) 
                     ),
                     address,
                 )
@@ -770,20 +872,16 @@ class MercurySyncBaseServer:
 
                 target = f'{host}:{port}'.encode()
 
-                response_bytes = await asyncio.wait_for(
-                    self._udp_client_data[target][handler_name].get(),
+                response: tuple[bytes, int] = await asyncio.wait_for(
+                    self._udp_client_data[target][encoded_action].get(),
                     timeout=timeout,
                 )
 
-                response_message = Message.load_json(response_bytes)
+                response_bytes, clock = response
 
-                await self._tcp_clock.ack(response_message.time)
+                await self._udp_clock.ack(clock)
 
-                if response_message.error is None:
-                    response_model = self.udp_client_response_models[handler_name]
-                    response_message.data = response_model(**response_message.data)
-                    
-                return response_message
+                return response_bytes
             
         except Exception as error:
             return Message(
@@ -794,7 +892,7 @@ class MercurySyncBaseServer:
                     node=(self._host, self._udp_port),
                 ),
                 time=self._udp_clock.time,
-                call=handler_name.decode(),
+                call=action,
                 protocol='udp',
                 sender=(self._host, self._udp_port),
                 recipient=address,
@@ -932,6 +1030,14 @@ class MercurySyncBaseServer:
         data: bytes,
         transport: asyncio.Transport,
     ):
+        self._pending_tcp_server_responses.append(
+            asyncio.ensure_future(
+                self.process_tcp_server_call(
+                    data,
+                    transport,
+                ),
+            ),
+        )
         decrypted = self._decompressor.decompress(
             self._encryptor.decrypt(
                data,
@@ -948,7 +1054,7 @@ class MercurySyncBaseServer:
     ):
         self._pending_tcp_server_responses.append(
             asyncio.ensure_future(
-                self.process_tcp_server_call(
+                self.process_tcp_server_request(
                     data,
                     transport,
                 ),
@@ -960,164 +1066,176 @@ class MercurySyncBaseServer:
         data: bytes,
         transport: asyncio.Transport,
     ):
-        decrypted = self._decompressor.decompress(
-            self._encryptor.decrypt(data),
-        )
+        try:
 
-        request_type, handler_name, addr, payload = decrypted.split(b'<|/|', maxsplit=3)
+            decrypted = self._encryptor.decrypt(data)
 
-        match request_type:
-            case b'c':
-                self._pending_udp_server_responses.append(
-                    asyncio.ensure_future(
-                        self.process_udp_call(
-                            handler_name,
-                            addr,
-                            payload,
-                            transport,
+            request_type, addr, handler_name, payload = decrypted.split(b'<', maxsplit=3)
+
+            match request_type:
+
+                case b'c':
+                    payload, clock = payload.split(b'<', maxsplit=1)
+
+
+                    self._pending_udp_server_responses.append(
+                        asyncio.ensure_future(
+                            self.process_udp_server_request(
+                                handler_name,
+                                addr,
+                                payload,
+                                int.from_bytes(clock),
+                                transport,
+                            ),
                         ),
-                    ),
-                )
+                    )
 
-            case b's':
-                self._udp_client_data[addr][handler_name].put_nowait(payload)
+                case b's':
 
+                    self._pending_udp_server_responses.append(
+                        asyncio.ensure_future(
+                            self.process_udp_client_response(
+                                handler_name,
+                                addr,
+                                payload,
+                            )
+                        )
+                    )
 
-    async def process_tcp_server_call(
+        except Exception:
+            pass
+
+    async def process_tcp_client_resopnse(
+        self,
+        
+    )
+
+    async def process_tcp_server_request(
         self,
         data: bytes,
         transport: asyncio.Transport,
     ):
-
+        
         try:
+
             decrypted = self._decompressor.decompress(
-            self._encryptor.decrypt(
+                self._encryptor.decrypt(
                     data,
                 )
             )
 
-            handler_name, _, payload = decrypted.split(b'<|/|', maxsplit=2)
+            handler_name, address_bytes, payload, clock = decrypted.split(b'<', maxsplit=3)
+            clock_time = int.from_bytes(clock)
 
-            request_message = Message.load_json(payload)
-            next_time = await self._tcp_clock.update(request_message.time)
+            next_time = await self._tcp_clock.update(clock_time)
+
+            host, port_str = address_bytes.decode().split(':', maxsplit=1)
+            addr = (host, int(port_str))
+            
+            if request_model := self.tcp_server_request_models.get(handler_name):
+                payload = request_model.load(payload)
 
             handler = self.tcp_handlers[handler_name]
-            request_model = self.tcp_server_request_models[handler_name]
 
-            response = await handler(request_model(**request_message.data))
-
-            response_message = Message(
-                data={
-                    key: value for key, value in msgspec.structs.asdict(response).items() if value is not None
-                },
-                time=next_time,
-                call=handler_name.decode(),
-                protocol='tcp',
-                sender=(self._host, self._tcp_port),
-                recipient=request_message.sender,
+            (
+                response_handler,
+                response,
+            ) = await handler(
+                addr,
+                payload,
+                clock_time,
             )
 
-            response_message_bytes = response_message.dump_json()
+            if isinstance(response, Message):
+                response = response.dump()
 
             response_payload = self._encryptor.encrypt(
-                self._compressor.compress(handler_name + b'<|/|' + self._tcp_addr_slug + b'<|/|' + response_message_bytes)
+                self._compressor.compress(
+                    self._tcp_addr_slug + b'<' + response_handler + b'<' + response + b'<' + next_time.to_bytes(64),
+                )
             )
 
             transport.write(response_payload)
 
         except Exception as error:
-            response_message = Message(
-                data={},
-                error=Error(
-                    message=str(error),
-                    traceback=traceback.format_exc(),
-                    node=(self._host, self._tcp_port),
-                ),
-                time=next_time,
-                call=handler_name.decode(),
-                protocol='tcp',
-                sender=(self._host, self._tcp_port),
-                recipient=request_message.sender,
-            )
-
-            response_message_bytes = response_message.dump_json()
 
             response_payload = self._encryptor.encrypt(
-                self._compressor.compress(b's' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + response_message_bytes)
+                self._compressor.compress(
+                    self._tcp_addr_slug + b'<' + response_handler + b'<' + str(error) + b'<' + next_time.to_bytes(64),
+                )
             )
 
             transport.write(response_payload)
 
-    async def process_udp_call(
+    async def process_udp_server_request(
         self,
         handler_name: bytes,
         addr: bytes,
         payload: bytes,
+        clock_time: int,
         transport: asyncio.DatagramTransport,
     ):
         
+        next_time = await self._udp_clock.update(clock_time)
+        
         try:
-            request_message = Message.load_json(payload)
-            next_time = await self._udp_clock.update(request_message.time)
+
+            host, port_str = addr.decode().split(':', maxsplit=1)
+            addr = (host, int(port_str))
+
+            if request_models := self.udp_server_request_models.get(handler_name):
+                    payload = request_models.load(payload)
 
             handler = self.udp_handlers[handler_name]
-
-            if request_message.wraps:
-                response = await handler(request_message)
-
-            else:
-                request_model = self.udp_server_request_models[handler_name]
-                response = await handler(request_model(**request_message.data))
-
-            response_message = Message(
-                data={
-                    key: value for key, value in msgspec.structs.asdict(response).items() if value is not None
-                },
-                time=next_time,
-                call=handler_name.decode(),
-                protocol='udp',
-                sender=(self._host, self._udp_port),
-                recipient=request_message.sender,
-                wraps=request_message.wraps,
+            response = await handler(
+                addr,
+                payload,
+                clock_time,
             )
 
-            response_message_bytes = response_message.dump_json()
+            if isinstance(response, Message):
+                response = response.dump()
 
             response_payload = self._encryptor.encrypt(
-                self._compressor.compress(b's' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + response_message_bytes)
+                b's<' + self._udp_addr_slug + b'<' + handler_name + b'<' + response + b'<' + next_time.to_bytes(64)
             )
 
-            host, port = addr.decode().split(':', maxsplit=1)
-
-            transport.sendto(response_payload, (host, int(port)))
+            transport.sendto(response_payload, addr)
 
         except Exception as error:
-            import traceback
-            print(traceback.format_exc())
-
-            response_message = Message(
-                data={},
-                error=Error(
-                    message=str(error),
-                    traceback=traceback.format_exc(),
-                    node=(self._host, self._udp_port),
-                ),
-                time=next_time,
-                call=handler_name.decode(),
-                protocol='udp',
-                sender=(self._host, self._udp_port),
-                recipient=request_message.sender,
-            )
-
-            response_message_bytes = response_message.dump_json()
+            pass
 
             response_payload = self._encryptor.encrypt(
-                self._compressor.compress(b's' + b'<|/|' + handler_name + b'<|/|' + self._udp_addr_slug + b'<|/|' + response_message_bytes)
+                b's<' + self._udp_addr_slug + b'<' + handler_name + b'<' + str(error) + b'<' + next_time.to_bytes(64)
             )
 
             host, port = addr.decode().split(':', maxsplit=1)
-
             transport.sendto(response_payload, (host, int(port)))
+
+    async def process_udp_client_response(
+        self,
+        handler_name: bytes,
+        addr: bytes,
+        payload: bytes,
+    ):
+        payload, clock = payload.split(b'<', maxsplit=1)
+        clock_time = int.from_bytes(clock)
+
+        await self._udp_clock.ack(clock_time)
+
+        if response_model := self.udp_client_response_models.get(handler_name):
+                payload = response_model.load(payload)
+
+        handler = self.udp_client_handlers.get(handler_name)
+        if handler:
+            payload = await handler(
+                addr,
+                payload,
+                clock_time,
+            )
+
+
+        self._udp_client_data[addr][handler_name].put_nowait((payload, clock_time))
 
     async def _cleanup_tcp_server_tasks(self):
         while self._running:
@@ -1164,6 +1282,8 @@ class MercurySyncBaseServer:
 
     async def shutdown(self) -> None:
         self._running = False
+
+        await self._task_runner.shutdown()
 
         for client in self._tcp_client_transports.values():
             client.abort()
@@ -1213,6 +1333,8 @@ class MercurySyncBaseServer:
 
     def abort(self) -> None:
         self._running = False
+
+        self._task_runner.abort()
 
         if self._tcp_server_cleanup_task:
             try:

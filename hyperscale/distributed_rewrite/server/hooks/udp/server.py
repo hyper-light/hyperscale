@@ -1,7 +1,16 @@
 import msgspec
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, TYPE_CHECKING, TypeVar
 
-class UDPServerCall:
+
+T = TypeVar("T")
+
+
+if TYPE_CHECKING:
+    from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
+
+
+
+class UDPReceiveCall:
 
     def __init__(
         self,
@@ -12,15 +21,37 @@ class UDPServerCall:
         self.__call__ = func
 
 
-def server():
-    def wraps(func):
-        
-        def wrapper(*args, **kwrags):
-            return UDPServerCall(func)
-        
-        wrapper.is_hook = True
-        wrapper.type = 'udp'
-        
-        return wrapper
+def receive(target: str, raw: bool = False):
+    encoded_target = target.encode()
+
+    if raw:
+
+        def wraps(func):
+            
+            async def wrapper(
+                server: MercurySyncBaseServer,
+                addr: tuple[str, int],
+                data: T,
+                clock_time: int,
+            ):
+                
+                res = await func(
+                    server,
+                    addr,
+                    data,
+                    clock_time,
+                )
+
+                return (
+                    encoded_target,
+                    res,
+                )
+            
+            
+            wrapper.is_hook = True
+            wrapper.type = 'udp'
+            wrapper.action = 'receive'
+            
+            return wrapper
 
     return wraps

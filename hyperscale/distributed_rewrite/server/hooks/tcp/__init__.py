@@ -1,4 +1,6 @@
-from .client import client as client
-from .client import TCPClientCall as TCPClientCall
-from .server import server as server
-from .server import TCPServerCall as TCPServerCall
+from .client import send as send
+from .client import TCPClientSendCall as TCPClientSendCall
+from .client import handle as handle
+from .client import TCPClientHandleCall as TCPClientHandleCall
+from .server import receive as receive
+from .server import TCPReceiveCall as TCPReceiveCall

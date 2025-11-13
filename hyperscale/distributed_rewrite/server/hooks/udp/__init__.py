@@ -1,4 +1,6 @@
-from .client import client as client
-from .client import UDPClientCall as UDPClientCall
-from .server import server as server
-from .server import UDPServerCall as UDPServerCall
+from .client import send as send
+from .client import UDPClientSendCall as UDPClientSendCall
+from .client import handle as handle
+from .client import UDPClientHandleCall as UDPClientHandleCall
+from .server import receive as receive
+from .server import UDPReceiveCall as UDPReceiveCall
