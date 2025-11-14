@@ -72,34 +72,30 @@ class TestServer(MercurySyncBaseServer[Ctx]):
             lambda timeout: max(min_timeout, timeout - 1),
         )
 
-    @udp.client()
+    @udp.send('receive')
     async def send(
         self,
         addr: tuple[str, int],
-        message: Message,
+        message: bytes,
         timeout: int | None = None,
-    ) -> Message:
-        res: Message = await self.send_bytes_udp(
+    ) -> bytes:
+        return (
             addr,
-            'receive',
             message,
-            timeout=timeout,
+            timeout,
         )
-
-        async with self._context.with_value(addr):
-            match res:
-                case b'ack':
-                    await self.decrease_failure_detector()
-
-                case b'leave':
-                    pass
-
-                case b'nack':
-                    pass
-
-            
     
-    @udp.server()
+    @udp.handle('receive')
+    async def process(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> Message:
+        return data
+
+    
+    @udp.receive()
     async def receive(
         self,
         addr: tuple[str, int],

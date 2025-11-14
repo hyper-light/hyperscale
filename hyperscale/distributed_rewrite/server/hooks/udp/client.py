@@ -1,99 +1,75 @@
-import msgspec
-from typing import Callable, Awaitable, TYPE_CHECKING, TypeVar
+from typing import TypeVar
+from .mock import UDPServer
 
 
 T = TypeVar("T")
 
 
-if TYPE_CHECKING:
-    from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
+def send(target: str):
 
-
-
-class UDPClientSendCall:
-
-    def __init__(
-        self,
-        func: Callable[[msgspec.Struct], Awaitable[msgspec.Struct]]
-    ):
-        self.call = func
-        self.name = func.__name__
-        self.__call__ = func
-
-
-class UDPClientHandleCall:
-
-    def __init__(
-        self,
-        func: Callable[[msgspec.Struct], Awaitable[msgspec.Struct]],
-    ):
-        self.call = func
-        self.name = func.__name__
-        self.type = func.type
-
-
-def send(target: str, raw: bool = False):
-    encoded_target = target.encode()
-
-    if raw:
-
-        def wraps(func):
+    def wraps(func):
+        
+        async def wrapper(
+            server: UDPServer,
+            addr: tuple[str, int],
+            data: T,
+            timeout: int | float | None = None
+        ):
             
-            async def wrapper(
-                server: MercurySyncBaseServer,
-                addr: tuple[str, int],
-                data: T,
-                timeout: int | float | None = None
-            ):
-                
-                res = await func(data)
+            (
+                addr,
+                data,
+                timeout,
+            ) = await func(
+                server,
+                addr,
+                data,
+                timeout=timeout,
+            )
 
-                return await server.send_bytes_udp(
-                    addr,
-                    encoded_target,
-                    res,
-                    timeout=timeout,
-                )
-            
-            wrapper.is_hook = True
-            wrapper.type = 'udp'
-            wrapper.action = 'send'
-            
-            return wrapper
+            return await server.send_udp(
+                addr,
+                target,
+                data,
+                timeout=timeout,
+            )
+    
+        
+        wrapper.is_hook = True
+        wrapper.type = 'udp'
+        wrapper.action = 'send'
+        wrapper.name = func.__name__
+        
+        return wrapper
 
     return wraps
 
 
-def handle(target: str, raw: bool = False):
+def handle(target: str):
     encoded_target = target.encode()
 
-    if raw:
-
-        def wraps(func):
+    def wraps(func):
+        
+        async def wrapper(
+            server: UDPServer,
+            addr: tuple[str, int],
+            data: T,
+            clock_time: int,
+        ):
             
-            async def wrapper(
-                server: MercurySyncBaseServer,
-                addr: tuple[str, int],
-                data: T,
-                clock_time: int,
-            ):
-                
-                res = await func(
-                    server,
-                    addr,
-                    data,
-                    clock_time,
-                )
-
-                return (
-                    encoded_target,
-                    res,
-                )
-            
-            wrapper.is_hook = True
-            wrapper.type = 'udp'
-            wrapper.action = 'handle'
-            
-            return wrapper
+            return await func(
+                server,
+                addr,
+                data,
+                clock_time,
+            )
+        
+        wrapper.is_hook = True
+        wrapper.type = 'udp'
+        wrapper.action = 'handle'
+        wrapper.name = func.__name__
+        wrapper.target = encoded_target
+        
+        return wrapper
 
     return wraps

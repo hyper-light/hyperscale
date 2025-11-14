@@ -76,44 +76,32 @@ class TestServer(MercurySyncBaseServer[Ctx]):
     async def send(
         self,
         addr: tuple[str, int],
-        message: Message,
+        message: bytes,
         timeout: int | None = None,
-    ) -> Message:
-        res: Message = await self.send_bytes_udp(
+    ) -> bytes:
+        return (
             addr,
-            'receive',
             message,
-            timeout=timeout,
+            timeout,
         )
-
-        async with self._context.with_value(addr):
-            match res:
-                case b'ack':
-                    await self.decrease_failure_detector()
-
-                case b'leave':
-                    pass
-
-                case b'nack':
-                    pass
-
-    @udp.handle()
-    async def receive(
+    
+    @udp.handle('receive')
+    async def handle(
         self,
         addr: tuple[str, int],
-        data: Message,
+        data: bytes,
         clock_time: int,
-    ) -> Message:
-        pass
+    ) -> bytes:
+        return data
 
     
-    @udp.receive('send')
+    @udp.receive()
     async def receive(
         self,
         addr: tuple[str, int],
         data: Message,
         clock_time: int,
-    ) -> Message:
+    ) -> bytes:
         try:
 
             parsed = data.split(b'>', maxsplit=1)
@@ -252,13 +240,13 @@ async def run():
         message,
     )
 
+    print(resp)
 
     loop = asyncio.get_event_loop()
     waiter = loop.create_future()
 
     await waiter
 
-    print(resp)
 
     print('Completed: ', idx)
 
