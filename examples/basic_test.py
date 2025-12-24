@@ -24,18 +24,6 @@ class Test(Workflow):
     @step()
     async def get_httpbin(
         self,
-        url: URL = 'https://hardware.hellohelium.com/',
-        headers: Headers = {
-            "cookie": "intercom-id-i4gsbx08=a56be7ce-00cf-4bb3-b7f4-bcb54c62aa06; intercom-session-i4gsbx08=; intercom-device-id-i4gsbx08=3ec99f5a-54c7-4663-a094-1f367f464822'",
-            "priority": "u=1, i",
-            "referer": "https://hardware.hellohelium.com/en/?q=gdskl",
-            "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "Linux",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        }
+        url: URL = 'https://www.thevirtualasylum.com/',
     ) -> HTTP2Response:
-        return await self.client.http2.get(url, headers=headers)
+        return await self.client.http2.get(url)
