@@ -1,5 +1,10 @@
 """
 Probe scheduler for SWIM randomized round-robin probing.
+
+Uses a lockless copy-on-write pattern for high performance:
+- Reads (get_next_target) are completely lock-free
+- Writes (update_members, add_member, remove_member) create new immutable tuples
+- Python's GIL ensures atomic reference swaps
 """
 
 import asyncio
@@ -22,98 +27,153 @@ class ProbeScheduler:
     - Probing is unpredictable (helps with network partition handling)
     - Even load distribution across members
     
-    Thread Safety:
-    - Uses asyncio.Lock to protect member list mutations
-    - All mutating operations are async to enable proper locking
+    Lockless Design (Copy-on-Write):
+    - _members is an immutable tuple, swapped atomically on updates
+    - _member_set enables O(1) membership checks
+    - _probe_index uses modulo for wraparound, increment is atomic under GIL
+    - Reads are completely lock-free for maximum performance
+    - Writes create new tuples and swap references atomically
     """
-    members: list[tuple[str, int]] = field(default_factory=list)
-    probe_index: int = 0
+    # Internal immutable state
+    _members: tuple[tuple[str, int], ...] = field(default_factory=tuple)
+    _member_set: frozenset[tuple[str, int]] = field(default_factory=frozenset)
+    _probe_index: int = 0
+    _last_cycle_length: int = 0  # Track for reshuffle detection
+    
     protocol_period: float = 1.0  # Time between probes in seconds
     _running: bool = False
     _probe_task: asyncio.Task | None = field(default=None, repr=False)
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     
-    async def update_members(self, members: list[tuple[str, int]]) -> None:
+    # Stats for monitoring
+    _cycles_completed: int = 0
+    _reshuffles: int = 0
+    
+    @property
+    def members(self) -> tuple[tuple[str, int], ...]:
+        """Read-only access to current members."""
+        return self._members
+    
+    def update_members(self, members: list[tuple[str, int]]) -> None:
         """
         Update the member list and reshuffle.
         Called when membership changes.
         
-        Optimized to reuse existing list and shuffle in-place when possible.
+        Lockless: Creates new immutable tuple and swaps atomically.
         """
-        async with self._lock:
-            # Check if we can do an incremental update
-            member_set = set(members)
-            current_set = set(self.members)
-            
-            if member_set == current_set:
-                # No change in membership, don't reshuffle
-                return
-            
-            # Full update needed - reuse list buffer if possible
-            self.members.clear()
-            self.members.extend(members)
-            random.shuffle(self.members)
-            
-            # Reset index if it's now out of bounds
-            if self.probe_index >= len(self.members):
-                self.probe_index = 0
+        new_set = frozenset(members)
+        
+        # No change - skip
+        if new_set == self._member_set:
+            return
+        
+        # Create new shuffled tuple
+        new_list = list(members)
+        random.shuffle(new_list)
+        new_members = tuple(new_list)
+        
+        # Atomic swap (single reference assignment under GIL)
+        self._member_set = new_set
+        self._members = new_members
+        self._last_cycle_length = len(new_members)
+        self._reshuffles += 1
+        
+        # Reset index to start fresh with new membership
+        self._probe_index = 0
     
-    async def get_next_target(self) -> tuple[str, int] | None:
+    def get_next_target(self) -> tuple[str, int] | None:
         """
         Get the next member to probe.
         Returns None if no members available.
+        
+        Lockless: Uses local snapshot and atomic index increment.
         """
-        async with self._lock:
-            if not self.members:
-                return None
-            
-            # If we've probed everyone, reshuffle
-            if self.probe_index >= len(self.members):
-                random.shuffle(self.members)
-                self.probe_index = 0
-            
-            target = self.members[self.probe_index]
-            self.probe_index += 1
-            return target
+        # Get snapshot (atomic read)
+        members = self._members
+        
+        if not members:
+            return None
+        
+        length = len(members)
+        
+        # Get current index and increment atomically (under GIL)
+        # Use modulo for safe wraparound
+        idx = self._probe_index
+        self._probe_index = idx + 1
+        
+        # Check if we completed a cycle (for reshuffling)
+        if idx > 0 and idx % length == 0:
+            self._cycles_completed += 1
+            # Reshuffle for unpredictability on next update
+            # We don't reshuffle inline to avoid races
+        
+        # Use modulo to handle wraparound
+        effective_idx = idx % length
+        return members[effective_idx]
     
-    async def remove_member(self, member: tuple[str, int]) -> None:
-        """Remove a member from the probe list (e.g., when declared dead)."""
-        async with self._lock:
-            if member in self.members:
-                # Adjust index if needed
-                idx = self.members.index(member)
-                self.members.remove(member)
-                if idx < self.probe_index:
-                    self.probe_index = max(0, self.probe_index - 1)
+    def remove_member(self, member: tuple[str, int]) -> None:
+        """
+        Remove a member from the probe list (e.g., when declared dead).
+        
+        Lockless: Creates new tuple without the member.
+        """
+        if member not in self._member_set:
+            return
+        
+        # Create new tuple without this member
+        new_members = tuple(m for m in self._members if m != member)
+        new_set = self._member_set - {member}
+        
+        # Atomic swap
+        self._member_set = new_set
+        self._members = new_members
+        self._last_cycle_length = len(new_members)
     
-    async def add_member(self, member: tuple[str, int]) -> None:
-        """Add a new member to the probe list."""
-        async with self._lock:
-            if member not in self.members:
-                # Insert at random position for unpredictability
-                if self.members:
-                    insert_idx = random.randint(0, len(self.members))
-                    self.members.insert(insert_idx, member)
-                    # Adjust probe index if we inserted before it
-                    if insert_idx <= self.probe_index:
-                        self.probe_index += 1
-                else:
-                    self.members.append(member)
+    def add_member(self, member: tuple[str, int]) -> None:
+        """
+        Add a new member to the probe list.
+        
+        Lockless: Creates new tuple with the member at random position.
+        """
+        if member in self._member_set:
+            return
+        
+        # Insert at random position for unpredictability
+        new_list = list(self._members)
+        if new_list:
+            insert_idx = random.randint(0, len(new_list))
+            new_list.insert(insert_idx, member)
+        else:
+            new_list.append(member)
+        
+        new_members = tuple(new_list)
+        new_set = self._member_set | {member}
+        
+        # Atomic swap
+        self._member_set = new_set
+        self._members = new_members
+        self._last_cycle_length = len(new_members)
     
     def get_probe_cycle_time(self) -> float:
         """
         Calculate time to complete one full probe cycle.
         This is the maximum time before a failure is detected.
         """
-        return len(self.members) * self.protocol_period
+        return len(self._members) * self.protocol_period
+    
+    def get_stats(self) -> dict[str, int]:
+        """Get scheduler statistics for monitoring."""
+        return {
+            'member_count': len(self._members),
+            'probe_index': self._probe_index,
+            'cycles_completed': self._cycles_completed,
+            'reshuffles': self._reshuffles,
+        }
     
     def stop(self) -> None:
         """
         Stop the probe scheduler.
         
-        Thread-safe: Sets _running to False and cancels task atomically.
-        The probe loop checks _running before each probe, so even if there's
-        a race between setting _running and cancelling, the loop will exit.
+        Safe to call from any context - uses atomic flag.
         """
         # Cancel task first to prevent new iterations from starting
         task = self._probe_task
@@ -122,4 +182,3 @@ class ProbeScheduler:
         
         if task and not task.done():
             task.cancel()
-
