@@ -1,6 +1,7 @@
 import asyncio
 import math
 import msgspec
+import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -10,7 +11,17 @@ from hyperscale.distributed_rewrite.env import Env
 from hyperscale.distributed_rewrite.server import tcp, udp, task
 from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
 
-Message = Literal[b'ack', b'nack', b'join', b'leave', b'probe']
+Message = Literal[
+    b'ack', 
+    b'nack', 
+    b'join', 
+    b'leave', 
+    b'probe',
+    b'ping-req',  # Indirect probe request (ask another node to probe target)
+    b'ping-req-ack',  # Response from indirect probe
+    b'suspect',  # Suspicion message
+    b'alive',  # Refutation/alive message
+]
 Status = Literal[b'JOIN', b'OK', b'SUSPECT', b'DEAD']
 
 Nodes = dict[tuple[str, int], asyncio.Queue[tuple[int, Status]]]
@@ -477,6 +488,121 @@ class SuspicionManager:
         return [s for s in self.suspicions.values() if s.should_regossip()]
 
 
+@dataclass
+class PendingIndirectProbe:
+    """
+    Tracks a pending indirect probe request.
+    
+    When a direct probe to a target fails, we ask k other nodes to 
+    probe the target on our behalf. This tracks those pending requests.
+    """
+    target: tuple[str, int]
+    requester: tuple[str, int]
+    start_time: float
+    timeout: float
+    proxies: set[tuple[str, int]] = field(default_factory=set)
+    received_acks: int = 0
+    _completed: bool = False
+    
+    def add_proxy(self, proxy: tuple[str, int]) -> None:
+        """Add a proxy node that we asked to probe the target."""
+        self.proxies.add(proxy)
+    
+    def record_ack(self) -> bool:
+        """
+        Record that we received an ack from one of the proxies.
+        Returns True if this is the first ack (target is alive).
+        """
+        if self._completed:
+            return False
+        self.received_acks += 1
+        if self.received_acks == 1:
+            self._completed = True
+            return True
+        return False
+    
+    def is_expired(self) -> bool:
+        """Check if the probe request has timed out."""
+        return time.monotonic() - self.start_time > self.timeout
+    
+    def is_completed(self) -> bool:
+        """Check if we've received an ack (probe succeeded)."""
+        return self._completed
+
+
+@dataclass
+class IndirectProbeManager:
+    """
+    Manages indirect probe requests for SWIM protocol.
+    
+    When a direct probe to node B fails, node A asks k random other
+    nodes to probe B on A's behalf. If any proxy gets a response from B,
+    it forwards the ack back to A.
+    
+    This helps distinguish between:
+    - B being actually failed
+    - Network issues between A and B specifically
+    """
+    pending_probes: dict[tuple[str, int], PendingIndirectProbe] = field(default_factory=dict)
+    # Number of proxy nodes to use for indirect probing
+    k_proxies: int = 3
+    
+    def start_indirect_probe(
+        self,
+        target: tuple[str, int],
+        requester: tuple[str, int],
+        timeout: float,
+    ) -> PendingIndirectProbe:
+        """Start tracking an indirect probe request."""
+        probe = PendingIndirectProbe(
+            target=target,
+            requester=requester,
+            start_time=time.monotonic(),
+            timeout=timeout,
+        )
+        self.pending_probes[target] = probe
+        return probe
+    
+    def get_pending_probe(self, target: tuple[str, int]) -> PendingIndirectProbe | None:
+        """Get the pending probe for a target, if any."""
+        return self.pending_probes.get(target)
+    
+    def record_ack(self, target: tuple[str, int]) -> bool:
+        """
+        Record that the target responded to an indirect probe.
+        Returns True if the probe was pending and this is the first ack.
+        """
+        probe = self.pending_probes.get(target)
+        if probe and probe.record_ack():
+            del self.pending_probes[target]
+            return True
+        return False
+    
+    def cancel_probe(self, target: tuple[str, int]) -> bool:
+        """Cancel a pending probe (e.g., target confirmed dead)."""
+        if target in self.pending_probes:
+            del self.pending_probes[target]
+            return True
+        return False
+    
+    def get_expired_probes(self) -> list[PendingIndirectProbe]:
+        """Get all probes that have timed out without an ack."""
+        expired = []
+        now = time.monotonic()
+        to_remove = []
+        for target, probe in self.pending_probes.items():
+            if probe.is_expired():
+                expired.append(probe)
+                to_remove.append(target)
+        for target in to_remove:
+            del self.pending_probes[target]
+        return expired
+    
+    def clear_all(self) -> None:
+        """Clear all pending probes."""
+        self.pending_probes.clear()
+
+
 class TestServer(MercurySyncBaseServer[Ctx]):
 
     def __init__(self, *args, **kwargs):
@@ -484,6 +610,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         self._local_health = LocalHealthMultiplier()
         self._incarnation_tracker = IncarnationTracker()
         self._suspicion_manager = SuspicionManager()
+        self._indirect_probe_manager = IndirectProbeManager()
         
         # Set up suspicion manager callbacks
         self._suspicion_manager.set_callbacks(
@@ -711,6 +838,157 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         """Get the remaining timeout for a suspicion, if any."""
         state = self._suspicion_manager.get_suspicion(node)
         return state.time_remaining() if state else None
+    
+    def get_random_proxy_nodes(
+        self, 
+        target: tuple[str, int], 
+        k: int = 3,
+    ) -> list[tuple[str, int]]:
+        """
+        Get k random nodes to use as proxies for indirect probing.
+        Excludes self and the target node.
+        """
+        nodes: Nodes = self._context.read('nodes')
+        self_addr = self._get_self_udp_addr()
+        
+        # Get all OK nodes except self and target
+        candidates = [
+            node for node, queue in nodes.items()
+            if node != target and node != self_addr
+        ]
+        
+        # Return up to k random candidates
+        k = min(k, len(candidates))
+        if k <= 0:
+            return []
+        return random.sample(candidates, k)
+    
+    def _get_self_udp_addr(self) -> tuple[str, int]:
+        """Get this server's UDP address as a tuple."""
+        # Parse from _udp_addr_slug which is formatted as "host:port"
+        host, port = self._udp_addr_slug.decode().split(':')
+        return (host, int(port))
+    
+    async def initiate_indirect_probe(
+        self,
+        target: tuple[str, int],
+        incarnation: int,
+    ) -> bool:
+        """
+        Initiate indirect probing for a target node.
+        
+        Called when a direct probe times out. Asks k random nodes
+        to probe the target on our behalf.
+        
+        Returns True if we sent at least one indirect probe request.
+        """
+        k = self._indirect_probe_manager.k_proxies
+        proxies = self.get_random_proxy_nodes(target, k)
+        
+        if not proxies:
+            # No proxies available, go straight to suspicion
+            return False
+        
+        base_timeout = self._context.read('current_timeout')
+        timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        
+        # Start tracking the indirect probe
+        probe = self._indirect_probe_manager.start_indirect_probe(
+            target=target,
+            requester=self._get_self_udp_addr(),
+            timeout=timeout,
+        )
+        
+        # Send ping-req to each proxy
+        # Format: ping-req:incarnation>target_host:target_port
+        target_addr = f'{target[0]}:{target[1]}'.encode()
+        msg = b'ping-req:' + str(incarnation).encode() + b'>' + target_addr
+        
+        for proxy in proxies:
+            probe.add_proxy(proxy)
+            self._tasks.run(
+                self.send,
+                proxy,
+                msg,
+                timeout=timeout,
+            )
+        
+        return True
+    
+    async def handle_indirect_probe_response(
+        self,
+        target: tuple[str, int],
+        is_alive: bool,
+    ) -> None:
+        """
+        Handle response from an indirect probe.
+        
+        Called when we receive a ping-req-ack indicating whether
+        the target responded to the proxy's probe.
+        """
+        if is_alive:
+            # Target is alive - cancel any pending suspicion
+            if self._indirect_probe_manager.record_ack(target):
+                await self.decrease_failure_detector('successful_probe')
+        # If not alive, we wait for the probe to expire
+    
+    async def _send_probe_and_wait(self, target: tuple[str, int]) -> bool:
+        """
+        Send a probe to target and wait for response.
+        Returns True if target responds with ack, False otherwise.
+        
+        This is a simplified probe used for indirect probing where
+        we need to synchronously wait for a response.
+        """
+        base_timeout = self._context.read('current_timeout')
+        timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        
+        target_addr = f'{target[0]}:{target[1]}'.encode()
+        msg = b'probe>' + target_addr
+        
+        try:
+            # This sends and expects a response - the exact mechanism 
+            # depends on the underlying UDP implementation
+            response = await asyncio.wait_for(
+                self._send_and_receive(target, msg),
+                timeout=timeout,
+            )
+            # Check if response indicates success
+            return response and b'ack' in response
+        except (asyncio.TimeoutError, Exception):
+            return False
+    
+    async def _send_and_receive(
+        self, 
+        target: tuple[str, int], 
+        message: bytes,
+    ) -> bytes | None:
+        """
+        Send a message and wait for a response.
+        Returns the response bytes or None if failed.
+        """
+        # Create a future to wait for the response
+        response_future: asyncio.Future[bytes] = asyncio.get_event_loop().create_future()
+        
+        # Store the pending request (implementation depends on framework)
+        # For now, we use the send mechanism and hope for a response
+        self._tasks.run(
+            self.send,
+            target,
+            message,
+            timeout=None,
+        )
+        
+        # In a real implementation, we'd track pending requests and 
+        # resolve the future when a response arrives.
+        # For this simplified version, we return None and let the caller
+        # handle it via timeout.
+        try:
+            # Give a short window for response
+            await asyncio.sleep(0.1)
+            return None
+        except Exception:
+            return None
 
     @udp.send('receive')
     async def send(
@@ -853,6 +1131,62 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                         ])
                             
                         return b'ack'
+                
+                case b'ping-req':
+                    # Indirect probe request: another node is asking us to probe target
+                    # Message format: ping-req:incarnation>target_host:target_port
+                    async with self._context.with_value(target):
+                        nodes: Nodes = self._context.read('nodes')
+                        
+                        if target is None:
+                            return b'nack>' + self._udp_addr_slug
+                        
+                        if self.udp_target_is_self(target):
+                            # We are the target - respond with ack
+                            return b'ping-req-ack:alive>' + self._udp_addr_slug
+                        
+                        if target not in nodes:
+                            # Unknown target
+                            return b'ping-req-ack:unknown>' + self._udp_addr_slug
+                        
+                        base_timeout = self._context.read('current_timeout')
+                        timeout = self.get_lhm_adjusted_timeout(base_timeout)
+                        
+                        # Send probe to target and wait for response
+                        # We need to probe the target and forward result back to requester
+                        try:
+                            # Probe the target directly
+                            result = await asyncio.wait_for(
+                                self._send_probe_and_wait(target),
+                                timeout=timeout,
+                            )
+                            if result:
+                                # Target responded - send ack back to requester
+                                return b'ping-req-ack:alive>' + target_addr
+                            else:
+                                # Target did not respond
+                                return b'ping-req-ack:dead>' + target_addr
+                        except asyncio.TimeoutError:
+                            # Probe timed out
+                            return b'ping-req-ack:timeout>' + target_addr
+                
+                case b'ping-req-ack':
+                    # Response from an indirect probe we requested
+                    # Message format: ping-req-ack:status>target_host:target_port
+                    # Parse the status from message part
+                    msg_parts = message.split(b':', maxsplit=1)
+                    if len(msg_parts) > 1:
+                        status_str = msg_parts[1]
+                        if status_str == b'alive' and target:
+                            # Target is alive - record this
+                            await self.handle_indirect_probe_response(target, is_alive=True)
+                            await self.decrease_failure_detector('successful_probe')
+                            return b'ack>' + self._udp_addr_slug
+                        elif status_str in (b'dead', b'timeout', b'unknown') and target:
+                            # Target did not respond to this proxy
+                            # Don't immediately fail - wait for other proxies or timeout
+                            await self.handle_indirect_probe_response(target, is_alive=False)
+                    return b'ack>' + self._udp_addr_slug
                     
                 case _:
                     return b'nack'
