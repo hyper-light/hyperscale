@@ -26,8 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from collections import defaultdict
 from hyperscale.distributed_rewrite.env import Env
 
-# Import the SWIM server implementation
-from server_test import TestServer
+# Import the SWIM server implementation from the swim package
+from swim import TestServer
 
 
 async def run_server_2():
@@ -49,6 +49,7 @@ async def run_server_2():
             MERCURY_SYNC_REQUEST_TIMEOUT='2s',
         ),
         dc_id='DC-EAST',
+        priority=2,  # Medium priority for leadership
     )
 
     await server.start_server(init_context={
@@ -63,6 +64,8 @@ async def run_server_2():
     })
     
     print("\n[Server 2] Started successfully!")
+    print(f"[Server 2] Node ID: {server.node_id}")
+    print(f"[Server 2] Short ID: {server.node_id.short}")
     print(f"[Server 2] Local Health Multiplier: {server._local_health.get_multiplier():.2f}")
     print(f"[Server 2] Incarnation: {server.get_self_incarnation()}")
     
@@ -112,8 +115,9 @@ async def run_server_2():
             
             # Display current status
             print("\n" + "-" * 50)
-            print(f"[Server 2] Status Update")
+            print(f"[{server.node_id.short}] Status Update")
             print("-" * 50)
+            print(f"  Node ID: {server.node_id}")
             
             # SWIM status
             print(f"  LHM Score: {server._local_health.score}/{server._local_health.max_score}")
