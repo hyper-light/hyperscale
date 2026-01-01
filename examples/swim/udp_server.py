@@ -37,6 +37,7 @@ from .core.errors import (
     NotEligibleError,
 )
 from .core.error_handler import ErrorHandler, ErrorContext
+from .core.resource_limits import BoundedDict
 from .core.retry import (
     retry_with_backoff,
     retry_with_result,
@@ -102,6 +103,14 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         self._gossip_buffer = GossipBuffer()
         self._probe_scheduler = ProbeScheduler()
         self._leader_election = LocalLeaderElection(dc_id=dc_id)
+        
+        # Message deduplication - track recently seen messages to prevent duplicates
+        self._seen_messages: BoundedDict[int, float] = BoundedDict(
+            max_size=10000,
+            eviction_policy='LRA',  # Least Recently Added - old messages first
+        )
+        self._dedup_window: float = 30.0  # Seconds to consider a message as duplicate
+        self._dedup_stats = {'duplicates': 0, 'unique': 0}
         
         # Initialize error handler (logger set up after server starts)
         self._error_handler: ErrorHandler | None = None
@@ -1164,6 +1173,47 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             target=target,
         )
     
+    def _is_duplicate_message(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+    ) -> bool:
+        """
+        Check if a message is a duplicate using content hash.
+        
+        Messages are considered duplicates if:
+        1. Same hash seen within dedup window
+        2. Hash is in seen_messages dict
+        
+        Returns True if duplicate (should skip), False if new.
+        """
+        # Create hash from source + message content
+        msg_hash = hash((addr, data))
+        now = time.monotonic()
+        
+        if msg_hash in self._seen_messages:
+            seen_time = self._seen_messages[msg_hash]
+            if now - seen_time < self._dedup_window:
+                self._dedup_stats['duplicates'] += 1
+                return True
+            # Seen but outside window - update timestamp
+            self._seen_messages[msg_hash] = now
+        else:
+            # New message - track it
+            self._seen_messages[msg_hash] = now
+        
+        self._dedup_stats['unique'] += 1
+        return False
+    
+    def get_dedup_stats(self) -> dict:
+        """Get message deduplication statistics."""
+        return {
+            'duplicates': self._dedup_stats['duplicates'],
+            'unique': self._dedup_stats['unique'],
+            'cache_size': len(self._seen_messages),
+            'window_seconds': self._dedup_window,
+        }
+    
     def update_node_state(
         self,
         node: tuple[str, int],
@@ -1605,6 +1655,11 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         clock_time: int,
     ) -> Message:
         try:
+            # Check for duplicate messages first
+            if self._is_duplicate_message(addr, data):
+                # Duplicate - still send ack but don't process
+                return b'ack>' + self._udp_addr_slug
+            
             # Extract any piggybacked membership updates first
             piggyback_idx = data.find(b'|')
             if piggyback_idx > 0:
