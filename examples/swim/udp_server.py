@@ -874,7 +874,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         target: tuple[str, int],
         incarnation: int,
     ) -> bool:
-        """Initiate indirect probing for a target node."""
+        """
+        Initiate indirect probing for a target node with retry support.
+        
+        If a proxy send fails, we try another proxy. Tracks which proxies
+        were successfully contacted.
+        """
         k = self._indirect_probe_manager.k_proxies
         proxies = self.get_random_proxy_nodes(target, k)
         
@@ -893,16 +898,65 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         target_addr = f'{target[0]}:{target[1]}'.encode()
         msg = b'ping-req:' + str(incarnation).encode() + b'>' + target_addr
         
+        successful_sends = 0
+        failed_proxies: list[tuple[str, int]] = []
+        
         for proxy in proxies:
             probe.add_proxy(proxy)
-            self._task_runner.run(
-                self.send,
-                proxy,
-                msg,
-                timeout=timeout,
+            success = await self._send_indirect_probe_to_proxy(proxy, msg, timeout)
+            if success:
+                successful_sends += 1
+            else:
+                failed_proxies.append(proxy)
+        
+        # If some proxies failed, try to get replacement proxies
+        if failed_proxies and successful_sends < k:
+            # Get additional proxies excluding those we already tried
+            all_tried = set(proxies)
+            additional = self.get_random_proxy_nodes(target, k - successful_sends)
+            
+            for proxy in additional:
+                if proxy not in all_tried:
+                    success = await self._send_indirect_probe_to_proxy(proxy, msg, timeout)
+                    if success:
+                        probe.add_proxy(proxy)
+                        successful_sends += 1
+        
+        if successful_sends == 0:
+            await self.handle_error(
+                IndirectProbeTimeoutError(target, proxies, timeout)
             )
+            return False
         
         return True
+    
+    async def _send_indirect_probe_to_proxy(
+        self,
+        proxy: tuple[str, int],
+        msg: bytes,
+        timeout: float,
+    ) -> bool:
+        """
+        Send an indirect probe request to a single proxy.
+        
+        Returns True if send succeeded, False otherwise.
+        """
+        try:
+            await self.send(proxy, msg, timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        except OSError as e:
+            await self.handle_error(
+                NetworkError(
+                    f"Indirect probe to proxy {proxy[0]}:{proxy[1]} failed: {e}",
+                    target=proxy,
+                )
+            )
+            return False
+        except Exception as e:
+            await self.handle_exception(e, f"indirect_probe_proxy_{proxy[0]}_{proxy[1]}")
+            return False
     
     async def handle_indirect_probe_response(
         self,
