@@ -311,6 +311,15 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Check if we need to step down from leadership
         if policy.should_step_down and self._leader_election.state.is_leader():
+            # Log NotEligibleError - we're being forced to step down
+            self._task_runner.run(
+                self.handle_error,
+                NotEligibleError(
+                    reason="Stepping down due to degradation policy",
+                    lhm_score=self._local_health.score,
+                    max_lhm=self._leader_election.eligibility.max_leader_lhm,
+                ),
+            )
             self._task_runner.run(self._leader_election._step_down)
     
     def get_degradation_stats(self) -> dict:

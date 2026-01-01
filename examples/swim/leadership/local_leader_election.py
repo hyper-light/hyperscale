@@ -485,6 +485,16 @@ class LocalLeaderElection:
         if not self.self_addr:
             return None
         
+        # Check if candidate's LHM makes them ineligible
+        if candidate_lhm > self.eligibility.max_leader_lhm:
+            self._handle_error_sync(
+                NotEligibleError(
+                    reason=f"Pre-vote denied: candidate {candidate} LHM {candidate_lhm} too high",
+                    lhm_score=candidate_lhm,
+                    max_lhm=self.eligibility.max_leader_lhm,
+                )
+            )
+        
         # Check if we would grant this pre-vote
         can_grant = self.state.can_grant_pre_vote(
             candidate=candidate,
