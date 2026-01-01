@@ -234,6 +234,14 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         # More aggressive LHM increment
         await self.increase_failure_detector('event_loop_critical')
         await self.increase_failure_detector('event_loop_critical')
+        
+        # Log TaskOverloadError for monitoring
+        await self.handle_error(
+            TaskOverloadError(
+                task_count=len(self._task_runner.tasks),
+                max_tasks=100,  # Nominal limit
+            )
+        )
     
     async def _on_event_loop_recovered(self) -> None:
         """Called when event loop recovers from degraded state."""
@@ -273,6 +281,16 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Handle degradation level changes."""
         direction = "increased" if new_level.value > old_level.value else "decreased"
         policy = self._degradation.get_current_policy()
+        
+        # Log TaskOverloadError for severe/critical degradation
+        if new_level.value >= DegradationLevel.SEVERE.value and new_level.value > old_level.value:
+            self._task_runner.run(
+                self.handle_error,
+                TaskOverloadError(
+                    task_count=len(self._task_runner.tasks),
+                    max_tasks=100,
+                ),
+            )
         
         # Log the change
         if hasattr(self, '_udp_logger'):

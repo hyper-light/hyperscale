@@ -10,7 +10,7 @@ from typing import Callable, Awaitable
 from .leader_state import LeaderState
 from .leader_eligibility import LeaderEligibility
 from .flapping_detector import FlappingDetector
-from ..core.errors import ElectionError, ElectionTimeoutError, SplitBrainError, UnexpectedError
+from ..core.errors import ElectionError, ElectionTimeoutError, SplitBrainError, UnexpectedError, NotEligibleError
 
 
 @dataclass
@@ -178,7 +178,15 @@ class LocalLeaderElection:
                     if self.is_self_eligible():
                         await self._run_election()
                     else:
-                        # Not eligible, wait for someone else
+                        # Not eligible, log and wait for someone else
+                        lhm = self._get_lhm_score() if self._get_lhm_score else 0
+                        await self._handle_error(
+                            NotEligibleError(
+                                reason="LHM too high or degradation active",
+                                lhm_score=lhm,
+                                max_lhm=self.eligibility.max_leader_lhm,
+                            )
+                        )
                         await asyncio.sleep(self.get_election_timeout())
                 
                 else:
@@ -209,6 +217,22 @@ class LocalLeaderElection:
                     file=sys.stderr,
                 )
         # Error is logged by the handler, no need to print here
+    
+    def _handle_error_sync(self, error: ElectionError) -> None:
+        """
+        Handle an election error synchronously by scheduling async handler.
+        
+        Used by sync methods like handle_claim that need to report errors.
+        """
+        if self._on_error:
+            try:
+                # Get the running loop and schedule the error handling
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._handle_error(error))
+            except RuntimeError:
+                # No running loop - fall back to stderr
+                import sys
+                print(f"[LocalLeaderElection] Error (no loop): {error}", file=sys.stderr)
     
     async def _run_pre_vote(self) -> bool:
         """
@@ -386,6 +410,13 @@ class LocalLeaderElection:
         
         # Check if candidate is eligible (based on their LHM)
         if not self.eligibility.is_eligible(candidate_lhm, b'OK', False):
+            self._handle_error_sync(
+                NotEligibleError(
+                    reason=f"Candidate {candidate} has LHM {candidate_lhm} above threshold",
+                    lhm_score=candidate_lhm,
+                    max_lhm=self.eligibility.max_leader_lhm,
+                )
+            )
             return None
         
         # Check if we can vote for them
