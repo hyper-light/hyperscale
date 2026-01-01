@@ -99,6 +99,13 @@ from .flapping_detector import (
     LeadershipChange,
 )
 
+from .graceful_degradation import (
+    GracefulDegradation,
+    DegradationLevel,
+    DegradationPolicy,
+    DEGRADATION_POLICIES,
+)
+
 from .local_health_multiplier import LocalHealthMultiplier
 from .node_state import NodeState
 from .incarnation_tracker import IncarnationTracker
@@ -177,6 +184,11 @@ __all__ = [
     # Flapping Detection
     'FlappingDetector',
     'LeadershipChange',
+    # Graceful Degradation
+    'GracefulDegradation',
+    'DegradationLevel',
+    'DegradationPolicy',
+    'DEGRADATION_POLICIES',
     # Components
     'LocalHealthMultiplier',
     'NodeState',

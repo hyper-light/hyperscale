@@ -36,6 +36,7 @@ from .errors import (
 from .error_handler import ErrorHandler, ErrorContext
 from .retry import retry_with_backoff, PROBE_RETRY_POLICY
 from .health_monitor import EventLoopHealthMonitor
+from .graceful_degradation import GracefulDegradation, DegradationLevel
 
 
 class TestServer(MercurySyncBaseServer[Ctx]):
@@ -82,6 +83,9 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         
         # Event loop health monitor (proactive CPU saturation detection)
         self._health_monitor = EventLoopHealthMonitor()
+        
+        # Graceful degradation (load shedding under pressure)
+        self._degradation = GracefulDegradation()
         
         # Cleanup configuration
         self._cleanup_interval: float = 30.0  # Seconds between cleanup runs
@@ -169,6 +173,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
     async def start_health_monitor(self) -> None:
         """Start the event loop health monitor."""
         self._setup_health_monitor()
+        self._setup_graceful_degradation()
         await self._health_monitor.start()
     
     async def stop_health_monitor(self) -> None:
@@ -182,6 +187,60 @@ class TestServer(MercurySyncBaseServer[Ctx]):
     def is_event_loop_degraded(self) -> bool:
         """Check if event loop is in degraded state."""
         return self._health_monitor.is_degraded
+    
+    def _setup_graceful_degradation(self) -> None:
+        """Set up graceful degradation with health callbacks."""
+        self._degradation.set_health_callbacks(
+            get_lhm=lambda: self._local_health.score,
+            get_event_loop_lag=lambda: self._health_monitor.average_lag_ratio,
+            on_level_change=self._on_degradation_level_change,
+        )
+    
+    def _on_degradation_level_change(
+        self,
+        old_level: DegradationLevel,
+        new_level: DegradationLevel,
+    ) -> None:
+        """Handle degradation level changes."""
+        direction = "increased" if new_level.value > old_level.value else "decreased"
+        policy = self._degradation.get_current_policy()
+        
+        # Log the change
+        if hasattr(self, '_udp_logger'):
+            try:
+                from hyperscale.distributed.types import ServerInfo
+                self._udp_logger.log(
+                    ServerInfo(
+                        f"Degradation {direction}: {old_level.name} -> {new_level.name} ({policy.description})"
+                    )
+                )
+            except Exception:
+                pass
+        
+        # Check if we need to step down from leadership
+        if policy.should_step_down and self._leader_election.state.is_leader():
+            asyncio.create_task(self._leader_election._step_down())
+    
+    def get_degradation_stats(self) -> dict:
+        """Get graceful degradation statistics."""
+        return self._degradation.get_stats()
+    
+    def update_degradation(self) -> DegradationLevel:
+        """Update and get current degradation level."""
+        return self._degradation.update()
+    
+    def should_skip_probe(self) -> bool:
+        """Check if probe should be skipped due to degradation."""
+        self._degradation.update()
+        return self._degradation.should_skip_probe()
+    
+    def should_skip_gossip(self) -> bool:
+        """Check if gossip should be skipped due to degradation."""
+        return self._degradation.should_skip_gossip()
+    
+    def get_degraded_timeout_multiplier(self) -> float:
+        """Get timeout multiplier based on degradation level."""
+        return self._degradation.get_timeout_multiplier()
     
     # === Message Size Helpers ===
     
@@ -282,6 +341,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
             get_lhm_score=lambda: self._local_health.score,
             self_addr=self._get_self_udp_addr(),
             on_error=self._handle_election_error,
+            should_refuse_leadership=lambda: self._degradation.should_refuse_leadership(),
         )
     
     async def _handle_election_error(self, error) -> None:
@@ -624,8 +684,10 @@ class TestServer(MercurySyncBaseServer[Ctx]):
             self._local_health.decrement()
     
     def get_lhm_adjusted_timeout(self, base_timeout: float) -> float:
-        """Get timeout adjusted by Local Health Multiplier."""
-        return base_timeout * self._local_health.get_multiplier()
+        """Get timeout adjusted by Local Health Multiplier and degradation level."""
+        lhm_multiplier = self._local_health.get_multiplier()
+        degradation_multiplier = self._degradation.get_timeout_multiplier()
+        return base_timeout * lhm_multiplier * degradation_multiplier
     
     def get_self_incarnation(self) -> int:
         """Get this node's current incarnation number."""

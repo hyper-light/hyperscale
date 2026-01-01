@@ -57,6 +57,7 @@ class LocalLeaderElection:
     _get_member_count: Callable[[], int] | None = None
     _get_lhm_score: Callable[[], int] | None = None
     _send_to_node: Callable[[tuple[str, int], bytes], None] | None = None
+    _should_refuse_leadership: Callable[[], bool] | None = None  # Graceful degradation check
     
     # Error handler callback (set by owner)
     _on_error: Callable[[ElectionError], Awaitable[None]] | None = None
@@ -74,6 +75,7 @@ class LocalLeaderElection:
         self_addr: tuple[str, int],
         send_to_node: Callable[[tuple[str, int], bytes], None] | None = None,
         on_error: Callable[[ElectionError], Awaitable[None]] | None = None,
+        should_refuse_leadership: Callable[[], bool] | None = None,
     ) -> None:
         """Set callback functions for election operations."""
         self._broadcast_message = broadcast_message
@@ -82,6 +84,7 @@ class LocalLeaderElection:
         self.self_addr = self_addr
         self._on_error = on_error
         self._send_to_node = send_to_node
+        self._should_refuse_leadership = should_refuse_leadership
     
     def get_election_timeout(self) -> float:
         """Get randomized election timeout, adjusted for flapping."""
@@ -110,6 +113,10 @@ class LocalLeaderElection:
     
     def is_self_eligible(self) -> bool:
         """Check if this node is eligible to become leader."""
+        # Check graceful degradation first
+        if self._should_refuse_leadership and self._should_refuse_leadership():
+            return False
+        
         if not self._get_lhm_score:
             return True
         lhm = self._get_lhm_score()
