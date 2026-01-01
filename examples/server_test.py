@@ -342,21 +342,31 @@ class SuspicionManager:
     - Calculates dynamic timeouts based on confirmations
     - Handles suspicion expiration and node death declaration
     - Supports refutation (clearing suspicion on higher incarnation)
+    - Applies Local Health Multiplier to timeouts (Lifeguard)
     """
     suspicions: dict[tuple[str, int], SuspicionState] = field(default_factory=dict)
     min_timeout: float = 1.0
     max_timeout: float = 10.0
     _on_suspicion_expired: Callable[[tuple[str, int], int], None] | None = None
     _n_members_getter: Callable[[], int] | None = None
+    _lhm_multiplier_getter: Callable[[], float] | None = None
     
     def set_callbacks(
         self,
         on_expired: Callable[[tuple[str, int], int], None],
         get_n_members: Callable[[], int],
+        get_lhm_multiplier: Callable[[], float] | None = None,
     ) -> None:
         """Set callback functions for suspicion events."""
         self._on_suspicion_expired = on_expired
         self._n_members_getter = get_n_members
+        self._lhm_multiplier_getter = get_lhm_multiplier
+    
+    def _get_lhm_multiplier(self) -> float:
+        """Get the current LHM multiplier for timeout adjustment."""
+        if self._lhm_multiplier_getter:
+            return self._lhm_multiplier_getter()
+        return 1.0
     
     def _get_n_members(self) -> int:
         """Get current member count."""
@@ -375,6 +385,8 @@ class SuspicionManager:
         
         If suspicion already exists with same incarnation, add confirmation.
         If new suspicion or higher incarnation, create new suspicion state.
+        
+        Timeouts are adjusted by the Local Health Multiplier per Lifeguard.
         """
         existing = self.suspicions.get(node)
         
@@ -392,13 +404,17 @@ class SuspicionManager:
                 # Higher incarnation suspicion, replace
                 existing.cancel_timer()
         
-        # Create new suspicion
+        # Apply LHM to timeouts - when we're unhealthy, extend timeouts
+        # to reduce false positives caused by our own slow processing
+        lhm_multiplier = self._get_lhm_multiplier()
+        
+        # Create new suspicion with LHM-adjusted timeouts
         state = SuspicionState(
             node=node,
             incarnation=incarnation,
             start_time=time.monotonic(),
-            min_timeout=self.min_timeout,
-            max_timeout=self.max_timeout,
+            min_timeout=self.min_timeout * lhm_multiplier,
+            max_timeout=self.max_timeout * lhm_multiplier,
             n_members=self._get_n_members(),
         )
         state.add_confirmation(from_node)
@@ -808,7 +824,12 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         self._suspicion_manager.set_callbacks(
             on_expired=self._on_suspicion_expired,
             get_n_members=self._get_member_count,
+            get_lhm_multiplier=self._get_lhm_multiplier,
         )
+    
+    def _get_lhm_multiplier(self) -> float:
+        """Get the current LHM timeout multiplier."""
+        return self._local_health.get_multiplier()
     
     def _get_member_count(self) -> int:
         """Get the current number of known members."""
