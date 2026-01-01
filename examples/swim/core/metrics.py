@@ -5,7 +5,6 @@ Provides counters and gauges for monitoring key events.
 """
 
 import time
-import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,9 +21,11 @@ class Metrics:
     - Gauges: Current state values (active members, suspicions, etc.)
     - Timing: Track operation durations
     
-    Thread-safe for concurrent updates using threading.Lock.
-    This protects the read-modify-write pattern in increment() and
-    compound operations in reset().
+    Lockless Design:
+    - Metrics are best-effort counters, not critical data
+    - Python's GIL makes individual operations atomic
+    - In async code, no await points exist between read and write
+    - Rare race conditions may lose an increment, which is acceptable for metrics
     """
     
     # Probe metrics
@@ -77,9 +78,6 @@ class Metrics:
     # Start time for uptime calculation
     _start_time: float = field(default_factory=time.monotonic)
     
-    # Lock for thread-safe updates
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    
     # Logger for structured logging (optional)
     _logger: LoggerProtocol | None = None
     _node_host: str = ""
@@ -106,16 +104,20 @@ class Metrics:
         self._node_id = node_id
     
     def increment(self, metric: str, amount: int = 1) -> None:
-        """Increment a counter metric with overflow protection."""
-        with self._lock:
-            if hasattr(self, metric):
-                current = getattr(self, metric)
-                if current < self.MAX_COUNTER_VALUE:
-                    new_value = min(current + amount, self.MAX_COUNTER_VALUE)
-                    setattr(self, metric, new_value)
-                    # Track saturation for monitoring
-                    if new_value >= self.MAX_COUNTER_VALUE:
-                        self._saturated_counters.add(metric)
+        """
+        Increment a counter metric with overflow protection.
+        
+        Lockless: relies on Python GIL for atomicity of individual operations.
+        In the rare case of a race, we may lose an increment - acceptable for metrics.
+        """
+        if hasattr(self, metric):
+            current = getattr(self, metric)
+            if current < self.MAX_COUNTER_VALUE:
+                new_value = min(current + amount, self.MAX_COUNTER_VALUE)
+                setattr(self, metric, new_value)
+                # Track saturation for monitoring (set.add is atomic under GIL)
+                if new_value >= self.MAX_COUNTER_VALUE:
+                    self._saturated_counters.add(metric)
     
     def get(self, metric: str) -> int:
         """Get current value of a metric."""
@@ -123,8 +125,8 @@ class Metrics:
     
     def get_saturated_counters(self) -> set[str]:
         """Get set of counters that have reached MAX_COUNTER_VALUE."""
-        with self._lock:
-            return self._saturated_counters.copy()
+        # Return a copy to avoid mutation issues
+        return set(self._saturated_counters)
     
     async def log_saturation_warnings(self) -> int:
         """
@@ -136,8 +138,8 @@ class Metrics:
         if not self._logger or not self._saturated_counters:
             return 0
         
-        with self._lock:
-            saturated = list(self._saturated_counters)
+        # Take a snapshot (list() is atomic under GIL)
+        saturated = list(self._saturated_counters)
         
         if saturated:
             try:
@@ -211,10 +213,15 @@ class Metrics:
         }
     
     def reset(self) -> None:
-        """Reset all counters to zero."""
-        with self._lock:
-            for name in dir(self):
-                if not name.startswith('_') and isinstance(getattr(self, name), int):
-                    setattr(self, name, 0)
-            self._start_time = time.monotonic()
+        """
+        Reset all counters to zero.
+        
+        Lockless: should only be called when no other operations are in progress
+        (e.g., during shutdown or initialization).
+        """
+        for name in dir(self):
+            if not name.startswith('_') and isinstance(getattr(self, name), int):
+                setattr(self, name, 0)
+        self._start_time = time.monotonic()
+        self._saturated_counters.clear()
 
