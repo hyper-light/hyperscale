@@ -1942,7 +1942,30 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         clock_time: int,
     ) -> Message:
         try:
-            # Check rate limit first - drop if sender is flooding
+            # Validate message size first - prevent memory issues from oversized messages
+            if len(data) > MAX_UDP_PAYLOAD:
+                await self.handle_error(
+                    ProtocolError(
+                        f"Message from {addr[0]}:{addr[1]} exceeds size limit "
+                        f"({len(data)} > {MAX_UDP_PAYLOAD})",
+                        size=len(data),
+                        limit=MAX_UDP_PAYLOAD,
+                        source=addr,
+                    )
+                )
+                return b'nack>' + self._udp_addr_slug
+            
+            # Validate message has content
+            if len(data) == 0:
+                await self.handle_error(
+                    ProtocolError(
+                        f"Empty message from {addr[0]}:{addr[1]}",
+                        source=addr,
+                    )
+                )
+                return b'nack>' + self._udp_addr_slug
+            
+            # Check rate limit - drop if sender is flooding
             if not await self._check_rate_limit(addr):
                 return b'nack>' + self._udp_addr_slug
             
