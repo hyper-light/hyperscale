@@ -30,7 +30,13 @@ from .core.errors import (
     UnexpectedError,
 )
 from .core.error_handler import ErrorHandler, ErrorContext
-from .core.retry import retry_with_backoff, PROBE_RETRY_POLICY
+from .core.retry import (
+    retry_with_backoff,
+    retry_with_result,
+    PROBE_RETRY_POLICY,
+    ELECTION_RETRY_POLICY,
+)
+from .core.error_handler import ErrorContext
 
 # Health monitoring
 from .health.local_health_multiplier import LocalHealthMultiplier
@@ -332,32 +338,24 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                 await self.handle_exception(e, "cleanup_loop")
     
     async def _run_cleanup(self) -> None:
-        """Run one cleanup cycle for all SWIM components."""
+        """Run one cleanup cycle for all SWIM components using ErrorContext."""
         stats = {}
         
         # Cleanup incarnation tracker (dead node GC)
-        try:
+        async with ErrorContext(self._error_handler, "incarnation_cleanup"):
             stats['incarnation'] = self._incarnation_tracker.cleanup()
-        except Exception as e:
-            await self.handle_exception(e, "incarnation_cleanup")
         
         # Cleanup suspicion manager (orphaned suspicions)
-        try:
+        async with ErrorContext(self._error_handler, "suspicion_cleanup"):
             stats['suspicion'] = self._suspicion_manager.cleanup()
-        except Exception as e:
-            await self.handle_exception(e, "suspicion_cleanup")
         
         # Cleanup indirect probe manager
-        try:
+        async with ErrorContext(self._error_handler, "indirect_probe_cleanup"):
             stats['indirect_probe'] = self._indirect_probe_manager.cleanup()
-        except Exception as e:
-            await self.handle_exception(e, "indirect_probe_cleanup")
         
         # Cleanup gossip buffer
-        try:
+        async with ErrorContext(self._error_handler, "gossip_cleanup"):
             stats['gossip'] = self._gossip_buffer.cleanup()
-        except Exception as e:
-            await self.handle_exception(e, "gossip_cleanup")
     
     def get_cleanup_stats(self) -> dict:
         """Get cleanup statistics from all components."""
@@ -419,27 +417,40 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         timeout: float,
     ) -> bool:
         """
-        Send a leadership message with error tracking.
+        Send a leadership message with retry.
         
-        Leadership messages are important for cluster coordination.
+        Leadership messages are critical for cluster coordination,
+        so we use retry_with_backoff with ELECTION_RETRY_POLICY.
         """
-        try:
-            await self.send(node, message, timeout=timeout)
+        result = await retry_with_result(
+            lambda: self._send_once(node, message, timeout),
+            policy=ELECTION_RETRY_POLICY,
+            on_retry=self._on_leadership_retry,
+        )
+        
+        if result.success:
+            self.record_network_success()
             return True
-        except asyncio.TimeoutError:
-            return False
-        except OSError as e:
-            await self.handle_error(
-                NetworkError(
-                    f"Leadership message to {node[0]}:{node[1]} failed: {e}",
-                    severity=ErrorSeverity.DEGRADED,  # Leadership messages are more important
-                    target=node,
+        else:
+            if result.last_error:
+                await self.handle_error(
+                    NetworkError(
+                        f"Leadership message to {node[0]}:{node[1]} failed after retries: {result.last_error}",
+                        severity=ErrorSeverity.DEGRADED,
+                        target=node,
+                        attempts=result.attempts,
+                    )
                 )
-            )
             return False
-        except Exception as e:
-            await self.handle_exception(e, f"leadership_to_{node[0]}_{node[1]}")
-            return False
+    
+    async def _on_leadership_retry(
+        self,
+        attempt: int,
+        error: Exception,
+        delay: float,
+    ) -> None:
+        """Callback for leadership retry attempts."""
+        await self.increase_failure_detector('leadership_retry')
     
     def _on_become_leader(self) -> None:
         """Called when this node becomes the leader."""
@@ -591,6 +602,55 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             await asyncio.sleep(self._context.read('udp_poll_interval', 1))
             status = await self._context.read_with_lock(target)
     
+    async def join_cluster(
+        self,
+        seed_node: tuple[str, int],
+        timeout: float = 5.0,
+    ) -> bool:
+        """
+        Join a cluster via a seed node with retry support.
+        
+        Uses retry_with_backoff to handle transient failures when
+        the seed node might not be ready yet.
+        
+        Args:
+            seed_node: (host, port) of a node already in the cluster
+            timeout: Timeout per attempt
+        
+        Returns:
+            True if join succeeded, False if all retries exhausted
+        """
+        self_addr = self._get_self_udp_addr()
+        join_msg = b'join>' + f'{self_addr[0]}:{self_addr[1]}'.encode()
+        
+        async def attempt_join() -> bool:
+            await self.send(seed_node, join_msg, timeout=timeout)
+            # Add seed to our known nodes
+            self._context.write(seed_node, b'OK')
+            self._probe_scheduler.add_member(seed_node)
+            return True
+        
+        result = await retry_with_result(
+            attempt_join,
+            policy=ELECTION_RETRY_POLICY,  # Use election policy for joining
+            on_retry=lambda a, e, d: self.increase_failure_detector('join_retry'),
+        )
+        
+        if result.success:
+            self.record_network_success()
+            return True
+        else:
+            if result.last_error:
+                await self.handle_error(
+                    NetworkError(
+                        f"Failed to join cluster via {seed_node[0]}:{seed_node[1]} after {result.attempts} attempts",
+                        severity=ErrorSeverity.DEGRADED,
+                        target=seed_node,
+                        attempts=result.attempts,
+                    )
+                )
+            return False
+    
     async def start_probe_cycle(self) -> None:
         """Start the SWIM randomized round-robin probe cycle."""
         # Ensure error handler is set up first
@@ -639,21 +699,22 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         if self.udp_target_is_self(target):
             return
         
-        node_state = self._incarnation_tracker.get_node_state(target)
-        incarnation = node_state.incarnation if node_state else 0
-        
-        base_timeout = self._context.read('current_timeout')
-        timeout = self.get_lhm_adjusted_timeout(base_timeout)
-        
-        target_addr = f'{target[0]}:{target[1]}'.encode()
-        probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
-        
-        try:
+        # Use ErrorContext for consistent error handling throughout the probe
+        async with ErrorContext(self._error_handler, f"probe_round_{target[0]}_{target[1]}") as ctx:
+            node_state = self._incarnation_tracker.get_node_state(target)
+            incarnation = node_state.incarnation if node_state else 0
+            
+            base_timeout = self._context.read('current_timeout')
+            timeout = self.get_lhm_adjusted_timeout(base_timeout)
+            
+            target_addr = f'{target[0]}:{target[1]}'.encode()
+            probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
+            
             response_received = await self._probe_with_timeout(target, probe_msg, timeout)
             
             if response_received:
                 await self.decrease_failure_detector('successful_probe')
-                self.record_network_success()  # Help circuit breaker recover
+                ctx.record_success(ErrorCategory.NETWORK)  # Help circuit breaker recover
                 return
             
             await self.increase_failure_detector('probe_timeout')
@@ -664,21 +725,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                 probe = self._indirect_probe_manager.get_pending_probe(target)
                 if probe and probe.is_completed():
                     await self.decrease_failure_detector('successful_probe')
+                    ctx.record_success(ErrorCategory.NETWORK)
                     return
             
             self_addr = self._get_self_udp_addr()
             self.start_suspicion(target, incarnation, self_addr)
             await self.broadcast_suspicion(target, incarnation)
-            
-        except asyncio.CancelledError:
-            raise
-        except asyncio.TimeoutError:
-            # Probe timeout - handle specifically
-            await self.handle_error(
-                ProbeTimeoutError(target, timeout)
-            )
-        except Exception as e:
-            await self.handle_exception(e, "probe_round")
     
     async def _probe_with_timeout(
         self, 
@@ -1145,8 +1197,8 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """
         Broadcast an alive message to refute any suspicions about this node.
         
+        Uses retry_with_backoff for each send since refutation is critical.
         Tracks send failures and logs them but doesn't fail the overall operation.
-        Refutation is critical so we try all nodes even if some fail.
         """
         new_incarnation = self.increment_incarnation()
         
@@ -1164,7 +1216,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         for node in nodes:
             if node != self_addr:
-                success = await self._send_broadcast_message(node, msg, timeout)
+                success = await self._send_with_retry(node, msg, timeout)
                 if success:
                     successful += 1
                 else:
@@ -1182,6 +1234,50 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             )
         
         return new_incarnation
+    
+    async def _send_with_retry(
+        self,
+        target: tuple[str, int],
+        message: bytes,
+        timeout: float,
+    ) -> bool:
+        """
+        Send a message with retry using retry_with_backoff.
+        
+        Returns True on success, False if all retries exhausted.
+        """
+        result = await retry_with_result(
+            lambda: self._send_once(target, message, timeout),
+            policy=PROBE_RETRY_POLICY,
+            on_retry=self._on_send_retry,
+        )
+        
+        if result.success:
+            self.record_network_success()
+            return True
+        else:
+            if result.last_error:
+                await self.handle_exception(result.last_error, f"send_retry_{target[0]}_{target[1]}")
+            return False
+    
+    async def _send_once(
+        self,
+        target: tuple[str, int],
+        message: bytes,
+        timeout: float,
+    ) -> bool:
+        """Single send attempt (for use with retry_with_backoff)."""
+        await self.send(target, message, timeout=timeout)
+        return True
+    
+    async def _on_send_retry(
+        self,
+        attempt: int,
+        error: Exception,
+        delay: float,
+    ) -> None:
+        """Callback for retry attempts - update LHM."""
+        await self.increase_failure_detector('send_retry')
     
     async def broadcast_suspicion(
         self, 
