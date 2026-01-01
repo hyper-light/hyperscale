@@ -267,8 +267,17 @@ class LocalLeaderElection:
             return
         
         # Phase 2: Real election
-        new_term = self.state.current_term + 1
-        self.state.start_election(new_term)
+        new_term = self.state.next_term()
+        
+        # Check for term exhaustion (indicates attack or severe bug)
+        if self.state.is_term_exhausted():
+            # Log and bail - this should never happen in normal operation
+            print(f"[CRITICAL] Term exhausted at {self.state.current_term}", file=sys.stderr)
+            return
+        
+        if not self.state.start_election(new_term):
+            # Term overflow - shouldn't happen with next_term()
+            return
         self.state.update_fencing_token(new_term)
         
         # Vote for self
@@ -297,7 +306,9 @@ class LocalLeaderElection:
             if len(self.state.votes_received) >= votes_needed:
                 # We won!
                 old_leader = self.state.current_leader
-                self.state.become_leader(new_term)
+                if not self.state.become_leader(new_term):
+                    # Term became invalid (shouldn't happen)
+                    return
                 self.state.current_leader = self.self_addr
                 self._record_leader_change(old_leader, self.self_addr, 'election')
                 self.state.update_fencing_token(new_term)

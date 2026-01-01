@@ -8,6 +8,10 @@ from typing import Callable
 
 from ..core.types import LeaderRole
 
+# Maximum term value - prevents overflow and wrap-around attacks
+# Using 2^53 - 1 to stay within JavaScript safe integer range for JSON serialization
+MAX_TERM = (2**53) - 1
+
 
 @dataclass
 class LeaderState:
@@ -107,21 +111,54 @@ class LeaderState:
             return False
         return not self.is_lease_valid()
     
-    def start_election(self, new_term: int) -> None:
-        """Transition to candidate state and start election."""
+    def is_term_valid(self, term: int) -> bool:
+        """Check if a term value is within valid range."""
+        return 0 <= term <= MAX_TERM
+    
+    def next_term(self) -> int:
+        """
+        Get the next term value safely.
+        
+        Returns MAX_TERM if we've reached the limit, preventing overflow.
+        In practice, this should never happen with normal operation.
+        """
+        if self.current_term >= MAX_TERM:
+            return MAX_TERM
+        return self.current_term + 1
+    
+    def is_term_exhausted(self) -> bool:
+        """Check if term space is exhausted (indicates potential attack or bug)."""
+        return self.current_term >= MAX_TERM
+    
+    def start_election(self, new_term: int) -> bool:
+        """
+        Transition to candidate state and start election.
+        
+        Returns False if term is invalid (e.g., overflow).
+        """
+        if not self.is_term_valid(new_term):
+            return False
         self.role = 'candidate'
         self.current_term = new_term
         self.votes_received.clear()
         self.voted_for = None
         self.voted_in_term = -1
+        return True
     
     def record_vote(self, voter: tuple[str, int]) -> int:
         """Record a vote received. Returns total vote count."""
         self.votes_received.add(voter)
         return len(self.votes_received)
     
-    def become_leader(self, term: int) -> None:
-        """Transition to leader state."""
+    def become_leader(self, term: int) -> bool:
+        """
+        Transition to leader state.
+        
+        Returns False if term is invalid (e.g., overflow).
+        """
+        if not self.is_term_valid(term):
+            return False
+        
         was_leader = self.role == 'leader'
         self.role = 'leader'
         self.current_term = term
@@ -131,6 +168,8 @@ class LeaderState:
         
         if not was_leader and self._on_become_leader:
             self._on_become_leader()
+        
+        return True
     
     def become_follower(self, term: int, leader: tuple[str, int] | None = None) -> None:
         """Transition to follower state."""

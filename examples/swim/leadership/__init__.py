@@ -2,7 +2,7 @@
 Leadership election for SWIM protocol with Lifeguard enhancements.
 """
 
-from .leader_state import LeaderState
+from .leader_state import LeaderState, MAX_TERM
 
 from .leader_eligibility import LeaderEligibility
 
@@ -20,5 +20,6 @@ __all__ = [
     'LocalLeaderElection',
     'FlappingDetector',
     'LeadershipChange',
+    'MAX_TERM',
 ]
 
