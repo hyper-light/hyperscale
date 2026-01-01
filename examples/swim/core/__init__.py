@@ -63,6 +63,8 @@ from .resource_limits import (
     create_cleanup_config_from_context,
 )
 
+from .metrics import Metrics
+
 
 __all__ = [
     # Types
@@ -113,5 +115,7 @@ __all__ = [
     'BoundedDict',
     'CleanupConfig',
     'create_cleanup_config_from_context',
+    # Metrics
+    'Metrics',
 ]
 

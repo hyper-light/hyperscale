@@ -38,6 +38,7 @@ from .core.errors import (
 )
 from .core.error_handler import ErrorHandler, ErrorContext
 from .core.resource_limits import BoundedDict
+from .core.metrics import Metrics
 from .core.retry import (
     retry_with_backoff,
     retry_with_result,
@@ -124,6 +125,9 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Initialize error handler (logger set up after server starts)
         self._error_handler: ErrorHandler | None = None
+        
+        # Metrics collection
+        self._metrics = Metrics()
         
         # Event loop health monitor (proactive CPU saturation detection)
         self._health_monitor = EventLoopHealthMonitor()
@@ -888,6 +892,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         Uses PROBE_RETRY_POLICY for retry logic with exponential backoff.
         Returns True if probe succeeded, False if all retries exhausted.
         """
+        self._metrics.increment('probes_sent')
         attempt = 0
         max_attempts = PROBE_RETRY_POLICY.max_retries + 1
         
@@ -1205,6 +1210,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             seen_time = self._seen_messages[msg_hash]
             if now - seen_time < self._dedup_window:
                 self._dedup_stats['duplicates'] += 1
+                self._metrics.increment('messages_deduplicated')
                 return True
             # Seen but outside window - update timestamp
             self._seen_messages[msg_hash] = now
@@ -1261,6 +1267,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             return True
         else:
             self._rate_limit_stats['rejected'] += 1
+            self._metrics.increment('messages_rate_limited')
             # Log rate limit violation
             await self.handle_error(
                 ResourceError(
@@ -1280,6 +1287,10 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             'tokens_per_sender': self._rate_limit_tokens,
             'refill_rate': self._rate_limit_refill,
         }
+    
+    def get_metrics(self) -> dict:
+        """Get all protocol metrics for monitoring."""
+        return self._metrics.to_dict()
     
     async def _validate_target(
         self,
@@ -1826,6 +1837,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'join':
+                    self._metrics.increment('joins_received')
                     if not await self._validate_target(target, b'join', addr):
                         return b'nack>' + self._udp_addr_slug
                     
