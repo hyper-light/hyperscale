@@ -21,9 +21,16 @@ Message = Literal[
     b'ping-req-ack',  # Response from indirect probe
     b'suspect',  # Suspicion message
     b'alive',  # Refutation/alive message
+    # Leadership messages
+    b'leader-claim',     # Claim local leadership: leader-claim:term:lhm>addr
+    b'leader-vote',      # Vote for candidate: leader-vote:term>candidate_addr
+    b'leader-elected',   # Announce election win: leader-elected:term>leader_addr
+    b'leader-heartbeat', # Leader heartbeat: leader-heartbeat:term>leader_addr
+    b'leader-stepdown',  # Voluntary stepdown: leader-stepdown:term>addr
 ]
 Status = Literal[b'JOIN', b'OK', b'SUSPECT', b'DEAD']
 UpdateType = Literal['alive', 'suspect', 'dead', 'join', 'leave']
+LeaderRole = Literal['follower', 'candidate', 'leader']
 
 Nodes = dict[tuple[str, int], asyncio.Queue[tuple[int, Status]]]
 Ctx = dict[Literal['nodes'], Nodes]
@@ -896,9 +903,507 @@ class ProbeScheduler:
             self._probe_task = None
 
 
+@dataclass
+class LeaderEligibility:
+    """
+    Determines if a node can become or remain a leader.
+    
+    Integrates with Lifeguard's Local Health Multiplier (LHM) to ensure
+    that overloaded nodes do not become leaders. This is critical for
+    multi-datacenter deployments where nodes may consume high CPU/memory.
+    
+    A node is eligible for leadership if:
+    1. Its status is ALIVE (not SUSPECT or DEAD)
+    2. Its LHM score is below the threshold
+    3. It is not currently suspected by others
+    """
+    # Maximum LHM score for a node to be eligible as leader
+    # LHM ranges from 0 (healthy) to max_score (8 by default)
+    max_leader_lhm: int = 2
+    
+    # Minimum members required for election (quorum)
+    min_members_for_election: int = 1
+    
+    def is_eligible(
+        self, 
+        lhm_score: int, 
+        status: Status,
+        is_suspected: bool = False,
+    ) -> bool:
+        """Check if a node with given state can become leader."""
+        return (
+            status == b'OK' and
+            lhm_score <= self.max_leader_lhm and
+            not is_suspected
+        )
+    
+    def should_step_down(self, current_lhm: int) -> bool:
+        """
+        Check if current leader should voluntarily step down.
+        Called when leader's LHM increases due to load.
+        """
+        return current_lhm > self.max_leader_lhm
+    
+    def get_leader_priority(
+        self, 
+        node: tuple[str, int], 
+        incarnation: int, 
+        lhm_score: int,
+    ) -> tuple[int, int, str, int]:
+        """
+        Get priority tuple for leader selection.
+        Lower tuple = higher priority for leadership.
+        
+        Priority order:
+        1. Lower LHM score (healthier nodes preferred)
+        2. Higher incarnation (more "proven" nodes)
+        3. Lower address (deterministic tie-breaker)
+        """
+        return (lhm_score, -incarnation, node[0], node[1])
+
+
+@dataclass
+class LeaderState:
+    """
+    Tracks the leadership state for a node.
+    
+    Implements a simplified Raft-like state machine:
+    - FOLLOWER: Not a leader, following current leader
+    - CANDIDATE: Running for election
+    - LEADER: Currently the leader, must send heartbeats
+    
+    Integrates with Lifeguard for health-aware leadership.
+    """
+    role: LeaderRole = 'follower'
+    current_term: int = 0
+    
+    # Current known leader (None if no leader)
+    current_leader: tuple[str, int] | None = None
+    leader_term: int = 0
+    
+    # Lease tracking
+    leader_lease_start: float = 0.0
+    lease_duration: float = 5.0  # Seconds
+    
+    # Election state
+    votes_received: set[tuple[str, int]] = field(default_factory=set)
+    voted_for: tuple[str, int] | None = None
+    voted_in_term: int = -1
+    election_timeout: float = 10.0  # Seconds
+    last_heartbeat_time: float = 0.0
+    
+    # Callbacks (set by owner)
+    _on_become_leader: Callable[[], None] | None = None
+    _on_lose_leadership: Callable[[], None] | None = None
+    _on_leader_change: Callable[[tuple[str, int] | None], None] | None = None
+    
+    def set_callbacks(
+        self,
+        on_become_leader: Callable[[], None] | None = None,
+        on_lose_leadership: Callable[[], None] | None = None,
+        on_leader_change: Callable[[tuple[str, int] | None], None] | None = None,
+    ) -> None:
+        """Set callback functions for leadership events."""
+        self._on_become_leader = on_become_leader
+        self._on_lose_leadership = on_lose_leadership
+        self._on_leader_change = on_leader_change
+    
+    def is_leader(self) -> bool:
+        """Check if this node is currently the leader."""
+        return self.role == 'leader'
+    
+    def is_follower(self) -> bool:
+        """Check if this node is currently a follower."""
+        return self.role == 'follower'
+    
+    def is_candidate(self) -> bool:
+        """Check if this node is currently a candidate."""
+        return self.role == 'candidate'
+    
+    def has_leader(self) -> bool:
+        """Check if there's a known leader."""
+        return self.current_leader is not None and self.is_lease_valid()
+    
+    def is_lease_valid(self) -> bool:
+        """Check if the current leader's lease is still valid."""
+        if self.current_leader is None:
+            return False
+        return time.monotonic() < self.leader_lease_start + self.lease_duration
+    
+    def time_until_lease_expiry(self) -> float:
+        """Get time until leader lease expires."""
+        expiry = self.leader_lease_start + self.lease_duration
+        return max(0, expiry - time.monotonic())
+    
+    def should_start_election(self) -> bool:
+        """Check if we should start a new election."""
+        if self.role == 'leader':
+            return False
+        return not self.is_lease_valid()
+    
+    def start_election(self, new_term: int) -> None:
+        """Transition to candidate state and start election."""
+        self.role = 'candidate'
+        self.current_term = new_term
+        self.votes_received.clear()
+        self.voted_for = None
+        self.voted_in_term = -1
+    
+    def record_vote(self, voter: tuple[str, int]) -> int:
+        """Record a vote received. Returns total vote count."""
+        self.votes_received.add(voter)
+        return len(self.votes_received)
+    
+    def become_leader(self, term: int) -> None:
+        """Transition to leader state."""
+        was_leader = self.role == 'leader'
+        self.role = 'leader'
+        self.current_term = term
+        self.leader_term = term
+        self.leader_lease_start = time.monotonic()
+        self.current_leader = None  # We are the leader, set by caller
+        
+        if not was_leader and self._on_become_leader:
+            self._on_become_leader()
+    
+    def become_follower(self, term: int, leader: tuple[str, int] | None = None) -> None:
+        """Transition to follower state."""
+        was_leader = self.role == 'leader'
+        old_leader = self.current_leader
+        
+        self.role = 'follower'
+        self.current_term = max(self.current_term, term)
+        self.votes_received.clear()
+        
+        if leader:
+            self.current_leader = leader
+            self.leader_term = term
+            self.leader_lease_start = time.monotonic()
+        
+        if was_leader and self._on_lose_leadership:
+            self._on_lose_leadership()
+        
+        if leader != old_leader and self._on_leader_change:
+            self._on_leader_change(leader)
+    
+    def update_heartbeat(self, leader: tuple[str, int], term: int) -> None:
+        """Update lease on receiving leader heartbeat."""
+        if term >= self.leader_term:
+            self.current_leader = leader
+            self.leader_term = term
+            self.leader_lease_start = time.monotonic()
+            self.last_heartbeat_time = time.monotonic()
+            
+            if self.role != 'follower':
+                self.become_follower(term, leader)
+    
+    def renew_lease(self) -> None:
+        """Renew leader lease (called by leader on heartbeat send)."""
+        if self.role == 'leader':
+            self.leader_lease_start = time.monotonic()
+    
+    def can_vote_for(self, candidate: tuple[str, int], term: int) -> bool:
+        """Check if we can vote for a candidate."""
+        # Can't vote if already voted in this term for someone else
+        if self.voted_in_term == term and self.voted_for != candidate:
+            return False
+        # Can only vote for higher or equal term
+        return term >= self.current_term
+    
+    def vote_for(self, candidate: tuple[str, int], term: int) -> None:
+        """Record that we voted for a candidate."""
+        self.voted_for = candidate
+        self.voted_in_term = term
+        self.current_term = max(self.current_term, term)
+
+
+@dataclass
+class LocalLeaderElection:
+    """
+    Manages local (within-datacenter) leader election.
+    
+    Uses a lease-based approach with LHM-aware eligibility:
+    1. Nodes monitor leader lease expiry
+    2. When lease expires, eligible nodes can become candidates
+    3. Candidates request votes from peers
+    4. First candidate with majority wins
+    5. Leader sends periodic heartbeats to renew lease
+    
+    This is designed for low-latency, single-datacenter operation.
+    """
+    state: LeaderState = field(default_factory=LeaderState)
+    eligibility: LeaderEligibility = field(default_factory=LeaderEligibility)
+    
+    # Configuration
+    heartbeat_interval: float = 2.0  # Seconds between leader heartbeats
+    election_timeout_base: float = 5.0  # Base election timeout
+    election_timeout_jitter: float = 2.0  # Random jitter added to timeout
+    
+    # Datacenter identification
+    dc_id: str = "default"
+    
+    # Reference to node address (set by owner)
+    self_addr: tuple[str, int] | None = None
+    
+    # Callbacks for sending messages (set by owner)
+    _broadcast_message: Callable[[bytes], None] | None = None
+    _get_member_count: Callable[[], int] | None = None
+    _get_lhm_score: Callable[[], int] | None = None
+    
+    # Background tasks
+    _heartbeat_task: asyncio.Task | None = field(default=None, repr=False)
+    _election_task: asyncio.Task | None = field(default=None, repr=False)
+    _running: bool = False
+    
+    def set_callbacks(
+        self,
+        broadcast_message: Callable[[bytes], None],
+        get_member_count: Callable[[], int],
+        get_lhm_score: Callable[[], int],
+        self_addr: tuple[str, int],
+    ) -> None:
+        """Set callback functions for election operations."""
+        self._broadcast_message = broadcast_message
+        self._get_member_count = get_member_count
+        self._get_lhm_score = get_lhm_score
+        self.self_addr = self_addr
+    
+    def get_election_timeout(self) -> float:
+        """Get randomized election timeout."""
+        jitter = random.uniform(0, self.election_timeout_jitter)
+        return self.election_timeout_base + jitter
+    
+    def is_self_eligible(self) -> bool:
+        """Check if this node is eligible to become leader."""
+        if not self._get_lhm_score:
+            return True
+        lhm = self._get_lhm_score()
+        return self.eligibility.is_eligible(lhm, b'OK', False)
+    
+    def should_step_down(self) -> bool:
+        """Check if leader should step down due to high load."""
+        if not self.state.is_leader():
+            return False
+        if not self._get_lhm_score:
+            return False
+        return self.eligibility.should_step_down(self._get_lhm_score())
+    
+    async def start(self) -> None:
+        """Start the leader election process."""
+        self._running = True
+        self._election_task = asyncio.create_task(self._election_loop())
+    
+    async def stop(self) -> None:
+        """Stop the leader election process."""
+        self._running = False
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat_task = None
+        
+        if self._election_task:
+            self._election_task.cancel()
+            try:
+                await self._election_task
+            except asyncio.CancelledError:
+                pass
+            self._election_task = None
+    
+    async def _election_loop(self) -> None:
+        """Main election monitoring loop."""
+        while self._running:
+            try:
+                if self.state.is_leader():
+                    # Leader: check if we should step down
+                    if self.should_step_down():
+                        await self._step_down()
+                    else:
+                        await asyncio.sleep(self.heartbeat_interval)
+                        await self._send_heartbeat()
+                
+                elif self.state.should_start_election():
+                    # No leader or lease expired: maybe start election
+                    if self.is_self_eligible():
+                        await self._run_election()
+                    else:
+                        # Not eligible, wait for someone else
+                        await asyncio.sleep(self.get_election_timeout())
+                
+                else:
+                    # Following a leader, wait for lease to expire
+                    wait_time = self.state.time_until_lease_expiry()
+                    await asyncio.sleep(min(wait_time + 0.5, self.heartbeat_interval))
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                import traceback
+                print(f"Election loop error: {traceback.format_exc()}")
+                await asyncio.sleep(1)
+    
+    async def _run_election(self) -> None:
+        """Run a leader election."""
+        if not self.self_addr or not self._broadcast_message:
+            return
+        
+        # Start new term
+        new_term = self.state.current_term + 1
+        self.state.start_election(new_term)
+        
+        # Vote for self
+        self.state.vote_for(self.self_addr, new_term)
+        self.state.record_vote(self.self_addr)
+        
+        # Broadcast claim
+        lhm = self._get_lhm_score() if self._get_lhm_score else 0
+        claim_msg = (
+            b'leader-claim:' + 
+            str(new_term).encode() + b':' +
+            str(lhm).encode() + b'>' +
+            f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
+        )
+        self._broadcast_message(claim_msg)
+        
+        # Wait for votes
+        await asyncio.sleep(self.get_election_timeout())
+        
+        # Check if we won
+        if self.state.role == 'candidate':  # Still candidate
+            n_members = self._get_member_count() if self._get_member_count else 1
+            votes_needed = (n_members // 2) + 1
+            
+            if len(self.state.votes_received) >= votes_needed:
+                # We won!
+                self.state.become_leader(new_term)
+                self.state.current_leader = self.self_addr
+                
+                # Announce victory
+                elected_msg = (
+                    b'leader-elected:' +
+                    str(new_term).encode() + b'>' +
+                    f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
+                )
+                self._broadcast_message(elected_msg)
+                
+                # Start heartbeating
+                await self._send_heartbeat()
+    
+    async def _send_heartbeat(self) -> None:
+        """Send leader heartbeat."""
+        if not self.state.is_leader() or not self.self_addr or not self._broadcast_message:
+            return
+        
+        self.state.renew_lease()
+        
+        heartbeat_msg = (
+            b'leader-heartbeat:' +
+            str(self.state.current_term).encode() + b'>' +
+            f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
+        )
+        self._broadcast_message(heartbeat_msg)
+    
+    async def _step_down(self) -> None:
+        """Voluntarily step down from leadership."""
+        if not self.state.is_leader() or not self.self_addr or not self._broadcast_message:
+            return
+        
+        stepdown_msg = (
+            b'leader-stepdown:' +
+            str(self.state.current_term).encode() + b'>' +
+            f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
+        )
+        self._broadcast_message(stepdown_msg)
+        
+        self.state.become_follower(self.state.current_term)
+    
+    def handle_claim(
+        self,
+        candidate: tuple[str, int],
+        term: int,
+        candidate_lhm: int,
+    ) -> bytes | None:
+        """
+        Handle a leader-claim message.
+        Returns vote message if we vote for the candidate, None otherwise.
+        """
+        if not self.self_addr:
+            return None
+        
+        # Ignore claims from lower terms
+        if term < self.state.current_term:
+            return None
+        
+        # Check if candidate is eligible (based on their LHM)
+        if not self.eligibility.is_eligible(candidate_lhm, b'OK', False):
+            return None
+        
+        # Check if we can vote for them
+        if not self.state.can_vote_for(candidate, term):
+            return None
+        
+        # Vote for the candidate
+        self.state.vote_for(candidate, term)
+        
+        vote_msg = (
+            b'leader-vote:' +
+            str(term).encode() + b'>' +
+            f'{candidate[0]}:{candidate[1]}'.encode()
+        )
+        return vote_msg
+    
+    def handle_vote(self, voter: tuple[str, int], term: int) -> bool:
+        """
+        Handle a leader-vote message.
+        Returns True if this vote wins the election.
+        """
+        if term != self.state.current_term or not self.state.is_candidate():
+            return False
+        
+        vote_count = self.state.record_vote(voter)
+        n_members = self._get_member_count() if self._get_member_count else 1
+        votes_needed = (n_members // 2) + 1
+        
+        return vote_count >= votes_needed
+    
+    def handle_elected(self, leader: tuple[str, int], term: int) -> None:
+        """Handle a leader-elected message."""
+        if term >= self.state.current_term:
+            self.state.become_follower(term, leader)
+    
+    def handle_heartbeat(self, leader: tuple[str, int], term: int) -> None:
+        """Handle a leader-heartbeat message."""
+        self.state.update_heartbeat(leader, term)
+    
+    def handle_stepdown(self, leader: tuple[str, int], term: int) -> None:
+        """Handle a leader-stepdown message."""
+        if leader == self.state.current_leader:
+            self.state.current_leader = None
+            # Will trigger election on next loop iteration
+    
+    def get_current_leader(self) -> tuple[str, int] | None:
+        """Get the current leader, if any."""
+        if self.state.is_leader() and self.self_addr:
+            return self.self_addr
+        return self.state.current_leader if self.state.is_lease_valid() else None
+    
+    def get_status(self) -> dict:
+        """Get current leadership status for debugging."""
+        return {
+            'role': self.state.role,
+            'term': self.state.current_term,
+            'leader': self.get_current_leader(),
+            'lease_remaining': self.state.time_until_lease_expiry(),
+            'eligible': self.is_self_eligible(),
+            'votes': len(self.state.votes_received) if self.state.is_candidate() else 0,
+        }
+
+
 class TestServer(MercurySyncBaseServer[Ctx]):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, dc_id: str = "default", **kwargs):
         super().__init__(*args, **kwargs)
         self._local_health = LocalHealthMultiplier()
         self._incarnation_tracker = IncarnationTracker()
@@ -906,6 +1411,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         self._indirect_probe_manager = IndirectProbeManager()
         self._gossip_buffer = GossipBuffer()
         self._probe_scheduler = ProbeScheduler()
+        self._leader_election = LocalLeaderElection(dc_id=dc_id)
         
         # Set up suspicion manager callbacks
         self._suspicion_manager.set_callbacks(
@@ -917,6 +1423,53 @@ class TestServer(MercurySyncBaseServer[Ctx]):
     def _get_lhm_multiplier(self) -> float:
         """Get the current LHM timeout multiplier."""
         return self._local_health.get_multiplier()
+    
+    def _setup_leader_election(self) -> None:
+        """Initialize leader election callbacks after server is started."""
+        self._leader_election.set_callbacks(
+            broadcast_message=self._broadcast_leadership_message,
+            get_member_count=self._get_member_count,
+            get_lhm_score=lambda: self._local_health.score,
+            self_addr=self._get_self_udp_addr(),
+        )
+        
+        # Set up leadership event callbacks
+        self._leader_election.state.set_callbacks(
+            on_become_leader=self._on_become_leader,
+            on_lose_leadership=self._on_lose_leadership,
+            on_leader_change=self._on_leader_change,
+        )
+    
+    def _broadcast_leadership_message(self, message: bytes) -> None:
+        """Broadcast a leadership message to all known nodes."""
+        nodes: Nodes = self._context.read('nodes')
+        self_addr = self._get_self_udp_addr()
+        base_timeout = self._context.read('current_timeout')
+        timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        
+        for node in nodes:
+            if node != self_addr:
+                self._task_runner.run(
+                    self.send,
+                    node,
+                    message,
+                    timeout=timeout,
+                )
+    
+    def _on_become_leader(self) -> None:
+        """Called when this node becomes the leader."""
+        print(f"[{self._udp_addr_slug.decode()}] Became LEADER (term {self._leader_election.state.current_term})")
+    
+    def _on_lose_leadership(self) -> None:
+        """Called when this node loses leadership."""
+        print(f"[{self._udp_addr_slug.decode()}] Lost leadership")
+    
+    def _on_leader_change(self, new_leader: tuple[str, int] | None) -> None:
+        """Called when the known leader changes."""
+        if new_leader:
+            print(f"[{self._udp_addr_slug.decode()}] New leader: {new_leader[0]}:{new_leader[1]}")
+        else:
+            print(f"[{self._udp_addr_slug.decode()}] No leader currently")
     
     def _get_member_count(self) -> int:
         """Get the current number of known members."""
@@ -1038,7 +1591,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
             if include_piggyback:
                 message = message + self.get_piggyback_data()
             
-            self._tasks.run(
+            self._task_runner.run(
                 self.send,
                 node,
                 message,
@@ -1179,7 +1732,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         # and wait for the corresponding response. For now, we use
         # a simplified version that sends and waits.
         try:
-            self._tasks.run(
+            self._task_runner.run(
                 self.send,
                 target,
                 message,
@@ -1202,6 +1755,30 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         self_addr = self._get_self_udp_addr()
         members = [node for node in nodes.keys() if node != self_addr]
         self._probe_scheduler.update_members(members)
+    
+    async def start_leader_election(self) -> None:
+        """Start the leader election process."""
+        # Setup callbacks (needs server to be started)
+        self._setup_leader_election()
+        
+        # Start the election loop
+        await self._leader_election.start()
+    
+    async def stop_leader_election(self) -> None:
+        """Stop the leader election process."""
+        await self._leader_election.stop()
+    
+    def get_current_leader(self) -> tuple[str, int] | None:
+        """Get the current leader, if known."""
+        return self._leader_election.get_current_leader()
+    
+    def is_leader(self) -> bool:
+        """Check if this node is the current leader."""
+        return self._leader_election.state.is_leader()
+    
+    def get_leadership_status(self) -> dict:
+        """Get current leadership status for debugging."""
+        return self._leader_election.get_status()
 
     async def increase_failure_detector(self, event_type: str = 'probe_timeout'):
         """
@@ -1428,7 +2005,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         
         for proxy in proxies:
             probe.add_proxy(proxy)
-            self._tasks.run(
+            self._task_runner.run(
                 self.send,
                 proxy,
                 msg,
@@ -1481,7 +2058,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         # Broadcast to all known nodes
         for node in nodes:
             if node != self_addr:
-                self._tasks.run(
+                self._task_runner.run(
                     self.send,
                     node,
                     msg,
@@ -1513,7 +2090,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         
         for node in nodes:
             if node != self_addr and node != target:
-                self._tasks.run(
+                self._task_runner.run(
                     self.send,
                     node,
                     msg,
@@ -1560,7 +2137,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         
         # Store the pending request (implementation depends on framework)
         # For now, we use the send mechanism and hope for a response
-        self._tasks.run(
+        self._task_runner.run(
             self.send,
             target,
             message,
@@ -1716,7 +2293,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
                         # Tell the suspect node to forward an ack.
-                        self._tasks.run(
+                        self._task_runner.run(
                             self.send,
                             target,
                             b'ack>' + source_addr.encode(),
@@ -1849,6 +2426,116 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                                 await self.broadcast_suspicion(target, msg_incarnation)
                     
                     return b'ack>' + self._udp_addr_slug
+                
+                # Leadership messages
+                case b'leader-claim':
+                    # Candidate is claiming leadership
+                    # Format: leader-claim:term:lhm>candidate_addr
+                    msg_parts = message.split(b':', maxsplit=2)
+                    term = 0
+                    candidate_lhm = 0
+                    if len(msg_parts) >= 2:
+                        try:
+                            term = int(msg_parts[1].decode())
+                        except ValueError:
+                            pass
+                    if len(msg_parts) >= 3:
+                        try:
+                            candidate_lhm = int(msg_parts[2].decode())
+                        except ValueError:
+                            pass
+                    
+                    if target:
+                        # Process the claim and maybe vote
+                        vote_msg = self._leader_election.handle_claim(target, term, candidate_lhm)
+                        if vote_msg:
+                            # Send vote back to candidate
+                            self._task_runner.run(
+                                self.send,
+                                target,
+                                vote_msg,
+                                timeout=self.get_lhm_adjusted_timeout(
+                                    self._context.read('current_timeout')
+                                ),
+                            )
+                    
+                    return b'ack>' + self._udp_addr_slug
+                
+                case b'leader-vote':
+                    # Vote received for our candidacy
+                    # Format: leader-vote:term>candidate_addr
+                    msg_parts = message.split(b':', maxsplit=1)
+                    term = 0
+                    if len(msg_parts) >= 2:
+                        try:
+                            term = int(msg_parts[1].decode())
+                        except ValueError:
+                            pass
+                    
+                    # Record the vote
+                    if self._leader_election.handle_vote(addr, term):
+                        # We won the election!
+                        self._leader_election.state.become_leader(term)
+                        self._leader_election.state.current_leader = self._get_self_udp_addr()
+                        
+                        # Announce victory
+                        self_addr = self._get_self_udp_addr()
+                        elected_msg = (
+                            b'leader-elected:' +
+                            str(term).encode() + b'>' +
+                            f'{self_addr[0]}:{self_addr[1]}'.encode()
+                        )
+                        self._broadcast_leadership_message(elected_msg)
+                    
+                    return b'ack>' + self._udp_addr_slug
+                
+                case b'leader-elected':
+                    # New leader announced
+                    # Format: leader-elected:term>leader_addr
+                    msg_parts = message.split(b':', maxsplit=1)
+                    term = 0
+                    if len(msg_parts) >= 2:
+                        try:
+                            term = int(msg_parts[1].decode())
+                        except ValueError:
+                            pass
+                    
+                    if target:
+                        self._leader_election.handle_elected(target, term)
+                    
+                    return b'ack>' + self._udp_addr_slug
+                
+                case b'leader-heartbeat':
+                    # Leader heartbeat received
+                    # Format: leader-heartbeat:term>leader_addr
+                    msg_parts = message.split(b':', maxsplit=1)
+                    term = 0
+                    if len(msg_parts) >= 2:
+                        try:
+                            term = int(msg_parts[1].decode())
+                        except ValueError:
+                            pass
+                    
+                    if target:
+                        self._leader_election.handle_heartbeat(target, term)
+                    
+                    return b'ack>' + self._udp_addr_slug
+                
+                case b'leader-stepdown':
+                    # Leader stepping down
+                    # Format: leader-stepdown:term>leader_addr
+                    msg_parts = message.split(b':', maxsplit=1)
+                    term = 0
+                    if len(msg_parts) >= 2:
+                        try:
+                            term = int(msg_parts[1].decode())
+                        except ValueError:
+                            pass
+                    
+                    if target:
+                        self._leader_election.handle_stepdown(target, term)
+                    
+                    return b'ack>' + self._udp_addr_slug
                     
                 case _:
                     return b'nack'
@@ -1856,35 +2543,3 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         except Exception:
             import traceback
             print(traceback.format_exc())
-
-
-async def run():
-    server = TestServer(
-        '127.0.0.1',
-        8667,
-        8668,
-        Env(
-            MERCURY_SYNC_REQUEST_TIMEOUT='1s',
-        ),
-    )
-
-    await server.start_server(init_context={
-        'max_probe_timeout': 10,
-        'min_probe_timeout': 1,
-        'current_timeout': 1,
-        'nodes': defaultdict(asyncio.Queue),
-        'udp_poll_interval': 1,
-        # Suspicion timeout settings (Lifeguard)
-        'suspicion_min_timeout': 1.0,
-        'suspicion_max_timeout': 10.0,
-    })
-    
-    loop = asyncio.get_event_loop()
-    waiter = loop.create_future()
-
-    await waiter
-
-    await server.shutdown()
-
-
-asyncio.run(run())
