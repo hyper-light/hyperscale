@@ -1,5 +1,6 @@
 import asyncio
 import msgspec
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Literal
@@ -98,11 +99,144 @@ class LocalHealthMultiplier:
         self.score = 0
 
 
+@dataclass
+class NodeState:
+    """
+    Tracks the state of a known node in the SWIM membership.
+    
+    Includes status, incarnation number, and timing information
+    for the suspicion subprotocol.
+    """
+    status: Status = b'OK'
+    incarnation: int = 0
+    last_update_time: float = 0.0
+    
+    def update(self, new_status: Status, new_incarnation: int, timestamp: float) -> bool:
+        """
+        Update node state if the new information is fresher.
+        Returns True if the state was updated, False if ignored.
+        
+        Per SWIM protocol:
+        - Higher incarnation always wins
+        - Same incarnation: DEAD > SUSPECT > OK
+        - Lower incarnation is always ignored
+        """
+        if new_incarnation > self.incarnation:
+            self.status = new_status
+            self.incarnation = new_incarnation
+            self.last_update_time = timestamp
+            return True
+        elif new_incarnation == self.incarnation:
+            # Same incarnation - apply status priority
+            status_priority = {b'OK': 0, b'JOIN': 0, b'SUSPECT': 1, b'DEAD': 2}
+            if status_priority.get(new_status, 0) > status_priority.get(self.status, 0):
+                self.status = new_status
+                self.last_update_time = timestamp
+                return True
+        return False
+
+
+@dataclass 
+class IncarnationTracker:
+    """
+    Tracks incarnation numbers for SWIM protocol.
+    
+    Each node maintains:
+    - Its own incarnation number (incremented on refutation)
+    - Known incarnation numbers for all other nodes
+    
+    Incarnation numbers are used to:
+    - Order messages about the same node
+    - Allow refutation of false suspicions
+    - Prevent old messages from overriding newer state
+    """
+    self_incarnation: int = 0
+    node_states: dict[tuple[str, int], NodeState] = field(default_factory=dict)
+    
+    def get_self_incarnation(self) -> int:
+        """Get current incarnation number for this node."""
+        return self.self_incarnation
+    
+    def increment_self_incarnation(self) -> int:
+        """
+        Increment own incarnation number.
+        Called when refuting a suspicion about ourselves.
+        Returns the new incarnation number.
+        """
+        self.self_incarnation += 1
+        return self.self_incarnation
+    
+    def get_node_state(self, node: tuple[str, int]) -> NodeState | None:
+        """Get the current state for a known node."""
+        return self.node_states.get(node)
+    
+    def get_node_incarnation(self, node: tuple[str, int]) -> int:
+        """Get the incarnation number for a node, or 0 if unknown."""
+        state = self.node_states.get(node)
+        return state.incarnation if state else 0
+    
+    def update_node(
+        self, 
+        node: tuple[str, int], 
+        status: Status, 
+        incarnation: int,
+        timestamp: float,
+    ) -> bool:
+        """
+        Update the state of a node.
+        Returns True if the state was updated, False if the message was stale.
+        """
+        if node not in self.node_states:
+            self.node_states[node] = NodeState(
+                status=status,
+                incarnation=incarnation,
+                last_update_time=timestamp,
+            )
+            return True
+        return self.node_states[node].update(status, incarnation, timestamp)
+    
+    def remove_node(self, node: tuple[str, int]) -> bool:
+        """Remove a node from tracking. Returns True if it existed."""
+        if node in self.node_states:
+            del self.node_states[node]
+            return True
+        return False
+    
+    def get_all_nodes(self) -> list[tuple[tuple[str, int], NodeState]]:
+        """Get all known nodes and their states."""
+        return list(self.node_states.items())
+    
+    def is_message_fresh(
+        self, 
+        node: tuple[str, int], 
+        incarnation: int, 
+        status: Status,
+    ) -> bool:
+        """
+        Check if a message about a node is fresh (should be processed).
+        
+        A message is fresh if:
+        - We don't know about the node yet
+        - It has a higher incarnation number
+        - Same incarnation but higher priority status
+        """
+        state = self.node_states.get(node)
+        if state is None:
+            return True
+        if incarnation > state.incarnation:
+            return True
+        if incarnation == state.incarnation:
+            status_priority = {b'OK': 0, b'JOIN': 0, b'SUSPECT': 1, b'DEAD': 2}
+            return status_priority.get(status, 0) > status_priority.get(state.status, 0)
+        return False
+
+
 class TestServer(MercurySyncBaseServer[Ctx]):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._local_health = LocalHealthMultiplier()
+        self._incarnation_tracker = IncarnationTracker()
 
     def get_other_nodes(self, node: tuple[str, int]):
         target_host, target_port = node
@@ -178,6 +312,74 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         When node is unhealthy, timeouts are extended to reduce false positives.
         """
         return base_timeout * self._local_health.get_multiplier()
+    
+    def get_self_incarnation(self) -> int:
+        """Get this node's current incarnation number."""
+        return self._incarnation_tracker.get_self_incarnation()
+    
+    def increment_incarnation(self) -> int:
+        """Increment and return this node's incarnation number (for refutation)."""
+        return self._incarnation_tracker.increment_self_incarnation()
+    
+    def encode_message_with_incarnation(
+        self, 
+        msg_type: bytes, 
+        target: tuple[str, int] | None = None,
+        incarnation: int | None = None,
+    ) -> bytes:
+        """
+        Encode a SWIM message with incarnation number.
+        Format: msg_type:incarnation>target_host:target_port
+        """
+        inc = incarnation if incarnation is not None else self.get_self_incarnation()
+        msg = msg_type + b':' + str(inc).encode()
+        if target:
+            msg += b'>' + f'{target[0]}:{target[1]}'.encode()
+        return msg
+    
+    def decode_message_with_incarnation(
+        self, 
+        data: bytes,
+    ) -> tuple[bytes, int, tuple[str, int] | None]:
+        """
+        Decode a SWIM message with incarnation number.
+        Returns: (msg_type, incarnation, target or None)
+        """
+        # Split on '>' first to separate message from target
+        parts = data.split(b'>', maxsplit=1)
+        msg_part = parts[0]
+        
+        target = None
+        if len(parts) > 1:
+            target_str = parts[1].decode()
+            host, port = target_str.split(':', maxsplit=1)
+            target = (host, int(port))
+        
+        # Split message part to get type and incarnation
+        msg_parts = msg_part.split(b':', maxsplit=1)
+        msg_type = msg_parts[0]
+        incarnation = int(msg_parts[1].decode()) if len(msg_parts) > 1 else 0
+        
+        return msg_type, incarnation, target
+    
+    def is_message_fresh(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        status: Status,
+    ) -> bool:
+        """Check if a message about a node should be processed."""
+        return self._incarnation_tracker.is_message_fresh(node, incarnation, status)
+    
+    def update_node_state(
+        self,
+        node: tuple[str, int],
+        status: Status,
+        incarnation: int,
+        timestamp: float,
+    ) -> bool:
+        """Update the state of a node. Returns True if state changed."""
+        return self._incarnation_tracker.update_node(node, status, incarnation, timestamp)
 
     @udp.send('receive')
     async def send(
