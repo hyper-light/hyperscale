@@ -54,7 +54,15 @@ class GossipBuffer:
     _stale_removed_count: int = 0
     _size_limited_count: int = 0  # Times we hit size limit
     _oversized_updates_count: int = 0  # Individual updates that were too large
+    _overflow_count: int = 0  # Times we had to evict due to capacity
     
+    # Callbacks
+    _on_overflow: Any = None  # Callable[[int, int], None] - (evicted, capacity)
+    
+    def set_overflow_callback(self, callback: Any) -> None:
+        """Set callback to be called when buffer overflows and eviction occurs."""
+        self._on_overflow = callback
+
     def add_update(
         self,
         update_type: UpdateType,
@@ -279,6 +287,14 @@ class GossipBuffer:
             self._evicted_count += 1
             evicted += 1
         
+        if evicted > 0:
+            self._overflow_count += 1
+            if self._on_overflow:
+                try:
+                    self._on_overflow(evicted, self.max_updates)
+                except Exception:
+                    pass  # Don't let callback errors affect buffer operations
+        
         return evicted
     
     def cleanup_stale(self) -> int:
@@ -343,6 +359,8 @@ class GossipBuffer:
             'total_stale_removed': self._stale_removed_count,
             'size_limited_count': self._size_limited_count,
             'oversized_updates': self._oversized_updates_count,
+            'overflow_events': self._overflow_count,
             'max_piggyback_size': self.max_piggyback_size,
+            'max_updates': self.max_updates,
         }
 

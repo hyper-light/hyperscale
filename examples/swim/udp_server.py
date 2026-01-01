@@ -101,6 +101,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         self._suspicion_manager = SuspicionManager()
         self._indirect_probe_manager = IndirectProbeManager()
         self._gossip_buffer = GossipBuffer()
+        self._gossip_buffer.set_overflow_callback(self._on_gossip_overflow)
         self._probe_scheduler = ProbeScheduler()
         self._leader_election = LocalLeaderElection(dc_id=dc_id)
         
@@ -1325,6 +1326,21 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Remove from gossip buffer (old state)
         self._gossip_buffer.remove_node(node)
+    
+    def _on_gossip_overflow(self, evicted: int, capacity: int) -> None:
+        """
+        Called when gossip buffer overflows and updates are evicted.
+        
+        This indicates high churn or undersized buffer.
+        """
+        self._task_runner.run(
+            self.handle_error,
+            ResourceError(
+                f"Gossip buffer overflow: evicted {evicted} updates at capacity {capacity}",
+                evicted=evicted,
+                capacity=capacity,
+            ),
+        )
     
     def update_node_state(
         self,
