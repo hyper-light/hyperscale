@@ -30,6 +30,11 @@ from .core.errors import (
     UnexpectedError,
     QueueFullError,
     StaleMessageError,
+    ConnectionRefusedError as SwimConnectionRefusedError,
+    SplitBrainError,
+    ResourceError,
+    TaskOverloadError,
+    NotEligibleError,
 )
 from .core.error_handler import ErrorHandler, ErrorContext
 from .core.retry import (
@@ -896,10 +901,8 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     await self.handle_error(ProbeTimeoutError(target, timeout))
                     return False
             except OSError as e:
-                # Network error - wrap and handle
-                await self.handle_error(
-                    NetworkError(f"Probe to {target[0]}:{target[1]} failed: {e}", target=target)
-                )
+                # Network error - wrap with appropriate error type
+                await self.handle_error(self._make_network_error(e, target, "Probe"))
                 return False
             except Exception as e:
                 await self.handle_exception(e, f"probe_{target[0]}_{target[1]}")
@@ -1129,7 +1132,37 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         status: Status,
     ) -> bool:
         """Check if a message about a node should be processed."""
-        return self._incarnation_tracker.is_message_fresh(node, incarnation, status)
+        is_fresh = self._incarnation_tracker.is_message_fresh(node, incarnation, status)
+        if not is_fresh:
+            # Log stale message for monitoring (don't await since this is sync)
+            self._task_runner.run(
+                self.handle_error,
+                StaleMessageError(
+                    node,
+                    incarnation,
+                    self._incarnation_tracker.get_incarnation(node),
+                ),
+            )
+        return is_fresh
+    
+    def _make_network_error(
+        self,
+        e: OSError,
+        target: tuple[str, int],
+        operation: str,
+    ) -> NetworkError:
+        """
+        Create the appropriate NetworkError subclass based on OSError type.
+        
+        Returns ConnectionRefusedError for ECONNREFUSED, otherwise NetworkError.
+        """
+        import errno
+        if e.errno == errno.ECONNREFUSED:
+            return SwimConnectionRefusedError(target)
+        return NetworkError(
+            f"{operation} to {target[0]}:{target[1]} failed: {e}",
+            target=target,
+        )
     
     def update_node_state(
         self,
@@ -1292,12 +1325,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         except asyncio.TimeoutError:
             return False
         except OSError as e:
-            await self.handle_error(
-                NetworkError(
-                    f"Indirect probe to proxy {proxy[0]}:{proxy[1]} failed: {e}",
-                    target=proxy,
-                )
-            )
+            await self.handle_error(self._make_network_error(e, proxy, "Indirect probe"))
             return False
         except Exception as e:
             await self.handle_exception(e, f"indirect_probe_proxy_{proxy[0]}_{proxy[1]}")
@@ -1461,13 +1489,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         except OSError as e:
             # Network errors - log but don't fail broadcast
             if self._error_handler:
-                await self.handle_error(
-                    NetworkError(
-                        f"Broadcast to {node[0]}:{node[1]} failed: {e}",
-                        severity=ErrorSeverity.TRANSIENT,
-                        target=node,
-                    )
-                )
+                await self.handle_error(self._make_network_error(e, node, "Broadcast"))
             return False
         except Exception as e:
             await self.handle_exception(e, f"broadcast_to_{node[0]}_{node[1]}")
@@ -1497,13 +1519,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             )
             return False
         except OSError as e:
-            await self.handle_error(
-                NetworkError(
-                    f"Send to {target[0]}:{target[1]} failed: {e}",
-                    severity=ErrorSeverity.TRANSIENT,
-                    target=target,
-                )
-            )
+            await self.handle_error(self._make_network_error(e, target, "Send"))
             return False
         except Exception as e:
             await self.handle_exception(e, f"send_to_{target[0]}_{target[1]}")
@@ -1552,13 +1568,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             await self.handle_error(ProbeTimeoutError(target, timeout))
             return False
         except OSError as e:
-            await self.handle_error(
-                NetworkError(
-                    f"Probe to {target[0]}:{target[1]} failed: {e}",
-                    severity=ErrorSeverity.TRANSIENT,
-                    target=target,
-                )
-            )
+            await self.handle_error(self._make_network_error(e, target, "Probe"))
             return False
         except Exception as e:
             await self.handle_exception(e, f"probe_and_wait_{target[0]}_{target[1]}")
@@ -1898,6 +1908,16 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                                         node_host=self._host,
                                         node_port=self._udp_port,
                                         node_id=self._node_id.short,
+                                    )
+                                )
+                                # Also log via error handler for monitoring
+                                self_addr = self._get_self_udp_addr()
+                                await self.handle_error(
+                                    SplitBrainError(
+                                        self_addr,
+                                        target,
+                                        self._leader_election.state.current_term,
+                                        term,
                                     )
                                 )
                                 self._task_runner.run(self._leader_election._step_down)
