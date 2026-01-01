@@ -254,15 +254,14 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             except Exception as e:
                 # Don't let logging failure prevent degradation handling
                 # But still track the unexpected error
-                asyncio.create_task(
-                    self.handle_error(
-                        UnexpectedError(e, "degradation_logging")
-                    )
+                self._task_runner.run(
+                    self.handle_error,
+                    UnexpectedError(e, "degradation_logging"),
                 )
         
         # Check if we need to step down from leadership
         if policy.should_step_down and self._leader_election.state.is_leader():
-            asyncio.create_task(self._leader_election._step_down())
+            self._task_runner.run(self._leader_election._step_down)
     
     def get_degradation_stats(self) -> dict:
         """Get graceful degradation statistics."""
@@ -532,15 +531,14 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             queue.put_nowait(item)
             return True
         except asyncio.QueueFull:
-            # Schedule error logging as a task since we can't await in sync context
-            asyncio.create_task(
-                self.handle_error(
-                    QueueFullError(
-                        f"Node queue full for {node[0]}:{node[1]}, dropping update",
-                        node=node,
-                        queue_size=queue.qsize(),
-                    )
-                )
+            # Schedule error logging via task runner since we can't await in sync context
+            self._task_runner.run(
+                self.handle_error,
+                QueueFullError(
+                    f"Node queue full for {node[0]}:{node[1]}, dropping update",
+                    node=node,
+                    queue_size=queue.qsize(),
+                ),
             )
             return False
     
@@ -1902,7 +1900,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                                         node_id=self._node_id.short,
                                     )
                                 )
-                                asyncio.create_task(self._leader_election._step_down())
+                                self._task_runner.run(self._leader_election._step_down)
                         
                         self._leader_election.handle_heartbeat(target, term)
                     
