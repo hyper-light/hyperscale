@@ -168,7 +168,15 @@ class RetryResult:
     """Last error encountered (if failed)."""
     
     errors: list[Exception] = field(default_factory=list)
-    """All errors encountered."""
+    """
+    Errors encountered during retries.
+    
+    Bounded to last MAX_STORED_ERRORS to prevent memory growth
+    during extended retry sequences.
+    """
+    
+    # Maximum errors to store (prevents memory growth during extended retries)
+    MAX_STORED_ERRORS: int = 10
 
 
 async def retry_with_backoff(
@@ -291,6 +299,7 @@ async def retry_with_result(
     import time
     start_time = time.monotonic()
     errors: list[Exception] = []
+    max_stored_errors = RetryResult.MAX_STORED_ERRORS
     
     for attempt in range(policy.max_attempts):
         try:
@@ -304,6 +313,10 @@ async def retry_with_result(
             )
             
         except Exception as e:
+            # Bound stored errors to prevent memory growth
+            if len(errors) >= max_stored_errors:
+                # Keep most recent errors by removing oldest
+                errors.pop(0)
             errors.append(e)
             
             # Check if we should retry

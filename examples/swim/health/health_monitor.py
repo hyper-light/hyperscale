@@ -18,9 +18,13 @@ class TaskRunnerProtocol(Protocol):
     def run(self, call: Callable, *args, **kwargs) -> Any: ...
 
 
-@dataclass
+@dataclass(slots=True)
 class HealthSample:
-    """A single health measurement."""
+    """
+    A single health measurement.
+    
+    Uses __slots__ for memory efficiency since many instances are created.
+    """
     timestamp: float
     expected_sleep: float
     actual_sleep: float

@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from typing import Self
 
 
-@dataclass
+@dataclass(slots=True)
 class PiggybackUpdate:
     """
     A membership update to be piggybacked on probe messages.
@@ -20,6 +20,8 @@ class PiggybackUpdate:
     In SWIM, membership updates are disseminated by "piggybacking" them
     onto the protocol messages (probes, acks). This achieves O(log n)
     dissemination without additional message overhead.
+    
+    Uses __slots__ for memory efficiency since many instances are created.
     """
     update_type: UpdateType
     node: tuple[str, int]

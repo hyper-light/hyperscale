@@ -34,9 +34,13 @@ class AuditEventType(Enum):
     STATUS_CHANGED = "status_changed"
 
 
-@dataclass
+@dataclass(slots=True)
 class AuditEvent:
-    """A single audit event."""
+    """
+    A single audit event.
+    
+    Uses __slots__ for memory efficiency since many instances are created.
+    """
     event_type: AuditEventType
     timestamp: float
     node: tuple[str, int] | None

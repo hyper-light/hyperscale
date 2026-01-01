@@ -32,9 +32,22 @@ class ProbeScheduler:
         """
         Update the member list and reshuffle.
         Called when membership changes.
+        
+        Optimized to reuse existing list and shuffle in-place when possible.
         """
-        self.members = list(members)
+        # Check if we can do an incremental update
+        member_set = set(members)
+        current_set = set(self.members)
+        
+        if member_set == current_set:
+            # No change in membership, don't reshuffle
+            return
+        
+        # Full update needed - reuse list buffer if possible
+        self.members.clear()
+        self.members.extend(members)
         random.shuffle(self.members)
+        
         # Reset index if it's now out of bounds
         if self.probe_index >= len(self.members):
             self.probe_index = 0

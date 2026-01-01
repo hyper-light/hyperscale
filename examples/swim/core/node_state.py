@@ -6,13 +6,15 @@ from dataclasses import dataclass
 from .types import Status
 
 
-@dataclass
+@dataclass(slots=True)
 class NodeState:
     """
     Tracks the state of a known node in the SWIM membership.
     
     Includes status, incarnation number, and timing information
     for the suspicion subprotocol.
+    
+    Uses __slots__ for memory efficiency since many instances are created.
     """
     status: Status = b'OK'
     incarnation: int = 0
