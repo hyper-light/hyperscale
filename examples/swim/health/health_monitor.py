@@ -9,8 +9,13 @@ is under stress.
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable, Any
+from typing import Callable, Awaitable, Any, Protocol
 from collections import deque
+
+
+class TaskRunnerProtocol(Protocol):
+    """Protocol for TaskRunner to avoid circular imports."""
+    def run(self, call: Callable, *args, **kwargs) -> Any: ...
 
 
 @dataclass
@@ -88,6 +93,9 @@ class EventLoopHealthMonitor:
     _on_recovered: Callable[[], Awaitable[None] | None] | None = None
     _on_sample: Callable[[HealthSample], None] | None = None
     
+    # TaskRunner for managed async callbacks (optional)
+    _task_runner: TaskRunnerProtocol | None = None
+    
     # Stats
     _total_samples: int = 0
     _total_lag_samples: int = 0
@@ -103,12 +111,14 @@ class EventLoopHealthMonitor:
         on_critical_lag: Callable[[float], Awaitable[None] | None] | None = None,
         on_recovered: Callable[[], Awaitable[None] | None] | None = None,
         on_sample: Callable[[HealthSample], None] | None = None,
+        task_runner: TaskRunnerProtocol | None = None,
     ) -> None:
         """Set callback functions for health events."""
         self._on_lag_detected = on_lag_detected
         self._on_critical_lag = on_critical_lag
         self._on_recovered = on_recovered
         self._on_sample = on_sample
+        self._task_runner = task_runner
     
     async def start(self) -> None:
         """Start the health monitor."""
@@ -196,7 +206,7 @@ class EventLoopHealthMonitor:
             self._trigger_callback(self._on_recovered)
     
     def _trigger_callback(
-        self, 
+        self,
         callback: Callable[..., Awaitable[None] | None] | None,
         *args: Any,
     ) -> None:
@@ -207,9 +217,18 @@ class EventLoopHealthMonitor:
         try:
             result = callback(*args)
             if asyncio.iscoroutine(result):
-                asyncio.create_task(result)
-        except Exception:
-            pass  # Don't let callback errors affect monitoring
+                # Use TaskRunner if available, otherwise fall back
+                if self._task_runner:
+                    # Wrap the awaitable in a lambda for TaskRunner
+                    async def _run_callback():
+                        await result
+                    self._task_runner.run(_run_callback)
+                else:
+                    asyncio.create_task(result)
+        except Exception as e:
+            # Log callback errors for debugging
+            import sys
+            print(f"[HealthMonitor] Callback error: {e}", file=sys.stderr)
     
     @property
     def is_degraded(self) -> bool:

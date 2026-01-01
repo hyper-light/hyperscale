@@ -128,31 +128,31 @@ class RunFatal(Entry, kw_only=True):
     workflow_vus: int
     level: LogLevel = LogLevel.FATAL
 
-class ControllerTrace(Entry, kw_only=True):
+class ServerTrace(Entry, kw_only=True):
     node_id: int
     node_host: str
     node_port: int
     level: LogLevel = LogLevel.TRACE
 
-class ControllerDebug(Entry, kw_only=True):
+class ServerDebug(Entry, kw_only=True):
     node_id: int
     node_host: str
     node_port: int
     level: LogLevel = LogLevel.DEBUG
 
-class ControllerInfo(Entry, kw_only=True):
+class ServerInfo(Entry, kw_only=True):
     node_id: int
     node_host: str
     node_port: int
     level: LogLevel = LogLevel.INFO
 
-class ControllerError(Entry, kw_only=True):
+class ServerError(Entry, kw_only=True):
     node_id: int
     node_host: str
     node_port: int
     level: LogLevel = LogLevel.ERROR
 
-class ControllerFatal(Entry, kw_only=True):
+class ServerFatal(Entry, kw_only=True):
     node_id: int
     node_host: str
     node_port: int

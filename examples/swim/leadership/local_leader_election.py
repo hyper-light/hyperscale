@@ -5,12 +5,17 @@ Local leader election with pre-voting and split-brain prevention.
 import asyncio
 import random
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Any, Protocol
 
 from .leader_state import LeaderState
 from .leader_eligibility import LeaderEligibility
 from .flapping_detector import FlappingDetector
 from ..core.errors import ElectionError, ElectionTimeoutError, SplitBrainError, UnexpectedError, NotEligibleError
+
+
+class TaskRunnerProtocol(Protocol):
+    """Protocol for TaskRunner to avoid circular imports."""
+    def run(self, call: Callable, *args, **kwargs) -> Any: ...
 
 
 @dataclass
@@ -62,6 +67,9 @@ class LocalLeaderElection:
     # Error handler callback (set by owner)
     _on_error: Callable[[ElectionError], Awaitable[None]] | None = None
     
+    # TaskRunner for managed async operations (optional)
+    _task_runner: TaskRunnerProtocol | None = None
+    
     # Background tasks
     _heartbeat_task: asyncio.Task | None = field(default=None, repr=False)
     _election_task: asyncio.Task | None = field(default=None, repr=False)
@@ -76,6 +84,7 @@ class LocalLeaderElection:
         send_to_node: Callable[[tuple[str, int], bytes], None] | None = None,
         on_error: Callable[[ElectionError], Awaitable[None]] | None = None,
         should_refuse_leadership: Callable[[], bool] | None = None,
+        task_runner: TaskRunnerProtocol | None = None,
     ) -> None:
         """Set callback functions for election operations."""
         self._broadcast_message = broadcast_message
@@ -85,6 +94,7 @@ class LocalLeaderElection:
         self._on_error = on_error
         self._send_to_node = send_to_node
         self._should_refuse_leadership = should_refuse_leadership
+        self._task_runner = task_runner
     
     def get_election_timeout(self) -> float:
         """Get randomized election timeout, adjusted for flapping."""
@@ -225,14 +235,18 @@ class LocalLeaderElection:
         Used by sync methods like handle_claim that need to report errors.
         """
         if self._on_error:
-            try:
-                # Get the running loop and schedule the error handling
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._handle_error(error))
-            except RuntimeError:
-                # No running loop - fall back to stderr
-                import sys
-                print(f"[LocalLeaderElection] Error (no loop): {error}", file=sys.stderr)
+            # Use TaskRunner if available for proper lifecycle management
+            if self._task_runner:
+                self._task_runner.run(self._handle_error, error)
+            else:
+                try:
+                    # Fall back to raw asyncio if no TaskRunner
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._handle_error(error))
+                except RuntimeError:
+                    # No running loop - fall back to stderr
+                    import sys
+                    print(f"[LocalLeaderElection] Error (no loop): {error}", file=sys.stderr)
     
     async def _run_pre_vote(self) -> bool:
         """

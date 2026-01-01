@@ -48,6 +48,7 @@ from hyperscale.distributed_rewrite.server.hooks.task import (
 
 from hyperscale.distributed_rewrite.taskex import TaskRunner
 from hyperscale.distributed_rewrite.taskex.run import Run
+from hyperscale.logging import Logger
 
 do_patch()
 
@@ -76,6 +77,10 @@ class MercurySyncBaseServer(Generic[T]):
     ) -> None:
         self._tcp_clock = LamportClock()
         self._udp_clock = LamportClock()
+
+        self._tcp_logger: Logger | None = None
+        self._udp_logger: Logger | None = None
+
         self.env = env
 
         self._host = host
@@ -246,6 +251,12 @@ class MercurySyncBaseServer(Generic[T]):
         tcp_server_worker_socket: socket.socket | None = None,
         tcp_server_worker_server: asyncio.Server | None = None,
     ):
+        
+        if self._tcp_logger is None:
+            self._tcp_logger = Logger()
+
+        if self._udp_logger is None:
+            self._udp_logger = Logger()
         
         if init_context is None:
             init_context = {}

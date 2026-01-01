@@ -222,6 +222,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             on_lag_detected=self._on_event_loop_lag,
             on_critical_lag=self._on_event_loop_critical,
             on_recovered=self._on_event_loop_recovered,
+            task_runner=self._task_runner,
         )
     
     async def _on_event_loop_lag(self, lag_ratio: float) -> None:
@@ -435,6 +436,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             self_addr=self._get_self_udp_addr(),
             on_error=self._handle_election_error,
             should_refuse_leadership=lambda: self._degradation.should_refuse_leadership(),
+            task_runner=self._task_runner,
         )
     
     async def _handle_election_error(self, error) -> None:
