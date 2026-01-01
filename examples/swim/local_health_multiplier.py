@@ -32,8 +32,11 @@ class LocalHealthMultiplier:
     PROBE_TIMEOUT_PENALTY: int = 1
     REFUTATION_PENALTY: int = 2
     MISSED_NACK_PENALTY: int = 1
+    EVENT_LOOP_LAG_PENALTY: int = 1
+    EVENT_LOOP_CRITICAL_PENALTY: int = 2
     SUCCESSFUL_PROBE_REWARD: int = 1
     SUCCESSFUL_NACK_REWARD: int = 1
+    EVENT_LOOP_RECOVERED_REWARD: int = 1
     
     def increment(self, amount: int = 1) -> int:
         """
@@ -70,6 +73,18 @@ class LocalHealthMultiplier:
     def on_successful_nack(self) -> int:
         """Called when we successfully respond to a message."""
         return self.decrement(self.SUCCESSFUL_NACK_REWARD)
+    
+    def on_event_loop_lag(self) -> int:
+        """Called when event loop lag is detected (proactive)."""
+        return self.increment(self.EVENT_LOOP_LAG_PENALTY)
+    
+    def on_event_loop_critical(self) -> int:
+        """Called when event loop is critically overloaded."""
+        return self.increment(self.EVENT_LOOP_CRITICAL_PENALTY)
+    
+    def on_event_loop_recovered(self) -> int:
+        """Called when event loop recovers from degraded state."""
+        return self.decrement(self.EVENT_LOOP_RECOVERED_REWARD)
     
     def get_multiplier(self) -> float:
         """

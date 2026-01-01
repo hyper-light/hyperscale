@@ -35,6 +35,7 @@ from .errors import (
 )
 from .error_handler import ErrorHandler, ErrorContext
 from .retry import retry_with_backoff, PROBE_RETRY_POLICY
+from .health_monitor import EventLoopHealthMonitor
 
 
 class TestServer(MercurySyncBaseServer[Ctx]):
@@ -78,6 +79,9 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         
         # Initialize error handler (logger set up after server starts)
         self._error_handler: ErrorHandler | None = None
+        
+        # Event loop health monitor (proactive CPU saturation detection)
+        self._health_monitor = EventLoopHealthMonitor()
         
         # Cleanup configuration
         self._cleanup_interval: float = 30.0  # Seconds between cleanup runs
@@ -138,6 +142,46 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         """Integrate TaskRunner with SWIM components."""
         # Pass task runner to suspicion manager for timer management
         self._suspicion_manager.set_task_runner(self._task_runner)
+    
+    def _setup_health_monitor(self) -> None:
+        """Set up event loop health monitor with LHM integration."""
+        self._health_monitor.set_callbacks(
+            on_lag_detected=self._on_event_loop_lag,
+            on_critical_lag=self._on_event_loop_critical,
+            on_recovered=self._on_event_loop_recovered,
+        )
+    
+    async def _on_event_loop_lag(self, lag_ratio: float) -> None:
+        """Called when event loop lag is detected."""
+        # Proactively increment LHM before failures occur
+        await self.increase_failure_detector('event_loop_lag')
+    
+    async def _on_event_loop_critical(self, lag_ratio: float) -> None:
+        """Called when event loop is critically overloaded."""
+        # More aggressive LHM increment
+        await self.increase_failure_detector('event_loop_critical')
+        await self.increase_failure_detector('event_loop_critical')
+    
+    async def _on_event_loop_recovered(self) -> None:
+        """Called when event loop recovers from degraded state."""
+        await self.decrease_failure_detector('event_loop_recovered')
+    
+    async def start_health_monitor(self) -> None:
+        """Start the event loop health monitor."""
+        self._setup_health_monitor()
+        await self._health_monitor.start()
+    
+    async def stop_health_monitor(self) -> None:
+        """Stop the event loop health monitor."""
+        await self._health_monitor.stop()
+    
+    def get_health_stats(self) -> dict:
+        """Get event loop health statistics."""
+        return self._health_monitor.get_stats()
+    
+    def is_event_loop_degraded(self) -> bool:
+        """Check if event loop is in degraded state."""
+        return self._health_monitor.is_degraded
     
     async def start_cleanup(self) -> None:
         """Start the periodic cleanup task."""
@@ -398,6 +442,9 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         # Integrate task runner with SWIM components
         self._setup_task_runner_integration()
         
+        # Start health monitor for proactive CPU detection
+        await self.start_health_monitor()
+        
         # Start cleanup task
         await self.start_cleanup()
         
@@ -530,6 +577,10 @@ class TestServer(MercurySyncBaseServer[Ctx]):
             self._local_health.on_refutation_needed()
         elif event_type == 'missed_nack':
             self._local_health.on_missed_nack()
+        elif event_type == 'event_loop_lag':
+            self._local_health.on_event_loop_lag()
+        elif event_type == 'event_loop_critical':
+            self._local_health.on_event_loop_critical()
         else:
             self._local_health.increment()
 
@@ -539,6 +590,8 @@ class TestServer(MercurySyncBaseServer[Ctx]):
             self._local_health.on_successful_probe()
         elif event_type == 'successful_nack':
             self._local_health.on_successful_nack()
+        elif event_type == 'event_loop_recovered':
+            self._local_health.on_event_loop_recovered()
         else:
             self._local_health.decrement()
     

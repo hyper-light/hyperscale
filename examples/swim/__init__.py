@@ -88,6 +88,12 @@ from .resource_limits import (
     create_cleanup_config_from_context,
 )
 
+from .health_monitor import (
+    EventLoopHealthMonitor,
+    HealthSample,
+    measure_event_loop_lag,
+)
+
 from .local_health_multiplier import LocalHealthMultiplier
 from .node_state import NodeState
 from .incarnation_tracker import IncarnationTracker
@@ -159,6 +165,10 @@ __all__ = [
     'BoundedDict',
     'CleanupConfig',
     'create_cleanup_config_from_context',
+    # Health Monitoring
+    'EventLoopHealthMonitor',
+    'HealthSample',
+    'measure_event_loop_lag',
     # Components
     'LocalHealthMultiplier',
     'NodeState',
