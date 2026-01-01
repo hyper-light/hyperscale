@@ -72,33 +72,15 @@ async def run_server_1():
     # Wait a moment for server 2 to potentially start
     await asyncio.sleep(2)
     
-    # Try to join server 2
+    # Try to join server 2 using the new join_cluster method with retry support
     server_2_addr = ('127.0.0.1', 8673)
-    self_udp_addr = ('127.0.0.1', 8671)
     print(f"\n[Server 1] Attempting to join Server 2 at {server_2_addr}...")
     
-    try:
-        # Send join message with OUR address (the node joining)
-        join_msg = b'join>' + f'{self_udp_addr[0]}:{self_udp_addr[1]}'.encode()
-        server._task_runner.run(
-            server.send,
-            server_2_addr,
-            join_msg,
-            timeout=5,
-        )
-        print("[Server 1] Join request sent to Server 2")
-        
-        # Add server 2 to our known nodes
-        nodes = server._context.read('nodes')
-        nodes[server_2_addr].put_nowait((0, b'OK'))
-        server._probe_scheduler.add_member(server_2_addr)
-        server._incarnation_tracker.update_node(
-            server_2_addr, b'OK', 0, 0
-        )
-        print(f"[Server 1] Added Server 2 to membership list")
-        
-    except Exception as e:
-        print(f"[Server 1] Failed to join Server 2: {e}")
+    success = await server.join_cluster(server_2_addr, timeout=5.0)
+    if success:
+        print("[Server 1] Successfully joined cluster via Server 2")
+    else:
+        print("[Server 1] Failed to join Server 2 (will retry via probe cycle)")
     
     # Start the probe cycle in the background
     print("\n[Server 1] Starting probe cycle...")
