@@ -186,6 +186,14 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     
     async def handle_error(self, error: SwimError) -> None:
         """Handle a SWIM protocol error."""
+        # Track error by category
+        if error.category == ErrorCategory.NETWORK:
+            self._metrics.increment('network_errors')
+        elif error.category == ErrorCategory.PROTOCOL:
+            self._metrics.increment('protocol_errors')
+        elif error.category == ErrorCategory.RESOURCE:
+            self._metrics.increment('resource_errors')
+        
         if self._error_handler:
             await self._error_handler.handle(error)
     
@@ -516,6 +524,8 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     
     def _on_become_leader(self) -> None:
         """Called when this node becomes the leader."""
+        self._metrics.increment('elections_won')
+        self._metrics.increment('leadership_changes')
         self._udp_logger.log(
             ServerInfo(
                 message=f"[{self._udp_addr_slug.decode()}] Became LEADER (term {self._leader_election.state.current_term})",
@@ -527,6 +537,8 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     
     def _on_lose_leadership(self) -> None:
         """Called when this node loses leadership."""
+        self._metrics.increment('elections_lost')
+        self._metrics.increment('leadership_changes')
         self._udp_logger.log(
             ServerInfo(
                 message=f"[{self._node_id.short}] Lost leadership",
@@ -565,6 +577,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     
     def _on_suspicion_expired(self, node: tuple[str, int], incarnation: int) -> None:
         """Callback when a suspicion expires - mark node as DEAD."""
+        self._metrics.increment('suspicions_expired')
         self._incarnation_tracker.update_node(
             node, 
             b'DEAD', 
@@ -637,6 +650,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         incarnation: int,
     ) -> None:
         """Queue a membership update for piggybacking on future messages."""
+        self._metrics.increment('gossip_updates_sent')
         n_members = self._get_member_count()
         self._gossip_buffer.add_update(update_type, node, incarnation, n_members)
     
@@ -647,6 +661,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     def process_piggyback_data(self, data: bytes) -> None:
         """Process piggybacked membership updates received in a message."""
         updates = GossipBuffer.decode_piggyback(data)
+        self._metrics.increment('gossip_updates_received', len(updates))
         for update in updates:
             status_map = {
                 'alive': b'OK',
@@ -968,6 +983,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                 # Check if we got an ack (tracked via incarnation/node state)
                 node_state = self._incarnation_tracker.get_node_state(target)
                 if node_state and node_state.status == b'OK':
+                    self._metrics.increment('probes_received')  # Got response
                     return True
                 
                 attempt += 1
@@ -982,16 +998,20 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             except asyncio.TimeoutError:
                 attempt += 1
                 if attempt >= max_attempts:
+                    self._metrics.increment('probes_timeout')
                     await self.handle_error(ProbeTimeoutError(target, timeout))
                     return False
             except OSError as e:
                 # Network error - wrap with appropriate error type
+                self._metrics.increment('probes_failed')
                 await self.handle_error(self._make_network_error(e, target, "Probe"))
                 return False
             except Exception as e:
+                self._metrics.increment('probes_failed')
                 await self.handle_exception(e, f"probe_{target[0]}_{target[1]}")
                 return False
         
+        self._metrics.increment('probes_failed')
         return False
     
     def stop_probe_cycle(self) -> None:
@@ -1492,6 +1512,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         This indicates high churn or undersized buffer.
         """
+        self._metrics.increment('gossip_buffer_overflows')
         self._task_runner.run(
             self.handle_error,
             ResourceError(
@@ -1518,6 +1539,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         from_node: tuple[str, int],
     ) -> SuspicionState:
         """Start suspecting a node or add confirmation to existing suspicion."""
+        self._metrics.increment('suspicions_started')
         self._incarnation_tracker.update_node(
             node,
             b'SUSPECT',
@@ -1533,7 +1555,10 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         from_node: tuple[str, int],
     ) -> bool:
         """Add a confirmation to an existing suspicion."""
-        return self._suspicion_manager.confirm_suspicion(node, incarnation, from_node)
+        result = self._suspicion_manager.confirm_suspicion(node, incarnation, from_node)
+        if result:
+            self._metrics.increment('suspicions_confirmed')
+        return result
     
     def refute_suspicion(
         self,
@@ -1542,6 +1567,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     ) -> bool:
         """Refute a suspicion - the node proved it's alive."""
         if self._suspicion_manager.refute_suspicion(node, incarnation):
+            self._metrics.increment('suspicions_refuted')
             self._incarnation_tracker.update_node(
                 node,
                 b'OK',
@@ -1609,6 +1635,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             requester=self._get_self_udp_addr(),
             timeout=timeout,
         )
+        self._metrics.increment('indirect_probes_sent')
         
         target_addr = f'{target[0]}:{target[1]}'.encode()
         msg = b'ping-req:' + str(incarnation).encode() + b'>' + target_addr
@@ -2273,6 +2300,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'leader-heartbeat':
+                    self._metrics.increment('heartbeats_received')
                     term = await self._parse_term_safe(message, addr)
                     
                     # Check if we received our own heartbeat (shouldn't happen)
