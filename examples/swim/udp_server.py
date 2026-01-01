@@ -39,6 +39,7 @@ from .core.errors import (
 from .core.error_handler import ErrorHandler, ErrorContext
 from .core.resource_limits import BoundedDict
 from .core.metrics import Metrics
+from .core.audit import AuditLog, AuditEventType
 from .core.retry import (
     retry_with_backoff,
     retry_with_result,
@@ -128,6 +129,9 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Metrics collection
         self._metrics = Metrics()
+        
+        # Audit log for membership and leadership changes
+        self._audit_log = AuditLog(max_events=1000)
         
         # Event loop health monitor (proactive CPU saturation detection)
         self._health_monitor = EventLoopHealthMonitor()
@@ -1319,6 +1323,14 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Get all protocol metrics for monitoring."""
         return self._metrics.to_dict()
     
+    def get_audit_log(self) -> list[dict]:
+        """Get recent audit events for debugging and compliance."""
+        return self._audit_log.export()
+    
+    def get_audit_stats(self) -> dict:
+        """Get audit log statistics."""
+        return self._audit_log.get_stats()
+    
     async def _validate_target(
         self,
         target: tuple[str, int] | None,
@@ -1874,8 +1886,19 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         if self.udp_target_is_self(target):
                             return b'ack' + b'>' + self._udp_addr_slug
                         
+                        # Check if this is a rejoin
+                        is_rejoin = target in nodes
+                        
                         # Clear any stale state from previous membership
                         self._clear_stale_state(target)
+                        
+                        # Record audit event
+                        event_type = AuditEventType.NODE_REJOIN if is_rejoin else AuditEventType.NODE_JOINED
+                        self._audit_log.record(
+                            event_type,
+                            node=target,
+                            source=addr,
+                        )
                         
                         self._context.write(target, b'OK')
 
@@ -1908,6 +1931,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         if target not in nodes:
                             await self.increase_failure_detector('missed_nack')
                             return b'nack>' + self._udp_addr_slug
+                        
+                        # Record audit event
+                        self._audit_log.record(
+                            AuditEventType.NODE_LEFT,
+                            node=target,
+                            source=addr,
+                        )
                         
                         others = self.get_other_nodes(target)
                         base_timeout = self._context.read('current_timeout')

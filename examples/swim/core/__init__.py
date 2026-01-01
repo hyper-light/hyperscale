@@ -65,6 +65,12 @@ from .resource_limits import (
 
 from .metrics import Metrics
 
+from .audit import (
+    AuditEventType,
+    AuditEvent,
+    AuditLog,
+)
+
 
 __all__ = [
     # Types
@@ -117,5 +123,9 @@ __all__ = [
     'create_cleanup_config_from_context',
     # Metrics
     'Metrics',
+    # Audit
+    'AuditEventType',
+    'AuditEvent',
+    'AuditLog',
 ]
 
