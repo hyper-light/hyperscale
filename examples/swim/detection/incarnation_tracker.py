@@ -4,16 +4,14 @@ Incarnation number tracking for SWIM protocol.
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Any, Protocol
+from typing import Callable, Any
 from ..core.types import Status
 from ..core.node_state import NodeState
 
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
-class LoggerProtocol(Protocol):
-    """Protocol for logger to avoid circular imports."""
-    async def log(self, entry: Any) -> None: ...
+from ..core.protocols import LoggerProtocol
 
 # Maximum valid incarnation number (2^31 - 1 for wide compatibility)
 MAX_INCARNATION = 2**31 - 1

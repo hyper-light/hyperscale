@@ -7,16 +7,14 @@ in high-churn distributed environments.
 
 import time
 from dataclasses import dataclass, field
-from typing import TypeVar, Generic, Callable, Any, Protocol
+from typing import TypeVar, Generic, Callable, Any
 from collections import OrderedDict
 
 K = TypeVar('K')
 V = TypeVar('V')
 
 
-class LoggerProtocol(Protocol):
-    """Protocol for logger to avoid circular imports."""
-    async def log(self, entry: Any) -> None: ...
+from .protocols import LoggerProtocol
 
 
 @dataclass

@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field
 
 from .pending_indirect_probe import PendingIndirectProbe
+from ..core.protocols import LoggerProtocol
 
 
 @dataclass
@@ -40,6 +41,26 @@ class IndirectProbeManager:
     _started_count: int = 0
     _completed_count: int = 0
     _expired_count: int = 0
+    _rejected_count: int = 0  # Rejected due to max_pending limit
+    
+    # Logger for structured logging (optional)
+    _logger: LoggerProtocol | None = None
+    _node_host: str = ""
+    _node_port: int = 0
+    _node_id: int = 0
+    
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+        node_id: int,
+    ) -> None:
+        """Set logger for structured logging."""
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
     
     def start_indirect_probe(
         self,
@@ -57,6 +78,7 @@ class IndirectProbeManager:
             # Try cleanup first
             self.cleanup_expired()
             if len(self.pending_probes) >= self.max_pending:
+                self._rejected_count += 1
                 return None
         
         probe = PendingIndirectProbe(
@@ -163,5 +185,29 @@ class IndirectProbeManager:
             'total_started': self._started_count,
             'total_completed': self._completed_count,
             'total_expired': self._expired_count,
+            'total_rejected': self._rejected_count,
         }
+    
+    async def log_capacity_warning(self) -> bool:
+        """
+        Log a warning if probes are being rejected due to capacity.
+        
+        Returns True if a warning was logged.
+        Should be called periodically (e.g., from cleanup loop).
+        """
+        if not self._logger or self._rejected_count == 0:
+            return False
+        
+        try:
+            from hyperscale.logging.hyperscale_logging_models import ServerDebug
+            await self._logger.log(ServerDebug(
+                message=f"[IndirectProbeManager] Probes rejected due to capacity: {self._rejected_count} "
+                        f"(max_pending={self.max_pending}, pending={len(self.pending_probes)})",
+                node_host=self._node_host,
+                node_port=self._node_port,
+                node_id=self._node_id,
+            ))
+            return True
+        except Exception:
+            return False
 

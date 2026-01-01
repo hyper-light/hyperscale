@@ -11,14 +11,12 @@ When a node is overloaded (high LHM, event loop lag, etc.), it should:
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Any, Protocol
+from typing import Callable, Any
 
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
-class LoggerProtocol(Protocol):
-    """Protocol for logger to avoid circular imports."""
-    async def log(self, entry: Any) -> None: ...
+from ..core.protocols import LoggerProtocol
 
 
 class DegradationLevel(Enum):

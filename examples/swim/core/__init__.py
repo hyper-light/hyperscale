@@ -71,6 +71,11 @@ from .audit import (
     AuditLog,
 )
 
+from .protocols import (
+    LoggerProtocol,
+    TaskRunnerProtocol,
+)
+
 
 __all__ = [
     # Types
@@ -127,5 +132,8 @@ __all__ = [
     'AuditEventType',
     'AuditEvent',
     'AuditLog',
+    # Protocols
+    'LoggerProtocol',
+    'TaskRunnerProtocol',
 ]
 

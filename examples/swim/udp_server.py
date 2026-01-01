@@ -932,7 +932,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             await self.send(seed_node, join_msg, timeout=timeout)
             # Add seed to our known nodes
             self._context.write(seed_node, b'OK')
-            self._probe_scheduler.add_member(seed_node)
+            await self._probe_scheduler.add_member(seed_node)
             return True
         
         result = await retry_with_result(
@@ -975,7 +975,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
         members = [node for node in nodes.keys() if node != self_addr]
-        self._probe_scheduler.update_members(members)
+        await self._probe_scheduler.update_members(members)
         
         protocol_period = self._context.read('udp_poll_interval', 1.0)
         self._probe_scheduler.protocol_period = protocol_period
@@ -997,7 +997,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             await asyncio.sleep(1.0)  # Brief pause before next attempt
             return
         
-        target = self._probe_scheduler.get_next_target()
+        target = await self._probe_scheduler.get_next_target()
         if target is None:
             return
         
@@ -1100,12 +1100,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Stop the probe cycle."""
         self._probe_scheduler.stop()
     
-    def update_probe_scheduler_membership(self) -> None:
+    async def update_probe_scheduler_membership(self) -> None:
         """Update the probe scheduler with current membership."""
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
         members = [node for node in nodes.keys() if node != self_addr]
-        self._probe_scheduler.update_members(members)
+        await self._probe_scheduler.update_members(members)
     
     async def start_leader_election(self) -> None:
         """Start the leader election process."""
@@ -2183,7 +2183,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
 
                         await self._safe_queue_put(nodes[target], (clock_time, b'OK'), target)
                         
-                        self._probe_scheduler.add_member(target)
+                        await self._probe_scheduler.add_member(target)
                         self._incarnation_tracker.update_node(target, b'OK', 0, time.monotonic())
 
                         return b'ack>' + self._udp_addr_slug

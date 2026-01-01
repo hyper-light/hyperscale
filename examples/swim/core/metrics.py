@@ -5,8 +5,11 @@ Provides counters and gauges for monitoring key events.
 """
 
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Any
+
+from .protocols import LoggerProtocol
 
 
 @dataclass
@@ -19,7 +22,9 @@ class Metrics:
     - Gauges: Current state values (active members, suspicions, etc.)
     - Timing: Track operation durations
     
-    Thread-safe for concurrent updates.
+    Thread-safe for concurrent updates using threading.Lock.
+    This protects the read-modify-write pattern in increment() and
+    compound operations in reset().
     """
     
     # Probe metrics
@@ -72,19 +77,81 @@ class Metrics:
     # Start time for uptime calculation
     _start_time: float = field(default_factory=time.monotonic)
     
+    # Lock for thread-safe updates
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    
+    # Logger for structured logging (optional)
+    _logger: LoggerProtocol | None = None
+    _node_host: str = ""
+    _node_port: int = 0
+    _node_id: int = 0
+    
+    # Track saturated counters for monitoring
+    _saturated_counters: set[str] = field(default_factory=set, repr=False)
+    
     # Maximum counter value to prevent overflow
     MAX_COUNTER_VALUE: int = 2**31 - 1
     
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+        node_id: int,
+    ) -> None:
+        """Set logger for structured logging."""
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
+    
     def increment(self, metric: str, amount: int = 1) -> None:
         """Increment a counter metric with overflow protection."""
-        if hasattr(self, metric):
-            current = getattr(self, metric)
-            if current < self.MAX_COUNTER_VALUE:
-                setattr(self, metric, min(current + amount, self.MAX_COUNTER_VALUE))
+        with self._lock:
+            if hasattr(self, metric):
+                current = getattr(self, metric)
+                if current < self.MAX_COUNTER_VALUE:
+                    new_value = min(current + amount, self.MAX_COUNTER_VALUE)
+                    setattr(self, metric, new_value)
+                    # Track saturation for monitoring
+                    if new_value >= self.MAX_COUNTER_VALUE:
+                        self._saturated_counters.add(metric)
     
     def get(self, metric: str) -> int:
         """Get current value of a metric."""
         return getattr(self, metric, 0)
+    
+    def get_saturated_counters(self) -> set[str]:
+        """Get set of counters that have reached MAX_COUNTER_VALUE."""
+        with self._lock:
+            return self._saturated_counters.copy()
+    
+    async def log_saturation_warnings(self) -> int:
+        """
+        Log warnings for any saturated counters.
+        
+        Returns the number of saturated counters.
+        Should be called periodically (e.g., from cleanup loop).
+        """
+        if not self._logger or not self._saturated_counters:
+            return 0
+        
+        with self._lock:
+            saturated = list(self._saturated_counters)
+        
+        if saturated:
+            try:
+                from hyperscale.logging.hyperscale_logging_models import ServerDebug
+                await self._logger.log(ServerDebug(
+                    message=f"[Metrics] Counters saturated at MAX_COUNTER_VALUE: {', '.join(saturated)}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                ))
+            except Exception:
+                pass  # Don't let logging errors propagate
+        
+        return len(saturated)
     
     def uptime(self) -> float:
         """Get uptime in seconds."""
@@ -145,8 +212,9 @@ class Metrics:
     
     def reset(self) -> None:
         """Reset all counters to zero."""
-        for name in dir(self):
-            if not name.startswith('_') and isinstance(getattr(self, name), int):
-                setattr(self, name, 0)
-        self._start_time = time.monotonic()
+        with self._lock:
+            for name in dir(self):
+                if not name.startswith('_') and isinstance(getattr(self, name), int):
+                    setattr(self, name, 0)
+            self._start_time = time.monotonic()
 

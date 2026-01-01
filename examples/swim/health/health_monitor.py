@@ -9,20 +9,13 @@ is under stress.
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable, Any, Protocol
+from typing import Callable, Awaitable, Any
 from collections import deque
 
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
-class TaskRunnerProtocol(Protocol):
-    """Protocol for TaskRunner to avoid circular imports."""
-    def run(self, call: Callable, *args, **kwargs) -> Any: ...
-
-
-class LoggerProtocol(Protocol):
-    """Protocol for logger to avoid circular imports."""
-    async def log(self, entry: Any) -> None: ...
+from ..core.protocols import LoggerProtocol, TaskRunnerProtocol
 
 
 @dataclass(slots=True)

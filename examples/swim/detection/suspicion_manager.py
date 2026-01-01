@@ -5,14 +5,12 @@ Suspicion management for Lifeguard protocol.
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Any, Protocol
+from typing import Callable, Any
 
 from .suspicion_state import SuspicionState
 
 
-class LoggerProtocol(Protocol):
-    """Protocol for logger to avoid circular imports."""
-    def log(self, entry: Any) -> None: ...
+from ..core.protocols import LoggerProtocol
 
 
 @dataclass

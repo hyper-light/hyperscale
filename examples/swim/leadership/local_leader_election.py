@@ -5,7 +5,7 @@ Local leader election with pre-voting and split-brain prevention.
 import asyncio
 import random
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable, Any, Protocol
+from typing import Callable, Awaitable, Any
 
 from .leader_state import LeaderState
 from .leader_eligibility import LeaderEligibility
@@ -15,14 +15,7 @@ from ..core.errors import ElectionError, ElectionTimeoutError, SplitBrainError, 
 from hyperscale.logging.hyperscale_logging_models import ServerDebug
 
 
-class TaskRunnerProtocol(Protocol):
-    """Protocol for TaskRunner to avoid circular imports."""
-    def run(self, call: Callable, *args, **kwargs) -> Any: ...
-
-
-class LoggerProtocol(Protocol):
-    """Protocol for logger to avoid circular imports."""
-    async def log(self, entry: Any) -> None: ...
+from ..core.protocols import LoggerProtocol, TaskRunnerProtocol
 
 
 @dataclass

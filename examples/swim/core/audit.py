@@ -10,6 +10,8 @@ from enum import Enum
 from typing import Any
 from collections import deque
 
+from .protocols import LoggerProtocol
+
 
 class AuditEventType(Enum):
     """Types of auditable events."""
@@ -69,12 +71,32 @@ class AuditLog:
     
     _events: deque[AuditEvent] = field(default_factory=deque)
     _total_events: int = 0
+    _events_dropped: int = 0  # Track dropped events for monitoring
     
     # Maximum counter value to prevent overflow
     MAX_COUNTER_VALUE: int = 2**31 - 1
     
+    # Logger for structured logging (optional)
+    _logger: LoggerProtocol | None = None
+    _node_host: str = ""
+    _node_port: int = 0
+    _node_id: int = 0
+    
     def __post_init__(self):
         self._events = deque(maxlen=self.max_events)
+    
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+        node_id: int,
+    ) -> None:
+        """Set logger for structured logging."""
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
     
     def record(
         self,
@@ -83,6 +105,9 @@ class AuditLog:
         **details: Any,
     ) -> None:
         """Record an audit event."""
+        # Track if we're about to drop an event
+        at_capacity = len(self._events) >= self.max_events
+        
         event = AuditEvent(
             event_type=event_type,
             timestamp=time.time(),  # Wall-clock time for audit
@@ -90,8 +115,12 @@ class AuditLog:
             details=details,
         )
         self._events.append(event)
+        
         if self._total_events < self.MAX_COUNTER_VALUE:
             self._total_events += 1
+        
+        if at_capacity and self._events_dropped < self.MAX_COUNTER_VALUE:
+            self._events_dropped += 1
     
     def get_recent(self, count: int = 100) -> list[AuditEvent]:
         """Get the most recent events."""
@@ -135,12 +164,36 @@ class AuditLog:
             'current_events': len(self._events),
             'max_events': self.max_events,
             'total_recorded': self._total_events,
-            'events_dropped': max(0, self._total_events - self.max_events),
+            'events_dropped': self._events_dropped,
             'event_counts': event_counts,
         }
+    
+    async def log_capacity_warning(self) -> bool:
+        """
+        Log a warning if events are being dropped due to capacity.
+        
+        Returns True if a warning was logged.
+        Should be called periodically (e.g., from cleanup loop).
+        """
+        if not self._logger or self._events_dropped == 0:
+            return False
+        
+        try:
+            from hyperscale.logging.hyperscale_logging_models import ServerDebug
+            await self._logger.log(ServerDebug(
+                message=f"[AuditLog] Events dropped due to capacity: {self._events_dropped} "
+                        f"(max_events={self.max_events}, total_recorded={self._total_events})",
+                node_host=self._node_host,
+                node_port=self._node_port,
+                node_id=self._node_id,
+            ))
+            return True
+        except Exception:
+            return False
     
     def clear(self) -> None:
         """Clear the audit log."""
         self._events.clear()
         self._total_events = 0
+        self._events_dropped = 0
 

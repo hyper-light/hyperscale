@@ -10,7 +10,7 @@ Provides:
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable, Any, Protocol
+from typing import Callable, Awaitable, Any
 from collections import deque
 from enum import Enum, auto
 import asyncio
@@ -37,12 +37,7 @@ class CircuitState(Enum):
     HALF_OPEN = auto()   # Testing if recovery succeeded
 
 
-class LoggerProtocol(Protocol):
-    """Protocol for structured logging."""
-    
-    async def log(self, message: Any) -> None:
-        """Log a message."""
-        ...
+from .protocols import LoggerProtocol
 
 
 @dataclass
