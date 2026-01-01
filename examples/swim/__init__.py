@@ -102,7 +102,7 @@ from .suspicion_manager import SuspicionManager
 from .pending_indirect_probe import PendingIndirectProbe
 from .indirect_probe_manager import IndirectProbeManager
 from .piggyback_update import PiggybackUpdate
-from .gossip_buffer import GossipBuffer
+from .gossip_buffer import GossipBuffer, MAX_PIGGYBACK_SIZE, MAX_UDP_PAYLOAD
 from .probe_scheduler import ProbeScheduler
 from .leader_eligibility import LeaderEligibility
 from .leader_state import LeaderState
@@ -179,6 +179,8 @@ __all__ = [
     'IndirectProbeManager',
     'PiggybackUpdate',
     'GossipBuffer',
+    'MAX_PIGGYBACK_SIZE',
+    'MAX_UDP_PAYLOAD',
     'ProbeScheduler',
     'LeaderEligibility',
     'LeaderState',

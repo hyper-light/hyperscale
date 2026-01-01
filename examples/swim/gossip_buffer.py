@@ -5,9 +5,20 @@ Gossip buffer for SWIM membership update dissemination.
 import math
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from .types import UpdateType
 from .piggyback_update import PiggybackUpdate
+
+
+# UDP MTU considerations:
+# - Ethernet MTU: 1500 bytes
+# - IP header: 20 bytes (min)
+# - UDP header: 8 bytes
+# - Safe payload: ~1472 bytes
+# We leave headroom for the base message (probe, ack, etc.)
+MAX_PIGGYBACK_SIZE = 1200  # Safe size for piggybacked data
+MAX_UDP_PAYLOAD = 1400  # Maximum total UDP payload
 
 
 @dataclass
@@ -34,9 +45,15 @@ class GossipBuffer:
     stale_age_seconds: float = 60.0
     """Remove updates older than this (seconds)."""
     
+    # Message size limits
+    max_piggyback_size: int = MAX_PIGGYBACK_SIZE
+    """Maximum bytes for piggybacked data."""
+    
     # Stats
     _evicted_count: int = 0
     _stale_removed_count: int = 0
+    _size_limited_count: int = 0  # Times we hit size limit
+    _oversized_updates_count: int = 0  # Individual updates that were too large
     
     def add_update(
         self,
@@ -130,17 +147,80 @@ class GossipBuffer:
                 if not self.updates[update.node].should_broadcast():
                     del self.updates[update.node]
     
-    def encode_piggyback(self, max_count: int = 5) -> bytes:
+    def encode_piggyback(
+        self, 
+        max_count: int = 5, 
+        max_size: int | None = None,
+    ) -> bytes:
         """
         Get piggybacked updates as bytes to append to a message.
         Format: |update1|update2|update3
+        
+        Args:
+            max_count: Maximum number of updates to include.
+            max_size: Maximum total size in bytes (defaults to max_piggyback_size).
+        
+        Returns:
+            Encoded piggyback data respecting size limits.
         """
+        if max_size is None:
+            max_size = self.max_piggyback_size
+        
         updates = self.get_updates_to_piggyback(max_count)
         if not updates:
             return b''
         
-        self.mark_broadcasts(updates)
-        return b'|' + b'|'.join(u.to_bytes() for u in updates)
+        # Build result respecting size limit
+        result_parts: list[bytes] = []
+        total_size = 0  # Not counting leading '|' yet
+        included_updates: list[PiggybackUpdate] = []
+        
+        for update in updates:
+            encoded = update.to_bytes()
+            update_size = len(encoded) + 1  # +1 for separator '|'
+            
+            # Check if individual update is too large
+            if update_size > max_size:
+                self._oversized_updates_count += 1
+                continue
+            
+            # Check if adding this update would exceed limit
+            if total_size + update_size > max_size:
+                self._size_limited_count += 1
+                break
+            
+            result_parts.append(encoded)
+            total_size += update_size
+            included_updates.append(update)
+        
+        if not result_parts:
+            return b''
+        
+        self.mark_broadcasts(included_updates)
+        return b'|' + b'|'.join(result_parts)
+    
+    def encode_piggyback_with_base(
+        self,
+        base_message: bytes,
+        max_count: int = 5,
+    ) -> bytes:
+        """
+        Encode piggyback data considering the base message size.
+        
+        Ensures the total message (base + piggyback) doesn't exceed MTU.
+        
+        Args:
+            base_message: The core message (probe, ack, etc.)
+            max_count: Maximum number of updates to include.
+        
+        Returns:
+            Encoded piggyback data that fits within UDP limits.
+        """
+        remaining = MAX_UDP_PAYLOAD - len(base_message)
+        if remaining <= 0:
+            return b''
+        
+        return self.encode_piggyback(max_count, max_size=remaining)
     
     @staticmethod
     def decode_piggyback(data: bytes) -> list[PiggybackUpdate]:
@@ -241,11 +321,14 @@ class GossipBuffer:
             'pending_updates': len(self.updates),
         }
     
-    def get_stats(self) -> dict[str, int]:
+    def get_stats(self) -> dict[str, Any]:
         """Get buffer statistics for monitoring."""
         return {
             'pending_updates': len(self.updates),
             'total_evicted': self._evicted_count,
             'total_stale_removed': self._stale_removed_count,
+            'size_limited_count': self._size_limited_count,
+            'oversized_updates': self._oversized_updates_count,
+            'max_piggyback_size': self.max_piggyback_size,
         }
 

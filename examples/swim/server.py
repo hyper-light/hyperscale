@@ -21,7 +21,7 @@ from .incarnation_tracker import IncarnationTracker
 from .suspicion_state import SuspicionState
 from .suspicion_manager import SuspicionManager
 from .indirect_probe_manager import IndirectProbeManager
-from .gossip_buffer import GossipBuffer
+from .gossip_buffer import GossipBuffer, MAX_UDP_PAYLOAD
 from .probe_scheduler import ProbeScheduler
 from .local_leader_election import LocalLeaderElection
 from .errors import (
@@ -182,6 +182,34 @@ class TestServer(MercurySyncBaseServer[Ctx]):
     def is_event_loop_degraded(self) -> bool:
         """Check if event loop is in degraded state."""
         return self._health_monitor.is_degraded
+    
+    # === Message Size Helpers ===
+    
+    def _add_piggyback_safe(self, base_message: bytes) -> bytes:
+        """
+        Add piggybacked gossip updates to a message, respecting MTU limits.
+        
+        Args:
+            base_message: The core message to send.
+        
+        Returns:
+            Message with piggybacked updates that fits within UDP MTU.
+        """
+        if len(base_message) >= MAX_UDP_PAYLOAD:
+            # Base message already at limit, can't add piggyback
+            return base_message
+        
+        piggyback = self._gossip_buffer.encode_piggyback_with_base(base_message)
+        return base_message + piggyback
+    
+    def _check_message_size(self, message: bytes) -> bool:
+        """
+        Check if a message is safe to send via UDP.
+        
+        Returns:
+            True if message is within safe limits, False otherwise.
+        """
+        return len(message) <= MAX_UDP_PAYLOAD
     
     async def start_cleanup(self) -> None:
         """Start the periodic cleanup task."""
