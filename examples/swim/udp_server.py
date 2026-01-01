@@ -526,6 +526,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Called when this node becomes the leader."""
         self._metrics.increment('elections_won')
         self._metrics.increment('leadership_changes')
+        self_addr = self._get_self_udp_addr()
+        self._audit_log.record(
+            AuditEventType.ELECTION_WON,
+            node=self_addr,
+            term=self._leader_election.state.current_term,
+        )
         self._udp_logger.log(
             ServerInfo(
                 message=f"[{self._udp_addr_slug.decode()}] Became LEADER (term {self._leader_election.state.current_term})",
@@ -539,6 +545,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Called when this node loses leadership."""
         self._metrics.increment('elections_lost')
         self._metrics.increment('leadership_changes')
+        self_addr = self._get_self_udp_addr()
+        self._audit_log.record(
+            AuditEventType.ELECTION_LOST,
+            node=self_addr,
+            term=self._leader_election.state.current_term,
+        )
         self._udp_logger.log(
             ServerInfo(
                 message=f"[{self._node_id.short}] Lost leadership",
@@ -550,6 +562,11 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     
     def _on_leader_change(self, new_leader: tuple[str, int] | None) -> None:
         """Called when the known leader changes."""
+        self._audit_log.record(
+            AuditEventType.LEADER_CHANGED,
+            node=new_leader,
+            term=self._leader_election.state.current_term,
+        )
         if new_leader:
             self._udp_logger.log(
                 ServerInfo(
@@ -578,6 +595,11 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     def _on_suspicion_expired(self, node: tuple[str, int], incarnation: int) -> None:
         """Callback when a suspicion expires - mark node as DEAD."""
         self._metrics.increment('suspicions_expired')
+        self._audit_log.record(
+            AuditEventType.NODE_CONFIRMED_DEAD,
+            node=node,
+            incarnation=incarnation,
+        )
         self._incarnation_tracker.update_node(
             node, 
             b'DEAD', 
@@ -1540,6 +1562,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     ) -> SuspicionState:
         """Start suspecting a node or add confirmation to existing suspicion."""
         self._metrics.increment('suspicions_started')
+        self._audit_log.record(
+            AuditEventType.NODE_SUSPECTED,
+            node=node,
+            from_node=from_node,
+            incarnation=incarnation,
+        )
         self._incarnation_tracker.update_node(
             node,
             b'SUSPECT',
@@ -1568,6 +1596,11 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Refute a suspicion - the node proved it's alive."""
         if self._suspicion_manager.refute_suspicion(node, incarnation):
             self._metrics.increment('suspicions_refuted')
+            self._audit_log.record(
+                AuditEventType.NODE_REFUTED,
+                node=node,
+                incarnation=incarnation,
+            )
             self._incarnation_tracker.update_node(
                 node,
                 b'OK',
@@ -2339,8 +2372,17 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                                         node_id=self._node_id.short,
                                     )
                                 )
-                                # Also log via error handler for monitoring
+                                # Record split brain in audit log
                                 self_addr = self._get_self_udp_addr()
+                                self._audit_log.record(
+                                    AuditEventType.SPLIT_BRAIN_DETECTED,
+                                    node=self_addr,
+                                    other_leader=target,
+                                    self_term=self._leader_election.state.current_term,
+                                    other_term=term,
+                                )
+                                self._metrics.increment('split_brain_events')
+                                # Also log via error handler for monitoring
                                 await self.handle_error(
                                     SplitBrainError(
                                         self_addr,
