@@ -1,1 +1,1 @@
-from .aes_gcm import AESGCMFernet
+from .aes_gcm import AESGCMFernet, EncryptionError

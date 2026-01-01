@@ -36,11 +36,11 @@ from hyperscale.core.snowflake import Snowflake
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
-    ControllerDebug,
-    ControllerError,
-    ControllerFatal,
-    ControllerInfo,
-    ControllerTrace,
+    ServerDebug,
+    ServerError,
+    ServerFatal,
+    ServerInfo,
+    ServerTrace,
 )
 
 from .encryption import AESGCMFernet
@@ -236,21 +236,21 @@ class UDPProtocol(Generic[T, K]):
             path=logfile,
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
-                "trace": (ControllerTrace, default_config),
+                "trace": (ServerTrace, default_config),
                 "debug": (
-                    ControllerDebug,
+                    ServerDebug,
                     default_config,
                 ),
                 "info": (
-                    ControllerInfo,
+                    ServerInfo,
                     default_config,
                 ),
                 "error": (
-                    ControllerError,
+                    ServerError,
                     default_config,
                 ),
                 "fatal": (
-                    ControllerFatal,
+                    ServerFatal,
                     default_config,
                 ),
             },
@@ -431,21 +431,21 @@ class UDPProtocol(Generic[T, K]):
             path=logfile,
             template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
             models={
-                "trace": (ControllerTrace, default_config),
+                "trace": (ServerTrace, default_config),
                 "debug": (
-                    ControllerDebug,
+                    ServerDebug,
                     default_config,
                 ),
                 "info": (
-                    ControllerInfo,
+                    ServerInfo,
                     default_config,
                 ),
                 "error": (
-                    ControllerError,
+                    ServerError,
                     default_config,
                 ),
                 "fatal": (
-                    ControllerFatal,
+                    ServerFatal,
                     default_config,
                 ),
             },

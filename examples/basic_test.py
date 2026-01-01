@@ -18,12 +18,12 @@ from hyperscale.testing import URL, HTTP2Response, Headers
 #   -H 'user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
 class Test(Workflow):
-    vus = 20000
+    vus = 2000
     duration = "1m"
 
     @step()
     async def get_httpbin(
         self,
-        url: URL = 'https://www.thevirtualasylum.com/',
+        url: URL = 'https://httpbin.org/get',
     ) -> HTTP2Response:
-        return await self.client.http2.get(url)
+        return await self.client.http.get(url)

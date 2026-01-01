@@ -1,1 +1,1 @@
-from .aes_gcm import AESGCMFernet as AESGCMFernet
+from .aes_gcm import AESGCMFernet as AESGCMFernet, EncryptionError as EncryptionError

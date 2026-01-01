@@ -16,7 +16,7 @@ class Env(BaseModel):
     MERCURY_SYNC_CONNECT_SECONDS: StrictStr = "5s"
     MERCURY_SYNC_CLEANUP_INTERVAL: StrictStr = "1m"
     MERCURY_SYNC_MAX_CONCURRENCY: StrictInt = 2048
-    MERCURY_SYNC_AUTH_SECRET: StrictStr = "hyperscale"
+    MERCURY_SYNC_AUTH_SECRET: StrictStr = "hyperscale-dev-secret-change-in-prod"
     MERCURY_SYNC_LOGS_DIRECTORY: StrictStr = os.getcwd()
     MERCURY_SYNC_REQUEST_TIMEOUT: StrictStr = "1s"
     MERCURY_SYNC_CONNECT_TIMEOUT: StrictStr = "1s"

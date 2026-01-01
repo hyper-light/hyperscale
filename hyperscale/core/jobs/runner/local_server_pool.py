@@ -58,6 +58,8 @@ async def run_server(
             await server.acknowledge_start(leader_address)
 
         except Exception:
+            import traceback
+            print(traceback.format_exc())
             pass
         
         await server.run_forever()
@@ -73,6 +75,8 @@ async def run_server(
         BrokenProcessPool,
         AssertionError,
     ):
+        import traceback
+        print(traceback.format_exc())
         server.stop()
         await server.close()
 
@@ -99,6 +103,8 @@ async def run_server(
         )
 
     except Exception:
+        import traceback
+        print(traceback.format_exc())
         pass
 
 
@@ -168,6 +174,8 @@ def run_thread(
         asyncio.CancelledError,
         asyncio.InvalidStateError,
     ):
+        import traceback
+        print(traceback.format_exc())
         pass
 
 
