@@ -1288,42 +1288,59 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             return False
     
     async def _send_probe_and_wait(self, target: tuple[str, int]) -> bool:
-        """Send a probe to target and wait for response."""
+        """
+        Send a probe to target and wait for response indication.
+        
+        Since UDP is connectionless, we can't directly receive a response.
+        Instead, we send the probe and wait a short time for the node's
+        state to update (indicating an ack was processed).
+        
+        Returns True if target appears alive, False otherwise.
+        """
         base_timeout = self._context.read('current_timeout')
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
         
         target_addr = f'{target[0]}:{target[1]}'.encode()
         msg = b'probe>' + target_addr
         
+        # Get current node state before probe
+        state_before = self._incarnation_tracker.get_node_state(target)
+        last_seen_before = state_before.last_seen if state_before else 0
+        
         try:
-            response = await asyncio.wait_for(
-                self._send_and_receive(target, msg),
-                timeout=timeout,
-            )
-            return response and b'ack' in response
-        except (asyncio.TimeoutError, Exception):
+            # Send probe with error handling
+            await self.send(target, msg, timeout=timeout)
+            
+            # Wait for potential response to arrive
+            await asyncio.sleep(min(timeout * 0.7, 0.5))
+            
+            # Check if node state was updated (indicates response received)
+            state_after = self._incarnation_tracker.get_node_state(target)
+            if state_after:
+                # Node was updated more recently than before our probe
+                if state_after.last_seen > last_seen_before:
+                    return state_after.status == b'OK'
+                # Node status is OK
+                if state_after.status == b'OK':
+                    return True
+            
             return False
-    
-    async def _send_and_receive(
-        self, 
-        target: tuple[str, int], 
-        message: bytes,
-    ) -> bytes | None:
-        """Send a message and wait for a response."""
-        response_future: asyncio.Future[bytes] = asyncio.get_event_loop().create_future()
-        
-        self._task_runner.run(
-            self.send,
-            target,
-            message,
-            timeout=None,
-        )
-        
-        try:
-            await asyncio.sleep(0.1)
-            return None
-        except Exception:
-            return None
+            
+        except asyncio.TimeoutError:
+            await self.handle_error(ProbeTimeoutError(target, timeout))
+            return False
+        except OSError as e:
+            await self.handle_error(
+                NetworkError(
+                    f"Probe to {target[0]}:{target[1]} failed: {e}",
+                    severity=ErrorSeverity.TRANSIENT,
+                    target=target,
+                )
+            )
+            return False
+        except Exception as e:
+            await self.handle_exception(e, f"probe_and_wait_{target[0]}_{target[1]}")
+            return False
 
     @udp.send('receive')
     async def send(
