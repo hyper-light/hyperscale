@@ -75,6 +75,10 @@ class LocalLeaderElection:
     _election_task: asyncio.Task | None = field(default=None, repr=False)
     _running: bool = False
     
+    # Track fallback tasks created when TaskRunner not available
+    _pending_error_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
+    _unmanaged_tasks_created: int = 0
+    
     def set_callbacks(
         self,
         broadcast_message: Callable[[bytes], None],
@@ -163,6 +167,12 @@ class LocalLeaderElection:
             except asyncio.CancelledError:
                 pass
             self._election_task = None
+        
+        # Cancel any pending error handler tasks
+        for task in list(self._pending_error_tasks):
+            if not task.done():
+                task.cancel()
+        self._pending_error_tasks.clear()
     
     async def _election_loop(self) -> None:
         """Main election monitoring loop."""
@@ -240,9 +250,19 @@ class LocalLeaderElection:
                 self._task_runner.run(self._handle_error, error)
             else:
                 try:
-                    # Fall back to raw asyncio if no TaskRunner
+                    # Fall back to raw asyncio if no TaskRunner - track task for cleanup
                     loop = asyncio.get_running_loop()
-                    loop.create_task(self._handle_error(error))
+                    
+                    async def error_handler_wrapper():
+                        try:
+                            await self._handle_error(error)
+                        finally:
+                            # Remove self from pending tasks when done
+                            self._pending_error_tasks.discard(asyncio.current_task())
+                    
+                    task = loop.create_task(error_handler_wrapper())
+                    self._pending_error_tasks.add(task)
+                    self._unmanaged_tasks_created += 1
                 except RuntimeError:
                     # No running loop - fall back to stderr
                     import sys
@@ -289,6 +309,18 @@ class LocalLeaderElection:
             
             # Wait for pre-votes with timeout protection
             await asyncio.sleep(self.pre_vote_timeout)
+            
+            # Check if a valid leader was discovered during pre-vote
+            # This prevents continuing with election if we've already
+            # received a heartbeat from a healthy leader
+            if self.state.is_lease_valid() and self.state.current_leader:
+                # A leader emerged during our pre-vote - abort
+                return False
+            
+            # Check if our term became outdated (higher term seen)
+            if self.state.current_term >= new_term:
+                # Our pre-vote term is now stale - abort
+                return False
             
             # Check if we got enough pre-votes
             n_members = self._get_member_count() if self._get_member_count else 1

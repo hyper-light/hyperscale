@@ -15,6 +15,7 @@ from collections import deque
 from enum import Enum, auto
 import asyncio
 import time
+from hyperscale.logging.hyperscale_logging_models import ServerError
 
 from .errors import (
     SwimError,
@@ -342,7 +343,6 @@ class ErrorHandler:
         if self.logger:
             try:
                 # Try to use structured logging
-                from hyperscale.logging.hyperscale_logging_models import ServerError
                 self.logger.log(
                     ServerError(
                         message=str(error),

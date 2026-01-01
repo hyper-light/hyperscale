@@ -5,9 +5,14 @@ Suspicion management for Lifeguard protocol.
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Any
+from typing import Callable, Any, Protocol
 
 from .suspicion_state import SuspicionState
+
+
+class LoggerProtocol(Protocol):
+    """Protocol for logger to avoid circular imports."""
+    def log(self, entry: Any) -> None: ...
 
 
 @dataclass
@@ -26,6 +31,10 @@ class SuspicionManager:
     - max_suspicions: Maximum concurrent suspicions (default 1000)
     - orphaned_timeout: Cleanup suspicions with no timer after this time
     - Uses TaskRunner for timer management when available
+    
+    Thread safety:
+    - Uses asyncio.Lock to protect dict modifications from async timer callbacks
+    - All public methods that modify state are async to enable proper locking
     """
     suspicions: dict[tuple[str, int], SuspicionState] = field(default_factory=dict)
     min_timeout: float = 1.0
@@ -47,16 +56,50 @@ class SuspicionManager:
     _task_runner: Any | None = None
     _timer_tokens: dict[tuple[str, int], str] = field(default_factory=dict)
     
+    # Logger for error reporting (optional)
+    _logger: LoggerProtocol | None = None
+    _node_host: str = ""
+    _node_port: int = 0
+    _node_id: int = 0
+    
     # Stats for monitoring
     _expired_count: int = 0
     _refuted_count: int = 0
     _orphaned_cleanup_count: int = 0
     _race_avoided_count: int = 0  # Double-check prevented race condition
     _stale_tokens_cleaned: int = 0  # Tokens cleaned without matching suspicion
+    _lock_contention_count: int = 0  # Times lock was already held
     
     def __post_init__(self):
         """Initialize the lock after dataclass creation."""
         self._lock = asyncio.Lock()
+    
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+        node_id: int,
+    ) -> None:
+        """Set logger for error reporting."""
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
+    
+    def _log_warning(self, message: str) -> None:
+        """Log a warning message."""
+        if self._logger:
+            try:
+                from hyperscale.logging.hyperscale_logging_models import ServerDebug
+                self._logger.log(ServerDebug(
+                    message=message,
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                ))
+            except Exception:
+                pass  # Don't let logging errors propagate
     
     def set_callbacks(
         self,
@@ -90,7 +133,7 @@ class SuspicionManager:
             return self._n_members_getter()
         return 1
     
-    def start_suspicion(
+    async def start_suspicion(
         self,
         node: tuple[str, int],
         incarnation: int,
@@ -105,52 +148,56 @@ class SuspicionManager:
         Timeouts are adjusted by the Local Health Multiplier per Lifeguard.
         
         Returns None if max_suspicions limit reached and this is a new suspicion.
+        
+        Note: This method is async to allow proper lock synchronization with
+        async timer callbacks that also modify the suspicions dict.
         """
-        existing = self.suspicions.get(node)
-        
-        if existing:
-            if incarnation < existing.incarnation:
-                # Stale suspicion message, ignore
-                return existing
-            elif incarnation == existing.incarnation:
-                # Same suspicion, add confirmation
-                existing.add_confirmation(from_node)
-                # Recalculate timeout with new confirmation
-                self._reschedule_timer(existing)
-                return existing
+        async with self._lock:
+            existing = self.suspicions.get(node)
+            
+            if existing:
+                if incarnation < existing.incarnation:
+                    # Stale suspicion message, ignore
+                    return existing
+                elif incarnation == existing.incarnation:
+                    # Same suspicion, add confirmation
+                    existing.add_confirmation(from_node)
+                    # Recalculate timeout with new confirmation
+                    self._reschedule_timer(existing)
+                    return existing
+                else:
+                    # Higher incarnation suspicion, replace
+                    self._cancel_timer(existing)
             else:
-                # Higher incarnation suspicion, replace
-                self._cancel_timer(existing)
-        else:
-            # New suspicion - check limits
-            if len(self.suspicions) >= self.max_suspicions:
-                # Try to cleanup orphaned suspicions first
-                self.cleanup_orphaned()
-                
-                # Still at limit? Refuse new suspicion
+                # New suspicion - check limits
                 if len(self.suspicions) >= self.max_suspicions:
-                    return None
-        
-        # Apply LHM to timeouts - when we're unhealthy, extend timeouts
-        # to reduce false positives caused by our own slow processing
-        lhm_multiplier = self._get_lhm_multiplier()
-        
-        # Create new suspicion with LHM-adjusted timeouts
-        state = SuspicionState(
-            node=node,
-            incarnation=incarnation,
-            start_time=time.monotonic(),
-            min_timeout=self.min_timeout * lhm_multiplier,
-            max_timeout=self.max_timeout * lhm_multiplier,
-            n_members=self._get_n_members(),
-        )
-        state.add_confirmation(from_node)
-        self.suspicions[node] = state
-        
-        # Schedule expiration timer
-        self._schedule_timer(state)
-        
-        return state
+                    # Try to cleanup orphaned suspicions first
+                    self._cleanup_orphaned_unlocked()
+                    
+                    # Still at limit? Refuse new suspicion
+                    if len(self.suspicions) >= self.max_suspicions:
+                        return None
+            
+            # Apply LHM to timeouts - when we're unhealthy, extend timeouts
+            # to reduce false positives caused by our own slow processing
+            lhm_multiplier = self._get_lhm_multiplier()
+            
+            # Create new suspicion with LHM-adjusted timeouts
+            state = SuspicionState(
+                node=node,
+                incarnation=incarnation,
+                start_time=time.monotonic(),
+                min_timeout=self.min_timeout * lhm_multiplier,
+                max_timeout=self.max_timeout * lhm_multiplier,
+                n_members=self._get_n_members(),
+            )
+            state.add_confirmation(from_node)
+            self.suspicions[node] = state
+            
+            # Schedule expiration timer
+            self._schedule_timer(state)
+            
+            return state
     
     def _schedule_timer(self, state: SuspicionState) -> None:
         """Schedule the expiration timer for a suspicion."""
@@ -158,7 +205,7 @@ class SuspicionManager:
         
         async def expire_suspicion():
             await asyncio.sleep(timeout)
-            self._handle_expiration(state)
+            await self._handle_expiration(state)
         
         if self._task_runner:
             # Use TaskRunner for automatic cleanup
@@ -182,7 +229,7 @@ class SuspicionManager:
         if remaining > 0:
             async def expire_suspicion():
                 await asyncio.sleep(remaining)
-                self._handle_expiration(state)
+                await self._handle_expiration(state)
             
             if self._task_runner:
                 run = self._task_runner.run(
@@ -197,7 +244,14 @@ class SuspicionManager:
             else:
                 state._timer_task = asyncio.create_task(expire_suspicion())
         else:
-            self._handle_expiration(state)
+            # Schedule immediate expiration via task to maintain async contract
+            async def expire_now():
+                await self._handle_expiration(state)
+            
+            if self._task_runner:
+                self._task_runner.run(expire_now)
+            else:
+                asyncio.create_task(expire_now())
     
     def _cancel_timer(self, state: SuspicionState) -> None:
         """Cancel the timer for a suspicion."""
@@ -208,36 +262,40 @@ class SuspicionManager:
                 try:
                     # Use task runner's run method instead of raw create_task
                     self._task_runner.run(self._task_runner.cancel, token)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._log_warning(f"Failed to cancel timer via TaskRunner: {e}")
         
         # Also cancel the raw task if present
         state.cancel_timer()
     
-    def _handle_expiration(self, state: SuspicionState) -> None:
+    async def _handle_expiration(self, state: SuspicionState) -> None:
         """
         Handle suspicion expiration - declare node as DEAD.
         
-        Uses double-check pattern to prevent race conditions with _cancel_timer.
+        Uses lock + double-check pattern to prevent race conditions.
+        This is async to properly coordinate with other async methods.
         """
-        # Double-check that suspicion still exists (may have been cancelled)
-        if state.node not in self.suspicions:
-            self._race_avoided_count += 1
-            return
+        async with self._lock:
+            # Double-check that suspicion still exists (may have been cancelled)
+            if state.node not in self.suspicions:
+                self._race_avoided_count += 1
+                return
+            
+            # Verify this is the same suspicion (not a new one with same node)
+            current = self.suspicions.get(state.node)
+            if current is not state:
+                self._race_avoided_count += 1
+                return
+            
+            del self.suspicions[state.node]
+            self._timer_tokens.pop(state.node, None)
+            self._expired_count += 1
         
-        # Verify this is the same suspicion (not a new one with same node)
-        current = self.suspicions.get(state.node)
-        if current is not state:
-            self._race_avoided_count += 1
-            return
-        
-        del self.suspicions[state.node]
-        self._timer_tokens.pop(state.node, None)
-        self._expired_count += 1
+        # Call callback outside of lock to avoid deadlock
         if self._on_suspicion_expired:
             self._on_suspicion_expired(state.node, state.incarnation)
     
-    def confirm_suspicion(
+    async def confirm_suspicion(
         self,
         node: tuple[str, int],
         incarnation: int,
@@ -247,14 +305,15 @@ class SuspicionManager:
         Add a confirmation to an existing suspicion.
         Returns True if the suspicion exists and confirmation was added.
         """
-        state = self.suspicions.get(node)
-        if state and state.incarnation == incarnation:
-            if state.add_confirmation(from_node):
-                self._reschedule_timer(state)
-                return True
-        return False
+        async with self._lock:
+            state = self.suspicions.get(node)
+            if state and state.incarnation == incarnation:
+                if state.add_confirmation(from_node):
+                    self._reschedule_timer(state)
+                    return True
+            return False
     
-    def refute_suspicion(
+    async def refute_suspicion(
         self,
         node: tuple[str, int],
         incarnation: int,
@@ -263,13 +322,14 @@ class SuspicionManager:
         Refute a suspicion (node proved it's alive with higher incarnation).
         Returns True if a suspicion was cleared.
         """
-        state = self.suspicions.get(node)
-        if state and incarnation > state.incarnation:
-            self._cancel_timer(state)
-            del self.suspicions[node]
-            self._refuted_count += 1
-            return True
-        return False
+        async with self._lock:
+            state = self.suspicions.get(node)
+            if state and incarnation > state.incarnation:
+                self._cancel_timer(state)
+                del self.suspicions[node]
+                self._refuted_count += 1
+                return True
+            return False
     
     def get_suspicion(self, node: tuple[str, int]) -> SuspicionState | None:
         """Get the current suspicion state for a node, if any."""
@@ -279,28 +339,28 @@ class SuspicionManager:
         """Check if a node is currently suspected."""
         return node in self.suspicions
     
-    def clear_all(self) -> None:
+    async def clear_all(self) -> None:
         """Clear all suspicions (e.g., on shutdown)."""
-        for state in self.suspicions.values():
-            self._cancel_timer(state)
-            state.cleanup()  # Clean up confirmers set
-        self.suspicions.clear()
-        self._timer_tokens.clear()
+        async with self._lock:
+            for state in self.suspicions.values():
+                self._cancel_timer(state)
+                state.cleanup()  # Clean up confirmers set
+            self.suspicions.clear()
+            self._timer_tokens.clear()
     
     def get_suspicions_to_regossip(self) -> list[SuspicionState]:
         """Get suspicions that should be re-gossiped."""
+        # Read-only operation, no lock needed
         return [s for s in self.suspicions.values() if s.should_regossip()]
     
-    def cleanup_orphaned(self) -> int:
+    def _cleanup_orphaned_unlocked(self) -> tuple[int, list[tuple[tuple[str, int], int]]]:
         """
-        Cleanup suspicions with no active timer (orphaned).
+        Internal: Cleanup orphaned suspicions without acquiring lock.
         
-        This can happen if:
-        - Timer task raised an exception
-        - Timer was cancelled but suspicion wasn't removed
+        Must be called while already holding the lock.
         
         Returns:
-            Number of orphaned suspicions removed.
+            Tuple of (count, list of (node, incarnation) for expired nodes).
         """
         now = time.monotonic()
         cutoff = now - self.orphaned_timeout
@@ -316,18 +376,38 @@ class SuspicionManager:
                 if state.start_time < cutoff:
                     to_remove.append(node)
         
+        expired_nodes: list[tuple[tuple[str, int], int]] = []
         for node in to_remove:
             state = self.suspicions.pop(node)
             self._timer_tokens.pop(node, None)
             state.cleanup()  # Clean up confirmers set
             self._orphaned_cleanup_count += 1
-            # Treat as expired
-            if self._on_suspicion_expired:
-                self._on_suspicion_expired(state.node, state.incarnation)
+            expired_nodes.append((state.node, state.incarnation))
         
-        return len(to_remove)
+        return len(to_remove), expired_nodes
     
-    def cleanup_stale_tokens(self) -> int:
+    async def cleanup_orphaned(self) -> int:
+        """
+        Cleanup suspicions with no active timer (orphaned).
+        
+        This can happen if:
+        - Timer task raised an exception
+        - Timer was cancelled but suspicion wasn't removed
+        
+        Returns:
+            Number of orphaned suspicions removed.
+        """
+        async with self._lock:
+            count, expired_nodes = self._cleanup_orphaned_unlocked()
+        
+        # Call callbacks outside of lock to avoid deadlock
+        for node, incarnation in expired_nodes:
+            if self._on_suspicion_expired:
+                self._on_suspicion_expired(node, incarnation)
+        
+        return count
+    
+    async def cleanup_stale_tokens(self) -> int:
         """
         Remove timer tokens that have no matching suspicion.
         
@@ -338,26 +418,27 @@ class SuspicionManager:
         Returns:
             Number of stale tokens removed.
         """
-        stale_tokens = []
-        for node in self._timer_tokens:
-            if node not in self.suspicions:
-                stale_tokens.append(node)
-        
-        for node in stale_tokens:
-            self._timer_tokens.pop(node, None)
-            self._stale_tokens_cleaned += 1
-        
-        return len(stale_tokens)
+        async with self._lock:
+            stale_tokens = []
+            for node in self._timer_tokens:
+                if node not in self.suspicions:
+                    stale_tokens.append(node)
+            
+            for node in stale_tokens:
+                self._timer_tokens.pop(node, None)
+                self._stale_tokens_cleaned += 1
+            
+            return len(stale_tokens)
     
-    def cleanup(self) -> dict[str, int]:
+    async def cleanup(self) -> dict[str, int]:
         """
         Run all cleanup operations.
         
         Returns:
             Dict with cleanup stats.
         """
-        orphaned = self.cleanup_orphaned()
-        stale_tokens = self.cleanup_stale_tokens()
+        orphaned = await self.cleanup_orphaned()
+        stale_tokens = await self.cleanup_stale_tokens()
         
         return {
             'orphaned_removed': orphaned,

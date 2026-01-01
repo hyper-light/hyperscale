@@ -423,7 +423,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Cleanup suspicion manager (orphaned suspicions)
         async with ErrorContext(self._error_handler, "suspicion_cleanup"):
-            stats['suspicion'] = self._suspicion_manager.cleanup()
+            stats['suspicion'] = await self._suspicion_manager.cleanup()
         
         # Cleanup indirect probe manager
         async with ErrorContext(self._error_handler, "indirect_probe_cleanup"):
@@ -720,7 +720,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Get piggybacked membership updates to append to a message."""
         return self._gossip_buffer.encode_piggyback(max_updates)
     
-    def process_piggyback_data(self, data: bytes) -> None:
+    async def process_piggyback_data(self, data: bytes) -> None:
         """Process piggybacked membership updates received in a message."""
         updates = GossipBuffer.decode_piggyback(data)
         self._metrics.increment('gossip_updates_received', len(updates))
@@ -745,13 +745,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                 if update.update_type == 'suspect':
                     self_addr = self._get_self_udp_addr()
                     if update.node != self_addr:
-                        self.start_suspicion(
+                        await self.start_suspicion(
                             update.node,
                             update.incarnation,
                             self_addr,
                         )
                 elif update.update_type == 'alive':
-                    self.refute_suspicion(update.node, update.incarnation)
+                    await self.refute_suspicion(update.node, update.incarnation)
                 
                 self.queue_gossip_update(
                     update.update_type,
@@ -1014,7 +1014,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return
             
             self_addr = self._get_self_udp_addr()
-            self.start_suspicion(target, incarnation, self_addr)
+            await self.start_suspicion(target, incarnation, self_addr)
             await self.broadcast_suspicion(target, incarnation)
     
     async def _probe_with_timeout(
@@ -1545,7 +1545,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             return False
         return True
     
-    def _clear_stale_state(self, node: tuple[str, int]) -> None:
+    async def _clear_stale_state(self, node: tuple[str, int]) -> None:
         """
         Clear any stale state when a node rejoins.
         
@@ -1556,7 +1556,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """
         # Clear any active suspicion
         if node in self._suspicion_manager.suspicions:
-            self._suspicion_manager.refute_suspicion(
+            await self._suspicion_manager.refute_suspicion(
                 node,
                 self._incarnation_tracker.get_incarnation(node) + 1,
             )
@@ -1594,12 +1594,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Update the state of a node. Returns True if state changed."""
         return self._incarnation_tracker.update_node(node, status, incarnation, timestamp)
     
-    def start_suspicion(
+    async def start_suspicion(
         self,
         node: tuple[str, int],
         incarnation: int,
         from_node: tuple[str, int],
-    ) -> SuspicionState:
+    ) -> SuspicionState | None:
         """Start suspecting a node or add confirmation to existing suspicion."""
         self._metrics.increment('suspicions_started')
         self._audit_log.record(
@@ -1614,27 +1614,27 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             incarnation,
             time.monotonic(),
         )
-        return self._suspicion_manager.start_suspicion(node, incarnation, from_node)
+        return await self._suspicion_manager.start_suspicion(node, incarnation, from_node)
     
-    def confirm_suspicion(
+    async def confirm_suspicion(
         self,
         node: tuple[str, int],
         incarnation: int,
         from_node: tuple[str, int],
     ) -> bool:
         """Add a confirmation to an existing suspicion."""
-        result = self._suspicion_manager.confirm_suspicion(node, incarnation, from_node)
+        result = await self._suspicion_manager.confirm_suspicion(node, incarnation, from_node)
         if result:
             self._metrics.increment('suspicions_confirmed')
         return result
     
-    def refute_suspicion(
+    async def refute_suspicion(
         self,
         node: tuple[str, int],
         incarnation: int,
     ) -> bool:
         """Refute a suspicion - the node proved it's alive."""
-        if self._suspicion_manager.refute_suspicion(node, incarnation):
+        if await self._suspicion_manager.refute_suspicion(node, incarnation):
             self._metrics.increment('suspicions_refuted')
             self._audit_log.record(
                 AuditEventType.NODE_REFUTED,
@@ -2079,7 +2079,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             if piggyback_idx > 0:
                 main_data = data[:piggyback_idx]
                 piggyback_data = data[piggyback_idx:]
-                self.process_piggyback_data(piggyback_data)
+                await self.process_piggyback_data(piggyback_data)
                 data = main_data
 
             parsed = data.split(b'>', maxsplit=1)
@@ -2122,7 +2122,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         is_rejoin = target in nodes
                         
                         # Clear any stale state from previous membership
-                        self._clear_stale_state(target)
+                        await self._clear_stale_state(target)
                         
                         # Record audit event
                         event_type = AuditEventType.NODE_REJOIN if is_rejoin else AuditEventType.NODE_JOINED
@@ -2276,7 +2276,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     
                     if target:
                         if self.is_message_fresh(target, msg_incarnation, b'OK'):
-                            self.refute_suspicion(target, msg_incarnation)
+                            await self.refute_suspicion(target, msg_incarnation)
                             self.update_node_state(
                                 target, 
                                 b'OK', 
@@ -2297,7 +2297,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                             return b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
                         
                         if self.is_message_fresh(target, msg_incarnation, b'SUSPECT'):
-                            self.start_suspicion(target, msg_incarnation, addr)
+                            await self.start_suspicion(target, msg_incarnation, addr)
                             
                             suspicion = self._suspicion_manager.get_suspicion(target)
                             if suspicion and suspicion.should_regossip():
