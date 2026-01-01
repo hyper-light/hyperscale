@@ -932,6 +932,72 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                 await self.decrease_failure_detector('successful_probe')
         # If not alive, we wait for the probe to expire
     
+    async def broadcast_refutation(self) -> int:
+        """
+        Broadcast an alive message to refute any suspicions about this node.
+        
+        Per SWIM/Lifeguard protocol:
+        1. Increment our incarnation number
+        2. Broadcast alive message with new incarnation to all nodes
+        
+        Returns the new incarnation number.
+        """
+        # Increment incarnation to override any suspicion messages
+        new_incarnation = self.increment_incarnation()
+        
+        # Get all known nodes to broadcast to
+        nodes: Nodes = self._context.read('nodes')
+        self_addr = self._get_self_udp_addr()
+        
+        # Format: alive:incarnation>self_host:self_port
+        self_addr_bytes = f'{self_addr[0]}:{self_addr[1]}'.encode()
+        msg = b'alive:' + str(new_incarnation).encode() + b'>' + self_addr_bytes
+        
+        base_timeout = self._context.read('current_timeout')
+        timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        
+        # Broadcast to all known nodes
+        for node in nodes:
+            if node != self_addr:
+                self._tasks.run(
+                    self.send,
+                    node,
+                    msg,
+                    timeout=timeout,
+                )
+        
+        return new_incarnation
+    
+    async def broadcast_suspicion(
+        self, 
+        target: tuple[str, int], 
+        incarnation: int,
+    ) -> None:
+        """
+        Broadcast a suspicion about a node to all other members.
+        
+        Per SWIM protocol, suspicions are gossiped to spread 
+        the information and gather confirmations.
+        """
+        nodes: Nodes = self._context.read('nodes')
+        self_addr = self._get_self_udp_addr()
+        
+        # Format: suspect:incarnation>target_host:target_port
+        target_addr_bytes = f'{target[0]}:{target[1]}'.encode()
+        msg = b'suspect:' + str(incarnation).encode() + b'>' + target_addr_bytes
+        
+        base_timeout = self._context.read('current_timeout')
+        timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        
+        for node in nodes:
+            if node != self_addr and node != target:
+                self._tasks.run(
+                    self.send,
+                    node,
+                    msg,
+                    timeout=timeout,
+                )
+    
     async def _send_probe_and_wait(self, target: tuple[str, int]) -> bool:
         """
         Send a probe to target and wait for response.
@@ -1101,9 +1167,15 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                         nodes: Nodes = self._context.read('nodes')
 
                         if self.udp_target_is_self(target):
-                            # Refute - we're being probed, indicates someone suspects us
+                            # We're being probed - this indicates someone might suspect us
+                            # Increment our LHM (we might be slow)
                             await self.increase_failure_detector('refutation')
-                            return b'ack>' + self._udp_addr_slug
+                            
+                            # Broadcast refutation with new incarnation
+                            new_incarnation = await self.broadcast_refutation()
+                            
+                            # Return alive message with new incarnation
+                            return b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
                         
                         if target not in nodes:
                             # We missed something
@@ -1186,6 +1258,65 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                             # Target did not respond to this proxy
                             # Don't immediately fail - wait for other proxies or timeout
                             await self.handle_indirect_probe_response(target, is_alive=False)
+                    return b'ack>' + self._udp_addr_slug
+                
+                case b'alive':
+                    # Refutation message: a node is declaring itself alive
+                    # Message format: alive:incarnation>node_host:node_port
+                    # Parse incarnation from the message
+                    msg_parts = message.split(b':', maxsplit=1)
+                    msg_incarnation = 0
+                    if len(msg_parts) > 1:
+                        try:
+                            msg_incarnation = int(msg_parts[1].decode())
+                        except ValueError:
+                            pass
+                    
+                    if target:
+                        # Check if this refutes a current suspicion
+                        if self.is_message_fresh(target, msg_incarnation, b'OK'):
+                            # Refutation is valid - clear suspicion
+                            self.refute_suspicion(target, msg_incarnation)
+                            self.update_node_state(
+                                target, 
+                                b'OK', 
+                                msg_incarnation, 
+                                time.monotonic(),
+                            )
+                            await self.decrease_failure_detector('successful_probe')
+                    
+                    return b'ack>' + self._udp_addr_slug
+                
+                case b'suspect':
+                    # Suspicion message: another node suspects the target
+                    # Message format: suspect:incarnation>target_host:target_port
+                    # Parse incarnation from the message
+                    msg_parts = message.split(b':', maxsplit=1)
+                    msg_incarnation = 0
+                    if len(msg_parts) > 1:
+                        try:
+                            msg_incarnation = int(msg_parts[1].decode())
+                        except ValueError:
+                            pass
+                    
+                    if target:
+                        if self.udp_target_is_self(target):
+                            # We are the suspect! Broadcast refutation immediately
+                            await self.increase_failure_detector('refutation')
+                            new_incarnation = await self.broadcast_refutation()
+                            return b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
+                        
+                        # Check if this suspicion is fresh
+                        if self.is_message_fresh(target, msg_incarnation, b'SUSPECT'):
+                            # Record/confirm the suspicion
+                            self.start_suspicion(target, msg_incarnation, addr)
+                            
+                            # Re-gossip the suspicion if needed
+                            suspicion = self._suspicion_manager.get_suspicion(target)
+                            if suspicion and suspicion.should_regossip():
+                                suspicion.mark_regossiped()
+                                await self.broadcast_suspicion(target, msg_incarnation)
+                    
                     return b'ack>' + self._udp_addr_slug
                     
                 case _:
