@@ -72,11 +72,15 @@ class Metrics:
     # Start time for uptime calculation
     _start_time: float = field(default_factory=time.monotonic)
     
+    # Maximum counter value to prevent overflow
+    MAX_COUNTER_VALUE: int = 2**31 - 1
+    
     def increment(self, metric: str, amount: int = 1) -> None:
-        """Increment a counter metric."""
+        """Increment a counter metric with overflow protection."""
         if hasattr(self, metric):
             current = getattr(self, metric)
-            setattr(self, metric, current + amount)
+            if current < self.MAX_COUNTER_VALUE:
+                setattr(self, metric, min(current + amount, self.MAX_COUNTER_VALUE))
     
     def get(self, metric: str) -> int:
         """Get current value of a metric."""

@@ -40,7 +40,7 @@ class CircuitState(Enum):
 class LoggerProtocol(Protocol):
     """Protocol for structured logging."""
     
-    def log(self, message: Any) -> None:
+    async def log(self, message: Any) -> None:
         """Log a message."""
         ...
 
@@ -239,7 +239,7 @@ class ErrorHandler:
         5. Escalate fatal errors
         """
         # 1. Log with structured context
-        self._log_error(error)
+        await self._log_error(error)
         
         # 2. Update error stats
         stats = self._get_stats(error.category)
@@ -250,7 +250,7 @@ class ErrorHandler:
         
         # 4. Check circuit breaker and trigger recovery
         if stats.is_circuit_open:
-            self._log_circuit_open(error.category, stats)
+            await self._log_circuit_open(error.category, stats)
             await self._trigger_recovery(error.category)
         
         # 5. Fatal errors need escalation
@@ -351,12 +351,12 @@ class ErrorHandler:
             self._stats[category] = ErrorStats(**settings)
         return self._stats[category]
     
-    def _log_internal(self, message: str) -> None:
+    async def _log_internal(self, message: str) -> None:
         """Log an internal error handler issue using ServerDebug."""
         if self.logger:
             try:
                 from hyperscale.logging.hyperscale_logging_models import ServerDebug
-                self.logger.log(ServerDebug(
+                await self.logger.log(ServerDebug(
                     message=f"[ErrorHandler] {message}",
                     node_id=self.node_id,
                     node_host="",  # Not available at handler level
@@ -365,12 +365,12 @@ class ErrorHandler:
             except Exception:
                 pass  # Best effort - don't fail on logging errors
     
-    def _log_error(self, error: SwimError) -> None:
+    async def _log_error(self, error: SwimError) -> None:
         """Log error with structured context."""
         if self.logger:
             try:
                 # Try to use structured logging
-                self.logger.log(
+                await self.logger.log(
                     ServerError(
                         message=str(error),
                         node_id=self.node_id,
@@ -384,11 +384,11 @@ class ErrorHandler:
                 # Fallback to simple logging - if this also fails, silently ignore
                 # since logging errors shouldn't crash the application
                 try:
-                    self.logger.log(str(error))
+                    await self.logger.log(str(error))
                 except Exception:
                     pass  # Logging is best-effort
     
-    def _log_circuit_open(self, category: ErrorCategory, stats: ErrorStats) -> None:
+    async def _log_circuit_open(self, category: ErrorCategory, stats: ErrorStats) -> None:
         """Log circuit breaker opening."""
         message = (
             f"Circuit breaker OPEN for {category.name}: "
@@ -397,7 +397,7 @@ class ErrorHandler:
         if self.logger:
             try:
                 from hyperscale.logging.hyperscale_logging_models import ServerError
-                self.logger.log(
+                await self.logger.log(
                     ServerError(
                         message=message,
                         node_id=self.node_id,
@@ -408,7 +408,7 @@ class ErrorHandler:
             except (ImportError, AttributeError):
                 # Fallback to simple logging - if this also fails, silently ignore
                 try:
-                    self.logger.log(message)
+                    await self.logger.log(message)
                 except Exception:
                     pass  # Logging is best-effort
     
@@ -441,7 +441,7 @@ class ErrorHandler:
                 await self.increment_lhm(event_type)
             except Exception as e:
                 # Log but don't let LHM updates cause more errors
-                self._log_internal(f"LHM update failed for {event_type}: {type(e).__name__}: {e}")
+                await self._log_internal(f"LHM update failed for {event_type}: {type(e).__name__}: {e}")
     
     async def _trigger_recovery(self, category: ErrorCategory) -> None:
         """Trigger recovery action for a category."""
@@ -450,7 +450,7 @@ class ErrorHandler:
                 await self._recovery_actions[category]()
             except Exception as e:
                 # Log recovery failure but don't propagate
-                self._log_internal(f"Recovery action failed for {category.name}: {type(e).__name__}: {e}")
+                await self._log_internal(f"Recovery action failed for {category.name}: {type(e).__name__}: {e}")
     
     async def _handle_fatal(self, error: SwimError) -> None:
         """Handle fatal error - escalate to callback or raise."""
@@ -459,7 +459,7 @@ class ErrorHandler:
                 await self._fatal_callback(error)
             except Exception as e:
                 # Log fatal callback failure - this is serious
-                self._log_internal(f"FATAL: Fatal callback failed: {type(e).__name__}: {e} (original error: {error})")
+                await self._log_internal(f"FATAL: Fatal callback failed: {type(e).__name__}: {e} (original error: {error})")
         else:
             # Re-raise fatal errors if no handler
             raise error

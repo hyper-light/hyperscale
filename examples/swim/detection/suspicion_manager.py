@@ -56,6 +56,10 @@ class SuspicionManager:
     _task_runner: Any | None = None
     _timer_tokens: dict[tuple[str, int], str] = field(default_factory=dict)
     
+    # Track fallback tasks created when TaskRunner not available
+    _pending_fallback_tasks: set[asyncio.Task] = field(default_factory=set)
+    _unmanaged_tasks_created: int = 0
+    
     # Logger for error reporting (optional)
     _logger: LoggerProtocol | None = None
     _node_host: str = ""
@@ -246,12 +250,19 @@ class SuspicionManager:
         else:
             # Schedule immediate expiration via task to maintain async contract
             async def expire_now():
-                await self._handle_expiration(state)
+                try:
+                    await self._handle_expiration(state)
+                finally:
+                    # Remove from tracked tasks when done
+                    self._pending_fallback_tasks.discard(asyncio.current_task())
             
             if self._task_runner:
                 self._task_runner.run(expire_now)
             else:
-                asyncio.create_task(expire_now())
+                # Track fallback task for cleanup
+                task = asyncio.create_task(expire_now())
+                self._pending_fallback_tasks.add(task)
+                self._unmanaged_tasks_created += 1
     
     def _cancel_timer(self, state: SuspicionState) -> None:
         """Cancel the timer for a suspicion."""
@@ -347,6 +358,12 @@ class SuspicionManager:
                 state.cleanup()  # Clean up confirmers set
             self.suspicions.clear()
             self._timer_tokens.clear()
+            
+            # Cancel any pending fallback tasks
+            for task in list(self._pending_fallback_tasks):
+                if not task.done():
+                    task.cancel()
+            self._pending_fallback_tasks.clear()
     
     def get_suspicions_to_regossip(self) -> list[SuspicionState]:
         """Get suspicions that should be re-gossiped."""

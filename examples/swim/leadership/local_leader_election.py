@@ -74,6 +74,10 @@ class LocalLeaderElection:
     # Error handler callback (set by owner)
     _on_error: Callable[[ElectionError], Awaitable[None]] | None = None
     
+    # Metrics callbacks (set by owner)
+    _on_election_started: Callable[[], None] | None = None
+    _on_heartbeat_sent: Callable[[], None] | None = None
+    
     # TaskRunner for managed async operations (optional)
     _task_runner: TaskRunnerProtocol | None = None
     
@@ -130,6 +134,8 @@ class LocalLeaderElection:
         on_error: Callable[[ElectionError], Awaitable[None]] | None = None,
         should_refuse_leadership: Callable[[], bool] | None = None,
         task_runner: TaskRunnerProtocol | None = None,
+        on_election_started: Callable[[], None] | None = None,
+        on_heartbeat_sent: Callable[[], None] | None = None,
     ) -> None:
         """Set callback functions for election operations."""
         self._broadcast_message = broadcast_message
@@ -140,6 +146,8 @@ class LocalLeaderElection:
         self._send_to_node = send_to_node
         self._should_refuse_leadership = should_refuse_leadership
         self._task_runner = task_runner
+        self._on_election_started = on_election_started
+        self._on_heartbeat_sent = on_heartbeat_sent
     
     def get_election_timeout(self) -> float:
         """Get randomized election timeout, adjusted for flapping."""
@@ -402,6 +410,10 @@ class LocalLeaderElection:
             return
         self.state.update_fencing_token(new_term)
         
+        # Notify that election has started (for metrics)
+        if self._on_election_started:
+            self._on_election_started()
+        
         # Vote for self
         self.state.vote_for(self.self_addr, new_term)
         self.state.record_vote(self.self_addr)
@@ -459,6 +471,10 @@ class LocalLeaderElection:
             f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
         )
         self._broadcast_message(heartbeat_msg)
+        
+        # Notify metrics
+        if self._on_heartbeat_sent:
+            self._on_heartbeat_sent()
     
     async def _step_down(self) -> None:
         """Voluntarily step down from leadership."""

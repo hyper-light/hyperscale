@@ -70,6 +70,9 @@ class AuditLog:
     _events: deque[AuditEvent] = field(default_factory=deque)
     _total_events: int = 0
     
+    # Maximum counter value to prevent overflow
+    MAX_COUNTER_VALUE: int = 2**31 - 1
+    
     def __post_init__(self):
         self._events = deque(maxlen=self.max_events)
     
@@ -87,7 +90,8 @@ class AuditLog:
             details=details,
         )
         self._events.append(event)
-        self._total_events += 1
+        if self._total_events < self.MAX_COUNTER_VALUE:
+            self._total_events += 1
     
     def get_recent(self, count: int = 100) -> list[AuditEvent]:
         """Get the most recent events."""

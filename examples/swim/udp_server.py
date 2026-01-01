@@ -354,8 +354,9 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         await self._degradation.update()
         return self._degradation.should_skip_probe()
     
-    def should_skip_gossip(self) -> bool:
+    async def should_skip_gossip(self) -> bool:
         """Check if gossip should be skipped due to degradation."""
+        await self._degradation.update()
         return self._degradation.should_skip_gossip()
     
     def get_degraded_timeout_multiplier(self) -> float:
@@ -488,6 +489,8 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             on_error=self._handle_election_error,
             should_refuse_leadership=lambda: self._degradation.should_refuse_leadership(),
             task_runner=self._task_runner,
+            on_election_started=self._on_election_started,
+            on_heartbeat_sent=self._on_heartbeat_sent,
         )
     
     async def _handle_election_error(self, error) -> None:
@@ -564,6 +567,19 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     ) -> None:
         """Callback for leadership retry attempts."""
         await self.increase_failure_detector('leadership_retry')
+    
+    def _on_election_started(self) -> None:
+        """Called when this node starts an election."""
+        self._metrics.increment('elections_started')
+        self._audit_log.record(
+            AuditEventType.ELECTION_STARTED,
+            node=self._get_self_udp_addr(),
+            term=self._leader_election.state.current_term,
+        )
+    
+    def _on_heartbeat_sent(self) -> None:
+        """Called when this node sends a heartbeat as leader."""
+        self._metrics.increment('heartbeats_sent')
     
     def _on_become_leader(self) -> None:
         """Called when this node becomes the leader."""
