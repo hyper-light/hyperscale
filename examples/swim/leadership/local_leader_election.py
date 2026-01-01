@@ -199,8 +199,15 @@ class LocalLeaderElection:
         if self._on_error:
             try:
                 await self._on_error(error)
-            except Exception:
-                pass  # Don't let error handler cause more errors
+            except Exception as e:
+                # Log the callback failure but don't break
+                # This uses stderr since we may not have a proper logger
+                import sys
+                print(
+                    f"[LocalLeaderElection] Error callback failed: {e} "
+                    f"(original error: {error})",
+                    file=sys.stderr,
+                )
         # Error is logged by the handler, no need to print here
     
     async def _run_pre_vote(self) -> bool:

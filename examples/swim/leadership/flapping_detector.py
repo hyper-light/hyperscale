@@ -173,8 +173,9 @@ class FlappingDetector:
         if self._on_warning:
             try:
                 self._on_warning(count)
-            except Exception:
-                pass
+            except Exception as e:
+                import sys
+                print(f"[FlappingDetector] Warning callback failed: {e}", file=sys.stderr)
     
     def _handle_flapping_detected(self, count: int, now: float) -> bool:
         """Handle flapping detection."""
@@ -194,8 +195,9 @@ class FlappingDetector:
         if self._on_flapping_detected:
             try:
                 self._on_flapping_detected(count, self._current_cooldown)
-            except Exception:
-                pass
+            except Exception as e:
+                import sys
+                print(f"[FlappingDetector] Flapping detected callback failed: {e}", file=sys.stderr)
         
         return True
     
@@ -231,8 +233,9 @@ class FlappingDetector:
             if self._on_flapping_resolved:
                 try:
                     self._on_flapping_resolved()
-                except Exception:
-                    pass
+                except Exception as e:
+                    import sys
+                    print(f"[FlappingDetector] Flapping resolved callback failed: {e}", file=sys.stderr)
     
     def _escalate_cooldown(self) -> None:
         """Increase the cooldown period."""
