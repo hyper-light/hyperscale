@@ -112,6 +112,15 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         self._dedup_window: float = 30.0  # Seconds to consider a message as duplicate
         self._dedup_stats = {'duplicates': 0, 'unique': 0}
         
+        # Rate limiting - per-sender token bucket to prevent resource exhaustion
+        self._rate_limits: BoundedDict[tuple[str, int], dict] = BoundedDict(
+            max_size=1000,  # Track at most 1000 senders
+            eviction_policy='LRA',
+        )
+        self._rate_limit_tokens: int = 100  # Max tokens per sender
+        self._rate_limit_refill: float = 10.0  # Tokens per second
+        self._rate_limit_stats = {'accepted': 0, 'rejected': 0}
+        
         # Initialize error handler (logger set up after server starts)
         self._error_handler: ErrorHandler | None = None
         
@@ -1214,6 +1223,63 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             'window_seconds': self._dedup_window,
         }
     
+    async def _check_rate_limit(self, addr: tuple[str, int]) -> bool:
+        """
+        Check if a sender is within rate limits using token bucket.
+        
+        Each sender has a token bucket that refills over time.
+        If bucket is empty, message is rejected.
+        
+        Returns True if allowed, False if rate limited.
+        """
+        now = time.monotonic()
+        
+        if addr not in self._rate_limits:
+            # New sender - initialize bucket
+            self._rate_limits[addr] = {
+                'tokens': self._rate_limit_tokens,
+                'last_refill': now,
+            }
+        
+        bucket = self._rate_limits[addr]
+        
+        # Refill tokens based on elapsed time
+        elapsed = now - bucket['last_refill']
+        refill = int(elapsed * self._rate_limit_refill)
+        if refill > 0:
+            bucket['tokens'] = min(
+                bucket['tokens'] + refill,
+                self._rate_limit_tokens,
+            )
+            bucket['last_refill'] = now
+        
+        # Check if we have tokens
+        if bucket['tokens'] > 0:
+            bucket['tokens'] -= 1
+            self._rate_limit_stats['accepted'] += 1
+            return True
+        else:
+            self._rate_limit_stats['rejected'] += 1
+            # Log rate limit violation
+            await self.handle_error(
+                ResourceError(
+                    f"Rate limit exceeded for {addr[0]}:{addr[1]}",
+                    source=addr,
+                    tokens=bucket['tokens'],
+                )
+            )
+            return False
+    
+    def get_rate_limit_stats(self) -> dict:
+        """Get rate limiting statistics."""
+        return {
+            'accepted': self._rate_limit_stats['accepted'],
+            'rejected': self._rate_limit_stats['rejected'],
+            'tracked_senders': len(self._rate_limits),
+            'tokens_per_sender': self._rate_limit_tokens,
+            'refill_rate': self._rate_limit_refill,
+        }
+    
     def update_node_state(
         self,
         node: tuple[str, int],
@@ -1655,7 +1721,11 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         clock_time: int,
     ) -> Message:
         try:
-            # Check for duplicate messages first
+            # Check rate limit first - drop if sender is flooding
+            if not await self._check_rate_limit(addr):
+                return b'nack>' + self._udp_addr_slug
+            
+            # Check for duplicate messages
             if self._is_duplicate_message(addr, data):
                 # Duplicate - still send ack but don't process
                 return b'ack>' + self._udp_addr_slug
