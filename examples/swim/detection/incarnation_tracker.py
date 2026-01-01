@@ -8,6 +8,13 @@ from typing import Callable
 from ..core.types import Status
 from ..core.node_state import NodeState
 
+# Maximum valid incarnation number (2^31 - 1 for wide compatibility)
+MAX_INCARNATION = 2**31 - 1
+
+# Maximum allowed incarnation jump in a single message
+# Larger jumps may indicate attack or corruption
+MAX_INCARNATION_JUMP = 1000
+
 
 @dataclass 
 class IncarnationTracker:
@@ -54,9 +61,46 @@ class IncarnationTracker:
         Increment own incarnation number.
         Called when refuting a suspicion about ourselves.
         Returns the new incarnation number.
+        
+        Raises:
+            OverflowError: If incarnation would exceed MAX_INCARNATION.
         """
+        if self.self_incarnation >= MAX_INCARNATION:
+            raise OverflowError(
+                f"Incarnation number exhausted (at {MAX_INCARNATION}). "
+                "Node must restart to continue participating in cluster."
+            )
         self.self_incarnation += 1
         return self.self_incarnation
+    
+    def is_valid_incarnation(self, incarnation: int) -> bool:
+        """
+        Check if an incarnation number is valid.
+        
+        Returns False for:
+        - Negative numbers
+        - Numbers exceeding MAX_INCARNATION
+        """
+        return 0 <= incarnation <= MAX_INCARNATION
+    
+    def is_suspicious_jump(
+        self,
+        node: tuple[str, int],
+        new_incarnation: int,
+    ) -> bool:
+        """
+        Check if an incarnation jump is suspiciously large.
+        
+        Large jumps may indicate:
+        - Attack (trying to fast-forward incarnation)
+        - Data corruption
+        - Node restart with persisted high incarnation
+        
+        Returns True if jump exceeds MAX_INCARNATION_JUMP.
+        """
+        current = self.get_node_incarnation(node)
+        jump = new_incarnation - current
+        return jump > MAX_INCARNATION_JUMP
     
     def get_node_state(self, node: tuple[str, int]) -> NodeState | None:
         """Get the current state for a known node."""
@@ -73,11 +117,32 @@ class IncarnationTracker:
         status: Status, 
         incarnation: int,
         timestamp: float,
+        validate: bool = True,
     ) -> bool:
         """
         Update the state of a node.
-        Returns True if the state was updated, False if the message was stale.
+        
+        Args:
+            node: Node address tuple (host, port).
+            status: Node status (OK, SUSPECT, DEAD, JOIN).
+            incarnation: Node's incarnation number.
+            timestamp: Time of this update.
+            validate: Whether to validate incarnation number.
+        
+        Returns:
+            True if the state was updated, False if message was rejected.
+            
+        Note:
+            If validate=True, invalid or suspicious incarnation numbers
+            are rejected and the method returns False.
         """
+        if validate:
+            if not self.is_valid_incarnation(incarnation):
+                return False
+            if self.is_suspicious_jump(node, incarnation):
+                # Log suspicious activity but still reject
+                return False
+        
         if node not in self.node_states:
             self.node_states[node] = NodeState(
                 status=status,
@@ -103,15 +168,33 @@ class IncarnationTracker:
         node: tuple[str, int], 
         incarnation: int, 
         status: Status,
+        validate: bool = True,
     ) -> bool:
         """
         Check if a message about a node is fresh (should be processed).
         
         A message is fresh if:
+        - Incarnation number is valid (if validate=True)
+        - Jump is not suspiciously large (if validate=True)
         - We don't know about the node yet
         - It has a higher incarnation number
         - Same incarnation but higher priority status
+        
+        Args:
+            node: Node address tuple.
+            incarnation: Incarnation number from message.
+            status: Status from message.
+            validate: Whether to validate incarnation number.
+        
+        Returns:
+            True if message should be processed, False otherwise.
         """
+        if validate:
+            if not self.is_valid_incarnation(incarnation):
+                return False
+            if self.is_suspicious_jump(node, incarnation):
+                return False
+        
         state = self.node_states.get(node)
         if state is None:
             return True

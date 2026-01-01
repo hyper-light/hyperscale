@@ -2,7 +2,11 @@
 Failure detection components for SWIM protocol.
 """
 
-from .incarnation_tracker import IncarnationTracker
+from .incarnation_tracker import (
+    IncarnationTracker,
+    MAX_INCARNATION,
+    MAX_INCARNATION_JUMP,
+)
 
 from .suspicion_state import SuspicionState
 
@@ -17,6 +21,8 @@ from .probe_scheduler import ProbeScheduler
 
 __all__ = [
     'IncarnationTracker',
+    'MAX_INCARNATION',
+    'MAX_INCARNATION_JUMP',
     'SuspicionState',
     'SuspicionManager',
     'PendingIndirectProbe',
