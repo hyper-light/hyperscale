@@ -1232,13 +1232,36 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         target: tuple[str, int], 
         message: bytes,
         timeout: float | None = None,
-    ) -> None:
-        """Send a message to a specific address."""
+    ) -> bool:
+        """
+        Send a message to a specific address with error handling.
+        
+        Returns True on success, False on failure.
+        """
         if timeout is None:
             base_timeout = self._context.read('current_timeout')
             timeout = self.get_lhm_adjusted_timeout(base_timeout)
         
-        await self.send(target, message, timeout=timeout)
+        try:
+            await self.send(target, message, timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            await self.handle_error(
+                ProbeTimeoutError(target, timeout)
+            )
+            return False
+        except OSError as e:
+            await self.handle_error(
+                NetworkError(
+                    f"Send to {target[0]}:{target[1]} failed: {e}",
+                    severity=ErrorSeverity.TRANSIENT,
+                    target=target,
+                )
+            )
+            return False
+        except Exception as e:
+            await self.handle_exception(e, f"send_to_{target[0]}_{target[1]}")
+            return False
     
     async def _send_probe_and_wait(self, target: tuple[str, int]) -> bool:
         """Send a probe to target and wait for response."""
