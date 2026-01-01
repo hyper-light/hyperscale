@@ -10,6 +10,7 @@ from typing import Callable, Awaitable
 from .leader_state import LeaderState
 from .leader_eligibility import LeaderEligibility
 from .errors import ElectionError, ElectionTimeoutError, SplitBrainError, UnexpectedError
+from .flapping_detector import FlappingDetector
 
 
 @dataclass
@@ -37,6 +38,7 @@ class LocalLeaderElection:
     """
     state: LeaderState = field(default_factory=LeaderState)
     eligibility: LeaderEligibility = field(default_factory=LeaderEligibility)
+    flapping_detector: FlappingDetector = field(default_factory=FlappingDetector)
     
     # Configuration
     heartbeat_interval: float = 2.0  # Seconds between leader heartbeats
@@ -82,9 +84,29 @@ class LocalLeaderElection:
         self._send_to_node = send_to_node
     
     def get_election_timeout(self) -> float:
-        """Get randomized election timeout."""
+        """Get randomized election timeout, adjusted for flapping."""
+        base = self.election_timeout_base
+        
+        # If flapping, use the escalated cooldown
+        if self.flapping_detector.is_flapping:
+            base = max(base, self.flapping_detector.current_cooldown)
+        
         jitter = random.uniform(0, self.election_timeout_jitter)
-        return self.election_timeout_base + jitter
+        return base + jitter
+    
+    def _record_leader_change(
+        self,
+        old_leader: tuple[str, int] | None,
+        new_leader: tuple[str, int] | None,
+        reason: str,
+    ) -> None:
+        """Record a leadership change for flapping detection."""
+        self.flapping_detector.record_change(
+            old_leader=old_leader,
+            new_leader=new_leader,
+            term=self.state.current_term,
+            reason=reason,
+        )
     
     def is_self_eligible(self) -> bool:
         """Check if this node is eligible to become leader."""
@@ -139,6 +161,13 @@ class LocalLeaderElection:
                 
                 elif self.state.should_start_election():
                     # No leader or lease expired: maybe start election
+                    
+                    # Check flapping - delay election if needed
+                    should_delay, delay = self.flapping_detector.should_delay_election()
+                    if should_delay:
+                        await asyncio.sleep(delay)
+                        continue
+                    
                     if self.is_self_eligible():
                         await self._run_election()
                     else:
@@ -253,8 +282,10 @@ class LocalLeaderElection:
             
             if len(self.state.votes_received) >= votes_needed:
                 # We won!
+                old_leader = self.state.current_leader
                 self.state.become_leader(new_term)
                 self.state.current_leader = self.self_addr
+                self._record_leader_change(old_leader, self.self_addr, 'election')
                 self.state.update_fencing_token(new_term)
                 
                 # Announce victory
@@ -294,6 +325,7 @@ class LocalLeaderElection:
         )
         self._broadcast_message(stepdown_msg)
         
+        self._record_leader_change(self.self_addr, None, 'stepdown')
         self.state.become_follower(self.state.current_term)
     
     def handle_claim(
@@ -348,15 +380,23 @@ class LocalLeaderElection:
     def handle_elected(self, leader: tuple[str, int], term: int) -> None:
         """Handle a leader-elected message."""
         if term >= self.state.current_term:
+            old_leader = self.state.current_leader
             self.state.become_follower(term, leader)
+            if old_leader != leader:
+                self._record_leader_change(old_leader, leader, 'elected')
     
     def handle_heartbeat(self, leader: tuple[str, int], term: int) -> None:
         """Handle a leader-heartbeat message."""
+        old_leader = self.state.current_leader
         self.state.update_heartbeat(leader, term)
+        # Record if this is first time seeing this leader
+        if old_leader != leader and leader is not None:
+            self._record_leader_change(old_leader, leader, 'heartbeat')
     
     def handle_stepdown(self, leader: tuple[str, int], term: int) -> None:
         """Handle a leader-stepdown message."""
         if leader == self.state.current_leader:
+            self._record_leader_change(leader, None, 'remote_stepdown')
             self.state.current_leader = None
             # Will trigger election on next loop iteration
     
@@ -470,5 +510,11 @@ class LocalLeaderElection:
             'fencing_token': self.get_fencing_token(),
             'pre_voting': self.state.pre_voting_in_progress,
             'pre_votes': len(self.state.pre_votes_received),
+            'flapping': self.flapping_detector.is_flapping,
+            'flapping_cooldown': self.flapping_detector.current_cooldown,
         }
+    
+    def get_flapping_stats(self) -> dict:
+        """Get flapping detector statistics."""
+        return self.flapping_detector.get_stats()
 

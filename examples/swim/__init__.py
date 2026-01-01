@@ -94,6 +94,11 @@ from .health_monitor import (
     measure_event_loop_lag,
 )
 
+from .flapping_detector import (
+    FlappingDetector,
+    LeadershipChange,
+)
+
 from .local_health_multiplier import LocalHealthMultiplier
 from .node_state import NodeState
 from .incarnation_tracker import IncarnationTracker
@@ -169,6 +174,9 @@ __all__ = [
     'EventLoopHealthMonitor',
     'HealthSample',
     'measure_event_loop_lag',
+    # Flapping Detection
+    'FlappingDetector',
+    'LeadershipChange',
     # Components
     'LocalHealthMultiplier',
     'NodeState',
