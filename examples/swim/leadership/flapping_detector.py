@@ -16,9 +16,14 @@ from hyperscale.logging.hyperscale_logging_models import ServerDebug
 from ..core.protocols import LoggerProtocol
 
 
-@dataclass
+@dataclass(slots=True)
 class LeadershipChange:
-    """Record of a leadership change event."""
+    """
+    Record of a leadership change event.
+    
+    Uses __slots__ for memory efficiency since many instances may be created
+    during flapping episodes.
+    """
     timestamp: float
     old_leader: tuple[str, int] | None
     new_leader: tuple[str, int] | None

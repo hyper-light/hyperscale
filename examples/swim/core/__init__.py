@@ -76,6 +76,45 @@ from .protocols import (
     TaskRunnerProtocol,
 )
 
+from .constants import (
+    # Message types
+    MSG_PROBE,
+    MSG_ACK,
+    MSG_PING_REQ,
+    MSG_PING_REQ_ACK,
+    MSG_JOIN,
+    MSG_LEAVE,
+    MSG_SUSPECT,
+    MSG_ALIVE,
+    MSG_CLAIM,
+    MSG_VOTE,
+    MSG_PREVOTE_REQ,
+    MSG_PREVOTE_RESP,
+    MSG_ELECTED,
+    MSG_HEARTBEAT,
+    MSG_STEPDOWN,
+    # Status bytes
+    STATUS_OK,
+    STATUS_JOIN,
+    STATUS_SUSPECT,
+    STATUS_DEAD,
+    # Update types
+    UPDATE_ALIVE,
+    UPDATE_SUSPECT,
+    UPDATE_DEAD,
+    UPDATE_JOIN,
+    UPDATE_LEAVE,
+    # Delimiters
+    DELIM_COLON,
+    DELIM_PIPE,
+    DELIM_ARROW,
+    DELIM_SEMICOLON,
+    EMPTY_BYTES,
+    # Utilities
+    encode_int,
+    encode_bool,
+)
+
 
 __all__ = [
     # Types
@@ -135,5 +174,37 @@ __all__ = [
     # Protocols
     'LoggerProtocol',
     'TaskRunnerProtocol',
+    # Constants
+    'MSG_PROBE',
+    'MSG_ACK',
+    'MSG_PING_REQ',
+    'MSG_PING_REQ_ACK',
+    'MSG_JOIN',
+    'MSG_LEAVE',
+    'MSG_SUSPECT',
+    'MSG_ALIVE',
+    'MSG_CLAIM',
+    'MSG_VOTE',
+    'MSG_PREVOTE_REQ',
+    'MSG_PREVOTE_RESP',
+    'MSG_ELECTED',
+    'MSG_HEARTBEAT',
+    'MSG_STEPDOWN',
+    'STATUS_OK',
+    'STATUS_JOIN',
+    'STATUS_SUSPECT',
+    'STATUS_DEAD',
+    'UPDATE_ALIVE',
+    'UPDATE_SUSPECT',
+    'UPDATE_DEAD',
+    'UPDATE_JOIN',
+    'UPDATE_LEAVE',
+    'DELIM_COLON',
+    'DELIM_PIPE',
+    'DELIM_ARROW',
+    'DELIM_SEMICOLON',
+    'EMPTY_BYTES',
+    'encode_int',
+    'encode_bool',
 ]
 

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 MAX_PROXIES = 10
 
 
-@dataclass
+@dataclass(slots=True)
 class PendingIndirectProbe:
     """
     Tracks a pending indirect probe request.
@@ -19,6 +19,9 @@ class PendingIndirectProbe:
     
     Memory safety:
     - Proxies set is bounded to max_proxies to prevent unbounded growth
+    
+    Uses __slots__ for memory efficiency since many instances may be created
+    during network issues.
     """
     target: tuple[str, int]
     requester: tuple[str, int]

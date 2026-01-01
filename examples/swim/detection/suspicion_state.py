@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 MAX_CONFIRMERS = 1000
 
 
-@dataclass
+@dataclass(slots=True)
 class SuspicionState:
     """
     Tracks the suspicion state for a single node.
@@ -30,6 +30,9 @@ class SuspicionState:
     Memory safety:
     - Confirmers set is bounded to max_confirmers
     - Extra confirmations beyond limit are dropped but still affect timeout
+    
+    Uses __slots__ for memory efficiency since many instances may be created
+    during failure scenarios.
     """
     node: tuple[str, int]
     incarnation: int

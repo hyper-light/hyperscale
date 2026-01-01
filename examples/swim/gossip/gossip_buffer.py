@@ -2,6 +2,7 @@
 Gossip buffer for SWIM membership update dissemination.
 """
 
+import heapq
 import math
 import time
 from dataclasses import dataclass, field
@@ -141,17 +142,18 @@ class GossipBuffer:
         
         Returns up to max_count updates, prioritizing those with
         the lowest broadcast count (least disseminated).
+        
+        Uses heapq.nsmallest() for O(n log k) complexity instead of
+        O(n log n) from full sorting.
         """
         # Bound max_count to prevent excessive iteration
         max_count = max(1, min(max_count, 100))
         
-        # Sort by broadcast count (ascending) to prioritize new updates
-        candidates = sorted(
-            [u for u in self.updates.values() if u.should_broadcast()],
-            key=lambda u: u.broadcast_count,
-        )
+        # Filter to broadcastable updates
+        candidates = (u for u in self.updates.values() if u.should_broadcast())
         
-        return candidates[:max_count]
+        # Use nsmallest for efficient top-k selection: O(n log k) vs O(n log n)
+        return heapq.nsmallest(max_count, candidates, key=lambda u: u.broadcast_count)
     
     def mark_broadcasts(self, updates: list[PiggybackUpdate]) -> None:
         """Mark updates as having been broadcast and remove if done."""
@@ -298,20 +300,23 @@ class GossipBuffer:
         """
         Evict the oldest updates.
         
+        Uses heapq.nsmallest() for O(n log k) complexity.
+        
         Returns:
             Number of updates evicted.
         """
         if not self.updates:
             return 0
         
-        # Sort by timestamp (oldest first)
-        sorted_updates = sorted(
+        # Use nsmallest for efficient bottom-k selection: O(n log k) vs O(n log n)
+        oldest = heapq.nsmallest(
+            count,
             self.updates.items(),
             key=lambda x: x[1].timestamp,
         )
         
         evicted = 0
-        for node, _ in sorted_updates[:count]:
+        for node, _ in oldest:
             del self.updates[node]
             self._evicted_count += 1
             evicted += 1
