@@ -51,6 +51,11 @@ class SuspicionManager:
     _expired_count: int = 0
     _refuted_count: int = 0
     _orphaned_cleanup_count: int = 0
+    _race_avoided_count: int = 0  # Double-check prevented race condition
+    
+    def __post_init__(self):
+        """Initialize the lock after dataclass creation."""
+        self._lock = asyncio.Lock()
     
     def set_callbacks(
         self,
@@ -197,23 +202,39 @@ class SuspicionManager:
         """Cancel the timer for a suspicion."""
         # Cancel via TaskRunner if available
         if state.node in self._timer_tokens and self._task_runner:
-            token = self._timer_tokens.pop(state.node)
-            try:
-                asyncio.create_task(self._task_runner.cancel(token))
-            except Exception:
-                pass
+            token = self._timer_tokens.pop(state.node, None)
+            if token:
+                try:
+                    # Use task runner's run method instead of raw create_task
+                    self._task_runner.run(self._task_runner.cancel, token)
+                except Exception:
+                    pass
         
         # Also cancel the raw task if present
         state.cancel_timer()
     
     def _handle_expiration(self, state: SuspicionState) -> None:
-        """Handle suspicion expiration - declare node as DEAD."""
-        if state.node in self.suspicions:
-            del self.suspicions[state.node]
-            self._timer_tokens.pop(state.node, None)
-            self._expired_count += 1
-            if self._on_suspicion_expired:
-                self._on_suspicion_expired(state.node, state.incarnation)
+        """
+        Handle suspicion expiration - declare node as DEAD.
+        
+        Uses double-check pattern to prevent race conditions with _cancel_timer.
+        """
+        # Double-check that suspicion still exists (may have been cancelled)
+        if state.node not in self.suspicions:
+            self._race_avoided_count += 1
+            return
+        
+        # Verify this is the same suspicion (not a new one with same node)
+        current = self.suspicions.get(state.node)
+        if current is not state:
+            self._race_avoided_count += 1
+            return
+        
+        del self.suspicions[state.node]
+        self._timer_tokens.pop(state.node, None)
+        self._expired_count += 1
+        if self._on_suspicion_expired:
+            self._on_suspicion_expired(state.node, state.incarnation)
     
     def confirm_suspicion(
         self,
@@ -327,5 +348,6 @@ class SuspicionManager:
             'total_expired': self._expired_count,
             'total_refuted': self._refuted_count,
             'orphaned_cleaned': self._orphaned_cleanup_count,
+            'race_conditions_avoided': self._race_avoided_count,
         }
 
