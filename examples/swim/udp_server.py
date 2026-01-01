@@ -28,6 +28,8 @@ from .core.errors import (
     MalformedMessageError,
     UnexpectedMessageError,
     UnexpectedError,
+    QueueFullError,
+    StaleMessageError,
 )
 from .core.error_handler import ErrorHandler, ErrorContext
 from .core.retry import (
@@ -513,7 +515,61 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         self.queue_gossip_update('dead', node, incarnation)
         nodes: Nodes = self._context.read('nodes')
         if node in nodes:
-            nodes[node].put_nowait((int(time.monotonic()), b'DEAD'))
+            self._safe_queue_put_sync(nodes[node], (int(time.monotonic()), b'DEAD'), node)
+    
+    def _safe_queue_put_sync(
+        self,
+        queue: asyncio.Queue,
+        item: tuple,
+        node: tuple[str, int],
+    ) -> bool:
+        """
+        Synchronous version of _safe_queue_put for use in sync callbacks.
+        
+        If queue is full, schedules error logging as a task and drops the update.
+        """
+        try:
+            queue.put_nowait(item)
+            return True
+        except asyncio.QueueFull:
+            # Schedule error logging as a task since we can't await in sync context
+            asyncio.create_task(
+                self.handle_error(
+                    QueueFullError(
+                        f"Node queue full for {node[0]}:{node[1]}, dropping update",
+                        node=node,
+                        queue_size=queue.qsize(),
+                    )
+                )
+            )
+            return False
+    
+    async def _safe_queue_put(
+        self,
+        queue: asyncio.Queue,
+        item: tuple,
+        node: tuple[str, int],
+    ) -> bool:
+        """
+        Safely put an item into a node's queue with overflow handling.
+        
+        If queue is full, logs QueueFullError and drops the update.
+        This prevents blocking on slow consumers.
+        
+        Returns True if successful, False if queue was full.
+        """
+        try:
+            queue.put_nowait(item)
+            return True
+        except asyncio.QueueFull:
+            await self.handle_error(
+                QueueFullError(
+                    f"Node queue full for {node[0]}:{node[1]}, dropping update",
+                    node=node,
+                    queue_size=queue.qsize(),
+                )
+            )
+            return False
     
     def queue_gossip_update(
         self,
@@ -1591,7 +1647,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                             timeout=gather_timeout,
                         )
 
-                        nodes[target].put_nowait((clock_time, b'OK'))
+                        await self._safe_queue_put(nodes[target], (clock_time, b'OK'), target)
                         
                         self._probe_scheduler.add_member(target)
                         self._incarnation_tracker.update_node(target, b'OK', 0, time.monotonic())
@@ -1618,7 +1674,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                             timeout=gather_timeout,
                         )
 
-                        nodes[target].put_nowait((clock_time, b'DEAD'))
+                        await self._safe_queue_put(nodes[target], (clock_time, b'DEAD'), target)
                         self._context.write('nodes', nodes)
 
                         return b'ack>' + self._udp_addr_slug
