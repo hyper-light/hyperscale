@@ -351,6 +351,20 @@ class ErrorHandler:
             self._stats[category] = ErrorStats(**settings)
         return self._stats[category]
     
+    def _log_internal(self, message: str) -> None:
+        """Log an internal error handler issue using ServerDebug."""
+        if self.logger:
+            try:
+                from hyperscale.logging.hyperscale_logging_models import ServerDebug
+                self.logger.log(ServerDebug(
+                    message=f"[ErrorHandler] {message}",
+                    node_id=self.node_id,
+                    node_host="",  # Not available at handler level
+                    node_port=0,
+                ))
+            except Exception:
+                pass  # Best effort - don't fail on logging errors
+    
     def _log_error(self, error: SwimError) -> None:
         """Log error with structured context."""
         if self.logger:
@@ -367,17 +381,12 @@ class ErrorHandler:
                     )
                 )
             except (ImportError, AttributeError):
-                # Fallback to simple logging
+                # Fallback to simple logging - if this also fails, silently ignore
+                # since logging errors shouldn't crash the application
                 try:
                     self.logger.log(str(error))
-                except Exception as e:
-                    # Last resort: write to stderr
-                    import sys
-                    print(
-                        f"[ErrorHandler] Logging failed: {type(e).__name__}: {e} "
-                        f"(original: {error})",
-                        file=sys.stderr
-                    )
+                except Exception:
+                    pass  # Logging is best-effort
     
     def _log_circuit_open(self, category: ErrorCategory, stats: ErrorStats) -> None:
         """Log circuit breaker opening."""
@@ -397,15 +406,11 @@ class ErrorHandler:
                     )
                 )
             except (ImportError, AttributeError):
+                # Fallback to simple logging - if this also fails, silently ignore
                 try:
                     self.logger.log(message)
-                except Exception as e:
-                    import sys
-                    print(
-                        f"[ErrorHandler] Circuit open logging failed: {type(e).__name__}: {e} "
-                        f"(message: {message})",
-                        file=sys.stderr
-                    )
+                except Exception:
+                    pass  # Logging is best-effort
     
     async def _update_lhm(self, error: SwimError) -> None:
         """Update Local Health Multiplier based on error."""
@@ -436,12 +441,7 @@ class ErrorHandler:
                 await self.increment_lhm(event_type)
             except Exception as e:
                 # Log but don't let LHM updates cause more errors
-                import sys
-                print(
-                    f"[ErrorHandler] LHM update failed for {event_type}: "
-                    f"{type(e).__name__}: {e}",
-                    file=sys.stderr
-                )
+                self._log_internal(f"LHM update failed for {event_type}: {type(e).__name__}: {e}")
     
     async def _trigger_recovery(self, category: ErrorCategory) -> None:
         """Trigger recovery action for a category."""
@@ -450,12 +450,7 @@ class ErrorHandler:
                 await self._recovery_actions[category]()
             except Exception as e:
                 # Log recovery failure but don't propagate
-                import sys
-                print(
-                    f"[ErrorHandler] Recovery action failed for {category.name}: "
-                    f"{type(e).__name__}: {e}",
-                    file=sys.stderr
-                )
+                self._log_internal(f"Recovery action failed for {category.name}: {type(e).__name__}: {e}")
     
     async def _handle_fatal(self, error: SwimError) -> None:
         """Handle fatal error - escalate to callback or raise."""
@@ -464,12 +459,7 @@ class ErrorHandler:
                 await self._fatal_callback(error)
             except Exception as e:
                 # Log fatal callback failure - this is serious
-                import sys
-                print(
-                    f"[ErrorHandler] FATAL: Fatal callback failed: "
-                    f"{type(e).__name__}: {e} (original error: {error})",
-                    file=sys.stderr
-                )
+                self._log_internal(f"FATAL: Fatal callback failed: {type(e).__name__}: {e} (original error: {error})")
         else:
             # Re-raise fatal errors if no handler
             raise error

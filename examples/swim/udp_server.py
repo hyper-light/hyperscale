@@ -345,13 +345,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Get graceful degradation statistics."""
         return self._degradation.get_stats()
     
-    def update_degradation(self) -> DegradationLevel:
+    async def update_degradation(self) -> DegradationLevel:
         """Update and get current degradation level."""
-        return self._degradation.update()
+        return await self._degradation.update()
     
-    def should_skip_probe(self) -> bool:
+    async def should_skip_probe(self) -> bool:
         """Check if probe should be skipped due to degradation."""
-        self._degradation.update()
+        await self._degradation.update()
         return self._degradation.should_skip_probe()
     
     def should_skip_gossip(self) -> bool:
@@ -422,7 +422,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Cleanup incarnation tracker (dead node GC)
         async with ErrorContext(self._error_handler, "incarnation_cleanup"):
-            stats['incarnation'] = self._incarnation_tracker.cleanup()
+            stats['incarnation'] = await self._incarnation_tracker.cleanup()
         
         # Cleanup suspicion manager (orphaned suspicions)
         async with ErrorContext(self._error_handler, "suspicion_cleanup"):
@@ -2383,7 +2383,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                             )
                             return b'ack>' + self._udp_addr_slug
                         
-                        self._leader_election.handle_elected(target, term)
+                        await self._leader_election.handle_elected(target, term)
                     
                     return b'ack>' + self._udp_addr_slug
                 
@@ -2448,7 +2448,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                                 )
                                 self._task_runner.run(self._leader_election._step_down)
                         
-                        self._leader_election.handle_heartbeat(target, term)
+                        await self._leader_election.handle_heartbeat(target, term)
                     
                     return b'ack>' + self._udp_addr_slug
                 
@@ -2456,7 +2456,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     term = await self._parse_term_safe(message, addr)
                     
                     if target:
-                        self._leader_election.handle_stepdown(target, term)
+                        await self._leader_election.handle_stepdown(target, term)
                     
                     return b'ack>' + self._udp_addr_slug
                 

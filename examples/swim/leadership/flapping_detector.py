@@ -8,7 +8,14 @@ network issues, or misconfiguration.
 import time
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Callable, Any
+from typing import Callable, Any, Protocol
+
+from hyperscale.logging.hyperscale_logging_models import ServerDebug
+
+
+class LoggerProtocol(Protocol):
+    """Protocol for logger to avoid circular imports."""
+    async def log(self, entry: Any) -> None: ...
 
 
 @dataclass
@@ -48,7 +55,7 @@ class FlappingDetector:
             window_seconds=60.0,
             on_flapping_detected=handle_flapping,
         )
-        detector.record_change(old_leader, new_leader, term, 'election')
+        await detector.record_change(old_leader, new_leader, term, 'election')
     """
     
     # Thresholds
@@ -92,9 +99,41 @@ class FlappingDetector:
     _flapping_episodes: int = 0
     _total_flapping_duration: float = 0.0
     
+    # Logger for structured logging (optional)
+    _logger: LoggerProtocol | None = None
+    _node_host: str = ""
+    _node_port: int = 0
+    _node_id: int = 0
+    
     def __post_init__(self):
         self._changes = deque(maxlen=100)
         self._current_cooldown = self.base_cooldown
+    
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+        node_id: int,
+    ) -> None:
+        """Set logger for structured logging."""
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
+    
+    async def _log_debug(self, message: str) -> None:
+        """Log a debug message."""
+        if self._logger:
+            try:
+                await self._logger.log(ServerDebug(
+                    message=f"[FlappingDetector] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                ))
+            except Exception:
+                pass  # Don't let logging errors propagate
     
     def set_callbacks(
         self,
@@ -114,7 +153,7 @@ class FlappingDetector:
         self._on_flapping_resolved = on_flapping_resolved
         self._on_warning = on_warning
     
-    def record_change(
+    async def record_change(
         self,
         old_leader: tuple[str, int] | None,
         new_leader: tuple[str, int] | None,
@@ -152,14 +191,14 @@ class FlappingDetector:
         triggered_flapping = False
         
         if changes_in_window >= self.critical_threshold:
-            self._handle_critical(changes_in_window)
+            await self._handle_critical(changes_in_window)
         elif changes_in_window >= self.max_changes_per_window:
-            triggered_flapping = self._handle_flapping_detected(changes_in_window, now)
+            triggered_flapping = await self._handle_flapping_detected(changes_in_window, now)
         elif changes_in_window >= self.warning_threshold:
-            self._handle_warning(changes_in_window)
+            await self._handle_warning(changes_in_window)
         elif self._is_flapping:
             # Check if flapping has resolved
-            self._check_flapping_resolved(now)
+            await self._check_flapping_resolved(now)
         
         return triggered_flapping
     
@@ -168,16 +207,15 @@ class FlappingDetector:
         cutoff = now - self.window_seconds
         return sum(1 for c in self._changes if c.timestamp >= cutoff)
     
-    def _handle_warning(self, count: int) -> None:
+    async def _handle_warning(self, count: int) -> None:
         """Handle approaching the flapping threshold."""
         if self._on_warning:
             try:
                 self._on_warning(count)
             except Exception as e:
-                import sys
-                print(f"[FlappingDetector] Warning callback failed: {e}", file=sys.stderr)
+                await self._log_debug(f"Warning callback failed: {type(e).__name__}: {e}")
     
-    def _handle_flapping_detected(self, count: int, now: float) -> bool:
+    async def _handle_flapping_detected(self, count: int, now: float) -> bool:
         """Handle flapping detection."""
         if self._is_flapping:
             # Already flapping, just update cooldown
@@ -196,21 +234,20 @@ class FlappingDetector:
             try:
                 self._on_flapping_detected(count, self._current_cooldown)
             except Exception as e:
-                import sys
-                print(f"[FlappingDetector] Flapping detected callback failed: {e}", file=sys.stderr)
+                await self._log_debug(f"Flapping detected callback failed: {type(e).__name__}: {e}")
         
         return True
     
-    def _handle_critical(self, count: int) -> None:
+    async def _handle_critical(self, count: int) -> None:
         """Handle critical flapping level."""
         # Ensure we're in flapping state
         if not self._is_flapping:
-            self._handle_flapping_detected(count, time.monotonic())
+            await self._handle_flapping_detected(count, time.monotonic())
         
         # Max out cooldown
         self._current_cooldown = self.max_cooldown
     
-    def _check_flapping_resolved(self, now: float) -> None:
+    async def _check_flapping_resolved(self, now: float) -> None:
         """Check if flapping has resolved."""
         # Require a full quiet window before resolving
         changes_in_window = self._count_changes_in_window(now)
@@ -234,8 +271,7 @@ class FlappingDetector:
                 try:
                     self._on_flapping_resolved()
                 except Exception as e:
-                    import sys
-                    print(f"[FlappingDetector] Flapping resolved callback failed: {e}", file=sys.stderr)
+                    await self._log_debug(f"Flapping resolved callback failed: {type(e).__name__}: {e}")
     
     def _escalate_cooldown(self) -> None:
         """Increase the cooldown period."""

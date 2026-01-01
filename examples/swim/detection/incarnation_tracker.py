@@ -4,9 +4,16 @@ Incarnation number tracking for SWIM protocol.
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Any, Protocol
 from ..core.types import Status
 from ..core.node_state import NodeState
+
+from hyperscale.logging.hyperscale_logging_models import ServerDebug
+
+
+class LoggerProtocol(Protocol):
+    """Protocol for logger to avoid circular imports."""
+    async def log(self, entry: Any) -> None: ...
 
 # Maximum valid incarnation number (2^31 - 1 for wide compatibility)
 MAX_INCARNATION = 2**31 - 1
@@ -51,6 +58,38 @@ class IncarnationTracker:
     # Stats for monitoring
     _eviction_count: int = 0
     _cleanup_count: int = 0
+    
+    # Logger for structured logging (optional)
+    _logger: LoggerProtocol | None = None
+    _node_host: str = ""
+    _node_port: int = 0
+    _node_id: int = 0
+    
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+        node_id: int,
+    ) -> None:
+        """Set logger for structured logging."""
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
+    
+    async def _log_debug(self, message: str) -> None:
+        """Log a debug message."""
+        if self._logger:
+            try:
+                await self._logger.log(ServerDebug(
+                    message=f"[IncarnationTracker] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                ))
+            except Exception:
+                pass  # Don't let logging errors propagate
     
     def get_self_incarnation(self) -> int:
         """Get current incarnation number for this node."""
@@ -212,7 +251,7 @@ class IncarnationTracker:
         """Set callback for when nodes are evicted."""
         self._on_node_evicted = callback
     
-    def cleanup_dead_nodes(self) -> int:
+    async def cleanup_dead_nodes(self) -> int:
         """
         Remove dead nodes that have exceeded retention period.
         
@@ -234,16 +273,14 @@ class IncarnationTracker:
                 try:
                     self._on_node_evicted(node, state)
                 except Exception as e:
-                    import sys
-                    print(
-                        f"[IncarnationTracker] Eviction callback error "
-                        f"for node {node}: {e}",
-                        file=sys.stderr
+                    await self._log_debug(
+                        f"Eviction callback error for node {node}: "
+                        f"{type(e).__name__}: {e}"
                     )
         
         return len(to_remove)
     
-    def evict_if_needed(self) -> int:
+    async def evict_if_needed(self) -> int:
         """
         Evict oldest nodes if we exceed max_nodes limit.
         
@@ -280,24 +317,22 @@ class IncarnationTracker:
                 try:
                     self._on_node_evicted(node, state)
                 except Exception as e:
-                    import sys
-                    print(
-                        f"[IncarnationTracker] Eviction callback error "
-                        f"for node {node}: {e}",
-                        file=sys.stderr
+                    await self._log_debug(
+                        f"Eviction callback error for node {node}: "
+                        f"{type(e).__name__}: {e}"
                     )
         
         return evicted
     
-    def cleanup(self) -> dict[str, int]:
+    async def cleanup(self) -> dict[str, int]:
         """
         Run all cleanup operations.
         
         Returns:
             Dict with cleanup stats.
         """
-        dead_removed = self.cleanup_dead_nodes()
-        evicted = self.evict_if_needed()
+        dead_removed = await self.cleanup_dead_nodes()
+        evicted = await self.evict_if_needed()
         
         return {
             'dead_removed': dead_removed,

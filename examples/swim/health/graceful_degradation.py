@@ -11,7 +11,14 @@ When a node is overloaded (high LHM, event loop lag, etc.), it should:
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Any
+from typing import Callable, Any, Protocol
+
+from hyperscale.logging.hyperscale_logging_models import ServerDebug
+
+
+class LoggerProtocol(Protocol):
+    """Protocol for logger to avoid circular imports."""
+    async def log(self, entry: Any) -> None: ...
 
 
 class DegradationLevel(Enum):
@@ -169,6 +176,38 @@ class GracefulDegradation:
     _probes_skipped: int = 0
     _gossips_skipped: int = 0
     
+    # Logger for structured logging (optional)
+    _logger: LoggerProtocol | None = None
+    _node_host: str = ""
+    _node_port: int = 0
+    _node_id: int = 0
+    
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+        node_id: int,
+    ) -> None:
+        """Set logger for structured logging."""
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
+    
+    async def _log_debug(self, message: str) -> None:
+        """Log a debug message."""
+        if self._logger:
+            try:
+                await self._logger.log(ServerDebug(
+                    message=f"[GracefulDegradation] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                ))
+            except Exception:
+                pass  # Don't let logging errors propagate
+    
     def __post_init__(self):
         self._level_entered_at = time.monotonic()
     
@@ -183,7 +222,7 @@ class GracefulDegradation:
         self._get_event_loop_lag = get_event_loop_lag
         self._on_level_change = on_level_change
     
-    def update(self) -> DegradationLevel:
+    async def update(self) -> DegradationLevel:
         """
         Update degradation level based on current health metrics.
         
@@ -206,11 +245,10 @@ class GracefulDegradation:
                 try:
                     self._on_level_change(old_level, new_level)
                 except Exception as e:
-                    import sys
-                    print(
-                        f"[GracefulDegradation] Level change callback error "
-                        f"({old_level.name} -> {new_level.name}): {e}",
-                        file=sys.stderr
+                    await self._log_debug(
+                        f"Level change callback error "
+                        f"({old_level.name} -> {new_level.name}): "
+                        f"{type(e).__name__}: {e}"
                     )
         
         return self._current_level
@@ -344,7 +382,7 @@ class GracefulDegradation:
         """Check if we're in any degraded state."""
         return self._current_level != DegradationLevel.NORMAL
     
-    def force_level(self, level: DegradationLevel) -> None:
+    async def force_level(self, level: DegradationLevel) -> None:
         """Force a specific degradation level (for testing)."""
         if level != self._current_level:
             old_level = self._current_level
@@ -354,16 +392,15 @@ class GracefulDegradation:
                 try:
                     self._on_level_change(old_level, level)
                 except Exception as e:
-                    import sys
-                    print(
-                        f"[GracefulDegradation] Force level callback error "
-                        f"({old_level.name} -> {level.name}): {e}",
-                        file=sys.stderr
+                    await self._log_debug(
+                        f"Force level callback error "
+                        f"({old_level.name} -> {level.name}): "
+                        f"{type(e).__name__}: {e}"
                     )
     
-    def reset(self) -> None:
+    async def reset(self) -> None:
         """Reset to normal operation."""
-        self.force_level(DegradationLevel.NORMAL)
+        await self.force_level(DegradationLevel.NORMAL)
         self._probe_skip_counter = 0
         self._gossip_skip_counter = 0
     

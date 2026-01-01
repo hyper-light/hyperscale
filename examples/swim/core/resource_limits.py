@@ -17,7 +17,7 @@ V = TypeVar('V')
 
 class LoggerProtocol(Protocol):
     """Protocol for logger to avoid circular imports."""
-    def log(self, entry: Any) -> None: ...
+    async def log(self, entry: Any) -> None: ...
 
 
 @dataclass
@@ -160,14 +160,10 @@ class BoundedDict(Generic[K, V]):
             if value is not None and self.on_evict:
                 try:
                     self.on_evict(key, value)
-                except Exception as e:
-                    # Log error but don't fail eviction - would cause memory issues
+                except Exception:
+                    # Count error but don't fail eviction - would cause memory issues
+                    # Cannot log async from sync __setitem__ - error count is tracked
                     self._evict_callback_errors += 1
-                    name = self.name or "BoundedDict"
-                    print(
-                        f"[{name}] Eviction callback error: {type(e).__name__}: {e}",
-                        file=sys.stderr
-                    )
     
     def cleanup_by_predicate(
         self,

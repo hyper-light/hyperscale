@@ -207,7 +207,7 @@ async def retry_with_backoff(
         result = await retry_with_backoff(
             lambda: probe_node(target),
             policy=PROBE_RETRY_POLICY,
-            on_retry=lambda a, e, d: print(f"Retry {a}: {e}, waiting {d:.2f}s"),
+            on_retry=lambda a, e, d: logger.debug(f"Retry {a}: {e}, waiting {d:.2f}s"),
         )
     """
     if policy is None:
@@ -289,9 +289,11 @@ async def retry_with_result(
         )
         
         if result.success:
-            print(f"Succeeded after {result.attempts} attempts")
+            # Handle success - result.value contains the return value
+            pass
         else:
-            print(f"Failed after {result.attempts} attempts: {result.last_error}")
+            # Handle failure - result.last_error contains the exception
+            pass
     """
     if policy is None:
         policy = PROBE_RETRY_POLICY

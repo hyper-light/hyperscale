@@ -12,10 +12,17 @@ from dataclasses import dataclass, field
 from typing import Callable, Awaitable, Any, Protocol
 from collections import deque
 
+from hyperscale.logging.hyperscale_logging_models import ServerDebug
+
 
 class TaskRunnerProtocol(Protocol):
     """Protocol for TaskRunner to avoid circular imports."""
     def run(self, call: Callable, *args, **kwargs) -> Any: ...
+
+
+class LoggerProtocol(Protocol):
+    """Protocol for logger to avoid circular imports."""
+    async def log(self, entry: Any) -> None: ...
 
 
 @dataclass(slots=True)
@@ -110,6 +117,38 @@ class EventLoopHealthMonitor:
     # Track fallback tasks so they can be cleaned up
     _pending_callback_tasks: set[asyncio.Task] = field(default_factory=set)
     
+    # Logger for structured logging (optional)
+    _logger: LoggerProtocol | None = None
+    _node_host: str = ""
+    _node_port: int = 0
+    _node_id: int = 0
+    
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+        node_id: int,
+    ) -> None:
+        """Set logger for structured logging."""
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
+    
+    async def _log_debug(self, message: str) -> None:
+        """Log a debug message."""
+        if self._logger:
+            try:
+                await self._logger.log(ServerDebug(
+                    message=f"[HealthMonitor] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                ))
+            except Exception:
+                pass  # Don't let logging errors propagate
+    
     def __post_init__(self):
         self._samples = deque(maxlen=self.history_size)
         self._pending_callback_tasks = set()
@@ -159,7 +198,7 @@ class EventLoopHealthMonitor:
         while self._running:
             try:
                 sample = await self._take_sample()
-                self._process_sample(sample)
+                await self._process_sample(sample)
                 await asyncio.sleep(self.sample_interval)
             except asyncio.CancelledError:
                 break
@@ -185,7 +224,7 @@ class EventLoopHealthMonitor:
         
         return sample
     
-    def _process_sample(self, sample: HealthSample) -> None:
+    async def _process_sample(self, sample: HealthSample) -> None:
         """Process a sample and trigger callbacks as needed."""
         self._samples.append(sample)
         self._total_samples += 1
@@ -202,12 +241,12 @@ class EventLoopHealthMonitor:
             self._total_critical_samples += 1
             self._consecutive_lag_count += 1
             self._consecutive_ok_count = 0
-            self._trigger_callback(self._on_critical_lag, sample.lag_ratio)
+            await self._trigger_callback(self._on_critical_lag, sample.lag_ratio)
         elif is_lagging:
             self._total_lag_samples += 1
             self._consecutive_lag_count += 1
             self._consecutive_ok_count = 0
-            self._trigger_callback(self._on_lag_detected, sample.lag_ratio)
+            await self._trigger_callback(self._on_lag_detected, sample.lag_ratio)
         else:
             self._consecutive_ok_count += 1
             self._consecutive_lag_count = 0
@@ -218,9 +257,9 @@ class EventLoopHealthMonitor:
             self._degraded_transitions += 1
         elif self._is_degraded and self._consecutive_ok_count >= self.ok_count_to_recover:
             self._is_degraded = False
-            self._trigger_callback(self._on_recovered)
+            await self._trigger_callback(self._on_recovered)
     
-    def _trigger_callback(
+    async def _trigger_callback(
         self,
         callback: Callable[..., Awaitable[None] | None] | None,
         *args: Any,
@@ -246,9 +285,7 @@ class EventLoopHealthMonitor:
                     # Clean up task from set when done
                     task.add_done_callback(self._pending_callback_tasks.discard)
         except Exception as e:
-            # Log callback errors for debugging
-            import sys
-            print(f"[HealthMonitor] Callback error: {e}", file=sys.stderr)
+            await self._log_debug(f"Callback error: {type(e).__name__}: {e}")
     
     @property
     def is_degraded(self) -> bool:

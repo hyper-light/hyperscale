@@ -12,10 +12,17 @@ from .leader_eligibility import LeaderEligibility
 from .flapping_detector import FlappingDetector
 from ..core.errors import ElectionError, ElectionTimeoutError, SplitBrainError, UnexpectedError, NotEligibleError
 
+from hyperscale.logging.hyperscale_logging_models import ServerDebug
+
 
 class TaskRunnerProtocol(Protocol):
     """Protocol for TaskRunner to avoid circular imports."""
     def run(self, call: Callable, *args, **kwargs) -> Any: ...
+
+
+class LoggerProtocol(Protocol):
+    """Protocol for logger to avoid circular imports."""
+    async def log(self, entry: Any) -> None: ...
 
 
 @dataclass
@@ -79,6 +86,40 @@ class LocalLeaderElection:
     _pending_error_tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
     _unmanaged_tasks_created: int = 0
     
+    # Logger for structured logging (optional)
+    _logger: LoggerProtocol | None = None
+    _node_host: str = ""
+    _node_port: int = 0
+    _node_id: int = 0
+    
+    def set_logger(
+        self,
+        logger: LoggerProtocol,
+        node_host: str,
+        node_port: int,
+        node_id: int,
+    ) -> None:
+        """Set logger for structured logging."""
+        self._logger = logger
+        self._node_host = node_host
+        self._node_port = node_port
+        self._node_id = node_id
+        # Also set logger on child components
+        self.flapping_detector.set_logger(logger, node_host, node_port, node_id)
+    
+    async def _log_debug(self, message: str) -> None:
+        """Log a debug message."""
+        if self._logger:
+            try:
+                await self._logger.log(ServerDebug(
+                    message=f"[LocalLeaderElection] {message}",
+                    node_host=self._node_host,
+                    node_port=self._node_port,
+                    node_id=self._node_id,
+                ))
+            except Exception:
+                pass  # Don't let logging errors propagate
+    
     def set_callbacks(
         self,
         broadcast_message: Callable[[bytes], None],
@@ -111,14 +152,14 @@ class LocalLeaderElection:
         jitter = random.uniform(0, self.election_timeout_jitter)
         return base + jitter
     
-    def _record_leader_change(
+    async def _record_leader_change(
         self,
         old_leader: tuple[str, int] | None,
         new_leader: tuple[str, int] | None,
         reason: str,
     ) -> None:
         """Record a leadership change for flapping detection."""
-        self.flapping_detector.record_change(
+        await self.flapping_detector.record_change(
             old_leader=old_leader,
             new_leader=new_leader,
             term=self.state.current_term,
@@ -228,15 +269,12 @@ class LocalLeaderElection:
             try:
                 await self._on_error(error)
             except Exception as e:
-                # Log the callback failure but don't break
-                # This uses stderr since we may not have a proper logger
-                import sys
-                print(
-                    f"[LocalLeaderElection] Error callback failed: {e} "
-                    f"(original error: {error})",
-                    file=sys.stderr,
+                # Log the callback failure
+                await self._log_debug(
+                    f"Error callback failed: {type(e).__name__}: {e} "
+                    f"(original error: {error})"
                 )
-        # Error is logged by the handler, no need to print here
+        # Error is logged by the handler, no need to log here
     
     def _handle_error_sync(self, error: ElectionError) -> None:
         """
@@ -264,9 +302,9 @@ class LocalLeaderElection:
                     self._pending_error_tasks.add(task)
                     self._unmanaged_tasks_created += 1
                 except RuntimeError:
-                    # No running loop - fall back to stderr
-                    import sys
-                    print(f"[LocalLeaderElection] Error (no loop): {error}", file=sys.stderr)
+                    # No running loop - error cannot be logged asynchronously
+                    # This is an edge case; error is silently dropped
+                    pass
     
     async def _run_pre_vote(self) -> bool:
         """
@@ -356,7 +394,7 @@ class LocalLeaderElection:
         # Check for term exhaustion (indicates attack or severe bug)
         if self.state.is_term_exhausted():
             # Log and bail - this should never happen in normal operation
-            print(f"[CRITICAL] Term exhausted at {self.state.current_term}", file=sys.stderr)
+            await self._log_debug(f"CRITICAL: Term exhausted at {self.state.current_term}")
             return
         
         if not self.state.start_election(new_term):
@@ -394,7 +432,7 @@ class LocalLeaderElection:
                     # Term became invalid (shouldn't happen)
                     return
                 self.state.current_leader = self.self_addr
-                self._record_leader_change(old_leader, self.self_addr, 'election')
+                await self._record_leader_change(old_leader, self.self_addr, 'election')
                 self.state.update_fencing_token(new_term)
                 
                 # Announce victory
@@ -434,7 +472,7 @@ class LocalLeaderElection:
         )
         self._broadcast_message(stepdown_msg)
         
-        self._record_leader_change(self.self_addr, None, 'stepdown')
+        await self._record_leader_change(self.self_addr, None, 'stepdown')
         self.state.become_follower(self.state.current_term)
     
     def handle_claim(
@@ -493,26 +531,26 @@ class LocalLeaderElection:
         
         return vote_count >= votes_needed
     
-    def handle_elected(self, leader: tuple[str, int], term: int) -> None:
+    async def handle_elected(self, leader: tuple[str, int], term: int) -> None:
         """Handle a leader-elected message."""
         if term >= self.state.current_term:
             old_leader = self.state.current_leader
             self.state.become_follower(term, leader)
             if old_leader != leader:
-                self._record_leader_change(old_leader, leader, 'elected')
+                await self._record_leader_change(old_leader, leader, 'elected')
     
-    def handle_heartbeat(self, leader: tuple[str, int], term: int) -> None:
+    async def handle_heartbeat(self, leader: tuple[str, int], term: int) -> None:
         """Handle a leader-heartbeat message."""
         old_leader = self.state.current_leader
         self.state.update_heartbeat(leader, term)
         # Record if this is first time seeing this leader
         if old_leader != leader and leader is not None:
-            self._record_leader_change(old_leader, leader, 'heartbeat')
+            await self._record_leader_change(old_leader, leader, 'heartbeat')
     
-    def handle_stepdown(self, leader: tuple[str, int], term: int) -> None:
+    async def handle_stepdown(self, leader: tuple[str, int], term: int) -> None:
         """Handle a leader-stepdown message."""
         if leader == self.state.current_leader:
-            self._record_leader_change(leader, None, 'remote_stepdown')
+            await self._record_leader_change(leader, None, 'remote_stepdown')
             self.state.current_leader = None
             # Will trigger election on next loop iteration
     
