@@ -223,34 +223,48 @@ class LocalLeaderElection:
         if not self.self_addr or not self._broadcast_message:
             return False
         
+        # Abort if already in pre-vote (concurrent election attempt)
+        if self.state.pre_voting_in_progress:
+            return False
+        
         new_term = self.state.current_term + 1
+        
+        # Validate term before starting
+        if not self.state.is_term_valid(new_term):
+            return False
+        
         self.state.start_pre_vote(new_term)
         
-        # Add self pre-vote
-        self.state.record_pre_vote(self.self_addr)
-        
-        # Broadcast pre-vote request
-        lhm = self._get_lhm_score() if self._get_lhm_score else 0
-        pre_vote_msg = (
-            b'pre-vote-req:' +
-            str(new_term).encode() + b':' +
-            str(lhm).encode() + b'>' +
-            f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
-        )
-        self._broadcast_message(pre_vote_msg)
-        
-        # Wait for pre-votes
-        await asyncio.sleep(self.pre_vote_timeout)
-        
-        # Check if we got enough pre-votes
-        n_members = self._get_member_count() if self._get_member_count else 1
-        # For pre-vote, we need at least one response (or majority for larger clusters)
-        pre_votes_needed = max(1, (n_members + 1) // 2)  # Include self in count
-        
-        success = len(self.state.pre_votes_received) >= pre_votes_needed
-        self.state.end_pre_vote()
-        
-        return success
+        try:
+            # Add self pre-vote
+            self.state.record_pre_vote(self.self_addr)
+            
+            # Broadcast pre-vote request
+            lhm = self._get_lhm_score() if self._get_lhm_score else 0
+            pre_vote_msg = (
+                b'pre-vote-req:' +
+                str(new_term).encode() + b':' +
+                str(lhm).encode() + b'>' +
+                f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
+            )
+            self._broadcast_message(pre_vote_msg)
+            
+            # Wait for pre-votes with timeout protection
+            await asyncio.sleep(self.pre_vote_timeout)
+            
+            # Check if we got enough pre-votes
+            n_members = self._get_member_count() if self._get_member_count else 1
+            # For pre-vote, we need at least one response (or majority for larger clusters)
+            pre_votes_needed = max(1, (n_members + 1) // 2)  # Include self in count
+            
+            success = len(self.state.pre_votes_received) >= pre_votes_needed
+            return success
+        except asyncio.CancelledError:
+            # Pre-vote cancelled - clean up state
+            return False
+        finally:
+            # Always clean up pre-vote state
+            self.state.end_pre_vote()
     
     async def _run_election(self) -> None:
         """Run a leader election with pre-voting for split-brain prevention."""

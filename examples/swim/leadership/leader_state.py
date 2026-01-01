@@ -238,8 +238,23 @@ class LeaderState:
         End pre-vote phase.
         Returns True if we should proceed to real election.
         """
+        had_votes = len(self.pre_votes_received) > 0
         self.pre_voting_in_progress = False
-        return len(self.pre_votes_received) > 0
+        self.pre_votes_received.clear()  # Clean up for next pre-vote
+        return had_votes
+    
+    def abort_pre_vote(self) -> None:
+        """
+        Abort an in-progress pre-vote.
+        
+        Used when:
+        - A higher term leader is discovered
+        - The node becomes ineligible
+        - Pre-vote timeout is interrupted
+        """
+        self.pre_voting_in_progress = False
+        self.pre_votes_received.clear()
+        self.pre_vote_term = 0
     
     def can_grant_pre_vote(
         self, 
