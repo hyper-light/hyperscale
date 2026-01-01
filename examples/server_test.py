@@ -1,6 +1,7 @@
 import asyncio
 import msgspec
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Literal
 from pydantic import BaseModel, StrictStr
 from hyperscale.distributed_rewrite.env import Env
@@ -14,8 +15,94 @@ Nodes = dict[tuple[str, int], asyncio.Queue[tuple[int, Status]]]
 Ctx = dict[Literal['nodes'], Nodes]
 
 
+@dataclass
+class LocalHealthMultiplier:
+    """
+    Lifeguard Local Health Multiplier (LHM).
+    
+    Tracks the node's own health state. A score of 0 indicates healthy,
+    higher scores indicate potential issues with this node's ability
+    to process messages in a timely manner.
+    
+    The score saturates at max_score to prevent unbounded growth.
+    
+    Events that increment LHM:
+    - Missed nack (failed to respond in time)
+    - Failed refutation (suspicion about self received)
+    - Probe timeout when we initiated the probe
+    
+    Events that decrement LHM:
+    - Successful probe round completion
+    - Successful nack response received
+    """
+    score: int = 0
+    max_score: int = 8  # Saturation limit 'S' from paper
+    
+    # Scoring weights for different events
+    PROBE_TIMEOUT_PENALTY: int = 1
+    REFUTATION_PENALTY: int = 2
+    MISSED_NACK_PENALTY: int = 1
+    SUCCESSFUL_PROBE_REWARD: int = 1
+    SUCCESSFUL_NACK_REWARD: int = 1
+    
+    def increment(self, amount: int = 1) -> int:
+        """
+        Increment LHM score (node health is degrading).
+        Returns the new score.
+        """
+        self.score = min(self.max_score, self.score + amount)
+        return self.score
+    
+    def decrement(self, amount: int = 1) -> int:
+        """
+        Decrement LHM score (node health is improving).
+        Returns the new score.
+        """
+        self.score = max(0, self.score - amount)
+        return self.score
+    
+    def on_probe_timeout(self) -> int:
+        """Called when a probe we sent times out."""
+        return self.increment(self.PROBE_TIMEOUT_PENALTY)
+    
+    def on_refutation_needed(self) -> int:
+        """Called when we receive a suspicion about ourselves."""
+        return self.increment(self.REFUTATION_PENALTY)
+    
+    def on_missed_nack(self) -> int:
+        """Called when we failed to respond in time."""
+        return self.increment(self.MISSED_NACK_PENALTY)
+    
+    def on_successful_probe(self) -> int:
+        """Called when a probe round completes successfully."""
+        return self.decrement(self.SUCCESSFUL_PROBE_REWARD)
+    
+    def on_successful_nack(self) -> int:
+        """Called when we successfully respond with a nack."""
+        return self.decrement(self.SUCCESSFUL_NACK_REWARD)
+    
+    def get_multiplier(self) -> float:
+        """
+        Get the timeout multiplier based on current health score.
+        Returns a value >= 1.0 that should multiply base timeouts.
+        """
+        # Linear scaling: healthy (0) = 1x, max unhealthy = 2x
+        return 1.0 + (self.score / self.max_score)
+    
+    def is_healthy(self) -> bool:
+        """Returns True if the node considers itself healthy."""
+        return self.score == 0
+    
+    def reset(self) -> None:
+        """Reset health score to 0 (healthy)."""
+        self.score = 0
+
+
 class TestServer(MercurySyncBaseServer[Ctx]):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._local_health = LocalHealthMultiplier()
 
     def get_other_nodes(self, node: tuple[str, int]):
         target_host, target_port = node
@@ -33,7 +120,8 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         node: tuple[str, int],
         message: bytes,
     ):
-        timeout = await self._context.read('current_timeout')
+        base_timeout = self._context.read('current_timeout')
+        timeout = self.get_lhm_adjusted_timeout(base_timeout)
         _, status = node[-1]
         if status == b'OK':
             self._tasks.run(
@@ -58,19 +146,38 @@ class TestServer(MercurySyncBaseServer[Ctx]):
 
             status = await self._context.read_with_lock(target)
 
-    async def increase_failure_detector(self):
-        max_timeout = self._context.read('max_probe_timeout')
-        await self._context.update_with_lock(
-            'current_timeout',
-            lambda timeout: min(max_timeout, timeout + 1),
-        )
+    async def increase_failure_detector(self, event_type: str = 'probe_timeout'):
+        """
+        Increase local health score based on event type.
+        Uses the Local Health Multiplier (LHM) from Lifeguard.
+        """
+        if event_type == 'probe_timeout':
+            self._local_health.on_probe_timeout()
+        elif event_type == 'refutation':
+            self._local_health.on_refutation_needed()
+        elif event_type == 'missed_nack':
+            self._local_health.on_missed_nack()
+        else:
+            self._local_health.increment()
 
-    async def decrease_failure_detector(self):
-        min_timeout = self._context.read('min_probe_timeout')
-        await self._context.update_with_lock(
-            'current_timeout',
-            lambda timeout: max(min_timeout, timeout - 1),
-        )
+    async def decrease_failure_detector(self, event_type: str = 'successful_probe'):
+        """
+        Decrease local health score based on event type.
+        Uses the Local Health Multiplier (LHM) from Lifeguard.
+        """
+        if event_type == 'successful_probe':
+            self._local_health.on_successful_probe()
+        elif event_type == 'successful_nack':
+            self._local_health.on_successful_nack()
+        else:
+            self._local_health.decrement()
+    
+    def get_lhm_adjusted_timeout(self, base_timeout: float) -> float:
+        """
+        Get timeout adjusted by Local Health Multiplier.
+        When node is unhealthy, timeouts are extended to reduce false positives.
+        """
+        return base_timeout * self._local_health.get_multiplier()
 
     @udp.send('receive')
     async def send(
@@ -119,9 +226,11 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                 case b'ack' | b'nack':
 
                     if target not in nodes:
-                        await self.increase_failure_detector()
+                        await self.increase_failure_detector('missed_nack')
                         return b'nack>' + self._udp_addr_slug
-
+                    
+                    # Successful ack/nack processing improves our health
+                    await self.decrease_failure_detector('successful_nack')
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'join':
@@ -159,7 +268,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                         
 
                         if target not in nodes:
-                            await self.increase_failure_detector()
+                            await self.increase_failure_detector('missed_nack')
                             return b'nack>' + self._udp_addr_slug
                         
                         others = self.get_other_nodes(target)
@@ -181,15 +290,16 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                         nodes: Nodes = self._context.read('nodes')
 
                         if self.udp_target_is_self(target):
-                            # Refute
-                            await self.increase_failure_detector()
+                            # Refute - we're being probed, indicates someone suspects us
+                            await self.increase_failure_detector('refutation')
                             return b'ack>' + self._udp_addr_slug
                         
                         if target not in nodes:
                             # We missed something
                             return b'nack>' + self._udp_addr_slug
                         
-                        timeout = await self._context.read('current_timeout')
+                        base_timeout = self._context.read('current_timeout')
+                        timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
                         # Tell the suspect node to forward an ack.
                         self._tasks.run(
