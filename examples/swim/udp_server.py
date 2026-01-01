@@ -728,19 +728,46 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         node: tuple[str, int],
         message: bytes,
         include_piggyback: bool = True,
-    ):
+    ) -> bool:
+        """
+        Send a message to a node if its status is OK.
+        
+        Returns True if send was queued, False if skipped (node not OK).
+        Failures are logged via error handler.
+        """
         base_timeout = self._context.read('current_timeout')
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
-        _, status = node[-1]
-        if status == b'OK':
-            if include_piggyback:
-                message = message + self.get_piggyback_data()
-            self._task_runner.run(
-                self.send,
-                node,
-                message,
-                timeout=timeout,
+        
+        # Check node status
+        nodes: Nodes = self._context.read('nodes')
+        node_entry = nodes.get(node)
+        if not node_entry:
+            return False
+        
+        try:
+            _, status = node_entry.get_nowait()
+            if status != b'OK':
+                return False
+        except asyncio.QueueEmpty:
+            return False
+        
+        if include_piggyback:
+            message = message + self.get_piggyback_data()
+        
+        # Track the send and log failures
+        try:
+            await self._send_with_retry(node, message, timeout)
+            return True
+        except Exception as e:
+            # Log the failure but don't re-raise
+            await self.handle_error(
+                NetworkError(
+                    f"send_if_ok to {node[0]}:{node[1]} failed: {e}",
+                    target=node,
+                    severity=ErrorSeverity.TRANSIENT,
+                )
             )
+            return False
 
     async def poll_node(self, target: tuple[str, int]):
         """Legacy single-node polling (deprecated, use start_probe_cycle instead)."""
