@@ -813,6 +813,113 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         return msg_type, incarnation, target
     
+    async def _parse_incarnation_safe(
+        self,
+        message: bytes,
+        source: tuple[str, int],
+    ) -> int:
+        """
+        Parse incarnation number from message safely.
+        
+        Returns 0 on parse failure but logs the error for monitoring.
+        """
+        msg_parts = message.split(b':', maxsplit=1)
+        if len(msg_parts) > 1:
+            try:
+                return int(msg_parts[1].decode())
+            except ValueError as e:
+                await self.handle_error(
+                    MalformedMessageError(
+                        message,
+                        f"Invalid incarnation number: {e}",
+                        source,
+                    )
+                )
+        return 0
+    
+    async def _parse_term_safe(
+        self,
+        message: bytes,
+        source: tuple[str, int],
+    ) -> int:
+        """
+        Parse term number from message safely.
+        
+        Returns 0 on parse failure but logs the error for monitoring.
+        """
+        msg_parts = message.split(b':', maxsplit=1)
+        if len(msg_parts) > 1:
+            try:
+                return int(msg_parts[1].decode())
+            except ValueError as e:
+                await self.handle_error(
+                    MalformedMessageError(
+                        message,
+                        f"Invalid term number: {e}",
+                        source,
+                    )
+                )
+        return 0
+    
+    async def _parse_leadership_claim(
+        self,
+        message: bytes,
+        source: tuple[str, int],
+    ) -> tuple[int, int]:
+        """
+        Parse term and LHM from leader-claim or pre-vote-req message.
+        
+        Returns (term, lhm) tuple, with 0 for any failed parses.
+        """
+        msg_parts = message.split(b':', maxsplit=2)
+        term = 0
+        lhm = 0
+        
+        if len(msg_parts) >= 2:
+            try:
+                term = int(msg_parts[1].decode())
+            except ValueError as e:
+                await self.handle_error(
+                    MalformedMessageError(message, f"Invalid term: {e}", source)
+                )
+        
+        if len(msg_parts) >= 3:
+            try:
+                lhm = int(msg_parts[2].decode())
+            except ValueError as e:
+                await self.handle_error(
+                    MalformedMessageError(message, f"Invalid LHM: {e}", source)
+                )
+        
+        return term, lhm
+    
+    async def _parse_pre_vote_response(
+        self,
+        message: bytes,
+        source: tuple[str, int],
+    ) -> tuple[int, bool]:
+        """
+        Parse term and granted from pre-vote-resp message.
+        
+        Returns (term, granted) tuple.
+        """
+        msg_parts = message.split(b':', maxsplit=2)
+        term = 0
+        granted = False
+        
+        if len(msg_parts) >= 2:
+            try:
+                term = int(msg_parts[1].decode())
+            except ValueError as e:
+                await self.handle_error(
+                    MalformedMessageError(message, f"Invalid term: {e}", source)
+                )
+        
+        if len(msg_parts) >= 3:
+            granted = msg_parts[2].decode() == '1'
+        
+        return term, granted
+    
     def is_message_fresh(
         self,
         node: tuple[str, int],
@@ -1355,13 +1462,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'alive':
-                    msg_parts = message.split(b':', maxsplit=1)
-                    msg_incarnation = 0
-                    if len(msg_parts) > 1:
-                        try:
-                            msg_incarnation = int(msg_parts[1].decode())
-                        except ValueError:
-                            pass
+                    msg_incarnation = await self._parse_incarnation_safe(message, addr)
                     
                     if target:
                         if self.is_message_fresh(target, msg_incarnation, b'OK'):
@@ -1377,13 +1478,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'suspect':
-                    msg_parts = message.split(b':', maxsplit=1)
-                    msg_incarnation = 0
-                    if len(msg_parts) > 1:
-                        try:
-                            msg_incarnation = int(msg_parts[1].decode())
-                        except ValueError:
-                            pass
+                    msg_incarnation = await self._parse_incarnation_safe(message, addr)
                     
                     if target:
                         if self.udp_target_is_self(target):
@@ -1403,19 +1498,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                 
                 # Leadership messages
                 case b'leader-claim':
-                    msg_parts = message.split(b':', maxsplit=2)
-                    term = 0
-                    candidate_lhm = 0
-                    if len(msg_parts) >= 2:
-                        try:
-                            term = int(msg_parts[1].decode())
-                        except ValueError:
-                            pass
-                    if len(msg_parts) >= 3:
-                        try:
-                            candidate_lhm = int(msg_parts[2].decode())
-                        except ValueError:
-                            pass
+                    term, candidate_lhm = await self._parse_leadership_claim(message, addr)
                     
                     if target:
                         vote_msg = self._leader_election.handle_claim(target, term, candidate_lhm)
@@ -1432,13 +1515,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'leader-vote':
-                    msg_parts = message.split(b':', maxsplit=1)
-                    term = 0
-                    if len(msg_parts) >= 2:
-                        try:
-                            term = int(msg_parts[1].decode())
-                        except ValueError:
-                            pass
+                    term = await self._parse_term_safe(message, addr)
                     
                     if self._leader_election.handle_vote(addr, term):
                         self._leader_election.state.become_leader(term)
@@ -1455,13 +1532,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'leader-elected':
-                    msg_parts = message.split(b':', maxsplit=1)
-                    term = 0
-                    if len(msg_parts) >= 2:
-                        try:
-                            term = int(msg_parts[1].decode())
-                        except ValueError:
-                            pass
+                    term = await self._parse_term_safe(message, addr)
                     
                     if target:
                         self._leader_election.handle_elected(target, term)
@@ -1469,13 +1540,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'leader-heartbeat':
-                    msg_parts = message.split(b':', maxsplit=1)
-                    term = 0
-                    if len(msg_parts) >= 2:
-                        try:
-                            term = int(msg_parts[1].decode())
-                        except ValueError:
-                            pass
+                    term = await self._parse_term_safe(message, addr)
                     
                     if target:
                         self_addr = self._get_self_udp_addr()
@@ -1507,13 +1572,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'leader-stepdown':
-                    msg_parts = message.split(b':', maxsplit=1)
-                    term = 0
-                    if len(msg_parts) >= 2:
-                        try:
-                            term = int(msg_parts[1].decode())
-                        except ValueError:
-                            pass
+                    term = await self._parse_term_safe(message, addr)
                     
                     if target:
                         self._leader_election.handle_stepdown(target, term)
@@ -1521,15 +1580,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'pre-vote-req':
-                    msg_parts = message.split(b':', maxsplit=2)
-                    term = 0
-                    candidate_lhm = 0
-                    if len(msg_parts) >= 3:
-                        try:
-                            term = int(msg_parts[1].decode())
-                            candidate_lhm = int(msg_parts[2].decode())
-                        except ValueError:
-                            pass
+                    term, candidate_lhm = await self._parse_leadership_claim(message, addr)
                     
                     if target:
                         resp = self._leader_election.handle_pre_vote_request(
@@ -1547,15 +1598,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'pre-vote-resp':
-                    msg_parts = message.split(b':', maxsplit=2)
-                    term = 0
-                    granted = False
-                    if len(msg_parts) >= 3:
-                        try:
-                            term = int(msg_parts[1].decode())
-                            granted = msg_parts[2].decode() == '1'
-                        except ValueError:
-                            pass
+                    term, granted = await self._parse_pre_vote_response(message, addr)
                     
                     self._leader_election.handle_pre_vote_response(
                         voter=addr,
