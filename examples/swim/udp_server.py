@@ -1017,6 +1017,86 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Stop the leader election process."""
         await self._leader_election.stop()
     
+    async def graceful_shutdown(
+        self,
+        drain_timeout: float = 5.0,
+        broadcast_leave: bool = True,
+    ) -> None:
+        """
+        Perform graceful shutdown of the SWIM protocol node.
+        
+        This method coordinates the shutdown of all components in the proper order:
+        1. Step down from leadership (if leader)
+        2. Broadcast leave message to cluster
+        3. Wait for drain period (allow in-flight messages to complete)
+        4. Stop all background tasks
+        5. Clean up resources
+        
+        Args:
+            drain_timeout: Seconds to wait for in-flight messages to complete.
+            broadcast_leave: Whether to broadcast a leave message.
+        """
+        self._running = False
+        self_addr = self._get_self_udp_addr()
+        
+        # 1. Step down from leadership if we're the leader
+        if self._leader_election.state.is_leader():
+            try:
+                await self._leader_election._step_down()
+            except Exception as e:
+                if self._error_handler:
+                    await self.handle_exception(e, "shutdown_step_down")
+        
+        # 2. Broadcast leave message to cluster
+        if broadcast_leave:
+            try:
+                leave_msg = b'leave>' + f'{self_addr[0]}:{self_addr[1]}'.encode()
+                nodes: Nodes = self._context.read('nodes')
+                timeout = self.get_lhm_adjusted_timeout(1.0)
+                
+                for node in nodes.keys():
+                    if node != self_addr:
+                        try:
+                            await self.send(node, leave_msg, timeout=timeout)
+                        except Exception:
+                            pass  # Best effort - don't fail shutdown for send errors
+            except Exception as e:
+                if self._error_handler:
+                    await self.handle_exception(e, "shutdown_broadcast_leave")
+        
+        # 3. Wait for drain period
+        if drain_timeout > 0:
+            await asyncio.sleep(drain_timeout)
+        
+        # 4. Stop all background tasks in proper order
+        # Stop leader election first (stops sending heartbeats)
+        try:
+            await self.stop_leader_election()
+        except Exception as e:
+            if self._error_handler:
+                await self.handle_exception(e, "shutdown_stop_election")
+        
+        # Stop health monitor
+        try:
+            await self.stop_health_monitor()
+        except Exception as e:
+            if self._error_handler:
+                await self.handle_exception(e, "shutdown_stop_health_monitor")
+        
+        # Stop cleanup task
+        try:
+            await self.stop_cleanup()
+        except Exception as e:
+            if self._error_handler:
+                await self.handle_exception(e, "shutdown_stop_cleanup")
+        
+        # 5. Log final audit event
+        self._audit_log.add_event(
+            AuditEventType.NODE_LEFT,
+            node=self_addr,
+            details={'reason': 'graceful_shutdown'},
+        )
+    
     def get_current_leader(self) -> tuple[str, int] | None:
         """Get the current leader, if known."""
         return self._leader_election.get_current_leader()
