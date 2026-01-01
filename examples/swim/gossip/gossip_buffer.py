@@ -136,9 +136,15 @@ class GossipBuffer:
         """
         Get updates to piggyback on the next message.
         
+        Args:
+            max_count: Max updates to return (bounded to 1-100).
+        
         Returns up to max_count updates, prioritizing those with
         the lowest broadcast count (least disseminated).
         """
+        # Bound max_count to prevent excessive iteration
+        max_count = max(1, min(max_count, 100))
+        
         # Sort by broadcast count (ascending) to prioritize new updates
         candidates = sorted(
             [u for u in self.updates.values() if u.should_broadcast()],
@@ -155,6 +161,9 @@ class GossipBuffer:
                 if not self.updates[update.node].should_broadcast():
                     del self.updates[update.node]
     
+    # Maximum allowed max_count to prevent excessive iteration
+    MAX_ENCODE_COUNT = 100
+    
     def encode_piggyback(
         self, 
         max_count: int = 5, 
@@ -165,12 +174,15 @@ class GossipBuffer:
         Format: |update1|update2|update3
         
         Args:
-            max_count: Maximum number of updates to include.
+            max_count: Maximum number of updates to include (1-100).
             max_size: Maximum total size in bytes (defaults to max_piggyback_size).
         
         Returns:
             Encoded piggyback data respecting size limits.
         """
+        # Validate and bound max_count
+        max_count = max(1, min(max_count, self.MAX_ENCODE_COUNT))
+        
         if max_size is None:
             max_size = self.max_piggyback_size
         

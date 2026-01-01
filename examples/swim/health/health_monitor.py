@@ -91,6 +91,9 @@ class EventLoopHealthMonitor:
     _consecutive_ok_count: int = 0
     _is_degraded: bool = False
     
+    # Maximum consecutive counter value (prevents unbounded growth)
+    MAX_CONSECUTIVE_COUNT: int = 1000
+    
     # Thresholds for state transitions
     lag_count_to_degrade: int = 3
     """Consecutive lag samples to enter degraded state."""
@@ -239,16 +242,16 @@ class EventLoopHealthMonitor:
         
         if is_critical:
             self._total_critical_samples += 1
-            self._consecutive_lag_count += 1
+            self._consecutive_lag_count = min(self._consecutive_lag_count + 1, self.MAX_CONSECUTIVE_COUNT)
             self._consecutive_ok_count = 0
             await self._trigger_callback(self._on_critical_lag, sample.lag_ratio)
         elif is_lagging:
             self._total_lag_samples += 1
-            self._consecutive_lag_count += 1
+            self._consecutive_lag_count = min(self._consecutive_lag_count + 1, self.MAX_CONSECUTIVE_COUNT)
             self._consecutive_ok_count = 0
             await self._trigger_callback(self._on_lag_detected, sample.lag_ratio)
         else:
-            self._consecutive_ok_count += 1
+            self._consecutive_ok_count = min(self._consecutive_ok_count + 1, self.MAX_CONSECUTIVE_COUNT)
             self._consecutive_lag_count = 0
         
         # State transitions

@@ -99,6 +99,9 @@ class FlappingDetector:
     _flapping_episodes: int = 0
     _total_flapping_duration: float = 0.0
     
+    # Maximum counter values to prevent overflow
+    MAX_COUNTER_VALUE: int = 2**31 - 1
+    
     # Logger for structured logging (optional)
     _logger: LoggerProtocol | None = None
     _node_host: str = ""
@@ -182,7 +185,8 @@ class FlappingDetector:
             reason=reason,
         )
         self._changes.append(change)
-        self._total_changes += 1
+        if self._total_changes < self.MAX_COUNTER_VALUE:
+            self._total_changes += 1
         
         # Count changes in window
         changes_in_window = self._count_changes_in_window(now)
@@ -224,7 +228,8 @@ class FlappingDetector:
         
         self._is_flapping = True
         self._flapping_start = now
-        self._flapping_episodes += 1
+        if self._flapping_episodes < self.MAX_COUNTER_VALUE:
+            self._flapping_episodes += 1
         self._last_detection_time = now
         
         # Escalate cooldown

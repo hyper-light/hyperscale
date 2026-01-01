@@ -362,8 +362,8 @@ class LocalLeaderElection:
             
             # Check if we got enough pre-votes
             n_members = self._get_member_count() if self._get_member_count else 1
-            # For pre-vote, we need at least one response (or majority for larger clusters)
-            pre_votes_needed = max(1, (n_members + 1) // 2)  # Include self in count
+            # Pre-vote needs majority: floor(n/2) + 1, but at least 1
+            pre_votes_needed = max(1, (n_members // 2) + 1)
             
             success = len(self.state.pre_votes_received) >= pre_votes_needed
             return success
@@ -422,8 +422,8 @@ class LocalLeaderElection:
         # Check if we won
         if self.state.role == 'candidate':  # Still candidate
             n_members = self._get_member_count() if self._get_member_count else 1
-            # Need majority including self: (n+1)/2 rounded up
-            votes_needed = (n_members + 2) // 2  # This gives ceiling((n+1)/2)
+            # Majority = floor(n/2) + 1, equivalent to (n // 2) + 1
+            votes_needed = (n_members // 2) + 1
             
             if len(self.state.votes_received) >= votes_needed:
                 # We won!
