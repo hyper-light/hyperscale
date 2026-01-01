@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+SWIM + Lifeguard Test Server 1
+
+This server runs on ports 8670 (TCP) and 8671 (UDP) and demonstrates
+the SWIM protocol with Lifeguard enhancements for failure detection.
+
+Usage:
+    python swim_server_1.py
+
+This server will:
+1. Start up and begin the probe cycle
+2. Attempt to join server 2 at 127.0.0.1:8673
+3. Exchange probes and membership information
+4. Demonstrate refutation if suspected
+"""
+
+import asyncio
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from collections import defaultdict
+from hyperscale.distributed_rewrite.env import Env
+
+# Import the SWIM server implementation
+from server_test import TestServer
+
+
+async def run_server_1():
+    """Run SWIM server 1 on ports 8670/8671"""
+    
+    print("=" * 60)
+    print("SWIM + Lifeguard Test Server 1")
+    print("=" * 60)
+    print("TCP Port: 8670")
+    print("UDP Port: 8671")
+    print("=" * 60)
+    
+    server = TestServer(
+        '127.0.0.1',
+        8670,  # TCP port
+        8671,  # UDP port
+        Env(
+            MERCURY_SYNC_REQUEST_TIMEOUT='2s',
+        ),
+    )
+
+    await server.start_server(init_context={
+        'max_probe_timeout': 10,
+        'min_probe_timeout': 1,
+        'current_timeout': 2,
+        'nodes': defaultdict(asyncio.Queue),
+        'udp_poll_interval': 2,
+        # Suspicion timeout settings (Lifeguard)
+        'suspicion_min_timeout': 2.0,
+        'suspicion_max_timeout': 15.0,
+    })
+    
+    print("\n[Server 1] Started successfully!")
+    print(f"[Server 1] Local Health Multiplier: {server._local_health.get_multiplier():.2f}")
+    print(f"[Server 1] Incarnation: {server.get_self_incarnation()}")
+    
+    # Wait a moment for server 2 to potentially start
+    await asyncio.sleep(2)
+    
+    # Try to join server 2
+    server_2_addr = ('127.0.0.1', 8673)
+    print(f"\n[Server 1] Attempting to join Server 2 at {server_2_addr}...")
+    
+    try:
+        # Send join message to server 2
+        join_msg = b'join>' + f'{server_2_addr[0]}:{server_2_addr[1]}'.encode()
+        server._tasks.run(
+            server.send,
+            server_2_addr,
+            join_msg,
+            timeout=5,
+        )
+        print("[Server 1] Join request sent to Server 2")
+        
+        # Add server 2 to our known nodes
+        nodes = server._context.read('nodes')
+        nodes[server_2_addr].put_nowait((0, b'OK'))
+        server._probe_scheduler.add_member(server_2_addr)
+        server._incarnation_tracker.update_node(
+            server_2_addr, b'OK', 0, 0
+        )
+        print(f"[Server 1] Added Server 2 to membership list")
+        
+    except Exception as e:
+        print(f"[Server 1] Failed to join Server 2: {e}")
+    
+    # Start the probe cycle in the background
+    print("\n[Server 1] Starting probe cycle...")
+    probe_task = asyncio.create_task(server.start_probe_cycle())
+    
+    # Run status display loop
+    try:
+        while True:
+            await asyncio.sleep(5)
+            
+            # Display current status
+            print("\n" + "-" * 40)
+            print(f"[Server 1] Status Update")
+            print("-" * 40)
+            print(f"  LHM Score: {server._local_health.score}/{server._local_health.max_score}")
+            print(f"  LHM Multiplier: {server._local_health.get_multiplier():.2f}")
+            print(f"  Incarnation: {server.get_self_incarnation()}")
+            print(f"  Probe Scheduler Members: {len(server._probe_scheduler.members)}")
+            print(f"  Active Suspicions: {len(server._suspicion_manager.suspicions)}")
+            print(f"  Gossip Buffer Size: {len(server._gossip_buffer.updates)}")
+            
+            # Show known nodes
+            for node, state in server._incarnation_tracker.get_all_nodes():
+                print(f"  Node {node[0]}:{node[1]} - Status: {state.status}, Inc: {state.incarnation}")
+            
+    except asyncio.CancelledError:
+        print("\n[Server 1] Shutting down...")
+        probe_task.cancel()
+        try:
+            await probe_task
+        except asyncio.CancelledError:
+            pass
+        server.stop_probe_cycle()
+        await server.shutdown()
+        print("[Server 1] Shutdown complete")
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(run_server_1())
+    except KeyboardInterrupt:
+        print("\n[Server 1] Interrupted by user")
+
