@@ -12,6 +12,10 @@ from ..core.types import LeaderRole
 # Using 2^53 - 1 to stay within JavaScript safe integer range for JSON serialization
 MAX_TERM = (2**53) - 1
 
+# Maximum votes to track - prevents memory exhaustion from malicious voters
+# In practice, votes should never exceed cluster size, so this is generous
+MAX_VOTES = 1000
+
 
 @dataclass
 class LeaderState:
@@ -33,6 +37,10 @@ class LeaderState:
     - Operations can be tagged with term for safety
     
     Integrates with Lifeguard for health-aware leadership.
+    
+    Memory safety:
+    - Vote sets are bounded to MAX_VOTES to prevent memory exhaustion
+    - Sets are cleared on state transitions
     """
     role: LeaderRole = 'follower'
     current_term: int = 0
@@ -45,17 +53,21 @@ class LeaderState:
     leader_lease_start: float = 0.0
     lease_duration: float = 5.0  # Seconds
     
-    # Election state
+    # Election state (bounded to prevent memory exhaustion)
     votes_received: set[tuple[str, int]] = field(default_factory=set)
     voted_for: tuple[str, int] | None = None
     voted_in_term: int = -1
     election_timeout: float = 10.0  # Seconds
     last_heartbeat_time: float = 0.0
+    max_votes: int = MAX_VOTES  # Configurable bound
     
-    # Pre-voting state (split-brain prevention)
+    # Pre-voting state (split-brain prevention, bounded)
     pre_votes_received: set[tuple[str, int]] = field(default_factory=set)
     pre_vote_term: int = 0
     pre_voting_in_progress: bool = False
+    
+    # Stats for monitoring
+    _votes_dropped: int = 0
     
     # Fencing token (for operation safety)
     # The term serves as the fencing token - operations tagged with
@@ -146,7 +158,14 @@ class LeaderState:
         return True
     
     def record_vote(self, voter: tuple[str, int]) -> int:
-        """Record a vote received. Returns total vote count."""
+        """
+        Record a vote received. Returns total vote count.
+        
+        Votes beyond max_votes are dropped to prevent memory exhaustion.
+        """
+        if len(self.votes_received) >= self.max_votes:
+            self._votes_dropped += 1
+            return len(self.votes_received)
         self.votes_received.add(voter)
         return len(self.votes_received)
     
@@ -165,6 +184,10 @@ class LeaderState:
         self.leader_term = term
         self.leader_lease_start = time.monotonic()
         self.current_leader = None  # We are the leader, set by caller
+        
+        # Clear vote sets to free memory - we're done with the election
+        self.votes_received.clear()
+        self.pre_votes_received.clear()
         
         if not was_leader and self._on_become_leader:
             self._on_become_leader()
@@ -229,7 +252,14 @@ class LeaderState:
         self.pre_voting_in_progress = True
     
     def record_pre_vote(self, voter: tuple[str, int]) -> int:
-        """Record a pre-vote received. Returns total pre-vote count."""
+        """
+        Record a pre-vote received. Returns total pre-vote count.
+        
+        Pre-votes beyond max_votes are dropped to prevent memory exhaustion.
+        """
+        if len(self.pre_votes_received) >= self.max_votes:
+            self._votes_dropped += 1
+            return len(self.pre_votes_received)
         self.pre_votes_received.add(voter)
         return len(self.pre_votes_received)
     
@@ -334,4 +364,39 @@ class LeaderState:
             # Lower address wins
             return other_addr < self_addr
         return False
+    
+    # Cleanup and monitoring
+    def cleanup(self) -> dict[str, int]:
+        """
+        Clean up vote sets to free memory.
+        
+        Should be called periodically or after elections complete.
+        
+        Returns:
+            Dict with cleanup stats.
+        """
+        votes_cleared = len(self.votes_received)
+        pre_votes_cleared = len(self.pre_votes_received)
+        
+        # Only clear if not in an active election
+        if self.role != 'candidate':
+            self.votes_received.clear()
+        
+        if not self.pre_voting_in_progress:
+            self.pre_votes_received.clear()
+        
+        return {
+            'votes_cleared': votes_cleared if self.role != 'candidate' else 0,
+            'pre_votes_cleared': pre_votes_cleared if not self.pre_voting_in_progress else 0,
+            'votes_dropped': self._votes_dropped,
+        }
+    
+    def get_memory_stats(self) -> dict[str, int]:
+        """Get memory-related statistics for monitoring."""
+        return {
+            'votes_count': len(self.votes_received),
+            'pre_votes_count': len(self.pre_votes_received),
+            'votes_dropped': self._votes_dropped,
+            'max_votes': self.max_votes,
+        }
 

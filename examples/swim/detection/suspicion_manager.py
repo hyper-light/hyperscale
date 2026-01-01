@@ -52,6 +52,7 @@ class SuspicionManager:
     _refuted_count: int = 0
     _orphaned_cleanup_count: int = 0
     _race_avoided_count: int = 0  # Double-check prevented race condition
+    _stale_tokens_cleaned: int = 0  # Tokens cleaned without matching suspicion
     
     def __post_init__(self):
         """Initialize the lock after dataclass creation."""
@@ -282,6 +283,7 @@ class SuspicionManager:
         """Clear all suspicions (e.g., on shutdown)."""
         for state in self.suspicions.values():
             self._cancel_timer(state)
+            state.cleanup()  # Clean up confirmers set
         self.suspicions.clear()
         self._timer_tokens.clear()
     
@@ -317,12 +319,35 @@ class SuspicionManager:
         for node in to_remove:
             state = self.suspicions.pop(node)
             self._timer_tokens.pop(node, None)
+            state.cleanup()  # Clean up confirmers set
             self._orphaned_cleanup_count += 1
             # Treat as expired
             if self._on_suspicion_expired:
                 self._on_suspicion_expired(state.node, state.incarnation)
         
         return len(to_remove)
+    
+    def cleanup_stale_tokens(self) -> int:
+        """
+        Remove timer tokens that have no matching suspicion.
+        
+        This prevents memory leak if tokens accumulate due to:
+        - Race conditions in cleanup
+        - Suspicions removed without proper token cleanup
+        
+        Returns:
+            Number of stale tokens removed.
+        """
+        stale_tokens = []
+        for node in self._timer_tokens:
+            if node not in self.suspicions:
+                stale_tokens.append(node)
+        
+        for node in stale_tokens:
+            self._timer_tokens.pop(node, None)
+            self._stale_tokens_cleaned += 1
+        
+        return len(stale_tokens)
     
     def cleanup(self) -> dict[str, int]:
         """
@@ -332,10 +357,13 @@ class SuspicionManager:
             Dict with cleanup stats.
         """
         orphaned = self.cleanup_orphaned()
+        stale_tokens = self.cleanup_stale_tokens()
         
         return {
             'orphaned_removed': orphaned,
+            'stale_tokens_removed': stale_tokens,
             'active_suspicions': len(self.suspicions),
+            'active_timer_tokens': len(self._timer_tokens),
             'total_expired': self._expired_count,
             'total_refuted': self._refuted_count,
         }
@@ -348,6 +376,7 @@ class SuspicionManager:
             'total_expired': self._expired_count,
             'total_refuted': self._refuted_count,
             'orphaned_cleaned': self._orphaned_cleanup_count,
+            'stale_tokens_cleaned': self._stale_tokens_cleaned,
             'race_conditions_avoided': self._race_avoided_count,
         }
 

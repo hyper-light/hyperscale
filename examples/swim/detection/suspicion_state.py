@@ -7,6 +7,10 @@ import math
 import time
 from dataclasses import dataclass, field
 
+# Maximum confirmers to track per suspicion
+# In practice, confirmers should never exceed cluster size
+MAX_CONFIRMERS = 1000
+
 
 @dataclass
 class SuspicionState:
@@ -22,6 +26,10 @@ class SuspicionState:
     
     The timeout decreases as more confirmations are received, but never
     goes below min_timeout.
+    
+    Memory safety:
+    - Confirmers set is bounded to max_confirmers
+    - Extra confirmations beyond limit are dropped but still affect timeout
     """
     node: tuple[str, int]
     incarnation: int
@@ -35,20 +43,44 @@ class SuspicionState:
     regossip_count: int = 0
     _timer_task: asyncio.Task | None = field(default=None, repr=False)
     
+    # Memory bounds
+    max_confirmers: int = MAX_CONFIRMERS
+    _confirmations_dropped: int = 0
+    # Track actual confirmation count even if we don't store all confirmers
+    _logical_confirmation_count: int = 0
+    
     def add_confirmation(self, from_node: tuple[str, int]) -> bool:
         """
         Add a confirmation from another node.
         Returns True if this is a new confirmation.
+        
+        If confirmers set is at max capacity, the confirmation is still
+        counted for timeout calculation but the confirmer is not stored.
         """
+        # Check if already confirmed
         if from_node in self.confirmers:
             return False
-        self.confirmers.add(from_node)
+        
+        # Track logical count for timeout calculation
+        self._logical_confirmation_count += 1
+        
+        # Only store if under limit
+        if len(self.confirmers) < self.max_confirmers:
+            self.confirmers.add(from_node)
+        else:
+            self._confirmations_dropped += 1
+        
         return True
     
     @property
     def confirmation_count(self) -> int:
-        """Number of independent confirmations received."""
-        return len(self.confirmers)
+        """
+        Number of independent confirmations received.
+        
+        Uses logical count which may be higher than stored confirmers
+        if we hit the max_confirmers limit.
+        """
+        return max(len(self.confirmers), self._logical_confirmation_count)
     
     def calculate_timeout(self) -> float:
         """
@@ -94,4 +126,19 @@ class SuspicionState:
         if self._timer_task and not self._timer_task.done():
             self._timer_task.cancel()
             self._timer_task = None
+    
+    def cleanup(self) -> None:
+        """Clean up resources held by this suspicion state."""
+        self.cancel_timer()
+        self.confirmers.clear()
+        self._logical_confirmation_count = 0
+    
+    def get_memory_stats(self) -> dict[str, int]:
+        """Get memory-related statistics."""
+        return {
+            'confirmers_stored': len(self.confirmers),
+            'confirmations_logical': self._logical_confirmation_count,
+            'confirmations_dropped': self._confirmations_dropped,
+            'max_confirmers': self.max_confirmers,
+        }
 
