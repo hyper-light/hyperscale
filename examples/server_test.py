@@ -810,6 +810,92 @@ class GossipBuffer:
         self.updates.clear()
 
 
+@dataclass
+class ProbeScheduler:
+    """
+    Implements SWIM's randomized round-robin probing.
+    
+    In SWIM, members are probed in a randomized round-robin fashion:
+    1. Shuffle the member list
+    2. Probe each member in sequence
+    3. When exhausted, reshuffle and repeat
+    
+    This ensures:
+    - Each member is probed within a bounded time window
+    - Probing is unpredictable (helps with network partition handling)
+    - Even load distribution across members
+    """
+    members: list[tuple[str, int]] = field(default_factory=list)
+    probe_index: int = 0
+    protocol_period: float = 1.0  # Time between probes in seconds
+    _running: bool = False
+    _probe_task: asyncio.Task | None = field(default=None, repr=False)
+    
+    def update_members(self, members: list[tuple[str, int]]) -> None:
+        """
+        Update the member list and reshuffle.
+        Called when membership changes.
+        """
+        self.members = list(members)
+        random.shuffle(self.members)
+        # Reset index if it's now out of bounds
+        if self.probe_index >= len(self.members):
+            self.probe_index = 0
+    
+    def get_next_target(self) -> tuple[str, int] | None:
+        """
+        Get the next member to probe.
+        Returns None if no members available.
+        """
+        if not self.members:
+            return None
+        
+        # If we've probed everyone, reshuffle
+        if self.probe_index >= len(self.members):
+            random.shuffle(self.members)
+            self.probe_index = 0
+        
+        target = self.members[self.probe_index]
+        self.probe_index += 1
+        return target
+    
+    def remove_member(self, member: tuple[str, int]) -> None:
+        """Remove a member from the probe list (e.g., when declared dead)."""
+        if member in self.members:
+            # Adjust index if needed
+            idx = self.members.index(member)
+            self.members.remove(member)
+            if idx < self.probe_index:
+                self.probe_index = max(0, self.probe_index - 1)
+    
+    def add_member(self, member: tuple[str, int]) -> None:
+        """Add a new member to the probe list."""
+        if member not in self.members:
+            # Insert at random position for unpredictability
+            if self.members:
+                insert_idx = random.randint(0, len(self.members))
+                self.members.insert(insert_idx, member)
+                # Adjust probe index if we inserted before it
+                if insert_idx <= self.probe_index:
+                    self.probe_index += 1
+            else:
+                self.members.append(member)
+    
+    def get_probe_cycle_time(self) -> float:
+        """
+        Calculate time to complete one full probe cycle.
+        This is the maximum time before a failure is detected.
+        """
+        return len(self.members) * self.protocol_period
+    
+    def stop(self) -> None:
+        """Stop the probe scheduler."""
+        self._running = False
+        if self._probe_task and not self._probe_task.done():
+            self._probe_task.cancel()
+            self._probe_task = None
+
+
 class TestServer(MercurySyncBaseServer[Ctx]):
 
     def __init__(self, *args, **kwargs):
@@ -819,6 +905,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         self._suspicion_manager = SuspicionManager()
         self._indirect_probe_manager = IndirectProbeManager()
         self._gossip_buffer = GossipBuffer()
+        self._probe_scheduler = ProbeScheduler()
         
         # Set up suspicion manager callbacks
         self._suspicion_manager.set_callbacks(
@@ -960,6 +1047,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
 
 
     async def poll_node(self, target: tuple[str, int]):
+        """Legacy single-node polling (deprecated, use start_probe_cycle instead)."""
         status: Status = await self._context.read_with_lock(target)
         while self._running and status == b'OK':
             await self.send_if_ok(
@@ -972,6 +1060,148 @@ class TestServer(MercurySyncBaseServer[Ctx]):
             )
 
             status = await self._context.read_with_lock(target)
+    
+    async def start_probe_cycle(self) -> None:
+        """
+        Start the SWIM randomized round-robin probe cycle.
+        
+        This is the main failure detection loop that:
+        1. Gets the next member to probe from the scheduler
+        2. Sends a probe and waits for response
+        3. If no response, initiates indirect probing
+        4. If still no response, starts suspicion
+        5. Repeats after protocol_period
+        """
+        self._probe_scheduler._running = True
+        
+        # Initialize probe scheduler with current members
+        nodes: Nodes = self._context.read('nodes')
+        self_addr = self._get_self_udp_addr()
+        members = [node for node in nodes.keys() if node != self_addr]
+        self._probe_scheduler.update_members(members)
+        
+        protocol_period = self._context.read('udp_poll_interval', 1.0)
+        self._probe_scheduler.protocol_period = protocol_period
+        
+        while self._running and self._probe_scheduler._running:
+            try:
+                await self._run_probe_round()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                import traceback
+                print(f"Probe cycle error: {traceback.format_exc()}")
+            
+            # Wait for next protocol period
+            await asyncio.sleep(protocol_period)
+    
+    async def _run_probe_round(self) -> None:
+        """
+        Execute a single probe round in the SWIM protocol.
+        
+        Steps:
+        1. Select next target using round-robin
+        2. Send direct probe
+        3. If timeout, try indirect probing via k random nodes
+        4. If still no response, start/confirm suspicion
+        """
+        # Get next target
+        target = self._probe_scheduler.get_next_target()
+        if target is None:
+            return
+        
+        # Skip if target is us
+        if self.udp_target_is_self(target):
+            return
+        
+        # Get current incarnation for the target
+        node_state = self._incarnation_tracker.get_node_state(target)
+        incarnation = node_state.incarnation if node_state else 0
+        
+        # Get LHM-adjusted timeout
+        base_timeout = self._context.read('current_timeout')
+        timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        
+        # Send direct probe
+        target_addr = f'{target[0]}:{target[1]}'.encode()
+        probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
+        
+        try:
+            # Try direct probe first
+            response_received = await self._probe_with_timeout(target, probe_msg, timeout)
+            
+            if response_received:
+                # Success - node is alive
+                await self.decrease_failure_detector('successful_probe')
+                return
+            
+            # Direct probe failed - try indirect probing
+            await self.increase_failure_detector('probe_timeout')
+            
+            # Initiate indirect probing through k random nodes
+            indirect_sent = await self.initiate_indirect_probe(target, incarnation)
+            
+            if indirect_sent:
+                # Wait for indirect probe responses
+                await asyncio.sleep(timeout)
+                
+                # Check if any proxy got a response
+                probe = self._indirect_probe_manager.get_pending_probe(target)
+                if probe and probe.is_completed():
+                    # Indirect probe succeeded - node is alive
+                    await self.decrease_failure_detector('successful_probe')
+                    return
+            
+            # Both direct and indirect probes failed - start suspicion
+            self_addr = self._get_self_udp_addr()
+            self.start_suspicion(target, incarnation, self_addr)
+            
+            # Broadcast the suspicion
+            await self.broadcast_suspicion(target, incarnation)
+            
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            import traceback
+            print(f"Probe round error: {traceback.format_exc()}")
+    
+    async def _probe_with_timeout(
+        self, 
+        target: tuple[str, int], 
+        message: bytes,
+        timeout: float,
+    ) -> bool:
+        """
+        Send a probe message and wait for response.
+        Returns True if we received a response, False on timeout.
+        """
+        # In a real implementation, this would track the pending request
+        # and wait for the corresponding response. For now, we use
+        # a simplified version that sends and waits.
+        try:
+            self._tasks.run(
+                self.send,
+                target,
+                message,
+                timeout=timeout,
+            )
+            # Give time for response (simplified - real impl would use futures)
+            await asyncio.sleep(timeout * 0.8)
+            # Check if we got an ack (would need response tracking)
+            return False  # Simplified: always try indirect
+        except asyncio.TimeoutError:
+            return False
+    
+    def stop_probe_cycle(self) -> None:
+        """Stop the probe cycle."""
+        self._probe_scheduler.stop()
+    
+    def update_probe_scheduler_membership(self) -> None:
+        """Update the probe scheduler with current membership."""
+        nodes: Nodes = self._context.read('nodes')
+        self_addr = self._get_self_udp_addr()
+        members = [node for node in nodes.keys() if node != self_addr]
+        self._probe_scheduler.update_members(members)
 
     async def increase_failure_detector(self, event_type: str = 'probe_timeout'):
         """
