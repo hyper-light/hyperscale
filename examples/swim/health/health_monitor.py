@@ -101,9 +101,14 @@ class EventLoopHealthMonitor:
     _total_lag_samples: int = 0
     _total_critical_samples: int = 0
     _degraded_transitions: int = 0
+    _unmanaged_tasks_created: int = 0  # Track fallback task creation
+    
+    # Track fallback tasks so they can be cleaned up
+    _pending_callback_tasks: set[asyncio.Task] = field(default_factory=set)
     
     def __post_init__(self):
         self._samples = deque(maxlen=self.history_size)
+        self._pending_callback_tasks = set()
     
     def set_callbacks(
         self,
@@ -138,6 +143,12 @@ class EventLoopHealthMonitor:
             except asyncio.CancelledError:
                 pass
         self._monitor_task = None
+        
+        # Cancel any pending callback tasks
+        for task in list(self._pending_callback_tasks):
+            if not task.done():
+                task.cancel()
+        self._pending_callback_tasks.clear()
     
     async def _monitor_loop(self) -> None:
         """Main monitoring loop."""
@@ -224,7 +235,12 @@ class EventLoopHealthMonitor:
                         await result
                     self._task_runner.run(_run_callback)
                 else:
-                    asyncio.create_task(result)
+                    # Fallback: create task but track it for cleanup
+                    self._unmanaged_tasks_created += 1
+                    task = asyncio.create_task(result)
+                    self._pending_callback_tasks.add(task)
+                    # Clean up task from set when done
+                    task.add_done_callback(self._pending_callback_tasks.discard)
         except Exception as e:
             # Log callback errors for debugging
             import sys
@@ -298,6 +314,8 @@ class EventLoopHealthMonitor:
             'degraded_transitions': self._degraded_transitions,
             'consecutive_lag': self._consecutive_lag_count,
             'consecutive_ok': self._consecutive_ok_count,
+            'unmanaged_tasks_created': self._unmanaged_tasks_created,
+            'pending_callback_tasks': len(self._pending_callback_tasks),
         }
     
     def reset_stats(self) -> None:
