@@ -237,67 +237,72 @@ class RemoteGraphManager:
             timeouts: dict[str, Exception] = {}
 
             for workflow_set in workflow_traversal_order:
-                provisioned_batch, workflow_vus = self._provision(workflow_set)
+                try:
 
-                batch_workflows = [
-                    workflow_name
-                    for group in provisioned_batch
-                    for workflow_name, _, _ in group
-                ]
+                    provisioned_batch, workflow_vus = self._provision(workflow_set)
 
-                workflow_names = ", ".join(batch_workflows)
-
-                await ctx.log(
-                    GraphDebug(
-                        message=f"Graph {test_name} executing workflows {workflow_names}",
-                        workflows=batch_workflows,
-                        workers=self._threads,
-                        graph=test_name,
-                        level=LogLevel.DEBUG,
-                    )
-                )
-
-                self._updates.update_active_workflows(
-                    [
-                        workflow_name.lower()
+                    batch_workflows = [
+                        workflow_name
                         for group in provisioned_batch
                         for workflow_name, _, _ in group
                     ]
-                )
 
-                results = await asyncio.gather(
-                    *[
-                        self._run_workflow(
-                            run_id,
-                            workflow_set[workflow_name],
-                            threads,
-                            workflow_vus[workflow_name],
+                    workflow_names = ", ".join(batch_workflows)
+
+                    await ctx.log(
+                        GraphDebug(
+                            message=f"Graph {test_name} executing workflows {workflow_names}",
+                            workflows=batch_workflows,
+                            workers=self._threads,
+                            graph=test_name,
+                            level=LogLevel.DEBUG,
                         )
-                        for group in provisioned_batch
-                        for workflow_name, _, threads in group
-                    ]
-                )
-
-                await ctx.log(
-                    GraphDebug(
-                        message=f"Graph {test_name} completed workflows {workflow_names}",
-                        workflows=batch_workflows,
-                        workers=self._threads,
-                        graph=test_name,
-                        level=LogLevel.DEBUG,
                     )
-                )
 
-                workflow_results.update(
-                    {
-                        workflow_name: results
-                        for workflow_name, results, timeout_error in results
-                        if timeout_error is None
-                    }
-                )
+                    self._updates.update_active_workflows(
+                        [
+                            workflow_name.lower()
+                            for group in provisioned_batch
+                            for workflow_name, _, _ in group
+                        ]
+                    )
 
-                for workflow_name, _, timeout_error in results:
-                    timeouts[workflow_name] = timeout_error
+                    results = await asyncio.gather(
+                        *[
+                            self._run_workflow(
+                                run_id,
+                                workflow_set[workflow_name],
+                                threads,
+                                workflow_vus[workflow_name],
+                            )
+                            for group in provisioned_batch
+                            for workflow_name, _, threads in group
+                        ]
+                    )
+
+                    await ctx.log(
+                        GraphDebug(
+                            message=f"Graph {test_name} completed workflows {workflow_names}",
+                            workflows=batch_workflows,
+                            workers=self._threads,
+                            graph=test_name,
+                            level=LogLevel.DEBUG,
+                        )
+                    )
+
+                    # workflow_results.update(
+                    #     {
+                    #         workflow_name: results
+                    #         for workflow_name, results, timeout_error in results
+                    #         if timeout_error is None
+                    #     }
+                    # )
+
+                    # for workflow_name, _, timeout_error in results:
+                    #     timeouts[workflow_name] = timeout_error
+                except Exception:
+                    import traceback
+                    print(traceback.format_exc())
 
             await ctx.log_prepared(
                 message=f"Graph {test_name} completed execution", name="debug"
@@ -740,6 +745,10 @@ class RemoteGraphManager:
             await update_active_workflow_message(workflow_slug, "Aborted")
 
             raise err
+        
+        except Exception:
+            import traceback
+            print(traceback.format_exc())
 
     def _setup_state_actions(self, workflow: Workflow) -> Dict[str, ContextHook]:
         state_actions: Dict[str, ContextHook] = {

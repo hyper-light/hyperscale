@@ -1,5 +1,5 @@
 from hyperscale.graph import Workflow, step
-from hyperscale.testing import URL, HTTP2Response, Headers
+from hyperscale.testing import URL, HTTPResponse, Headers
 
 
 
@@ -19,11 +19,11 @@ from hyperscale.testing import URL, HTTP2Response, Headers
 
 class Test(Workflow):
     vus = 2000
-    duration = "1m"
+    duration = "15s"
 
     @step()
     async def get_httpbin(
         self,
         url: URL = 'https://httpbin.org/get',
-    ) -> HTTP2Response:
+    ) -> HTTPResponse:
         return await self.client.http.get(url)

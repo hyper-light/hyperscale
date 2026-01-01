@@ -43,6 +43,7 @@ from hyperscale.logging.hyperscale_logging_models import (
 
 from .client_protocol import MercurySyncTCPClientProtocol
 from .encryption import AESGCMFernet
+from .replay_guard import ReplayGuard, ReplayError
 from .server_protocol import MercurySyncTCPServerProtocol
 
 T = TypeVar("T")
@@ -117,6 +118,13 @@ class TCPProtocol(Generic[T, K]):
         self._abort_handle_created: bool = None
         self._connect_lock: asyncio.Lock | None = None
         self._shutdown_task: asyncio.Future | None = None
+        
+        # Replay attack protection
+        self._replay_guard = ReplayGuard(
+            max_age_seconds=300,  # 5 minutes
+            max_future_seconds=60,  # 1 minute clock skew tolerance
+            max_window_size=100000,
+        )
 
     @property
     def nodes(self):
@@ -862,6 +870,16 @@ class TCPProtocol(Generic[T, K]):
 
         if transport.is_closing():
             return
+
+        # Replay attack protection - validate message freshness and uniqueness
+        # Skip replay check for responses (they're replies to our requests)
+        if message_type != "response":
+            try:
+                self._replay_guard.validate(shard_id, raise_on_error=True)
+            except ReplayError:
+                # Silently drop replayed messages - don't send error response
+                # as that could be used for timing attacks
+                return
 
         snowflake = Snowflake.parse(shard_id)
         instance = snowflake.instance

@@ -19,7 +19,9 @@ Note: This class is pickle-compatible for multiprocessing. The cryptography
 backend is obtained on-demand rather than stored as an instance attribute.
 """
 
+import os
 import secrets
+import warnings
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
@@ -37,6 +39,23 @@ HEADER_SIZE = SALT_SIZE + NONCE_SIZE  # 28 bytes
 
 # Domain separation context for HKDF
 ENCRYPTION_CONTEXT = b"hyperscale-jobs-encryption-v1"
+
+# Known weak/default secrets that should be rejected in production
+WEAK_SECRETS = frozenset([
+    "hyperscale",
+    "hyperscalelocal",
+    "hyperscale-local",
+    "hyperscale-dev-secret-change-in-prod",
+    "hyperscale-local-dev-secret",
+    "secret",
+    "password",
+    "changeme",
+    "default",
+    "test",
+    "testing",
+    "development",
+    "dev",
+])
 
 
 class EncryptionError(Exception):
@@ -77,6 +96,27 @@ class AESGCMFernet:
                 "MERCURY_SYNC_AUTH_SECRET must be at least 16 characters. "
                 "Use a strong, random secret for production deployments."
             )
+        
+        # Check for weak/default secrets
+        secret_lower = secret.lower() if isinstance(secret, str) else secret.decode('utf-8', errors='ignore').lower()
+        is_production = os.environ.get('HYPERSCALE_ENV', '').lower() in ('production', 'prod')
+        
+        if secret_lower in WEAK_SECRETS:
+            if is_production:
+                raise ValueError(
+                    f"MERCURY_SYNC_AUTH_SECRET is set to a known weak/default value. "
+                    f"This is not allowed in production (HYPERSCALE_ENV=production). "
+                    f"Please set a strong, random secret. "
+                    f"Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+                )
+            else:
+                warnings.warn(
+                    f"MERCURY_SYNC_AUTH_SECRET is set to a known weak/default value '{secret_lower}'. "
+                    f"This is acceptable for development but will be rejected in production. "
+                    f"Set HYPERSCALE_ENV=production to enforce strong secrets.",
+                    UserWarning,
+                    stacklevel=2
+                )
 
     def _derive_key(self, salt: bytes) -> bytes:
         """
