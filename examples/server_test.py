@@ -23,6 +23,7 @@ Message = Literal[
     b'alive',  # Refutation/alive message
 ]
 Status = Literal[b'JOIN', b'OK', b'SUSPECT', b'DEAD']
+UpdateType = Literal['alive', 'suspect', 'dead', 'join', 'leave']
 
 Nodes = dict[tuple[str, int], asyncio.Queue[tuple[int, Status]]]
 Ctx = dict[Literal['nodes'], Nodes]
@@ -603,6 +604,196 @@ class IndirectProbeManager:
         self.pending_probes.clear()
 
 
+@dataclass
+class PiggybackUpdate:
+    """
+    A membership update to be piggybacked on probe messages.
+    
+    In SWIM, membership updates are disseminated by "piggybacking" them
+    onto the protocol messages (probes, acks). This achieves O(log n)
+    dissemination without additional message overhead.
+    """
+    update_type: UpdateType
+    node: tuple[str, int]
+    incarnation: int
+    timestamp: float
+    # Number of times this update has been piggybacked
+    broadcast_count: int = 0
+    # Maximum number of times to piggyback (lambda * log(n))
+    max_broadcasts: int = 10
+    
+    def should_broadcast(self) -> bool:
+        """Check if this update should still be piggybacked."""
+        return self.broadcast_count < self.max_broadcasts
+    
+    def mark_broadcast(self) -> None:
+        """Mark that this update was piggybacked."""
+        self.broadcast_count += 1
+    
+    def to_bytes(self) -> bytes:
+        """Serialize update for transmission."""
+        # Format: type:incarnation:host:port
+        return (
+            self.update_type.encode() + b':' +
+            str(self.incarnation).encode() + b':' +
+            self.node[0].encode() + b':' +
+            str(self.node[1]).encode()
+        )
+    
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'PiggybackUpdate | None':
+        """Deserialize an update from bytes."""
+        try:
+            parts = data.decode().split(':')
+            if len(parts) < 4:
+                return None
+            update_type = parts[0]
+            incarnation = int(parts[1])
+            host = parts[2]
+            port = int(parts[3])
+            return cls(
+                update_type=update_type,
+                node=(host, port),
+                incarnation=incarnation,
+                timestamp=time.monotonic(),
+            )
+        except (ValueError, UnicodeDecodeError):
+            return None
+    
+    def __hash__(self) -> int:
+        return hash((self.update_type, self.node, self.incarnation))
+    
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, PiggybackUpdate):
+            return False
+        return (
+            self.update_type == other.update_type and
+            self.node == other.node and
+            self.incarnation == other.incarnation
+        )
+
+
+@dataclass
+class GossipBuffer:
+    """
+    Buffer for membership updates to be piggybacked on messages.
+    
+    Maintains a priority queue of updates ordered by broadcast count,
+    so that less-disseminated updates are sent first. Updates are
+    removed after being broadcast lambda * log(n) times.
+    """
+    updates: dict[tuple[str, int], PiggybackUpdate] = field(default_factory=dict)
+    # Multiplier for max broadcasts (lambda in the paper)
+    broadcast_multiplier: int = 3
+    
+    def add_update(
+        self,
+        update_type: UpdateType,
+        node: tuple[str, int],
+        incarnation: int,
+        n_members: int = 1,
+    ) -> None:
+        """
+        Add or update a membership update in the buffer.
+        
+        If an update for the same node exists with lower incarnation,
+        it is replaced. Updates with equal or higher incarnation are
+        only replaced if the new status has higher priority.
+        """
+        # Calculate max broadcasts: lambda * log(n+1)
+        max_broadcasts = max(1, int(
+            self.broadcast_multiplier * math.log(n_members + 1)
+        ))
+        
+        existing = self.updates.get(node)
+        
+        if existing is None:
+            # New update
+            self.updates[node] = PiggybackUpdate(
+                update_type=update_type,
+                node=node,
+                incarnation=incarnation,
+                timestamp=time.monotonic(),
+                max_broadcasts=max_broadcasts,
+            )
+        elif incarnation > existing.incarnation:
+            # Higher incarnation replaces
+            self.updates[node] = PiggybackUpdate(
+                update_type=update_type,
+                node=node,
+                incarnation=incarnation,
+                timestamp=time.monotonic(),
+                max_broadcasts=max_broadcasts,
+            )
+        elif incarnation == existing.incarnation:
+            # Same incarnation - check status priority
+            priority = {'alive': 0, 'join': 0, 'suspect': 1, 'dead': 2, 'leave': 2}
+            if priority.get(update_type, 0) > priority.get(existing.update_type, 0):
+                self.updates[node] = PiggybackUpdate(
+                    update_type=update_type,
+                    node=node,
+                    incarnation=incarnation,
+                    timestamp=time.monotonic(),
+                    max_broadcasts=max_broadcasts,
+                )
+    
+    def get_updates_to_piggyback(self, max_count: int = 5) -> list[PiggybackUpdate]:
+        """
+        Get updates to piggyback on the next message.
+        
+        Returns up to max_count updates, prioritizing those with
+        the lowest broadcast count (least disseminated).
+        """
+        # Sort by broadcast count (ascending) to prioritize new updates
+        candidates = sorted(
+            [u for u in self.updates.values() if u.should_broadcast()],
+            key=lambda u: u.broadcast_count,
+        )
+        
+        return candidates[:max_count]
+    
+    def mark_broadcasts(self, updates: list[PiggybackUpdate]) -> None:
+        """Mark updates as having been broadcast and remove if done."""
+        for update in updates:
+            if update.node in self.updates:
+                self.updates[update.node].mark_broadcast()
+                if not self.updates[update.node].should_broadcast():
+                    del self.updates[update.node]
+    
+    def encode_piggyback(self, max_count: int = 5) -> bytes:
+        """
+        Get piggybacked updates as bytes to append to a message.
+        Format: |update1|update2|update3
+        """
+        updates = self.get_updates_to_piggyback(max_count)
+        if not updates:
+            return b''
+        
+        self.mark_broadcasts(updates)
+        return b'|' + b'|'.join(u.to_bytes() for u in updates)
+    
+    @staticmethod
+    def decode_piggyback(data: bytes) -> list[PiggybackUpdate]:
+        """
+        Decode piggybacked updates from message suffix.
+        """
+        if not data or data[0:1] != b'|':
+            return []
+        
+        updates = []
+        parts = data[1:].split(b'|')
+        for part in parts:
+            if part:
+                update = PiggybackUpdate.from_bytes(part)
+                if update:
+                    updates.append(update)
+        return updates
+    
+    def clear(self) -> None:
+        """Clear all pending updates."""
+        self.updates.clear()
+
+
 class TestServer(MercurySyncBaseServer[Ctx]):
 
     def __init__(self, *args, **kwargs):
@@ -611,6 +802,7 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         self._incarnation_tracker = IncarnationTracker()
         self._suspicion_manager = SuspicionManager()
         self._indirect_probe_manager = IndirectProbeManager()
+        self._gossip_buffer = GossipBuffer()
         
         # Set up suspicion manager callbacks
         self._suspicion_manager.set_callbacks(
@@ -635,9 +827,83 @@ class TestServer(MercurySyncBaseServer[Ctx]):
             time.monotonic(),
         )
         # Queue the death notification for gossip
+        self.queue_gossip_update('dead', node, incarnation)
         nodes: Nodes = self._context.read('nodes')
         if node in nodes:
             nodes[node].put_nowait((int(time.monotonic()), b'DEAD'))
+    
+    def queue_gossip_update(
+        self,
+        update_type: UpdateType,
+        node: tuple[str, int],
+        incarnation: int,
+    ) -> None:
+        """
+        Queue a membership update for piggybacking on future messages.
+        
+        Updates are disseminated by being attached to probe/ack messages
+        until they have been broadcast lambda * log(n) times.
+        """
+        n_members = self._get_member_count()
+        self._gossip_buffer.add_update(update_type, node, incarnation, n_members)
+    
+    def get_piggyback_data(self, max_updates: int = 5) -> bytes:
+        """
+        Get piggybacked membership updates to append to a message.
+        Returns encoded bytes ready to append to message.
+        """
+        return self._gossip_buffer.encode_piggyback(max_updates)
+    
+    def process_piggyback_data(self, data: bytes) -> None:
+        """
+        Process piggybacked membership updates received in a message.
+        Applies each update to local state if fresh.
+        """
+        updates = GossipBuffer.decode_piggyback(data)
+        for update in updates:
+            # Check if the update is fresh
+            status_map = {
+                'alive': b'OK',
+                'join': b'OK', 
+                'suspect': b'SUSPECT',
+                'dead': b'DEAD',
+                'leave': b'DEAD',
+            }
+            status = status_map.get(update.update_type, b'OK')
+            
+            if self.is_message_fresh(update.node, update.incarnation, status):
+                # Apply the update
+                self.update_node_state(
+                    update.node,
+                    status,
+                    update.incarnation,
+                    update.timestamp,
+                )
+                
+                # If it's a suspicion, start/confirm it
+                if update.update_type == 'suspect':
+                    self_addr = self._get_self_udp_addr()
+                    if update.node == self_addr:
+                        # We're being suspected - this will trigger refutation
+                        # in the message handler
+                        pass
+                    else:
+                        # Someone else is suspected
+                        self.start_suspicion(
+                            update.node,
+                            update.incarnation,
+                            self_addr,  # We're the confirmer
+                        )
+                elif update.update_type == 'alive':
+                    # Clear any suspicion
+                    self.refute_suspicion(update.node, update.incarnation)
+                
+                # Re-queue for further dissemination
+                self.queue_gossip_update(
+                    update.update_type,
+                    update.node,
+                    update.incarnation,
+                )
 
     def get_other_nodes(self, node: tuple[str, int]):
         target_host, target_port = node
@@ -654,11 +920,16 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         self,
         node: tuple[str, int],
         message: bytes,
+        include_piggyback: bool = True,
     ):
         base_timeout = self._context.read('current_timeout')
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
         _, status = node[-1]
         if status == b'OK':
+            # Append piggybacked membership updates if enabled
+            if include_piggyback:
+                message = message + self.get_piggyback_data()
+            
             self._tasks.run(
                 self.send,
                 node,
@@ -1087,6 +1358,15 @@ class TestServer(MercurySyncBaseServer[Ctx]):
         clock_time: int,
     ) -> Message:
         try:
+            # Extract any piggybacked membership updates first
+            # Piggyback format: main_message|update1|update2|...
+            piggyback_idx = data.find(b'|')
+            if piggyback_idx > 0:
+                main_data = data[:piggyback_idx]
+                piggyback_data = data[piggyback_idx:]
+                # Process piggybacked updates
+                self.process_piggyback_data(piggyback_data)
+                data = main_data
 
             parsed = data.split(b'>', maxsplit=1)
             message = data
