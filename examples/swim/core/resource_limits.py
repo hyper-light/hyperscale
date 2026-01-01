@@ -6,12 +6,18 @@ in high-churn distributed environments.
 """
 
 import time
+import sys
 from dataclasses import dataclass, field
-from typing import TypeVar, Generic, Callable, Any
+from typing import TypeVar, Generic, Callable, Any, Protocol
 from collections import OrderedDict
 
 K = TypeVar('K')
 V = TypeVar('V')
+
+
+class LoggerProtocol(Protocol):
+    """Protocol for logger to avoid circular imports."""
+    def log(self, entry: Any) -> None: ...
 
 
 @dataclass
@@ -47,14 +53,21 @@ class BoundedDict(Generic[K, V]):
     on_evict: Callable[[K, V], None] | None = None
     """Optional callback when an entry is evicted."""
     
+    name: str = ""
+    """Name for this dict (used in error logging)."""
+    
     # Internal storage
     # - OrderedDict tracks access order for LRU (most recent at end)
     # - _add_times only populated for LRA/OLDEST policies
     _data: OrderedDict[K, V] = field(default_factory=OrderedDict)
     _add_times: dict[K, float] = field(default_factory=dict)
     
+    # Error tracking
+    _evict_callback_errors: int = 0
+    
     def __post_init__(self):
         self._data = OrderedDict()
+        self._evict_callback_errors = 0
         # Only allocate _add_times if needed for the eviction policy
         if self.eviction_policy in ('LRA', 'OLDEST'):
             self._add_times = {}
@@ -147,8 +160,14 @@ class BoundedDict(Generic[K, V]):
             if value is not None and self.on_evict:
                 try:
                     self.on_evict(key, value)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Log error but don't fail eviction - would cause memory issues
+                    self._evict_callback_errors += 1
+                    name = self.name or "BoundedDict"
+                    print(
+                        f"[{name}] Eviction callback error: {type(e).__name__}: {e}",
+                        file=sys.stderr
+                    )
     
     def cleanup_by_predicate(
         self,

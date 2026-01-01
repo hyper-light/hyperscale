@@ -357,8 +357,14 @@ class ErrorHandler:
                 # Fallback to simple logging
                 try:
                     self.logger.log(str(error))
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Last resort: write to stderr
+                    import sys
+                    print(
+                        f"[ErrorHandler] Logging failed: {type(e).__name__}: {e} "
+                        f"(original: {error})",
+                        file=sys.stderr
+                    )
     
     def _log_circuit_open(self, category: ErrorCategory, stats: ErrorStats) -> None:
         """Log circuit breaker opening."""
@@ -380,8 +386,13 @@ class ErrorHandler:
             except (ImportError, AttributeError):
                 try:
                     self.logger.log(message)
-                except Exception:
-                    pass
+                except Exception as e:
+                    import sys
+                    print(
+                        f"[ErrorHandler] Circuit open logging failed: {type(e).__name__}: {e} "
+                        f"(message: {message})",
+                        file=sys.stderr
+                    )
     
     async def _update_lhm(self, error: SwimError) -> None:
         """Update Local Health Multiplier based on error."""
@@ -410,8 +421,14 @@ class ErrorHandler:
         if event_type:
             try:
                 await self.increment_lhm(event_type)
-            except Exception:
-                pass  # Don't let LHM updates cause more errors
+            except Exception as e:
+                # Log but don't let LHM updates cause more errors
+                import sys
+                print(
+                    f"[ErrorHandler] LHM update failed for {event_type}: "
+                    f"{type(e).__name__}: {e}",
+                    file=sys.stderr
+                )
     
     async def _trigger_recovery(self, category: ErrorCategory) -> None:
         """Trigger recovery action for a category."""
@@ -420,21 +437,26 @@ class ErrorHandler:
                 await self._recovery_actions[category]()
             except Exception as e:
                 # Log recovery failure but don't propagate
-                if self.logger:
-                    try:
-                        self.logger.log(
-                            f"Recovery action failed for {category.name}: {e}"
-                        )
-                    except Exception:
-                        pass
+                import sys
+                print(
+                    f"[ErrorHandler] Recovery action failed for {category.name}: "
+                    f"{type(e).__name__}: {e}",
+                    file=sys.stderr
+                )
     
     async def _handle_fatal(self, error: SwimError) -> None:
         """Handle fatal error - escalate to callback or raise."""
         if self._fatal_callback:
             try:
                 await self._fatal_callback(error)
-            except Exception:
-                pass
+            except Exception as e:
+                # Log fatal callback failure - this is serious
+                import sys
+                print(
+                    f"[ErrorHandler] FATAL: Fatal callback failed: "
+                    f"{type(e).__name__}: {e} (original error: {error})",
+                    file=sys.stderr
+                )
         else:
             # Re-raise fatal errors if no handler
             raise error

@@ -311,10 +311,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         # Log the change
         if hasattr(self, '_udp_logger'):
             try:
-                from hyperscale.distributed.types import ServerInfo
+                from hyperscale.logging.hyperscale_logging_models import ServerInfo as ServerInfoLog
                 self._udp_logger.log(
-                    ServerInfo(
-                        f"Degradation {direction}: {old_level.name} -> {new_level.name} ({policy.description})"
+                    ServerInfoLog(
+                        message=f"Degradation {direction}: {old_level.name} -> {new_level.name} ({policy.description})",
+                        node_host=self._host,
+                        node_port=self._port,
+                        node_id=self._node_id.numeric_id if hasattr(self, '_node_id') else 0,
                     )
                 )
             except Exception as e:
@@ -1136,12 +1139,30 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                 nodes: Nodes = self._context.read('nodes')
                 timeout = self.get_lhm_adjusted_timeout(1.0)
                 
+                send_failures = 0
                 for node in nodes.keys():
                     if node != self_addr:
                         try:
                             await self.send(node, leave_msg, timeout=timeout)
-                        except Exception:
-                            pass  # Best effort - don't fail shutdown for send errors
+                        except Exception as e:
+                            # Best effort - log but don't fail shutdown for send errors
+                            send_failures += 1
+                            from hyperscale.logging.hyperscale_logging_models import ServerDebug
+                            self._udp_logger.log(ServerDebug(
+                                message=f"Leave broadcast to {node[0]}:{node[1]} failed: {type(e).__name__}",
+                                node_host=self._host,
+                                node_port=self._port,
+                                node_id=self._node_id.numeric_id,
+                            ))
+                
+                if send_failures > 0:
+                    from hyperscale.logging.hyperscale_logging_models import ServerDebug
+                    self._udp_logger.log(ServerDebug(
+                        message=f"Leave broadcast: {send_failures}/{len(nodes)-1} sends failed",
+                        node_host=self._host,
+                        node_port=self._port,
+                        node_id=self._node_id.numeric_id,
+                    ))
             except Exception as e:
                 if self._error_handler:
                     await self.handle_exception(e, "shutdown_broadcast_leave")
