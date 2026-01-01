@@ -1280,6 +1280,29 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             'refill_rate': self._rate_limit_refill,
         }
     
+    async def _validate_target(
+        self,
+        target: tuple[str, int] | None,
+        msg_type: bytes,
+        addr: tuple[str, int],
+    ) -> bool:
+        """
+        Validate that target is present when required.
+        
+        Logs MalformedMessageError if target is missing.
+        Returns True if valid, False if invalid.
+        """
+        if target is None:
+            await self.handle_error(
+                MalformedMessageError(
+                    msg_type,
+                    "Missing target address in message",
+                    addr,
+                )
+            )
+            return False
+        return True
+    
     def update_node_state(
         self,
         node: tuple[str, int],
@@ -1754,15 +1777,19 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
 
             match msg_type:
                 case b'ack' | b'nack':
-                    nodes: Nodes = self._context.read('nodes')
-                    if target not in nodes:
-                        await self.increase_failure_detector('missed_nack')
-                        return b'nack>' + self._udp_addr_slug
-                    
-                    await self.decrease_failure_detector('successful_nack')
+                    # ack/nack may or may not have target
+                    if target:
+                        nodes: Nodes = self._context.read('nodes')
+                        if target not in nodes:
+                            await self.increase_failure_detector('missed_nack')
+                            return b'nack>' + self._udp_addr_slug
+                        await self.decrease_failure_detector('successful_nack')
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'join':
+                    if not await self._validate_target(target, b'join', addr):
+                        return b'nack>' + self._udp_addr_slug
+                    
                     async with self._context.with_value(target):
                         nodes: Nodes = self._context.read('nodes')
 
@@ -1788,6 +1815,9 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         return b'ack>' + self._udp_addr_slug
 
                 case b'leave':
+                    if not await self._validate_target(target, b'leave', addr):
+                        return b'nack>' + self._udp_addr_slug
+                    
                     async with self._context.with_value(target):
                         nodes: Nodes = self._context.read('nodes')
 
@@ -1813,6 +1843,9 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         return b'ack>' + self._udp_addr_slug
                 
                 case b'probe':
+                    if not await self._validate_target(target, b'probe', addr):
+                        return b'nack>' + self._udp_addr_slug
+                    
                     async with self._context.with_value(target):
                         nodes: Nodes = self._context.read('nodes')
 
