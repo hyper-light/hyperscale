@@ -243,6 +243,20 @@ class GossipBuffer:
         """Clear all pending updates."""
         self.updates.clear()
     
+    def remove_node(self, node: tuple[str, int]) -> bool:
+        """
+        Remove all pending updates for a specific node.
+        
+        Used when a node rejoins to clear stale state.
+        
+        Returns:
+            True if any updates were removed.
+        """
+        if node in self.updates:
+            del self.updates[node]
+            return True
+        return False
+    
     def _evict_oldest(self, count: int = 10) -> int:
         """
         Evict the oldest updates.

@@ -1303,6 +1303,29 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             return False
         return True
     
+    def _clear_stale_state(self, node: tuple[str, int]) -> None:
+        """
+        Clear any stale state when a node rejoins.
+        
+        This prevents:
+        - Acting on old suspicions after rejoin
+        - Stale indirect probes interfering with new probes
+        - Incarnation confusion from old state
+        """
+        # Clear any active suspicion
+        if node in self._suspicion_manager.suspicions:
+            self._suspicion_manager.refute_suspicion(
+                node,
+                self._incarnation_tracker.get_incarnation(node) + 1,
+            )
+        
+        # Clear any pending indirect probes
+        if self._indirect_probe_manager.get_pending_probe(node):
+            self._indirect_probe_manager.cancel_probe(node)
+        
+        # Remove from gossip buffer (old state)
+        self._gossip_buffer.remove_node(node)
+    
     def update_node_state(
         self,
         node: tuple[str, int],
@@ -1795,6 +1818,9 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
 
                         if self.udp_target_is_self(target):
                             return b'ack' + b'>' + self._udp_addr_slug
+                        
+                        # Clear any stale state from previous membership
+                        self._clear_stale_state(target)
                         
                         self._context.write(target, b'OK')
 
