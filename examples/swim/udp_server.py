@@ -575,6 +575,72 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             if target_host != host and target_port != port
         ]
     
+    async def _gather_with_errors(
+        self,
+        coros: list,
+        operation: str,
+        timeout: float | None = None,
+    ) -> tuple[list, list[Exception]]:
+        """
+        Run coroutines concurrently with proper error handling.
+        
+        Unlike asyncio.gather, this:
+        - Returns (results, errors) tuple instead of raising
+        - Applies optional timeout to prevent hanging
+        - Logs failures via error handler
+        
+        Args:
+            coros: List of coroutines to run
+            operation: Name for error context
+            timeout: Optional timeout for the entire gather
+        
+        Returns:
+            (successful_results, exceptions)
+        """
+        if not coros:
+            return [], []
+        
+        try:
+            if timeout:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*coros, return_exceptions=True),
+                    timeout=timeout,
+                )
+            else:
+                results = await asyncio.gather(*coros, return_exceptions=True)
+        except asyncio.TimeoutError:
+            await self.handle_error(
+                NetworkError(
+                    f"Gather timeout in {operation}",
+                    severity=ErrorSeverity.DEGRADED,
+                    operation=operation,
+                )
+            )
+            return [], [asyncio.TimeoutError(f"Gather timeout in {operation}")]
+        
+        successes = []
+        errors = []
+        
+        for result in results:
+            if isinstance(result, Exception):
+                errors.append(result)
+            else:
+                successes.append(result)
+        
+        # Log aggregate errors if any
+        if errors:
+            await self.handle_error(
+                NetworkError(
+                    f"{operation}: {len(errors)}/{len(results)} operations failed",
+                    severity=ErrorSeverity.TRANSIENT,
+                    operation=operation,
+                    error_count=len(errors),
+                    success_count=len(successes),
+                )
+            )
+        
+        return successes, errors
+
     async def send_if_ok(
         self,
         node: tuple[str, int],
@@ -1517,12 +1583,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         self._context.write(target, b'OK')
 
                         others = self.get_other_nodes(target)
-                        await asyncio.gather(*[
-                            self.send_if_ok(
-                                node,
-                                b'join>' + target_addr,
-                            ) for node in others
-                        ])
+                        base_timeout = self._context.read('current_timeout')
+                        gather_timeout = self.get_lhm_adjusted_timeout(base_timeout) * 2
+                        await self._gather_with_errors(
+                            [self.send_if_ok(node, b'join>' + target_addr) for node in others],
+                            operation="join_propagation",
+                            timeout=gather_timeout,
+                        )
 
                         nodes[target].put_nowait((clock_time, b'OK'))
                         
@@ -1543,12 +1610,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                             return b'nack>' + self._udp_addr_slug
                         
                         others = self.get_other_nodes(target)
-                        await asyncio.gather(*[
-                            self.send_if_ok(
-                                node,
-                                message + b'>' + target_addr,
-                            ) for node in others
-                        ])
+                        base_timeout = self._context.read('current_timeout')
+                        gather_timeout = self.get_lhm_adjusted_timeout(base_timeout) * 2
+                        await self._gather_with_errors(
+                            [self.send_if_ok(node, message + b'>' + target_addr) for node in others],
+                            operation="leave_propagation",
+                            timeout=gather_timeout,
+                        )
 
                         nodes[target].put_nowait((clock_time, b'DEAD'))
                         self._context.write('nodes', nodes)
@@ -1578,12 +1646,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         )
                         
                         others = self.get_other_nodes(target)
-                        await asyncio.gather(*[
-                            self.send_if_ok(
-                                node,
-                                message + b'>' + target_addr,
-                            ) for node in others
-                        ])
+                        gather_timeout = timeout * 2
+                        await self._gather_with_errors(
+                            [self.send_if_ok(node, message + b'>' + target_addr) for node in others],
+                            operation="probe_propagation",
+                            timeout=gather_timeout,
+                        )
                             
                         return b'ack'
                 
