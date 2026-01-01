@@ -42,7 +42,13 @@ from hyperscale.logging.hyperscale_logging_models import (
 )
 
 from .client_protocol import MercurySyncTCPClientProtocol
-from .encryption import AESGCMFernet
+from .encryption import AESGCMFernet, EncryptionError
+from .message_limits import (
+    validate_compressed_size,
+    validate_decompressed_size,
+    MessageSizeError,
+)
+from .rate_limiter import RateLimiter, RateLimitExceeded
 from .replay_guard import ReplayGuard, ReplayError
 from .server_protocol import MercurySyncTCPServerProtocol
 
@@ -124,6 +130,13 @@ class TCPProtocol(Generic[T, K]):
             max_age_seconds=300,  # 5 minutes
             max_future_seconds=60,  # 1 minute clock skew tolerance
             max_window_size=100000,
+        )
+        
+        # Rate limiting (per-source)
+        self._rate_limiter = RateLimiter(
+            requests_per_second=1000,
+            burst_size=100,
+            max_sources=10000,
         )
 
     @property
@@ -801,17 +814,34 @@ class TCPProtocol(Generic[T, K]):
         data: bytes,
         transport: asyncio.Transport,
     ) -> None:
+        # Get peer address for rate limiting
+        try:
+            addr = transport.get_extra_info('peername')
+            if addr and not self._rate_limiter.check(addr, raise_on_limit=False):
+                return  # Rate limited - silently drop
+        except Exception:
+            pass  # Continue if we can't get address
+        
+        # Validate compressed message size
+        try:
+            validate_compressed_size(data, raise_on_error=True)
+        except MessageSizeError:
+            return  # Silently drop oversized messages
+        
+        compressed_size = len(data)
         decompressed = b""
+        
         try:
             decompressed = self._decompressor.decompress(data)
 
-        except Exception as decompression_error:
+        except Exception:
+            # Sanitized error - don't leak internal details
             error = Message(
                 node_id=self.node_id,
                 host=self.host,
                 port=self.port,
-                name="decompression_error",
-                error=str(decompression_error),
+                name="protocol_error",
+                error="Message processing failed",
             )
 
             item = cloudpickle.dumps(
@@ -827,23 +857,54 @@ class TCPProtocol(Generic[T, K]):
             compressed = self._compressor.compress(encrypted_message)
 
             transport.write(compressed)
-
             return
 
-        decrypted = self._encryptor.decrypt(decompressed)
+        # Validate decompressed size (compression bomb detection)
+        try:
+            validate_decompressed_size(decompressed, compressed_size, raise_on_error=True)
+        except MessageSizeError:
+            return  # Silently drop - possible compression bomb
+
+        try:
+            decrypted = self._encryptor.decrypt(decompressed)
+        except (EncryptionError, Exception):
+            # Sanitized error - don't leak encryption details
+            error = Message(
+                node_id=self.node_id,
+                host=self.host,
+                port=self.port,
+                name="protocol_error",
+                error="Message processing failed",
+            )
+
+            item = cloudpickle.dumps(
+                (
+                    "response",
+                    self.id_generator.generate(),
+                    error,
+                ),
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+
+            encrypted_message = self._encryptor.encrypt(item)
+            compressed = self._compressor.compress(encrypted_message)
+
+            transport.write(compressed)
+            return
 
         result: Tuple[str, int, Message] = None
 
         try:
             result: Tuple[str, int, Message] = cloudpickle.loads(decrypted)
 
-        except Exception as err:
+        except Exception:
+            # Sanitized error - don't leak deserialization details
             error = Message(
                 node_id=self.node_id,
                 host=self.host,
                 port=self.port,
-                name="deserialization_error",
-                error=str(err),
+                name="protocol_error",
+                error="Message processing failed",
             )
 
             item = cloudpickle.dumps(

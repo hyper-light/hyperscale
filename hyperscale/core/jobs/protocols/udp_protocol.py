@@ -43,7 +43,13 @@ from hyperscale.logging.hyperscale_logging_models import (
     ServerTrace,
 )
 
-from .encryption import AESGCMFernet
+from .encryption import AESGCMFernet, EncryptionError
+from .message_limits import (
+    validate_compressed_size,
+    validate_decompressed_size,
+    MessageSizeError,
+)
+from .rate_limiter import RateLimiter, RateLimitExceeded
 from .replay_guard import ReplayGuard, ReplayError
 from .udp_socket_protocol import UDPSocketProtocol
 
@@ -125,6 +131,13 @@ class UDPProtocol(Generic[T, K]):
             max_age_seconds=300,  # 5 minutes
             max_future_seconds=60,  # 1 minute clock skew tolerance
             max_window_size=100000,
+        )
+        
+        # Rate limiting (per-source)
+        self._rate_limiter = RateLimiter(
+            requests_per_second=1000,
+            burst_size=100,
+            max_sources=10000,
         )
 
     @property
@@ -715,12 +728,25 @@ class UDPProtocol(Generic[T, K]):
         )
 
     def read(self, data: bytes, addr: Tuple[str, int]) -> None:
+        # Rate limiting - silently drop if rate exceeded
+        if not self._rate_limiter.check(addr, raise_on_limit=False):
+            return
+        
+        # Validate compressed message size before decompression
+        try:
+            validate_compressed_size(data, raise_on_error=True)
+        except MessageSizeError:
+            # Silently drop oversized messages - don't send error response
+            return
+        
         decompressed = b""
+        compressed_size = len(data)
 
         try:
             decompressed = self._decompressor.decompress(data)
 
-        except Exception as decompression_error:
+        except Exception:
+            # Sanitized error - don't leak internal details
             self._pending_responses.append(
                 asyncio.create_task(
                     self._return_error(
@@ -728,14 +754,20 @@ class UDPProtocol(Generic[T, K]):
                             node_id=self.node_id,
                             service_host=self.host,
                             service_port=self.port,
-                            name="decompression_error",
-                            error=str(decompression_error),
+                            name="protocol_error",
+                            error="Message processing failed",
                         ),
                         addr,
                     )
                 )
             )
+            return
 
+        # Validate decompressed size (compression bomb detection)
+        try:
+            validate_decompressed_size(decompressed, compressed_size, raise_on_error=True)
+        except MessageSizeError:
+            # Silently drop - possible compression bomb
             return
 
         decrypted = decompressed
@@ -743,7 +775,8 @@ class UDPProtocol(Generic[T, K]):
         try:
             decrypted = self._encryptor.decrypt(decompressed)
 
-        except Exception as decryption_error:
+        except (EncryptionError, Exception):
+            # Sanitized error - don't leak encryption details
             self._pending_responses.append(
                 asyncio.create_task(
                     self._return_error(
@@ -751,14 +784,13 @@ class UDPProtocol(Generic[T, K]):
                             node_id=self.node_id,
                             service_host=self.host,
                             service_port=self.port,
-                            name="decryption_error",
-                            error=str(decryption_error),
+                            name="protocol_error",
+                            error="Message processing failed",
                         ),
                         addr,
                     )
                 )
             )
-
             return
 
         result: Tuple[str, int, Message] = (None, None, None)
@@ -766,7 +798,8 @@ class UDPProtocol(Generic[T, K]):
         try:
             result: Tuple[str, int, Message] = cloudpickle.loads(decrypted)
 
-        except Exception as err:
+        except Exception:
+            # Sanitized error - don't leak deserialization details
             self._pending_responses.append(
                 asyncio.create_task(
                     self._return_error(
@@ -774,14 +807,13 @@ class UDPProtocol(Generic[T, K]):
                             node_id=self.node_id,
                             service_host=self.host,
                             service_port=self.port,
-                            name="deserialization_error",
-                            error=str(err),
+                            name="protocol_error",
+                            error="Message processing failed",
                         ),
                         addr,
                     )
                 )
             )
-
             return
 
         message_type: str | None = None
@@ -795,7 +827,8 @@ class UDPProtocol(Generic[T, K]):
                 message,
             ) = result
 
-        except Exception as err:
+        except Exception:
+            # Sanitized error - don't leak message structure details
             self._pending_responses.append(
                 asyncio.create_task(
                     self._return_error(
@@ -803,14 +836,13 @@ class UDPProtocol(Generic[T, K]):
                             node_id=self.node_id,
                             service_host=self.host,
                             service_port=self.port,
-                            name="deserialization_error",
-                            error=str(err),
+                            name="protocol_error",
+                            error="Message processing failed",
                         ),
                         addr,
                     )
                 )
             )
-
             return
 
         # Replay attack protection - validate message freshness and uniqueness
