@@ -154,6 +154,23 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         if self._error_handler:
             await self._error_handler.handle_exception(exc, operation)
     
+    def is_network_circuit_open(self) -> bool:
+        """Check if the network circuit breaker is open."""
+        if self._error_handler:
+            return self._error_handler.is_circuit_open(ErrorCategory.NETWORK)
+        return False
+    
+    def is_election_circuit_open(self) -> bool:
+        """Check if the election circuit breaker is open."""
+        if self._error_handler:
+            return self._error_handler.is_circuit_open(ErrorCategory.ELECTION)
+        return False
+    
+    def record_network_success(self) -> None:
+        """Record a successful network operation (helps circuit recover)."""
+        if self._error_handler:
+            self._error_handler.record_success(ErrorCategory.NETWORK)
+    
     def _setup_task_runner_integration(self) -> None:
         """Integrate TaskRunner with SWIM components."""
         # Pass task runner to suspicion manager for timer management
@@ -603,6 +620,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     
     async def _run_probe_round(self) -> None:
         """Execute a single probe round in the SWIM protocol."""
+        # Check circuit breaker - if too many network errors, back off
+        if self._error_handler and self._error_handler.is_circuit_open(ErrorCategory.NETWORK):
+            # Network circuit is open - skip this round to let things recover
+            await asyncio.sleep(1.0)  # Brief pause before next attempt
+            return
+        
         target = self._probe_scheduler.get_next_target()
         if target is None:
             return
@@ -624,6 +647,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             
             if response_received:
                 await self.decrease_failure_detector('successful_probe')
+                self.record_network_success()  # Help circuit breaker recover
                 return
             
             await self.increase_failure_detector('probe_timeout')
