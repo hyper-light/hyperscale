@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .types import UpdateType
+from ..core.types import UpdateType
 
 if TYPE_CHECKING:
     from typing import Self

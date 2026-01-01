@@ -5,19 +5,12 @@ A Python implementation of the SWIM (Scalable Weakly-consistent
 Infection-style Process Group Membership) protocol with Lifeguard
 enhancements for more accurate failure detection.
 
-Components:
-- LocalHealthMultiplier: Tracks node's own health score for adaptive timeouts
-- IncarnationTracker: Manages incarnation numbers for message ordering
-- SuspicionManager: Handles the suspicion subprotocol with dynamic timeouts
-- IndirectProbeManager: Manages indirect probing via proxy nodes
-- GossipBuffer: Handles piggybacking of membership updates
-- ProbeScheduler: Implements randomized round-robin probing
-- LocalLeaderElection: Hierarchical lease-based leadership election
-
-Error Handling:
-- SwimError: Base exception with category/severity classification
-- ErrorHandler: Centralized handler with circuit breaker
-- retry_with_backoff: Exponential backoff with jitter
+Submodules:
+- core: Types, node identity, errors, retry utilities, resource limits
+- health: Local health multiplier, event loop monitoring, graceful degradation
+- detection: Failure detection (incarnation, suspicion, probing)
+- gossip: Message piggybacking and dissemination
+- leadership: Leader election with flapping detection
 
 Usage:
     from swim import TestServer
@@ -30,26 +23,27 @@ Usage:
     )
 """
 
-from .types import (
+# Core types and utilities
+from .core import (
+    # Types
     Message,
     Status,
     UpdateType,
     LeaderRole,
     Nodes,
     Ctx,
-)
-
-from .node_id import NodeId, NodeAddress
-
-# Error handling
-from .errors import (
+    # Node Identity
+    NodeId,
+    NodeAddress,
+    NodeState,
+    # Error Handling
     SwimError,
     ErrorCategory,
     ErrorSeverity,
     NetworkError,
+    ConnectionRefusedError,
     ProbeTimeoutError,
     IndirectProbeTimeoutError,
-    ConnectionRefusedError,
     ProtocolError,
     MalformedMessageError,
     UnexpectedMessageError,
@@ -58,70 +52,74 @@ from .errors import (
     QueueFullError,
     TaskOverloadError,
     ElectionError,
-    SplitBrainError,
     ElectionTimeoutError,
+    SplitBrainError,
     NotEligibleError,
     InternalError,
     UnexpectedError,
-)
-from .error_handler import (
+    # Error Handler
     ErrorHandler,
-    ErrorStats,
     ErrorContext,
+    ErrorStats,
     CircuitState,
-)
-from .retry import (
+    # Retry
     RetryPolicy,
-    RetryResult,
-    RetryDecision,
     retry_with_backoff,
     retry_with_result,
     with_retry,
     PROBE_RETRY_POLICY,
     ELECTION_RETRY_POLICY,
-    GOSSIP_RETRY_POLICY,
-)
-
-from .resource_limits import (
+    # Resource Limits
     BoundedDict,
     CleanupConfig,
     create_cleanup_config_from_context,
 )
 
-from .health_monitor import (
+# Health monitoring
+from .health import (
+    LocalHealthMultiplier,
     EventLoopHealthMonitor,
     HealthSample,
     measure_event_loop_lag,
-)
-
-from .flapping_detector import (
-    FlappingDetector,
-    LeadershipChange,
-)
-
-from .graceful_degradation import (
     GracefulDegradation,
     DegradationLevel,
     DegradationPolicy,
     DEGRADATION_POLICIES,
 )
 
-from .local_health_multiplier import LocalHealthMultiplier
-from .node_state import NodeState
-from .incarnation_tracker import IncarnationTracker
-from .suspicion_state import SuspicionState
-from .suspicion_manager import SuspicionManager
-from .pending_indirect_probe import PendingIndirectProbe
-from .indirect_probe_manager import IndirectProbeManager
-from .piggyback_update import PiggybackUpdate
-from .gossip_buffer import GossipBuffer, MAX_PIGGYBACK_SIZE, MAX_UDP_PAYLOAD
-from .probe_scheduler import ProbeScheduler
-from .leader_eligibility import LeaderEligibility
-from .leader_state import LeaderState
-from .local_leader_election import LocalLeaderElection
+# Failure detection
+from .detection import (
+    IncarnationTracker,
+    SuspicionState,
+    SuspicionManager,
+    PendingIndirectProbe,
+    IndirectProbeManager,
+    ProbeScheduler,
+)
+
+# Gossip
+from .gossip import (
+    PiggybackUpdate,
+    GossipBuffer,
+    MAX_PIGGYBACK_SIZE,
+    MAX_UDP_PAYLOAD,
+)
+
+# Leadership
+from .leadership import (
+    LeaderState,
+    LeaderEligibility,
+    LocalLeaderElection,
+    FlappingDetector,
+    LeadershipChange,
+)
+
+# Main server
 from .server import TestServer
 
+
 __all__ = [
+    # === Core ===
     # Types
     'Message',
     'Status',
@@ -132,80 +130,76 @@ __all__ = [
     # Node Identity
     'NodeId',
     'NodeAddress',
-    # Error Handling - Base
+    'NodeState',
+    # Error Handling
     'SwimError',
     'ErrorCategory',
     'ErrorSeverity',
-    # Error Handling - Network Errors
     'NetworkError',
+    'ConnectionRefusedError',
     'ProbeTimeoutError',
     'IndirectProbeTimeoutError',
-    'ConnectionRefusedError',
-    # Error Handling - Protocol Errors
     'ProtocolError',
     'MalformedMessageError',
     'UnexpectedMessageError',
     'StaleMessageError',
-    # Error Handling - Resource Errors
     'ResourceError',
     'QueueFullError',
     'TaskOverloadError',
-    # Error Handling - Election Errors
     'ElectionError',
-    'SplitBrainError',
     'ElectionTimeoutError',
+    'SplitBrainError',
     'NotEligibleError',
-    # Error Handling - Internal Errors
     'InternalError',
     'UnexpectedError',
     # Error Handler
     'ErrorHandler',
-    'ErrorStats',
     'ErrorContext',
+    'ErrorStats',
     'CircuitState',
-    # Retry Utilities
+    # Retry
     'RetryPolicy',
-    'RetryResult',
-    'RetryDecision',
     'retry_with_backoff',
     'retry_with_result',
     'with_retry',
     'PROBE_RETRY_POLICY',
     'ELECTION_RETRY_POLICY',
-    'GOSSIP_RETRY_POLICY',
     # Resource Limits
     'BoundedDict',
     'CleanupConfig',
     'create_cleanup_config_from_context',
-    # Health Monitoring
+    
+    # === Health ===
+    'LocalHealthMultiplier',
     'EventLoopHealthMonitor',
     'HealthSample',
     'measure_event_loop_lag',
-    # Flapping Detection
-    'FlappingDetector',
-    'LeadershipChange',
-    # Graceful Degradation
     'GracefulDegradation',
     'DegradationLevel',
     'DegradationPolicy',
     'DEGRADATION_POLICIES',
-    # Components
-    'LocalHealthMultiplier',
-    'NodeState',
+    
+    # === Detection ===
     'IncarnationTracker',
     'SuspicionState',
     'SuspicionManager',
     'PendingIndirectProbe',
     'IndirectProbeManager',
+    'ProbeScheduler',
+    
+    # === Gossip ===
     'PiggybackUpdate',
     'GossipBuffer',
     'MAX_PIGGYBACK_SIZE',
     'MAX_UDP_PAYLOAD',
-    'ProbeScheduler',
-    'LeaderEligibility',
+    
+    # === Leadership ===
     'LeaderState',
+    'LeaderEligibility',
     'LocalLeaderElection',
-    # Server
+    'FlappingDetector',
+    'LeadershipChange',
+    
+    # === Server ===
     'TestServer',
 ]
-

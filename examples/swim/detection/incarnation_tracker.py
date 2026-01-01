@@ -5,8 +5,8 @@ Incarnation number tracking for SWIM protocol.
 import time
 from dataclasses import dataclass, field
 from typing import Callable
-from .types import Status
-from .node_state import NodeState
+from ..core.types import Status
+from ..core.node_state import NodeState
 
 
 @dataclass 

@@ -3,7 +3,7 @@ Leader eligibility determination for LHM-aware leadership.
 """
 
 from dataclasses import dataclass
-from .types import Status
+from ..core.types import Status
 
 
 @dataclass

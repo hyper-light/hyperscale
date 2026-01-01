@@ -14,17 +14,10 @@ from hyperscale.distributed_rewrite.server import tcp, udp, task
 from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
 from hyperscale.logging.hyperscale_logging_models import ServerInfo
 
-from .types import Status, Nodes, Ctx, UpdateType, Message
-from .node_id import NodeId, NodeAddress
-from .local_health_multiplier import LocalHealthMultiplier
-from .incarnation_tracker import IncarnationTracker
-from .suspicion_state import SuspicionState
-from .suspicion_manager import SuspicionManager
-from .indirect_probe_manager import IndirectProbeManager
-from .gossip_buffer import GossipBuffer, MAX_UDP_PAYLOAD
-from .probe_scheduler import ProbeScheduler
-from .local_leader_election import LocalLeaderElection
-from .errors import (
+# Core types and utilities
+from .core.types import Status, Nodes, Ctx, UpdateType, Message
+from .core.node_id import NodeId, NodeAddress
+from .core.errors import (
     SwimError,
     ErrorCategory,
     NetworkError,
@@ -33,10 +26,26 @@ from .errors import (
     MalformedMessageError,
     UnexpectedError,
 )
-from .error_handler import ErrorHandler, ErrorContext
-from .retry import retry_with_backoff, PROBE_RETRY_POLICY
-from .health_monitor import EventLoopHealthMonitor
-from .graceful_degradation import GracefulDegradation, DegradationLevel
+from .core.error_handler import ErrorHandler, ErrorContext
+from .core.retry import retry_with_backoff, PROBE_RETRY_POLICY
+
+# Health monitoring
+from .health.local_health_multiplier import LocalHealthMultiplier
+from .health.health_monitor import EventLoopHealthMonitor
+from .health.graceful_degradation import GracefulDegradation, DegradationLevel
+
+# Failure detection
+from .detection.incarnation_tracker import IncarnationTracker
+from .detection.suspicion_state import SuspicionState
+from .detection.suspicion_manager import SuspicionManager
+from .detection.indirect_probe_manager import IndirectProbeManager
+from .detection.probe_scheduler import ProbeScheduler
+
+# Gossip
+from .gossip.gossip_buffer import GossipBuffer, MAX_UDP_PAYLOAD
+
+# Leadership
+from .leadership.local_leader_election import LocalLeaderElection
 
 
 class TestServer(MercurySyncBaseServer[Ctx]):

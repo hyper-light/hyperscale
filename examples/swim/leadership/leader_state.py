@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .types import LeaderRole
+from ..core.types import LeaderRole
 
 
 @dataclass

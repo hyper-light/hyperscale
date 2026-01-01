@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .types import UpdateType
+from ..core.types import UpdateType
 from .piggyback_update import PiggybackUpdate
 
 

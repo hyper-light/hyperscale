@@ -9,8 +9,8 @@ from typing import Callable, Awaitable
 
 from .leader_state import LeaderState
 from .leader_eligibility import LeaderEligibility
-from .errors import ElectionError, ElectionTimeoutError, SplitBrainError, UnexpectedError
 from .flapping_detector import FlappingDetector
+from ..core.errors import ElectionError, ElectionTimeoutError, SplitBrainError, UnexpectedError
 
 
 @dataclass
