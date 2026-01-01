@@ -71,11 +71,12 @@ async def run_server_2():
     
     # Try to join server 1
     server_1_addr = ('127.0.0.1', 8671)
+    self_udp_addr = ('127.0.0.1', 8673)
     print(f"\n[Server 2] Attempting to join Server 1 at {server_1_addr}...")
     
     try:
-        # Send join message to server 1
-        join_msg = b'join>' + f'{server_1_addr[0]}:{server_1_addr[1]}'.encode()
+        # Send join message with OUR address (the node joining)
+        join_msg = b'join>' + f'{self_udp_addr[0]}:{self_udp_addr[1]}'.encode()
         server._task_runner.run(
             server.send,
             server_1_addr,

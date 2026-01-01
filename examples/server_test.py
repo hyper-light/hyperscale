@@ -1591,7 +1591,7 @@ class LocalLeaderElection:
             candidate=candidate,
             term=term,
             candidate_lhm=candidate_lhm,
-            max_leader_lhm=self.eligibility.max_lhm_score,
+            max_leader_lhm=self.eligibility.max_leader_lhm,
         )
         
         # Build response: pre-vote-resp:term:granted>candidate_addr
@@ -2507,8 +2507,11 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                 message, target_addr = parsed
                 host, port = target_addr.decode().split(':', maxsplit=1)
                 target = (host, int(port))
+            
+            # Extract message type (before first colon) for messages with embedded data
+            msg_type = message.split(b':', maxsplit=1)[0]
 
-            match message:
+            match msg_type:
                 case b'ack' | b'nack':
 
                     if target not in nodes:
@@ -2532,16 +2535,16 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                         await asyncio.gather(*[
                             self.send_if_ok(
                                 node,
-                                message + b'>' + target_addr,
+                                b'join>' + target_addr,
 
                             ) for node in others
                         ])
 
                         nodes[target].put_nowait((clock_time, b'OK'))
-                        # self._task_runner.run(
-                        #     self.poll_node,
-                        #     target,
-                        # )
+                        
+                        # Add to probe scheduler and incarnation tracker
+                        self._probe_scheduler.add_member(target)
+                        self._incarnation_tracker.update_node(target, b'OK', 0, time.monotonic())
 
                         return b'ack>' + self._udp_addr_slug
 
@@ -2819,12 +2822,15 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                     
                     if target:
                         # Split-brain detection: if we're also a leader
-                        if self._leader_election.state.is_leader():
+                        self_addr = self._get_self_udp_addr()
+                        if self._leader_election.state.is_leader() and target != self_addr:
+                            # We received a heartbeat from another leader!
                             should_yield = self._leader_election.handle_discovered_leader(target, term)
+                            print(f"[{self._udp_addr_slug.decode()}] Received heartbeat from leader {target} term={term}, yield={should_yield}")
                             if should_yield:
                                 # We need to step down
                                 print(f"[SPLIT-BRAIN] Detected other leader {target} with term {term}, stepping down")
-                                self._task_runner.run(self._leader_election._step_down())
+                                asyncio.create_task(self._leader_election._step_down())
                         
                         self._leader_election.handle_heartbeat(target, term)
                     
@@ -2868,7 +2874,9 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                         if resp:
                             # Send response back to candidate
                             self._task_runner.run(
-                                self._send_to_addr(target, resp)
+                                self._send_to_addr,
+                                target,
+                                resp,
                             )
                     
                     return b'ack>' + self._udp_addr_slug
