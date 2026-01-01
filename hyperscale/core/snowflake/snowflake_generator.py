@@ -1,7 +1,7 @@
 from time import time
 from typing import Optional
 
-from .constants import MAX_SEQ
+from .constants import MAX_INSTANCE, MAX_SEQ
 from .snowflake import Snowflake
 
 
@@ -19,7 +19,8 @@ class SnowflakeGenerator:
 
         self._ts = timestamp
 
-        self._inf = instance << 12
+        # Mask instance to 10 bits to fit Snowflake format
+        self._inf = (instance & MAX_INSTANCE) << 12
         self._seq = seq
 
     @classmethod

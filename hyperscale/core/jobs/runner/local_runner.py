@@ -70,7 +70,7 @@ class LocalRunner:
         if env is None:
             env = Env(
                 MERCURY_SYNC_AUTH_SECRET=os.getenv(
-                    "MERCURY_SYNC_AUTH_SECRET", "hyperscale-local-dev-secret"
+                    "MERCURY_SYNC_AUTH_SECRET", "hyperscale-dev-secret-change-in-prod"
                 ),
             )
 
@@ -187,10 +187,14 @@ class LocalRunner:
                     key_path=key_path,
                 )
 
+                print('A')
+
                 await self._remote_manger.connect_to_workers(
                     worker_ips,
                     timeout=timeout,
                 )
+
+                print('B')
 
                 await ctx.log_prepared_batch(
                     {
@@ -205,6 +209,8 @@ class LocalRunner:
                     test_name,
                     workflows,
                 )
+
+                print('C')
 
                 await ctx.log_prepared(
                     f"Completed execution of test {test_name} on runner type {self._runner_type} - shutting down",

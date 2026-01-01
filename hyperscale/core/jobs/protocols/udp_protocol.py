@@ -846,8 +846,9 @@ class UDPProtocol(Generic[T, K]):
             return
 
         # Replay attack protection - validate message freshness and uniqueness
-        # Skip replay check for responses (they're replies to our requests)
-        if message_type != "response":
+        # Skip for "response" (replies to our requests) and "connect" (idempotent, 
+        # often retried during startup when processes may be slow to spin up)
+        if message_type not in ("response", "connect"):
             try:
                 self._replay_guard.validate(shard_id, raise_on_error=True)
             except ReplayError:
