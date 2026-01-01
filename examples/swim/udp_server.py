@@ -1656,6 +1656,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                     
                 case _:
+                    # Unknown message type - log for monitoring
+                    await self.handle_error(
+                        ProtocolError(
+                            f"Unknown message type: {msg_type.decode(errors='replace')}",
+                            source=addr,
+                        )
+                    )
                     return b'nack'
                 
         except ValueError as e:
