@@ -1,9 +1,10 @@
 import asyncio
+import math
 import msgspec
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Callable
 from pydantic import BaseModel, StrictStr
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.distributed_rewrite.server import tcp, udp, task
@@ -231,12 +232,285 @@ class IncarnationTracker:
         return False
 
 
+@dataclass
+class SuspicionState:
+    """
+    Tracks the suspicion state for a single node.
+    
+    Per Lifeguard paper, the suspicion timeout is dynamically calculated as:
+    timeout = max(min_timeout, (max_timeout - min_timeout) * log(C+1) / log(N+1))
+    
+    Where:
+    - C is the number of independent confirmations
+    - N is the total number of members in the group
+    
+    The timeout decreases as more confirmations are received, but never
+    goes below min_timeout.
+    """
+    node: tuple[str, int]
+    incarnation: int
+    start_time: float
+    confirmers: set[tuple[str, int]] = field(default_factory=set)
+    min_timeout: float = 1.0
+    max_timeout: float = 10.0
+    n_members: int = 1
+    # Lifeguard re-gossip factor K: number of times to re-gossip suspicion
+    regossip_factor: int = 3
+    regossip_count: int = 0
+    _timer_task: asyncio.Task | None = field(default=None, repr=False)
+    
+    def add_confirmation(self, from_node: tuple[str, int]) -> bool:
+        """
+        Add a confirmation from another node.
+        Returns True if this is a new confirmation.
+        """
+        if from_node in self.confirmers:
+            return False
+        self.confirmers.add(from_node)
+        return True
+    
+    @property
+    def confirmation_count(self) -> int:
+        """Number of independent confirmations received."""
+        return len(self.confirmers)
+    
+    def calculate_timeout(self) -> float:
+        """
+        Calculate the current suspicion timeout based on confirmations.
+        
+        Uses the Lifeguard formula:
+        timeout = max(min, (max - min) * log(C+1) / log(N+1))
+        
+        More confirmations = lower timeout (faster declaration of failure)
+        """
+        c = self.confirmation_count
+        n = max(1, self.n_members)
+        
+        if n <= 1:
+            return self.max_timeout
+        
+        # Lifeguard formula from the paper
+        log_factor = math.log(c + 1) / math.log(n + 1)
+        timeout = self.max_timeout - (self.max_timeout - self.min_timeout) * log_factor
+        
+        return max(self.min_timeout, timeout)
+    
+    def time_remaining(self) -> float:
+        """Calculate time remaining before suspicion expires."""
+        elapsed = time.monotonic() - self.start_time
+        timeout = self.calculate_timeout()
+        return max(0, timeout - elapsed)
+    
+    def is_expired(self) -> bool:
+        """Check if the suspicion has expired (node should be marked DEAD)."""
+        return self.time_remaining() <= 0
+    
+    def should_regossip(self) -> bool:
+        """Check if we should re-gossip this suspicion."""
+        return self.regossip_count < self.regossip_factor
+    
+    def mark_regossiped(self) -> None:
+        """Mark that we've re-gossiped this suspicion."""
+        self.regossip_count += 1
+    
+    def cancel_timer(self) -> None:
+        """Cancel the expiration timer if running."""
+        if self._timer_task and not self._timer_task.done():
+            self._timer_task.cancel()
+            self._timer_task = None
+
+
+@dataclass
+class SuspicionManager:
+    """
+    Manages suspicions for all nodes using the Lifeguard protocol.
+    
+    Key features:
+    - Tracks active suspicions with confirmation counting
+    - Calculates dynamic timeouts based on confirmations
+    - Handles suspicion expiration and node death declaration
+    - Supports refutation (clearing suspicion on higher incarnation)
+    """
+    suspicions: dict[tuple[str, int], SuspicionState] = field(default_factory=dict)
+    min_timeout: float = 1.0
+    max_timeout: float = 10.0
+    _on_suspicion_expired: Callable[[tuple[str, int], int], None] | None = None
+    _n_members_getter: Callable[[], int] | None = None
+    
+    def set_callbacks(
+        self,
+        on_expired: Callable[[tuple[str, int], int], None],
+        get_n_members: Callable[[], int],
+    ) -> None:
+        """Set callback functions for suspicion events."""
+        self._on_suspicion_expired = on_expired
+        self._n_members_getter = get_n_members
+    
+    def _get_n_members(self) -> int:
+        """Get current member count."""
+        if self._n_members_getter:
+            return self._n_members_getter()
+        return 1
+    
+    def start_suspicion(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        from_node: tuple[str, int],
+    ) -> SuspicionState:
+        """
+        Start or update a suspicion for a node.
+        
+        If suspicion already exists with same incarnation, add confirmation.
+        If new suspicion or higher incarnation, create new suspicion state.
+        """
+        existing = self.suspicions.get(node)
+        
+        if existing:
+            if incarnation < existing.incarnation:
+                # Stale suspicion message, ignore
+                return existing
+            elif incarnation == existing.incarnation:
+                # Same suspicion, add confirmation
+                existing.add_confirmation(from_node)
+                # Recalculate timeout with new confirmation
+                self._reschedule_timer(existing)
+                return existing
+            else:
+                # Higher incarnation suspicion, replace
+                existing.cancel_timer()
+        
+        # Create new suspicion
+        state = SuspicionState(
+            node=node,
+            incarnation=incarnation,
+            start_time=time.monotonic(),
+            min_timeout=self.min_timeout,
+            max_timeout=self.max_timeout,
+            n_members=self._get_n_members(),
+        )
+        state.add_confirmation(from_node)
+        self.suspicions[node] = state
+        
+        # Schedule expiration timer
+        self._schedule_timer(state)
+        
+        return state
+    
+    def _schedule_timer(self, state: SuspicionState) -> None:
+        """Schedule the expiration timer for a suspicion."""
+        async def expire_suspicion():
+            timeout = state.calculate_timeout()
+            await asyncio.sleep(timeout)
+            self._handle_expiration(state)
+        
+        state._timer_task = asyncio.create_task(expire_suspicion())
+    
+    def _reschedule_timer(self, state: SuspicionState) -> None:
+        """Reschedule timer with updated timeout (after new confirmation)."""
+        state.cancel_timer()
+        remaining = state.time_remaining()
+        if remaining > 0:
+            async def expire_suspicion():
+                await asyncio.sleep(remaining)
+                self._handle_expiration(state)
+            state._timer_task = asyncio.create_task(expire_suspicion())
+        else:
+            self._handle_expiration(state)
+    
+    def _handle_expiration(self, state: SuspicionState) -> None:
+        """Handle suspicion expiration - declare node as DEAD."""
+        if state.node in self.suspicions:
+            del self.suspicions[state.node]
+            if self._on_suspicion_expired:
+                self._on_suspicion_expired(state.node, state.incarnation)
+    
+    def confirm_suspicion(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        from_node: tuple[str, int],
+    ) -> bool:
+        """
+        Add a confirmation to an existing suspicion.
+        Returns True if the suspicion exists and confirmation was added.
+        """
+        state = self.suspicions.get(node)
+        if state and state.incarnation == incarnation:
+            if state.add_confirmation(from_node):
+                self._reschedule_timer(state)
+                return True
+        return False
+    
+    def refute_suspicion(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+    ) -> bool:
+        """
+        Refute a suspicion (node proved it's alive with higher incarnation).
+        Returns True if a suspicion was cleared.
+        """
+        state = self.suspicions.get(node)
+        if state and incarnation > state.incarnation:
+            state.cancel_timer()
+            del self.suspicions[node]
+            return True
+        return False
+    
+    def get_suspicion(self, node: tuple[str, int]) -> SuspicionState | None:
+        """Get the current suspicion state for a node, if any."""
+        return self.suspicions.get(node)
+    
+    def is_suspected(self, node: tuple[str, int]) -> bool:
+        """Check if a node is currently suspected."""
+        return node in self.suspicions
+    
+    def clear_all(self) -> None:
+        """Clear all suspicions (e.g., on shutdown)."""
+        for state in self.suspicions.values():
+            state.cancel_timer()
+        self.suspicions.clear()
+    
+    def get_suspicions_to_regossip(self) -> list[SuspicionState]:
+        """Get suspicions that should be re-gossiped."""
+        return [s for s in self.suspicions.values() if s.should_regossip()]
+
+
 class TestServer(MercurySyncBaseServer[Ctx]):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._local_health = LocalHealthMultiplier()
         self._incarnation_tracker = IncarnationTracker()
+        self._suspicion_manager = SuspicionManager()
+        
+        # Set up suspicion manager callbacks
+        self._suspicion_manager.set_callbacks(
+            on_expired=self._on_suspicion_expired,
+            get_n_members=self._get_member_count,
+        )
+    
+    def _get_member_count(self) -> int:
+        """Get the current number of known members."""
+        nodes = self._context.read('nodes')
+        return len(nodes) if nodes else 1
+    
+    def _on_suspicion_expired(self, node: tuple[str, int], incarnation: int) -> None:
+        """
+        Callback when a suspicion expires - mark node as DEAD.
+        This is called by the SuspicionManager when the timeout elapses.
+        """
+        self._incarnation_tracker.update_node(
+            node, 
+            b'DEAD', 
+            incarnation, 
+            time.monotonic(),
+        )
+        # Queue the death notification for gossip
+        nodes: Nodes = self._context.read('nodes')
+        if node in nodes:
+            nodes[node].put_nowait((int(time.monotonic()), b'DEAD'))
 
     def get_other_nodes(self, node: tuple[str, int]):
         target_host, target_port = node
@@ -380,6 +654,63 @@ class TestServer(MercurySyncBaseServer[Ctx]):
     ) -> bool:
         """Update the state of a node. Returns True if state changed."""
         return self._incarnation_tracker.update_node(node, status, incarnation, timestamp)
+    
+    def start_suspicion(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        from_node: tuple[str, int],
+    ) -> SuspicionState:
+        """
+        Start suspecting a node or add confirmation to existing suspicion.
+        Uses Lifeguard's dynamic timeout based on confirmation count.
+        """
+        # Update node state to SUSPECT
+        self._incarnation_tracker.update_node(
+            node,
+            b'SUSPECT',
+            incarnation,
+            time.monotonic(),
+        )
+        return self._suspicion_manager.start_suspicion(node, incarnation, from_node)
+    
+    def confirm_suspicion(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        from_node: tuple[str, int],
+    ) -> bool:
+        """Add a confirmation to an existing suspicion."""
+        return self._suspicion_manager.confirm_suspicion(node, incarnation, from_node)
+    
+    def refute_suspicion(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+    ) -> bool:
+        """
+        Refute a suspicion - the node proved it's alive.
+        Returns True if a suspicion was cleared.
+        """
+        if self._suspicion_manager.refute_suspicion(node, incarnation):
+            # Update node state back to OK
+            self._incarnation_tracker.update_node(
+                node,
+                b'OK',
+                incarnation,
+                time.monotonic(),
+            )
+            return True
+        return False
+    
+    def is_node_suspected(self, node: tuple[str, int]) -> bool:
+        """Check if a node is currently under suspicion."""
+        return self._suspicion_manager.is_suspected(node)
+    
+    def get_suspicion_timeout(self, node: tuple[str, int]) -> float | None:
+        """Get the remaining timeout for a suspicion, if any."""
+        state = self._suspicion_manager.get_suspicion(node)
+        return state.time_remaining() if state else None
 
     @udp.send('receive')
     async def send(
@@ -547,6 +878,9 @@ async def run():
         'current_timeout': 1,
         'nodes': defaultdict(asyncio.Queue),
         'udp_poll_interval': 1,
+        # Suspicion timeout settings (Lifeguard)
+        'suspicion_min_timeout': 1.0,
+        'suspicion_max_timeout': 10.0,
     })
     
     loop = asyncio.get_event_loop()
