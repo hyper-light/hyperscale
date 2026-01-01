@@ -27,6 +27,9 @@ Message = Literal[
     b'leader-elected',   # Announce election win: leader-elected:term>leader_addr
     b'leader-heartbeat', # Leader heartbeat: leader-heartbeat:term>leader_addr
     b'leader-stepdown',  # Voluntary stepdown: leader-stepdown:term>addr
+    # Pre-voting (split-brain prevention)
+    b'pre-vote-req',     # Pre-vote request: pre-vote-req:term:lhm>candidate_addr
+    b'pre-vote-resp',    # Pre-vote response: pre-vote-resp:term:granted>candidate_addr
 ]
 Status = Literal[b'JOIN', b'OK', b'SUSPECT', b'DEAD']
 UpdateType = Literal['alive', 'suspect', 'dead', 'join', 'leave']
@@ -967,10 +970,19 @@ class LeaderState:
     """
     Tracks the leadership state for a node.
     
-    Implements a simplified Raft-like state machine:
+    Implements a simplified Raft-like state machine with pre-voting:
     - FOLLOWER: Not a leader, following current leader
     - CANDIDATE: Running for election
     - LEADER: Currently the leader, must send heartbeats
+    
+    Pre-voting (split-brain prevention):
+    - Before starting an election, gather pre-votes
+    - Only proceed if pre-vote succeeds
+    - Prevents disrupting a healthy leader
+    
+    Fencing tokens:
+    - Each term acts as a fencing token
+    - Operations can be tagged with term for safety
     
     Integrates with Lifeguard for health-aware leadership.
     """
@@ -991,6 +1003,16 @@ class LeaderState:
     voted_in_term: int = -1
     election_timeout: float = 10.0  # Seconds
     last_heartbeat_time: float = 0.0
+    
+    # Pre-voting state (split-brain prevention)
+    pre_votes_received: set[tuple[str, int]] = field(default_factory=set)
+    pre_vote_term: int = 0
+    pre_voting_in_progress: bool = False
+    
+    # Fencing token (for operation safety)
+    # The term serves as the fencing token - operations tagged with
+    # a term lower than current are rejected
+    fencing_token: int = 0
     
     # Callbacks (set by owner)
     _on_become_leader: Callable[[], None] | None = None
@@ -1115,6 +1137,105 @@ class LeaderState:
         self.voted_for = candidate
         self.voted_in_term = term
         self.current_term = max(self.current_term, term)
+    
+    # Pre-voting methods (split-brain prevention)
+    def start_pre_vote(self, term: int) -> None:
+        """Start a pre-vote phase before real election."""
+        self.pre_vote_term = term
+        self.pre_votes_received.clear()
+        self.pre_voting_in_progress = True
+    
+    def record_pre_vote(self, voter: tuple[str, int]) -> int:
+        """Record a pre-vote received. Returns total pre-vote count."""
+        self.pre_votes_received.add(voter)
+        return len(self.pre_votes_received)
+    
+    def end_pre_vote(self) -> bool:
+        """
+        End pre-vote phase.
+        Returns True if we should proceed to real election.
+        """
+        self.pre_voting_in_progress = False
+        return len(self.pre_votes_received) > 0
+    
+    def can_grant_pre_vote(
+        self, 
+        candidate: tuple[str, int], 
+        term: int,
+        candidate_lhm: int,
+        max_leader_lhm: int,
+    ) -> bool:
+        """
+        Check if we should grant a pre-vote.
+        
+        Grant pre-vote if:
+        1. Candidate's term is >= our term
+        2. We don't have a valid leader lease
+        3. Candidate's LHM is acceptable
+        """
+        # Don't grant if candidate's term is too low
+        if term < self.current_term:
+            return False
+        
+        # Don't grant if we have a healthy leader
+        if self.is_lease_valid():
+            return False
+        
+        # Don't grant if candidate is unhealthy
+        if candidate_lhm > max_leader_lhm:
+            return False
+        
+        return True
+    
+    # Fencing token methods
+    def get_fencing_token(self) -> int:
+        """
+        Get current fencing token for this node.
+        
+        The fencing token is used to tag operations so that
+        stale leaders cannot corrupt state. Operations with
+        a token lower than current are rejected.
+        """
+        if self.role == 'leader':
+            return self.current_term
+        return self.leader_term
+    
+    def update_fencing_token(self, term: int) -> None:
+        """Update fencing token when term changes."""
+        self.fencing_token = max(self.fencing_token, term)
+    
+    def is_fencing_token_valid(self, token: int) -> bool:
+        """
+        Check if a fencing token is still valid.
+        
+        A token is valid if it's >= our current term.
+        This prevents stale leaders from performing operations.
+        """
+        return token >= self.current_term
+    
+    # Term-based resolution (split-brain healing)
+    def should_yield_to(
+        self, 
+        other_addr: tuple[str, int], 
+        other_term: int,
+        self_addr: tuple[str, int],
+    ) -> bool:
+        """
+        Determine if we should yield leadership to another node.
+        
+        Used for split-brain resolution when two leaders discover each other.
+        
+        Rules:
+        1. Higher term always wins
+        2. Same term: lower address wins (deterministic tiebreaker)
+        """
+        if other_term > self.current_term:
+            return True
+        if other_term == self.current_term and self.role == 'leader':
+            # Same term, both leaders - use address as tiebreaker
+            # Lower address wins
+            return other_addr < self_addr
+        return False
 
 
 @dataclass
@@ -1122,12 +1243,21 @@ class LocalLeaderElection:
     """
     Manages local (within-datacenter) leader election.
     
-    Uses a lease-based approach with LHM-aware eligibility:
+    Uses a lease-based approach with LHM-aware eligibility and split-brain prevention:
+    
+    Election Flow:
     1. Nodes monitor leader lease expiry
-    2. When lease expires, eligible nodes can become candidates
-    3. Candidates request votes from peers
-    4. First candidate with majority wins
-    5. Leader sends periodic heartbeats to renew lease
+    2. When lease expires, eligible nodes start PRE-VOTE phase
+    3. Only if pre-vote succeeds, proceed to real election
+    4. Candidates request votes from peers
+    5. Candidate with majority wins
+    6. Leader sends periodic heartbeats to renew lease
+    
+    Split-Brain Prevention:
+    - Pre-voting prevents disrupting healthy leaders
+    - Term-based resolution when two leaders discover each other
+    - Deterministic tiebreaker (lower address wins)
+    - Fencing tokens for operation safety
     
     This is designed for low-latency, single-datacenter operation.
     """
@@ -1138,6 +1268,7 @@ class LocalLeaderElection:
     heartbeat_interval: float = 2.0  # Seconds between leader heartbeats
     election_timeout_base: float = 5.0  # Base election timeout
     election_timeout_jitter: float = 2.0  # Random jitter added to timeout
+    pre_vote_timeout: float = 2.0  # Timeout for pre-vote phase
     
     # Datacenter identification
     dc_id: str = "default"
@@ -1149,6 +1280,7 @@ class LocalLeaderElection:
     _broadcast_message: Callable[[bytes], None] | None = None
     _get_member_count: Callable[[], int] | None = None
     _get_lhm_score: Callable[[], int] | None = None
+    _send_to_node: Callable[[tuple[str, int], bytes], None] | None = None
     
     # Background tasks
     _heartbeat_task: asyncio.Task | None = field(default=None, repr=False)
@@ -1161,12 +1293,14 @@ class LocalLeaderElection:
         get_member_count: Callable[[], int],
         get_lhm_score: Callable[[], int],
         self_addr: tuple[str, int],
+        send_to_node: Callable[[tuple[str, int], bytes], None] | None = None,
     ) -> None:
         """Set callback functions for election operations."""
         self._broadcast_message = broadcast_message
         self._get_member_count = get_member_count
         self._get_lhm_score = get_lhm_score
         self.self_addr = self_addr
+        self._send_to_node = send_to_node
     
     def get_election_timeout(self) -> float:
         """Get randomized election timeout."""
@@ -1244,14 +1378,66 @@ class LocalLeaderElection:
                 print(f"Election loop error: {traceback.format_exc()}")
                 await asyncio.sleep(1)
     
+    async def _run_pre_vote(self) -> bool:
+        """
+        Run pre-vote phase before election.
+        
+        Pre-voting prevents split-brain by checking if other nodes
+        would vote for us before actually starting an election.
+        This prevents disrupting a healthy leader.
+        
+        Returns True if pre-vote succeeded and we should proceed.
+        """
+        if not self.self_addr or not self._broadcast_message:
+            return False
+        
+        new_term = self.state.current_term + 1
+        self.state.start_pre_vote(new_term)
+        
+        # Add self pre-vote
+        self.state.record_pre_vote(self.self_addr)
+        
+        # Broadcast pre-vote request
+        lhm = self._get_lhm_score() if self._get_lhm_score else 0
+        pre_vote_msg = (
+            b'pre-vote-req:' +
+            str(new_term).encode() + b':' +
+            str(lhm).encode() + b'>' +
+            f'{self.self_addr[0]}:{self.self_addr[1]}'.encode()
+        )
+        self._broadcast_message(pre_vote_msg)
+        
+        # Wait for pre-votes
+        await asyncio.sleep(self.pre_vote_timeout)
+        
+        # Check if we got enough pre-votes
+        n_members = self._get_member_count() if self._get_member_count else 1
+        # For pre-vote, we need at least one response (or majority for larger clusters)
+        pre_votes_needed = max(1, (n_members + 1) // 2)  # Include self in count
+        
+        success = len(self.state.pre_votes_received) >= pre_votes_needed
+        self.state.end_pre_vote()
+        
+        return success
+    
     async def _run_election(self) -> None:
-        """Run a leader election."""
+        """Run a leader election with pre-voting for split-brain prevention."""
         if not self.self_addr or not self._broadcast_message:
             return
         
-        # Start new term
+        # Phase 1: Pre-vote (split-brain prevention)
+        pre_vote_success = await self._run_pre_vote()
+        
+        if not pre_vote_success:
+            # Pre-vote failed - don't start election
+            # This likely means there's a healthy leader we can't reach
+            # or other nodes wouldn't vote for us
+            return
+        
+        # Phase 2: Real election
         new_term = self.state.current_term + 1
         self.state.start_election(new_term)
+        self.state.update_fencing_token(new_term)
         
         # Vote for self
         self.state.vote_for(self.self_addr, new_term)
@@ -1273,12 +1459,14 @@ class LocalLeaderElection:
         # Check if we won
         if self.state.role == 'candidate':  # Still candidate
             n_members = self._get_member_count() if self._get_member_count else 1
-            votes_needed = (n_members // 2) + 1
+            # Need majority including self: (n+1)/2 rounded up
+            votes_needed = (n_members + 2) // 2  # This gives ceiling((n+1)/2)
             
             if len(self.state.votes_received) >= votes_needed:
                 # We won!
                 self.state.become_leader(new_term)
                 self.state.current_leader = self.self_addr
+                self.state.update_fencing_token(new_term)
                 
                 # Announce victory
                 elected_msg = (
@@ -1383,6 +1571,98 @@ class LocalLeaderElection:
             self.state.current_leader = None
             # Will trigger election on next loop iteration
     
+    def handle_pre_vote_request(
+        self,
+        candidate: tuple[str, int],
+        term: int,
+        candidate_lhm: int,
+    ) -> bytes | None:
+        """
+        Handle a pre-vote request.
+        
+        Returns pre-vote response if we would vote for them, None otherwise.
+        Pre-votes don't update our state - they're just a check.
+        """
+        if not self.self_addr:
+            return None
+        
+        # Check if we would grant this pre-vote
+        can_grant = self.state.can_grant_pre_vote(
+            candidate=candidate,
+            term=term,
+            candidate_lhm=candidate_lhm,
+            max_leader_lhm=self.eligibility.max_lhm_score,
+        )
+        
+        # Build response: pre-vote-resp:term:granted>candidate_addr
+        granted = b'1' if can_grant else b'0'
+        resp_msg = (
+            b'pre-vote-resp:' +
+            str(term).encode() + b':' +
+            granted + b'>' +
+            f'{candidate[0]}:{candidate[1]}'.encode()
+        )
+        return resp_msg
+    
+    def handle_pre_vote_response(
+        self,
+        voter: tuple[str, int],
+        term: int,
+        granted: bool,
+    ) -> None:
+        """
+        Handle a pre-vote response.
+        
+        Records the pre-vote if it was granted and matches our pre-vote term.
+        """
+        if term != self.state.pre_vote_term or not self.state.pre_voting_in_progress:
+            return
+        
+        if granted:
+            self.state.record_pre_vote(voter)
+    
+    def handle_discovered_leader(
+        self,
+        other_leader: tuple[str, int],
+        other_term: int,
+    ) -> bool:
+        """
+        Handle discovering another leader (split-brain detection).
+        
+        Called when we receive a heartbeat from another leader while
+        we are also a leader. This should not happen in normal operation.
+        
+        Returns True if we should step down (yield to the other leader).
+        """
+        if not self.state.is_leader() or not self.self_addr:
+            return False
+        
+        should_yield = self.state.should_yield_to(
+            other_addr=other_leader,
+            other_term=other_term,
+            self_addr=self.self_addr,
+        )
+        
+        return should_yield
+    
+    def get_fencing_token(self) -> int:
+        """
+        Get current fencing token for operations.
+        
+        Operations should include this token, and workers should
+        reject operations with tokens lower than what they've seen.
+        """
+        return self.state.get_fencing_token()
+    
+    def validate_fencing_token(self, token: int) -> bool:
+        """
+        Validate a fencing token for an operation.
+        
+        Returns True if the operation should proceed,
+        False if it's from a stale leader.
+        """
+        return self.state.is_fencing_token_valid(token)
+    
     def get_current_leader(self) -> tuple[str, int] | None:
         """Get the current leader, if any."""
         if self.state.is_leader() and self.self_addr:
@@ -1398,6 +1678,9 @@ class LocalLeaderElection:
             'lease_remaining': self.state.time_until_lease_expiry(),
             'eligible': self.is_self_eligible(),
             'votes': len(self.state.votes_received) if self.state.is_candidate() else 0,
+            'fencing_token': self.get_fencing_token(),
+            'pre_voting': self.state.pre_voting_in_progress,
+            'pre_votes': len(self.state.pre_votes_received),
         }
 
 
@@ -2097,6 +2380,24 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                     timeout=timeout,
                 )
     
+    async def _send_to_addr(
+        self, 
+        target: tuple[str, int], 
+        message: bytes,
+        timeout: float | None = None,
+    ) -> None:
+        """
+        Send a message to a specific address.
+        
+        This is used for point-to-point communication, such as
+        sending pre-vote responses back to candidates.
+        """
+        if timeout is None:
+            base_timeout = self._context.read('current_timeout')
+            timeout = self.get_lhm_adjusted_timeout(base_timeout)
+        
+        await self.send(target, message, timeout=timeout)
+    
     async def _send_probe_and_wait(self, target: tuple[str, int]) -> bool:
         """
         Send a probe to target and wait for response.
@@ -2517,6 +2818,14 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                             pass
                     
                     if target:
+                        # Split-brain detection: if we're also a leader
+                        if self._leader_election.state.is_leader():
+                            should_yield = self._leader_election.handle_discovered_leader(target, term)
+                            if should_yield:
+                                # We need to step down
+                                print(f"[SPLIT-BRAIN] Detected other leader {target} with term {term}, stepping down")
+                                self._task_runner.run(self._leader_election._step_down())
+                        
                         self._leader_election.handle_heartbeat(target, term)
                     
                     return b'ack>' + self._udp_addr_slug
@@ -2534,6 +2843,55 @@ class TestServer(MercurySyncBaseServer[Ctx]):
                     
                     if target:
                         self._leader_election.handle_stepdown(target, term)
+                    
+                    return b'ack>' + self._udp_addr_slug
+                
+                case b'pre-vote-req':
+                    # Pre-vote request (split-brain prevention)
+                    # Format: pre-vote-req:term:lhm>candidate_addr
+                    msg_parts = message.split(b':', maxsplit=2)
+                    term = 0
+                    candidate_lhm = 0
+                    if len(msg_parts) >= 3:
+                        try:
+                            term = int(msg_parts[1].decode())
+                            candidate_lhm = int(msg_parts[2].decode())
+                        except ValueError:
+                            pass
+                    
+                    if target:
+                        resp = self._leader_election.handle_pre_vote_request(
+                            candidate=target,
+                            term=term,
+                            candidate_lhm=candidate_lhm,
+                        )
+                        if resp:
+                            # Send response back to candidate
+                            self._task_runner.run(
+                                self._send_to_addr(target, resp)
+                            )
+                    
+                    return b'ack>' + self._udp_addr_slug
+                
+                case b'pre-vote-resp':
+                    # Pre-vote response
+                    # Format: pre-vote-resp:term:granted>candidate_addr
+                    msg_parts = message.split(b':', maxsplit=2)
+                    term = 0
+                    granted = False
+                    if len(msg_parts) >= 3:
+                        try:
+                            term = int(msg_parts[1].decode())
+                            granted = msg_parts[2].decode() == '1'
+                        except ValueError:
+                            pass
+                    
+                    # Record pre-vote from sender
+                    self._leader_election.handle_pre_vote_response(
+                        voter=addr,  # The sender is voting
+                        term=term,
+                        granted=granted,
+                    )
                     
                     return b'ack>' + self._udp_addr_slug
                     

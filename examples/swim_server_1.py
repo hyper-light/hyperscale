@@ -132,6 +132,7 @@ async def run_server_1():
             else:
                 print(f"    Leader: None (election in progress)")
             print(f"    Eligible: {leader_status['eligible']}")
+            print(f"    Fencing Token: {leader_status.get('fencing_token', 'N/A')}")
             print(f"    Lease Remaining: {leader_status['lease_remaining']:.1f}s")
             
             # Show known nodes

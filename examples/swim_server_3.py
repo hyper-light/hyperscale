@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-SWIM + Lifeguard Test Server 2 with Leadership Election
+SWIM + Lifeguard Test Server 3 with Leadership Election
 
-This server runs on ports 8672 (TCP) and 8673 (UDP) and demonstrates
-the SWIM protocol with Lifeguard enhancements and hierarchical leadership.
+This server runs on ports 8674 (TCP) and 8675 (UDP) and completes
+the 3-node cluster for proper quorum-based leader election.
+
+With 3 nodes, majority quorum is 2 votes, which prevents split-brain
+scenarios that occur with only 2 nodes.
 
 Usage:
-    python swim_server_2.py
+    python swim_server_3.py
 
 This server will:
 1. Start up and begin the probe cycle
-2. Wait for server 1 to join
+2. Join the existing cluster (server 1 and 2)
 3. Exchange probes and membership information
-4. Participate in leader election
+4. Participate in leader election (with proper quorum)
 5. Display leadership status
 """
 
@@ -30,21 +33,21 @@ from hyperscale.distributed_rewrite.env import Env
 from server_test import TestServer
 
 
-async def run_server_2():
-    """Run SWIM server 2 on ports 8672/8673"""
+async def run_server_3():
+    """Run SWIM server 3 on ports 8674/8675"""
     
     print("=" * 60)
-    print("SWIM + Lifeguard + Leadership Test Server 2")
+    print("SWIM + Lifeguard + Leadership Test Server 3")
     print("=" * 60)
-    print("TCP Port: 8672")
-    print("UDP Port: 8673")
+    print("TCP Port: 8674")
+    print("UDP Port: 8675")
     print("Datacenter: DC-EAST")
     print("=" * 60)
     
     server = TestServer(
         '127.0.0.1',
-        8672,  # TCP port
-        8673,  # UDP port
+        8674,  # TCP port
+        8675,  # UDP port
         Env(
             MERCURY_SYNC_REQUEST_TIMEOUT='2s',
         ),
@@ -62,46 +65,54 @@ async def run_server_2():
         'suspicion_max_timeout': 15.0,
     })
     
-    print("\n[Server 2] Started successfully!")
-    print(f"[Server 2] Local Health Multiplier: {server._local_health.get_multiplier():.2f}")
-    print(f"[Server 2] Incarnation: {server.get_self_incarnation()}")
+    print("\n[Server 3] Started successfully!")
+    print(f"[Server 3] Local Health Multiplier: {server._local_health.get_multiplier():.2f}")
+    print(f"[Server 3] Incarnation: {server.get_self_incarnation()}")
     
-    # Wait a moment for server 1 to potentially start
-    await asyncio.sleep(2)
+    # Wait a moment for other servers to potentially start
+    await asyncio.sleep(3)
     
-    # Try to join server 1
-    server_1_addr = ('127.0.0.1', 8671)
-    print(f"\n[Server 2] Attempting to join Server 1 at {server_1_addr}...")
+    # Join both server 1 and server 2
+    servers_to_join = [
+        ('127.0.0.1', 8671),  # Server 1
+        ('127.0.0.1', 8673),  # Server 2
+    ]
     
-    try:
-        # Send join message to server 1
-        join_msg = b'join>' + f'{server_1_addr[0]}:{server_1_addr[1]}'.encode()
-        server._task_runner.run(
-            server.send,
-            server_1_addr,
-            join_msg,
-            timeout=5,
-        )
-        print("[Server 2] Join request sent to Server 1")
+    for server_addr in servers_to_join:
+        print(f"\n[Server 3] Attempting to join server at {server_addr}...")
         
-        # Add server 1 to our known nodes
-        nodes = server._context.read('nodes')
-        nodes[server_1_addr].put_nowait((0, b'OK'))
-        server._probe_scheduler.add_member(server_1_addr)
-        server._incarnation_tracker.update_node(
-            server_1_addr, b'OK', 0, 0
-        )
-        print(f"[Server 2] Added Server 1 to membership list")
-        
-    except Exception as e:
-        print(f"[Server 2] Failed to join Server 1: {e}")
+        try:
+            # Send join message
+            join_msg = b'join>' + f'{server_addr[0]}:{server_addr[1]}'.encode()
+            server._task_runner.run(
+                server.send,
+                server_addr,
+                join_msg,
+                timeout=5,
+            )
+            print(f"[Server 3] Join request sent to {server_addr}")
+            
+            # Add to our known nodes
+            nodes = server._context.read('nodes')
+            nodes[server_addr].put_nowait((0, b'OK'))
+            server._probe_scheduler.add_member(server_addr)
+            server._incarnation_tracker.update_node(
+                server_addr, b'OK', 0, 0
+            )
+            print(f"[Server 3] Added {server_addr} to membership list")
+            
+        except Exception as e:
+            print(f"[Server 3] Failed to join {server_addr}: {e}")
     
     # Start the probe cycle in the background
-    print("\n[Server 2] Starting probe cycle...")
+    print("\n[Server 3] Starting probe cycle...")
     probe_task = asyncio.create_task(server.start_probe_cycle())
     
+    # Wait a bit for membership to stabilize before starting election
+    await asyncio.sleep(2)
+    
     # Start leader election
-    print("[Server 2] Starting leader election...")
+    print("[Server 3] Starting leader election...")
     election_task = asyncio.create_task(server.start_leader_election())
     
     # Run status display loop
@@ -111,7 +122,7 @@ async def run_server_2():
             
             # Display current status
             print("\n" + "-" * 50)
-            print(f"[Server 2] Status Update")
+            print(f"[Server 3] Status Update")
             print("-" * 50)
             
             # SWIM status
@@ -141,7 +152,7 @@ async def run_server_2():
                 print(f"    {node[0]}:{node[1]} - Status: {state.status}, Inc: {state.incarnation}")
             
     except asyncio.CancelledError:
-        print("\n[Server 2] Shutting down...")
+        print("\n[Server 3] Shutting down...")
         probe_task.cancel()
         election_task.cancel()
         try:
@@ -155,11 +166,12 @@ async def run_server_2():
         server.stop_probe_cycle()
         await server.stop_leader_election()
         await server.shutdown()
-        print("[Server 2] Shutdown complete")
+        print("[Server 3] Shutdown complete")
 
 
 if __name__ == '__main__':
     try:
-        asyncio.run(run_server_2())
+        asyncio.run(run_server_3())
     except KeyboardInterrupt:
-        print("\n[Server 2] Interrupted by user")
+        print("\n[Server 3] Interrupted by user")
+
