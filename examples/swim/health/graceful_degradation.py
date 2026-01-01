@@ -205,8 +205,13 @@ class GracefulDegradation:
             if self._on_level_change:
                 try:
                     self._on_level_change(old_level, new_level)
-                except Exception:
-                    pass
+                except Exception as e:
+                    import sys
+                    print(
+                        f"[GracefulDegradation] Level change callback error "
+                        f"({old_level.name} -> {new_level.name}): {e}",
+                        file=sys.stderr
+                    )
         
         return self._current_level
     
@@ -348,8 +353,13 @@ class GracefulDegradation:
             if self._on_level_change:
                 try:
                     self._on_level_change(old_level, level)
-                except Exception:
-                    pass
+                except Exception as e:
+                    import sys
+                    print(
+                        f"[GracefulDegradation] Force level callback error "
+                        f"({old_level.name} -> {level.name}): {e}",
+                        file=sys.stderr
+                    )
     
     def reset(self) -> None:
         """Reset to normal operation."""

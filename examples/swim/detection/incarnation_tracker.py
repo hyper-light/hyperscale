@@ -233,8 +233,13 @@ class IncarnationTracker:
             if self._on_node_evicted:
                 try:
                     self._on_node_evicted(node, state)
-                except Exception:
-                    pass
+                except Exception as e:
+                    import sys
+                    print(
+                        f"[IncarnationTracker] Eviction callback error "
+                        f"for node {node}: {e}",
+                        file=sys.stderr
+                    )
         
         return len(to_remove)
     
@@ -274,8 +279,13 @@ class IncarnationTracker:
             if self._on_node_evicted:
                 try:
                     self._on_node_evicted(node, state)
-                except Exception:
-                    pass
+                except Exception as e:
+                    import sys
+                    print(
+                        f"[IncarnationTracker] Eviction callback error "
+                        f"for node {node}: {e}",
+                        file=sys.stderr
+                    )
         
         return evicted
     
