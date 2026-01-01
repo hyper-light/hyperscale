@@ -732,6 +732,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     ) -> None:
         """Queue a membership update for piggybacking on future messages."""
         self._metrics.increment('gossip_updates_sent')
+        
+        # Track specific propagation metrics
+        if update_type == 'join':
+            self._metrics.increment('joins_propagated')
+        elif update_type == 'leave':
+            self._metrics.increment('leaves_propagated')
+        
         n_members = self._get_member_count()
         self._gossip_buffer.add_update(update_type, node, incarnation, n_members)
     

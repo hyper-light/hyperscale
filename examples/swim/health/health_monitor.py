@@ -101,11 +101,11 @@ class EventLoopHealthMonitor:
     ok_count_to_recover: int = 5
     """Consecutive OK samples to exit degraded state."""
     
-    # Callbacks
+    # Callbacks (all support both sync and async)
     _on_lag_detected: Callable[[float], Awaitable[None] | None] | None = None
     _on_critical_lag: Callable[[float], Awaitable[None] | None] | None = None
     _on_recovered: Callable[[], Awaitable[None] | None] | None = None
-    _on_sample: Callable[[HealthSample], None] | None = None
+    _on_sample: Callable[[HealthSample], Awaitable[None] | None] | None = None
     
     # TaskRunner for managed async callbacks (optional)
     _task_runner: TaskRunnerProtocol | None = None
@@ -232,9 +232,11 @@ class EventLoopHealthMonitor:
         self._samples.append(sample)
         self._total_samples += 1
         
-        # Notify of sample
+        # Notify of sample (await if callback is async)
         if self._on_sample:
-            self._on_sample(sample)
+            result = self._on_sample(sample)
+            if result is not None:
+                await result
         
         # Check for lag
         is_lagging = sample.lag_ratio > self.lag_threshold

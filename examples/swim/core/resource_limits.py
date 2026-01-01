@@ -6,7 +6,6 @@ in high-churn distributed environments.
 """
 
 import time
-import sys
 from dataclasses import dataclass, field
 from typing import TypeVar, Generic, Callable, Any, Protocol
 from collections import OrderedDict
