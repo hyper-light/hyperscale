@@ -20,6 +20,7 @@ from .core.node_id import NodeId, NodeAddress
 from .core.errors import (
     SwimError,
     ErrorCategory,
+    ErrorSeverity,
     NetworkError,
     ProbeTimeoutError,
     IndirectProbeTimeoutError,
@@ -367,7 +368,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         )
     
     def _broadcast_leadership_message(self, message: bytes) -> None:
-        """Broadcast a leadership message to all known nodes."""
+        """
+        Broadcast a leadership message to all known nodes.
+        
+        Leadership messages are critical - schedule them via task runner
+        with error tracking.
+        """
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
         base_timeout = self._context.read('current_timeout')
@@ -375,12 +381,42 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         for node in nodes:
             if node != self_addr:
+                # Use task runner but schedule error-aware send
                 self._task_runner.run(
-                    self.send,
+                    self._send_leadership_message,
                     node,
                     message,
-                    timeout=timeout,
+                    timeout,
                 )
+    
+    async def _send_leadership_message(
+        self,
+        node: tuple[str, int],
+        message: bytes,
+        timeout: float,
+    ) -> bool:
+        """
+        Send a leadership message with error tracking.
+        
+        Leadership messages are important for cluster coordination.
+        """
+        try:
+            await self.send(node, message, timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        except OSError as e:
+            await self.handle_error(
+                NetworkError(
+                    f"Leadership message to {node[0]}:{node[1]} failed: {e}",
+                    severity=ErrorSeverity.DEGRADED,  # Leadership messages are more important
+                    target=node,
+                )
+            )
+            return False
+        except Exception as e:
+            await self.handle_exception(e, f"leadership_to_{node[0]}_{node[1]}")
+            return False
     
     def _on_become_leader(self) -> None:
         """Called when this node becomes the leader."""
@@ -969,7 +1005,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                 await self.decrease_failure_detector('successful_probe')
     
     async def broadcast_refutation(self) -> int:
-        """Broadcast an alive message to refute any suspicions about this node."""
+        """
+        Broadcast an alive message to refute any suspicions about this node.
+        
+        Tracks send failures and logs them but doesn't fail the overall operation.
+        Refutation is critical so we try all nodes even if some fail.
+        """
         new_incarnation = self.increment_incarnation()
         
         nodes: Nodes = self._context.read('nodes')
@@ -981,14 +1022,27 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         base_timeout = self._context.read('current_timeout')
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
         
+        successful = 0
+        failed = 0
+        
         for node in nodes:
             if node != self_addr:
-                self._task_runner.run(
-                    self.send,
-                    node,
-                    msg,
-                    timeout=timeout,
+                success = await self._send_broadcast_message(node, msg, timeout)
+                if success:
+                    successful += 1
+                else:
+                    failed += 1
+        
+        # Log if we had failures but don't fail the operation
+        if failed > 0 and self._error_handler:
+            await self.handle_error(
+                NetworkError(
+                    f"Refutation broadcast: {failed}/{successful + failed} sends failed",
+                    severity=ErrorSeverity.TRANSIENT if successful > 0 else ErrorSeverity.DEGRADED,
+                    successful=successful,
+                    failed=failed,
                 )
+            )
         
         return new_incarnation
     
@@ -997,7 +1051,11 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         target: tuple[str, int], 
         incarnation: int,
     ) -> None:
-        """Broadcast a suspicion about a node to all other members."""
+        """
+        Broadcast a suspicion about a node to all other members.
+        
+        Tracks send failures for monitoring but continues to all nodes.
+        """
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
         
@@ -1007,14 +1065,60 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         base_timeout = self._context.read('current_timeout')
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
         
+        successful = 0
+        failed = 0
+        
         for node in nodes:
             if node != self_addr and node != target:
-                self._task_runner.run(
-                    self.send,
-                    node,
-                    msg,
-                    timeout=timeout,
+                success = await self._send_broadcast_message(node, msg, timeout)
+                if success:
+                    successful += 1
+                else:
+                    failed += 1
+        
+        if failed > 0 and self._error_handler:
+            await self.handle_error(
+                NetworkError(
+                    f"Suspicion broadcast for {target}: {failed}/{successful + failed} sends failed",
+                    severity=ErrorSeverity.TRANSIENT,
+                    successful=successful,
+                    failed=failed,
+                    suspected_node=target,
                 )
+            )
+    
+    async def _send_broadcast_message(
+        self,
+        node: tuple[str, int],
+        msg: bytes,
+        timeout: float,
+    ) -> bool:
+        """
+        Send a single broadcast message with error handling.
+        
+        Returns True on success, False on failure.
+        Logs individual failures but doesn't raise exceptions.
+        """
+        try:
+            await self.send(node, msg, timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            # Timeouts are expected for unreachable nodes
+            return False
+        except OSError as e:
+            # Network errors - log but don't fail broadcast
+            if self._error_handler:
+                await self.handle_error(
+                    NetworkError(
+                        f"Broadcast to {node[0]}:{node[1]} failed: {e}",
+                        severity=ErrorSeverity.TRANSIENT,
+                        target=node,
+                    )
+                )
+            return False
+        except Exception as e:
+            await self.handle_exception(e, f"broadcast_to_{node[0]}_{node[1]}")
+            return False
     
     async def _send_to_addr(
         self, 
