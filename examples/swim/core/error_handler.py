@@ -52,6 +52,10 @@ class ErrorStats:
     
     Uses a sliding window to calculate recent error rate and
     determine if the circuit should open.
+    
+    Memory safety:
+    - Timestamps deque is bounded to prevent unbounded growth
+    - Prunes old entries on each operation
     """
     
     window_seconds: float = 60.0
@@ -63,14 +67,23 @@ class ErrorStats:
     half_open_after: float = 30.0
     """Seconds to wait before attempting recovery."""
     
+    max_timestamps: int = 1000
+    """Maximum timestamps to store (prevents memory growth under sustained errors)."""
+    
     _timestamps: deque[float] = field(default_factory=deque)
     _circuit_state: CircuitState = CircuitState.CLOSED
     _circuit_opened_at: float | None = None
     
+    def __post_init__(self):
+        """Initialize bounded deque."""
+        # Create bounded deque if not already bounded
+        if not hasattr(self._timestamps, 'maxlen') or self._timestamps.maxlen != self.max_timestamps:
+            self._timestamps = deque(self._timestamps, maxlen=self.max_timestamps)
+    
     def record_error(self) -> None:
         """Record an error occurrence."""
         now = time.monotonic()
-        self._timestamps.append(now)
+        self._timestamps.append(now)  # Deque maxlen handles overflow automatically
         self._prune_old_entries(now)
         
         # Check if we should open the circuit

@@ -230,17 +230,34 @@ class GossipBuffer:
         
         return self.encode_piggyback(max_count, max_size=remaining)
     
+    # Maximum updates to decode from a single piggyback message
+    MAX_DECODE_UPDATES = 100
+    
     @staticmethod
-    def decode_piggyback(data: bytes) -> list[PiggybackUpdate]:
+    def decode_piggyback(data: bytes, max_updates: int = 100) -> list[PiggybackUpdate]:
         """
         Decode piggybacked updates from message suffix.
+        
+        Args:
+            data: Raw piggyback data starting with '|'.
+            max_updates: Maximum updates to decode (default 100).
+                        Prevents malicious messages with thousands of updates.
+        
+        Returns:
+            List of decoded updates (bounded by max_updates).
         """
         if not data or data[0:1] != b'|':
             return []
         
+        # Bound max_updates to prevent abuse
+        bounded_max = min(max_updates, GossipBuffer.MAX_DECODE_UPDATES)
+        
         updates = []
         parts = data[1:].split(b'|')
         for part in parts:
+            if len(updates) >= bounded_max:
+                # Stop decoding - we've hit the limit
+                break
             if part:
                 update = PiggybackUpdate.from_bytes(part)
                 if update:

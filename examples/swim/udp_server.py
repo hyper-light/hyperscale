@@ -882,13 +882,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             )
             return False
 
-    async def poll_node(self, target: tuple[str, int]):
-        """Legacy single-node polling (deprecated, use start_probe_cycle instead)."""
-        status: Status = await self._context.read_with_lock(target)
-        while self._running and status == b'OK':
-            await self.send_if_ok(target, b'ack>' + target)
-            await asyncio.sleep(self._context.read('udp_poll_interval', 1))
-            status = await self._context.read_with_lock(target)
+    # poll_node method removed - was deprecated, use start_probe_cycle instead
     
     async def join_cluster(
         self,

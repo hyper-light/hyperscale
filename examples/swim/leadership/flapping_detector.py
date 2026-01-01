@@ -260,8 +260,18 @@ class FlappingDetector:
         return self._count_changes_in_window(time.monotonic())
     
     def get_recent_changes(self, count: int = 10) -> list[LeadershipChange]:
-        """Get the most recent leadership changes."""
-        return list(self._changes)[-count:]
+        """
+        Get the most recent leadership changes.
+        
+        Args:
+            count: Maximum number of changes to return (capped at 100).
+        
+        Returns:
+            List of recent changes, most recent last.
+        """
+        # Bound count to prevent excessive memory allocation
+        bounded_count = min(count, 100)
+        return list(self._changes)[-bounded_count:]
     
     def get_change_rate(self) -> float:
         """Get the average changes per minute over the window."""

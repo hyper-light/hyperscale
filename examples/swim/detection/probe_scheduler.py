@@ -99,9 +99,18 @@ class ProbeScheduler:
         return len(self.members) * self.protocol_period
     
     def stop(self) -> None:
-        """Stop the probe scheduler."""
+        """
+        Stop the probe scheduler.
+        
+        Thread-safe: Sets _running to False and cancels task atomically.
+        The probe loop checks _running before each probe, so even if there's
+        a race between setting _running and cancelling, the loop will exit.
+        """
+        # Cancel task first to prevent new iterations from starting
+        task = self._probe_task
+        self._probe_task = None
         self._running = False
-        if self._probe_task and not self._probe_task.done():
-            self._probe_task.cancel()
-            self._probe_task = None
+        
+        if task and not task.done():
+            task.cancel()
 
