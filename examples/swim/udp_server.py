@@ -90,6 +90,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         *args, 
         dc_id: str = "default",
         priority: int = 50,
+        # Message deduplication settings
+        dedup_cache_size: int = 2000,  # Default 2K messages (was 10K - excessive)
+        dedup_window: float = 30.0,    # Seconds to consider duplicate
+        # Rate limiting settings
+        rate_limit_cache_size: int = 500,  # Track at most 500 senders
+        rate_limit_tokens: int = 100,      # Max tokens per sender
+        rate_limit_refill: float = 10.0,   # Tokens per second
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -109,19 +116,19 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Message deduplication - track recently seen messages to prevent duplicates
         self._seen_messages: BoundedDict[int, float] = BoundedDict(
-            max_size=10000,
+            max_size=dedup_cache_size,
             eviction_policy='LRA',  # Least Recently Added - old messages first
         )
-        self._dedup_window: float = 30.0  # Seconds to consider a message as duplicate
+        self._dedup_window: float = dedup_window
         self._dedup_stats = {'duplicates': 0, 'unique': 0}
         
         # Rate limiting - per-sender token bucket to prevent resource exhaustion
         self._rate_limits: BoundedDict[tuple[str, int], dict] = BoundedDict(
-            max_size=1000,  # Track at most 1000 senders
+            max_size=rate_limit_cache_size,
             eviction_policy='LRA',
         )
-        self._rate_limit_tokens: int = 100  # Max tokens per sender
-        self._rate_limit_refill: float = 10.0  # Tokens per second
+        self._rate_limit_tokens: int = rate_limit_tokens
+        self._rate_limit_refill: float = rate_limit_refill
         self._rate_limit_stats = {'accepted': 0, 'rejected': 0}
         
         # Initialize error handler (logger set up after server starts)
@@ -425,6 +432,18 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         # Cleanup gossip buffer
         async with ErrorContext(self._error_handler, "gossip_cleanup"):
             stats['gossip'] = self._gossip_buffer.cleanup()
+        
+        # Cleanup old messages from dedup cache
+        async with ErrorContext(self._error_handler, "dedup_cleanup"):
+            self._seen_messages.cleanup_older_than(self._dedup_window * 2)
+        
+        # Cleanup old rate limit entries
+        async with ErrorContext(self._error_handler, "rate_limit_cleanup"):
+            self._rate_limits.cleanup_older_than(60.0)  # 1 minute
+        
+        # Check for counter overflow and reset if needed
+        # (Python handles big ints, but we reset periodically for monitoring clarity)
+        self._check_and_reset_stats()
     
     def get_cleanup_stats(self) -> dict:
         """Get cleanup statistics from all components."""
@@ -434,6 +453,27 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             'indirect_probe': self._indirect_probe_manager.get_stats(),
             'gossip': self._gossip_buffer.get_stats(),
         }
+    
+    def _check_and_reset_stats(self) -> None:
+        """
+        Check for counter overflow and reset stats if they're too large.
+        
+        While Python handles arbitrary precision integers, we reset
+        periodically to keep monitoring data meaningful and prevent
+        very large numbers that might cause issues in serialization
+        or logging.
+        """
+        MAX_COUNTER = 10_000_000_000  # 10 billion - reset threshold
+        
+        # Reset dedup stats if too large
+        if (self._dedup_stats['duplicates'] > MAX_COUNTER or 
+            self._dedup_stats['unique'] > MAX_COUNTER):
+            self._dedup_stats = {'duplicates': 0, 'unique': 0}
+        
+        # Reset rate limit stats if too large
+        if (self._rate_limit_stats['accepted'] > MAX_COUNTER or
+            self._rate_limit_stats['rejected'] > MAX_COUNTER):
+            self._rate_limit_stats = {'accepted': 0, 'rejected': 0}
     
     def _setup_leader_election(self) -> None:
         """Initialize leader election callbacks after server is started."""

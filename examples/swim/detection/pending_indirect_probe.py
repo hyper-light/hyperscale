@@ -5,6 +5,9 @@ Pending indirect probe tracking for SWIM protocol.
 import time
 from dataclasses import dataclass, field
 
+# Maximum proxies per probe - typically k=3, but allow some margin
+MAX_PROXIES = 10
+
 
 @dataclass
 class PendingIndirectProbe:
@@ -13,6 +16,9 @@ class PendingIndirectProbe:
     
     When a direct probe to a target fails, we ask k other nodes to 
     probe the target on our behalf. This tracks those pending requests.
+    
+    Memory safety:
+    - Proxies set is bounded to max_proxies to prevent unbounded growth
     """
     target: tuple[str, int]
     requester: tuple[str, int]
@@ -21,10 +27,20 @@ class PendingIndirectProbe:
     proxies: set[tuple[str, int]] = field(default_factory=set)
     received_acks: int = 0
     _completed: bool = False
+    max_proxies: int = MAX_PROXIES
+    _proxies_dropped: int = 0
     
-    def add_proxy(self, proxy: tuple[str, int]) -> None:
-        """Add a proxy node that we asked to probe the target."""
+    def add_proxy(self, proxy: tuple[str, int]) -> bool:
+        """
+        Add a proxy node that we asked to probe the target.
+        
+        Returns True if added, False if at max capacity.
+        """
+        if len(self.proxies) >= self.max_proxies:
+            self._proxies_dropped += 1
+            return False
         self.proxies.add(proxy)
+        return True
     
     def record_ack(self) -> bool:
         """

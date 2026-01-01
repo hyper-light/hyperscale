@@ -20,9 +20,13 @@ class BoundedDict(Generic[K, V]):
     A dictionary with bounded size and automatic eviction.
     
     Eviction policies:
-    - LRU: Least Recently Used (default)
-    - LRA: Least Recently Added
-    - OLDEST: By age (requires timestamped values)
+    - LRU: Least Recently Used (default) - uses OrderedDict position
+    - LRA: Least Recently Added - uses _add_times dict
+    - OLDEST: Same as LRA
+    
+    Memory optimization:
+    - LRU uses OrderedDict's built-in ordering, no extra dict needed
+    - LRA/OLDEST only store _add_times when needed
     
     Example:
         nodes = BoundedDict[tuple[str, int], NodeState](
@@ -43,14 +47,19 @@ class BoundedDict(Generic[K, V]):
     on_evict: Callable[[K, V], None] | None = None
     """Optional callback when an entry is evicted."""
     
+    # Internal storage
+    # - OrderedDict tracks access order for LRU (most recent at end)
+    # - _add_times only populated for LRA/OLDEST policies
     _data: OrderedDict[K, V] = field(default_factory=OrderedDict)
-    _access_times: dict[K, float] = field(default_factory=dict)
     _add_times: dict[K, float] = field(default_factory=dict)
     
     def __post_init__(self):
         self._data = OrderedDict()
-        self._access_times = {}
-        self._add_times = {}
+        # Only allocate _add_times if needed for the eviction policy
+        if self.eviction_policy in ('LRA', 'OLDEST'):
+            self._add_times = {}
+        else:
+            self._add_times = {}  # Empty, won't be used but needed for type safety
     
     def __len__(self) -> int:
         return len(self._data)
@@ -60,17 +69,13 @@ class BoundedDict(Generic[K, V]):
     
     def __getitem__(self, key: K) -> V:
         value = self._data[key]
-        self._access_times[key] = time.monotonic()
-        # Move to end for LRU tracking
+        # Move to end for LRU tracking (OrderedDict handles access order)
         self._data.move_to_end(key)
         return value
     
     def __setitem__(self, key: K, value: V) -> None:
-        now = time.monotonic()
-        
         if key in self._data:
             self._data[key] = value
-            self._access_times[key] = now
             self._data.move_to_end(key)
         else:
             # Check if we need to evict
@@ -78,13 +83,13 @@ class BoundedDict(Generic[K, V]):
                 self._evict()
             
             self._data[key] = value
-            self._access_times[key] = now
-            self._add_times[key] = now
+            # Only track add time for LRA/OLDEST policies
+            if self.eviction_policy in ('LRA', 'OLDEST'):
+                self._add_times[key] = time.monotonic()
     
     def __delitem__(self, key: K) -> None:
         if key in self._data:
             del self._data[key]
-            self._access_times.pop(key, None)
             self._add_times.pop(key, None)
     
     def get(self, key: K, default: V | None = None) -> V | None:
@@ -95,7 +100,6 @@ class BoundedDict(Generic[K, V]):
     def pop(self, key: K, default: V | None = None) -> V | None:
         if key in self._data:
             value = self._data.pop(key)
-            self._access_times.pop(key, None)
             self._add_times.pop(key, None)
             return value
         return default
@@ -111,7 +115,6 @@ class BoundedDict(Generic[K, V]):
     
     def clear(self) -> None:
         self._data.clear()
-        self._access_times.clear()
         self._add_times.clear()
     
     def _evict(self) -> None:
@@ -120,28 +123,25 @@ class BoundedDict(Generic[K, V]):
         
         if self.eviction_policy == 'LRU':
             # Evict least recently used (front of OrderedDict)
+            # OrderedDict maintains insertion/access order, oldest at front
             for key in list(self._data.keys())[:self.eviction_batch]:
                 to_evict.append(key)
         
-        elif self.eviction_policy == 'LRA':
-            # Evict least recently added
-            sorted_by_add = sorted(
-                self._add_times.items(),
-                key=lambda x: x[1],
-            )
-            to_evict = [k for k, _ in sorted_by_add[:self.eviction_batch]]
-        
-        elif self.eviction_policy == 'OLDEST':
-            # Same as LRA for now
-            sorted_by_add = sorted(
-                self._add_times.items(),
-                key=lambda x: x[1],
-            )
-            to_evict = [k for k, _ in sorted_by_add[:self.eviction_batch]]
+        elif self.eviction_policy in ('LRA', 'OLDEST'):
+            # Evict least recently added - use _add_times
+            if self._add_times:
+                sorted_by_add = sorted(
+                    self._add_times.items(),
+                    key=lambda x: x[1],
+                )
+                to_evict = [k for k, _ in sorted_by_add[:self.eviction_batch]]
+            else:
+                # Fallback to front of OrderedDict if no add times
+                for key in list(self._data.keys())[:self.eviction_batch]:
+                    to_evict.append(key)
         
         for key in to_evict:
             value = self._data.pop(key, None)
-            self._access_times.pop(key, None)
             self._add_times.pop(key, None)
             
             if value is not None and self.on_evict:
