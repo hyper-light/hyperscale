@@ -243,8 +243,14 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         f"Degradation {direction}: {old_level.name} -> {new_level.name} ({policy.description})"
                     )
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # Don't let logging failure prevent degradation handling
+                # But still track the unexpected error
+                asyncio.create_task(
+                    self.handle_error(
+                        UnexpectedError(e, "degradation_logging")
+                    )
+                )
         
         # Check if we need to step down from leadership
         if policy.should_step_down and self._leader_election.state.is_leader():
@@ -1514,6 +1520,17 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                             return b'ping-req-ack:timeout>' + target_addr
                 
                 case b'ping-req-ack':
+                    # Verify we have a pending indirect probe for this target
+                    if target and not self._indirect_probe_manager.get_pending_probe(target):
+                        await self.handle_error(
+                            UnexpectedMessageError(
+                                msg_type=b'ping-req-ack',
+                                expected=None,  # Not expecting this at all
+                                source=addr,
+                            )
+                        )
+                        return b'ack>' + self._udp_addr_slug
+                    
                     msg_parts = message.split(b':', maxsplit=1)
                     if len(msg_parts) > 1:
                         status_str = msg_parts[1]
@@ -1579,6 +1596,17 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'leader-vote':
+                    # Verify we're actually expecting votes (are we a candidate?)
+                    if not self._leader_election.state.is_candidate():
+                        await self.handle_error(
+                            UnexpectedMessageError(
+                                msg_type=b'leader-vote',
+                                expected=[b'probe', b'ack', b'leader-heartbeat'],
+                                source=addr,
+                            )
+                        )
+                        return b'ack>' + self._udp_addr_slug
+                    
                     term = await self._parse_term_safe(message, addr)
                     
                     if self._leader_election.handle_vote(addr, term):
@@ -1599,12 +1627,37 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     term = await self._parse_term_safe(message, addr)
                     
                     if target:
+                        # Check if we received our own election announcement (shouldn't happen)
+                        self_addr = self._get_self_udp_addr()
+                        if target == self_addr:
+                            await self.handle_error(
+                                UnexpectedMessageError(
+                                    msg_type=b'leader-elected',
+                                    expected=None,
+                                    source=addr,
+                                )
+                            )
+                            return b'ack>' + self._udp_addr_slug
+                        
                         self._leader_election.handle_elected(target, term)
                     
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'leader-heartbeat':
                     term = await self._parse_term_safe(message, addr)
+                    
+                    # Check if we received our own heartbeat (shouldn't happen)
+                    if target:
+                        self_addr = self._get_self_udp_addr()
+                        if target == self_addr and addr != self_addr:
+                            await self.handle_error(
+                                UnexpectedMessageError(
+                                    msg_type=b'leader-heartbeat',
+                                    expected=None,
+                                    source=addr,
+                                )
+                            )
+                            return b'ack>' + self._udp_addr_slug
                     
                     if target:
                         self_addr = self._get_self_udp_addr()
@@ -1662,6 +1715,17 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'pre-vote-resp':
+                    # Verify we're actually in a pre-voting phase
+                    if not self._leader_election.state.pre_voting_in_progress:
+                        await self.handle_error(
+                            UnexpectedMessageError(
+                                msg_type=b'pre-vote-resp',
+                                expected=None,  # Not expecting this
+                                source=addr,
+                            )
+                        )
+                        return b'ack>' + self._udp_addr_slug
+                    
                     term, granted = await self._parse_pre_vote_response(message, addr)
                     
                     self._leader_election.handle_pre_vote_response(
