@@ -30,7 +30,7 @@ from collections import defaultdict
 from hyperscale.distributed_rewrite.env import Env
 
 # Import the SWIM server implementation from the swim package
-from swim import TestServer
+from swim import UDPServer
 
 
 async def run_server_3():
@@ -44,7 +44,7 @@ async def run_server_3():
     print("Datacenter: DC-EAST")
     print("=" * 60)
     
-    server = TestServer(
+    server = UDPServer(
         '127.0.0.1',
         8674,  # TCP port
         8675,  # UDP port
