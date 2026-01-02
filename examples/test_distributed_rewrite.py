@@ -483,9 +483,10 @@ def test_manager_embedder_process():
     assert addr == ("192.168.1.10", 8000)
 
 
-@test("GateStateEmbedder: returns None state")
+@test("GateStateEmbedder: embeds GateHeartbeat state")
 def test_gate_embedder():
     from hyperscale.distributed_rewrite.swim.core.state_embedder import GateStateEmbedder
+    from hyperscale.distributed_rewrite.models import GateHeartbeat
     
     received = []
     
@@ -496,11 +497,17 @@ def test_gate_embedder():
         get_term=lambda: 1,
         get_state_version=lambda: 1,
         get_active_jobs=lambda: 10,
+        get_active_datacenters=lambda: 3,
+        get_manager_count=lambda: 6,
         on_manager_heartbeat=lambda hb, addr: received.append((hb, addr)),
     )
     
-    # Gates don't embed state by default
-    assert embedder.get_state() is None
+    # Gates now embed GateHeartbeat
+    state = embedder.get_state()
+    assert state is not None
+    heartbeat = GateHeartbeat.load(state)
+    assert heartbeat.node_id == "gate-1"
+    assert heartbeat.active_jobs == 10
 
 
 @test("GateStateEmbedder: processes ManagerHeartbeat")
@@ -519,6 +526,8 @@ def test_gate_embedder_process():
         get_term=lambda: 1,
         get_state_version=lambda: 1,
         get_active_jobs=lambda: 0,
+        get_active_datacenters=lambda: 3,
+        get_manager_count=lambda: 6,
         on_manager_heartbeat=lambda hb, addr: received.append((hb, addr)),
     )
     
@@ -3045,6 +3054,338 @@ test_worker_has_manager_heartbeat_handler()
 test_worker_embedder_includes_callback()
 test_worker_heartbeat_updates_leader()
 test_worker_heartbeat_discovers_new_managers()
+
+
+# =============================================================================
+# Manager <-> Gate Communication Tests (mirrors Worker <-> Manager)
+# =============================================================================
+
+print("\nManager <-> Gate Communication Tests")
+print("=" * 50)
+
+
+@test("GateInfo: model exists with expected fields")
+def test_gate_info_model():
+    from hyperscale.distributed_rewrite.models import GateInfo
+    
+    gate = GateInfo(
+        node_id="gate-1",
+        tcp_host="host1",
+        tcp_port=8000,
+        udp_host="host1",
+        udp_port=8001,
+        datacenter="dc-east",
+        is_leader=True,
+    )
+    
+    assert gate.node_id == "gate-1"
+    assert gate.is_leader is True
+
+
+@test("GateHeartbeat: model exists with expected fields")
+def test_gate_heartbeat_model():
+    from hyperscale.distributed_rewrite.models import GateHeartbeat
+    
+    heartbeat = GateHeartbeat(
+        node_id="gate-1",
+        datacenter="dc-east",
+        is_leader=True,
+        term=1,
+        version=5,
+        active_jobs=10,
+        active_datacenters=3,
+        manager_count=6,
+    )
+    
+    assert heartbeat.node_id == "gate-1"
+    assert heartbeat.active_jobs == 10
+
+
+@test("ManagerRegistrationResponse: model exists")
+def test_manager_registration_response_model():
+    from hyperscale.distributed_rewrite.models import ManagerRegistrationResponse, GateInfo
+    
+    gates = [
+        GateInfo(
+            node_id="gate-1",
+            tcp_host="host1",
+            tcp_port=8000,
+            udp_host="host1",
+            udp_port=8001,
+            datacenter="dc-east",
+            is_leader=True,
+        )
+    ]
+    
+    response = ManagerRegistrationResponse(
+        accepted=True,
+        gate_id="gate-1",
+        healthy_gates=gates,
+    )
+    
+    assert response.accepted is True
+    assert len(response.healthy_gates) == 1
+
+
+@test("JobProgressAck: model exists with expected fields")
+def test_job_progress_ack_model():
+    from hyperscale.distributed_rewrite.models import JobProgressAck, GateInfo
+    
+    ack = JobProgressAck(
+        gate_id="gate-1",
+        is_leader=True,
+        healthy_gates=[
+            GateInfo(
+                node_id="gate-1",
+                tcp_host="host1",
+                tcp_port=8000,
+                udp_host="host1",
+                udp_port=8001,
+                datacenter="dc-east",
+                is_leader=True,
+            )
+        ],
+    )
+    
+    assert ack.gate_id == "gate-1"
+    assert ack.is_leader is True
+
+
+@test("GateStateEmbedder: embeds GateHeartbeat")
+def test_gate_embedder_embeds_heartbeat():
+    import inspect
+    from hyperscale.distributed_rewrite.swim.core.state_embedder import GateStateEmbedder
+    
+    source = inspect.getsource(GateStateEmbedder.get_state)
+    
+    assert "GateHeartbeat" in source, \
+        "GateStateEmbedder should create GateHeartbeat"
+
+
+@test("GateStateEmbedder: has on_gate_heartbeat callback")
+def test_gate_embedder_has_gate_callback():
+    from hyperscale.distributed_rewrite.swim.core.state_embedder import GateStateEmbedder
+    import inspect
+    
+    sig = inspect.signature(GateStateEmbedder)
+    param_names = list(sig.parameters.keys())
+    
+    assert 'on_gate_heartbeat' in param_names, \
+        "GateStateEmbedder should have on_gate_heartbeat parameter"
+
+
+@test("GateStateEmbedder: process_state handles GateHeartbeat")
+def test_gate_embedder_processes_gate_heartbeat():
+    import inspect
+    from hyperscale.distributed_rewrite.swim.core.state_embedder import GateStateEmbedder
+    
+    source = inspect.getsource(GateStateEmbedder.process_state)
+    
+    assert "GateHeartbeat" in source, \
+        "process_state should try to parse GateHeartbeat from peers"
+
+
+@test("Gate: has _gate_peer_info tracking")
+def test_gate_has_peer_info_tracking():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer.__init__)
+    
+    assert "_gate_peer_info" in source, \
+        "GateServer should have _gate_peer_info dict"
+
+
+@test("Gate: has _handle_gate_peer_heartbeat method")
+def test_gate_has_peer_heartbeat_handler():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    import inspect
+    
+    assert hasattr(GateServer, '_handle_gate_peer_heartbeat'), \
+        "GateServer should have _handle_gate_peer_heartbeat method"
+    
+    source = inspect.getsource(GateServer._handle_gate_peer_heartbeat)
+    
+    assert "GateHeartbeat" in source, \
+        "_handle_gate_peer_heartbeat should handle GateHeartbeat"
+
+
+@test("Gate: has _get_healthy_gates method")
+def test_gate_has_get_healthy_gates():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    import inspect
+    
+    assert hasattr(GateServer, '_get_healthy_gates'), \
+        "GateServer should have _get_healthy_gates method"
+    
+    source = inspect.getsource(GateServer._get_healthy_gates)
+    
+    assert "GateInfo" in source, \
+        "_get_healthy_gates should return GateInfo list"
+
+
+@test("Gate: receive_job_progress returns JobProgressAck")
+def test_gate_progress_returns_ack():
+    import pathlib
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    source_file = pathlib.Path(gate_module.__file__)
+    source = source_file.read_text()
+    
+    assert "JobProgressAck(" in source, \
+        "receive_job_progress should construct JobProgressAck"
+    assert "_get_healthy_gates()" in source, \
+        "receive_job_progress should call _get_healthy_gates"
+
+
+@test("Gate: receive_manager_register returns ManagerRegistrationResponse")
+def test_gate_manager_register():
+    import pathlib
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    source_file = pathlib.Path(gate_module.__file__)
+    source = source_file.read_text()
+    
+    assert "ManagerRegistrationResponse(" in source, \
+        "receive_manager_register should return ManagerRegistrationResponse"
+
+
+@test("ManagerStateEmbedder: has on_gate_heartbeat callback")
+def test_manager_embedder_has_gate_callback():
+    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    import inspect
+    
+    sig = inspect.signature(ManagerStateEmbedder)
+    param_names = list(sig.parameters.keys())
+    
+    assert 'on_gate_heartbeat' in param_names, \
+        "ManagerStateEmbedder should have on_gate_heartbeat parameter"
+
+
+@test("ManagerStateEmbedder: process_state handles GateHeartbeat")
+def test_manager_embedder_processes_gate_heartbeat():
+    import inspect
+    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    
+    source = inspect.getsource(ManagerStateEmbedder.process_state)
+    
+    assert "GateHeartbeat" in source, \
+        "process_state should try to parse GateHeartbeat from gates"
+
+
+@test("Manager: has gate tracking structures")
+def test_manager_has_gate_tracking():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    assert "_known_gates" in source, \
+        "ManagerServer should have _known_gates dict"
+    assert "_healthy_gate_ids" in source, \
+        "ManagerServer should have _healthy_gate_ids set"
+    assert "_primary_gate_id" in source, \
+        "ManagerServer should have _primary_gate_id"
+
+
+@test("Manager: has _handle_gate_heartbeat method")
+def test_manager_has_gate_heartbeat_handler():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, '_handle_gate_heartbeat'), \
+        "ManagerServer should have _handle_gate_heartbeat method"
+    
+    source = inspect.getsource(ManagerServer._handle_gate_heartbeat)
+    
+    assert "GateHeartbeat" in source, \
+        "_handle_gate_heartbeat should handle GateHeartbeat"
+    assert "_known_gates" in source, \
+        "_handle_gate_heartbeat should update _known_gates"
+
+
+@test("Manager: has _process_job_progress_ack method")
+def test_manager_has_process_job_progress_ack():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, '_process_job_progress_ack'), \
+        "ManagerServer should have _process_job_progress_ack method"
+    
+    source = inspect.getsource(ManagerServer._process_job_progress_ack)
+    
+    assert "JobProgressAck" in source, \
+        "_process_job_progress_ack should parse JobProgressAck"
+
+
+@test("Manager: has _update_known_gates method")
+def test_manager_has_update_known_gates():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_update_known_gates'), \
+        "ManagerServer should have _update_known_gates method"
+
+
+@test("Manager: has gate registration at startup")
+def test_manager_has_gate_registration():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, '_register_with_gates'), \
+        "ManagerServer should have _register_with_gates method"
+    
+    source = inspect.getsource(ManagerServer._register_with_gates)
+    
+    assert "ManagerRegistrationResponse" in source, \
+        "_register_with_gates should handle ManagerRegistrationResponse"
+
+
+@test("Manager: state embedder includes on_gate_heartbeat")
+def test_manager_embedder_includes_gate_callback():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    assert "on_gate_heartbeat=self._handle_gate_heartbeat" in source, \
+        "Manager should pass _handle_gate_heartbeat to ManagerStateEmbedder"
+
+
+@test("Manager: _send_job_progress_to_gate processes ack")
+def test_manager_send_progress_processes_ack():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._send_job_progress_to_gate)
+    
+    assert "_process_job_progress_ack" in source, \
+        "_send_job_progress_to_gate should process ack response"
+
+
+# Run Manager <-> Gate tests
+test_gate_info_model()
+test_gate_heartbeat_model()
+test_manager_registration_response_model()
+test_job_progress_ack_model()
+test_gate_embedder_embeds_heartbeat()
+test_gate_embedder_has_gate_callback()
+test_gate_embedder_processes_gate_heartbeat()
+test_gate_has_peer_info_tracking()
+test_gate_has_peer_heartbeat_handler()
+test_gate_has_get_healthy_gates()
+test_gate_progress_returns_ack()
+test_gate_manager_register()
+test_manager_embedder_has_gate_callback()
+test_manager_embedder_processes_gate_heartbeat()
+test_manager_has_gate_tracking()
+test_manager_has_gate_heartbeat_handler()
+test_manager_has_process_job_progress_ack()
+test_manager_has_update_known_gates()
+test_manager_has_gate_registration()
+test_manager_embedder_includes_gate_callback()
+test_manager_send_progress_processes_ack()
 
 
 # =============================================================================

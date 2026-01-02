@@ -17,6 +17,7 @@ import time
 from hyperscale.distributed_rewrite.models import (
     WorkerHeartbeat,
     ManagerHeartbeat,
+    GateHeartbeat,
 )
 
 
@@ -139,8 +140,10 @@ class ManagerStateEmbedder:
     """
     State embedder for Manager nodes.
     
-    Embeds ManagerHeartbeat data and processes both WorkerHeartbeat 
-    from workers and ManagerHeartbeat from peer managers.
+    Embeds ManagerHeartbeat data and processes:
+    - WorkerHeartbeat from workers
+    - ManagerHeartbeat from peer managers  
+    - GateHeartbeat from gates
     
     Attributes:
         get_node_id: Callable returning the node's full ID.
@@ -154,6 +157,7 @@ class ManagerStateEmbedder:
         get_available_cores: Callable returning total available cores.
         on_worker_heartbeat: Callable to handle received WorkerHeartbeat.
         on_manager_heartbeat: Callable to handle received ManagerHeartbeat from peers.
+        on_gate_heartbeat: Callable to handle received GateHeartbeat from gates.
     """
     get_node_id: Callable[[], str]
     get_datacenter: Callable[[], str]
@@ -166,6 +170,7 @@ class ManagerStateEmbedder:
     get_available_cores: Callable[[], int]
     on_worker_heartbeat: Callable[[Any, tuple[str, int]], None]
     on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
+    on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     
     def get_state(self) -> bytes | None:
         """Get ManagerHeartbeat to embed in SWIM messages."""
@@ -187,7 +192,7 @@ class ManagerStateEmbedder:
         state_data: bytes,
         source_addr: tuple[str, int],
     ) -> None:
-        """Process embedded state from workers or peer managers."""
+        """Process embedded state from workers, peer managers, or gates."""
         # Try parsing as WorkerHeartbeat first (most common)
         try:
             heartbeat = WorkerHeartbeat.load(state_data)
@@ -203,6 +208,15 @@ class ManagerStateEmbedder:
                 # Don't process our own heartbeat
                 if heartbeat.node_id != self.get_node_id():
                     self.on_manager_heartbeat(heartbeat, source_addr)
+                    return
+            except Exception:
+                pass
+        
+        # Try parsing as GateHeartbeat from gates
+        if self.on_gate_heartbeat:
+            try:
+                heartbeat = GateHeartbeat.load(state_data)
+                self.on_gate_heartbeat(heartbeat, source_addr)
             except Exception:
                 pass
 
@@ -212,8 +226,9 @@ class GateStateEmbedder:
     """
     State embedder for Gate nodes.
     
-    Gates don't embed much state (they're coordinators), but they
-    process ManagerHeartbeat from datacenter managers.
+    Embeds GateHeartbeat data and processes:
+    - ManagerHeartbeat from datacenter managers
+    - GateHeartbeat from peer gates
     
     Attributes:
         get_node_id: Callable returning the node's full ID.
@@ -222,7 +237,10 @@ class GateStateEmbedder:
         get_term: Callable returning current leadership term.
         get_state_version: Callable returning state version.
         get_active_jobs: Callable returning active job count.
+        get_active_datacenters: Callable returning active datacenter count.
+        get_manager_count: Callable returning registered manager count.
         on_manager_heartbeat: Callable to handle received ManagerHeartbeat.
+        on_gate_heartbeat: Callable to handle received GateHeartbeat from peers.
     """
     get_node_id: Callable[[], str]
     get_datacenter: Callable[[], str]
@@ -230,29 +248,46 @@ class GateStateEmbedder:
     get_term: Callable[[], int]
     get_state_version: Callable[[], int]
     get_active_jobs: Callable[[], int]
+    get_active_datacenters: Callable[[], int]
+    get_manager_count: Callable[[], int]
     on_manager_heartbeat: Callable[[Any, tuple[str, int]], None]
+    on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     
     def get_state(self) -> bytes | None:
-        """
-        Gates embed minimal state - they're primarily coordinators.
-        
-        Could embed a GateHeartbeat in the future if peer gates
-        need to know about each other's status.
-        """
-        # For now, gates don't embed state
-        # Could add GateHeartbeat if needed for gate-to-gate awareness
-        return None
+        """Get GateHeartbeat to embed in SWIM messages."""
+        heartbeat = GateHeartbeat(
+            node_id=self.get_node_id(),
+            datacenter=self.get_datacenter(),
+            is_leader=self.is_leader(),
+            term=self.get_term(),
+            version=self.get_state_version(),
+            active_jobs=self.get_active_jobs(),
+            active_datacenters=self.get_active_datacenters(),
+            manager_count=self.get_manager_count(),
+        )
+        return heartbeat.dump()
     
     def process_state(
         self,
         state_data: bytes,
         source_addr: tuple[str, int],
     ) -> None:
-        """Process embedded state from managers."""
+        """Process embedded state from managers or peer gates."""
+        # Try parsing as ManagerHeartbeat first (most common)
         try:
             heartbeat = ManagerHeartbeat.load(state_data)
             self.on_manager_heartbeat(heartbeat, source_addr)
+            return
         except Exception:
-            # Not a ManagerHeartbeat or invalid data - ignore
             pass
+        
+        # Try parsing as GateHeartbeat from peer gates
+        if self.on_gate_heartbeat:
+            try:
+                heartbeat = GateHeartbeat.load(state_data)
+                # Don't process our own heartbeat
+                if heartbeat.node_id != self.get_node_id():
+                    self.on_gate_heartbeat(heartbeat, source_addr)
+            except Exception:
+                pass
 

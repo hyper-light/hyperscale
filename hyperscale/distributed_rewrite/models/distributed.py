@@ -145,6 +145,72 @@ class WorkflowProgressAck(Message):
     healthy_managers: list[ManagerInfo]     # Current healthy managers
 
 
+# =============================================================================
+# Gate Node Identity and Discovery (Manager <-> Gate)
+# =============================================================================
+
+@dataclass(slots=True)
+class GateInfo(Message):
+    """
+    Gate identity and address information for manager discovery.
+    
+    Managers use this to maintain a list of known gates for
+    redundant communication and failover.
+    """
+    node_id: str                 # Gate's unique identifier
+    tcp_host: str                # TCP host for data operations
+    tcp_port: int                # TCP port for data operations
+    udp_host: str                # UDP host for SWIM healthchecks
+    udp_port: int                # UDP port for SWIM healthchecks
+    datacenter: str              # Datacenter identifier (gate's home DC)
+    is_leader: bool = False      # Whether this gate is the current leader
+
+
+@dataclass(slots=True)
+class GateHeartbeat(Message):
+    """
+    Periodic heartbeat from gate embedded in SWIM messages.
+    
+    Contains gate-level status for cross-DC coordination.
+    Gates are the top-level coordinators managing global job state.
+    """
+    node_id: str                 # Gate identifier
+    datacenter: str              # Gate's home datacenter
+    is_leader: bool              # Is this the leader gate?
+    term: int                    # Leadership term
+    version: int                 # State version
+    active_jobs: int             # Number of active global jobs
+    active_datacenters: int      # Number of datacenters with active work
+    manager_count: int           # Number of registered managers
+
+
+@dataclass(slots=True, kw_only=True)
+class ManagerRegistrationResponse(Message):
+    """
+    Registration acknowledgment from gate to manager.
+    
+    Contains list of all known healthy gates so manager can
+    establish redundant communication channels.
+    """
+    accepted: bool                          # Whether registration was accepted
+    gate_id: str                            # Responding gate's node_id
+    healthy_gates: list[GateInfo]           # All known healthy gates (including self)
+    error: str | None = None                # Error message if not accepted
+
+
+@dataclass(slots=True, kw_only=True)
+class JobProgressAck(Message):
+    """
+    Acknowledgment for job progress updates from gates to managers.
+    
+    Includes updated gate list so managers can maintain
+    accurate view of gate cluster topology and leadership.
+    """
+    gate_id: str                            # Responding gate's node_id
+    is_leader: bool                         # Whether this gate is leader
+    healthy_gates: list[GateInfo]           # Current healthy gates
+
+
 @dataclass(slots=True)
 class WorkerRegistration(Message):
     """

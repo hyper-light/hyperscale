@@ -39,6 +39,10 @@ from hyperscale.distributed_rewrite.models import (
     ManagerInfo,
     RegistrationResponse,
     WorkflowProgressAck,
+    GateInfo,
+    GateHeartbeat,
+    ManagerRegistrationResponse,
+    JobProgressAck,
     WorkerRegistration,
     WorkerHeartbeat,
     WorkerState,
@@ -114,9 +118,17 @@ class ManagerServer(HealthAwareServer):
             dc_id=dc_id,
         )
         
-        # Gate discovery (optional)
-        self._gate_addrs = gate_addrs or []  # TCP
+        # Gate discovery (optional) - seed addresses from config
+        self._seed_gates = gate_addrs or []  # TCP seed addresses
         self._gate_udp_addrs = gate_udp_addrs or []  # UDP for SWIM
+        
+        # Gate tracking (similar to Worker's manager tracking)
+        self._known_gates: dict[str, GateInfo] = {}  # node_id -> GateInfo
+        self._healthy_gate_ids: set[str] = set()  # Currently healthy gate node_ids
+        self._primary_gate_id: str | None = None  # Primary gate (prefer leader)
+        
+        # Backwards compat: keep for initial iteration through seed addresses
+        self._gate_addrs = gate_addrs or []  # TCP
         self._current_gate: tuple[str, int] | None = None
         
         # Manager peers for quorum (TCP) and SWIM cluster (UDP)
@@ -194,6 +206,7 @@ class ManagerServer(HealthAwareServer):
             ),
             on_worker_heartbeat=self._handle_embedded_worker_heartbeat,
             on_manager_heartbeat=self._handle_manager_peer_heartbeat,
+            on_gate_heartbeat=self._handle_gate_heartbeat,
         ))
         
         # Register leadership callbacks (composition pattern - no override)
@@ -672,6 +685,138 @@ class ManagerServer(HealthAwareServer):
             self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
         )
     
+    def _handle_gate_heartbeat(
+        self,
+        heartbeat: GateHeartbeat,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """
+        Handle GateHeartbeat received from gates via SWIM.
+        
+        This enables managers to track gate leadership changes in real-time
+        without waiting for TCP ack responses.
+        """
+        gate_id = heartbeat.node_id
+        
+        # Check if this is a known gate
+        existing_gate = self._known_gates.get(gate_id)
+        
+        if existing_gate:
+            # Update is_leader status if it changed
+            old_is_leader = existing_gate.is_leader
+            if heartbeat.is_leader != old_is_leader:
+                # Update the gate info with new leadership status
+                self._known_gates[gate_id] = GateInfo(
+                    node_id=existing_gate.node_id,
+                    tcp_host=existing_gate.tcp_host,
+                    tcp_port=existing_gate.tcp_port,
+                    udp_host=existing_gate.udp_host,
+                    udp_port=existing_gate.udp_port,
+                    datacenter=heartbeat.datacenter,
+                    is_leader=heartbeat.is_leader,
+                )
+                
+                # If this gate became the leader, switch primary
+                if heartbeat.is_leader and self._primary_gate_id != gate_id:
+                    old_primary = self._primary_gate_id
+                    self._primary_gate_id = gate_id
+                    
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Gate leadership change via SWIM: {old_primary} -> {gate_id}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+        else:
+            # New gate discovered via SWIM - create entry
+            self._known_gates[gate_id] = GateInfo(
+                node_id=gate_id,
+                tcp_host=source_addr[0],
+                tcp_port=source_addr[1] - 1,  # Convention: TCP = UDP - 1
+                udp_host=source_addr[0],
+                udp_port=source_addr[1],
+                datacenter=heartbeat.datacenter,
+                is_leader=heartbeat.is_leader,
+            )
+            self._healthy_gate_ids.add(gate_id)
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Discovered new gate via SWIM: {gate_id} (leader={heartbeat.is_leader})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            
+            # If this is a leader and we don't have one, use it
+            if heartbeat.is_leader and not self._primary_gate_id:
+                self._primary_gate_id = gate_id
+    
+    def _update_known_gates(self, gates: list[GateInfo]) -> None:
+        """
+        Update the known gates from a list received via TCP ack.
+        
+        This is called when processing JobProgressAck from gates.
+        """
+        for gate in gates:
+            self._known_gates[gate.node_id] = gate
+            self._healthy_gate_ids.add(gate.node_id)
+    
+    def _process_job_progress_ack(self, data: bytes) -> None:
+        """
+        Process JobProgressAck to update gate topology.
+        
+        This enables continuous gate list refresh - every ack includes
+        the current list of healthy gates and leadership status.
+        """
+        try:
+            ack = JobProgressAck.load(data)
+            
+            # Update known gates from ack
+            self._update_known_gates(ack.healthy_gates)
+            
+            # Update primary gate if leadership changed
+            if ack.is_leader and self._primary_gate_id != ack.gate_id:
+                old_primary = self._primary_gate_id
+                self._primary_gate_id = ack.gate_id
+                
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Gate leadership change: {old_primary} -> {ack.gate_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                
+        except Exception:
+            # Backwards compatibility: ignore parse errors for old b'ok' responses
+            pass
+    
+    def _get_primary_gate_tcp_addr(self) -> tuple[str, int] | None:
+        """Get TCP address of the primary gate."""
+        if not self._primary_gate_id:
+            return None
+        gate = self._known_gates.get(self._primary_gate_id)
+        if gate:
+            return (gate.tcp_host, gate.tcp_port)
+        return None
+    
+    def _get_healthy_gate_tcp_addrs(self) -> list[tuple[str, int]]:
+        """Get TCP addresses of all healthy gates."""
+        addrs = []
+        for gate_id in self._healthy_gate_ids:
+            gate = self._known_gates.get(gate_id)
+            if gate:
+                addrs.append((gate.tcp_host, gate.tcp_port))
+        return addrs
+    
     @property
     def node_info(self) -> NodeInfo:
         """Get this manager's node info."""
@@ -796,20 +941,103 @@ class ManagerServer(HealthAwareServer):
         # Start background cleanup for completed jobs
         self._task_runner.run(self._job_cleanup_loop)
         
+        # Register with gates (similar to Worker registering with Managers)
+        if self._seed_gates:
+            await self._register_with_gates()
+        
         # Start TCP heartbeat loop to gates (supplements SWIM embedding)
         # TCP provides reliability for critical status updates
-        if self._gate_addrs:
+        if self._gate_addrs or self._known_gates:
             self._task_runner.run(self._gate_heartbeat_loop)
         
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Manager started in DC {self._node_id.datacenter}, SWIM healthcheck active",
+                message=f"Manager started in DC {self._node_id.datacenter}, SWIM healthcheck active" +
+                        (f", primary gate: {self._primary_gate_id}" if self._primary_gate_id else ""),
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             )
         )
+    
+    async def _register_with_gates(self) -> None:
+        """
+        Register this manager with gates.
+        
+        Try each seed gate until one responds with a ManagerRegistrationResponse
+        containing the list of all healthy gates.
+        """
+        for gate_addr in self._seed_gates:
+            response = await self._try_register_with_gate(gate_addr)
+            if response and response.accepted:
+                self._current_gate = gate_addr
+                self._primary_gate_id = response.gate_id
+                
+                # Populate known gates from response
+                for gate_info in response.healthy_gates:
+                    self._known_gates[gate_info.node_id] = gate_info
+                    self._healthy_gate_ids.add(gate_info.node_id)
+                    
+                    # Add gate's UDP address for SWIM (if not already configured)
+                    gate_udp_addr = (gate_info.udp_host, gate_info.udp_port)
+                    if gate_udp_addr not in self._gate_udp_addrs:
+                        self._gate_udp_addrs.append(gate_udp_addr)
+                        # Join SWIM cluster with this gate
+                        await self.join_cluster(gate_udp_addr)
+                
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Registered with gate {response.gate_id}, discovered {len(response.healthy_gates)} gates",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return
+        
+        # Failed to register with any gate
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerError(
+                message="Failed to register with any gate - manager will operate without gate coordination",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+    
+    async def _try_register_with_gate(
+        self,
+        gate_addr: tuple[str, int],
+    ) -> ManagerRegistrationResponse | None:
+        """Try to register with a single gate."""
+        try:
+            heartbeat = self._build_manager_heartbeat()
+            
+            response = await self.send_tcp(
+                gate_addr,
+                "manager_register",
+                heartbeat.dump(),
+                timeout=5.0,
+            )
+            
+            if isinstance(response, Exception):
+                raise response
+            
+            return ManagerRegistrationResponse.load(response)
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Failed to register with gate {gate_addr}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return None
     
     async def stop(self) -> None:
         """Stop the manager server."""
@@ -852,8 +1080,10 @@ class ManagerServer(HealthAwareServer):
                 
                 heartbeat = self._build_manager_heartbeat()
                 
-                # Send to all configured gates
-                for gate_addr in self._gate_addrs:
+                # Send to all healthy gates (use known gates if available, else seed gates)
+                gate_addrs = self._get_healthy_gate_tcp_addrs() or self._gate_addrs
+                
+                for gate_addr in gate_addrs:
                     try:
                         await self.send_tcp(
                             gate_addr,
@@ -869,6 +1099,60 @@ class ManagerServer(HealthAwareServer):
                 break
             except Exception as e:
                 await self.handle_exception(e, "gate_heartbeat_loop")
+    
+    async def _send_job_progress_to_gate(self, job: JobProgress) -> None:
+        """
+        Send job progress to the primary gate and process ack.
+        
+        The gate responds with JobProgressAck containing updated
+        gate topology which we use to maintain redundant channels.
+        """
+        gate_addr = self._get_primary_gate_tcp_addr()
+        if not gate_addr:
+            # Fallback to first seed gate
+            if self._gate_addrs:
+                gate_addr = self._gate_addrs[0]
+            else:
+                return
+        
+        try:
+            response = await self.send_tcp(
+                gate_addr,
+                "job_progress",
+                job.dump(),
+                timeout=2.0,
+            )
+            
+            # Process ack to update gate topology
+            if response and isinstance(response, bytes) and response != b'error':
+                self._process_job_progress_ack(response)
+                
+        except Exception:
+            pass
+    
+    async def _send_job_progress_to_all_gates(self, job: JobProgress) -> None:
+        """
+        Send job progress to ALL healthy gates and process acks.
+        
+        Used for critical updates to ensure all gates receive the update.
+        """
+        gate_addrs = self._get_healthy_gate_tcp_addrs() or self._gate_addrs
+        
+        for gate_addr in gate_addrs:
+            try:
+                response = await self.send_tcp(
+                    gate_addr,
+                    "job_progress",
+                    job.dump(),
+                    timeout=2.0,
+                )
+                
+                # Process ack to update gate topology
+                if response and isinstance(response, bytes) and response != b'error':
+                    self._process_job_progress_ack(response)
+                    
+            except Exception:
+                pass
     
     def _get_state_snapshot(self) -> ManagerStateSnapshot:
         """Get a complete state snapshot."""
@@ -1206,6 +1490,10 @@ class ManagerServer(HealthAwareServer):
                     completion_event = self._workflow_completion_events.get(progress.workflow_id)
                     if completion_event:
                         completion_event.set()
+                
+                # Forward job progress to gates (if connected)
+                if self._known_gates or self._gate_addrs:
+                    self._task_runner.run(self._send_job_progress_to_gate, job)
             
             # Return ack with current manager topology for worker to update
             ack = WorkflowProgressAck(

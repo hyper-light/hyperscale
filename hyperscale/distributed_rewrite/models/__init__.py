@@ -21,7 +21,7 @@ from .distributed import (
     WorkerState as WorkerState,
     DatacenterHealth as DatacenterHealth,
     UpdateTier as UpdateTier,
-    # Node identity
+    # Node identity (Worker <-> Manager)
     NodeInfo as NodeInfo,
     ManagerInfo as ManagerInfo,
     RegistrationResponse as RegistrationResponse,
@@ -29,6 +29,11 @@ from .distributed import (
     WorkerRegistration as WorkerRegistration,
     WorkerHeartbeat as WorkerHeartbeat,
     ManagerHeartbeat as ManagerHeartbeat,
+    # Node identity (Manager <-> Gate)
+    GateInfo as GateInfo,
+    GateHeartbeat as GateHeartbeat,
+    ManagerRegistrationResponse as ManagerRegistrationResponse,
+    JobProgressAck as JobProgressAck,
     # Job submission
     JobSubmission as JobSubmission,
     JobAck as JobAck,

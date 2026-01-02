@@ -31,6 +31,10 @@ from hyperscale.distributed_rewrite.swim import HealthAwareServer, GateStateEmbe
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
+    GateInfo,
+    GateHeartbeat,
+    ManagerRegistrationResponse,
+    JobProgressAck,
     ManagerHeartbeat,
     JobSubmission,
     JobAck,
@@ -115,6 +119,10 @@ class GateServer(HealthAwareServer):
         # Track active gate peers (removed when SWIM marks as dead)
         self._active_gate_peers: set[tuple[str, int]] = set(self._gate_peers)
         
+        # Track gate peer info from GateHeartbeat (proper node_ids, leadership, etc)
+        # Maps UDP addr -> GateHeartbeat for peers we've heard from via SWIM
+        self._gate_peer_info: dict[tuple[str, int], GateHeartbeat] = {}
+        
         # Known datacenters and their status (from TCP updates)
         self._datacenter_status: dict[str, ManagerHeartbeat] = {}  # dc -> last status
         self._datacenter_last_status: dict[str, float] = {}  # dc -> timestamp
@@ -148,7 +156,15 @@ class GateServer(HealthAwareServer):
             get_term=lambda: self._leader_election.state.current_term,
             get_state_version=lambda: self._state_version,
             get_active_jobs=lambda: len(self._jobs),
+            get_active_datacenters=lambda: len([
+                dc for dc, status in self._datacenter_status.items()
+                if time.monotonic() - self._datacenter_last_status.get(dc, 0) < 60.0
+            ]),
+            get_manager_count=lambda: sum(
+                len(managers) for managers in self._datacenter_managers.values()
+            ),
             on_manager_heartbeat=self._handle_embedded_manager_heartbeat,
+            on_gate_heartbeat=self._handle_gate_peer_heartbeat,
         ))
         
         # Register node death and join callbacks for failure/recovery handling
@@ -287,6 +303,94 @@ class GateServer(HealthAwareServer):
         self._task_runner.run(
             self._versioned_clock.update_entity, dc_key, heartbeat.version
         )
+    
+    def _handle_gate_peer_heartbeat(
+        self,
+        heartbeat: GateHeartbeat,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """
+        Handle GateHeartbeat received from peer gates via SWIM.
+        
+        This enables:
+        1. Proper node_id tracking for peers (instead of synthetic IDs)
+        2. Leader tracking across the gate cluster
+        3. Version-based stale update rejection
+        """
+        # Check if update is stale using versioned clock
+        if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
+            return
+        
+        # Store peer info keyed by UDP address
+        self._gate_peer_info[source_addr] = heartbeat
+        
+        # Update version tracking
+        self._task_runner.run(
+            self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
+        )
+    
+    def _get_healthy_gates(self) -> list[GateInfo]:
+        """
+        Build list of all known healthy gates for manager discovery.
+        
+        Includes self and all active peer gates. Managers use this
+        to maintain redundant communication channels.
+        
+        Uses real node_ids from GateHeartbeat when available (received via SWIM),
+        falling back to synthetic IDs for peers we haven't heard from yet.
+        """
+        gates: list[GateInfo] = []
+        
+        # Add self
+        gates.append(GateInfo(
+            node_id=self._node_id.full,
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
+            udp_host=self._host,
+            udp_port=self._udp_port,
+            datacenter=self._node_id.datacenter,
+            is_leader=self.is_leader(),
+        ))
+        
+        # Add active peer gates
+        for tcp_addr in self._active_gate_peers:
+            # Find UDP addr for this peer
+            udp_addr: tuple[str, int] | None = None
+            for udp, tcp in self._gate_udp_to_tcp.items():
+                if tcp == tcp_addr:
+                    udp_addr = udp
+                    break
+            
+            if udp_addr is None:
+                udp_addr = tcp_addr  # Fallback
+            
+            # Check if we have real peer info from GateHeartbeat
+            peer_heartbeat = self._gate_peer_info.get(udp_addr)
+            
+            if peer_heartbeat:
+                # Use real info from SWIM heartbeat
+                gates.append(GateInfo(
+                    node_id=peer_heartbeat.node_id,
+                    tcp_host=tcp_addr[0],
+                    tcp_port=tcp_addr[1],
+                    udp_host=udp_addr[0],
+                    udp_port=udp_addr[1],
+                    datacenter=peer_heartbeat.datacenter,
+                    is_leader=peer_heartbeat.is_leader,
+                ))
+            else:
+                # Fallback to synthetic ID (peer hasn't sent heartbeat yet)
+                gates.append(GateInfo(
+                    node_id=f"gate-{tcp_addr[0]}:{tcp_addr[1]}",
+                    tcp_host=tcp_addr[0],
+                    tcp_port=tcp_addr[1],
+                    udp_host=udp_addr[0],
+                    udp_port=udp_addr[1],
+                    datacenter=self._node_id.datacenter,
+                    is_leader=False,
+                ))
+        
+        return gates
     
     @property
     def node_info(self) -> NodeInfo:
@@ -1141,6 +1245,61 @@ class GateServer(HealthAwareServer):
             await self.handle_exception(e, "receive_manager_status_update")
             return b'error'
     
+    @tcp.receive()
+    async def receive_manager_register(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle manager registration.
+        
+        Managers register with gates at startup to discover all healthy gates.
+        This is analogous to Workers registering with Managers.
+        """
+        try:
+            heartbeat = ManagerHeartbeat.load(data)
+            
+            # Update DC status tracking
+            self._datacenter_status[heartbeat.datacenter] = heartbeat
+            self._datacenter_last_status[heartbeat.datacenter] = time.monotonic()
+            
+            # Add manager address to datacenter managers (if not already tracked)
+            dc = heartbeat.datacenter
+            if dc not in self._datacenter_managers:
+                self._datacenter_managers[dc] = []
+            if addr not in self._datacenter_managers[dc]:
+                self._datacenter_managers[dc].append(addr)
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Manager registered: {heartbeat.node_id} from DC {dc} ({heartbeat.worker_count} workers)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            
+            # Return ack with all healthy gates
+            response = ManagerRegistrationResponse(
+                accepted=True,
+                gate_id=self._node_id.full,
+                healthy_gates=self._get_healthy_gates(),
+            )
+            return response.dump()
+            
+        except Exception as e:
+            await self.handle_exception(e, "receive_manager_register")
+            response = ManagerRegistrationResponse(
+                accepted=False,
+                gate_id=self._node_id.full,
+                healthy_gates=[],
+                error=str(e),
+            )
+            return response.dump()
+    
     # =========================================================================
     # TCP Handlers - Job Submission (from Client)
     # =========================================================================
@@ -1421,7 +1580,13 @@ class GateServer(HealthAwareServer):
                 
                 self._increment_version()
             
-            return b'ok'
+            # Return ack with current gate topology for manager to update
+            ack = JobProgressAck(
+                gate_id=self._node_id.full,
+                is_leader=self.is_leader(),
+                healthy_gates=self._get_healthy_gates(),
+            )
+            return ack.dump()
             
         except Exception as e:
             await self.handle_exception(e, "receive_job_progress")
