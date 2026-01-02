@@ -137,6 +137,14 @@ class ManagerServer(HealthAwareServer):
         self._healthy_gate_ids: set[str] = set()  # Currently healthy gate node_ids
         self._primary_gate_id: str | None = None  # Primary gate (prefer leader)
         
+        # Circuit breaker for gate communication
+        # Tracks failures and implements fail-fast when gates are unreachable
+        self._gate_circuit = ErrorStats(
+            error_threshold=3,      # Open after 3 failures
+            window_seconds=30.0,    # Within 30 second window
+            half_open_after=10.0,   # Allow retry after 10 seconds
+        )
+        
         # Backwards compat: keep for initial iteration through seed addresses
         self._gate_addrs = gate_addrs or []  # TCP
         self._current_gate: tuple[str, int] | None = None
@@ -1226,6 +1234,29 @@ class ManagerServer(HealthAwareServer):
         await self.graceful_shutdown()
         
         await super().stop()
+    
+    def _is_gate_circuit_open(self) -> bool:
+        """Check if gate circuit breaker is open (fail-fast mode)."""
+        return self._gate_circuit.circuit_state == CircuitState.OPEN
+    
+    def get_gate_circuit_status(self) -> dict:
+        """
+        Get current gate circuit breaker status.
+        
+        Returns a dict with:
+        - circuit_state: Current state (CLOSED, OPEN, HALF_OPEN)
+        - error_count: Recent error count
+        - error_rate: Error rate over window
+        - healthy_gates: Count of healthy gates
+        - primary_gate: Current primary gate ID
+        """
+        return {
+            "circuit_state": self._gate_circuit.circuit_state.name,
+            "error_count": self._gate_circuit.error_count,
+            "error_rate": self._gate_circuit.error_rate,
+            "healthy_gates": len(self._healthy_gate_ids),
+            "primary_gate": self._primary_gate_id,
+        }
     
     def _build_manager_heartbeat(self) -> ManagerHeartbeat:
         """Build a ManagerHeartbeat with current state."""

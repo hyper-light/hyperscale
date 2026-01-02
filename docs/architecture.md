@@ -3514,7 +3514,7 @@ Client push notifications allow Gates and Managers to push job status updates di
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                   Push Notification Flow                      │
+│                   Push Notification Flow                     │
 ├──────────────────────────────────────────────────────────────┤
 │  1. Client starts a TCP listener                             │
 │  2. Client → Gate/Manager: JobSubmission(callback_addr=...)  │

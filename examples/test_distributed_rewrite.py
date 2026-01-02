@@ -4425,6 +4425,58 @@ test_manager_dispatch_uses_backoff()
 
 
 # =============================================================================
+# Manager ↔ Gate Resilience Tests
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("MANAGER ↔ GATE RESILIENCE TESTS")
+print("=" * 70 + "\n")
+
+
+@test("Manager: has _gate_circuit")
+def test_manager_has_gate_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    assert "_gate_circuit" in source, \
+        "ManagerServer should have _gate_circuit ErrorStats"
+    assert "ErrorStats(" in source, \
+        "ManagerServer should create ErrorStats for gate circuit breaker"
+
+
+@test("Manager: has _is_gate_circuit_open method")
+def test_manager_has_gate_circuit_open():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_is_gate_circuit_open'), \
+        "ManagerServer should have _is_gate_circuit_open method"
+
+
+@test("Manager: has get_gate_circuit_status method")
+def test_manager_has_gate_circuit_status():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, 'get_gate_circuit_status'), \
+        "ManagerServer should have get_gate_circuit_status method"
+    
+    source = inspect.getsource(ManagerServer.get_gate_circuit_status)
+    
+    assert "circuit_state" in source, \
+        "get_gate_circuit_status should return circuit state"
+    assert "primary_gate" in source, \
+        "get_gate_circuit_status should return primary gate"
+
+
+# Run Manager Gate Circuit tests
+test_manager_has_gate_circuit()
+test_manager_has_gate_circuit_open()
+test_manager_has_gate_circuit_status()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 
