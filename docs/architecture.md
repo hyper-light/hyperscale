@@ -384,6 +384,375 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### Worker Core Allocation & Execution Cycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      WORKER NODE - CORE ALLOCATION                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Physical/Virtual Cores:                                                     │
+│  ┌───┬───┬───┬───┬───┬───┬───┬───┐                                          │
+│  │ 0 │ 1 │ 2 │ 3 │ 4 │ 5 │ 6 │ 7 │  (8-core worker example)                 │
+│  └───┴───┴───┴───┴───┴───┴───┴───┘                                          │
+│    │   │   │       │   │   │                                                 │
+│    │   └───┴───────┘   └───┴──────► wf-456 (3 cores: 1,2,5,6)               │
+│    │                                                                         │
+│    └──────────────────────────────► wf-123 (1 core: 0)                      │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                     _core_assignments                                  │  │
+│  │  {0: "wf-123", 1: "wf-456", 2: "wf-456", 3: None,                    │  │
+│  │   4: None, 5: "wf-456", 6: "wf-456", 7: None}                        │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                     _workflow_cores                                    │  │
+│  │  {"wf-123": [0], "wf-456": [1, 2, 5, 6]}                             │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  Allocation Algorithm (_allocate_cores):                                     │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  1. Scan _core_assignments for cores where value is None              │  │
+│  │  2. Take first N available cores (requested vus)                      │  │
+│  │  3. Mark cores as assigned to workflow_id                             │  │
+│  │  4. Add to _workflow_cores mapping                                    │  │
+│  │  5. Return list of allocated core indices                             │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  Deallocation (_free_cores):                                                 │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  1. Look up cores from _workflow_cores[workflow_id]                   │  │
+│  │  2. Set each core to None in _core_assignments                        │  │
+│  │  3. Remove workflow_id from _workflow_cores                           │  │
+│  │  4. Cancel running task via TaskRunner token                          │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Worker Execution Cycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      WORKER REQUEST/EXECUTION CYCLE                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  INBOUND: receive_workflow_dispatch (TCP)                            │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  1. Deserialize WorkflowDispatch                                     │    │
+│  │  2. Check capacity: available_cores >= vus                           │    │
+│  │  3. If insufficient → return WorkflowDispatchAck(accepted=False)     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  4. _allocate_cores(workflow_id, vus) → [core_indices]               │    │
+│  │  5. Deserialize Workflow class from cloudpickle                      │    │
+│  │  6. Create WorkflowProgress tracker                                  │    │
+│  │  7. Store in _active_workflows[workflow_id]                          │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  8. Submit to TaskRunner:                                            │    │
+│  │     token = _task_runner.run(_execute_workflow, workflow, ...)       │    │
+│  │  9. Store token: _workflow_tokens[workflow_id] = token               │    │
+│  │ 10. Return WorkflowDispatchAck(accepted=True, cores_assigned=N)      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              │                                               │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                    WORKFLOW EXECUTION LOOP                           │    │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │    │
+│  │  │  while not cancel_event.is_set():                           │    │    │
+│  │  │      execute_action()                                        │    │    │
+│  │  │      update_progress()                                       │    │    │
+│  │  │                                                              │    │    │
+│  │  │      # Throttled TCP progress updates (every 100ms)         │    │    │
+│  │  │      if int(elapsed * 10) % 10 == 0:                        │    │    │
+│  │  │          send_progress_to_manager()                         │    │    │
+│  │  └─────────────────────────────────────────────────────────────┘    │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                              │                                               │
+│                    ┌─────────┴─────────┐                                    │
+│                    ▼                   ▼                                    │
+│  ┌─────────────────────┐   ┌─────────────────────┐                          │
+│  │  COMPLETION         │   │  CANCELLATION       │                          │
+│  │  ───────────        │   │  ────────────       │                          │
+│  │  1. Update status   │   │  1. cancel_event    │                          │
+│  │  2. Send final      │   │     .set()          │                          │
+│  │     progress        │   │  2. TaskRunner      │                          │
+│  │  3. _free_cores()   │   │     .cancel(token)  │                          │
+│  │  4. Cleanup maps    │   │  3. _free_cores()   │                          │
+│  └─────────────────────┘   └─────────────────────┘                          │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  PARALLEL: SWIM UDP Probe Response                                   │    │
+│  │  • Embed WorkerHeartbeat in ack (via StateEmbedder)                 │    │
+│  │  • Fields: node_id, state, available_cores, queue_depth,            │    │
+│  │           cpu_percent, memory_percent, version, active_workflows    │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Manager Request Cycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        MANAGER REQUEST CYCLE                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ INBOUND: receive_job_submission (TCP from Gate or Client)              │ │
+│  │          JobSubmission { job_id, workflows (pickled), vus, timeout }   │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                     │                                        │
+│                                     ▼                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. Leader Check: if not self.is_leader() → forward to leader          │ │
+│  │ 2. Deserialize workflows list from cloudpickle                        │ │
+│  │ 3. Create JobProgress tracker for job_id                              │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                     │                                        │
+│           ┌─────────────────────────┴─────────────────────────┐             │
+│           │            FOR EACH WORKFLOW IN JOB:              │             │
+│           ▼                                                    │             │
+│  ┌─────────────────────────────────────────────────────────┐  │             │
+│  │  WORKER SELECTION (crypto-random for security)          │  │             │
+│  │  ───────────────────────────────────────────────────────│  │             │
+│  │  1. Get all registered workers from _workers            │  │             │
+│  │  2. Filter by health: HEALTHY or DEGRADED (not DRAINING)│  │             │
+│  │  3. Filter by capacity: available_cores >= vus          │  │             │
+│  │  4. Apply backpressure: queue_depth < soft_limit        │  │             │
+│  │  5. Use secrets.SystemRandom().choice() for selection   │  │             │
+│  └─────────────────────────────────────────────────────────┘  │             │
+│                         │                                      │             │
+│                         ▼                                      │             │
+│  ┌─────────────────────────────────────────────────────────┐  │             │
+│  │  QUORUM CONFIRMATION (if manager cluster size > 1)      │  │             │
+│  │  ───────────────────────────────────────────────────────│  │             │
+│  │  1. Create ProvisionRequest { workflow_id, worker, ... }│  │             │
+│  │  2. Send to all peer managers                           │  │             │
+│  │  3. Wait for quorum: (n // 2) + 1 confirmations         │  │             │
+│  │  4. Timeout → reject provisioning                       │  │             │
+│  │  5. Quorum achieved → proceed to commit                 │  │             │
+│  └─────────────────────────────────────────────────────────┘  │             │
+│                         │                                      │             │
+│                         ▼                                      │             │
+│  ┌─────────────────────────────────────────────────────────┐  │             │
+│  │  DISPATCH TO WORKER (TCP)                               │  │             │
+│  │  ───────────────────────────────────────────────────────│  │             │
+│  │  1. Create WorkflowDispatch { fence_token, ... }        │  │             │
+│  │  2. Store in _workflow_assignments[workflow_id]         │  │             │
+│  │  3. Store pickled bytes in _workflow_retries for retry  │  │             │
+│  │  4. Send via send_tcp(worker_addr, "dispatch", data)    │  │             │
+│  │  5. Wait for WorkflowDispatchAck                        │  │             │
+│  └─────────────────────────────────────────────────────────┘  │             │
+│                         │                                      │             │
+│           └─────────────┴──────────────────────────────────────┘             │
+│                         │                                                    │
+│                         ▼                                                    │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ OUTBOUND: JobAck { job_id, accepted, workflows_dispatched }            │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════│
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ INBOUND: receive_workflow_progress (TCP from Worker)                   │ │
+│  │          WorkflowProgress { job_id, workflow_id, status, stats... }    │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                     │                                        │
+│                                     ▼                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. Stale Check: _versioned_clock.is_entity_stale()                    │ │
+│  │ 2. Update _jobs[job_id] with workflow progress                        │ │
+│  │ 3. Check status:                                                       │ │
+│  │    • COMPLETED → _cleanup_workflow(), cleanup retry info              │ │
+│  │    • FAILED    → _handle_workflow_failure() (retry or mark failed)    │ │
+│  │ 4. Aggregate job-level stats                                          │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════│
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ PARALLEL: SWIM UDP Operations                                          │ │
+│  │                                                                         │ │
+│  │ 1. Receive WorkerHeartbeat (via StateEmbedder from worker probes)     │ │
+│  │    → Update _worker_status[node_id]                                    │ │
+│  │    → Passive capacity/health monitoring                                │ │
+│  │                                                                         │ │
+│  │ 2. Embed ManagerHeartbeat in probe acks (to Gates)                    │ │
+│  │    → Fields: node_id, datacenter, is_leader, term, job/workflow counts│ │
+│  │                                                                         │ │
+│  │ 3. Node death callback → _on_node_dead(worker_addr)                   │ │
+│  │    → Trigger workflow retry on different workers                       │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Gate Request Cycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          GATE REQUEST CYCLE                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ INBOUND: receive_job_submission (TCP from Client)                      │ │
+│  │          JobSubmission { job_id, workflows, vus, datacenter_count }    │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                     │                                        │
+│                                     ▼                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. Leader Check: if not self.is_leader() → forward to leader          │ │
+│  │ 2. Create GlobalJobStatus tracker                                      │ │
+│  │ 3. Select target datacenters:                                          │ │
+│  │    • If datacenters specified → use those                              │ │
+│  │    • Else → select N available DCs with healthy managers              │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                     │                                        │
+│           ┌─────────────────────────┴─────────────────────────┐             │
+│           │            FOR EACH TARGET DATACENTER:            │             │
+│           ▼                                                    │             │
+│  ┌─────────────────────────────────────────────────────────┐  │             │
+│  │  LEASE CREATION (at-most-once semantics)                │  │             │
+│  │  ───────────────────────────────────────────────────────│  │             │
+│  │  1. Generate fence_token (monotonic, derived from term) │  │             │
+│  │  2. Create DatacenterLease {                            │  │             │
+│  │       job_id, datacenter, lease_holder: self.node_id,  │  │             │
+│  │       fence_token, expires_at: now + timeout           │  │             │
+│  │     }                                                   │  │             │
+│  │  3. Store in _leases[(job_id, datacenter)]             │  │             │
+│  └─────────────────────────────────────────────────────────┘  │             │
+│                         │                                      │             │
+│                         ▼                                      │             │
+│  ┌─────────────────────────────────────────────────────────┐  │             │
+│  │  DISPATCH TO MANAGER (TCP)                              │  │             │
+│  │  ───────────────────────────────────────────────────────│  │             │
+│  │  1. Find leader manager for datacenter                  │  │             │
+│  │     (from _datacenter_status ManagerHeartbeats)         │  │             │
+│  │  2. Send JobSubmission with fence_token                 │  │             │
+│  │  3. Wait for JobAck                                     │  │             │
+│  │  4. If failed → mark DC as failed, continue to others   │  │             │
+│  └─────────────────────────────────────────────────────────┘  │             │
+│                         │                                      │             │
+│           └─────────────┴──────────────────────────────────────┘             │
+│                         │                                                    │
+│                         ▼                                                    │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ OUTBOUND: JobAck { job_id, accepted, datacenters_dispatched }          │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════│
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ PARALLEL: Status Aggregation                                           │ │
+│  │                                                                         │ │
+│  │ 1. Receive ManagerHeartbeat (via StateEmbedder from SWIM probes)      │ │
+│  │    → Update _datacenter_status[datacenter]                             │ │
+│  │    → Passive monitoring of DC health                                   │ │
+│  │                                                                         │ │
+│  │ 2. Receive JobProgress (TCP from Managers)                            │ │
+│  │    → Update _jobs[job_id].datacenters[dc]                              │ │
+│  │    → Aggregate totals: completed, failed, rate                         │ │
+│  │                                                                         │ │
+│  │ 3. Lease Management (_lease_cleanup_loop via TaskRunner)              │ │
+│  │    → Check expired leases every cleanup_interval                       │ │
+│  │    → Expired lease → mark DC as FAILED for that job                   │ │
+│  │    → No retry (explicit failure to client)                             │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════│
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ CLIENT STATUS QUERY: get_job_status(job_id) → GlobalJobStatus         │ │
+│  │                                                                         │ │
+│  │ GlobalJobStatus {                                                       │ │
+│  │   job_id: "job-123"                                                    │ │
+│  │   status: RUNNING                                                       │ │
+│  │   datacenters: [                                                        │ │
+│  │     JobProgress { dc: "us-east-1", completed: 10000, rate: 5000/s },  │ │
+│  │     JobProgress { dc: "eu-west-1", completed: 8500, rate: 4200/s },   │ │
+│  │   ]                                                                     │ │
+│  │   total_completed: 18500                                                │ │
+│  │   overall_rate: 9200/s                                                  │ │
+│  │   elapsed_seconds: 42.5                                                 │ │
+│  │   completed_datacenters: 0                                              │ │
+│  │   failed_datacenters: 0                                                 │ │
+│  │ }                                                                       │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete Request Flow (End-to-End)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        END-TO-END JOB EXECUTION                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  CLIENT                                                                      │
+│    │                                                                         │
+│    │ ① JobSubmission (workflows, vus, dc_count)                             │
+│    ▼                                                                         │
+│  GATE (Leader)                                                               │
+│    │                                                                         │
+│    ├─► Create leases for target DCs                                         │
+│    │                                                                         │
+│    │ ② JobSubmission + fence_token (per DC)                                 │
+│    ├──────────────────┬──────────────────┐                                  │
+│    ▼                  ▼                  ▼                                  │
+│  MANAGER-A          MANAGER-B          MANAGER-C     (DC leaders)           │
+│    │                  │                  │                                   │
+│    ├─► Quorum        ├─► Quorum        ├─► Quorum                          │
+│    │   confirm       │   confirm       │   confirm                          │
+│    │                  │                  │                                   │
+│    │ ③ WorkflowDispatch (per workflow)                                      │
+│    ├───┬───┬───┐     ├───┬───┬───┐     ├───┬───┬───┐                       │
+│    ▼   ▼   ▼   ▼     ▼   ▼   ▼   ▼     ▼   ▼   ▼   ▼                       │
+│   W1  W2  W3  W4    W5  W6  W7  W8    W9 W10 W11 W12  (Workers)             │
+│    │   │   │   │     │   │   │   │     │   │   │   │                        │
+│    │   │   │   │     │   │   │   │     │   │   │   │                        │
+│    ├───┴───┴───┘     ├───┴───┴───┘     ├───┴───┴───┘                        │
+│    │                  │                  │                                   │
+│    │ ④ WorkflowProgress (throttled TCP, every 100ms)                        │
+│    ▼                  ▼                  ▼                                  │
+│  MANAGER-A          MANAGER-B          MANAGER-C                            │
+│    │                  │                  │                                   │
+│    │ ⑤ JobProgress (aggregated)                                             │
+│    ├──────────────────┴──────────────────┘                                  │
+│    ▼                                                                         │
+│  GATE (Leader)                                                               │
+│    │                                                                         │
+│    │ ⑥ GlobalJobStatus (aggregated across DCs)                              │
+│    ▼                                                                         │
+│  CLIENT                                                                      │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════│
+│                                                                              │
+│  PARALLEL SWIM UDP FLOW (Healthcheck + Passive Discovery):                  │
+│                                                                              │
+│      Workers ◄──probe──► Managers ◄──probe──► Gates                         │
+│              └─ack+HB─┘            └─ack+HB─┘                               │
+│                                                                              │
+│      WorkerHeartbeat               ManagerHeartbeat                          │
+│      • available_cores             • datacenter                              │
+│      • queue_depth                 • is_leader                               │
+│      • cpu/mem percent             • job/workflow counts                     │
+│      • active_workflows            • worker_count                            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 ## Data Flow
