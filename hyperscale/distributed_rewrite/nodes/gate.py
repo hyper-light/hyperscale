@@ -65,7 +65,7 @@ from hyperscale.distributed_rewrite.swim.core import (
     CircuitState,
 )
 from hyperscale.distributed_rewrite.env import Env
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError
 
 
 class GateServer(HealthAwareServer):
@@ -783,19 +783,27 @@ class GateServer(HealthAwareServer):
         self,
         count: int,
         preferred: list[str] | None = None,
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], str]:
         """
         Select datacenters with fallback list for resilient routing.
         
-        Priority order: HEALTHY > BUSY > DEGRADED
-        Only UNHEALTHY DCs are excluded entirely.
+        Routing Rules (evaluated in order):
+        - UNHEALTHY: Fallback to non-UNHEALTHY DC, else fail job with error
+        - DEGRADED: Fallback to non-DEGRADED DC, else queue with warning  
+        - BUSY: Fallback to HEALTHY DC, else queue
+        - HEALTHY: Enqueue (preferred)
         
         Args:
             count: Number of primary DCs to select
             preferred: Optional list of preferred DCs
             
         Returns:
-            (primary_dcs, fallback_dcs)
+            (primary_dcs, fallback_dcs, worst_health)
+            worst_health indicates the worst state we had to accept:
+            - "healthy": All selected DCs are healthy
+            - "busy": Had to accept BUSY DCs (no HEALTHY available)
+            - "degraded": Had to accept DEGRADED DCs (no HEALTHY/BUSY available)
+            - "unhealthy": All DCs are unhealthy (job should fail)
         """
         # Classify all DCs
         dc_health = self._get_all_datacenter_health()
@@ -804,6 +812,7 @@ class GateServer(HealthAwareServer):
         healthy = []
         busy = []
         degraded = []
+        unhealthy_count = 0
         
         for dc_id, status in dc_health.items():
             if status.health == DatacenterHealth.HEALTHY.value:
@@ -812,7 +821,8 @@ class GateServer(HealthAwareServer):
                 busy.append((dc_id, status))
             elif status.health == DatacenterHealth.DEGRADED.value:
                 degraded.append((dc_id, status))
-            # UNHEALTHY DCs are excluded
+            else:  # UNHEALTHY
+                unhealthy_count += 1
         
         # Sort healthy by capacity (highest first)
         healthy.sort(key=lambda x: x[1].available_capacity, reverse=True)
@@ -828,19 +838,29 @@ class GateServer(HealthAwareServer):
             other_healthy = [dc for dc in healthy_ids if dc not in preferred]
             healthy_ids = preferred_healthy + other_healthy
         
+        # Determine worst health we need to accept
+        if healthy_ids:
+            worst_health = "healthy"
+        elif busy_ids:
+            worst_health = "busy"
+        elif degraded_ids:
+            worst_health = "degraded"
+        else:
+            worst_health = "unhealthy"
+        
         # Build selection: HEALTHY first, then BUSY, then DEGRADED
         all_usable = healthy_ids + busy_ids + degraded_ids
         
         if len(all_usable) == 0:
             # All DCs are UNHEALTHY - will cause job failure
-            return ([], [])
+            return ([], [], "unhealthy")
         
         # Primary = first `count` DCs
         primary = all_usable[:count]
         # Fallback = remaining usable DCs
         fallback = all_usable[count:]
         
-        return (primary, fallback)
+        return (primary, fallback, worst_health)
     
     def _select_datacenters(
         self,
@@ -853,7 +873,7 @@ class GateServer(HealthAwareServer):
         Uses cryptographically secure random selection for HEALTHY DCs,
         with fallback to BUSY and DEGRADED DCs.
         """
-        primary, _ = self._select_datacenters_with_fallback(count, preferred)
+        primary, _, _ = self._select_datacenters_with_fallback(count, preferred)
         return primary
     
     async def _try_dispatch_to_manager(
@@ -2051,9 +2071,11 @@ class GateServer(HealthAwareServer):
         Uses _select_datacenters_with_fallback to get primary and fallback DCs,
         then uses _dispatch_job_with_fallback for resilient dispatch.
         
-        Key behavior (per AD-17):
-        - Only fails if ALL DCs are UNHEALTHY
-        - BUSY DCs are acceptable (job will be queued)
+        Routing Rules:
+        - UNHEALTHY: Fallback to non-UNHEALTHY DC, else fail job with error
+        - DEGRADED: Fallback to non-DEGRADED DC, else queue with warning
+        - BUSY: Fallback to HEALTHY DC, else queue  
+        - HEALTHY: Enqueue (preferred)
         """
         job = self._jobs.get(submission.job_id)
         if not job:
@@ -2063,19 +2085,20 @@ class GateServer(HealthAwareServer):
         self._increment_version()
         
         # Get primary and fallback DCs based on health classification
-        primary_dcs, fallback_dcs = self._select_datacenters_with_fallback(
+        primary_dcs, fallback_dcs, worst_health = self._select_datacenters_with_fallback(
             len(target_dcs),
             target_dcs if target_dcs else None,
         )
         
-        # If we have no usable DCs at all, fail immediately
-        if not primary_dcs and not fallback_dcs:
+        # If ALL DCs are UNHEALTHY, fail immediately
+        if worst_health == "unhealthy":
             job.status = JobStatus.FAILED.value
             job.failed_datacenters = len(target_dcs)
+            self._quorum_circuit.record_error()
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(
-                    message=f"Job {submission.job_id}: All datacenters are UNHEALTHY",
+                    message=f"Job {submission.job_id}: All datacenters are UNHEALTHY - job failed",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
@@ -2083,6 +2106,30 @@ class GateServer(HealthAwareServer):
             )
             self._increment_version()
             return
+        
+        # Log warning if we had to accept DEGRADED DCs
+        if worst_health == "degraded":
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Job {submission.job_id}: No HEALTHY or BUSY DCs available, "
+                            f"routing to DEGRADED DCs: {primary_dcs}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        elif worst_health == "busy":
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Job {submission.job_id}: No HEALTHY DCs available, "
+                            f"routing to BUSY DCs: {primary_dcs}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
         
         # Dispatch with fallback support
         successful_dcs, failed_dcs = await self._dispatch_job_with_fallback(

@@ -390,30 +390,43 @@ class JobStatsCRDT:
 
 **Rationale**:
 - BUSY ≠ UNHEALTHY (critical distinction)
-- BUSY = transient, will clear when workflows complete → accept job (queued)
-- UNHEALTHY = structural problem, requires intervention → try fallback
-- Only fail job if ALL datacenters are UNHEALTHY, not just busy
+- BUSY = transient, will clear when workflows complete
+- DEGRADED = structural problem, reduced capacity but operational
+- UNHEALTHY = severe problem, requires intervention
+- Routing should actively seek healthier DCs before accepting degraded states
 
-**States**:
-| State | Definition | Accept Jobs? |
-|-------|------------|--------------|
-| HEALTHY | Managers responding, workers available, capacity exists | YES |
-| BUSY | Managers responding, workers available, no immediate capacity | YES (queued) |
-| DEGRADED | Some managers responding, reduced capacity | YES (with warning) |
-| UNHEALTHY | No managers responding OR all workers down | NO - try fallback |
+**States** (evaluated in order):
+
+| State | Definition | Condition |
+|-------|------------|-----------|
+| UNHEALTHY | No managers responding OR no workers registered | `alive_managers == 0` OR `worker_count == 0` |
+| DEGRADED | Majority of workers unhealthy OR majority of managers unhealthy | `healthy_workers < worker_count // 2 + 1` OR `alive_managers < total_managers // 2 + 1` |
+| BUSY | Not degraded AND no available capacity | NOT degraded AND `available_cores == 0` |
+| HEALTHY | Not degraded AND capacity available | NOT degraded AND `available_cores > 0` |
+
+**Key Metrics from ManagerHeartbeat**:
+- `worker_count`: Total registered workers
+- `healthy_worker_count`: Workers responding to SWIM probes
+- `available_cores`: Available cores from healthy workers only
+- `total_cores`: Total cores across all registered workers
 
 **Implementation**:
 ```python
 class DatacenterHealth(Enum):
-    HEALTHY = "healthy"
-    BUSY = "busy"
-    DEGRADED = "degraded"
-    UNHEALTHY = "unhealthy"
+    HEALTHY = "healthy"      # Capacity available, all systems operational
+    BUSY = "busy"            # No capacity but structurally healthy (transient)
+    DEGRADED = "degraded"    # Majority of workers/managers unhealthy
+    UNHEALTHY = "unhealthy"  # No managers OR no workers
 
 def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
-    # Check manager liveness via SWIM
-    # Check worker availability from ManagerHeartbeat
-    # Check capacity from available_cores
+    # 1. Check manager liveness via SWIM
+    # 2. If alive_managers == 0 → UNHEALTHY
+    # 3. If no workers registered → UNHEALTHY
+    # 4. Check majority health:
+    #    - healthy_workers < worker_quorum → DEGRADED
+    #    - alive_managers < manager_quorum → DEGRADED
+    # 5. If not degraded and available_cores == 0 → BUSY
+    # 6. If not degraded and available_cores > 0 → HEALTHY
 ```
 
 ### AD-17: Smart Dispatch with Fallback Chain
@@ -423,19 +436,31 @@ def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
 **Rationale**:
 - Single DC failure shouldn't fail entire job
 - Automatic recovery without client involvement
+- Actively seek healthier DCs before accepting degraded states
 - Preserve user's datacenter preferences while enabling fallback
 
-**Priority Order**: HEALTHY > BUSY > DEGRADED > (fail only if ALL UNHEALTHY)
+**Routing Rules** (in order of preference):
+
+| Current DC State | Action |
+|------------------|--------|
+| HEALTHY | Enqueue job (preferred) |
+| BUSY | Fallback to HEALTHY DC if available, else queue |
+| DEGRADED | Fallback to HEALTHY or BUSY DC if available, else queue with warning |
+| UNHEALTHY | Fallback to any non-UNHEALTHY DC, else **fail job with error** |
+
+**Selection Priority**: HEALTHY > BUSY > DEGRADED (UNHEALTHY excluded)
 
 **Flow**:
 1. Classify all DCs by health
-2. Select primary DCs (preferring HEALTHY with capacity)
-3. Build fallback list (remaining usable DCs)
-4. For each primary DC:
-   - If dispatch succeeds → done
-   - If DC is UNHEALTHY → try next fallback DC
-   - If DC is BUSY → accept (will be queued)
-5. Only fail job if ALL DCs are UNHEALTHY
+2. Bucket DCs: HEALTHY (sorted by capacity), BUSY, DEGRADED
+3. Determine `worst_health` we must accept
+4. Select primary DCs from best available bucket
+5. Build fallback list from remaining usable DCs
+6. Dispatch with appropriate logging:
+   - If `worst_health == "unhealthy"` → **fail job immediately**
+   - If `worst_health == "degraded"` → log warning, then queue
+   - If `worst_health == "busy"` → log info, then queue
+   - If `worst_health == "healthy"` → queue normally
 
 **Implementation**:
 ```python
@@ -443,14 +468,28 @@ def _select_datacenters_with_fallback(
     self,
     count: int,
     preferred: list[str] | None = None,
-) -> tuple[list[str], list[str]]:  # (primary_dcs, fallback_dcs)
+) -> tuple[list[str], list[str], str]:  # (primary_dcs, fallback_dcs, worst_health)
+    # worst_health: "healthy" | "busy" | "degraded" | "unhealthy"
 
-async def _dispatch_job_with_fallback(
+async def _dispatch_job_to_datacenters(
     self,
     submission: JobSubmission,
-    primary_dcs: list[str],
-    fallback_dcs: list[str],
-) -> tuple[list[str], list[str]]:  # (successful_dcs, failed_dcs)
+    target_dcs: list[str],
+) -> None:
+    primary_dcs, fallback_dcs, worst_health = self._select_datacenters_with_fallback(...)
+    
+    if worst_health == "unhealthy":
+        # Fail job - no usable DCs
+        job.status = JobStatus.FAILED
+        return
+    
+    if worst_health == "degraded":
+        log_warning("Routing to DEGRADED DCs")
+    elif worst_health == "busy":
+        log_info("Routing to BUSY DCs")
+    
+    # Dispatch with fallback support
+    await self._dispatch_job_with_fallback(submission, primary_dcs, fallback_dcs)
 ```
 
 ---
