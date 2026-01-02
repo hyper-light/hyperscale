@@ -787,32 +787,37 @@ class GateServer(HealthAwareServer):
         primary, _ = self._select_datacenters_with_fallback(count, preferred)
         return primary
     
-    async def _try_dispatch_to_dc(
+    async def _try_dispatch_to_manager(
         self,
-        job_id: str,
-        dc: str,
+        manager_addr: tuple[str, int],
         submission: JobSubmission,
+        max_retries: int = 2,
+        base_delay: float = 0.3,
     ) -> tuple[bool, str | None]:
         """
-        Try to dispatch job to a single datacenter.
+        Try to dispatch job to a single manager with retries.
         
-        Iterates through managers in the DC, skipping those with open circuits.
-        Records success/error for per-manager circuit breakers.
+        Uses retries with exponential backoff:
+        - Attempt 1: immediate
+        - Attempt 2: 0.3s delay
+        - Attempt 3: 0.6s delay
         
+        Args:
+            manager_addr: (host, port) of the manager
+            submission: Job submission to dispatch
+            max_retries: Maximum retry attempts (default 2)
+            base_delay: Base delay for exponential backoff (default 0.3s)
+            
         Returns:
             (success: bool, error: str | None)
-            - True if DC accepted (even if queued)
-            - False only if DC is UNHEALTHY (should try fallback)
         """
-        managers = self._datacenter_managers.get(dc, [])
+        # Check circuit breaker first
+        if self._is_manager_circuit_open(manager_addr):
+            return (False, "Circuit breaker is OPEN")
         
-        for manager_addr in managers:
-            # Skip managers with open circuits
-            if self._is_manager_circuit_open(manager_addr):
-                continue
-            
-            circuit = self._get_manager_circuit(manager_addr)
-            
+        circuit = self._get_manager_circuit(manager_addr)
+        
+        for attempt in range(max_retries + 1):
             try:
                 response = await self.send_tcp(
                     manager_addr,
@@ -833,15 +838,51 @@ class GateServer(HealthAwareServer):
                             # BUSY is still acceptable - job will be queued
                             circuit.record_success()
                             return (True, None)
-                    # Other errors = try next manager
+                    # Manager rejected - don't retry
                     circuit.record_error()
-                else:
-                    circuit.record_error()
+                    return (False, ack.error)
                     
-            except Exception:
-                # Connection error = manager might be down
-                circuit.record_error()
-                continue
+            except Exception as e:
+                # Connection error - retry
+                if attempt == max_retries:
+                    circuit.record_error()
+                    return (False, str(e))
+            
+            # Exponential backoff before retry
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+        
+        # Should not reach here
+        circuit.record_error()
+        return (False, "Unknown error")
+    
+    async def _try_dispatch_to_dc(
+        self,
+        job_id: str,
+        dc: str,
+        submission: JobSubmission,
+    ) -> tuple[bool, str | None]:
+        """
+        Try to dispatch job to a single datacenter.
+        
+        Iterates through managers in the DC, using _try_dispatch_to_manager
+        which handles retries and circuit breakers.
+        
+        Returns:
+            (success: bool, error: str | None)
+            - True if DC accepted (even if queued)
+            - False only if DC is UNHEALTHY (should try fallback)
+        """
+        managers = self._datacenter_managers.get(dc, [])
+        
+        for manager_addr in managers:
+            success, error = await self._try_dispatch_to_manager(
+                manager_addr, submission
+            )
+            if success:
+                return (True, None)
+            # Continue to next manager
         
         # All managers failed = DC is UNHEALTHY for this dispatch
         return (False, f"All managers in {dc} failed to accept job")

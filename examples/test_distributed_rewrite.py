@@ -2538,12 +2538,13 @@ def test_smart_dispatch_only_fail_if_all_unhealthy():
     import inspect
     from hyperscale.distributed_rewrite.nodes import GateServer
     
-    # Check _try_dispatch_to_dc handles BUSY correctly
-    try_dispatch_source = inspect.getsource(GateServer._try_dispatch_to_dc)
+    # Check _try_dispatch_to_manager handles BUSY correctly
+    # (this is where the actual dispatch logic lives now)
+    try_dispatch_source = inspect.getsource(GateServer._try_dispatch_to_manager)
     
     # Should treat "no capacity" / "busy" as acceptable
     assert 'no capacity' in try_dispatch_source.lower() or 'busy' in try_dispatch_source.lower(), \
-        "_try_dispatch_to_dc should treat BUSY as acceptable"
+        "_try_dispatch_to_manager should treat BUSY as acceptable"
     
     # Check _dispatch_job_to_datacenters only fails when ALL fail
     dispatch_source = inspect.getsource(GateServer._dispatch_job_to_datacenters)
@@ -4648,30 +4649,34 @@ def test_gate_has_all_manager_circuit_status():
         "GateServer should have get_all_manager_circuit_status method"
 
 
-@test("Gate: _try_dispatch_to_dc checks circuit")
-def test_gate_dispatch_checks_circuit():
+@test("Gate: _try_dispatch_to_dc uses retry helper")
+def test_gate_dispatch_uses_retry_helper():
     import inspect
     from hyperscale.distributed_rewrite.nodes import GateServer
     
     source = inspect.getsource(GateServer._try_dispatch_to_dc)
+    
+    # Now uses _try_dispatch_to_manager which handles circuits and retries
+    assert "_try_dispatch_to_manager" in source, \
+        "_try_dispatch_to_dc should use _try_dispatch_to_manager helper"
+
+
+@test("Gate: dispatch flow has circuit and retry support")
+def test_gate_dispatch_flow_has_circuit_retry():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    # Check _try_dispatch_to_manager has circuit and retry logic
+    source = inspect.getsource(GateServer._try_dispatch_to_manager)
     
     assert "_is_manager_circuit_open" in source, \
-        "_try_dispatch_to_dc should check circuit breaker"
-
-
-@test("Gate: _try_dispatch_to_dc uses circuit")
-def test_gate_dispatch_uses_circuit():
-    import inspect
-    from hyperscale.distributed_rewrite.nodes import GateServer
-    
-    source = inspect.getsource(GateServer._try_dispatch_to_dc)
-    
+        "_try_dispatch_to_manager should check circuit breaker"
     assert "_get_manager_circuit" in source, \
-        "_try_dispatch_to_dc should get circuit breaker"
+        "_try_dispatch_to_manager should get circuit breaker"
     assert "record_success" in source, \
-        "_try_dispatch_to_dc should record success"
+        "_try_dispatch_to_manager should record success"
     assert "record_error" in source, \
-        "_try_dispatch_to_dc should record error"
+        "_try_dispatch_to_manager should record error"
 
 
 # Run Gate Per-Manager Circuit Breaker tests
@@ -4680,8 +4685,98 @@ test_gate_has_get_manager_circuit()
 test_gate_has_is_manager_circuit_open()
 test_gate_has_manager_circuit_status()
 test_gate_has_all_manager_circuit_status()
-test_gate_dispatch_checks_circuit()
-test_gate_dispatch_uses_circuit()
+test_gate_dispatch_uses_retry_helper()
+test_gate_dispatch_flow_has_circuit_retry()
+
+
+# =============================================================================
+# Gate Dispatch Retry Tests
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("GATE DISPATCH RETRY TESTS")
+print("=" * 70 + "\n")
+
+
+@test("Gate: has _try_dispatch_to_manager method")
+def test_gate_has_dispatch_to_manager():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_try_dispatch_to_manager'), \
+        "GateServer should have _try_dispatch_to_manager method"
+
+
+@test("Gate: _try_dispatch_to_manager has retry parameters")
+def test_gate_dispatch_manager_has_retry_params():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    sig = inspect.signature(GateServer._try_dispatch_to_manager)
+    params = list(sig.parameters.keys())
+    
+    assert 'max_retries' in params, \
+        "_try_dispatch_to_manager should have max_retries parameter"
+    assert 'base_delay' in params, \
+        "_try_dispatch_to_manager should have base_delay parameter"
+
+
+@test("Gate: _try_dispatch_to_manager uses exponential backoff")
+def test_gate_dispatch_manager_uses_backoff():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._try_dispatch_to_manager)
+    
+    assert "for attempt in range" in source, \
+        "_try_dispatch_to_manager should have retry loop"
+    assert "2 ** attempt" in source or "2**attempt" in source, \
+        "_try_dispatch_to_manager should use exponential backoff"
+    assert "asyncio.sleep" in source, \
+        "_try_dispatch_to_manager should sleep between retries"
+
+
+@test("Gate: _try_dispatch_to_manager checks circuit")
+def test_gate_dispatch_manager_checks_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._try_dispatch_to_manager)
+    
+    assert "_is_manager_circuit_open" in source, \
+        "_try_dispatch_to_manager should check circuit breaker"
+
+
+@test("Gate: _try_dispatch_to_manager records circuit state")
+def test_gate_dispatch_manager_records_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._try_dispatch_to_manager)
+    
+    assert "record_success" in source, \
+        "_try_dispatch_to_manager should record success"
+    assert "record_error" in source, \
+        "_try_dispatch_to_manager should record error"
+
+
+@test("Gate: _try_dispatch_to_dc uses _try_dispatch_to_manager")
+def test_gate_dispatch_dc_uses_dispatch_manager():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._try_dispatch_to_dc)
+    
+    assert "_try_dispatch_to_manager" in source, \
+        "_try_dispatch_to_dc should use _try_dispatch_to_manager"
+
+
+# Run Gate Dispatch Retry tests
+test_gate_has_dispatch_to_manager()
+test_gate_dispatch_manager_has_retry_params()
+test_gate_dispatch_manager_uses_backoff()
+test_gate_dispatch_manager_checks_circuit()
+test_gate_dispatch_manager_records_circuit()
+test_gate_dispatch_dc_uses_dispatch_manager()
 
 
 # =============================================================================
