@@ -3450,6 +3450,62 @@ Gates use the same circuit breaker pattern as managers for fail-fast behavior.
 4. Select datacenters and dispatch job
 5. Record success/failure for circuit breaker transitions
 
+### Worker ↔ Manager Communication Resilience (✅ Implemented)
+
+All Worker ↔ Manager communication now uses retries with exponential backoff and circuit breakers.
+
+#### Worker → Manager Communication
+
+**Circuit Breaker**:
+- `_manager_circuit`: ErrorStats tracking failures to managers
+- `_is_manager_circuit_open()`: Check if circuit is open (fail-fast mode)
+- `get_manager_circuit_status()`: Observability endpoint
+- Settings: Opens after 3 failures in 30s, recovers after 10s
+
+**Registration with Retries**:
+```python
+_register_with_manager(manager_addr, max_retries=3, base_delay=0.5)
+# Delays: 0.5s → 1.0s → 2.0s
+# Checks circuit breaker before attempting
+# Records success/error for circuit state
+```
+
+**Progress Updates with Retries**:
+```python
+_send_progress_update(progress, max_retries=2, base_delay=0.2)
+# Delays: 0.2s → 0.4s (shorter for frequent updates)
+# Checks circuit breaker before attempting
+# Records success/error for circuit state
+```
+
+#### Manager → Worker Communication
+
+**Per-Worker Circuit Breakers**:
+- `_worker_circuits: dict[str, ErrorStats]`: One circuit per worker
+- `_get_worker_circuit()`: Get or create circuit for a worker
+- `_is_worker_circuit_open()`: Check if worker's circuit is open
+- `get_worker_circuit_status()`: Status for specific worker
+- `get_all_worker_circuit_status()`: Status for all workers
+
+**Worker Selection**:
+- `_select_worker_for_workflow()`: Skips workers with open circuits
+- `_select_worker_for_workflow_excluding()`: Skips workers with open circuits
+
+**Workflow Dispatch with Retries**:
+```python
+_dispatch_workflow_to_worker(worker_id, dispatch, max_retries=2, base_delay=0.3)
+# Delays: 0.3s → 0.6s
+# Checks per-worker circuit before attempting
+# Records success/error for per-worker circuit
+# Worker rejection (not accepted) does NOT trigger retry
+```
+
+**Benefits**:
+- Transient network failures are retried automatically
+- Persistent failures trigger circuit breaker (fail-fast)
+- Per-worker circuits prevent one bad worker from affecting others
+- Exponential backoff prevents thundering herd on recovery
+
 ### Client Push Notifications (Implemented)
 
 Client push notifications allow Gates and Managers to push job status updates directly to clients, eliminating the need for polling.
@@ -3537,7 +3593,7 @@ Run the test suite:
 python examples/test_distributed_rewrite.py
 ```
 
-Current test coverage: 200+ tests covering:
+Current test coverage: 230+ tests covering:
 - SWIM protocol (probing, suspicion, gossip)
 - Leadership election (pre-voting, flapping)
 - State embedding (heartbeat serialization)
@@ -3555,6 +3611,10 @@ Current test coverage: 200+ tests covering:
 - Client push notifications (JobStatusPush, JobBatchPush)
 - Gate state management (SYNCING/ACTIVE/DRAINING)
 - Gate quorum circuit breaker
+- Worker circuit breaker for manager communication
+- Worker retries with exponential backoff (registration, progress)
+- Manager per-worker circuit breakers
+- Manager retries with exponential backoff (workflow dispatch)
 
 ---
 
