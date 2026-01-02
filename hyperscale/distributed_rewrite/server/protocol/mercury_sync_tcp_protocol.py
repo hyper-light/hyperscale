@@ -64,13 +64,6 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
         self.scheme = "mtcps" if is_ssl(transport) else "mtcp"
 
     def data_received(self, data: bytes):
-        if data:
-            if self._receive_buffer_closed:
-                raise RuntimeError("received close, then received more data?")
-            self._receive_buffer += data
-        else:
-            self._receive_buffer_closed = True
-        
         self.read(
             data,
             self.transport,

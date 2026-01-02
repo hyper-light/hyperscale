@@ -35,6 +35,8 @@ from .distributed import (
     GateInfo as GateInfo,
     GateHeartbeat as GateHeartbeat,
     ManagerRegistrationResponse as ManagerRegistrationResponse,
+    ManagerDiscoveryBroadcast as ManagerDiscoveryBroadcast,
+    WorkerDiscoveryBroadcast as WorkerDiscoveryBroadcast,
     JobProgressAck as JobProgressAck,
     # Job submission
     JobSubmission as JobSubmission,

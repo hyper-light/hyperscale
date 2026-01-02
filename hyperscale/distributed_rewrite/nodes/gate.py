@@ -35,6 +35,7 @@ from hyperscale.distributed_rewrite.models import (
     GateState,
     GateHeartbeat,
     ManagerRegistrationResponse,
+    ManagerDiscoveryBroadcast,
     JobProgressAck,
     ManagerHeartbeat,
     JobSubmission,
@@ -459,6 +460,9 @@ class GateServer(HealthAwareServer):
                 for dc in self._datacenter_managers.keys()
             },
             leases=dict(self._leases),
+            # Include manager discovery info for cross-gate sync
+            datacenter_managers={dc: list(addrs) for dc, addrs in self._datacenter_managers.items()},
+            datacenter_manager_udp={dc: list(addrs) for dc, addrs in self._datacenter_manager_udp.items()},
         )
     
     def _on_gate_become_leader(self) -> None:
@@ -561,6 +565,53 @@ class GateServer(HealthAwareServer):
                 self._leases[lease_key] = lease
         
         self._increment_version()
+    
+    async def _broadcast_manager_discovery(
+        self,
+        datacenter: str,
+        manager_tcp_addr: tuple[str, int],
+        manager_udp_addr: tuple[str, int] | None = None,
+    ) -> None:
+        """
+        Broadcast a newly discovered manager to all peer gates.
+        
+        Called when a manager registers with this gate. Ensures all gates
+        learn about the manager even if they don't receive direct registration.
+        """
+        if not self._active_gate_peers:
+            return
+        
+        broadcast = ManagerDiscoveryBroadcast(
+            datacenter=datacenter,
+            manager_tcp_addr=manager_tcp_addr,
+            manager_udp_addr=manager_udp_addr,
+            source_gate_id=self._node_id.full,
+        )
+        
+        broadcast_count = 0
+        for peer_addr in self._active_gate_peers:
+            try:
+                await self.send_tcp(
+                    peer_addr,
+                    "manager_discovery",
+                    broadcast.dump(),
+                    timeout=2.0,
+                )
+                broadcast_count += 1
+            except Exception:
+                # Best effort - peer may be down
+                pass
+        
+        if broadcast_count > 0:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Broadcast manager {manager_tcp_addr} in DC {datacenter} to {broadcast_count} peer gates",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
     
     def _get_manager_circuit(self, manager_addr: tuple[str, int]) -> ErrorStats:
         """
@@ -1330,7 +1381,7 @@ class GateServer(HealthAwareServer):
                     current_version=self._state_version,
                 )
                 
-                result = await self.send_tcp(
+                result, _ = await self.send_tcp(
                     peer_tcp_addr,
                     "state_sync",
                     request.dump(),
@@ -1368,12 +1419,33 @@ class GateServer(HealthAwareServer):
         """
         Apply a state snapshot received from a peer gate.
         
-        Merges job state that we don't already have.
+        Merges job state and manager discovery that we don't already have.
         """
         # Merge jobs we don't have
         for job_id, job_status in snapshot.jobs.items():
             if job_id not in self._jobs:
                 self._jobs[job_id] = job_status
+        
+        # Merge manager discovery - add any managers we don't know about
+        new_managers_count = 0
+        for dc, manager_addrs in snapshot.datacenter_managers.items():
+            if dc not in self._datacenter_managers:
+                self._datacenter_managers[dc] = []
+            for addr in manager_addrs:
+                # Convert list to tuple if needed
+                addr_tuple = tuple(addr) if isinstance(addr, list) else addr
+                if addr_tuple not in self._datacenter_managers[dc]:
+                    self._datacenter_managers[dc].append(addr_tuple)
+                    new_managers_count += 1
+        
+        # Merge manager UDP addresses
+        for dc, udp_addrs in snapshot.datacenter_manager_udp.items():
+            if dc not in self._datacenter_manager_udp:
+                self._datacenter_manager_udp[dc] = []
+            for addr in udp_addrs:
+                addr_tuple = tuple(addr) if isinstance(addr, list) else addr
+                if addr_tuple not in self._datacenter_manager_udp[dc]:
+                    self._datacenter_manager_udp[dc].append(addr_tuple)
         
         # Update state version if snapshot is newer
         if snapshot.version > self._state_version:
@@ -1382,7 +1454,7 @@ class GateServer(HealthAwareServer):
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Applied state snapshot from {snapshot.node_id}: {len(snapshot.jobs)} jobs",
+                message=f"Applied state snapshot from {snapshot.node_id}: {len(snapshot.jobs)} jobs, {new_managers_count} new managers",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -1582,7 +1654,7 @@ class GateServer(HealthAwareServer):
         # Try each manager until one accepts
         for manager_addr in managers:
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     manager_addr,
                     "job_submission",
                     submission.dump(),
@@ -1619,7 +1691,7 @@ class GateServer(HealthAwareServer):
             # Try first available manager
             for manager_addr in managers:
                 try:
-                    response = await self.send_tcp(
+                    response, _ = await self.send_tcp(
                         manager_addr,
                         "job_status_request",
                         job_id.encode(),
@@ -1708,7 +1780,7 @@ class GateServer(HealthAwareServer):
             return b'error'
     
     @tcp.receive()
-    async def receive_manager_register(
+    async def manager_register(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -1721,6 +1793,7 @@ class GateServer(HealthAwareServer):
         This is analogous to Workers registering with Managers.
         """
         try:
+
             heartbeat = ManagerHeartbeat.load(data)
             
             # Update DC status tracking
@@ -1750,10 +1823,14 @@ class GateServer(HealthAwareServer):
                 gate_id=self._node_id.full,
                 healthy_gates=self._get_healthy_gates(),
             )
+            
+            # Broadcast this manager discovery to peer gates
+            self._task_runner.run(self._broadcast_manager_discovery, dc, addr)
+            
             return response.dump()
             
         except Exception as e:
-            await self.handle_exception(e, "receive_manager_register")
+            await self.handle_exception(e, "manager_register")
             response = ManagerRegistrationResponse(
                 accepted=False,
                 gate_id=self._node_id.full,
@@ -1761,6 +1838,56 @@ class GateServer(HealthAwareServer):
                 error=str(e),
             )
             return response.dump()
+    
+    @tcp.receive()
+    async def manager_discovery(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle manager discovery broadcast from a peer gate.
+        
+        When another gate receives a manager registration, it broadcasts
+        to all peers. This handler adds the manager to our tracking.
+        """
+        try:
+            broadcast = ManagerDiscoveryBroadcast.load(data)
+            
+            dc = broadcast.datacenter
+            manager_addr = tuple(broadcast.manager_tcp_addr)
+            
+            # Add manager if not already tracked
+            if dc not in self._datacenter_managers:
+                self._datacenter_managers[dc] = []
+            
+            if manager_addr not in self._datacenter_managers[dc]:
+                self._datacenter_managers[dc].append(manager_addr)
+                
+                # Also add UDP address if provided
+                if broadcast.manager_udp_addr:
+                    if dc not in self._datacenter_manager_udp:
+                        self._datacenter_manager_udp[dc] = []
+                    udp_addr = tuple(broadcast.manager_udp_addr)
+                    if udp_addr not in self._datacenter_manager_udp[dc]:
+                        self._datacenter_manager_udp[dc].append(udp_addr)
+                
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Discovered manager {manager_addr} in DC {dc} via gate {broadcast.source_gate_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            
+            return b'ok'
+            
+        except Exception as e:
+            await self.handle_exception(e, "manager_discovery")
+            return b'error'
     
     # =========================================================================
     # TCP Handlers - Job Submission (from Client)
@@ -2130,7 +2257,7 @@ class GateServer(HealthAwareServer):
                 managers = self._datacenter_managers.get(dc, [])
                 for manager_addr in managers:
                     try:
-                        response = await self.send_tcp(
+                        response, _ = await self.send_tcp(
                             manager_addr,
                             "cancel_job",
                             cancel.dump(),

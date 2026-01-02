@@ -469,7 +469,7 @@ class MercurySyncBaseServer(Generic[T]):
 
         if self._tcp_connected is False:
             server = await self._loop.create_server(
-                lambda: MercurySyncTCPProtocol(self),
+                lambda: MercurySyncTCPProtocol(self, mode='server'),
                 sock=self._tcp_server_socket,
                 ssl=self._server_tcp_ssl_context,
             )
@@ -719,9 +719,11 @@ class MercurySyncBaseServer(Generic[T]):
                 timeout = self._request_timeout
             
             async with self._tcp_semaphore:        
-                transport = self._tcp_client_transports.get(address)
+                transport: asyncio.Transport = self._tcp_client_transports.get(address)
                 if transport is None or transport.is_closing():
                     transport = await self._connect_tcp_client(address)
+                    self._tcp_client_transports[address] = transport
+
 
                 clock = await self._udp_clock.increment()
 
@@ -732,16 +734,25 @@ class MercurySyncBaseServer(Generic[T]):
 
                 transport.write(
                     self._encryptor.encrypt(
-                        self._compressor.compress(encoded_action + b'<' + self._tcp_addr_slug + b'<' + data  + b'<' + clock.to_bytes(64) )
+                        self._compressor.compress(self._tcp_addr_slug + b'<' + encoded_action +  b'<' + data  + b'<' + clock.to_bytes(64) )
                     ),
                 )
 
+
+                host, port = address
+
+                target = f'{host}:{port}'.encode()
+
                 return await asyncio.wait_for(
-                    self._tcp_client_data[self._tcp_addr_slug][encoded_action].get(),
+                    self._tcp_client_data[target][encoded_action].get(),
                     timeout=timeout,
                 )
             
         except Exception as error:
+            transport = self._tcp_client_transports.get(address)
+            if transport and not transport.is_closing():
+                transport.close()
+
             return (
                 error,
                 self._tcp_clock.time,
@@ -1009,16 +1020,15 @@ class MercurySyncBaseServer(Generic[T]):
     async def process_tcp_client_resopnse(
         self,
         data: bytes,
-        _: asyncio.Transport,
+        transport: asyncio.Transport,
     ):
-        
         decrypted = self._decompressor.decompress(
             self._encryptor.decrypt(
                 data,
             )
         )
 
-        handler_name, address_bytes, payload, clock = decrypted.split(b'<', maxsplit=3)
+        address_bytes, handler_name, payload, clock = decrypted.split(b'<', maxsplit=3)
         clock_time = int.from_bytes(clock)
 
         await self._udp_clock.ack(clock_time)
@@ -1045,10 +1055,10 @@ class MercurySyncBaseServer(Generic[T]):
                     clock_time,
                 )
 
-            self._tcp_client_data[addr][handler_name].put_nowait((payload, clock_time))
+            self._tcp_client_data[address_bytes][handler_name].put_nowait((payload, clock_time))
 
         except Exception as err:
-            self._tcp_client_data[addr][handler_name].put_nowait((err, clock_time))
+            self._tcp_client_data[address_bytes][handler_name].put_nowait((err, clock_time))
         
 
     async def process_tcp_server_request(
@@ -1077,7 +1087,7 @@ class MercurySyncBaseServer(Generic[T]):
             if len(decrypted) > MAX_DECOMPRESSED_SIZE:
                 return  # Decompressed message too large - silently drop
 
-            handler_name, address_bytes, payload, clock = decrypted.split(b'<', maxsplit=3)
+            address_bytes, handler_name, payload, clock = decrypted.split(b'<', maxsplit=3)
             clock_time = int.from_bytes(clock)
 
             next_time = await self._tcp_clock.update(clock_time)
@@ -1091,15 +1101,13 @@ class MercurySyncBaseServer(Generic[T]):
                 )
                 return
             
+            
             if request_model := self.tcp_server_request_models.get(handler_name):
                 payload = request_model.load(payload)
 
             handler = self.tcp_handlers[handler_name]
 
-            (
-                response_handler,
-                response,
-            ) = await handler(
+            response = await handler(
                 addr,
                 payload,
                 clock_time,
@@ -1110,7 +1118,7 @@ class MercurySyncBaseServer(Generic[T]):
 
             response_payload = self._encryptor.encrypt(
                 self._compressor.compress(
-                    self._tcp_addr_slug + b'<' + response_handler + b'<' + response + b'<' + next_time.to_bytes(64),
+                    self._tcp_addr_slug + b'<' + handler_name + b'<' + response + b'<' + next_time.to_bytes(64),
                 )
             )
 
@@ -1127,7 +1135,7 @@ class MercurySyncBaseServer(Generic[T]):
                 error_time = await self._tcp_clock.tick()
                 error_response = self._encryptor.encrypt(
                     self._compressor.compress(
-                        self._tcp_addr_slug + b'<error<Request processing failed<' + error_time.to_bytes(64),
+                        self._tcp_addr_slug + b'<' + handler_name + b'<Request processing failed<' + error_time.to_bytes(64),
                     )
                 )
                 transport.write(error_response)

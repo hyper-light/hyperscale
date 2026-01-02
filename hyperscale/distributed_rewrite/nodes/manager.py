@@ -75,6 +75,7 @@ from hyperscale.distributed_rewrite.models import (
     ProvisionCommit,
     CancelJob,
     CancelAck,
+    WorkerDiscoveryBroadcast,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -997,6 +998,56 @@ class ManagerServer(HealthAwareServer):
         
         return managers
     
+    async def _broadcast_worker_discovery(
+        self,
+        worker_id: str,
+        worker_tcp_addr: tuple[str, int],
+        worker_udp_addr: tuple[str, int],
+        available_cores: int,
+    ) -> None:
+        """
+        Broadcast a newly discovered worker to all peer managers.
+        
+        Called when a worker registers with this manager. Ensures all managers
+        learn about the worker even if they don't receive direct registration.
+        """
+        if not self._manager_peers:
+            return
+        
+        broadcast = WorkerDiscoveryBroadcast(
+            worker_id=worker_id,
+            worker_tcp_addr=worker_tcp_addr,
+            worker_udp_addr=worker_udp_addr,
+            datacenter=self._node_id.datacenter,
+            available_cores=available_cores,
+            source_manager_id=self._node_id.full,
+        )
+        
+        broadcast_count = 0
+        for peer_addr in self._manager_peers:
+            try:
+                await self.send_tcp(
+                    peer_addr,
+                    "worker_discovery",
+                    broadcast.dump(),
+                    timeout=2.0,
+                )
+                broadcast_count += 1
+            except Exception:
+                # Best effort - peer may be down
+                pass
+        
+        if broadcast_count > 0:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Broadcast worker {worker_id} to {broadcast_count} peer managers",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+    
     async def start(self) -> None:
         """
         Start the manager server.
@@ -1274,6 +1325,8 @@ class ManagerServer(HealthAwareServer):
                     return result
                     
             except Exception as e:
+                import traceback
+                print(traceback.format_exc())
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerError(
@@ -1902,6 +1955,16 @@ class ManagerServer(HealthAwareServer):
                 manager_id=self._node_id.full,
                 healthy_managers=self._get_healthy_managers(),
             )
+            
+            # Broadcast this worker discovery to peer managers
+            self._task_runner.run(
+                self._broadcast_worker_discovery,
+                registration.node.node_id,
+                worker_addr,
+                worker_addr,  # UDP addr same as TCP for workers
+                registration.total_cores,
+            )
+            
             return response.dump()
             
         except Exception as e:
@@ -1914,6 +1977,65 @@ class ManagerServer(HealthAwareServer):
                 error=str(e),
             )
             return response.dump()
+    
+    @tcp.receive()
+    async def worker_discovery(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle worker discovery broadcast from a peer manager.
+        
+        When another manager receives a worker registration, it broadcasts
+        to all peers. This handler adds the worker to our tracking.
+        """
+        try:
+            broadcast = WorkerDiscoveryBroadcast.load(data)
+            
+            worker_id = broadcast.worker_id
+            worker_tcp_addr = tuple(broadcast.worker_tcp_addr)
+            worker_udp_addr = tuple(broadcast.worker_udp_addr)
+            
+            # Add worker if not already tracked
+            if worker_id not in self._workers:
+                # Create a minimal registration for tracking
+                node_info = NodeInfo(
+                    node_id=worker_id,
+                    host=worker_tcp_addr[0],
+                    port=worker_tcp_addr[1],
+                    role=NodeRole.WORKER.value,
+                    datacenter=broadcast.datacenter,
+                )
+                registration = WorkerRegistration(
+                    node=node_info,
+                    available_cores=broadcast.available_cores,
+                    total_cores=broadcast.available_cores,
+                    capacity=1.0,
+                )
+                self._workers[worker_id] = registration
+                self._worker_addr_to_id[worker_tcp_addr] = worker_id
+                self._worker_last_status[worker_id] = time.monotonic()
+                
+                # Add to SWIM probing
+                self._probe_scheduler.add_member(worker_udp_addr)
+                
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Discovered worker {worker_id} via manager {broadcast.source_manager_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            
+            return b'ok'
+            
+        except Exception as e:
+            await self.handle_exception(e, "worker_discovery")
+            return b'error'
     
     @tcp.receive()
     async def receive_worker_status_update(

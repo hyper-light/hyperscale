@@ -238,6 +238,38 @@ class ManagerRegistrationResponse(Message):
 
 
 @dataclass(slots=True, kw_only=True)
+class ManagerDiscoveryBroadcast(Message):
+    """
+    Broadcast from one gate to another about a newly discovered manager.
+    
+    Used for cross-gate synchronization of manager discovery.
+    When a manager registers with one gate, that gate broadcasts
+    to all peer gates so they can also track the manager.
+    """
+    datacenter: str                         # Manager's datacenter
+    manager_tcp_addr: tuple[str, int]       # Manager's TCP address
+    manager_udp_addr: tuple[str, int] | None = None  # Manager's UDP address (if known)
+    source_gate_id: str = ""                # Gate that received the original registration
+
+
+@dataclass(slots=True, kw_only=True)
+class WorkerDiscoveryBroadcast(Message):
+    """
+    Broadcast from one manager to another about a newly discovered worker.
+    
+    Used for cross-manager synchronization of worker discovery.
+    When a worker registers with one manager, that manager broadcasts
+    to all peer managers so they can also track the worker.
+    """
+    worker_id: str                          # Worker's node_id
+    worker_tcp_addr: tuple[str, int]        # Worker's TCP address
+    worker_udp_addr: tuple[str, int]        # Worker's UDP address
+    datacenter: str                         # Worker's datacenter
+    available_cores: int                    # Worker's available cores
+    source_manager_id: str = ""             # Manager that received the original registration
+
+
+@dataclass(slots=True, kw_only=True)
 class JobProgressAck(Message):
     """
     Acknowledgment for job progress updates from gates to managers.
@@ -543,6 +575,9 @@ class GateStateSnapshot(Message):
     jobs: dict[str, "GlobalJobStatus"] = field(default_factory=dict)
     datacenter_status: dict[str, "DatacenterStatus"] = field(default_factory=dict)
     leases: dict[str, "DatacenterLease"] = field(default_factory=dict)
+    # Manager discovery - shared between gates
+    datacenter_managers: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    datacenter_manager_udp: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

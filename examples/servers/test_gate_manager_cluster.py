@@ -164,7 +164,6 @@ async def run_test():
             print(f"  ✓ {config['name']} started - Node ID: {gate._node_id.short}")
         
         print()
-        
         # ================================================================
         # STEP 3: Start managers (they will register with gates)
         # ================================================================
