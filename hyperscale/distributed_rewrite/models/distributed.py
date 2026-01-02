@@ -272,6 +272,8 @@ class JobProgress(Message):
     overall_rate: float = 0.0    # Aggregate rate
     elapsed_seconds: float = 0.0 # Time since job start
     timestamp: float = 0.0       # Monotonic timestamp
+    # Aggregated step stats across all workflows in the job
+    step_stats: list["StepStats"] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -328,6 +330,23 @@ class ManagerStateSnapshot(Message):
 
 
 @dataclass(slots=True)
+class GateStateSnapshot(Message):
+    """
+    Complete state snapshot from a gate.
+    
+    Used for state sync between gates when a new leader is elected.
+    Contains global job state and datacenter status.
+    """
+    node_id: str                 # Gate identifier
+    is_leader: bool              # Leadership status
+    term: int                    # Current term
+    version: int                 # State version
+    jobs: dict[str, "GlobalJobStatus"] = field(default_factory=dict)
+    datacenter_status: dict[str, "DatacenterStatus"] = field(default_factory=dict)
+    leases: dict[str, "DatacenterLease"] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class StateSyncRequest(Message):
     """
     Request for state synchronization.
@@ -349,6 +368,7 @@ class StateSyncResponse(Message):
     # One of these will be set based on node type
     worker_state: "WorkerStateSnapshot | None" = None
     manager_state: "ManagerStateSnapshot | None" = None
+    gate_state: "GateStateSnapshot | None" = None
 
 
 # =============================================================================

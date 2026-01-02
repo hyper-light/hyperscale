@@ -14,6 +14,11 @@ from dataclasses import dataclass
 from typing import Protocol, Callable, Any
 import time
 
+from hyperscale.distributed_rewrite.models import (
+    WorkerHeartbeat,
+    ManagerHeartbeat,
+)
+
 
 class StateEmbedder(Protocol):
     """
@@ -97,9 +102,6 @@ class WorkerStateEmbedder:
     
     def get_state(self) -> bytes | None:
         """Get WorkerHeartbeat to embed in SWIM messages."""
-        # Import here to avoid circular imports
-        from hyperscale.distributed_rewrite.models import WorkerHeartbeat
-        
         heartbeat = WorkerHeartbeat(
             node_id=self.get_node_id(),
             state=self.get_worker_state(),
@@ -153,8 +155,6 @@ class ManagerStateEmbedder:
     
     def get_state(self) -> bytes | None:
         """Get ManagerHeartbeat to embed in SWIM messages."""
-        from hyperscale.distributed_rewrite.models import ManagerHeartbeat
-        
         heartbeat = ManagerHeartbeat(
             node_id=self.get_node_id(),
             datacenter=self.get_datacenter(),
@@ -174,8 +174,6 @@ class ManagerStateEmbedder:
         source_addr: tuple[str, int],
     ) -> None:
         """Process embedded state from workers."""
-        from hyperscale.distributed_rewrite.models import WorkerHeartbeat
-        
         try:
             heartbeat = WorkerHeartbeat.load(state_data)
             self.on_worker_heartbeat(heartbeat, source_addr)
@@ -226,8 +224,6 @@ class GateStateEmbedder:
         source_addr: tuple[str, int],
     ) -> None:
         """Process embedded state from managers."""
-        from hyperscale.distributed_rewrite.models import ManagerHeartbeat
-        
         try:
             heartbeat = ManagerHeartbeat.load(state_data)
             self.on_manager_heartbeat(heartbeat, source_addr)

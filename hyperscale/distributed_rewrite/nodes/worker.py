@@ -419,6 +419,27 @@ class WorkerServer(HealthAwareServer):
             active_workflows=dict(self._active_workflows),
         )
     
+    def _get_heartbeat(self) -> WorkerHeartbeat:
+        """
+        Build a WorkerHeartbeat with current state.
+        
+        This is the same data that gets embedded in SWIM messages via
+        WorkerStateEmbedder, but available for other uses like diagnostics
+        or explicit TCP status updates if needed.
+        """
+        return WorkerHeartbeat(
+            node_id=self._node_id.full,
+            state=self._get_worker_state().value,
+            available_cores=self._available_cores,
+            queue_depth=len(self._pending_workflows),
+            cpu_percent=self._get_cpu_percent(),
+            memory_percent=self._get_memory_percent(),
+            version=self._state_version,
+            active_workflows={
+                wf_id: wf.status for wf_id, wf in self._active_workflows.items()
+            },
+        )
+    
     # =========================================================================
     # Per-Core Assignment Tracking
     # =========================================================================

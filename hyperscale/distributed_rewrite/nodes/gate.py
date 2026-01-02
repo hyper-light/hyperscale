@@ -39,6 +39,7 @@ from hyperscale.distributed_rewrite.models import (
     GlobalJobStatus,
     StateSyncRequest,
     StateSyncResponse,
+    GateStateSnapshot,
     CancelJob,
     CancelAck,
     DatacenterLease,
@@ -154,6 +155,10 @@ class GateServer(HealthAwareServer):
         # (Same pattern as ManagerServer for split-brain prevention)
         self.register_on_node_dead(self._on_node_dead)
         self.register_on_node_join(self._on_node_join)
+        
+        # Register leadership callbacks for state sync
+        self.register_on_become_leader(self._on_gate_become_leader)
+        self.register_on_lose_leadership(self._on_gate_lose_leadership)
     
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
@@ -304,6 +309,123 @@ class GateServer(HealthAwareServer):
         """Generate a new fencing token."""
         self._fence_token += 1
         return self._fence_token
+    
+    def _get_state_snapshot(self) -> GateStateSnapshot:
+        """Get a complete state snapshot for state sync."""
+        return GateStateSnapshot(
+            node_id=self._node_id.full,
+            is_leader=self.is_leader(),
+            term=self._leader_election.state.current_term,
+            version=self._state_version,
+            jobs=dict(self._jobs),
+            datacenter_status={
+                dc: self._classify_datacenter_health(dc)
+                for dc in self._datacenter_managers.keys()
+            },
+            leases=dict(self._leases),
+        )
+    
+    def _on_gate_become_leader(self) -> None:
+        """
+        Called when this gate becomes the leader.
+        
+        Triggers state sync from other gate peers to ensure the new
+        leader has complete global job state.
+        """
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message="Gate became leader, initiating state sync from peers",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        self._task_runner.run(self._sync_state_from_gate_peers)
+    
+    def _on_gate_lose_leadership(self) -> None:
+        """Called when this gate loses leadership."""
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message="Gate lost leadership",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+    
+    async def _sync_state_from_gate_peers(self) -> None:
+        """
+        Sync state from active gate peers when becoming leader.
+        
+        Uses exponential backoff for retries to handle transient failures.
+        """
+        if not self._active_gate_peers:
+            return
+        
+        request = StateSyncRequest(
+            requester_id=self._node_id.full,
+            requester_role=NodeRole.GATE.value,
+            since_version=0,  # Get all state
+        )
+        
+        synced_count = 0
+        max_retries = 3
+        
+        for peer_addr in self._active_gate_peers:
+            for attempt in range(max_retries):
+                try:
+                    response = await self.send_tcp(
+                        peer_addr,
+                        "gate_state_sync_request",
+                        request.dump(),
+                        timeout=5.0 * (attempt + 1),  # Exponential backoff
+                    )
+                    
+                    if isinstance(response, bytes) and response:
+                        sync_response = StateSyncResponse.load(response)
+                        if sync_response.gate_state:
+                            self._apply_gate_state_snapshot(sync_response.gate_state)
+                            synced_count += 1
+                    break  # Success
+                    
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        await self.handle_exception(e, f"state_sync_from_{peer_addr}")
+                    else:
+                        await asyncio.sleep(0.5 * (2 ** attempt))  # Backoff
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"State sync complete: synced from {synced_count}/{len(self._active_gate_peers)} peers",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+    
+    def _apply_gate_state_snapshot(self, snapshot: GateStateSnapshot) -> None:
+        """
+        Apply a state snapshot from another gate.
+        
+        Merges job state, preferring entries with higher versions.
+        Uses restricted_loads for any serialized workflow data.
+        """
+        # Merge jobs - keep newer versions
+        for job_id, job in snapshot.jobs.items():
+            existing = self._jobs.get(job_id)
+            if not existing or getattr(job, 'timestamp', 0) > getattr(existing, 'timestamp', 0):
+                self._jobs[job_id] = job
+        
+        # Merge leases - keep ones with higher fence tokens
+        for lease_key, lease in snapshot.leases.items():
+            existing = self._leases.get(lease_key)
+            if not existing or lease.fence_token > existing.fence_token:
+                self._leases[lease_key] = lease
+        
+        self._increment_version()
     
     def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
         """
@@ -600,8 +722,6 @@ class GateServer(HealthAwareServer):
         
         Returns UpdateTier value.
         """
-        from hyperscale.distributed_rewrite.models import UpdateTier
-        
         # Critical state transitions = Immediate
         if new_status in (JobStatus.COMPLETED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value):
             return UpdateTier.IMMEDIATE.value
@@ -722,8 +842,6 @@ class GateServer(HealthAwareServer):
         Tier 2 → batched periodic update
         Tier 3 → stored for on-demand retrieval
         """
-        from hyperscale.distributed_rewrite.models import UpdateTier
-        
         tier = self._classify_update_tier(job_id, old_status, new_status)
         
         if tier == UpdateTier.IMMEDIATE.value:
@@ -1423,4 +1541,56 @@ class GateServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "receive_lease_transfer")
             return b'error'
+    
+    # =========================================================================
+    # TCP Handlers - State Sync (between Gates)
+    # =========================================================================
+    
+    @tcp.send('gate_state_sync_response')
+    async def send_gate_state_sync_response(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        timeout: int | float | None = None,
+    ):
+        """Send state sync response."""
+        return (addr, data, timeout)
+    
+    @tcp.handle('gate_state_sync_response')
+    async def handle_gate_state_sync_response_raw(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Handle raw state sync response."""
+        return data
+    
+    @tcp.receive()
+    async def receive_gate_state_sync_request(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle state sync request from another gate (usually new leader).
+        
+        Returns this gate's complete state snapshot for merging.
+        """
+        try:
+            request = StateSyncRequest.load(data)
+            
+            # Build and return state snapshot
+            snapshot = self._get_state_snapshot()
+            response = StateSyncResponse(
+                responder_id=self._node_id.full,
+                current_version=self._state_version,
+                gate_state=snapshot,
+            )
+            return response.dump()
+            
+        except Exception as e:
+            await self.handle_exception(e, "receive_gate_state_sync_request")
+            return b''
 

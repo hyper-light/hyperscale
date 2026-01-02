@@ -700,8 +700,10 @@ class ManagerServer(HealthAwareServer):
         # Start background cleanup for completed jobs
         self._task_runner.run(self._job_cleanup_loop)
         
-        # Note: Status updates to gates are now handled via Serf-style heartbeat
-        # embedding in SWIM probe responses. Gates learn our state passively.
+        # Start TCP heartbeat loop to gates (supplements SWIM embedding)
+        # TCP provides reliability for critical status updates
+        if self._gate_addrs:
+            self._task_runner.run(self._gate_heartbeat_loop)
         
         self._task_runner.run(
             self._udp_logger.log,
@@ -720,8 +722,57 @@ class ManagerServer(HealthAwareServer):
         
         await super().stop()
     
-    # Note: Status updates to gates are now handled via Serf-style heartbeat
-    # embedding in SWIM probe responses. See ManagerStateEmbedder in __init__.
+    def _build_manager_heartbeat(self) -> ManagerHeartbeat:
+        """Build a ManagerHeartbeat with current state."""
+        return ManagerHeartbeat(
+            node_id=self._node_id.full,
+            datacenter=self._node_id.datacenter,
+            is_leader=self.is_leader(),
+            term=self._leader_election.state.current_term,
+            version=self._state_version,
+            active_jobs=len(self._jobs),
+            active_workflows=sum(
+                len(job.workflows) for job in self._jobs.values()
+            ),
+            worker_count=len(self._workers),
+            available_cores=sum(
+                status.available_cores
+                for status in self._worker_status.values()
+            ),
+        )
+    
+    async def _gate_heartbeat_loop(self) -> None:
+        """
+        Periodically send ManagerHeartbeat to gates via TCP.
+        
+        This supplements the Serf-style SWIM embedding for reliability.
+        Gates use this for datacenter health classification.
+        """
+        heartbeat_interval = 5.0  # Send every 5 seconds
+        
+        while self._running:
+            try:
+                await asyncio.sleep(heartbeat_interval)
+                
+                heartbeat = self._build_manager_heartbeat()
+                
+                # Send to all configured gates
+                for gate_addr in self._gate_addrs:
+                    try:
+                        await self.send_tcp(
+                            gate_addr,
+                            "manager_status_update",
+                            heartbeat.dump(),
+                            timeout=2.0,
+                        )
+                    except Exception:
+                        # Gate might be down - continue to others
+                        pass
+                        
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.handle_exception(e, "gate_heartbeat_loop")
     
     def _get_state_snapshot(self) -> ManagerStateSnapshot:
         """Get a complete state snapshot."""
@@ -1024,6 +1075,9 @@ class ManagerServer(HealthAwareServer):
                 job.overall_rate = sum(w.rate_per_second for w in job.workflows)
                 job.timestamp = time.monotonic()
                 
+                # Aggregate step stats from all workflows
+                job.step_stats = self._aggregate_step_stats(job.workflows)
+                
                 # Update worker available cores based on cores_completed
                 # This enables faster provisioning - we don't need to wait for
                 # the entire workflow to complete to start using freed cores
@@ -1049,6 +1103,47 @@ class ManagerServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "receive_workflow_progress")
             return b'error'
+    
+    def _aggregate_step_stats(
+        self,
+        workflows: list[WorkflowProgress],
+    ) -> list[StepStats]:
+        """
+        Aggregate step stats from all workflows in a job.
+        
+        Merges stats with the same step_name, summing counts.
+        
+        Args:
+            workflows: List of workflow progress updates
+            
+        Returns:
+            Aggregated list of StepStats
+        """
+        # Merge by step_name
+        stats_by_name: dict[str, dict[str, int]] = {}
+        
+        for workflow in workflows:
+            for step_stat in workflow.step_stats:
+                if step_stat.step_name not in stats_by_name:
+                    stats_by_name[step_stat.step_name] = {
+                        "completed": 0,
+                        "failed": 0,
+                        "total": 0,
+                    }
+                stats_by_name[step_stat.step_name]["completed"] += step_stat.completed_count
+                stats_by_name[step_stat.step_name]["failed"] += step_stat.failed_count
+                stats_by_name[step_stat.step_name]["total"] += step_stat.total_count
+        
+        # Convert back to StepStats
+        return [
+            StepStats(
+                step_name=name,
+                completed_count=stats["completed"],
+                failed_count=stats["failed"],
+                total_count=stats["total"],
+            )
+            for name, stats in stats_by_name.items()
+        ]
     
     async def _update_worker_cores_from_progress(
         self,

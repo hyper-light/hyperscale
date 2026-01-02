@@ -39,6 +39,7 @@ from .distributed import (
     # State sync
     WorkerStateSnapshot as WorkerStateSnapshot,
     ManagerStateSnapshot as ManagerStateSnapshot,
+    GateStateSnapshot as GateStateSnapshot,
     StateSyncRequest as StateSyncRequest,
     StateSyncResponse as StateSyncResponse,
     # Quorum
