@@ -52,6 +52,25 @@ class WorkerState(str, Enum):
     OFFLINE = "offline"          # Not responding
 
 
+class ManagerState(str, Enum):
+    """
+    State of a manager node in the cluster.
+    
+    New Manager Join Process:
+    1. Manager joins SWIM cluster → State = SYNCING
+    2. SYNCING managers are NOT counted in quorum
+    3. Request state sync from leader (if not leader)
+    4. Apply state snapshot
+    5. State = ACTIVE → now counted in quorum
+    
+    This prevents new/recovering managers from affecting quorum
+    until they have synchronized state from the cluster.
+    """
+    SYNCING = "syncing"          # Joined cluster, syncing state (not in quorum)
+    ACTIVE = "active"            # Fully operational (counted in quorum)
+    DRAINING = "draining"        # Not accepting new work, draining existing
+
+
 class DatacenterHealth(str, Enum):
     """
     Health classification for datacenter routing decisions.
@@ -259,6 +278,7 @@ class ManagerHeartbeat(Message):
     active_workflows: int        # Number of active workflows
     worker_count: int            # Number of registered workers
     available_cores: int         # Total available cores across workers
+    state: str = "active"        # ManagerState value (syncing/active/draining)
 
 
 # =============================================================================

@@ -3389,6 +3389,142 @@ test_manager_send_progress_processes_ack()
 
 
 # =============================================================================
+# New Manager Join Process Tests (SYNCING -> ACTIVE)
+# =============================================================================
+
+print("\nNew Manager Join Process Tests")
+print("=" * 50)
+
+
+@test("ManagerState: enum exists with expected values")
+def test_manager_state_enum():
+    from hyperscale.distributed_rewrite.models import ManagerState
+    
+    assert hasattr(ManagerState, 'SYNCING'), "ManagerState should have SYNCING"
+    assert hasattr(ManagerState, 'ACTIVE'), "ManagerState should have ACTIVE"
+    assert hasattr(ManagerState, 'DRAINING'), "ManagerState should have DRAINING"
+    
+    assert ManagerState.SYNCING.value == "syncing"
+    assert ManagerState.ACTIVE.value == "active"
+
+
+@test("Manager: starts in SYNCING state")
+def test_manager_starts_syncing():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    from hyperscale.distributed_rewrite.models import ManagerState
+    
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    assert "_manager_state = ManagerState.SYNCING" in source, \
+        "Manager should initialize in SYNCING state"
+
+
+@test("Manager: _has_quorum_available excludes SYNCING managers")
+def test_manager_quorum_excludes_syncing():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._has_quorum_available)
+    
+    # Should check manager state before allowing quorum operations
+    assert "_manager_state" in source, \
+        "_has_quorum_available should check manager state"
+    assert "ManagerState.ACTIVE" in source, \
+        "_has_quorum_available should require ACTIVE state"
+
+
+@test("Manager: has _complete_startup_sync method")
+def test_manager_has_startup_sync():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, '_complete_startup_sync'), \
+        "Manager should have _complete_startup_sync method"
+    
+    source = inspect.getsource(ManagerServer._complete_startup_sync)
+    
+    # Should sync from leader if not leader
+    assert "is_leader()" in source, \
+        "_complete_startup_sync should check leadership"
+    assert "StateSyncRequest" in source, \
+        "_complete_startup_sync should request state sync"
+    assert "ManagerState.ACTIVE" in source, \
+        "_complete_startup_sync should transition to ACTIVE"
+
+
+@test("Manager: start() calls _complete_startup_sync")
+def test_manager_start_calls_sync():
+    import pathlib
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    import hyperscale.distributed_rewrite.nodes.manager as manager_module
+    source_file = pathlib.Path(manager_module.__file__)
+    source = source_file.read_text()
+    
+    assert "_complete_startup_sync" in source, \
+        "Manager.start() should call _complete_startup_sync"
+
+
+@test("ManagerHeartbeat: has state field")
+def test_manager_heartbeat_has_state():
+    from hyperscale.distributed_rewrite.models import ManagerHeartbeat
+    import inspect
+    
+    sig = inspect.signature(ManagerHeartbeat)
+    param_names = list(sig.parameters.keys())
+    
+    assert 'state' in param_names, \
+        "ManagerHeartbeat should have state field"
+
+
+@test("Manager: _build_manager_heartbeat includes state")
+def test_manager_heartbeat_includes_state():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._build_manager_heartbeat)
+    
+    assert "_manager_state.value" in source, \
+        "_build_manager_heartbeat should include manager state"
+
+
+@test("ManagerStateEmbedder: has get_manager_state callback")
+def test_manager_embedder_has_state_callback():
+    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    import inspect
+    
+    sig = inspect.signature(ManagerStateEmbedder)
+    param_names = list(sig.parameters.keys())
+    
+    assert 'get_manager_state' in param_names, \
+        "ManagerStateEmbedder should have get_manager_state parameter"
+
+
+@test("Manager: state embedder includes get_manager_state")
+def test_manager_embedder_includes_state_callback():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    assert "get_manager_state=lambda: self._manager_state.value" in source, \
+        "Manager should pass get_manager_state to ManagerStateEmbedder"
+
+
+# Run New Manager Join Process tests
+test_manager_state_enum()
+test_manager_starts_syncing()
+test_manager_quorum_excludes_syncing()
+test_manager_has_startup_sync()
+test_manager_start_calls_sync()
+test_manager_heartbeat_has_state()
+test_manager_heartbeat_includes_state()
+test_manager_embedder_has_state_callback()
+test_manager_embedder_includes_state_callback()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

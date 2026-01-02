@@ -37,6 +37,7 @@ from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
     ManagerInfo,
+    ManagerState,
     RegistrationResponse,
     WorkflowProgressAck,
     GateInfo,
@@ -181,6 +182,10 @@ class ManagerServer(HealthAwareServer):
         # State versioning (local manager state version)
         self._state_version = 0
         
+        # Manager state (SYNCING until state sync completes)
+        # SYNCING managers are NOT counted in quorum calculations
+        self._manager_state = ManagerState.SYNCING
+        
         # Quorum settings
         self._quorum_timeout = quorum_timeout
         
@@ -207,6 +212,7 @@ class ManagerServer(HealthAwareServer):
             on_worker_heartbeat=self._handle_embedded_worker_heartbeat,
             on_manager_heartbeat=self._handle_manager_peer_heartbeat,
             on_gate_heartbeat=self._handle_gate_heartbeat,
+            get_manager_state=lambda: self._manager_state.value,
         ))
         
         # Register leadership callbacks (composition pattern - no override)
@@ -855,9 +861,14 @@ class ManagerServer(HealthAwareServer):
         """
         Check if we have enough active managers to achieve quorum.
         
-        Returns True if the number of active managers (including self)
-        is >= the required quorum size.
+        Returns True if:
+        1. This manager is ACTIVE (SYNCING managers don't participate in quorum)
+        2. The number of active managers (including self) is >= required quorum size
         """
+        # SYNCING managers don't participate in quorum operations
+        if self._manager_state != ManagerState.ACTIVE:
+            return False
+        
         active_count = len(self._active_manager_peers) + 1  # Include self
         return active_count >= self._quorum_size()
     
@@ -925,8 +936,27 @@ class ManagerServer(HealthAwareServer):
         return managers
     
     async def start(self) -> None:
-        """Start the manager server."""
+        """
+        Start the manager server.
+        
+        New Manager Join Process:
+        1. Manager joins SWIM cluster → State = SYNCING
+        2. Start leader election
+        3. If leader: immediately become ACTIVE (leader syncs state in _on_manager_become_leader)
+        4. If not leader: request state sync from leader, then become ACTIVE
+        5. SYNCING managers are NOT counted in quorum
+        """
         await super().start()
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager starting in SYNCING state (not in quorum yet)",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
         
         # Join SWIM cluster with other managers (UDP healthchecks)
         for peer_udp in self._manager_udp_peers:
@@ -937,6 +967,12 @@ class ManagerServer(HealthAwareServer):
         
         # Start leader election (uses SWIM membership info)
         await self.start_leader_election()
+        
+        # Wait a short time for leader election to stabilize
+        await asyncio.sleep(0.5)
+        
+        # Sync state and transition to ACTIVE
+        await self._complete_startup_sync()
         
         # Start background cleanup for completed jobs
         self._task_runner.run(self._job_cleanup_loop)
@@ -953,13 +989,101 @@ class ManagerServer(HealthAwareServer):
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Manager started in DC {self._node_id.datacenter}, SWIM healthcheck active" +
+                message=f"Manager started in DC {self._node_id.datacenter}, state={self._manager_state.value}" +
                         (f", primary gate: {self._primary_gate_id}" if self._primary_gate_id else ""),
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             )
         )
+    
+    async def _complete_startup_sync(self) -> None:
+        """
+        Complete the startup state sync and transition to ACTIVE.
+        
+        If this manager is the leader, it becomes ACTIVE immediately 
+        (leader sync happens in _on_manager_become_leader callback).
+        
+        If not leader, requests state sync from the current leader,
+        then transitions to ACTIVE.
+        """
+        if self.is_leader():
+            # Leader becomes ACTIVE immediately
+            # State sync from workers/peers happens in _on_manager_become_leader
+            self._manager_state = ManagerState.ACTIVE
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message="Manager is LEADER, transitioning to ACTIVE state",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+        
+        # Not leader - request state sync from leader
+        leader_addr = self.get_current_leader()
+        
+        if leader_addr:
+            # Find TCP address for leader (UDP -> TCP mapping)
+            leader_tcp_addr = self._manager_udp_to_tcp.get(leader_addr)
+            
+            if leader_tcp_addr:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Requesting state sync from leader at {leader_tcp_addr}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                
+                # Request state sync from leader
+                request = StateSyncRequest(
+                    requester_id=self._node_id.full,
+                    requester_role=NodeRole.MANAGER.value,
+                    since_version=0,  # Request full state
+                )
+                
+                state = await self._request_manager_peer_state(leader_tcp_addr, request)
+                
+                if state:
+                    self._process_manager_state_response(state)
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"State sync from leader complete, transitioning to ACTIVE",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                else:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerError(
+                            message=f"State sync from leader failed, transitioning to ACTIVE anyway",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+        else:
+            # No leader available - we might be the first manager
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message="No leader available for state sync (first manager?), transitioning to ACTIVE",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        
+        # Transition to ACTIVE
+        self._manager_state = ManagerState.ACTIVE
     
     async def _register_with_gates(self) -> None:
         """
@@ -1063,6 +1187,7 @@ class ManagerServer(HealthAwareServer):
                 status.available_cores
                 for status in self._worker_status.values()
             ),
+            state=self._manager_state.value,
         )
     
     async def _gate_heartbeat_loop(self) -> None:

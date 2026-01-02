@@ -3374,22 +3374,24 @@ gate = GateServer(
 
 ## Known Limitations & Future Work
 
-### New Manager Join Process (Partially Implemented)
+### New Manager Join Process (✅ Implemented)
 
-The architecture document describes a "SYNCING" state for new managers, but this is not fully implemented.
+New managers join the cluster in a SYNCING state before becoming ACTIVE:
 
-**Documented flow (not yet implemented)**:
-1. New manager joins SWIM cluster
-2. State = SYNCING (not counted in quorum)
-3. Request state sync from leader
-4. Apply state snapshot
-5. State = ACTIVE (now in quorum)
+**Implementation**:
+1. New manager joins SWIM cluster → State = SYNCING
+2. SYNCING managers are NOT counted in quorum (`_has_quorum_available()` returns false)
+3. Manager starts leader election
+4. If leader: immediately transitions to ACTIVE (syncs state via `_on_manager_become_leader`)
+5. If not leader: requests state sync from current leader via `_complete_startup_sync()`
+6. After sync completes (or times out): State = ACTIVE → now counted in quorum
 
-**Current implementation**:
-- Manager joins SWIM and immediately participates
-- When becoming leader, syncs from workers AND peer managers
-- No explicit SYNCING state (implicit during sync)
-- Quorum includes new manager immediately (may be safe due to term-based fencing)
+**Key Components**:
+- `ManagerState` enum: SYNCING, ACTIVE, DRAINING
+- `_manager_state` field tracks current state
+- `ManagerHeartbeat.state` field broadcasts state to peers
+- `_complete_startup_sync()` handles non-leader state sync on startup
+- `_has_quorum_available()` excludes SYNCING managers from quorum count
 
 ### Quorum Timeout Handling (Partial)
 

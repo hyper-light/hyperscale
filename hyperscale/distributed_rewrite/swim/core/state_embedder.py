@@ -155,6 +155,7 @@ class ManagerStateEmbedder:
         get_active_workflows: Callable returning active workflow count.
         get_worker_count: Callable returning registered worker count.
         get_available_cores: Callable returning total available cores.
+        get_manager_state: Callable returning ManagerState value (syncing/active).
         on_worker_heartbeat: Callable to handle received WorkerHeartbeat.
         on_manager_heartbeat: Callable to handle received ManagerHeartbeat from peers.
         on_gate_heartbeat: Callable to handle received GateHeartbeat from gates.
@@ -171,6 +172,7 @@ class ManagerStateEmbedder:
     on_worker_heartbeat: Callable[[Any, tuple[str, int]], None]
     on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
+    get_manager_state: Callable[[], str] | None = None
     
     def get_state(self) -> bytes | None:
         """Get ManagerHeartbeat to embed in SWIM messages."""
@@ -184,6 +186,7 @@ class ManagerStateEmbedder:
             active_workflows=self.get_active_workflows(),
             worker_count=self.get_worker_count(),
             available_cores=self.get_available_cores(),
+            state=self.get_manager_state() if self.get_manager_state else "active",
         )
         return heartbeat.dump()
     
