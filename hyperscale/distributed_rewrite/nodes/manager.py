@@ -27,6 +27,9 @@ import secrets
 import time
 from typing import Any
 
+import networkx
+
+from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import UDPServer, ManagerStateEmbedder
@@ -138,6 +141,10 @@ class ManagerServer(UDPServer):
         self._workflow_retries: dict[str, tuple[int, bytes, set[str]]] = {}
         self._max_workflow_retries = max_workflow_retries
         self._workflow_timeout = workflow_timeout
+        
+        # Workflow completion events for dependency tracking
+        # Maps workflow_id -> asyncio.Event (set when workflow completes)
+        self._workflow_completion_events: dict[str, asyncio.Event] = {}
         
         # Fencing tokens for at-most-once
         self._fence_token = 0
@@ -707,6 +714,11 @@ class ManagerServer(UDPServer):
                 elif progress.status == WorkflowStatus.COMPLETED.value:
                     # Clean up retry tracking on success
                     self._workflow_retries.pop(progress.workflow_id, None)
+                    
+                    # Signal completion for dependency tracking
+                    completion_event = self._workflow_completion_events.get(progress.workflow_id)
+                    if completion_event:
+                        completion_event.set()
             
             return b'ok'
             
@@ -1057,6 +1069,7 @@ class ManagerServer(UDPServer):
         - The job itself from _jobs
         - All workflow assignments for this job
         - All workflow retries for this job
+        - All workflow completion events for this job
         """
         # Remove job
         self._jobs.pop(job_id, None)
@@ -1069,6 +1082,7 @@ class ManagerServer(UDPServer):
         for wf_id in workflow_ids_to_remove:
             self._workflow_assignments.pop(wf_id, None)
             self._workflow_retries.pop(wf_id, None)
+            self._workflow_completion_events.pop(wf_id, None)
     
     # =========================================================================
     # TCP Handlers - Job Submission (from Gate or Client)
@@ -1155,7 +1169,14 @@ class ManagerServer(UDPServer):
         submission: JobSubmission,
         workflows: list,
     ) -> None:
-        """Dispatch all workflows in a job to workers."""
+        """
+        Dispatch workflows respecting dependencies and resource constraints.
+        
+        Builds a DAG from DependentWorkflow dependencies and dispatches
+        in topological order (layer by layer). Workflows in the same layer
+        can run in parallel, but dependent workflows wait for their
+        dependencies to complete before dispatching.
+        """
         import cloudpickle
         
         job = self._jobs.get(submission.job_id)
@@ -1165,62 +1186,199 @@ class ManagerServer(UDPServer):
         job.status = JobStatus.DISPATCHING.value
         self._increment_version()
         
-        for i, workflow in enumerate(workflows):
-            workflow_id = f"{submission.job_id}:{i}"
-            
-            # Select worker
-            worker_id = self._select_worker_for_workflow(submission.vus)
-            if not worker_id:
-                job.status = JobStatus.FAILED.value
-                self._increment_version()
-                return
-            
-            # Create provision request for quorum
-            provision = ProvisionRequest(
-                job_id=submission.job_id,
-                workflow_id=workflow_id,
-                target_worker=worker_id,
-                cores_required=submission.vus,
-                fence_token=self._get_fence_token(),
-                version=self._state_version,
-            )
-            
-            # Request quorum (skip if only one manager)
-            if self._manager_peers:
-                confirmed = await self._request_quorum_confirmation(provision)
-                if not confirmed:
-                    job.status = JobStatus.FAILED.value
-                    self._increment_version()
-                    return
-                
-                # Send commit to all managers
-                await self._send_provision_commit(provision)
-            
-            # Dispatch to worker
-            dispatch = WorkflowDispatch(
-                job_id=submission.job_id,
-                workflow_id=workflow_id,
-                workflow=cloudpickle.dumps(workflow),
-                context=b'{}',  # Context would come from job
-                vus=submission.vus,
-                timeout_seconds=submission.timeout_seconds,
-                fence_token=provision.fence_token,
-            )
-            
-            # Store dispatch bytes for potential retry
-            dispatch_bytes = dispatch.dump()
-            self._workflow_retries[workflow_id] = (0, dispatch_bytes, set())
-            
-            ack = await self._dispatch_workflow_to_worker(worker_id, dispatch)
-            if not ack or not ack.accepted:
-                job.status = JobStatus.FAILED.value
-                self._increment_version()
-                return
-            
-            self._workflow_assignments[workflow_id] = worker_id
+        # Build dependency graph
+        workflow_graph = networkx.DiGraph()
+        workflow_by_name: dict[str, tuple[int, Any]] = {}  # name -> (index, workflow)
+        workflow_cores: dict[str, int] = {}  # name -> cores needed
+        sources: list[str] = []  # Workflows with no dependencies
         
-        job.status = JobStatus.RUNNING.value
-        self._increment_version()
+        for i, workflow in enumerate(workflows):
+            if isinstance(workflow, DependentWorkflow) and len(workflow.dependencies) > 0:
+                # DependentWorkflow wraps the actual workflow
+                name = workflow.dependent_workflow.name
+                workflow_by_name[name] = (i, workflow.dependent_workflow)
+                # Use workflow's vus if specified, otherwise use submission default
+                workflow_cores[name] = getattr(workflow.dependent_workflow, 'vus', submission.vus)
+                workflow_graph.add_node(name)
+                for dep in workflow.dependencies:
+                    workflow_graph.add_edge(dep, name)
+            else:
+                # Regular workflow (no dependencies)
+                name = workflow.name
+                workflow_by_name[name] = (i, workflow)
+                workflow_cores[name] = getattr(workflow, 'vus', submission.vus)
+                workflow_graph.add_node(name)
+                sources.append(name)
+        
+        # If no sources, all workflows have dependencies - find roots
+        if not sources:
+            # Find nodes with no incoming edges
+            for node in workflow_graph.nodes():
+                if workflow_graph.in_degree(node) == 0:
+                    sources.append(node)
+        
+        # If still no sources, we have a cycle - fail the job
+        if not sources:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Job {submission.job_id} has circular workflow dependencies",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+            job.status = JobStatus.FAILED.value
+            self._increment_version()
+            return
+        
+        # Create completion events for all workflows
+        for name in workflow_by_name:
+            idx, _ = workflow_by_name[name]
+            workflow_id = f"{submission.job_id}:{idx}"
+            self._workflow_completion_events[workflow_id] = asyncio.Event()
+        
+        try:
+            # Dispatch in dependency order using BFS layers
+            for layer in networkx.bfs_layers(workflow_graph, sources):
+                # Wait for dependencies of this layer to complete
+                for wf_name in layer:
+                    deps = list(workflow_graph.predecessors(wf_name))
+                    for dep in deps:
+                        dep_idx, _ = workflow_by_name.get(dep, (None, None))
+                        if dep_idx is not None:
+                            dep_workflow_id = f"{submission.job_id}:{dep_idx}"
+                            dep_event = self._workflow_completion_events.get(dep_workflow_id)
+                            if dep_event:
+                                # Wait for dependency to complete
+                                try:
+                                    await asyncio.wait_for(
+                                        dep_event.wait(),
+                                        timeout=submission.timeout_seconds,
+                                    )
+                                except asyncio.TimeoutError:
+                                    self._task_runner.run(
+                                        self._udp_logger.log,
+                                        ServerError(
+                                            message=f"Timeout waiting for dependency {dep} to complete",
+                                            node_host=self._host,
+                                            node_port=self._tcp_port,
+                                            node_id=self._node_id.short,
+                                        ),
+                                    )
+                                    job.status = JobStatus.TIMEOUT.value
+                                    self._increment_version()
+                                    return
+                
+                # Dispatch all workflows in this layer (can run in parallel)
+                dispatch_tasks = []
+                for wf_name in layer:
+                    idx, wf = workflow_by_name[wf_name]
+                    cores_needed = workflow_cores[wf_name]
+                    dispatch_tasks.append(
+                        self._dispatch_single_workflow(
+                            submission, idx, wf, cores_needed, cloudpickle
+                        )
+                    )
+                
+                # Wait for all dispatches in this layer
+                results = await asyncio.gather(*dispatch_tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerError(
+                                message=f"Workflow dispatch failed: {result}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            ),
+                        )
+                        job.status = JobStatus.FAILED.value
+                        self._increment_version()
+                        return
+                    elif result is False:
+                        # Dispatch failed
+                        job.status = JobStatus.FAILED.value
+                        self._increment_version()
+                        return
+            
+            job.status = JobStatus.RUNNING.value
+            self._increment_version()
+            
+        finally:
+            # Cleanup will happen when job completes
+            pass
+    
+    async def _dispatch_single_workflow(
+        self,
+        submission: JobSubmission,
+        idx: int,
+        workflow: Any,
+        cores_needed: int,
+        cloudpickle,
+    ) -> bool:
+        """
+        Dispatch a single workflow to a worker.
+        
+        Returns True if dispatch succeeded, False otherwise.
+        """
+        workflow_id = f"{submission.job_id}:{idx}"
+        
+        # Select worker with sufficient capacity
+        worker_id = self._select_worker_for_workflow(cores_needed)
+        if not worker_id:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"No worker with {cores_needed} available cores for {workflow_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
+            return False
+        
+        # Create provision request for quorum
+        provision = ProvisionRequest(
+            job_id=submission.job_id,
+            workflow_id=workflow_id,
+            target_worker=worker_id,
+            cores_required=cores_needed,
+            fence_token=self._get_fence_token(),
+            version=self._state_version,
+        )
+        
+        # Request quorum (skip if only one manager)
+        if self._manager_peers:
+            confirmed = await self._request_quorum_confirmation(provision)
+            if not confirmed:
+                return False
+            
+            # Send commit to all managers
+            await self._send_provision_commit(provision)
+        
+        # Dispatch to worker
+        dispatch = WorkflowDispatch(
+            job_id=submission.job_id,
+            workflow_id=workflow_id,
+            workflow=cloudpickle.dumps(workflow),
+            context=b'{}',  # Context would come from job
+            vus=cores_needed,
+            timeout_seconds=submission.timeout_seconds,
+            fence_token=provision.fence_token,
+        )
+        
+        # Store dispatch bytes for potential retry
+        dispatch_bytes = dispatch.dump()
+        self._workflow_retries[workflow_id] = (0, dispatch_bytes, set())
+        
+        ack = await self._dispatch_workflow_to_worker(worker_id, dispatch)
+        if not ack or not ack.accepted:
+            return False
+        
+        self._workflow_assignments[workflow_id] = worker_id
+        return True
     
     # =========================================================================
     # TCP Handlers - Quorum
