@@ -915,14 +915,21 @@ class ManagerServer(UDPServer):
                 continue
             if status.state != WorkerState.HEALTHY.value:
                 continue
-            if status.available_cores >= vus_needed:
-                # Check SWIM membership - only select workers that are ALIVE
-                node_state = self._incarnation_tracker.get_node_state((
-                    self._workers[node_id].node.host,
-                    self._workers[node_id].node.port,
-                ))
-                if node_state and node_state.status == b'OK':
-                    eligible.append(node_id)
+            if status.available_cores < vus_needed:
+                continue
+            
+            # Check worker registration exists
+            worker_reg = self._workers.get(node_id)
+            if not worker_reg:
+                continue
+            
+            # Check SWIM membership - only select workers that are ALIVE
+            node_state = self._incarnation_tracker.get_node_state((
+                worker_reg.node.host,
+                worker_reg.node.port,
+            ))
+            if node_state and node_state.status == b'OK':
+                eligible.append(node_id)
         
         if not eligible:
             return None
