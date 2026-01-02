@@ -4235,6 +4235,45 @@ test_worker_register_checks_circuit()
 test_worker_register_records_circuit()
 
 
+@test("Worker: _send_progress_update has retry parameters")
+def test_worker_progress_has_retry_params():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    sig = inspect.signature(WorkerServer._send_progress_update)
+    params = list(sig.parameters.keys())
+    
+    assert 'max_retries' in params, \
+        "_send_progress_update should have max_retries parameter"
+    assert 'base_delay' in params, \
+        "_send_progress_update should have base_delay parameter"
+
+
+@test("Worker: _send_progress_update uses exponential backoff")
+def test_worker_progress_uses_backoff():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._send_progress_update)
+    
+    # Should have retry loop
+    assert "for attempt in range" in source, \
+        "_send_progress_update should have retry loop"
+    
+    # Should have exponential backoff
+    assert "2 ** attempt" in source or "2**attempt" in source, \
+        "_send_progress_update should use exponential backoff"
+    
+    # Should sleep between retries
+    assert "asyncio.sleep" in source, \
+        "_send_progress_update should sleep between retries"
+
+
+# Run additional Worker Retry tests
+test_worker_progress_has_retry_params()
+test_worker_progress_uses_backoff()
+
+
 # =============================================================================
 # Summary
 # =============================================================================

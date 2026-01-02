@@ -1117,8 +1117,28 @@ class WorkerServer(HealthAwareServer):
             except Exception:
                 pass
     
-    async def _send_progress_update(self, progress: WorkflowProgress) -> None:
-        """Send a progress update to the primary manager and process ack."""
+    async def _send_progress_update(
+        self,
+        progress: WorkflowProgress,
+        max_retries: int = 2,
+        base_delay: float = 0.2,
+    ) -> None:
+        """
+        Send a progress update to the primary manager and process ack.
+        
+        Uses limited retries with exponential backoff:
+        - Progress updates happen frequently, so we keep retries short
+        - Attempt 1: immediate
+        - Attempt 2: 0.2s delay
+        - Attempt 3: 0.4s delay
+        
+        Circuit breaker prevents attempts when managers are unreachable.
+        
+        Args:
+            progress: Workflow progress to send
+            max_retries: Maximum retry attempts (default 2)
+            base_delay: Base delay for exponential backoff (default 0.2s)
+        """
         # Check circuit breaker first
         if self._is_manager_circuit_open():
             return  # Fail fast - don't attempt communication
@@ -1127,23 +1147,31 @@ class WorkerServer(HealthAwareServer):
         if not manager_addr:
             return
         
-        try:
-            response = await self.send_tcp(
-                manager_addr,
-                "workflow_progress",
-                progress.dump(),
-                timeout=1.0,
-            )
-            
-            # Process ack to update manager topology
-            if response and isinstance(response, bytes) and response != b'error':
-                self._process_workflow_progress_ack(response)
-                self._manager_circuit.record_success()
-            else:
-                self._manager_circuit.record_error()
+        for attempt in range(max_retries + 1):
+            try:
+                response = await self.send_tcp(
+                    manager_addr,
+                    "workflow_progress",
+                    progress.dump(),
+                    timeout=1.0,
+                )
                 
-        except Exception:
-            self._manager_circuit.record_error()
+                # Process ack to update manager topology
+                if response and isinstance(response, bytes) and response != b'error':
+                    self._process_workflow_progress_ack(response)
+                    self._manager_circuit.record_success()
+                    return  # Success
+                    
+            except Exception:
+                pass
+            
+            # Exponential backoff before retry (except after last attempt)
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+        
+        # All retries exhausted
+        self._manager_circuit.record_error()
     
     async def _send_progress_to_all_managers(self, progress: WorkflowProgress) -> None:
         """Send a progress update to ALL healthy managers and process acks."""
