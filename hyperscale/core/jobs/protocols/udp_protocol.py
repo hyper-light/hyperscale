@@ -502,7 +502,9 @@ class UDPProtocol(Generic[T, K]):
         ssl_ctx.options |= ssl.OP_SINGLE_ECDH_USE
         ssl_ctx.load_cert_chain(cert_path, keyfile=key_path)
         ssl_ctx.load_verify_locations(cafile=cert_path)
-        ssl_ctx.check_hostname = False
+        # Hostname verification: disabled by default for local testing,
+        # set MERCURY_SYNC_TLS_VERIFY_HOSTNAME=true in production
+        ssl_ctx.check_hostname = self.env.MERCURY_SYNC_TLS_VERIFY_HOSTNAME.lower() == "true"
         ssl_ctx.verify_mode = ssl.VerifyMode.CERT_REQUIRED
         ssl_ctx.set_ciphers("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")
 

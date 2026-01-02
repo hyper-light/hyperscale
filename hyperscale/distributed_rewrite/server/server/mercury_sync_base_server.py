@@ -454,7 +454,9 @@ class MercurySyncBaseServer(Generic[T]):
         ssl_ctx.options |= ssl.OP_SINGLE_ECDH_USE
         ssl_ctx.load_cert_chain(self._server_cert_path, keyfile=self._server_key_path)
         ssl_ctx.load_verify_locations(cafile=self._server_cert_path)
-        ssl_ctx.check_hostname = False
+        # Hostname verification: disabled by default for local testing,
+        # set MERCURY_SYNC_TLS_VERIFY_HOSTNAME=true in production
+        ssl_ctx.check_hostname = self.env.MERCURY_SYNC_TLS_VERIFY_HOSTNAME.lower() == "true"
 
 
         match self._verify_cert:
@@ -480,7 +482,9 @@ class MercurySyncBaseServer(Generic[T]):
         ssl_ctx.options |= ssl.OP_SINGLE_ECDH_USE
         ssl_ctx.load_cert_chain(self._server_cert_path, keyfile=self._server_key_path)
         ssl_ctx.load_verify_locations(cafile=self._server_cert_path)
-        ssl_ctx.check_hostname = False
+        # Hostname verification: disabled by default for local testing,
+        # set MERCURY_SYNC_TLS_VERIFY_HOSTNAME=true in production
+        ssl_ctx.check_hostname = self.env.MERCURY_SYNC_TLS_VERIFY_HOSTNAME.lower() == "true"
 
         match self._verify_cert:
             case "REQUIRED":
@@ -650,7 +654,9 @@ class MercurySyncBaseServer(Generic[T]):
         ssl_ctx.options |= ssl.OP_NO_TLSv1_1
         ssl_ctx.load_cert_chain(self._client_cert_path, keyfile=self._client_key_path)
         ssl_ctx.load_verify_locations(cafile=self._client_cert_path)
-        ssl_ctx.check_hostname = False
+        # Hostname verification: disabled by default for local testing,
+        # set MERCURY_SYNC_TLS_VERIFY_HOSTNAME=true in production
+        ssl_ctx.check_hostname = self.env.MERCURY_SYNC_TLS_VERIFY_HOSTNAME.lower() == "true"
         ssl_ctx.verify_mode = ssl.VerifyMode.CERT_REQUIRED
 
 

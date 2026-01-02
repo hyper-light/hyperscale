@@ -24,6 +24,7 @@ class Env(BaseModel):
     MERCURY_SYNC_MAX_REQUEST_CACHE_SIZE: StrictInt = 100
     MERCURY_SYNC_ENABLE_REQUEST_CACHING: StrictBool = False
     MERCURY_SYNC_VERIFY_SSL_CERT: Literal["REQUIRED", "OPTIONAL", "NONE"] = "REQUIRED"
+    MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "false"  # Set to "true" in production
 
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:

@@ -30,6 +30,7 @@ class Env(BaseModel):
     MERCURY_SYNC_CONTEXT_POLL_RATE: StrictStr = "0.1s"
     MERCURY_SYNC_SHUTDOWN_POLL_RATE: StrictStr = "0.1s"
     MERCURY_SYNC_DUPLICATE_JOB_POLICY: Literal["reject", "replace"] = "replace"
+    MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "false"  # Set to "true" in production
 
     @classmethod
     def types_map(self) -> Dict[str, Callable[[str], PrimaryType]]:
