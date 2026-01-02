@@ -696,9 +696,13 @@ class ManagerServer(UDPServer):
                 
                 self._increment_version()
                 
-                # Check if workflow failed and should be retried
+                # Handle workflow completion states
                 if progress.status == WorkflowStatus.FAILED.value:
+                    # Check if workflow should be retried
                     await self._handle_workflow_failure(progress)
+                elif progress.status == WorkflowStatus.COMPLETED.value:
+                    # Clean up retry tracking on success
+                    self._workflow_retries.pop(progress.workflow_id, None)
             
             return b'ok'
             
@@ -728,14 +732,22 @@ class ManagerServer(UDPServer):
         if not current_worker:
             return
         
-        # Get or create retry info
+        # Get retry info (should have been stored on initial dispatch)
         if workflow_id not in self._workflow_retries:
-            # First failure - need to get the original dispatch info
-            # This requires storing it when we first dispatch
-            self._workflow_retries[workflow_id] = (0, b'', {current_worker})
+            self._udp_logger.log(
+                ServerError(
+                    message=f"No retry info for failed workflow {workflow_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
         
         retry_count, original_dispatch, failed_workers = self._workflow_retries[workflow_id]
         failed_workers.add(current_worker)
+        # Update the retry info with the new failed worker
+        self._workflow_retries[workflow_id] = (retry_count, original_dispatch, failed_workers)
         
         # Check if we've exceeded max retries
         if retry_count >= self._max_workflow_retries:
@@ -786,6 +798,21 @@ class ManagerServer(UDPServer):
         if not workflow_progress:
             return False
         
+        # Get stored dispatch data from retry info
+        retry_info = self._workflow_retries.get(workflow_id)
+        if not retry_info or not retry_info[1]:
+            self._udp_logger.log(
+                ServerError(
+                    message=f"No dispatch data for workflow {workflow_id} retry",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+        
+        original_dispatch_bytes = retry_info[1]
+        
         # Select a new worker
         new_worker = self._select_worker_for_workflow_excluding(
             vus_needed=1,  # Single core per workflow
@@ -803,24 +830,11 @@ class ManagerServer(UDPServer):
             )
             return False
         
-        # Get the pending provision for this workflow (contains dispatch info)
-        provision = self._pending_provisions.get(workflow_id)
-        if not provision:
-            self._udp_logger.log(
-                ServerError(
-                    message=f"No provision info for workflow {workflow_id} retry",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return False
-        
         # Create new dispatch with new fence token
         new_fence_token = self._get_fence_token()
         
-        # Update tracking
-        self._workflow_retries[workflow_id] = (retry_count, b'', failed_workers)
+        # Update tracking - preserve original dispatch bytes
+        self._workflow_retries[workflow_id] = (retry_count, original_dispatch_bytes, failed_workers)
         self._workflow_assignments[workflow_id] = new_worker
         
         self._udp_logger.log(
@@ -832,13 +846,49 @@ class ManagerServer(UDPServer):
             )
         )
         
-        # Note: The actual re-dispatch would need the original workflow bytes
-        # which should be stored in the pending provision or retry info.
-        # For now, we update the assignment and the next status check will
-        # trigger the dispatch. A full implementation would store and replay
-        # the original WorkflowDispatch.
-        
-        return True
+        # Re-dispatch the workflow to the new worker
+        try:
+            # Deserialize the original dispatch and update fence token
+            original_dispatch = WorkflowDispatch.load(original_dispatch_bytes)
+            new_dispatch = WorkflowDispatch(
+                job_id=original_dispatch.job_id,
+                workflow_id=original_dispatch.workflow_id,
+                workflow=original_dispatch.workflow,
+                context=original_dispatch.context,
+                vus=original_dispatch.vus,
+                timeout_seconds=original_dispatch.timeout_seconds,
+                fence_token=new_fence_token,
+            )
+            
+            # Get worker address
+            worker_reg = self._workers.get(new_worker)
+            if not worker_reg:
+                return False
+            
+            worker_addr = (worker_reg.node.host, worker_reg.node.port)
+            
+            # Send dispatch
+            response = await self.send_tcp(
+                worker_addr,
+                "workflow_dispatch",
+                new_dispatch.dump(),
+                timeout=5.0,
+            )
+            
+            if response:
+                ack = WorkflowDispatchAck.load(response)
+                if ack.accepted:
+                    return True
+                else:
+                    # Worker rejected, add to failed set
+                    failed_workers.add(new_worker)
+                    return False
+            
+            return False
+            
+        except Exception as e:
+            await self.handle_exception(e, f"retry_workflow_{workflow_id}")
+            return False
     
     def _select_worker_for_workflow_excluding(
         self,
@@ -1130,6 +1180,10 @@ class ManagerServer(UDPServer):
                 timeout_seconds=submission.timeout_seconds,
                 fence_token=provision.fence_token,
             )
+            
+            # Store dispatch bytes for potential retry
+            dispatch_bytes = dispatch.dump()
+            self._workflow_retries[workflow_id] = (0, dispatch_bytes, set())
             
             ack = await self._dispatch_workflow_to_worker(worker_id, dispatch)
             if not ack or not ack.accepted:
