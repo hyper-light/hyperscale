@@ -239,6 +239,7 @@ class GateStateEmbedder:
         is_leader: Callable returning leadership status.
         get_term: Callable returning current leadership term.
         get_state_version: Callable returning state version.
+        get_gate_state: Callable returning GateState value.
         get_active_jobs: Callable returning active job count.
         get_active_datacenters: Callable returning active datacenter count.
         get_manager_count: Callable returning registered manager count.
@@ -250,6 +251,7 @@ class GateStateEmbedder:
     is_leader: Callable[[], bool]
     get_term: Callable[[], int]
     get_state_version: Callable[[], int]
+    get_gate_state: Callable[[], str]
     get_active_jobs: Callable[[], int]
     get_active_datacenters: Callable[[], int]
     get_manager_count: Callable[[], int]
@@ -264,6 +266,7 @@ class GateStateEmbedder:
             is_leader=self.is_leader(),
             term=self.get_term(),
             version=self.get_state_version(),
+            state=self.get_gate_state(),
             active_jobs=self.get_active_jobs(),
             active_datacenters=self.get_active_datacenters(),
             manager_count=self.get_manager_count(),

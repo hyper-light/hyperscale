@@ -32,6 +32,7 @@ from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
     GateInfo,
+    GateState,
     GateHeartbeat,
     ManagerRegistrationResponse,
     JobProgressAck,
@@ -54,6 +55,14 @@ from hyperscale.distributed_rewrite.models import (
     DatacenterStatus,
     UpdateTier,
     restricted_loads,
+)
+from hyperscale.distributed_rewrite.swim.core import (
+    QuorumError,
+    QuorumUnavailableError,
+    QuorumTimeoutError,
+    QuorumCircuitOpenError,
+    ErrorStats,
+    CircuitState,
 )
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
@@ -147,6 +156,18 @@ class GateServer(HealthAwareServer):
         # State versioning (local gate state version)
         self._state_version = 0
         
+        # Gate state for new gate join process
+        # Gates start in SYNCING and transition to ACTIVE after state sync
+        self._gate_state = GateState.SYNCING
+        
+        # Quorum circuit breaker
+        # Tracks quorum operation failures and implements fail-fast
+        self._quorum_circuit = ErrorStats(
+            error_threshold=3,
+            window_seconds=30.0,
+            half_open_after=10.0,
+        )
+        
         # Configuration
         self._lease_timeout = lease_timeout
         
@@ -161,6 +182,7 @@ class GateServer(HealthAwareServer):
             is_leader=self.is_leader,
             get_term=lambda: self._leader_election.state.current_term,
             get_state_version=lambda: self._state_version,
+            get_gate_state=lambda: self._gate_state.value,
             get_active_jobs=lambda: len(self._jobs),
             get_active_datacenters=lambda: len([
                 dc for dc, status in self._datacenter_status.items()
@@ -1026,9 +1048,258 @@ class GateServer(HealthAwareServer):
             )
         # Tier 2 and 3 are handled by batch loop and on-demand requests
     
+    # =========================================================================
+    # Gate State and Quorum Management
+    # =========================================================================
+    
+    def _quorum_size(self) -> int:
+        """
+        Calculate required quorum size for gate operations.
+        
+        Quorum = (total_gates // 2) + 1 (simple majority)
+        
+        Returns at least 1 for single-gate deployments.
+        """
+        total_gates = len(self._active_gate_peers) + 1  # Include self
+        return (total_gates // 2) + 1
+    
+    def _has_quorum_available(self) -> bool:
+        """
+        Check if we have enough active gates to achieve quorum.
+        
+        Returns True if:
+        1. This gate is ACTIVE (SYNCING gates don't participate in quorum)
+        2. The number of active gates (including self) >= required quorum size
+        """
+        # SYNCING gates don't participate in quorum operations
+        if self._gate_state != GateState.ACTIVE:
+            return False
+        
+        active_count = len(self._active_gate_peers) + 1  # Include self
+        return active_count >= self._quorum_size()
+    
+    def get_quorum_status(self) -> dict:
+        """
+        Get current quorum and circuit breaker status.
+        
+        Returns a dict with:
+        - active_gates: Number of active gates
+        - required_quorum: Quorum size needed
+        - quorum_available: Whether quorum is achievable
+        - circuit_state: Current circuit breaker state
+        - circuit_failures: Recent failure count
+        - circuit_error_rate: Error rate over window
+        - gate_state: Current gate state (syncing/active/draining)
+        """
+        active_count = len(self._active_gate_peers) + 1
+        required_quorum = self._quorum_size()
+        
+        return {
+            "active_gates": active_count,
+            "required_quorum": required_quorum,
+            "quorum_available": self._has_quorum_available(),
+            "circuit_state": self._quorum_circuit.circuit_state.name,
+            "circuit_failures": self._quorum_circuit.error_count,
+            "circuit_error_rate": self._quorum_circuit.error_rate,
+            "gate_state": self._gate_state.value,
+        }
+    
+    async def _complete_startup_sync(self) -> None:
+        """
+        Complete the startup state sync and transition to ACTIVE.
+        
+        If this gate is the leader, it becomes ACTIVE immediately.
+        
+        If not leader, requests state sync from the current leader,
+        then transitions to ACTIVE.
+        """
+        if self.is_leader():
+            # Leader becomes ACTIVE immediately
+            self._gate_state = GateState.ACTIVE
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message="Gate is LEADER, transitioning to ACTIVE state",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+        
+        # Not leader - request state sync from leader
+        leader_addr = self.get_current_leader()
+        
+        if leader_addr:
+            # Find TCP address for leader (UDP -> TCP mapping)
+            leader_tcp_addr = self._gate_udp_to_tcp.get(leader_addr)
+            
+            if leader_tcp_addr:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Gate is SYNCING, requesting state from leader {leader_tcp_addr}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                
+                # Request state sync with retry
+                sync_success = await self._sync_state_from_gate_peer(leader_tcp_addr)
+                
+                if sync_success:
+                    self._gate_state = GateState.ACTIVE
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message="Gate synced state from leader, transitioning to ACTIVE",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                else:
+                    # Sync failed but we can still become active
+                    # (We'll get state updates via SWIM and progress reports)
+                    self._gate_state = GateState.ACTIVE
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message="Gate sync from leader failed, becoming ACTIVE anyway (will sync via updates)",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+            else:
+                # No TCP address for leader - become active anyway
+                self._gate_state = GateState.ACTIVE
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"No TCP address for leader {leader_addr}, becoming ACTIVE",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+        else:
+            # No leader yet - become active (we might be the first gate)
+            self._gate_state = GateState.ACTIVE
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message="No leader elected yet, becoming ACTIVE",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+    
+    async def _sync_state_from_gate_peer(
+        self,
+        peer_tcp_addr: tuple[str, int],
+    ) -> bool:
+        """
+        Request and apply state snapshot from a peer gate.
+        
+        Uses exponential backoff for retries.
+        
+        Returns True if sync succeeded, False otherwise.
+        """
+        max_retries = 3
+        base_delay = 0.5
+        
+        for attempt in range(max_retries):
+            try:
+                request = StateSyncRequest(
+                    node_id=self._node_id.full,
+                    datacenter=self._node_id.datacenter,
+                    current_version=self._state_version,
+                )
+                
+                result = await self.send_tcp(
+                    peer_tcp_addr,
+                    "state_sync",
+                    request.dump(),
+                    timeout=5.0,
+                )
+                
+                if isinstance(result, bytes) and len(result) > 0:
+                    response = StateSyncResponse.load(result)
+                    if response.success and response.snapshot:
+                        snapshot = GateStateSnapshot.load(response.snapshot)
+                        await self._apply_gate_state_snapshot(snapshot)
+                        return True
+                        
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"State sync attempt {attempt + 1} failed: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            
+            # Exponential backoff
+            delay = base_delay * (2 ** attempt)
+            await asyncio.sleep(delay)
+        
+        return False
+    
+    async def _apply_gate_state_snapshot(
+        self,
+        snapshot: GateStateSnapshot,
+    ) -> None:
+        """
+        Apply a state snapshot received from a peer gate.
+        
+        Merges job state that we don't already have.
+        """
+        # Merge jobs we don't have
+        for job_id, job_status in snapshot.jobs.items():
+            if job_id not in self._jobs:
+                self._jobs[job_id] = job_status
+        
+        # Update state version if snapshot is newer
+        if snapshot.version > self._state_version:
+            self._state_version = snapshot.version
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Applied state snapshot from {snapshot.node_id}: {len(snapshot.jobs)} jobs",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+    
     async def start(self) -> None:
-        """Start the gate server."""
+        """
+        Start the gate server.
+        
+        New Gate Join Process:
+        1. Gate joins SWIM cluster → State = SYNCING
+        2. Start leader election
+        3. If leader: immediately become ACTIVE
+        4. If not leader: request state sync from leader, then become ACTIVE
+        5. SYNCING gates are NOT counted in quorum
+        """
         await super().start()
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Gate starting in SYNCING state (not in quorum yet)",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
         
         # Join SWIM cluster with other gates (UDP healthchecks)
         for peer_udp in self._gate_udp_peers:
@@ -1045,6 +1316,12 @@ class GateServer(HealthAwareServer):
         # Start leader election (uses SWIM membership info)
         await self.start_leader_election()
         
+        # Wait a short time for leader election to stabilize
+        await asyncio.sleep(0.5)
+        
+        # Sync state and transition to ACTIVE
+        await self._complete_startup_sync()
+        
         # Start background cleanup tasks via TaskRunner
         self._task_runner.run(self._lease_cleanup_loop)
         self._task_runner.run(self._job_cleanup_loop)
@@ -1055,7 +1332,8 @@ class GateServer(HealthAwareServer):
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Gate started with {len(self._datacenter_managers)} configured DCs, SWIM healthcheck active",
+                message=f"Gate started with {len(self._datacenter_managers)} configured DCs, " +
+                        f"state={self._gate_state.value}, SWIM healthcheck active",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -1414,6 +1692,24 @@ class GateServer(HealthAwareServer):
                 )
                 return ack.dump()
             
+            # Check quorum circuit breaker (fail-fast)
+            if self._quorum_circuit.circuit_state == CircuitState.OPEN:
+                ack = JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="Quorum circuit breaker is OPEN - too many recent failures",
+                )
+                return ack.dump()
+            
+            # Check if quorum is available (multi-gate deployments)
+            if len(self._active_gate_peers) > 0 and not self._has_quorum_available():
+                ack = JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=f"Quorum unavailable: {len(self._active_gate_peers) + 1} gates, need {self._quorum_size()}",
+                )
+                return ack.dump()
+            
             # Select datacenters
             target_dcs = self._select_datacenters(
                 submission.datacenter_count,
@@ -1443,6 +1739,9 @@ class GateServer(HealthAwareServer):
             
             self._increment_version()
             
+            # Record success for circuit breaker
+            self._quorum_circuit.record_success()
+            
             # Dispatch to each DC (in background via TaskRunner)
             self._task_runner.run(
                 self._dispatch_job_to_datacenters, submission, target_dcs
@@ -1455,6 +1754,14 @@ class GateServer(HealthAwareServer):
             )
             return ack.dump()
             
+        except QuorumError as e:
+            self._quorum_circuit.record_error()
+            ack = JobAck(
+                job_id=submission.job_id if 'submission' in dir() else "unknown",
+                accepted=False,
+                error=str(e),
+            )
+            return ack.dump()
         except Exception as e:
             await self.handle_exception(e, "receive_job_submission")
             ack = JobAck(
@@ -1516,7 +1823,8 @@ class GateServer(HealthAwareServer):
         )
         
         if not successful_dcs:
-            # All DCs failed (all UNHEALTHY)
+            # All DCs failed (all UNHEALTHY) - record for circuit breaker
+            self._quorum_circuit.record_error()
             job.status = JobStatus.FAILED.value
             job.failed_datacenters = len(failed_dcs)
             self._task_runner.run(
@@ -1529,6 +1837,8 @@ class GateServer(HealthAwareServer):
                 )
             )
         else:
+            # Successful dispatch - record success for circuit breaker
+            self._quorum_circuit.record_success()
             job.status = JobStatus.RUNNING.value
             job.completed_datacenters = 0
             job.failed_datacenters = len(failed_dcs)

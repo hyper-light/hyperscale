@@ -71,6 +71,25 @@ class ManagerState(str, Enum):
     DRAINING = "draining"        # Not accepting new work, draining existing
 
 
+class GateState(str, Enum):
+    """
+    State of a gate node in the cluster.
+    
+    New Gate Join Process:
+    1. Gate joins SWIM cluster → State = SYNCING
+    2. SYNCING gates are NOT counted in quorum
+    3. Request state sync from leader (if not leader)
+    4. Apply state snapshot
+    5. State = ACTIVE → now counted in quorum
+    
+    This prevents new/recovering gates from affecting quorum
+    until they have synchronized state from the cluster.
+    """
+    SYNCING = "syncing"          # Joined cluster, syncing state (not in quorum)
+    ACTIVE = "active"            # Fully operational (counted in quorum)
+    DRAINING = "draining"        # Not accepting new work, draining existing
+
+
 class DatacenterHealth(str, Enum):
     """
     Health classification for datacenter routing decisions.
@@ -198,6 +217,7 @@ class GateHeartbeat(Message):
     is_leader: bool              # Is this the leader gate?
     term: int                    # Leadership term
     version: int                 # State version
+    state: str                   # GateState value (syncing, active, draining)
     active_jobs: int             # Number of active global jobs
     active_datacenters: int      # Number of datacenters with active work
     manager_count: int           # Number of registered managers

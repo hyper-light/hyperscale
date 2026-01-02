@@ -20,6 +20,7 @@ from .distributed import (
     WorkflowStatus as WorkflowStatus,
     WorkerState as WorkerState,
     ManagerState as ManagerState,
+    GateState as GateState,
     DatacenterHealth as DatacenterHealth,
     UpdateTier as UpdateTier,
     # Node identity (Worker <-> Manager)

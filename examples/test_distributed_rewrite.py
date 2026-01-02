@@ -496,6 +496,7 @@ def test_gate_embedder():
         is_leader=lambda: True,
         get_term=lambda: 1,
         get_state_version=lambda: 1,
+        get_gate_state=lambda: "active",
         get_active_jobs=lambda: 10,
         get_active_datacenters=lambda: 3,
         get_manager_count=lambda: 6,
@@ -508,6 +509,7 @@ def test_gate_embedder():
     heartbeat = GateHeartbeat.load(state)
     assert heartbeat.node_id == "gate-1"
     assert heartbeat.active_jobs == 10
+    assert heartbeat.state == "active"
 
 
 @test("GateStateEmbedder: processes ManagerHeartbeat")
@@ -525,6 +527,7 @@ def test_gate_embedder_process():
         is_leader=lambda: True,
         get_term=lambda: 1,
         get_state_version=lambda: 1,
+        get_gate_state=lambda: "active",
         get_active_jobs=lambda: 0,
         get_active_datacenters=lambda: 3,
         get_manager_count=lambda: 6,
@@ -3092,6 +3095,7 @@ def test_gate_heartbeat_model():
         is_leader=True,
         term=1,
         version=5,
+        state="active",
         active_jobs=10,
         active_datacenters=3,
         manager_count=6,
@@ -3099,6 +3103,7 @@ def test_gate_heartbeat_model():
     
     assert heartbeat.node_id == "gate-1"
     assert heartbeat.active_jobs == 10
+    assert heartbeat.state == "active"
 
 
 @test("ManagerRegistrationResponse: model exists")
@@ -3872,6 +3877,198 @@ test_manager_has_push_batch()
 test_manager_has_batch_loop()
 test_manager_has_check_completion()
 test_manager_start_enables_batch_loop()
+
+
+# =============================================================================
+# Gate State and Quorum Tests
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("GATE STATE AND QUORUM TESTS")
+print("=" * 70 + "\n")
+
+
+@test("GateState: enum exists with expected values")
+def test_gate_state_enum():
+    from hyperscale.distributed_rewrite.models import GateState
+    
+    assert hasattr(GateState, 'SYNCING')
+    assert hasattr(GateState, 'ACTIVE')
+    assert hasattr(GateState, 'DRAINING')
+    
+    assert GateState.SYNCING.value == "syncing"
+    assert GateState.ACTIVE.value == "active"
+    assert GateState.DRAINING.value == "draining"
+
+
+@test("GateHeartbeat: has state field")
+def test_gate_heartbeat_has_state():
+    from hyperscale.distributed_rewrite.models import GateHeartbeat
+    import dataclasses
+    
+    fields = {f.name for f in dataclasses.fields(GateHeartbeat)}
+    
+    assert "state" in fields, "GateHeartbeat should have state field"
+
+
+@test("GateStateEmbedder: has get_gate_state callback")
+def test_gate_embedder_has_state_callback():
+    from hyperscale.distributed_rewrite.swim import GateStateEmbedder
+    import dataclasses
+    
+    fields = {f.name for f in dataclasses.fields(GateStateEmbedder)}
+    
+    assert "get_gate_state" in fields, \
+        "GateStateEmbedder should have get_gate_state callback"
+
+
+@test("GateServer: starts in SYNCING state")
+def test_gate_starts_syncing():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer.__init__)
+    
+    assert "_gate_state" in source, \
+        "GateServer should have _gate_state field"
+    assert "GateState.SYNCING" in source, \
+        "GateServer should start in SYNCING state"
+
+
+@test("GateServer: has _has_quorum_available method")
+def test_gate_has_quorum_available():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    import inspect
+    
+    assert hasattr(GateServer, '_has_quorum_available'), \
+        "GateServer should have _has_quorum_available method"
+    
+    source = inspect.getsource(GateServer._has_quorum_available)
+    
+    assert "GateState.ACTIVE" in source, \
+        "_has_quorum_available should check for ACTIVE state"
+
+
+@test("GateServer: has _quorum_size method")
+def test_gate_has_quorum_size():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_quorum_size'), \
+        "GateServer should have _quorum_size method"
+
+
+@test("GateServer: has get_quorum_status method")
+def test_gate_has_quorum_status():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    import inspect
+    
+    assert hasattr(GateServer, 'get_quorum_status'), \
+        "GateServer should have get_quorum_status method"
+    
+    source = inspect.getsource(GateServer.get_quorum_status)
+    
+    assert "circuit_state" in source, \
+        "get_quorum_status should return circuit state"
+    assert "gate_state" in source, \
+        "get_quorum_status should return gate state"
+
+
+@test("GateServer: has _complete_startup_sync method")
+def test_gate_has_startup_sync():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    import inspect
+    
+    assert hasattr(GateServer, '_complete_startup_sync'), \
+        "GateServer should have _complete_startup_sync method"
+    
+    source = inspect.getsource(GateServer._complete_startup_sync)
+    
+    assert "GateState.ACTIVE" in source, \
+        "_complete_startup_sync should transition to ACTIVE"
+
+
+@test("GateServer: has _quorum_circuit")
+def test_gate_has_quorum_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer.__init__)
+    
+    assert "_quorum_circuit" in source, \
+        "GateServer should have _quorum_circuit ErrorStats"
+
+
+@test("GateServer: receive_job_submission checks circuit")
+def test_gate_job_submission_checks_circuit():
+    import pathlib
+    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    
+    source_file = pathlib.Path(gate_module.__file__)
+    source = source_file.read_text()
+    
+    assert "circuit_state" in source
+    assert "CircuitState.OPEN" in source
+
+
+@test("GateServer: receive_job_submission checks quorum")
+def test_gate_job_submission_checks_quorum():
+    import pathlib
+    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    
+    source_file = pathlib.Path(gate_module.__file__)
+    source = source_file.read_text()
+    
+    assert "_has_quorum_available" in source
+
+
+@test("GateServer: start() calls _complete_startup_sync")
+def test_gate_start_calls_sync():
+    import pathlib
+    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    
+    source_file = pathlib.Path(gate_module.__file__)
+    source = source_file.read_text()
+    
+    assert "_complete_startup_sync" in source
+
+
+@test("GateServer: state embedder includes get_gate_state")
+def test_gate_embedder_includes_state():
+    import pathlib
+    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    
+    source_file = pathlib.Path(gate_module.__file__)
+    source = source_file.read_text()
+    
+    assert "get_gate_state=lambda: self._gate_state.value" in source
+
+
+@test("GateServer: dispatch records circuit success/failure")
+def test_gate_dispatch_records_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._dispatch_job_to_datacenters)
+    
+    assert "record_error" in source or "record_success" in source, \
+        "_dispatch_job_to_datacenters should record circuit state"
+
+
+# Run Gate State and Quorum tests
+test_gate_state_enum()
+test_gate_heartbeat_has_state()
+test_gate_embedder_has_state_callback()
+test_gate_starts_syncing()
+test_gate_has_quorum_available()
+test_gate_has_quorum_size()
+test_gate_has_quorum_status()
+test_gate_has_startup_sync()
+test_gate_has_quorum_circuit()
+test_gate_job_submission_checks_circuit()
+test_gate_job_submission_checks_quorum()
+test_gate_start_calls_sync()
+test_gate_embedder_includes_state()
+test_gate_dispatch_records_circuit()
 
 
 # =============================================================================

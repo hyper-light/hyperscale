@@ -3412,6 +3412,44 @@ When quorum cannot be achieved (e.g., too many managers down), operations fail f
 3. Attempt quorum → `QuorumTimeoutError` if timeout without enough confirmations
 4. Record success/failure for circuit breaker state transitions
 
+### New Gate Join Process (✅ Implemented)
+
+Same pattern as managers - gates join in SYNCING state before becoming ACTIVE:
+
+**Implementation**:
+1. New gate joins SWIM cluster → State = SYNCING
+2. SYNCING gates are NOT counted in quorum (`_has_quorum_available()` returns false)
+3. Gate starts leader election
+4. If leader: immediately transitions to ACTIVE
+5. If not leader: requests state sync from current leader via `_complete_startup_sync()`
+6. After sync completes (or times out): State = ACTIVE → now counted in quorum
+
+**Key Components**:
+- `GateState` enum: SYNCING, ACTIVE, DRAINING
+- `_gate_state` field tracks current state
+- `GateHeartbeat.state` field broadcasts state to peers
+- `_complete_startup_sync()` handles non-leader state sync on startup
+- `_has_quorum_available()` excludes SYNCING gates from quorum count
+
+### Gate Quorum Timeout Handling (✅ Implemented)
+
+Gates use the same circuit breaker pattern as managers for fail-fast behavior.
+
+**Implementation**:
+- `_quorum_circuit` ErrorStats instance tracks failures
+- `_quorum_size()` calculates required quorum (majority of gates)
+- `_has_quorum_available()` checks gate state and active peer count
+- `get_quorum_status()` returns circuit state and gate metrics
+- `receive_job_submission()` checks circuit breaker before accepting jobs
+- `_dispatch_job_to_datacenters()` records success/failure for circuit breaker
+
+**Job Submission Flow**:
+1. Check if leader (only leader accepts jobs)
+2. Check circuit breaker state → reject if OPEN
+3. Check quorum availability → reject if insufficient active gates
+4. Select datacenters and dispatch job
+5. Record success/failure for circuit breaker transitions
+
 ### Client Push Notifications (Implemented)
 
 Client push notifications allow Gates and Managers to push job status updates directly to clients, eliminating the need for polling.
@@ -3499,7 +3537,7 @@ Run the test suite:
 python examples/test_distributed_rewrite.py
 ```
 
-Current test coverage: 130+ tests covering:
+Current test coverage: 200+ tests covering:
 - SWIM protocol (probing, suspicion, gossip)
 - Leadership election (pre-voting, flapping)
 - State embedding (heartbeat serialization)
@@ -3515,6 +3553,8 @@ Current test coverage: 130+ tests covering:
 - Smart dispatch with fallback chain
 - Tiered update strategy
 - Client push notifications (JobStatusPush, JobBatchPush)
+- Gate state management (SYNCING/ACTIVE/DRAINING)
+- Gate quorum circuit breaker
 
 ---
 
