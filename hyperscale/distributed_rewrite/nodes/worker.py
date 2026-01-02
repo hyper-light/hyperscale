@@ -105,6 +105,7 @@ class WorkerServer(HealthAwareServer):
         dc_id: str = "default",
         total_cores: int | None = None,
         manager_addrs: list[tuple[str, int]] | None = None,
+        manager_udp_addrs: list[tuple[str, int]] | None = None,
     ):
         # Core capacity (set before super().__init__ so state embedder can access it)
         self._total_cores = total_cores or os.cpu_count() or 1
@@ -120,7 +121,7 @@ class WorkerServer(HealthAwareServer):
         
         # Manager discovery (UDP addresses for SWIM, TCP for data)
         self._manager_addrs = manager_addrs or []  # TCP addresses
-        self._manager_udp_addrs: list[tuple[str, int]] = []  # UDP addresses for SWIM
+        self._manager_udp_addrs = manager_udp_addrs or []  # UDP addresses for SWIM
         self._current_manager: tuple[str, int] | None = None
         
         # Workflow execution state
