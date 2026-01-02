@@ -7,7 +7,9 @@ from .security import (
     RateLimiter as RateLimiter,
     RateLimitExceeded as RateLimitExceeded,
     MessageSizeError as MessageSizeError,
+    AddressValidationError as AddressValidationError,
     validate_message_size as validate_message_size,
+    parse_address as parse_address,
     MAX_MESSAGE_SIZE,
     MAX_DECOMPRESSED_SIZE,
 )

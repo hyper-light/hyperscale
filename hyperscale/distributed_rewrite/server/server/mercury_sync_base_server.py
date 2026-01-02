@@ -43,6 +43,8 @@ from hyperscale.distributed_rewrite.server.protocol import (
     ReplayGuard,
     RateLimiter,
     validate_message_size,
+    parse_address,
+    AddressValidationError,
     MAX_MESSAGE_SIZE,
     MAX_DECOMPRESSED_SIZE,
 )
@@ -992,8 +994,10 @@ class MercurySyncBaseServer(Generic[T]):
 
         await self._udp_clock.ack(clock_time)
 
-        host, port_str = address_bytes.decode().split(':', maxsplit=1)
-        addr = (host, int(port_str))
+        try:
+            addr = parse_address(address_bytes)
+        except AddressValidationError:
+            return  # Silently drop malformed addresses
 
         try:
 
@@ -1045,8 +1049,10 @@ class MercurySyncBaseServer(Generic[T]):
 
             next_time = await self._tcp_clock.update(clock_time)
 
-            host, port_str = address_bytes.decode().split(':', maxsplit=1)
-            addr = (host, int(port_str))
+            try:
+                addr = parse_address(address_bytes)
+            except AddressValidationError:
+                return  # Silently drop malformed addresses
             
             if request_model := self.tcp_server_request_models.get(handler_name):
                 payload = request_model.load(payload)
@@ -1098,16 +1104,17 @@ class MercurySyncBaseServer(Generic[T]):
         next_time = await self._udp_clock.update(clock_time)
         
         try:
-
-            host, port_str = addr.decode().split(':', maxsplit=1)
-            addr = (host, int(port_str))
-
+            parsed_addr = parse_address(addr)
+        except AddressValidationError:
+            return  # Silently drop malformed addresses
+        
+        try:
             if request_models := self.udp_server_request_models.get(handler_name):
                     payload = request_models.load(payload)
 
             handler = self.udp_handlers[handler_name]
             response = await handler(
-                addr,
+                parsed_addr,
                 payload,
                 clock_time,
             )
@@ -1121,19 +1128,17 @@ class MercurySyncBaseServer(Generic[T]):
                 )
             )
 
-            transport.sendto(response_payload, addr)
+            transport.sendto(response_payload, parsed_addr)
 
-        except Exception as error:
-            pass
-
+        except Exception:
+            # Sanitized error response - don't leak internal details
             response_payload = self._encryptor.encrypt(
                 self._compressor.compress(
-                    b's<' + self._udp_addr_slug + b'<' + handler_name + b'<' + str(error) + b'<' + next_time.to_bytes(64),
+                    b's<' + self._udp_addr_slug + b'<' + handler_name + b'<Request processing failed<' + next_time.to_bytes(64),
                 )
             )
 
-            host, port = addr.decode().split(':', maxsplit=1)
-            transport.sendto(response_payload, (host, int(port)))
+            transport.sendto(response_payload, parsed_addr)
 
     async def process_udp_client_response(
         self,
