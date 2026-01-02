@@ -157,6 +157,129 @@ class ManagerServer(UDPServer):
             ),
             on_worker_heartbeat=self._handle_embedded_worker_heartbeat,
         ))
+        
+        # Register leadership callbacks (composition pattern - no override)
+        self.register_on_become_leader(self._on_manager_become_leader)
+        self.register_on_lose_leadership(self._on_manager_lose_leadership)
+    
+    def _on_manager_become_leader(self) -> None:
+        """
+        Called when this manager becomes the leader.
+        
+        Triggers state sync from all known workers to ensure the new leader
+        has the most current state.
+        """
+        # Schedule async state sync via task runner
+        self._task_runner.run(self._sync_state_from_workers)
+    
+    def _on_manager_lose_leadership(self) -> None:
+        """Called when this manager loses leadership."""
+        # Currently no special cleanup needed
+        pass
+    
+    async def _sync_state_from_workers(self) -> None:
+        """
+        Request current state from all registered workers.
+        
+        Called when this manager becomes leader to ensure we have
+        the freshest state from all workers.
+        """
+        if not self._workers:
+            return
+        
+        self._udp_logger.log(
+            ServerInfo(
+                message=f"New leader syncing state from {len(self._workers)} workers",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        # Request state from each registered worker
+        request = StateSyncRequest(
+            requester_id=self._node_id.full,
+            requester_role=NodeRole.MANAGER.value,
+            since_version=0,  # Request full state
+        )
+        
+        sync_tasks = []
+        for node_id, worker_reg in self._workers.items():
+            worker_addr = (worker_reg.node.host, worker_reg.node.port)
+            sync_tasks.append(
+                self._request_worker_state(worker_addr, request)
+            )
+        
+        if sync_tasks:
+            results = await asyncio.gather(*sync_tasks, return_exceptions=True)
+            
+            success_count = sum(
+                1 for r in results
+                if r is not None and not isinstance(r, Exception)
+            )
+            
+            self._udp_logger.log(
+                ServerInfo(
+                    message=f"State sync complete: {success_count}/{len(sync_tasks)} workers responded",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+    
+    async def _request_worker_state(
+        self,
+        worker_addr: tuple[str, int],
+        request: StateSyncRequest,
+    ) -> WorkerStateSnapshot | None:
+        """Request state from a single worker."""
+        try:
+            response = await self.send_tcp(
+                worker_addr,
+                action='state_sync_request',
+                data=request.dump(),
+                timeout=5.0,
+            )
+            
+            if response and not isinstance(response, Exception):
+                sync_response = StateSyncResponse.load(response)
+                if sync_response.worker_state:
+                    # Update our tracking with worker's state
+                    worker_state = sync_response.worker_state
+                    
+                    # Only accept if fresher than what we have
+                    if self._versioned_clock.should_accept_update(
+                        worker_state.node_id,
+                        worker_state.version,
+                    ):
+                        # Convert to heartbeat format for storage
+                        heartbeat = WorkerHeartbeat(
+                            node_id=worker_state.node_id,
+                            state=worker_state.state,
+                            available_cores=worker_state.available_cores,
+                            queue_depth=0,  # Not in snapshot
+                            cpu_percent=0.0,  # Not in snapshot
+                            memory_percent=0.0,  # Not in snapshot
+                            version=worker_state.version,
+                            active_workflows={
+                                wf_id: wf.status
+                                for wf_id, wf in worker_state.active_workflows.items()
+                            },
+                        )
+                        self._worker_status[worker_state.node_id] = heartbeat
+                        self._worker_last_status[worker_state.node_id] = time.monotonic()
+                        await self._versioned_clock.update_entity(
+                            worker_state.node_id,
+                            worker_state.version,
+                        )
+                    
+                    return worker_state
+            
+            return None
+            
+        except Exception as e:
+            await self.handle_exception(e, f"request_worker_state:{worker_addr}")
+            return None
     
     def _handle_embedded_worker_heartbeat(
         self,

@@ -8,7 +8,7 @@ components with Lifeguard enhancements.
 import asyncio
 import random
 import time
-from typing import Literal
+from typing import Callable, Literal
 
 from hyperscale.distributed_rewrite.server import tcp, udp, task
 from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
@@ -158,6 +158,12 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         self._cleanup_interval: float = 30.0  # Seconds between cleanup runs
         self._cleanup_task: asyncio.Task | None = None
         
+        # Leadership event callbacks (for composition)
+        # External components can register callbacks without overriding methods
+        self._on_become_leader_callbacks: list[Callable[[], None]] = []
+        self._on_lose_leadership_callbacks: list[Callable[[], None]] = []
+        self._on_leader_change_callbacks: list[Callable[[tuple[str, int] | None], None]] = []
+        
         # Set up suspicion manager callbacks
         self._suspicion_manager.set_callbacks(
             on_expired=self._on_suspicion_expired,
@@ -174,6 +180,43 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Get the full node address (ID + network location)."""
         host, port = self._get_self_udp_addr()
         return NodeAddress(node_id=self._node_id, host=host, port=port)
+    
+    # =========================================================================
+    # Leadership Event Registration (Composition Pattern)
+    # =========================================================================
+    
+    def register_on_become_leader(self, callback: Callable[[], None]) -> None:
+        """
+        Register a callback to be invoked when this node becomes leader.
+        
+        Use this instead of overriding _on_become_leader to compose behavior.
+        Callbacks are invoked in registration order after the base handling.
+        
+        Args:
+            callback: Function to call when this node becomes leader.
+        """
+        self._on_become_leader_callbacks.append(callback)
+    
+    def register_on_lose_leadership(self, callback: Callable[[], None]) -> None:
+        """
+        Register a callback to be invoked when this node loses leadership.
+        
+        Args:
+            callback: Function to call when leadership is lost.
+        """
+        self._on_lose_leadership_callbacks.append(callback)
+    
+    def register_on_leader_change(
+        self,
+        callback: Callable[[tuple[str, int] | None], None],
+    ) -> None:
+        """
+        Register a callback to be invoked when the cluster leader changes.
+        
+        Args:
+            callback: Function receiving the new leader address (or None).
+        """
+        self._on_leader_change_callbacks.append(callback)
     
     def _get_lhm_multiplier(self) -> float:
         """Get the current LHM timeout multiplier."""
@@ -729,6 +772,16 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                 node_id=self._node_id.short,
             )
         )
+        
+        # Invoke registered callbacks (composition pattern)
+        for callback in self._on_become_leader_callbacks:
+            try:
+                callback()
+            except Exception as e:
+                # Log but don't let one callback failure break others
+                self._task_runner.run(
+                    self.handle_exception, e, "on_become_leader_callback"
+                )
     
     def _on_lose_leadership(self) -> None:
         """Called when this node loses leadership."""
@@ -748,6 +801,15 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                 node_id=self._node_id.short,
             )
         )
+        
+        # Invoke registered callbacks (composition pattern)
+        for callback in self._on_lose_leadership_callbacks:
+            try:
+                callback()
+            except Exception as e:
+                self._task_runner.run(
+                    self.handle_exception, e, "on_lose_leadership_callback"
+                )
     
     def _on_leader_change(self, new_leader: tuple[str, int] | None) -> None:
         """Called when the known leader changes."""
@@ -775,6 +837,15 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     node_id=self._node_id.short,
                 )
             )
+        
+        # Invoke registered callbacks (composition pattern)
+        for callback in self._on_leader_change_callbacks:
+            try:
+                callback(new_leader)
+            except Exception as e:
+                self._task_runner.run(
+                    self.handle_exception, e, "on_leader_change_callback"
+                )
     
     def _get_member_count(self) -> int:
         """Get the current number of known members."""

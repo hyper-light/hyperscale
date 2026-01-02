@@ -971,6 +971,144 @@ test_vclock_concurrent_different()
 
 
 # =============================================================================
+# Leadership Callback Composition Tests
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Leadership Callback Composition Tests")
+print("=" * 60)
+
+
+@test("UDPServer: has callback registration methods")
+def test_udp_server_callback_methods():
+    from hyperscale.distributed_rewrite.swim import UDPServer
+    
+    assert hasattr(UDPServer, 'register_on_become_leader')
+    assert hasattr(UDPServer, 'register_on_lose_leadership')
+    assert hasattr(UDPServer, 'register_on_leader_change')
+    
+    # Check they are callable
+    assert callable(getattr(UDPServer, 'register_on_become_leader'))
+    assert callable(getattr(UDPServer, 'register_on_lose_leadership'))
+    assert callable(getattr(UDPServer, 'register_on_leader_change'))
+
+
+@test("UDPServer: callback lists are initialized")
+def test_udp_server_callback_lists():
+    """Test that callback lists exist on instance."""
+    # We can't instantiate UDPServer easily without full setup,
+    # but we can check the __init__ signature/code
+    import inspect
+    from hyperscale.distributed_rewrite.swim import UDPServer
+    
+    source = inspect.getsource(UDPServer.__init__)
+    assert '_on_become_leader_callbacks' in source
+    assert '_on_lose_leadership_callbacks' in source
+    assert '_on_leader_change_callbacks' in source
+
+
+@test("ManagerServer: has state sync methods")
+def test_manager_state_sync_methods():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_on_manager_become_leader')
+    assert hasattr(ManagerServer, '_on_manager_lose_leadership')
+    assert hasattr(ManagerServer, '_sync_state_from_workers')
+    assert hasattr(ManagerServer, '_request_worker_state')
+
+
+@test("StateSyncRequest: serialization")
+def test_state_sync_request_serde():
+    from hyperscale.distributed_rewrite.models import StateSyncRequest
+    
+    original = StateSyncRequest(
+        requester_id="manager-1",
+        requester_role="manager",
+        since_version=100,
+    )
+    
+    data = original.dump()
+    loaded = StateSyncRequest.load(data)
+    
+    assert loaded.requester_id == original.requester_id
+    assert loaded.requester_role == original.requester_role
+    assert loaded.since_version == original.since_version
+
+
+@test("StateSyncResponse: serialization with worker state")
+def test_state_sync_response_worker_serde():
+    from hyperscale.distributed_rewrite.models import (
+        StateSyncResponse,
+        WorkerStateSnapshot,
+    )
+    
+    worker_state = WorkerStateSnapshot(
+        node_id="worker-1",
+        state="healthy",
+        total_cores=16,
+        available_cores=12,
+        version=50,
+        active_workflows={},
+    )
+    
+    original = StateSyncResponse(
+        responder_id="worker-1",
+        current_version=50,
+        worker_state=worker_state,
+    )
+    
+    data = original.dump()
+    loaded = StateSyncResponse.load(data)
+    
+    assert loaded.responder_id == original.responder_id
+    assert loaded.current_version == original.current_version
+    assert loaded.worker_state is not None
+    assert loaded.worker_state.node_id == "worker-1"
+    assert loaded.worker_state.available_cores == 12
+
+
+@test("StateSyncResponse: serialization with manager state")
+def test_state_sync_response_manager_serde():
+    from hyperscale.distributed_rewrite.models import (
+        StateSyncResponse,
+        ManagerStateSnapshot,
+    )
+    
+    manager_state = ManagerStateSnapshot(
+        node_id="manager-1",
+        datacenter="dc-east",
+        is_leader=True,
+        term=5,
+        version=100,
+        workers=[],
+        jobs={},
+    )
+    
+    original = StateSyncResponse(
+        responder_id="manager-1",
+        current_version=100,
+        manager_state=manager_state,
+    )
+    
+    data = original.dump()
+    loaded = StateSyncResponse.load(data)
+    
+    assert loaded.responder_id == original.responder_id
+    assert loaded.manager_state is not None
+    assert loaded.manager_state.datacenter == "dc-east"
+    assert loaded.manager_state.is_leader == True
+
+
+# Run Leadership Callback tests
+test_udp_server_callback_methods()
+test_udp_server_callback_lists()
+test_manager_state_sync_methods()
+test_state_sync_request_serde()
+test_state_sync_response_worker_serde()
+test_state_sync_response_manager_serde()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 
