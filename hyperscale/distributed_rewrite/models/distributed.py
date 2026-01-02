@@ -132,6 +132,19 @@ class RegistrationResponse(Message):
     error: str | None = None                # Error message if not accepted
 
 
+@dataclass(slots=True, kw_only=True)
+class WorkflowProgressAck(Message):
+    """
+    Acknowledgment for workflow progress updates.
+    
+    Includes updated manager list so workers can maintain
+    accurate view of cluster topology and leadership.
+    """
+    manager_id: str                         # Responding manager's node_id
+    is_leader: bool                         # Whether this manager is leader
+    healthy_managers: list[ManagerInfo]     # Current healthy managers
+
+
 @dataclass(slots=True)
 class WorkerRegistration(Message):
     """

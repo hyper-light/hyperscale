@@ -2717,6 +2717,337 @@ test_gate_start_runs_batch_loop()
 
 
 # =============================================================================
+# Continuous Manager List Refresh Tests
+# =============================================================================
+
+print("\nContinuous Manager List Refresh Tests")
+print("=" * 50)
+
+
+@test("WorkflowProgressAck: model exists with expected fields")
+def test_workflow_progress_ack_model():
+    from hyperscale.distributed_rewrite.models import WorkflowProgressAck, ManagerInfo
+    
+    # Create a sample ack
+    managers = [
+        ManagerInfo(
+            node_id="manager-1",
+            tcp_host="host1",
+            tcp_port=8000,
+            udp_host="host1",
+            udp_port=8001,
+            datacenter="dc-east",
+            is_leader=True,
+        )
+    ]
+    
+    ack = WorkflowProgressAck(
+        manager_id="manager-1",
+        is_leader=True,
+        healthy_managers=managers,
+    )
+    
+    assert ack.manager_id == "manager-1"
+    assert ack.is_leader is True
+    assert len(ack.healthy_managers) == 1
+    assert ack.healthy_managers[0].node_id == "manager-1"
+
+
+@test("WorkflowProgressAck: serialization round-trip")
+def test_workflow_progress_ack_serialization():
+    from hyperscale.distributed_rewrite.models import WorkflowProgressAck, ManagerInfo
+    
+    ack = WorkflowProgressAck(
+        manager_id="manager-1",
+        is_leader=True,
+        healthy_managers=[
+            ManagerInfo(
+                node_id="manager-1",
+                tcp_host="host1",
+                tcp_port=8000,
+                udp_host="host1",
+                udp_port=8001,
+                datacenter="dc-east",
+                is_leader=True,
+            )
+        ],
+    )
+    
+    data = ack.dump()
+    restored = WorkflowProgressAck.load(data)
+    
+    assert restored.manager_id == ack.manager_id
+    assert restored.is_leader == ack.is_leader
+    assert len(restored.healthy_managers) == len(ack.healthy_managers)
+
+
+@test("Manager: receive_workflow_progress returns WorkflowProgressAck")
+def test_manager_progress_returns_ack():
+    """
+    Test that receive_workflow_progress returns WorkflowProgressAck.
+    
+    Note: We read the source file directly because the @tcp.receive() 
+    decorator wraps the method, and inspect.getsource() returns the wrapper.
+    """
+    import pathlib
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    # Get the source file path
+    import hyperscale.distributed_rewrite.nodes.manager as manager_module
+    source_file = pathlib.Path(manager_module.__file__)
+    source = source_file.read_text()
+    
+    # Find the receive_workflow_progress method section
+    # Should return WorkflowProgressAck, not just b'ok'
+    assert "WorkflowProgressAck(" in source, \
+        "receive_workflow_progress should construct WorkflowProgressAck"
+    assert "ack = WorkflowProgressAck" in source, \
+        "receive_workflow_progress should create ack variable"
+    assert "_get_healthy_managers()" in source, \
+        "receive_workflow_progress should call _get_healthy_managers"
+
+
+@test("Worker: processes WorkflowProgressAck from manager")
+def test_worker_processes_progress_ack():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    # Check that worker has method to process ack
+    assert hasattr(WorkerServer, '_process_workflow_progress_ack'), \
+        "WorkerServer should have _process_workflow_progress_ack method"
+    
+    # Check the method updates known managers and tracks leadership
+    source = inspect.getsource(WorkerServer._process_workflow_progress_ack)
+    
+    assert "WorkflowProgressAck" in source, \
+        "_process_workflow_progress_ack should parse WorkflowProgressAck"
+    assert "_update_known_managers" in source, \
+        "_process_workflow_progress_ack should update known managers"
+    assert "is_leader" in source, \
+        "_process_workflow_progress_ack should check leadership"
+
+
+@test("Worker: _send_progress_update processes ack response")
+def test_worker_send_progress_processes_ack():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._send_progress_update)
+    
+    # Should capture and process response
+    assert "_process_workflow_progress_ack" in source, \
+        "_send_progress_update should process ack response"
+
+
+# Run continuous refresh tests
+test_workflow_progress_ack_model()
+test_workflow_progress_ack_serialization()
+test_manager_progress_returns_ack()
+test_worker_processes_progress_ack()
+test_worker_send_progress_processes_ack()
+
+
+# =============================================================================
+# Manager Peer Node ID Tracking Tests
+# =============================================================================
+
+print("\nManager Peer Node ID Tracking Tests")
+print("=" * 50)
+
+
+@test("ManagerStateEmbedder: has on_manager_heartbeat callback")
+def test_manager_embedder_has_peer_callback():
+    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    import inspect
+    
+    # Check that on_manager_heartbeat is a field
+    sig = inspect.signature(ManagerStateEmbedder)
+    param_names = list(sig.parameters.keys())
+    
+    assert 'on_manager_heartbeat' in param_names, \
+        "ManagerStateEmbedder should have on_manager_heartbeat parameter"
+
+
+@test("ManagerStateEmbedder: process_state handles ManagerHeartbeat")
+def test_manager_embedder_processes_manager_heartbeat():
+    import inspect
+    from hyperscale.distributed_rewrite.swim.core.state_embedder import ManagerStateEmbedder
+    
+    source = inspect.getsource(ManagerStateEmbedder.process_state)
+    
+    # Should try to parse as ManagerHeartbeat
+    assert "ManagerHeartbeat" in source, \
+        "process_state should try to parse ManagerHeartbeat from peers"
+    assert "on_manager_heartbeat" in source, \
+        "process_state should call on_manager_heartbeat callback"
+
+
+@test("Manager: has _manager_peer_info tracking")
+def test_manager_has_peer_info_tracking():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    assert "_manager_peer_info" in source, \
+        "ManagerServer should have _manager_peer_info dict"
+
+
+@test("Manager: has _handle_manager_peer_heartbeat method")
+def test_manager_has_peer_heartbeat_handler():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, '_handle_manager_peer_heartbeat'), \
+        "ManagerServer should have _handle_manager_peer_heartbeat method"
+    
+    source = inspect.getsource(ManagerServer._handle_manager_peer_heartbeat)
+    
+    assert "ManagerHeartbeat" in source, \
+        "_handle_manager_peer_heartbeat should handle ManagerHeartbeat"
+    assert "_manager_peer_info" in source, \
+        "_handle_manager_peer_heartbeat should update _manager_peer_info"
+
+
+@test("Manager: _get_healthy_managers uses real peer info")
+def test_manager_get_healthy_uses_peer_info():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._get_healthy_managers)
+    
+    # Should use _manager_peer_info for real node_ids
+    assert "_manager_peer_info" in source, \
+        "_get_healthy_managers should check _manager_peer_info"
+    assert "peer_heartbeat.node_id" in source, \
+        "_get_healthy_managers should use real node_id from heartbeat"
+
+
+@test("Manager: state embedder includes on_manager_heartbeat")
+def test_manager_embedder_includes_callback():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    # Should pass on_manager_heartbeat to ManagerStateEmbedder
+    assert "on_manager_heartbeat=self._handle_manager_peer_heartbeat" in source, \
+        "Manager should pass _handle_manager_peer_heartbeat to ManagerStateEmbedder"
+
+
+# Run manager peer tracking tests
+test_manager_embedder_has_peer_callback()
+test_manager_embedder_processes_manager_heartbeat()
+test_manager_has_peer_info_tracking()
+test_manager_has_peer_heartbeat_handler()
+test_manager_get_healthy_uses_peer_info()
+test_manager_embedder_includes_callback()
+
+
+# =============================================================================
+# Worker Leader Tracking via SWIM Tests
+# =============================================================================
+
+print("\nWorker Leader Tracking via SWIM Tests")
+print("=" * 50)
+
+
+@test("WorkerStateEmbedder: has on_manager_heartbeat callback")
+def test_worker_embedder_has_manager_callback():
+    from hyperscale.distributed_rewrite.swim.core.state_embedder import WorkerStateEmbedder
+    import inspect
+    
+    sig = inspect.signature(WorkerStateEmbedder)
+    param_names = list(sig.parameters.keys())
+    
+    assert 'on_manager_heartbeat' in param_names, \
+        "WorkerStateEmbedder should have on_manager_heartbeat parameter"
+
+
+@test("WorkerStateEmbedder: process_state handles ManagerHeartbeat")
+def test_worker_embedder_processes_manager_heartbeat():
+    import inspect
+    from hyperscale.distributed_rewrite.swim.core.state_embedder import WorkerStateEmbedder
+    
+    source = inspect.getsource(WorkerStateEmbedder.process_state)
+    
+    # Should try to parse as ManagerHeartbeat
+    assert "ManagerHeartbeat" in source, \
+        "process_state should parse ManagerHeartbeat from managers"
+    assert "on_manager_heartbeat" in source, \
+        "process_state should call on_manager_heartbeat callback"
+
+
+@test("Worker: has _handle_manager_heartbeat method")
+def test_worker_has_manager_heartbeat_handler():
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    import inspect
+    
+    assert hasattr(WorkerServer, '_handle_manager_heartbeat'), \
+        "WorkerServer should have _handle_manager_heartbeat method"
+    
+    source = inspect.getsource(WorkerServer._handle_manager_heartbeat)
+    
+    assert "ManagerHeartbeat" in source, \
+        "_handle_manager_heartbeat should handle ManagerHeartbeat"
+    assert "is_leader" in source, \
+        "_handle_manager_heartbeat should track leadership"
+    assert "_primary_manager_id" in source, \
+        "_handle_manager_heartbeat should update primary manager"
+
+
+@test("Worker: state embedder includes on_manager_heartbeat")
+def test_worker_embedder_includes_callback():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer.__init__)
+    
+    # Should pass on_manager_heartbeat to WorkerStateEmbedder
+    assert "on_manager_heartbeat=self._handle_manager_heartbeat" in source, \
+        "Worker should pass _handle_manager_heartbeat to WorkerStateEmbedder"
+
+
+@test("Worker: _handle_manager_heartbeat updates leadership tracking")
+def test_worker_heartbeat_updates_leader():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._handle_manager_heartbeat)
+    
+    # Should update primary when leadership changes
+    assert "Leadership change" in source, \
+        "_handle_manager_heartbeat should log leadership changes"
+    
+    # Should update _known_managers
+    assert "_known_managers" in source, \
+        "_handle_manager_heartbeat should update _known_managers"
+
+
+@test("Worker: _handle_manager_heartbeat discovers new managers via SWIM")
+def test_worker_heartbeat_discovers_new_managers():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._handle_manager_heartbeat)
+    
+    # Should create new manager entry if not known
+    assert "Discovered new manager" in source, \
+        "_handle_manager_heartbeat should discover new managers"
+    assert "_healthy_manager_ids.add" in source, \
+        "_handle_manager_heartbeat should add new managers to healthy set"
+
+
+# Run worker leader tracking tests
+test_worker_embedder_has_manager_callback()
+test_worker_embedder_processes_manager_heartbeat()
+test_worker_has_manager_heartbeat_handler()
+test_worker_embedder_includes_callback()
+test_worker_heartbeat_updates_leader()
+test_worker_heartbeat_discovers_new_managers()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

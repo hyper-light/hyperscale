@@ -38,6 +38,7 @@ from hyperscale.distributed_rewrite.models import (
     NodeRole,
     ManagerInfo,
     RegistrationResponse,
+    WorkflowProgressAck,
     WorkerRegistration,
     WorkerHeartbeat,
     WorkerState,
@@ -132,6 +133,10 @@ class ManagerServer(HealthAwareServer):
         # Track active manager peers (removed when SWIM marks as dead)
         self._active_manager_peers: set[tuple[str, int]] = set(self._manager_peers)
         
+        # Track manager peer info from ManagerHeartbeat (proper node_ids, leadership, etc)
+        # Maps UDP addr -> ManagerHeartbeat for peers we've heard from via SWIM
+        self._manager_peer_info: dict[tuple[str, int], ManagerHeartbeat] = {}
+        
         # Registered workers (indexed by node_id)
         self._workers: dict[str, WorkerRegistration] = {}  # node_id -> registration
         self._worker_addr_to_id: dict[tuple[str, int], str] = {}  # (host, port) -> node_id (reverse mapping)
@@ -188,6 +193,7 @@ class ManagerServer(HealthAwareServer):
                 status.available_cores for status in self._worker_status.values()
             ),
             on_worker_heartbeat=self._handle_embedded_worker_heartbeat,
+            on_manager_heartbeat=self._handle_manager_peer_heartbeat,
         ))
         
         # Register leadership callbacks (composition pattern - no override)
@@ -641,6 +647,31 @@ class ManagerServer(HealthAwareServer):
             self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
         )
     
+    def _handle_manager_peer_heartbeat(
+        self,
+        heartbeat: ManagerHeartbeat,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """
+        Handle ManagerHeartbeat received from peer managers via SWIM.
+        
+        This enables:
+        1. Proper node_id tracking for peers (instead of synthetic IDs)
+        2. Leader tracking across the manager cluster
+        3. Version-based stale update rejection
+        """
+        # Check if update is stale using versioned clock
+        if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
+            return
+        
+        # Store peer info keyed by UDP address
+        self._manager_peer_info[source_addr] = heartbeat
+        
+        # Update version tracking
+        self._task_runner.run(
+            self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
+        )
+    
     @property
     def node_info(self) -> NodeInfo:
         """Get this manager's node info."""
@@ -691,6 +722,9 @@ class ManagerServer(HealthAwareServer):
         
         Includes self and all active peer managers. Workers use this
         to maintain redundant communication channels.
+        
+        Uses real node_ids from ManagerHeartbeat when available (received via SWIM),
+        falling back to synthetic IDs for peers we haven't heard from yet.
         """
         managers: list[ManagerInfo] = []
         
@@ -708,21 +742,40 @@ class ManagerServer(HealthAwareServer):
         # Add active peer managers
         for tcp_addr in self._active_manager_peers:
             # Find UDP addr for this peer
-            udp_addr = tcp_addr  # Default to same
+            udp_addr: tuple[str, int] | None = None
             for udp, tcp in self._manager_udp_to_tcp.items():
                 if tcp == tcp_addr:
                     udp_addr = udp
                     break
             
-            managers.append(ManagerInfo(
-                node_id=f"manager-{tcp_addr[0]}:{tcp_addr[1]}",  # Synthetic ID
-                tcp_host=tcp_addr[0],
-                tcp_port=tcp_addr[1],
-                udp_host=udp_addr[0],
-                udp_port=udp_addr[1],
-                datacenter=self._node_id.datacenter,  # Assume same DC
-                is_leader=False,  # We are the one responding, we know if we're leader
-            ))
+            if udp_addr is None:
+                udp_addr = tcp_addr  # Fallback
+            
+            # Check if we have real peer info from ManagerHeartbeat
+            peer_heartbeat = self._manager_peer_info.get(udp_addr)
+            
+            if peer_heartbeat:
+                # Use real info from SWIM heartbeat
+                managers.append(ManagerInfo(
+                    node_id=peer_heartbeat.node_id,
+                    tcp_host=tcp_addr[0],
+                    tcp_port=tcp_addr[1],
+                    udp_host=udp_addr[0],
+                    udp_port=udp_addr[1],
+                    datacenter=peer_heartbeat.datacenter,
+                    is_leader=peer_heartbeat.is_leader,
+                ))
+            else:
+                # Fallback to synthetic ID (peer hasn't sent heartbeat yet)
+                managers.append(ManagerInfo(
+                    node_id=f"manager-{tcp_addr[0]}:{tcp_addr[1]}",
+                    tcp_host=tcp_addr[0],
+                    tcp_port=tcp_addr[1],
+                    udp_host=udp_addr[0],
+                    udp_port=udp_addr[1],
+                    datacenter=self._node_id.datacenter,
+                    is_leader=False,
+                ))
         
         return managers
     
@@ -1154,7 +1207,13 @@ class ManagerServer(HealthAwareServer):
                     if completion_event:
                         completion_event.set()
             
-            return b'ok'
+            # Return ack with current manager topology for worker to update
+            ack = WorkflowProgressAck(
+                manager_id=self._node_id.full,
+                is_leader=self.is_leader(),
+                healthy_managers=self._get_healthy_managers(),
+            )
+            return ack.dump()
             
         except Exception as e:
             await self.handle_exception(e, "receive_workflow_progress")

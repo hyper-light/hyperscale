@@ -25,6 +25,7 @@ from .distributed import (
     NodeInfo as NodeInfo,
     ManagerInfo as ManagerInfo,
     RegistrationResponse as RegistrationResponse,
+    WorkflowProgressAck as WorkflowProgressAck,
     WorkerRegistration as WorkerRegistration,
     WorkerHeartbeat as WorkerHeartbeat,
     ManagerHeartbeat as ManagerHeartbeat,

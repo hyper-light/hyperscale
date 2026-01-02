@@ -43,7 +43,9 @@ from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
     ManagerInfo,
+    ManagerHeartbeat,
     RegistrationResponse,
+    WorkflowProgressAck,
     WorkerRegistration,
     WorkerHeartbeat,
     WorkerState,
@@ -166,6 +168,7 @@ class WorkerServer(HealthAwareServer):
             get_active_workflows=lambda: {
                 wf_id: wf.status for wf_id, wf in self._active_workflows.items()
             },
+            on_manager_heartbeat=self._handle_manager_heartbeat,
         )
         
         # Initialize parent HealthAwareServer
@@ -313,6 +316,81 @@ class WorkerServer(HealthAwareServer):
             if (manager.udp_host, manager.udp_port) == node_addr:
                 self._healthy_manager_ids.add(manager_id)
                 break
+    
+    def _handle_manager_heartbeat(
+        self,
+        heartbeat: ManagerHeartbeat,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """
+        Handle ManagerHeartbeat received via SWIM message embedding.
+        
+        This enables workers to track leadership changes in real-time
+        without waiting for TCP ack responses. When a manager's leadership
+        status changes, workers can immediately update their primary manager.
+        """
+        # Find or create manager info for this address
+        manager_id = heartbeat.node_id
+        
+        # Check if this is a known manager
+        existing_manager = self._known_managers.get(manager_id)
+        
+        if existing_manager:
+            # Update is_leader status if it changed
+            old_is_leader = existing_manager.is_leader
+            if heartbeat.is_leader != old_is_leader:
+                # Update the manager info with new leadership status
+                self._known_managers[manager_id] = ManagerInfo(
+                    node_id=existing_manager.node_id,
+                    tcp_host=existing_manager.tcp_host,
+                    tcp_port=existing_manager.tcp_port,
+                    udp_host=existing_manager.udp_host,
+                    udp_port=existing_manager.udp_port,
+                    datacenter=heartbeat.datacenter,
+                    is_leader=heartbeat.is_leader,
+                )
+                
+                # If this manager became the leader, switch primary
+                if heartbeat.is_leader and self._primary_manager_id != manager_id:
+                    old_primary = self._primary_manager_id
+                    self._primary_manager_id = manager_id
+                    
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Leadership change via SWIM: {old_primary} -> {manager_id}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+        else:
+            # New manager discovered via SWIM - create entry
+            # We need TCP/UDP host:port from source_addr
+            self._known_managers[manager_id] = ManagerInfo(
+                node_id=manager_id,
+                tcp_host=source_addr[0],
+                tcp_port=source_addr[1] - 1,  # Convention: TCP = UDP - 1
+                udp_host=source_addr[0],
+                udp_port=source_addr[1],
+                datacenter=heartbeat.datacenter,
+                is_leader=heartbeat.is_leader,
+            )
+            self._healthy_manager_ids.add(manager_id)
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Discovered new manager via SWIM: {manager_id} (leader={heartbeat.is_leader})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            
+            # If this is a leader and we don't have one, use it
+            if heartbeat.is_leader and not self._primary_manager_id:
+                self._primary_manager_id = manager_id
     
     async def _select_new_primary_manager(self) -> None:
         """Select a new primary manager from healthy managers."""
@@ -941,33 +1019,75 @@ class WorkerServer(HealthAwareServer):
                 pass
     
     async def _send_progress_update(self, progress: WorkflowProgress) -> None:
-        """Send a progress update to the primary manager."""
+        """Send a progress update to the primary manager and process ack."""
         manager_addr = self._get_primary_manager_tcp_addr()
         if not manager_addr:
             return
         
         try:
-            await self.send_tcp(
+            response = await self.send_tcp(
                 manager_addr,
                 "workflow_progress",
                 progress.dump(),
                 timeout=1.0,
             )
+            
+            # Process ack to update manager topology
+            if response and isinstance(response, bytes) and response != b'error':
+                self._process_workflow_progress_ack(response)
+                
         except Exception:
             pass
     
     async def _send_progress_to_all_managers(self, progress: WorkflowProgress) -> None:
-        """Send a progress update to ALL healthy managers."""
+        """Send a progress update to ALL healthy managers and process acks."""
         for manager_addr in self._get_healthy_manager_tcp_addrs():
             try:
-                await self.send_tcp(
+                response = await self.send_tcp(
                     manager_addr,
                     "workflow_progress",
                     progress.dump(),
                     timeout=1.0,
                 )
+                
+                # Process ack to update manager topology
+                if response and isinstance(response, bytes) and response != b'error':
+                    self._process_workflow_progress_ack(response)
+                    
             except Exception:
                 pass
+    
+    def _process_workflow_progress_ack(self, data: bytes) -> None:
+        """
+        Process WorkflowProgressAck to update manager topology.
+        
+        This enables continuous manager list refresh - every ack includes
+        the current list of healthy managers and leadership status.
+        """
+        try:
+            ack = WorkflowProgressAck.load(data)
+            
+            # Update known managers from ack
+            self._update_known_managers(ack.healthy_managers)
+            
+            # Update primary manager if leadership changed
+            if ack.is_leader and self._primary_manager_id != ack.manager_id:
+                old_primary = self._primary_manager_id
+                self._primary_manager_id = ack.manager_id
+                
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Leadership change detected: {old_primary} -> {ack.manager_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                
+        except Exception:
+            # Backwards compatibility: ignore parse errors for old b'ok' responses
+            pass
     
     # =========================================================================
     # TCP Handlers - State Sync

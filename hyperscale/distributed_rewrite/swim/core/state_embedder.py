@@ -81,6 +81,9 @@ class WorkerStateEmbedder:
     Embeds WorkerHeartbeat data in SWIM messages so managers can
     passively learn worker capacity and status.
     
+    Also processes ManagerHeartbeat from managers to track leadership
+    changes without requiring TCP acks.
+    
     Attributes:
         get_node_id: Callable returning the node's full ID.
         get_worker_state: Callable returning current WorkerState.
@@ -90,6 +93,7 @@ class WorkerStateEmbedder:
         get_memory_percent: Callable returning memory utilization.
         get_state_version: Callable returning state version.
         get_active_workflows: Callable returning workflow ID -> status dict.
+        on_manager_heartbeat: Optional callback for received ManagerHeartbeat.
     """
     get_node_id: Callable[[], str]
     get_worker_state: Callable[[], str]
@@ -99,6 +103,7 @@ class WorkerStateEmbedder:
     get_memory_percent: Callable[[], float]
     get_state_version: Callable[[], int]
     get_active_workflows: Callable[[], dict[str, str]]
+    on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     
     def get_state(self) -> bytes | None:
         """Get WorkerHeartbeat to embed in SWIM messages."""
@@ -119,8 +124,14 @@ class WorkerStateEmbedder:
         state_data: bytes,
         source_addr: tuple[str, int],
     ) -> None:
-        """Workers don't track other nodes' state."""
-        pass
+        """Process ManagerHeartbeat from managers to track leadership."""
+        if self.on_manager_heartbeat:
+            try:
+                heartbeat = ManagerHeartbeat.load(state_data)
+                self.on_manager_heartbeat(heartbeat, source_addr)
+            except Exception:
+                # Not a ManagerHeartbeat or invalid data - ignore
+                pass
 
 
 @dataclass(slots=True)
@@ -128,7 +139,8 @@ class ManagerStateEmbedder:
     """
     State embedder for Manager nodes.
     
-    Embeds ManagerHeartbeat data and processes WorkerHeartbeat from workers.
+    Embeds ManagerHeartbeat data and processes both WorkerHeartbeat 
+    from workers and ManagerHeartbeat from peer managers.
     
     Attributes:
         get_node_id: Callable returning the node's full ID.
@@ -141,6 +153,7 @@ class ManagerStateEmbedder:
         get_worker_count: Callable returning registered worker count.
         get_available_cores: Callable returning total available cores.
         on_worker_heartbeat: Callable to handle received WorkerHeartbeat.
+        on_manager_heartbeat: Callable to handle received ManagerHeartbeat from peers.
     """
     get_node_id: Callable[[], str]
     get_datacenter: Callable[[], str]
@@ -152,6 +165,7 @@ class ManagerStateEmbedder:
     get_worker_count: Callable[[], int]
     get_available_cores: Callable[[], int]
     on_worker_heartbeat: Callable[[Any, tuple[str, int]], None]
+    on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     
     def get_state(self) -> bytes | None:
         """Get ManagerHeartbeat to embed in SWIM messages."""
@@ -173,13 +187,24 @@ class ManagerStateEmbedder:
         state_data: bytes,
         source_addr: tuple[str, int],
     ) -> None:
-        """Process embedded state from workers."""
+        """Process embedded state from workers or peer managers."""
+        # Try parsing as WorkerHeartbeat first (most common)
         try:
             heartbeat = WorkerHeartbeat.load(state_data)
             self.on_worker_heartbeat(heartbeat, source_addr)
+            return
         except Exception:
-            # Not a WorkerHeartbeat or invalid data - ignore
             pass
+        
+        # Try parsing as ManagerHeartbeat from peer managers
+        if self.on_manager_heartbeat:
+            try:
+                heartbeat = ManagerHeartbeat.load(state_data)
+                # Don't process our own heartbeat
+                if heartbeat.node_id != self.get_node_id():
+                    self.on_manager_heartbeat(heartbeat, source_addr)
+            except Exception:
+                pass
 
 
 @dataclass(slots=True)
