@@ -13,7 +13,9 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
+import socket
 import sys
 import time
 import traceback
@@ -24,6 +26,35 @@ from typing import Callable, Any
 
 # Ensure hyperscale is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import hyperscale components
+from hyperscale.distributed_rewrite.nodes import WorkerServer, ManagerServer, GateServer
+from hyperscale.distributed_rewrite.env import Env
+from hyperscale.distributed_rewrite.models import (
+    JobSubmission,
+    JobAck,
+    WorkflowDispatch,
+    WorkflowProgress,
+    JobStatus,
+    WorkflowStatus,
+)
+
+# Import workflow components
+try:
+    from hyperscale.graph import Workflow, step
+    from hyperscale.testing import URL, HTTPResponse
+    WORKFLOW_AVAILABLE = True
+except ImportError:
+    WORKFLOW_AVAILABLE = False
+    # Define dummy classes for when workflow module isn't available
+    class Workflow:
+        vus = 1
+        duration = "1s"
+    
+    def step():
+        def decorator(func):
+            return func
+        return decorator
 
 
 # =============================================================================
@@ -67,12 +98,16 @@ def test(name: str):
     def decorator(func: Callable):
         def wrapper(*args, **kwargs):
             try:
-                if asyncio.iscoroutinefunction(func):
-                    run_async(func)(*args, **kwargs)
+                if inspect.iscoroutinefunction(func):
+                    # Run async test with timeout
+                    asyncio.run(asyncio.wait_for(func(*args, **kwargs), timeout=60.0))
                 else:
                     func(*args, **kwargs)
                 print(f"  ✓ {name}")
                 results.add_pass()
+            except asyncio.TimeoutError:
+                print(f"  ✗ {name}: Test timed out (60s)")
+                results.add_fail(name, "Test timed out (60s)")
             except AssertionError as e:
                 print(f"  ✗ {name}: {e}")
                 results.add_fail(name, str(e))
@@ -83,30 +118,12 @@ def test(name: str):
     return decorator
 
 
-def run_async(coro_func):
-    """Run an async function synchronously."""
-    def wrapper(*args, **kwargs):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        
-        if loop is not None:
-            # We're already in an async context
-            return asyncio.ensure_future(coro_func(*args, **kwargs))
-        else:
-            # Create a new event loop
-            return asyncio.run(coro_func(*args, **kwargs))
-    return wrapper
-
-
 # =============================================================================
 # Test Utilities
 # =============================================================================
 
 def get_free_port() -> int:
     """Get a free TCP/UDP port."""
-    import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
         return s.getsockname()[1]
@@ -173,7 +190,6 @@ async def cleanup_nodes(nodes: list):
 
 def create_env():
     """Create an Env instance for testing."""
-    from hyperscale.distributed_rewrite.env import Env
     return Env(
         MERCURY_SYNC_AUTH_SECRET="test-secret-for-simulation",
         MERCURY_SYNC_LOG_LEVEL="error",  # Quiet during tests
@@ -186,10 +202,8 @@ async def create_worker(
     manager_addrs: list[tuple[str, int]] | None = None,
     dc_id: str = "test-dc",
     total_cores: int = 4,
-) -> "WorkerServer":
+) -> WorkerServer:
     """Create and configure a WorkerServer."""
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
-    
     worker = WorkerServer(
         host="127.0.0.1",
         tcp_port=ports.tcp_port,
@@ -209,10 +223,8 @@ async def create_manager(
     gate_addrs: list[tuple[str, int]] | None = None,
     gate_udp_addrs: list[tuple[str, int]] | None = None,
     dc_id: str = "test-dc",
-) -> "ManagerServer":
+) -> ManagerServer:
     """Create and configure a ManagerServer."""
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
-    
     manager = ManagerServer(
         host="127.0.0.1",
         tcp_port=ports.tcp_port,
@@ -236,10 +248,8 @@ async def create_gate(
     datacenter_managers: dict[str, list[tuple[str, int]]] | None = None,
     datacenter_manager_udp: dict[str, list[tuple[str, int]]] | None = None,
     dc_id: str = "global",
-) -> "GateServer":
+) -> GateServer:
     """Create and configure a GateServer."""
-    from hyperscale.distributed_rewrite.nodes import GateServer
-    
     gate = GateServer(
         host="127.0.0.1",
         tcp_port=ports.tcp_port,
@@ -258,23 +268,6 @@ async def create_gate(
 # =============================================================================
 # Workflow for Job Submission Tests
 # =============================================================================
-
-# Import workflow components if available
-try:
-    from hyperscale.graph import Workflow, step
-    from hyperscale.testing import URL, HTTPResponse
-    WORKFLOW_AVAILABLE = True
-except ImportError:
-    WORKFLOW_AVAILABLE = False
-    # Define dummy classes
-    class Workflow:
-        vus = 1
-        duration = "1s"
-    
-    def step():
-        def decorator(func):
-            return func
-        return decorator
 
 
 class SimpleTestWorkflow(Workflow):
@@ -321,8 +314,6 @@ print("=" * 60)
 
 @test("WorkerServer: can be instantiated")
 async def test_worker_instantiate():
-    from hyperscale.distributed_rewrite.nodes import WorkerServer
-    
     ports = NodePorts()
     worker = await create_worker(ports)
     
@@ -350,8 +341,6 @@ async def test_worker_start_stop():
 
 @test("ManagerServer: can be instantiated")
 async def test_manager_instantiate():
-    from hyperscale.distributed_rewrite.nodes import ManagerServer
-    
     ports = NodePorts()
     manager = await create_manager(ports)
     
@@ -377,8 +366,6 @@ async def test_manager_start_stop():
 
 @test("GateServer: can be instantiated")
 async def test_gate_instantiate():
-    from hyperscale.distributed_rewrite.nodes import GateServer
-    
     ports = NodePorts()
     gate = await create_gate(ports)
     
@@ -1073,8 +1060,6 @@ print("=" * 60)
 @test("Job can be submitted through full pipeline (Worker→Manager→Gate)")
 async def test_job_submission_full_pipeline():
     """Test submitting a job through the full distributed pipeline."""
-    from hyperscale.distributed_rewrite.models import JobSubmission, JobAck
-    
     gate_ports = NodePorts()
     manager_ports = NodePorts()
     worker_ports = NodePorts()
@@ -1144,8 +1129,6 @@ async def test_job_submission_full_pipeline():
 @test("Multi-workflow job with dependencies")
 async def test_multi_workflow_job():
     """Test submitting a job with multiple workflows."""
-    from hyperscale.distributed_rewrite.models import JobSubmission
-    
     manager_ports = NodePorts()
     worker_ports = NodePorts()
     
