@@ -111,6 +111,10 @@ class WorkerServer(UDPServer):
         self._active_workflows: dict[str, WorkflowProgress] = {}
         self._workflow_tokens: dict[str, str] = {}  # workflow_id -> TaskRunner token
         self._workflow_cancel_events: dict[str, asyncio.Event] = {}
+        self._workflow_last_progress: dict[str, float] = {}  # workflow_id -> last update time
+        
+        # Progress update configuration
+        self._progress_update_interval: float = 1.0  # Update every 1 second
         
         # State versioning (Lamport clock extension)
         self._state_version = 0
@@ -559,9 +563,12 @@ class WorkerServer(UDPServer):
                     progress.status = WorkflowStatus.FAILED.value
                     break
                 
-                # Send progress update to manager
-                if self._current_manager and int(progress.elapsed_seconds) % 1 == 0:
+                # Send progress update to manager (throttled)
+                now = time.monotonic()
+                last_update = self._workflow_last_progress.get(dispatch.workflow_id, 0.0)
+                if self._current_manager and (now - last_update) >= self._progress_update_interval:
                     await self._send_progress_update(progress)
+                    self._workflow_last_progress[dispatch.workflow_id] = now
             
             if cancel_event.is_set():
                 progress.status = WorkflowStatus.CANCELLED.value
@@ -580,6 +587,7 @@ class WorkerServer(UDPServer):
             self._workflow_tokens.pop(dispatch.workflow_id, None)
             self._workflow_cancel_events.pop(dispatch.workflow_id, None)
             self._active_workflows.pop(dispatch.workflow_id, None)
+            self._workflow_last_progress.pop(dispatch.workflow_id, None)
     
     async def _send_progress_update(self, progress: WorkflowProgress) -> None:
         """Send a progress update to the manager."""
