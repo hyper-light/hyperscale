@@ -712,7 +712,7 @@ class MercurySyncBaseServer(Generic[T]):
         action: str,
         data: D,
         timeout: int | float | None = None,
-    ) -> R | Error:
+    ) -> tuple[R | Error, int]:
         try:
 
             if timeout is None:
@@ -732,7 +732,7 @@ class MercurySyncBaseServer(Generic[T]):
 
                 transport.write(
                     self._encryptor.encrypt(
-                        self._compressor.compress(self._tcp_addr_slug + b'<' + encoded_action + b'<' + data  + b'<' + clock.to_bytes(64) )
+                        self._compressor.compress(encoded_action + b'<' + self._tcp_addr_slug + b'<' + data  + b'<' + clock.to_bytes(64) )
                     ),
                 )
 
@@ -800,7 +800,7 @@ class MercurySyncBaseServer(Generic[T]):
         action: str,
         data: D,
         timeout: int | float | None = None
-    ) -> R | Exception:
+    ) -> tuple[R | Exception, int]:
         try:
 
             if timeout is None:

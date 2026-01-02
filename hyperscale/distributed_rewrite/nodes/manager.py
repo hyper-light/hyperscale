@@ -518,7 +518,7 @@ class ManagerServer(HealthAwareServer):
         
         for attempt in range(max_retries):
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     worker_addr,
                     action='state_sync_request',
                     data=request.dump(),
@@ -602,7 +602,7 @@ class ManagerServer(HealthAwareServer):
         
         for attempt in range(max_retries):
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     peer_addr,
                     action='state_sync_request',
                     data=request.dump(),
@@ -1244,7 +1244,7 @@ class ManagerServer(HealthAwareServer):
         
         for attempt in range(max_retries + 1):
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     gate_addr,
                     "manager_register",
                     heartbeat.dump(),
@@ -1415,7 +1415,7 @@ class ManagerServer(HealthAwareServer):
         
         for attempt in range(max_retries + 1):
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     gate_addr,
                     "job_progress",
                     job.dump(),
@@ -1449,7 +1449,7 @@ class ManagerServer(HealthAwareServer):
         
         for gate_addr in gate_addrs:
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     gate_addr,
                     "job_progress",
                     job.dump(),
@@ -1624,7 +1624,7 @@ class ManagerServer(HealthAwareServer):
         
         for attempt in range(max_retries + 1):
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     worker_addr,
                     "workflow_dispatch",
                     dispatch.dump(),
@@ -1794,7 +1794,7 @@ class ManagerServer(HealthAwareServer):
     ) -> bool:
         """Request confirmation from a single peer."""
         try:
-            response = await self.send_tcp(
+            response, _ = await self.send_tcp(
                 peer,
                 "provision_request",
                 provision.dump(),
@@ -2465,14 +2465,14 @@ class ManagerServer(HealthAwareServer):
             worker_addr = (worker_reg.node.host, worker_reg.node.port)
             
             # Send dispatch
-            response = await self.send_tcp(
+            response, _ = await self.send_tcp(
                 worker_addr,
                 "workflow_dispatch",
                 new_dispatch.dump(),
                 timeout=5.0,
             )
             
-            if response:
+            if response and isinstance(response, bytes):
                 ack = WorkflowDispatchAck.load(response)
                 if ack.accepted:
                     return True

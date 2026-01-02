@@ -1151,7 +1151,7 @@ class WorkerServer(HealthAwareServer):
         
         for attempt in range(max_retries + 1):
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     manager_addr,
                     "workflow_progress",
                     progress.dump(),
@@ -1184,7 +1184,7 @@ class WorkerServer(HealthAwareServer):
         success_count = 0
         for manager_addr in self._get_healthy_manager_tcp_addrs():
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     manager_addr,
                     "workflow_progress",
                     progress.dump(),

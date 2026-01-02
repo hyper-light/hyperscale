@@ -512,7 +512,7 @@ class GateServer(HealthAwareServer):
         for peer_addr in self._active_gate_peers:
             for attempt in range(max_retries):
                 try:
-                    response = await self.send_tcp(
+                    response, _ = await self.send_tcp(
                         peer_addr,
                         "gate_state_sync_request",
                         request.dump(),
@@ -819,7 +819,7 @@ class GateServer(HealthAwareServer):
         
         for attempt in range(max_retries + 1):
             try:
-                response = await self.send_tcp(
+                response, _ = await self.send_tcp(
                     manager_addr,
                     "job_submission",
                     submission.dump(),
