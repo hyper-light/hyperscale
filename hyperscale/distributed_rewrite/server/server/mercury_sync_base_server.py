@@ -56,6 +56,7 @@ from hyperscale.distributed_rewrite.server.hooks.task import (
 from hyperscale.distributed_rewrite.taskex import TaskRunner
 from hyperscale.distributed_rewrite.taskex.run import Run
 from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
 do_patch()
 
@@ -252,6 +253,34 @@ class MercurySyncBaseServer(Generic[T]):
         self._tcp_connect_retries = env.MERCURY_SYNC_TCP_CONNECT_RETRIES
         self._verify_cert = env.MERCURY_SYNC_VERIFY_SSL_CERT
 
+    async def _log_security_warning(
+        self,
+        message: str,
+        protocol: str = "udp",
+    ) -> None:
+        """
+        Log a security-related warning event.
+        
+        Used for logging security events like rate limiting, malformed requests,
+        decryption failures, etc. without leaking details to clients.
+        
+        Args:
+            message: Description of the security event
+            protocol: "tcp" or "udp" to select the appropriate logger
+        """
+        logger = self._udp_logger if protocol == "udp" else self._tcp_logger
+        if logger is not None:
+            try:
+                await logger.log(
+                    ServerWarning(
+                        message=message,
+                        node_id=0,  # Base server doesn't have node_id
+                        node_host=self._host,
+                        node_port=self._udp_port if protocol == "udp" else self._tcp_port,
+                    )
+                )
+            except Exception:
+                pass  # Best effort logging - don't fail on logging errors
 
     async def start_server(
         self,
@@ -975,7 +1004,7 @@ class MercurySyncBaseServer(Generic[T]):
                     )
 
         except Exception:
-            pass
+            pass  # Sync callback - cannot log asynchronously
 
     async def process_tcp_client_resopnse(
         self,
@@ -996,8 +1025,12 @@ class MercurySyncBaseServer(Generic[T]):
 
         try:
             addr = parse_address(address_bytes)
-        except AddressValidationError:
-            return  # Silently drop malformed addresses
+        except AddressValidationError as e:
+            await self._log_security_warning(
+                f"TCP client response malformed address: {e}",
+                protocol="tcp",
+            )
+            return
 
         try:
 
@@ -1051,8 +1084,12 @@ class MercurySyncBaseServer(Generic[T]):
 
             try:
                 addr = parse_address(address_bytes)
-            except AddressValidationError:
-                return  # Silently drop malformed addresses
+            except AddressValidationError as e:
+                await self._log_security_warning(
+                    f"TCP server request malformed address: {e}",
+                    protocol="tcp",
+                )
+                return
             
             if request_model := self.tcp_server_request_models.get(handler_name):
                 payload = request_model.load(payload)
@@ -1079,7 +1116,12 @@ class MercurySyncBaseServer(Generic[T]):
 
             transport.write(response_payload)
 
-        except Exception:
+        except Exception as e:
+            # Log security event - could be decryption failure, malformed message, etc.
+            await self._log_security_warning(
+                f"TCP server request failed: {type(e).__name__}",
+                protocol="tcp",
+            )
             # Sanitized error response - don't leak internal details
             try:
                 error_time = await self._tcp_clock.tick()
@@ -1105,8 +1147,12 @@ class MercurySyncBaseServer(Generic[T]):
         
         try:
             parsed_addr = parse_address(addr)
-        except AddressValidationError:
-            return  # Silently drop malformed addresses
+        except AddressValidationError as e:
+            await self._log_security_warning(
+                f"UDP server request malformed address: {e}",
+                protocol="udp",
+            )
+            return
         
         try:
             if request_models := self.udp_server_request_models.get(handler_name):
@@ -1130,7 +1176,12 @@ class MercurySyncBaseServer(Generic[T]):
 
             transport.sendto(response_payload, parsed_addr)
 
-        except Exception:
+        except Exception as e:
+            # Log security event
+            await self._log_security_warning(
+                f"UDP server request failed: {type(e).__name__}",
+                protocol="udp",
+            )
             # Sanitized error response - don't leak internal details
             response_payload = self._encryptor.encrypt(
                 self._compressor.compress(
