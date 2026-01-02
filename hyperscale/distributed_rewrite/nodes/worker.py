@@ -39,6 +39,7 @@ except ImportError:
 
 from hyperscale.distributed_rewrite.server import tcp
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, WorkerStateEmbedder
+from hyperscale.distributed_rewrite.swim.core import ErrorStats, CircuitState
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -131,6 +132,14 @@ class WorkerServer(HealthAwareServer):
         self._healthy_manager_ids: set[str] = set()
         # Primary manager for leader operations (set during registration)
         self._primary_manager_id: str | None = None
+        
+        # Circuit breaker for manager communication
+        # Tracks failures and implements fail-fast when managers are unreachable
+        self._manager_circuit = ErrorStats(
+            error_threshold=3,      # Open after 3 failures
+            window_seconds=30.0,    # Within 30 second window
+            half_open_after=10.0,   # Allow retry after 10 seconds
+        )
         
         # Workflow execution state
         self._active_workflows: dict[str, WorkflowProgress] = {}
@@ -235,6 +244,29 @@ class WorkerServer(HealthAwareServer):
         """Increment and return the state version."""
         self._state_version += 1
         return self._state_version
+    
+    def _is_manager_circuit_open(self) -> bool:
+        """Check if manager circuit breaker is open (fail-fast mode)."""
+        return self._manager_circuit.circuit_state == CircuitState.OPEN
+    
+    def get_manager_circuit_status(self) -> dict:
+        """
+        Get current manager circuit breaker status.
+        
+        Returns a dict with:
+        - circuit_state: Current state (CLOSED, OPEN, HALF_OPEN)
+        - error_count: Recent error count
+        - error_rate: Error rate over window
+        - healthy_managers: Count of healthy managers
+        - primary_manager: Current primary manager ID
+        """
+        return {
+            "circuit_state": self._manager_circuit.circuit_state.name,
+            "error_count": self._manager_circuit.error_count,
+            "error_rate": self._manager_circuit.error_rate,
+            "healthy_managers": len(self._healthy_manager_ids),
+            "primary_manager": self._primary_manager_id,
+        }
     
     async def start(self) -> None:
         """Start the worker server."""
@@ -1020,6 +1052,10 @@ class WorkerServer(HealthAwareServer):
     
     async def _send_progress_update(self, progress: WorkflowProgress) -> None:
         """Send a progress update to the primary manager and process ack."""
+        # Check circuit breaker first
+        if self._is_manager_circuit_open():
+            return  # Fail fast - don't attempt communication
+        
         manager_addr = self._get_primary_manager_tcp_addr()
         if not manager_addr:
             return
@@ -1035,12 +1071,20 @@ class WorkerServer(HealthAwareServer):
             # Process ack to update manager topology
             if response and isinstance(response, bytes) and response != b'error':
                 self._process_workflow_progress_ack(response)
+                self._manager_circuit.record_success()
+            else:
+                self._manager_circuit.record_error()
                 
         except Exception:
-            pass
+            self._manager_circuit.record_error()
     
     async def _send_progress_to_all_managers(self, progress: WorkflowProgress) -> None:
         """Send a progress update to ALL healthy managers and process acks."""
+        # Check circuit breaker first
+        if self._is_manager_circuit_open():
+            return  # Fail fast
+        
+        success_count = 0
         for manager_addr in self._get_healthy_manager_tcp_addrs():
             try:
                 response = await self.send_tcp(
@@ -1053,9 +1097,16 @@ class WorkerServer(HealthAwareServer):
                 # Process ack to update manager topology
                 if response and isinstance(response, bytes) and response != b'error':
                     self._process_workflow_progress_ack(response)
+                    success_count += 1
                     
             except Exception:
                 pass
+        
+        # Record circuit breaker result based on overall success
+        if success_count > 0:
+            self._manager_circuit.record_success()
+        elif len(self._healthy_manager_ids) > 0:
+            self._manager_circuit.record_error()
     
     def _process_workflow_progress_ack(self, data: bytes) -> None:
         """

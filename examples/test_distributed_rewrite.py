@@ -4072,6 +4072,96 @@ test_gate_dispatch_records_circuit()
 
 
 # =============================================================================
+# Worker Circuit Breaker Tests
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("WORKER CIRCUIT BREAKER TESTS")
+print("=" * 70 + "\n")
+
+
+@test("Worker: has _manager_circuit")
+def test_worker_has_manager_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer.__init__)
+    
+    assert "_manager_circuit" in source, \
+        "WorkerServer should have _manager_circuit ErrorStats"
+    assert "ErrorStats(" in source, \
+        "WorkerServer should create ErrorStats for circuit breaker"
+
+
+@test("Worker: has _is_manager_circuit_open method")
+def test_worker_has_circuit_open_check():
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    assert hasattr(WorkerServer, '_is_manager_circuit_open'), \
+        "WorkerServer should have _is_manager_circuit_open method"
+
+
+@test("Worker: has get_manager_circuit_status method")
+def test_worker_has_circuit_status():
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    import inspect
+    
+    assert hasattr(WorkerServer, 'get_manager_circuit_status'), \
+        "WorkerServer should have get_manager_circuit_status method"
+    
+    source = inspect.getsource(WorkerServer.get_manager_circuit_status)
+    
+    assert "circuit_state" in source, \
+        "get_manager_circuit_status should return circuit state"
+    assert "error_count" in source, \
+        "get_manager_circuit_status should return error count"
+
+
+@test("Worker: _send_progress_update checks circuit")
+def test_worker_progress_checks_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._send_progress_update)
+    
+    assert "_is_manager_circuit_open" in source, \
+        "_send_progress_update should check circuit breaker"
+
+
+@test("Worker: _send_progress_update records circuit state")
+def test_worker_progress_records_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._send_progress_update)
+    
+    assert "record_success" in source, \
+        "_send_progress_update should record success"
+    assert "record_error" in source, \
+        "_send_progress_update should record error"
+
+
+@test("Worker: _send_progress_to_all_managers checks circuit")
+def test_worker_progress_all_checks_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._send_progress_to_all_managers)
+    
+    assert "_is_manager_circuit_open" in source, \
+        "_send_progress_to_all_managers should check circuit breaker"
+
+
+# Run Worker Circuit Breaker tests
+test_worker_has_manager_circuit()
+test_worker_has_circuit_open_check()
+test_worker_has_circuit_status()
+test_worker_progress_checks_circuit()
+test_worker_progress_records_circuit()
+test_worker_progress_all_checks_circuit()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 
