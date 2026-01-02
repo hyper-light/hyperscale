@@ -1109,6 +1109,67 @@ test_state_sync_response_manager_serde()
 
 
 # =============================================================================
+# Worker Failure Retry Tests
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Worker Failure Retry Tests")
+print("=" * 60)
+
+
+@test("UDPServer: has node dead callback registration")
+def test_udp_server_node_dead_callback():
+    from hyperscale.distributed_rewrite.swim import UDPServer
+    
+    assert hasattr(UDPServer, 'register_on_node_dead')
+    assert callable(getattr(UDPServer, 'register_on_node_dead'))
+
+
+@test("UDPServer: node dead callback list initialized")
+def test_udp_server_node_dead_list():
+    import inspect
+    from hyperscale.distributed_rewrite.swim import UDPServer
+    
+    source = inspect.getsource(UDPServer.__init__)
+    assert '_on_node_dead_callbacks' in source
+
+
+@test("ManagerServer: has retry mechanism methods")
+def test_manager_retry_methods():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_on_node_dead')
+    assert hasattr(ManagerServer, '_handle_workflow_failure')
+    assert hasattr(ManagerServer, '_retry_workflow')
+    assert hasattr(ManagerServer, '_handle_worker_failure')
+    assert hasattr(ManagerServer, '_select_worker_for_workflow_excluding')
+
+
+@test("ManagerServer: has retry configuration")
+def test_manager_retry_config():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    # Check __init__ signature has retry params
+    sig = inspect.signature(ManagerServer.__init__)
+    params = sig.parameters
+    
+    assert 'max_workflow_retries' in params
+    assert 'workflow_timeout' in params
+    
+    # Check defaults
+    assert params['max_workflow_retries'].default == 3
+    assert params['workflow_timeout'].default == 300.0
+
+
+# Run Worker Failure tests
+test_udp_server_node_dead_callback()
+test_udp_server_node_dead_list()
+test_manager_retry_methods()
+test_manager_retry_config()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

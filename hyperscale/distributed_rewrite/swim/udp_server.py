@@ -164,6 +164,10 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         self._on_lose_leadership_callbacks: list[Callable[[], None]] = []
         self._on_leader_change_callbacks: list[Callable[[tuple[str, int] | None], None]] = []
         
+        # Node status change callbacks (for composition)
+        # Called when a node's status changes (e.g., becomes DEAD)
+        self._on_node_dead_callbacks: list[Callable[[tuple[str, int]], None]] = []
+        
         # Set up suspicion manager callbacks
         self._suspicion_manager.set_callbacks(
             on_expired=self._on_suspicion_expired,
@@ -217,6 +221,20 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             callback: Function receiving the new leader address (or None).
         """
         self._on_leader_change_callbacks.append(callback)
+    
+    def register_on_node_dead(
+        self,
+        callback: Callable[[tuple[str, int]], None],
+    ) -> None:
+        """
+        Register a callback to be invoked when a node is marked as DEAD.
+        
+        Use this to handle worker/peer failures without overriding methods.
+        
+        Args:
+            callback: Function receiving the dead node's address.
+        """
+        self._on_node_dead_callbacks.append(callback)
     
     def _get_lhm_multiplier(self) -> float:
         """Get the current LHM timeout multiplier."""
@@ -871,6 +889,15 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         nodes: Nodes = self._context.read('nodes')
         if node in nodes:
             self._safe_queue_put_sync(nodes[node], (int(time.monotonic()), b'DEAD'), node)
+        
+        # Invoke registered callbacks (composition pattern)
+        for callback in self._on_node_dead_callbacks:
+            try:
+                callback(node)
+            except Exception as e:
+                self._task_runner.run(
+                    self.handle_exception, e, "on_node_dead_callback"
+                )
     
     def _safe_queue_put_sync(
         self,

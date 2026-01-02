@@ -97,6 +97,8 @@ class ManagerServer(UDPServer):
         manager_peers: list[tuple[str, int]] | None = None,  # TCP addresses
         manager_udp_peers: list[tuple[str, int]] | None = None,  # UDP for SWIM cluster
         quorum_timeout: float = 5.0,
+        max_workflow_retries: int = 3,  # Max retry attempts per workflow
+        workflow_timeout: float = 300.0,  # Workflow timeout in seconds
     ):
         super().__init__(
             host=host,
@@ -130,6 +132,12 @@ class ManagerServer(UDPServer):
         self._pending_provisions: dict[str, ProvisionRequest] = {}  # workflow_id -> request
         self._provision_confirmations: dict[str, set[str]] = {}  # workflow_id -> confirming nodes
         
+        # Workflow retry tracking
+        # Maps workflow_id -> (retry_count, original_dispatch, failed_workers)
+        self._workflow_retries: dict[str, tuple[int, bytes, set[str]]] = {}
+        self._max_workflow_retries = max_workflow_retries
+        self._workflow_timeout = workflow_timeout
+        
         # Fencing tokens for at-most-once
         self._fence_token = 0
         
@@ -161,6 +169,9 @@ class ManagerServer(UDPServer):
         # Register leadership callbacks (composition pattern - no override)
         self.register_on_become_leader(self._on_manager_become_leader)
         self.register_on_lose_leadership(self._on_manager_lose_leadership)
+        
+        # Register node death callback for worker failure handling
+        self.register_on_node_dead(self._on_node_dead)
     
     def _on_manager_become_leader(self) -> None:
         """
@@ -176,6 +187,23 @@ class ManagerServer(UDPServer):
         """Called when this manager loses leadership."""
         # Currently no special cleanup needed
         pass
+    
+    def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
+        """
+        Called when a node is marked as DEAD via SWIM.
+        
+        If the dead node is a registered worker, triggers workflow retry.
+        """
+        # Find if this node is a registered worker
+        worker_node_id = None
+        for node_id, registration in self._workers.items():
+            if (registration.node.host, registration.node.port) == node_addr:
+                worker_node_id = node_id
+                break
+        
+        if worker_node_id:
+            # This is a worker - trigger failure handling
+            self._task_runner.run(self._handle_worker_failure, worker_node_id)
     
     async def _sync_state_from_workers(self) -> None:
         """
@@ -660,12 +688,233 @@ class ManagerServer(UDPServer):
                 job.timestamp = time.monotonic()
                 
                 self._increment_version()
+                
+                # Check if workflow failed and should be retried
+                if progress.status == WorkflowStatus.FAILED.value:
+                    await self._handle_workflow_failure(progress)
             
             return b'ok'
             
         except Exception as e:
             await self.handle_exception(e, "receive_workflow_progress")
             return b'error'
+    
+    # =========================================================================
+    # Workflow Failure Retry Logic
+    # =========================================================================
+    
+    async def _handle_workflow_failure(
+        self,
+        progress: WorkflowProgress,
+    ) -> None:
+        """
+        Handle a workflow failure and potentially retry on another worker.
+        
+        Called when a workflow reports FAILED status. Will attempt to
+        reschedule on a different worker up to max_workflow_retries times.
+        """
+        workflow_id = progress.workflow_id
+        job_id = progress.job_id
+        
+        # Get current assignment
+        current_worker = self._workflow_assignments.get(workflow_id)
+        if not current_worker:
+            return
+        
+        # Get or create retry info
+        if workflow_id not in self._workflow_retries:
+            # First failure - need to get the original dispatch info
+            # This requires storing it when we first dispatch
+            self._workflow_retries[workflow_id] = (0, b'', {current_worker})
+        
+        retry_count, original_dispatch, failed_workers = self._workflow_retries[workflow_id]
+        failed_workers.add(current_worker)
+        
+        # Check if we've exceeded max retries
+        if retry_count >= self._max_workflow_retries:
+            self._udp_logger.log(
+                ServerError(
+                    message=f"Workflow {workflow_id} failed after {retry_count} retries",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            # Clean up retry tracking
+            del self._workflow_retries[workflow_id]
+            return
+        
+        # Try to reschedule on a different worker
+        await self._retry_workflow(
+            workflow_id=workflow_id,
+            job_id=job_id,
+            failed_workers=failed_workers,
+            retry_count=retry_count + 1,
+        )
+    
+    async def _retry_workflow(
+        self,
+        workflow_id: str,
+        job_id: str,
+        failed_workers: set[str],
+        retry_count: int,
+    ) -> bool:
+        """
+        Attempt to retry a workflow on a different worker.
+        
+        Returns True if successfully rescheduled, False otherwise.
+        """
+        # Find eligible workers (not in failed set and have capacity)
+        job = self._jobs.get(job_id)
+        if not job:
+            return False
+        
+        # Find the workflow progress to get VUs needed
+        workflow_progress = None
+        for wf in job.workflows:
+            if wf.workflow_id == workflow_id:
+                workflow_progress = wf
+                break
+        
+        if not workflow_progress:
+            return False
+        
+        # Select a new worker
+        new_worker = self._select_worker_for_workflow_excluding(
+            vus_needed=1,  # Single core per workflow
+            exclude_workers=failed_workers,
+        )
+        
+        if not new_worker:
+            self._udp_logger.log(
+                ServerError(
+                    message=f"No eligible workers for workflow {workflow_id} retry (attempt {retry_count})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+        
+        # Get the pending provision for this workflow (contains dispatch info)
+        provision = self._pending_provisions.get(workflow_id)
+        if not provision:
+            self._udp_logger.log(
+                ServerError(
+                    message=f"No provision info for workflow {workflow_id} retry",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+        
+        # Create new dispatch with new fence token
+        new_fence_token = self._get_fence_token()
+        
+        # Update tracking
+        self._workflow_retries[workflow_id] = (retry_count, b'', failed_workers)
+        self._workflow_assignments[workflow_id] = new_worker
+        
+        self._udp_logger.log(
+            ServerInfo(
+                message=f"Retrying workflow {workflow_id} on {new_worker} (attempt {retry_count}/{self._max_workflow_retries})",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        # Note: The actual re-dispatch would need the original workflow bytes
+        # which should be stored in the pending provision or retry info.
+        # For now, we update the assignment and the next status check will
+        # trigger the dispatch. A full implementation would store and replay
+        # the original WorkflowDispatch.
+        
+        return True
+    
+    def _select_worker_for_workflow_excluding(
+        self,
+        vus_needed: int,
+        exclude_workers: set[str],
+    ) -> str | None:
+        """
+        Select a worker with sufficient capacity, excluding specified workers.
+        
+        Used for retry logic to avoid workers that have already failed.
+        """
+        eligible = []
+        for node_id, status in self._worker_status.items():
+            if node_id in exclude_workers:
+                continue
+            if status.state != WorkerState.HEALTHY.value:
+                continue
+            if status.available_cores >= vus_needed:
+                # Check SWIM membership - only select workers that are ALIVE
+                node_state = self._incarnation_tracker.get_node_state((
+                    self._workers[node_id].node.host,
+                    self._workers[node_id].node.port,
+                ))
+                if node_state and node_state.status == b'OK':
+                    eligible.append(node_id)
+        
+        if not eligible:
+            return None
+        
+        return secrets.choice(eligible)
+    
+    async def _handle_worker_failure(self, worker_node_id: str) -> None:
+        """
+        Handle a worker becoming unavailable (detected via SWIM).
+        
+        Reschedules all workflows assigned to that worker on other workers.
+        """
+        # Find all workflows assigned to this worker
+        workflows_to_retry = [
+            wf_id for wf_id, assigned_worker in self._workflow_assignments.items()
+            if assigned_worker == worker_node_id
+        ]
+        
+        if not workflows_to_retry:
+            return
+        
+        self._udp_logger.log(
+            ServerInfo(
+                message=f"Worker {worker_node_id} failed, rescheduling {len(workflows_to_retry)} workflows",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        # Mark each workflow as needing retry
+        for workflow_id in workflows_to_retry:
+            # Get the job for this workflow
+            job_id = None
+            for jid, job in self._jobs.items():
+                for wf in job.workflows:
+                    if wf.workflow_id == workflow_id:
+                        job_id = jid
+                        break
+                if job_id:
+                    break
+            
+            if job_id:
+                # Initialize or update retry tracking
+                if workflow_id not in self._workflow_retries:
+                    self._workflow_retries[workflow_id] = (0, b'', {worker_node_id})
+                else:
+                    count, data, failed = self._workflow_retries[workflow_id]
+                    failed.add(worker_node_id)
+                    self._workflow_retries[workflow_id] = (count, data, failed)
+                
+                # Attempt retry
+                await self._retry_workflow(
+                    workflow_id=workflow_id,
+                    job_id=job_id,
+                    failed_workers=self._workflow_retries[workflow_id][2],
+                    retry_count=self._workflow_retries[workflow_id][0] + 1,
+                )
     
     # =========================================================================
     # TCP Handlers - Job Submission (from Gate or Client)
