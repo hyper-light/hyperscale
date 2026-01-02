@@ -201,6 +201,14 @@ class WorkflowProgress(Message):
     Progress update for a running workflow.
     
     Sent from worker to manager during execution.
+    
+    Key fields for rapid provisioning:
+    - assigned_cores: Which CPU cores are executing this workflow
+    - cores_completed: How many cores have finished their portion
+    
+    When cores_completed > 0, the manager can immediately provision new
+    workflows to the freed cores without waiting for the entire workflow
+    to complete on all cores.
     """
     job_id: str                  # Parent job
     workflow_id: str             # Workflow instance
@@ -213,6 +221,9 @@ class WorkflowProgress(Message):
     step_stats: list["StepStats"] = field(default_factory=list)
     timestamp: float = 0.0       # Monotonic timestamp
     assigned_cores: list[int] = field(default_factory=list)  # Per-core assignment
+    cores_completed: int = 0     # Cores that have finished their portion
+    avg_cpu_percent: float = 0.0   # Average CPU utilization
+    avg_memory_mb: float = 0.0     # Average memory usage in MB
 
 
 @dataclass(slots=True)

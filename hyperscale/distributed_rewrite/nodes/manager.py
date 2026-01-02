@@ -683,16 +683,25 @@ class ManagerServer(UDPServer):
         data: bytes,
         clock_time: int,
     ):
-        """Handle workflow progress update from worker."""
+        """
+        Handle workflow progress update from worker.
+        
+        Key feature: Uses cores_completed to enable faster provisioning.
+        When a worker reports that some cores have finished their portion
+        of a workflow, we can immediately consider those cores available
+        for new workflows, without waiting for the entire workflow to complete.
+        """
         try:
             progress = WorkflowProgress.load(data)
             
             # Update job progress
             job = self._jobs.get(progress.job_id)
             if job:
-                # Find and update workflow in job
+                # Track previous cores_completed to detect newly freed cores
+                old_progress: WorkflowProgress | None = None
                 for i, wf in enumerate(job.workflows):
                     if wf.workflow_id == progress.workflow_id:
+                        old_progress = wf
                         job.workflows[i] = progress
                         break
                 else:
@@ -704,6 +713,11 @@ class ManagerServer(UDPServer):
                 job.total_failed = sum(w.failed_count for w in job.workflows)
                 job.overall_rate = sum(w.rate_per_second for w in job.workflows)
                 job.timestamp = time.monotonic()
+                
+                # Update worker available cores based on cores_completed
+                # This enables faster provisioning - we don't need to wait for
+                # the entire workflow to complete to start using freed cores
+                await self._update_worker_cores_from_progress(progress, old_progress)
                 
                 self._increment_version()
                 
@@ -725,6 +739,65 @@ class ManagerServer(UDPServer):
         except Exception as e:
             await self.handle_exception(e, "receive_workflow_progress")
             return b'error'
+    
+    async def _update_worker_cores_from_progress(
+        self,
+        progress: WorkflowProgress,
+        old_progress: WorkflowProgress | None,
+    ) -> None:
+        """
+        Update worker available cores based on cores_completed from progress.
+        
+        When cores_completed increases, we can mark those cores as available
+        for new workflows. This allows for more aggressive provisioning.
+        
+        Args:
+            progress: New progress update
+            old_progress: Previous progress (if any)
+        """
+        # Find the worker for this workflow
+        worker_id = self._workflow_assignments.get(progress.workflow_id)
+        if not worker_id:
+            return
+        
+        # Get worker status
+        worker_status = self._worker_status.get(worker_id)
+        if not worker_status:
+            return
+        
+        # Calculate newly completed cores
+        old_cores_completed = old_progress.cores_completed if old_progress else 0
+        new_cores_completed = progress.cores_completed
+        
+        if new_cores_completed > old_cores_completed:
+            # Cores have been freed - update worker's available count
+            cores_freed = new_cores_completed - old_cores_completed
+            
+            # Create updated heartbeat with incremented available cores
+            # Note: This is an optimistic update that may be superseded by
+            # the next heartbeat from the worker. That's OK - if we overestimate
+            # available cores, workflow dispatch will fail and retry.
+            updated_status = WorkerHeartbeat(
+                node_id=worker_status.node_id,
+                state=worker_status.state,
+                available_cores=worker_status.available_cores + cores_freed,
+                queue_depth=worker_status.queue_depth,
+                cpu_percent=worker_status.cpu_percent,
+                memory_percent=worker_status.memory_percent,
+                version=worker_status.version,  # Keep same version - worker heartbeat will update
+                active_workflows=worker_status.active_workflows,
+            )
+            self._worker_status[worker_id] = updated_status
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Worker {worker_id} freed {cores_freed} cores (now {updated_status.available_cores} available)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
     
     # =========================================================================
     # Workflow Failure Retry Logic

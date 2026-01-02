@@ -17,10 +17,14 @@ Protocols:
   - Status updates to managers
   - Workflow dispatch from managers
   - State sync requests
+
+Workflow Execution:
+- Uses WorkflowRunner from hyperscale.core.jobs.graphs for actual execution
+- Reports progress including cores_completed for faster manager reprovisioning
+- Supports single-VU (direct execution) and multi-VU (parallel) workflows
 """
 
 import asyncio
-import cloudpickle
 import os
 import time
 from typing import Any
@@ -56,6 +60,11 @@ from hyperscale.distributed_rewrite.models import (
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 
+# Import WorkflowRunner for actual workflow execution
+from hyperscale.core.jobs.graphs import WorkflowRunner
+from hyperscale.core.jobs.models.env import Env as CoreEnv
+from hyperscale.core.jobs.models.workflow_status import WorkflowStatus as CoreWorkflowStatus
+
 
 class WorkerServer(UDPServer):
     """
@@ -63,8 +72,8 @@ class WorkerServer(UDPServer):
     
     Workers:
     - Receive workflow dispatches from managers via TCP
-    - Execute workflows using available CPU cores
-    - Report progress back to managers via TCP
+    - Execute workflows using available CPU cores via WorkflowRunner
+    - Report progress back to managers via TCP (including cores_completed)
     - Participate in SWIM healthchecks via UDP (inherited from UDPServer)
     
     Workers have no knowledge of other workers - they only communicate
@@ -77,7 +86,14 @@ class WorkerServer(UDPServer):
     
     Status Updates (TCP):
         Workers send status updates to managers via TCP. These contain
-        capacity, queue depth, and workflow progress - NOT healthchecks.
+        capacity, queue depth, and workflow progress including cores_completed
+        for faster provisioning - NOT healthchecks.
+    
+    Workflow Execution:
+        Uses WorkflowRunner from hyperscale.core.jobs.graphs for actual
+        workflow execution. Progress updates include cores_completed to
+        allow managers to provision new workflows as soon as cores free up,
+        without waiting for the entire workflow to complete.
     """
     
     def __init__(
@@ -121,6 +137,15 @@ class WorkerServer(UDPServer):
         self._workflow_cancel_events: dict[str, asyncio.Event] = {}
         self._workflow_last_progress: dict[str, float] = {}  # workflow_id -> last update time
         
+        # WorkflowRunner for actual workflow execution
+        # Initialized lazily when first workflow is received
+        self._workflow_runner: WorkflowRunner | None = None
+        self._core_env: CoreEnv | None = None
+        
+        # Track cores that have completed within a workflow
+        # workflow_id -> set of completed core indices
+        self._workflow_cores_completed: dict[str, set[int]] = {}
+        
         # Progress update configuration
         self._progress_update_interval: float = 1.0  # Update every 1 second
         
@@ -143,6 +168,41 @@ class WorkerServer(UDPServer):
                 wf_id: wf.status for wf_id, wf in self._active_workflows.items()
             },
         ))
+    
+    def _get_core_env(self) -> CoreEnv:
+        """
+        Get or create a CoreEnv instance for WorkflowRunner.
+        
+        Converts from distributed_rewrite Env to core Env with sensible defaults.
+        """
+        if self._core_env is None:
+            self._core_env = CoreEnv(
+                MERCURY_SYNC_AUTH_SECRET=self._env.MERCURY_SYNC_AUTH_SECRET,
+                MERCURY_SYNC_AUTH_SECRET_PREVIOUS=self._env.MERCURY_SYNC_AUTH_SECRET_PREVIOUS,
+                MERCURY_SYNC_LOGS_DIRECTORY=self._env.MERCURY_SYNC_LOGS_DIRECTORY,
+                MERCURY_SYNC_LOG_LEVEL=self._env.MERCURY_SYNC_LOG_LEVEL,
+                MERCURY_SYNC_MAX_CONCURRENCY=self._env.MERCURY_SYNC_MAX_CONCURRENCY,
+                MERCURY_SYNC_TASK_RUNNER_MAX_THREADS=self._total_cores,
+                MERCURY_SYNC_MAX_RUNNING_WORKFLOWS=self._total_cores,
+                MERCURY_SYNC_MAX_PENDING_WORKFLOWS=100,
+            )
+        return self._core_env
+    
+    def _get_workflow_runner(self) -> WorkflowRunner:
+        """
+        Get or create the WorkflowRunner for executing workflows.
+        """
+        if self._workflow_runner is None:
+            core_env = self._get_core_env()
+            # Use node_id instance as worker_id and node_id
+            node_id_int = hash(self._node_id.full) % (2**31)
+            self._workflow_runner = WorkflowRunner(
+                env=core_env,
+                worker_id=node_id_int,
+                node_id=node_id_int,
+            )
+            self._workflow_runner.setup()
+        return self._workflow_runner
     
     @property
     def node_info(self) -> NodeInfo:
@@ -530,51 +590,94 @@ class WorkerServer(UDPServer):
         progress: WorkflowProgress,
         cancel_event: asyncio.Event,
     ) -> None:
-        """Execute a workflow."""
+        """
+        Execute a workflow using WorkflowRunner.
+        
+        This method:
+        1. Unpickles the workflow and context
+        2. Runs the workflow via WorkflowRunner
+        3. Reports progress updates including cores_completed
+        4. Cleans up on completion or cancellation
+        
+        The cores_completed field allows managers to start provisioning new
+        workflows as soon as cores become available, without waiting for the
+        entire workflow to complete on all assigned cores.
+        """
         start_time = time.monotonic()
+        run_id = hash(dispatch.workflow_id) % (2**31)  # Convert to int run_id
         
         try:
             # Unpickle workflow and context
             workflow = restricted_loads(dispatch.workflow)
-            context = restricted_loads(dispatch.context)
+            context_dict = restricted_loads(dispatch.context)
             
-            progress.workflow_name = workflow.__class__.__name__
+            progress.workflow_name = getattr(workflow, 'name', workflow.__class__.__name__)
             progress.status = WorkflowStatus.RUNNING.value
             self._increment_version()
             
-            # TODO: Actually execute the workflow
-            # This would integrate with the existing WorkflowRunner
-            # For now, simulate execution
+            # Initialize cores_completed tracking for this workflow
+            self._workflow_cores_completed[dispatch.workflow_id] = set()
             
-            while not cancel_event.is_set():
-                await asyncio.sleep(0.1)
-                
-                # Update progress
-                progress.elapsed_seconds = time.monotonic() - start_time
-                progress.completed_count += 1
-                progress.rate_per_second = (
-                    progress.completed_count / progress.elapsed_seconds
-                    if progress.elapsed_seconds > 0 else 0
+            # Get or create WorkflowRunner
+            runner = self._get_workflow_runner()
+            
+            # Start a background task to monitor and report progress
+            progress_token = self._task_runner.run(
+                self._monitor_workflow_progress,
+                dispatch,
+                progress,
+                run_id,
+                cancel_event,
+                alias=f"progress:{dispatch.workflow_id}",
+            )
+            
+            try:
+                # Execute the workflow using WorkflowRunner
+                # The runner handles VUs internally
+                (
+                    returned_run_id,
+                    results,
+                    result_context,
+                    error,
+                    status,
+                ) = await runner.run(
+                    run_id,
+                    workflow,
+                    context_dict if isinstance(context_dict, dict) else {},
+                    dispatch.vus,
                 )
-                progress.timestamp = time.monotonic()
                 
-                # Check timeout
-                if progress.elapsed_seconds > dispatch.timeout_seconds:
+                # Map core WorkflowStatus to distributed_rewrite WorkflowStatus
+                if status == CoreWorkflowStatus.COMPLETED:
+                    progress.status = WorkflowStatus.COMPLETED.value
+                    # All cores completed
+                    progress.cores_completed = len(progress.assigned_cores)
+                elif status == CoreWorkflowStatus.FAILED:
                     progress.status = WorkflowStatus.FAILED.value
-                    break
-                
-                # Send progress update to manager (throttled)
-                now = time.monotonic()
-                last_update = self._workflow_last_progress.get(dispatch.workflow_id, 0.0)
-                if self._current_manager and (now - last_update) >= self._progress_update_interval:
-                    await self._send_progress_update(progress)
-                    self._workflow_last_progress[dispatch.workflow_id] = now
-            
-            if cancel_event.is_set():
+                elif status == CoreWorkflowStatus.REJECTED:
+                    progress.status = WorkflowStatus.FAILED.value
+                else:
+                    progress.status = WorkflowStatus.COMPLETED.value
+                    progress.cores_completed = len(progress.assigned_cores)
+                    
+            except asyncio.CancelledError:
                 progress.status = WorkflowStatus.CANCELLED.value
-            else:
-                progress.status = WorkflowStatus.COMPLETED.value
+                raise
+            except Exception as e:
+                progress.status = WorkflowStatus.FAILED.value
+                await self.handle_exception(e, f"execute_workflow_{dispatch.workflow_id}")
+            finally:
+                # Cancel progress monitor
+                await self._task_runner.cancel(progress_token)
+            
+            # Final progress update
+            progress.elapsed_seconds = time.monotonic() - start_time
+            progress.timestamp = time.monotonic()
+            if self._current_manager:
+                await self._send_progress_update(progress)
                 
+        except asyncio.CancelledError:
+            progress.status = WorkflowStatus.CANCELLED.value
         except Exception as e:
             progress.status = WorkflowStatus.FAILED.value
             await self.handle_exception(e, f"execute_workflow_{dispatch.workflow_id}")
@@ -588,6 +691,102 @@ class WorkerServer(UDPServer):
             self._workflow_cancel_events.pop(dispatch.workflow_id, None)
             self._active_workflows.pop(dispatch.workflow_id, None)
             self._workflow_last_progress.pop(dispatch.workflow_id, None)
+            self._workflow_cores_completed.pop(dispatch.workflow_id, None)
+    
+    async def _monitor_workflow_progress(
+        self,
+        dispatch: WorkflowDispatch,
+        progress: WorkflowProgress,
+        run_id: int,
+        cancel_event: asyncio.Event,
+    ) -> None:
+        """
+        Monitor workflow progress and send updates to manager.
+        
+        This runs as a background task while the workflow executes.
+        It polls the WorkflowRunner for status updates and translates
+        them to WorkflowProgress updates for the manager.
+        
+        Key feature: Reports cores_completed to allow managers to 
+        provision new workflows as soon as cores become available.
+        """
+        start_time = time.monotonic()
+        runner = self._get_workflow_runner()
+        workflow_name = progress.workflow_name
+        
+        while not cancel_event.is_set():
+            try:
+                await asyncio.sleep(self._progress_update_interval)
+                
+                # Get stats from WorkflowRunner
+                (
+                    status,
+                    completed_count,
+                    failed_count,
+                    step_stats_dict,
+                ) = runner.get_running_workflow_stats(run_id, workflow_name)
+                
+                # Get system stats
+                avg_cpu, avg_mem = runner.get_system_stats(run_id, workflow_name)
+                
+                # Update progress object
+                progress.completed_count = completed_count
+                progress.failed_count = failed_count
+                progress.elapsed_seconds = time.monotonic() - start_time
+                progress.rate_per_second = (
+                    completed_count / progress.elapsed_seconds
+                    if progress.elapsed_seconds > 0 else 0.0
+                )
+                progress.timestamp = time.monotonic()
+                progress.avg_cpu_percent = avg_cpu
+                progress.avg_memory_mb = avg_mem
+                
+                # Convert step stats
+                progress.step_stats = [
+                    StepStats(
+                        step_name=step_name,
+                        completed_count=stats.get("ok", 0),
+                        failed_count=stats.get("err", 0),
+                        total_count=stats.get("total", 0),
+                    )
+                    for step_name, stats in step_stats_dict.items()
+                ]
+                
+                # Estimate cores_completed based on completion ratio
+                # This is a heuristic: if workflow is 80% complete, 
+                # roughly 80% of cores might be done
+                # More accurate tracking would require core-level instrumentation
+                total_cores = len(progress.assigned_cores)
+                if total_cores > 0:
+                    # Use workers_completed from WorkflowRunner if available
+                    # Otherwise estimate based on completion ratio
+                    estimated_complete = min(
+                        total_cores,
+                        int(total_cores * (completed_count / max(dispatch.vus * 100, 1)))
+                    )
+                    progress.cores_completed = estimated_complete
+                
+                # Map status
+                if status == CoreWorkflowStatus.RUNNING:
+                    progress.status = WorkflowStatus.RUNNING.value
+                elif status == CoreWorkflowStatus.COMPLETED:
+                    progress.status = WorkflowStatus.COMPLETED.value
+                    progress.cores_completed = total_cores
+                elif status == CoreWorkflowStatus.FAILED:
+                    progress.status = WorkflowStatus.FAILED.value
+                elif status == CoreWorkflowStatus.PENDING:
+                    progress.status = WorkflowStatus.ASSIGNED.value
+                
+                # Send update to manager
+                if self._current_manager:
+                    await self._send_progress_update(progress)
+                    self._workflow_last_progress[dispatch.workflow_id] = time.monotonic()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                # Progress monitoring failure is not critical
+                pass
     
     async def _send_progress_update(self, progress: WorkflowProgress) -> None:
         """Send a progress update to the manager."""

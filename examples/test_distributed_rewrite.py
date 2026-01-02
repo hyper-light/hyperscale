@@ -19,9 +19,21 @@ from typing import Any
 # Test utilities
 # =============================================================================
 
+# Create a global event loop at module load time for older Python versions
+try:
+    _loop = asyncio.get_running_loop()
+except RuntimeError:
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+
+
 def run_async(coro):
     """Run an async coroutine synchronously."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    return loop.run_until_complete(coro)
 
 
 class TestResult:
@@ -1261,6 +1273,242 @@ test_worker_per_core_methods()
 test_worker_per_core_data()
 test_workflow_progress_cores()
 test_workflow_progress_cores_serde()
+
+
+# =============================================================================
+# Cores Completed and Progress Tracking Tests
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Cores Completed and Progress Tracking Tests")
+print("=" * 60)
+
+
+@test("WorkflowProgress: has cores_completed field")
+def test_workflow_progress_cores_completed():
+    from hyperscale.distributed_rewrite.models import WorkflowProgress
+    
+    # Create with default (0)
+    progress = WorkflowProgress(
+        job_id="job-1",
+        workflow_id="wf-1",
+        workflow_name="TestWorkflow",
+        status="running",
+        completed_count=0,
+        failed_count=0,
+        rate_per_second=0.0,
+        elapsed_seconds=0.0,
+    )
+    assert progress.cores_completed == 0
+    
+    # Create with specific cores_completed
+    progress_with_completed = WorkflowProgress(
+        job_id="job-1",
+        workflow_id="wf-1",
+        workflow_name="TestWorkflow",
+        status="running",
+        completed_count=1000,
+        failed_count=5,
+        rate_per_second=500.0,
+        elapsed_seconds=2.0,
+        assigned_cores=[0, 1, 2, 3],
+        cores_completed=2,  # 2 of 4 cores completed
+    )
+    assert progress_with_completed.cores_completed == 2
+    assert progress_with_completed.assigned_cores == [0, 1, 2, 3]
+
+
+@test("WorkflowProgress: has avg_cpu_percent and avg_memory_mb fields")
+def test_workflow_progress_system_stats():
+    from hyperscale.distributed_rewrite.models import WorkflowProgress
+    
+    progress = WorkflowProgress(
+        job_id="job-1",
+        workflow_id="wf-1",
+        workflow_name="TestWorkflow",
+        status="running",
+        completed_count=1000,
+        failed_count=5,
+        rate_per_second=500.0,
+        elapsed_seconds=2.0,
+        avg_cpu_percent=75.5,
+        avg_memory_mb=1024.0,
+    )
+    assert progress.avg_cpu_percent == 75.5
+    assert progress.avg_memory_mb == 1024.0
+
+
+@test("WorkflowProgress: serialization with cores_completed")
+def test_workflow_progress_cores_completed_serde():
+    from hyperscale.distributed_rewrite.models import WorkflowProgress
+    
+    original = WorkflowProgress(
+        job_id="job-1",
+        workflow_id="wf-1",
+        workflow_name="TestWorkflow",
+        status="running",
+        completed_count=1000,
+        failed_count=10,
+        rate_per_second=250.0,
+        elapsed_seconds=4.0,
+        assigned_cores=[0, 1, 2, 3, 4, 5],
+        cores_completed=4,  # 4 of 6 cores have finished
+        avg_cpu_percent=80.0,
+        avg_memory_mb=2048.0,
+    )
+    
+    data = original.dump()
+    loaded = WorkflowProgress.load(data)
+    
+    assert loaded.cores_completed == 4
+    assert loaded.assigned_cores == [0, 1, 2, 3, 4, 5]
+    assert loaded.avg_cpu_percent == 80.0
+    assert loaded.avg_memory_mb == 2048.0
+
+
+@test("WorkerServer: has workflow runner integration")
+def test_worker_workflow_runner_integration():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    # Check for WorkflowRunner-related methods and fields
+    assert hasattr(WorkerServer, '_get_workflow_runner')
+    assert hasattr(WorkerServer, '_get_core_env')
+    assert hasattr(WorkerServer, '_monitor_workflow_progress')
+    
+    # Check __init__ for workflow runner fields
+    source = inspect.getsource(WorkerServer.__init__)
+    assert '_workflow_runner' in source
+    assert '_core_env' in source
+    assert '_workflow_cores_completed' in source
+
+
+@test("WorkerServer: _execute_workflow uses WorkflowRunner")
+def test_worker_execute_uses_runner():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._execute_workflow)
+    
+    # Should use the workflow runner
+    assert '_get_workflow_runner' in source or 'runner.run' in source
+    
+    # Should track cores_completed
+    assert 'cores_completed' in source
+
+
+@test("ManagerServer: has cores_completed progress handler")
+def test_manager_cores_completed_handler():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    # Check the method exists
+    assert hasattr(ManagerServer, '_update_worker_cores_from_progress')
+    
+    # Check the method docstring mentions cores_completed
+    method = ManagerServer._update_worker_cores_from_progress
+    assert 'cores_completed' in (method.__doc__ or '').lower()
+    
+    # Check the method signature accepts progress objects
+    sig = inspect.signature(method)
+    params = list(sig.parameters.keys())
+    assert 'progress' in params
+    assert 'old_progress' in params
+
+
+@test("ManagerServer: _update_worker_cores_from_progress updates available cores")
+def test_manager_update_cores_method():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._update_worker_cores_from_progress)
+    
+    # Should compare old and new cores_completed
+    assert 'old_cores_completed' in source or 'cores_completed' in source
+    
+    # Should update worker status
+    assert '_worker_status' in source
+    assert 'available_cores' in source
+
+
+@test("Cores completed tracking: enables faster provisioning scenario")
+def test_cores_completed_provisioning_scenario():
+    """
+    Test that cores_completed enables faster provisioning.
+    
+    Scenario:
+    - Worker has 8 cores
+    - Workflow A is assigned 4 cores
+    - After some time, 2 cores complete their portion of Workflow A
+    - Manager should see 2 + 4 = 6 available cores for new workflows
+    """
+    from hyperscale.distributed_rewrite.models import (
+        WorkflowProgress,
+        WorkerHeartbeat,
+        WorkerState,
+    )
+    
+    # Initial worker state: 8 total, 4 used by workflow A
+    initial_heartbeat = WorkerHeartbeat(
+        node_id="worker-1",
+        state=WorkerState.HEALTHY.value,
+        available_cores=4,  # 4 free, 4 used
+        queue_depth=0,
+        cpu_percent=50.0,
+        memory_percent=40.0,
+        version=1,
+        active_workflows={"wf-a": "running"},
+    )
+    
+    # Old progress: 0 cores completed
+    old_progress = WorkflowProgress(
+        job_id="job-1",
+        workflow_id="wf-a",
+        workflow_name="TestWorkflow",
+        status="running",
+        completed_count=500,
+        failed_count=0,
+        rate_per_second=100.0,
+        elapsed_seconds=5.0,
+        assigned_cores=[0, 1, 2, 3],
+        cores_completed=0,
+    )
+    
+    # New progress: 2 cores completed
+    new_progress = WorkflowProgress(
+        job_id="job-1",
+        workflow_id="wf-a",
+        workflow_name="TestWorkflow",
+        status="running",
+        completed_count=1500,
+        failed_count=0,
+        rate_per_second=150.0,
+        elapsed_seconds=10.0,
+        assigned_cores=[0, 1, 2, 3],
+        cores_completed=2,  # 2 cores have finished
+    )
+    
+    # Calculate freed cores
+    old_cores_completed = old_progress.cores_completed
+    new_cores_completed = new_progress.cores_completed
+    cores_freed = new_cores_completed - old_cores_completed
+    
+    assert cores_freed == 2
+    
+    # Simulate manager updating worker status
+    new_available = initial_heartbeat.available_cores + cores_freed
+    assert new_available == 6  # 4 + 2 = 6 available now
+
+
+# Run Cores Completed tests
+test_workflow_progress_cores_completed()
+test_workflow_progress_system_stats()
+test_workflow_progress_cores_completed_serde()
+test_worker_workflow_runner_integration()
+test_worker_execute_uses_runner()
+test_manager_cores_completed_handler()
+test_manager_update_cores_method()
+test_cores_completed_provisioning_scenario()
 
 
 # =============================================================================

@@ -18,6 +18,7 @@ class WorkflowStatusUpdate:
         "step_stats",
         "avg_cpu_usage",
         "avg_memory_usage_mb",
+        "workers_completed",
     )
 
     def __init__(
@@ -30,6 +31,7 @@ class WorkflowStatusUpdate:
         step_stats: Dict[str, Dict[StepStatsType, int]] | None = None,
         avg_cpu_usage: float | None = None,
         avg_memory_usage_mb: float | None = None,
+        workers_completed: int | None = None,
     ) -> None:
         self.workflow = workflow
         self.node_id = node_id
@@ -39,3 +41,4 @@ class WorkflowStatusUpdate:
         self.step_stats = step_stats
         self.avg_cpu_usage = avg_cpu_usage
         self.avg_memory_usage_mb = avg_memory_usage_mb
+        self.workers_completed = workers_completed
