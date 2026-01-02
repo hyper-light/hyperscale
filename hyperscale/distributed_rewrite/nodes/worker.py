@@ -105,7 +105,6 @@ class WorkerServer(HealthAwareServer):
         dc_id: str = "default",
         total_cores: int | None = None,
         manager_addrs: list[tuple[str, int]] | None = None,
-        manager_udp_addrs: list[tuple[str, int]] | None = None,
     ):
         # Core capacity (set before super().__init__ so state embedder can access it)
         self._total_cores = total_cores or os.cpu_count() or 1
@@ -119,9 +118,9 @@ class WorkerServer(HealthAwareServer):
         # Reverse mapping: workflow_id -> list of assigned core indices
         self._workflow_cores: dict[str, list[int]] = {}
         
-        # Manager discovery (UDP addresses for SWIM, TCP for data)
+        # Manager discovery (TCP addresses for registration, UDP populated via handle)
         self._manager_addrs = manager_addrs or []  # TCP addresses
-        self._manager_udp_addrs = manager_udp_addrs or []  # UDP addresses for SWIM
+        self._manager_udp_addrs: list[tuple[str, int]] = []  # Populated by handle_worker_register
         self._current_manager: tuple[str, int] | None = None
         
         # Workflow execution state
@@ -353,9 +352,9 @@ class WorkerServer(HealthAwareServer):
                 available_memory_mb=self._get_available_memory_mb(),
             )
             
-            result = await self.send_tcp(
+            # Use decorated send method - handle() will capture manager's address
+            result = await self.send_worker_register(
                 manager_addr,
-                "worker_register",
                 registration.dump(),
                 timeout=5.0,
             )
@@ -526,6 +525,33 @@ class WorkerServer(HealthAwareServer):
         
         self._increment_version()
         return True
+    
+    # =========================================================================
+    # TCP Handlers - Registration
+    # =========================================================================
+    
+    @tcp.send('worker_register')
+    async def send_worker_register(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        timeout: int | float | None = None,
+    ):
+        """Send worker registration to manager."""
+        return (addr, data, timeout)
+    
+    @tcp.handle('worker_register')
+    async def handle_worker_register(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Handle registration response from manager - store manager's address."""
+        # Store the manager's address for SWIM
+        if addr not in self._manager_udp_addrs:
+            self._manager_udp_addrs.append(addr)
+        return data
     
     # =========================================================================
     # TCP Handlers - Manager -> Worker

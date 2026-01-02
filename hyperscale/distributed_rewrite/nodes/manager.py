@@ -1005,11 +1005,26 @@ class ManagerServer(HealthAwareServer):
                 )
             )
             
-            return b'ok'
+            # Return ack with Manager's UDP address so Worker can join SWIM
+            ack = RegistrationAck(
+                accepted=True,
+                manager_node_id=self._node_id.full,
+                manager_udp_host=self._host,
+                manager_udp_port=self._udp_port,
+            )
+            return ack.dump()
             
         except Exception as e:
             await self.handle_exception(e, "receive_worker_register")
-            return b'error'
+            # Return error ack
+            ack = RegistrationAck(
+                accepted=False,
+                manager_node_id=self._node_id.full,
+                manager_udp_host=self._host,
+                manager_udp_port=self._udp_port,
+                error=str(e),
+            )
+            return ack.dump()
     
     @tcp.receive()
     async def receive_worker_status_update(

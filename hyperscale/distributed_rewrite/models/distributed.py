@@ -115,6 +115,21 @@ class WorkerRegistration(Message):
     available_memory_mb: int     # Currently free memory
 
 
+@dataclass(slots=True, kw_only=True)
+class RegistrationAck(Message):
+    """
+    Registration acknowledgment from manager to worker.
+    
+    Contains manager's UDP address so worker can join SWIM cluster
+    and push heartbeats.
+    """
+    accepted: bool               # Whether registration was accepted
+    manager_node_id: str         # Manager's node identifier
+    manager_udp_host: str        # Manager's UDP host for SWIM
+    manager_udp_port: int        # Manager's UDP port for SWIM
+    error: str | None = None     # Error message if not accepted
+
+
 @dataclass(slots=True)
 class WorkerHeartbeat(Message):
     """
