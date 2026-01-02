@@ -25,6 +25,14 @@ import os
 import time
 from typing import Any
 
+# Optional psutil import for system metrics
+try:
+    import psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    psutil = None  # type: ignore
+    _PSUTIL_AVAILABLE = False
+
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.distributed_rewrite.swim import UDPServer, WorkerStateEmbedder
 from hyperscale.distributed_rewrite.models import (
@@ -247,35 +255,27 @@ class WorkerServer(UDPServer):
     
     def _get_memory_mb(self) -> int:
         """Get total memory in MB."""
-        try:
-            import psutil
-            return psutil.virtual_memory().total // (1024 * 1024)
-        except ImportError:
+        if not _PSUTIL_AVAILABLE:
             return 0
+        return psutil.virtual_memory().total // (1024 * 1024)
     
     def _get_available_memory_mb(self) -> int:
         """Get available memory in MB."""
-        try:
-            import psutil
-            return psutil.virtual_memory().available // (1024 * 1024)
-        except ImportError:
+        if not _PSUTIL_AVAILABLE:
             return 0
+        return psutil.virtual_memory().available // (1024 * 1024)
     
     def _get_cpu_percent(self) -> float:
         """Get CPU utilization percentage."""
-        try:
-            import psutil
-            return psutil.cpu_percent()
-        except ImportError:
+        if not _PSUTIL_AVAILABLE:
             return 0.0
+        return psutil.cpu_percent()
     
     def _get_memory_percent(self) -> float:
         """Get memory utilization percentage."""
-        try:
-            import psutil
-            return psutil.virtual_memory().percent
-        except ImportError:
+        if not _PSUTIL_AVAILABLE:
             return 0.0
+        return psutil.virtual_memory().percent
     
     def _get_state_snapshot(self) -> WorkerStateSnapshot:
         """Get a complete state snapshot."""

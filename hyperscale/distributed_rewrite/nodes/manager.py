@@ -119,6 +119,7 @@ class ManagerServer(UDPServer):
         
         # Registered workers (indexed by node_id)
         self._workers: dict[str, WorkerRegistration] = {}  # node_id -> registration
+        self._worker_addr_to_id: dict[tuple[str, int], str] = {}  # (host, port) -> node_id (reverse mapping)
         self._worker_status: dict[str, WorkerHeartbeat] = {}  # node_id -> last status
         self._worker_last_status: dict[str, float] = {}  # node_id -> timestamp
         
@@ -198,12 +199,8 @@ class ManagerServer(UDPServer):
         
         If the dead node is a registered worker, triggers workflow retry.
         """
-        # Find if this node is a registered worker
-        worker_node_id = None
-        for node_id, registration in self._workers.items():
-            if (registration.node.host, registration.node.port) == node_addr:
-                worker_node_id = node_id
-                break
+        # O(1) lookup via reverse mapping
+        worker_node_id = self._worker_addr_to_id.get(node_addr)
         
         if worker_node_id:
             # This is a worker - trigger failure handling
@@ -619,6 +616,9 @@ class ManagerServer(UDPServer):
             
             # Store registration
             self._workers[registration.node.node_id] = registration
+            # Maintain reverse mapping for O(1) address -> node_id lookups
+            worker_addr = (registration.node.host, registration.node.port)
+            self._worker_addr_to_id[worker_addr] = registration.node.node_id
             self._worker_last_status[registration.node.node_id] = time.monotonic()
             self._increment_version()
             
@@ -942,6 +942,14 @@ class ManagerServer(UDPServer):
         
         Reschedules all workflows assigned to that worker on other workers.
         """
+        # Clean up worker from registration mappings
+        worker_reg = self._workers.pop(worker_node_id, None)
+        if worker_reg:
+            worker_addr = (worker_reg.node.host, worker_reg.node.port)
+            self._worker_addr_to_id.pop(worker_addr, None)
+        self._worker_status.pop(worker_node_id, None)
+        self._worker_last_status.pop(worker_node_id, None)
+        
         # Find all workflows assigned to this worker
         workflows_to_retry = [
             wf_id for wf_id, assigned_worker in self._workflow_assignments.items()
