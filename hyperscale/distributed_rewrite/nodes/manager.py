@@ -165,6 +165,10 @@ class ManagerServer(HealthAwareServer):
         self._worker_status: dict[str, WorkerHeartbeat] = {}  # node_id -> last status
         self._worker_last_status: dict[str, float] = {}  # node_id -> timestamp
         
+        # Per-worker circuit breakers for dispatch failures
+        # Tracks failures per-worker to avoid dispatching to failing workers
+        self._worker_circuits: dict[str, ErrorStats] = {}  # node_id -> ErrorStats
+        
         # Versioned state clock for rejecting stale updates
         # Tracks per-worker and per-job versions using Lamport timestamps
         self._versioned_clock = VersionedStateClock()
@@ -1357,15 +1361,71 @@ class ManagerServer(HealthAwareServer):
             jobs=dict(self._jobs),
         )
     
+    def _get_worker_circuit(self, worker_id: str) -> ErrorStats:
+        """
+        Get or create a circuit breaker for a specific worker.
+        
+        Each worker has its own circuit breaker so that failures to one
+        worker don't affect dispatch to other workers.
+        """
+        if worker_id not in self._worker_circuits:
+            self._worker_circuits[worker_id] = ErrorStats(
+                error_threshold=3,      # Open after 3 failures
+                window_seconds=30.0,    # Within 30 second window
+                half_open_after=10.0,   # Allow retry after 10 seconds
+            )
+        return self._worker_circuits[worker_id]
+    
+    def _is_worker_circuit_open(self, worker_id: str) -> bool:
+        """Check if a worker's circuit breaker is open."""
+        circuit = self._worker_circuits.get(worker_id)
+        if not circuit:
+            return False
+        return circuit.circuit_state == CircuitState.OPEN
+    
+    def get_worker_circuit_status(self, worker_id: str) -> dict | None:
+        """
+        Get circuit breaker status for a specific worker.
+        
+        Returns None if worker has no circuit breaker (never had failures).
+        """
+        circuit = self._worker_circuits.get(worker_id)
+        if not circuit:
+            return None
+        return {
+            "worker_id": worker_id,
+            "circuit_state": circuit.circuit_state.name,
+            "error_count": circuit.error_count,
+            "error_rate": circuit.error_rate,
+        }
+    
+    def get_all_worker_circuit_status(self) -> dict:
+        """Get circuit breaker status for all workers."""
+        return {
+            "workers": {
+                worker_id: self.get_worker_circuit_status(worker_id)
+                for worker_id in self._worker_circuits.keys()
+            },
+            "open_circuits": [
+                worker_id for worker_id in self._worker_circuits.keys()
+                if self._is_worker_circuit_open(worker_id)
+            ],
+        }
+    
     def _select_worker_for_workflow(self, vus_needed: int) -> str | None:
         """
         Select a worker with sufficient capacity for a workflow.
         
         Uses cryptographically secure random selection among eligible workers.
         Also checks SWIM membership - only select workers that are ALIVE.
+        Skips workers with open circuit breakers.
         """
         eligible = []
         for node_id, status in self._worker_status.items():
+            # Check circuit breaker - skip workers with open circuits
+            if self._is_worker_circuit_open(node_id):
+                continue
+            
             # Check capacity from status update
             if status.available_cores < vus_needed:
                 continue
@@ -1393,12 +1453,30 @@ class ManagerServer(HealthAwareServer):
         worker_node_id: str,
         dispatch: WorkflowDispatch,
     ) -> WorkflowDispatchAck | None:
-        """Dispatch a workflow to a specific worker."""
+        """
+        Dispatch a workflow to a specific worker.
+        
+        Checks and updates the per-worker circuit breaker.
+        """
+        # Check circuit breaker first
+        if self._is_worker_circuit_open(worker_node_id):
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Cannot dispatch to worker {worker_node_id}: circuit breaker is OPEN",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return None
+        
         worker = self._workers.get(worker_node_id)
         if not worker:
             return None
         
         worker_addr = (worker.node.host, worker.node.port)
+        circuit = self._get_worker_circuit(worker_node_id)
         
         try:
             response = await self.send_tcp(
@@ -1409,10 +1487,18 @@ class ManagerServer(HealthAwareServer):
             )
             
             if isinstance(response, bytes):
-                return WorkflowDispatchAck.load(response)
+                ack = WorkflowDispatchAck.load(response)
+                if ack.accepted:
+                    circuit.record_success()
+                else:
+                    circuit.record_error()
+                return ack
+            
+            circuit.record_error()
             return None
             
         except Exception as e:
+            circuit.record_error()
             await self.handle_exception(e, f"dispatch_to_worker_{worker_node_id}")
             return None
     
@@ -2241,11 +2327,17 @@ class ManagerServer(HealthAwareServer):
         Select a worker with sufficient capacity, excluding specified workers.
         
         Used for retry logic to avoid workers that have already failed.
+        Also skips workers with open circuit breakers.
         """
         eligible = []
         for node_id, status in self._worker_status.items():
             if node_id in exclude_workers:
                 continue
+            
+            # Check circuit breaker - skip workers with open circuits
+            if self._is_worker_circuit_open(node_id):
+                continue
+            
             if status.state != WorkerState.HEALTHY.value:
                 continue
             if status.available_cores < vus_needed:

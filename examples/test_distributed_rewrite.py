@@ -4275,6 +4275,108 @@ test_worker_progress_uses_backoff()
 
 
 # =============================================================================
+# Manager Per-Worker Circuit Breaker Tests
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("MANAGER PER-WORKER CIRCUIT BREAKER TESTS")
+print("=" * 70 + "\n")
+
+
+@test("Manager: has _worker_circuits dict")
+def test_manager_has_worker_circuits():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    assert "_worker_circuits" in source, \
+        "ManagerServer should have _worker_circuits dict"
+
+
+@test("Manager: has _get_worker_circuit method")
+def test_manager_has_get_worker_circuit():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_get_worker_circuit'), \
+        "ManagerServer should have _get_worker_circuit method"
+
+
+@test("Manager: has _is_worker_circuit_open method")
+def test_manager_has_is_worker_circuit_open():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_is_worker_circuit_open'), \
+        "ManagerServer should have _is_worker_circuit_open method"
+
+
+@test("Manager: has get_worker_circuit_status method")
+def test_manager_has_worker_circuit_status():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, 'get_worker_circuit_status'), \
+        "ManagerServer should have get_worker_circuit_status method"
+
+
+@test("Manager: has get_all_worker_circuit_status method")
+def test_manager_has_all_worker_circuit_status():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, 'get_all_worker_circuit_status'), \
+        "ManagerServer should have get_all_worker_circuit_status method"
+
+
+@test("Manager: _select_worker_for_workflow checks circuit")
+def test_manager_select_worker_checks_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._select_worker_for_workflow)
+    
+    assert "_is_worker_circuit_open" in source, \
+        "_select_worker_for_workflow should check circuit breaker"
+
+
+@test("Manager: _select_worker_for_workflow_excluding checks circuit")
+def test_manager_select_excluding_checks_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._select_worker_for_workflow_excluding)
+    
+    assert "_is_worker_circuit_open" in source, \
+        "_select_worker_for_workflow_excluding should check circuit breaker"
+
+
+@test("Manager: _dispatch_workflow_to_worker uses circuit")
+def test_manager_dispatch_uses_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._dispatch_workflow_to_worker)
+    
+    assert "_is_worker_circuit_open" in source, \
+        "_dispatch_workflow_to_worker should check circuit breaker"
+    assert "_get_worker_circuit" in source, \
+        "_dispatch_workflow_to_worker should get circuit breaker"
+    assert "record_success" in source, \
+        "_dispatch_workflow_to_worker should record success"
+    assert "record_error" in source, \
+        "_dispatch_workflow_to_worker should record error"
+
+
+# Run Manager Per-Worker Circuit Breaker tests
+test_manager_has_worker_circuits()
+test_manager_has_get_worker_circuit()
+test_manager_has_is_worker_circuit_open()
+test_manager_has_worker_circuit_status()
+test_manager_has_all_worker_circuit_status()
+test_manager_select_worker_checks_circuit()
+test_manager_select_excluding_checks_circuit()
+test_manager_dispatch_uses_circuit()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 
