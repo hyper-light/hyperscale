@@ -20,6 +20,7 @@ Protocols:
 """
 
 import asyncio
+import cloudpickle
 import os
 import time
 from typing import Any

@@ -1,14 +1,12 @@
 """
 Distributed system message types for Gate, Manager, and Worker nodes.
 
-These msgspec Structs define the wire format for all TCP communication
+These dataclasses define the wire format for all TCP communication
 in the distributed Hyperscale architecture.
 """
 
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal
-import cloudpickle
-from hyperscale.core.graph.workflow import Workflow
 from .message import Message
 
 
@@ -58,7 +56,8 @@ class WorkerState(str, Enum):
 # Node Identity and Registration
 # =============================================================================
 
-class NodeInfo(Message, kw_only=True):
+@dataclass(slots=True)
+class NodeInfo(Message):
     """
     Identity information for any node in the cluster.
     
@@ -72,7 +71,8 @@ class NodeInfo(Message, kw_only=True):
     version: int = 0             # State version (Lamport clock)
 
 
-class WorkerRegistration(Message, kw_only=True):
+@dataclass(slots=True)
+class WorkerRegistration(Message):
     """
     Worker registration message sent to managers.
     
@@ -85,7 +85,8 @@ class WorkerRegistration(Message, kw_only=True):
     available_memory_mb: int     # Currently free memory
 
 
-class WorkerHeartbeat(Message, kw_only=True):
+@dataclass(slots=True)
+class WorkerHeartbeat(Message):
     """
     Periodic heartbeat from worker to manager.
     
@@ -99,10 +100,11 @@ class WorkerHeartbeat(Message, kw_only=True):
     memory_percent: float        # Memory utilization 0-100
     version: int                 # State version for sync
     # Active workflows and their status
-    active_workflows: dict[str, str] = {}  # workflow_id -> WorkflowStatus
+    active_workflows: dict[str, str] = field(default_factory=dict)
 
 
-class ManagerHeartbeat(Message, kw_only=True):
+@dataclass(slots=True)
+class ManagerHeartbeat(Message):
     """
     Periodic heartbeat from manager to gates (if gates present).
     
@@ -123,7 +125,8 @@ class ManagerHeartbeat(Message, kw_only=True):
 # Job Submission and Dispatch
 # =============================================================================
 
-class JobSubmission(Message, kw_only=True):
+@dataclass(slots=True)
+class JobSubmission(Message):
     """
     Job submission from client to gate or manager.
     
@@ -134,9 +137,11 @@ class JobSubmission(Message, kw_only=True):
     vus: int                     # Virtual users (cores to use per workflow)
     timeout_seconds: float       # Maximum execution time
     datacenter_count: int = 1    # Number of DCs to run in (gates only)
-    datacenters: list[str] = []  # Specific DCs (empty = auto-select)
+    datacenters: list[str] = field(default_factory=list)
 
-class JobAck(Message, kw_only=True):
+
+@dataclass(slots=True)
+class JobAck(Message):
     """
     Acknowledgment of job submission.
     
@@ -148,7 +153,8 @@ class JobAck(Message, kw_only=True):
     queued_position: int = 0     # Position in queue (if queued)
 
 
-class WorkflowDispatch(Message, kw_only=True):
+@dataclass(slots=True)
+class WorkflowDispatch(Message):
     """
     Dispatch a single workflow to a worker.
     
@@ -163,7 +169,8 @@ class WorkflowDispatch(Message, kw_only=True):
     fence_token: int             # Fencing token for at-most-once
 
 
-class WorkflowDispatchAck(Message, kw_only=True):
+@dataclass(slots=True)
+class WorkflowDispatchAck(Message):
     """
     Worker acknowledgment of workflow dispatch.
     """
@@ -177,7 +184,8 @@ class WorkflowDispatchAck(Message, kw_only=True):
 # Status Updates and Reporting
 # =============================================================================
 
-class StepStats(Message, kw_only=True):
+@dataclass(slots=True)
+class StepStats(Message):
     """
     Statistics for a single workflow step.
     """
@@ -187,7 +195,8 @@ class StepStats(Message, kw_only=True):
     total_count: int = 0         # Total attempts
 
 
-class WorkflowProgress(Message, kw_only=True):
+@dataclass(slots=True)
+class WorkflowProgress(Message):
     """
     Progress update for a running workflow.
     
@@ -201,11 +210,12 @@ class WorkflowProgress(Message, kw_only=True):
     failed_count: int            # Total actions failed
     rate_per_second: float       # Current execution rate
     elapsed_seconds: float       # Time since start
-    step_stats: list[StepStats] = []  # Per-step breakdown
+    step_stats: list["StepStats"] = field(default_factory=list)
     timestamp: float = 0.0       # Monotonic timestamp
 
 
-class JobProgress(Message, kw_only=True):
+@dataclass(slots=True)
+class JobProgress(Message):
     """
     Aggregated job progress from manager to gate.
     
@@ -214,7 +224,7 @@ class JobProgress(Message, kw_only=True):
     job_id: str                  # Job identifier
     datacenter: str              # Reporting datacenter
     status: str                  # JobStatus value
-    workflows: list[WorkflowProgress] = []  # Per-workflow progress
+    workflows: list["WorkflowProgress"] = field(default_factory=list)
     total_completed: int = 0     # Total actions completed
     total_failed: int = 0        # Total actions failed
     overall_rate: float = 0.0    # Aggregate rate
@@ -222,7 +232,8 @@ class JobProgress(Message, kw_only=True):
     timestamp: float = 0.0       # Monotonic timestamp
 
 
-class GlobalJobStatus(Message, kw_only=True):
+@dataclass(slots=True)
+class GlobalJobStatus(Message):
     """
     Global job status aggregated by gate across datacenters.
     
@@ -230,7 +241,7 @@ class GlobalJobStatus(Message, kw_only=True):
     """
     job_id: str                  # Job identifier
     status: str                  # JobStatus value
-    datacenters: list[JobProgress] = []  # Per-DC progress
+    datacenters: list["JobProgress"] = field(default_factory=list)
     total_completed: int = 0     # Global total completed
     total_failed: int = 0        # Global total failed
     overall_rate: float = 0.0    # Global aggregate rate
@@ -243,7 +254,8 @@ class GlobalJobStatus(Message, kw_only=True):
 # State Synchronization
 # =============================================================================
 
-class WorkerStateSnapshot(Message, kw_only=True):
+@dataclass(slots=True)
+class WorkerStateSnapshot(Message):
     """
     Complete state snapshot from a worker.
     
@@ -254,10 +266,11 @@ class WorkerStateSnapshot(Message, kw_only=True):
     total_cores: int             # Total cores
     available_cores: int         # Free cores
     version: int                 # State version
-    active_workflows: dict[str, WorkflowProgress] = {}  # workflow_id -> progress
+    active_workflows: dict[str, "WorkflowProgress"] = field(default_factory=dict)
 
 
-class ManagerStateSnapshot(Message, kw_only=True):
+@dataclass(slots=True)
+class ManagerStateSnapshot(Message):
     """
     Complete state snapshot from a manager.
     
@@ -268,11 +281,12 @@ class ManagerStateSnapshot(Message, kw_only=True):
     is_leader: bool              # Leadership status
     term: int                    # Current term
     version: int                 # State version
-    workers: list[WorkerStateSnapshot] = []  # Registered workers
-    jobs: dict[str, JobProgress] = {}  # Active jobs
+    workers: list["WorkerStateSnapshot"] = field(default_factory=list)
+    jobs: dict[str, "JobProgress"] = field(default_factory=dict)
 
 
-class StateSyncRequest(Message, kw_only=True):
+@dataclass(slots=True)
+class StateSyncRequest(Message):
     """
     Request for state synchronization.
     
@@ -283,22 +297,24 @@ class StateSyncRequest(Message, kw_only=True):
     since_version: int = 0       # Only send updates after this version
 
 
-class StateSyncResponse(Message, kw_only=True):
+@dataclass(slots=True)
+class StateSyncResponse(Message):
     """
     Response to state sync request.
     """
     responder_id: str            # Responding node
     current_version: int         # Current state version
     # One of these will be set based on node type
-    worker_state: WorkerStateSnapshot | None = None
-    manager_state: ManagerStateSnapshot | None = None
+    worker_state: "WorkerStateSnapshot | None" = None
+    manager_state: "ManagerStateSnapshot | None" = None
 
 
 # =============================================================================
 # Quorum and Confirmation
 # =============================================================================
 
-class ProvisionRequest(Message, kw_only=True):
+@dataclass(slots=True)
+class ProvisionRequest(Message):
     """
     Request to provision a workflow across the cluster.
     
@@ -312,7 +328,8 @@ class ProvisionRequest(Message, kw_only=True):
     version: int                 # State version for this decision
 
 
-class ProvisionConfirm(Message, kw_only=True):
+@dataclass(slots=True)
+class ProvisionConfirm(Message):
     """
     Confirmation of provision request.
     
@@ -326,7 +343,8 @@ class ProvisionConfirm(Message, kw_only=True):
     error: str | None = None     # Error if not confirmed
 
 
-class ProvisionCommit(Message, kw_only=True):
+@dataclass(slots=True)
+class ProvisionCommit(Message):
     """
     Commit message after quorum achieved.
     
@@ -344,7 +362,8 @@ class ProvisionCommit(Message, kw_only=True):
 # Cancellation
 # =============================================================================
 
-class CancelJob(Message, kw_only=True):
+@dataclass(slots=True)
+class CancelJob(Message):
     """
     Request to cancel a job.
     
@@ -356,7 +375,8 @@ class CancelJob(Message, kw_only=True):
     fence_token: int = 0         # Fencing token for validation
 
 
-class CancelAck(Message, kw_only=True):
+@dataclass(slots=True)
+class CancelAck(Message):
     """
     Acknowledgment of cancellation.
     """
@@ -370,7 +390,8 @@ class CancelAck(Message, kw_only=True):
 # Lease Management (for Gates)
 # =============================================================================
 
-class DatacenterLease(Message, kw_only=True):
+@dataclass(slots=True)
+class DatacenterLease(Message):
     """
     Lease for job execution in a datacenter.
     
@@ -384,7 +405,8 @@ class DatacenterLease(Message, kw_only=True):
     version: int                 # Lease version
 
 
-class LeaseTransfer(Message, kw_only=True):
+@dataclass(slots=True)
+class LeaseTransfer(Message):
     """
     Transfer a lease to another gate (during scaling).
     """
@@ -394,4 +416,3 @@ class LeaseTransfer(Message, kw_only=True):
     to_gate: str                 # New holder
     new_fence_token: int         # New fencing token
     version: int                 # Transfer version
-

@@ -1,13 +1,14 @@
-import msgspec
+import cloudpickle
+from typing import Self
 
 
-class Message(msgspec.Struct):
+class Message:
 
     @classmethod
-    def load(cls, data: bytes):
-        """Deserialize bytes to this Message type."""
-        return msgspec.json.decode(data, type=cls)
+    def load(self, data: bytes) -> Self:
+        return cloudpickle.loads(data)
     
-    def dump(self) -> bytes:
-        """Serialize this Message to bytes."""
-        return msgspec.json.encode(self)
+    def dump(self):
+        return cloudpickle.dumps(self)
+    
+    
