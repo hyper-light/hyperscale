@@ -28,7 +28,7 @@ from typing import Any
 import cloudpickle
 
 from hyperscale.distributed_rewrite.server import tcp, udp
-from hyperscale.distributed_rewrite.swim import UDPServer
+from hyperscale.distributed_rewrite.swim import UDPServer, WorkerStateEmbedder
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -116,6 +116,20 @@ class WorkerServer(UDPServer):
         
         # Queue depth tracking
         self._pending_workflows: list[WorkflowDispatch] = []
+        
+        # Inject state embedder for Serf-style heartbeat embedding in SWIM messages
+        self.set_state_embedder(WorkerStateEmbedder(
+            get_node_id=lambda: self._node_id.full,
+            get_worker_state=lambda: self._get_worker_state().value,
+            get_available_cores=lambda: self._available_cores,
+            get_queue_depth=lambda: len(self._pending_workflows),
+            get_cpu_percent=self._get_cpu_percent,
+            get_memory_percent=self._get_memory_percent,
+            get_state_version=lambda: self._state_version,
+            get_active_workflows=lambda: {
+                wf_id: wf.status for wf_id, wf in self._active_workflows.items()
+            },
+        ))
     
     @property
     def node_info(self) -> NodeInfo:

@@ -28,7 +28,7 @@ import time
 from typing import Any
 
 from hyperscale.distributed_rewrite.server import tcp, udp
-from hyperscale.distributed_rewrite.swim import UDPServer
+from hyperscale.distributed_rewrite.swim import UDPServer, ManagerStateEmbedder
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -138,6 +138,34 @@ class ManagerServer(UDPServer):
         
         # Quorum settings
         self._quorum_timeout = quorum_timeout
+        
+        # Inject state embedder for Serf-style heartbeat embedding in SWIM messages
+        self.set_state_embedder(ManagerStateEmbedder(
+            get_node_id=lambda: self._node_id.full,
+            get_datacenter=lambda: self._node_id.datacenter,
+            is_leader=self.is_leader,
+            get_term=lambda: self._leader_election.state.current_term,
+            get_state_version=lambda: self._state_version,
+            get_active_jobs=lambda: len(self._jobs),
+            get_active_workflows=lambda: sum(
+                len([w for w in job.workflows if w.status == WorkflowStatus.RUNNING.value])
+                for job in self._jobs.values()
+            ),
+            get_worker_count=lambda: len(self._workers),
+            get_available_cores=lambda: sum(
+                status.available_cores for status in self._worker_status.values()
+            ),
+            on_worker_heartbeat=self._handle_embedded_worker_heartbeat,
+        ))
+    
+    def _handle_embedded_worker_heartbeat(
+        self,
+        heartbeat: WorkerHeartbeat,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """Handle WorkerHeartbeat received via SWIM message embedding."""
+        self._worker_status[heartbeat.node_id] = heartbeat
+        self._worker_last_status[heartbeat.node_id] = time.monotonic()
     
     @property
     def node_info(self) -> NodeInfo:

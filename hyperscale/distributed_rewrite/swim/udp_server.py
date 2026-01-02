@@ -66,6 +66,9 @@ from .gossip.gossip_buffer import GossipBuffer, MAX_UDP_PAYLOAD
 # Leadership
 from .leadership.local_leader_election import LocalLeaderElection
 
+# State embedding (Serf-style)
+from .core.state_embedder import StateEmbedder, NullStateEmbedder
+
 
 class UDPServer(MercurySyncBaseServer[Ctx]):
     """
@@ -90,6 +93,8 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         *args, 
         dc_id: str = "default",
         priority: int = 50,
+        # State embedding (Serf-style heartbeat in SWIM messages)
+        state_embedder: StateEmbedder | None = None,
         # Message deduplication settings
         dedup_cache_size: int = 2000,  # Default 2K messages (was 10K - excessive)
         dedup_window: float = 30.0,    # Seconds to consider duplicate
@@ -103,6 +108,9 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Generate unique node identity
         self._node_id = NodeId.generate(datacenter=dc_id, priority=priority)
+        
+        # State embedder for Serf-style heartbeat embedding
+        self._state_embedder: StateEmbedder = state_embedder or NullStateEmbedder()
         
         # Initialize SWIM components
         self._local_health = LocalHealthMultiplier()
@@ -362,6 +370,128 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
     def get_degraded_timeout_multiplier(self) -> float:
         """Get timeout multiplier based on degradation level."""
         return self._degradation.get_timeout_multiplier()
+    
+    # === Serf-Style Heartbeat Embedding ===
+    # State embedding is handled via composition (StateEmbedder protocol).
+    # Node types (Worker, Manager, Gate) inject their own embedder implementation.
+    
+    # Separator for embedded state in messages
+    _STATE_SEPARATOR = b'#'
+    
+    def set_state_embedder(self, embedder: StateEmbedder) -> None:
+        """
+        Set the state embedder for this server.
+        
+        This allows node types to inject their own state embedding logic
+        after construction (e.g., when the node has access to its own state).
+        
+        Args:
+            embedder: The StateEmbedder implementation to use.
+        """
+        self._state_embedder = embedder
+    
+    def _get_embedded_state(self) -> bytes | None:
+        """
+        Get state to embed in SWIM probe responses.
+        
+        Delegates to the injected StateEmbedder to get serialized
+        heartbeat data for Serf-style passive state discovery.
+        
+        Returns:
+            Serialized state bytes, or None if no state to embed.
+        """
+        return self._state_embedder.get_state()
+    
+    def _process_embedded_state(
+        self,
+        state_data: bytes,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """
+        Process embedded state received from another node.
+        
+        Delegates to the injected StateEmbedder to handle heartbeat data
+        from incoming SWIM messages.
+        
+        Args:
+            state_data: Serialized state bytes from the remote node.
+            source_addr: The (host, port) of the node that sent the state.
+        """
+        self._state_embedder.process_state(state_data, source_addr)
+    
+    def _build_ack_with_state(self) -> bytes:
+        """
+        Build an ack response with embedded state.
+        
+        Format: ack>host:port#base64_state (if state available)
+                ack>host:port (if no state)
+        
+        Returns:
+            Ack message bytes with optional embedded state.
+        """
+        import base64
+        
+        base_ack = b'ack>' + self._udp_addr_slug
+        
+        state = self._get_embedded_state()
+        if state is None:
+            return base_ack
+        
+        # Encode state as base64 to avoid byte issues
+        encoded_state = base64.b64encode(state)
+        
+        # Check if adding state would exceed MTU
+        full_message = base_ack + self._STATE_SEPARATOR + encoded_state
+        if len(full_message) > MAX_UDP_PAYLOAD:
+            # State too large, skip it
+            return base_ack
+        
+        return full_message
+    
+    def _extract_embedded_state(
+        self,
+        message: bytes,
+        source_addr: tuple[str, int],
+    ) -> bytes:
+        """
+        Extract and process embedded state from an incoming message.
+        
+        Separates the message content from any embedded state, processes
+        the state if present, and returns the clean message.
+        
+        Args:
+            message: Raw message that may contain embedded state.
+            source_addr: The (host, port) of the sender.
+        
+        Returns:
+            The message with embedded state removed.
+        """
+        import base64
+        
+        # Find state separator in the address portion
+        # Format: msg_type>host:port#base64_state
+        sep_idx = message.rfind(self._STATE_SEPARATOR)
+        if sep_idx < 0:
+            return message
+        
+        # Check if separator is after the '>' (in address portion)
+        addr_sep_idx = message.find(b'>')
+        if addr_sep_idx < 0 or sep_idx < addr_sep_idx:
+            # Separator is in message type, not state
+            return message
+        
+        # Extract and decode state
+        clean_message = message[:sep_idx]
+        encoded_state = message[sep_idx + 1:]
+        
+        try:
+            state_data = base64.b64decode(encoded_state)
+            self._process_embedded_state(state_data, source_addr)
+        except Exception:
+            # Invalid base64 or processing error - ignore silently
+            pass
+        
+        return clean_message
     
     # === Message Size Helpers ===
     
@@ -2128,6 +2258,20 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             source_addr = f'{addr[0]}:{addr[1]}'
             if len(parsed) > 1:
                 message, target_addr = parsed
+                
+                # Extract embedded state from address portion (Serf-style)
+                # Format: host:port#base64_state
+                if self._STATE_SEPARATOR in target_addr:
+                    addr_part, state_part = target_addr.split(self._STATE_SEPARATOR, 1)
+                    target_addr = addr_part
+                    # Process embedded state from sender
+                    import base64
+                    try:
+                        state_data = base64.b64decode(state_part)
+                        self._process_embedded_state(state_data, addr)
+                    except Exception:
+                        pass  # Invalid state, ignore
+                
                 host, port = target_addr.decode().split(':', maxsplit=1)
                 target = (host, int(port))
             
@@ -2186,7 +2330,8 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         self._probe_scheduler.add_member(target)
                         self._incarnation_tracker.update_node(target, b'OK', 0, time.monotonic())
 
-                        return b'ack>' + self._udp_addr_slug
+                        # Include embedded state so new node learns our state
+                        return self._build_ack_with_state()
 
                 case b'leave':
                     if not await self._validate_target(target, b'leave', addr):
@@ -2233,7 +2378,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         if self.udp_target_is_self(target):
                             await self.increase_failure_detector('refutation')
                             new_incarnation = await self.broadcast_refutation()
-                            return b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
+                            # Include embedded state when proving we're alive
+                            base = b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
+                            state = self._get_embedded_state()
+                            if state:
+                                import base64
+                                return base + self._STATE_SEPARATOR + base64.b64encode(state)
+                            return base
                         
                         if target not in nodes:
                             return b'nack>' + self._udp_addr_slug
@@ -2266,7 +2417,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                             return b'nack>' + self._udp_addr_slug
                         
                         if self.udp_target_is_self(target):
-                            return b'ping-req-ack:alive>' + self._udp_addr_slug
+                            # Include embedded state when responding to indirect probe
+                            base = b'ping-req-ack:alive>' + self._udp_addr_slug
+                            state = self._get_embedded_state()
+                            if state:
+                                import base64
+                                return base + self._STATE_SEPARATOR + base64.b64encode(state)
+                            return base
                         
                         if target not in nodes:
                             return b'ping-req-ack:unknown>' + self._udp_addr_slug
@@ -2332,7 +2489,13 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         if self.udp_target_is_self(target):
                             await self.increase_failure_detector('refutation')
                             new_incarnation = await self.broadcast_refutation()
-                            return b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
+                            # Include embedded state when refuting suspicion
+                            base = b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
+                            state = self._get_embedded_state()
+                            if state:
+                                import base64
+                                return base + self._STATE_SEPARATOR + base64.b64encode(state)
+                            return base
                         
                         if self.is_message_fresh(target, msg_incarnation, b'SUSPECT'):
                             await self.start_suspicion(target, msg_incarnation, addr)

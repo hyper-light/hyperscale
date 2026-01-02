@@ -26,7 +26,7 @@ import time
 from typing import Any
 
 from hyperscale.distributed_rewrite.server import tcp, udp
-from hyperscale.distributed_rewrite.swim import UDPServer
+from hyperscale.distributed_rewrite.swim import UDPServer, GateStateEmbedder
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -121,6 +121,26 @@ class GateServer(UDPServer):
         
         # Background tasks
         self._lease_cleanup_task: asyncio.Task | None = None
+        
+        # Inject state embedder for Serf-style heartbeat embedding in SWIM messages
+        self.set_state_embedder(GateStateEmbedder(
+            get_node_id=lambda: self._node_id.full,
+            get_datacenter=lambda: self._node_id.datacenter,
+            is_leader=self.is_leader,
+            get_term=lambda: self._leader_election.state.current_term,
+            get_state_version=lambda: self._state_version,
+            get_active_jobs=lambda: len(self._jobs),
+            on_manager_heartbeat=self._handle_embedded_manager_heartbeat,
+        ))
+    
+    def _handle_embedded_manager_heartbeat(
+        self,
+        heartbeat: ManagerHeartbeat,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """Handle ManagerHeartbeat received via SWIM message embedding."""
+        self._datacenter_status[heartbeat.datacenter] = heartbeat
+        self._datacenter_last_status[heartbeat.datacenter] = time.monotonic()
     
     @property
     def node_info(self) -> NodeInfo:

@@ -73,6 +73,12 @@ from .core import (
     BoundedDict as BoundedDict,
     CleanupConfig as CleanupConfig,
     create_cleanup_config_from_context as create_cleanup_config_from_context,
+    # State Embedders (Serf-style heartbeat embedding)
+    StateEmbedder as StateEmbedder,
+    NullStateEmbedder as NullStateEmbedder,
+    WorkerStateEmbedder as WorkerStateEmbedder,
+    ManagerStateEmbedder as ManagerStateEmbedder,
+    GateStateEmbedder as GateStateEmbedder,
 )
 
 # Health monitoring

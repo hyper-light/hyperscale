@@ -76,6 +76,14 @@ from .protocols import (
     TaskRunnerProtocol,
 )
 
+from .state_embedder import (
+    StateEmbedder,
+    NullStateEmbedder,
+    WorkerStateEmbedder,
+    ManagerStateEmbedder,
+    GateStateEmbedder,
+)
+
 from .constants import (
     # Message types
     MSG_PROBE,
@@ -174,6 +182,12 @@ __all__ = [
     # Protocols
     'LoggerProtocol',
     'TaskRunnerProtocol',
+    # State Embedders
+    'StateEmbedder',
+    'NullStateEmbedder',
+    'WorkerStateEmbedder',
+    'ManagerStateEmbedder',
+    'GateStateEmbedder',
     # Constants
     'MSG_PROBE',
     'MSG_ACK',
