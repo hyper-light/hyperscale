@@ -50,6 +50,7 @@ from .message_limits import (
 )
 from .rate_limiter import RateLimiter, RateLimitExceeded
 from .replay_guard import ReplayGuard, ReplayError
+from .restricted_unpickler import restricted_loads, SecurityError
 from .server_protocol import MercurySyncTCPServerProtocol
 
 T = TypeVar("T")
@@ -895,10 +896,11 @@ class TCPProtocol(Generic[T, K]):
         result: Tuple[str, int, Message] = None
 
         try:
-            result: Tuple[str, int, Message] = cloudpickle.loads(decrypted)
+            # Use restricted unpickler to prevent arbitrary code execution
+            result: Tuple[str, int, Message] = restricted_loads(decrypted)
 
-        except Exception:
-            # Sanitized error - don't leak deserialization details
+        except (SecurityError, Exception):
+            # Sanitized error - don't leak details about what was blocked
             error = Message(
                 node_id=self.node_id,
                 host=self.host,

@@ -187,14 +187,10 @@ class LocalRunner:
                     key_path=key_path,
                 )
 
-                print('A')
-
                 await self._remote_manger.connect_to_workers(
                     worker_ips,
                     timeout=timeout,
                 )
-
-                print('B')
 
                 await ctx.log_prepared_batch(
                     {
@@ -209,8 +205,6 @@ class LocalRunner:
                     test_name,
                     workflows,
                 )
-
-                print('C')
 
                 await ctx.log_prepared(
                     f"Completed execution of test {test_name} on runner type {self._runner_type} - shutting down",

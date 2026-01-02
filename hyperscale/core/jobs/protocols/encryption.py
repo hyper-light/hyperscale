@@ -76,14 +76,21 @@ class AESGCMFernet:
     3. Compromise of one message's key doesn't compromise others
     4. Both endpoints must know the shared secret to communicate
     
+    Key Rotation:
+    - Set MERCURY_SYNC_AUTH_SECRET to the new secret
+    - Set MERCURY_SYNC_AUTH_SECRET_PREVIOUS to the old secret
+    - Encryption uses the new secret
+    - Decryption tries new secret first, then falls back to old
+    - Once all nodes have rotated, remove MERCURY_SYNC_AUTH_SECRET_PREVIOUS
+    
     This class is pickle-compatible for use with multiprocessing.
     """
     
-    # Only store the secret bytes - no unpicklable objects
-    __slots__ = ('_secret_bytes',)
+    # Store primary and fallback secrets for key rotation
+    __slots__ = ('_secret_bytes', '_fallback_secret_bytes')
     
     def __init__(self, env: Env) -> None:
-        # Convert secret to bytes and validate minimum length
+        # Convert primary secret to bytes and validate
         secret = env.MERCURY_SYNC_AUTH_SECRET
         if isinstance(secret, str):
             self._secret_bytes = secret.encode('utf-8')
@@ -117,17 +124,33 @@ class AESGCMFernet:
                     UserWarning,
                     stacklevel=2
                 )
+        
+        # Handle fallback secret for key rotation
+        self._fallback_secret_bytes: bytes | None = None
+        previous_secret = getattr(env, 'MERCURY_SYNC_AUTH_SECRET_PREVIOUS', None)
+        if previous_secret:
+            if isinstance(previous_secret, str):
+                self._fallback_secret_bytes = previous_secret.encode('utf-8')
+            else:
+                self._fallback_secret_bytes = previous_secret
 
-    def _derive_key(self, salt: bytes) -> bytes:
+    def _derive_key(self, salt: bytes, secret_bytes: bytes | None = None) -> bytes:
         """
-        Derive a unique encryption key from the shared secret and salt.
+        Derive a unique encryption key from a secret and salt.
         
         Uses HKDF (HMAC-based Key Derivation Function) with SHA-256.
         The salt ensures each message gets a unique derived key.
         
+        Args:
+            salt: Random salt for key derivation
+            secret_bytes: Secret to use (defaults to primary secret)
+        
         Note: default_backend() is called inline rather than stored to
         maintain pickle compatibility for multiprocessing.
         """
+        if secret_bytes is None:
+            secret_bytes = self._secret_bytes
+            
         hkdf = HKDF(
             algorithm=hashes.SHA256(),
             length=KEY_SIZE,
@@ -135,7 +158,7 @@ class AESGCMFernet:
             info=ENCRYPTION_CONTEXT,
             backend=default_backend(),
         )
-        return hkdf.derive(self._secret_bytes)
+        return hkdf.derive(secret_bytes)
 
     def encrypt(self, data: bytes) -> bytes:
         """
@@ -173,8 +196,12 @@ class AESGCMFernet:
         Derives the same key using HKDF(shared_secret, salt, context)
         and decrypts. The auth tag is verified by AESGCM.
         
+        Key Rotation: If decryption with the primary secret fails and a
+        fallback secret is configured, tries the fallback secret. This
+        enables seamless key rotation without downtime.
+        
         Raises:
-            EncryptionError: If decryption fails (wrong key, tampered data, etc.)
+            EncryptionError: If decryption fails with all available keys
         """
         if len(data) < HEADER_SIZE + 16:  # Minimum: header + auth tag
             raise EncryptionError("Message too short to contain valid ciphertext")
@@ -184,15 +211,23 @@ class AESGCMFernet:
         nonce = data[SALT_SIZE:HEADER_SIZE]
         ciphertext = data[HEADER_SIZE:]
         
-        # Derive the same key from shared secret + salt
-        key = self._derive_key(salt)
-        
+        # Try primary secret first
+        key = self._derive_key(salt, self._secret_bytes)
         try:
-            # Decrypt and verify authentication tag
             return AESGCM(key).decrypt(nonce, ciphertext, associated_data=None)
-        except Exception as e:
-            # Don't leak details about why decryption failed
-            raise EncryptionError("Decryption failed: invalid key or tampered data") from e
+        except Exception:
+            pass  # Try fallback if available
+        
+        # Try fallback secret if configured (key rotation scenario)
+        if self._fallback_secret_bytes:
+            key = self._derive_key(salt, self._fallback_secret_bytes)
+            try:
+                return AESGCM(key).decrypt(nonce, ciphertext, associated_data=None)
+            except Exception:
+                pass
+        
+        # All secrets failed
+        raise EncryptionError("Decryption failed: invalid key or tampered data")
 
     def encrypt_with_aad(self, data: bytes, associated_data: bytes) -> bytes:
         """
@@ -215,6 +250,7 @@ class AESGCMFernet:
         Decrypt data encrypted with encrypt_with_aad().
         
         The same associated_data must be provided for authentication.
+        Supports key rotation like decrypt().
         
         Raises:
             EncryptionError: If decryption fails or AAD doesn't match
@@ -226,17 +262,31 @@ class AESGCMFernet:
         nonce = data[SALT_SIZE:HEADER_SIZE]
         ciphertext = data[HEADER_SIZE:]
         
-        key = self._derive_key(salt)
-        
+        # Try primary secret first
+        key = self._derive_key(salt, self._secret_bytes)
         try:
             return AESGCM(key).decrypt(nonce, ciphertext, associated_data=associated_data)
-        except Exception as e:
-            raise EncryptionError("Decryption failed: invalid key, tampered data, or AAD mismatch") from e
+        except Exception:
+            pass
+        
+        # Try fallback secret if configured
+        if self._fallback_secret_bytes:
+            key = self._derive_key(salt, self._fallback_secret_bytes)
+            try:
+                return AESGCM(key).decrypt(nonce, ciphertext, associated_data=associated_data)
+            except Exception:
+                pass
+        
+        raise EncryptionError("Decryption failed: invalid key, tampered data, or AAD mismatch")
     
     def __getstate__(self):
-        """Return state for pickling - only the secret bytes."""
-        return {'_secret_bytes': self._secret_bytes}
+        """Return state for pickling - includes both secrets for key rotation."""
+        return {
+            '_secret_bytes': self._secret_bytes,
+            '_fallback_secret_bytes': self._fallback_secret_bytes,
+        }
     
     def __setstate__(self, state):
         """Restore state from pickle."""
         self._secret_bytes = state['_secret_bytes']
+        self._fallback_secret_bytes = state.get('_fallback_secret_bytes')

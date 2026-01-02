@@ -528,6 +528,274 @@ print()
 
 
 # ============================================================================
+# P3: Key Rotation
+# ============================================================================
+
+print("P3: Key Rotation")
+print("-" * 40)
+
+def test_key_rotation_decrypt_with_new_key():
+    """Messages encrypted with new key decrypt with new key."""
+    env = Env(MERCURY_SYNC_AUTH_SECRET="new-secret-key-12345678")
+    encryptor = AESGCMFernet(env)
+    
+    data = b"test message"
+    encrypted = encryptor.encrypt(data)
+    decrypted = encryptor.decrypt(encrypted)
+    
+    assert decrypted == data
+    print("  ✓ Decrypt with new key works")
+
+def test_key_rotation_decrypt_with_old_key():
+    """Messages encrypted with old key decrypt during rotation."""
+    # Simulate: old node encrypts with old secret
+    old_env = Env(MERCURY_SYNC_AUTH_SECRET="old-secret-key-12345678")
+    old_encryptor = AESGCMFernet(old_env)
+    data = b"message from old node"
+    encrypted = old_encryptor.encrypt(data)
+    
+    # Simulate: new node has rotated keys (new primary, old fallback)
+    new_env = Env(
+        MERCURY_SYNC_AUTH_SECRET="new-secret-key-12345678",
+        MERCURY_SYNC_AUTH_SECRET_PREVIOUS="old-secret-key-12345678"
+    )
+    new_encryptor = AESGCMFernet(new_env)
+    
+    # Should decrypt using fallback secret
+    decrypted = new_encryptor.decrypt(encrypted)
+    assert decrypted == data
+    print("  ✓ Decrypt with fallback (old) key works")
+
+def test_key_rotation_encrypt_uses_new_key():
+    """Encryption always uses the new key."""
+    # Create encryptor with rotation config
+    env = Env(
+        MERCURY_SYNC_AUTH_SECRET="new-secret-key-12345678",
+        MERCURY_SYNC_AUTH_SECRET_PREVIOUS="old-secret-key-12345678"
+    )
+    encryptor = AESGCMFernet(env)
+    data = b"new message"
+    encrypted = encryptor.encrypt(data)
+    
+    # Verify it was encrypted with NEW key (old-only encryptor can't decrypt)
+    old_only_env = Env(MERCURY_SYNC_AUTH_SECRET="old-secret-key-12345678")
+    old_only_encryptor = AESGCMFernet(old_only_env)
+    
+    try:
+        old_only_encryptor.decrypt(encrypted)
+        assert False, "Should not decrypt with old key only"
+    except EncryptionError:
+        pass  # Expected
+    
+    # But new key can decrypt
+    new_only_env = Env(MERCURY_SYNC_AUTH_SECRET="new-secret-key-12345678")
+    new_only_encryptor = AESGCMFernet(new_only_env)
+    decrypted = new_only_encryptor.decrypt(encrypted)
+    assert decrypted == data
+    print("  ✓ Encryption uses new key (not old)")
+
+def test_key_rotation_no_fallback():
+    """Without fallback, only new key works."""
+    env = Env(MERCURY_SYNC_AUTH_SECRET="only-secret-key-123456")
+    encryptor = AESGCMFernet(env)
+    
+    data = b"test"
+    encrypted = encryptor.encrypt(data)
+    
+    # Decrypt works
+    assert encryptor.decrypt(encrypted) == data
+    
+    # Wrong key fails
+    wrong_env = Env(MERCURY_SYNC_AUTH_SECRET="wrong-secret-key-123456")
+    wrong_encryptor = AESGCMFernet(wrong_env)
+    try:
+        wrong_encryptor.decrypt(encrypted)
+        assert False, "Should fail with wrong key"
+    except EncryptionError:
+        pass
+    print("  ✓ Without fallback, only matching key works")
+
+def test_key_rotation_pickle_preserves_fallback():
+    """Pickle/unpickle preserves both secrets."""
+    import pickle
+    import cloudpickle
+    
+    env = Env(
+        MERCURY_SYNC_AUTH_SECRET="new-secret-key-12345678",
+        MERCURY_SYNC_AUTH_SECRET_PREVIOUS="old-secret-key-12345678"
+    )
+    encryptor = AESGCMFernet(env)
+    
+    # Pickle and unpickle
+    pickled = cloudpickle.dumps(encryptor)
+    restored = cloudpickle.loads(pickled)
+    
+    # Verify both secrets are preserved
+    assert restored._secret_bytes == encryptor._secret_bytes
+    assert restored._fallback_secret_bytes == encryptor._fallback_secret_bytes
+    
+    # Verify decryption still works with fallback
+    old_env = Env(MERCURY_SYNC_AUTH_SECRET="old-secret-key-12345678")
+    old_encryptor = AESGCMFernet(old_env)
+    encrypted_with_old = old_encryptor.encrypt(b"old message")
+    
+    assert restored.decrypt(encrypted_with_old) == b"old message"
+    print("  ✓ Pickle preserves fallback secret")
+
+test_key_rotation_decrypt_with_new_key()
+test_key_rotation_decrypt_with_old_key()
+test_key_rotation_encrypt_uses_new_key()
+test_key_rotation_no_fallback()
+test_key_rotation_pickle_preserves_fallback()
+
+print()
+
+
+# ============================================================================
+# P4: Restricted Unpickler (Arbitrary Code Execution Prevention)
+# ============================================================================
+
+print("P4: Restricted Unpickler")
+print("-" * 40)
+
+restricted_unpickler_module = load_module(
+    "restricted_unpickler",
+    "/home/ada/Projects/hyperscale/hyperscale/core/jobs/protocols/restricted_unpickler.py"
+)
+
+restricted_loads = restricted_unpickler_module.restricted_loads
+SecurityError = restricted_unpickler_module.SecurityError
+is_module_allowed = restricted_unpickler_module.is_module_allowed
+
+def test_restricted_allows_builtins():
+    """Basic Python types should be allowed."""
+    import pickle
+    
+    # Test basic types
+    data = pickle.dumps([1, 2, 3, {"key": "value"}, (1, 2), {1, 2}])
+    result = restricted_loads(data)
+    assert result == [1, 2, 3, {"key": "value"}, (1, 2), {1, 2}]
+    print("  ✓ Builtins (list, dict, tuple, set) allowed")
+
+def test_restricted_allows_datetime():
+    """Datetime module should be allowed."""
+    import pickle
+    from datetime import datetime, timedelta
+    
+    now = datetime.now()
+    delta = timedelta(days=1)
+    data = pickle.dumps((now, delta))
+    result = restricted_loads(data)
+    assert result[0] == now
+    assert result[1] == delta
+    print("  ✓ datetime module allowed")
+
+def test_restricted_blocks_os():
+    """os module should be blocked."""
+    import pickle
+    
+    # Create a pickle that would import os.system
+    # This is a simplified test - real attacks would be more sophisticated
+    class FakeOsPayload:
+        def __reduce__(self):
+            import os
+            return (os.system, ("echo pwned",))
+    
+    try:
+        data = pickle.dumps(FakeOsPayload())
+        restricted_loads(data)
+        assert False, "Should have blocked os module"
+    except SecurityError as e:
+        assert "os" in str(e).lower() or "blocked" in str(e).lower()
+    print("  ✓ os module blocked")
+
+def test_restricted_blocks_subprocess():
+    """subprocess module should be blocked."""
+    import pickle
+    
+    class FakeSubprocessPayload:
+        def __reduce__(self):
+            import subprocess
+            return (subprocess.Popen, (["echo", "pwned"],))
+    
+    try:
+        data = pickle.dumps(FakeSubprocessPayload())
+        restricted_loads(data)
+        assert False, "Should have blocked subprocess module"
+    except SecurityError as e:
+        assert "subprocess" in str(e).lower() or "blocked" in str(e).lower()
+    print("  ✓ subprocess module blocked")
+
+def test_restricted_blocks_eval():
+    """builtins.eval should be blocked."""
+    import pickle
+    
+    class FakeEvalPayload:
+        def __reduce__(self):
+            return (eval, ("__import__('os').system('echo pwned')",))
+    
+    try:
+        data = pickle.dumps(FakeEvalPayload())
+        restricted_loads(data)
+        assert False, "Should have blocked eval"
+    except SecurityError as e:
+        assert "eval" in str(e).lower() or "blocked" in str(e).lower()
+    print("  ✓ builtins.eval blocked")
+
+def test_restricted_allows_hyperscale():
+    """hyperscale.* modules should be allowed."""
+    assert is_module_allowed("hyperscale.core.jobs.models.env")
+    assert is_module_allowed("hyperscale.core.graph.workflow")
+    print("  ✓ hyperscale.* modules allowed")
+
+def test_restricted_allows_cloudpickle_internals():
+    """cloudpickle internals should be allowed (needed for class reconstruction)."""
+    assert is_module_allowed("cloudpickle")
+    assert is_module_allowed("cloudpickle.cloudpickle")
+    print("  ✓ cloudpickle internals allowed")
+
+def test_restricted_blocks_unknown_modules():
+    """Unknown modules should be blocked."""
+    assert not is_module_allowed("some_random_module")
+    assert not is_module_allowed("evil_package.malware")
+    print("  ✓ Unknown modules blocked")
+
+def test_restricted_allows_collections():
+    """collections module should work for defaultdict, Counter, etc."""
+    import pickle
+    from collections import defaultdict, Counter, deque
+    
+    # Test defaultdict (converted to dict for pickling)
+    dd = defaultdict(list)
+    dd['key'].append('value')
+    
+    # Test Counter
+    c = Counter(['a', 'b', 'a'])
+    
+    # Test deque
+    d = deque([1, 2, 3])
+    
+    data = pickle.dumps((dict(dd), dict(c), d))
+    result = restricted_loads(data)
+    assert result[0] == {'key': ['value']}
+    assert result[1] == {'a': 2, 'b': 1}
+    assert list(result[2]) == [1, 2, 3]
+    print("  ✓ collections module (defaultdict, Counter, deque) allowed")
+
+test_restricted_allows_builtins()
+test_restricted_allows_datetime()
+test_restricted_blocks_os()
+test_restricted_blocks_subprocess()
+test_restricted_blocks_eval()
+test_restricted_allows_hyperscale()
+test_restricted_allows_cloudpickle_internals()
+test_restricted_blocks_unknown_modules()
+test_restricted_allows_collections()
+
+print()
+
+
+# ============================================================================
 # Summary
 # ============================================================================
 
@@ -542,5 +810,7 @@ print("  P1 #2: Strong secrets - Weak/default secrets rejected in production")
 print("  P2 #1: Rate limiting - Token bucket per-source rate limiting")
 print("  P2 #2: Message size limits - Compression bomb detection")
 print("  P2 #3: Sanitized errors - Generic error messages only")
+print("  P3:    Key rotation - Seamless secret rotation without downtime")
+print("  P4:    Restricted unpickler - Blocks dangerous modules (os, subprocess, eval)")
 print()
 

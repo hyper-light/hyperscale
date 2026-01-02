@@ -51,6 +51,7 @@ from .message_limits import (
 )
 from .rate_limiter import RateLimiter, RateLimitExceeded
 from .replay_guard import ReplayGuard, ReplayError
+from .restricted_unpickler import restricted_loads, SecurityError
 from .udp_socket_protocol import UDPSocketProtocol
 
 do_patch()
@@ -796,10 +797,13 @@ class UDPProtocol(Generic[T, K]):
         result: Tuple[str, int, Message] = (None, None, None)
 
         try:
-            result: Tuple[str, int, Message] = cloudpickle.loads(decrypted)
+            # Use restricted unpickler to prevent arbitrary code execution
+            result: Tuple[str, int, Message] = restricted_loads(decrypted)
 
-        except Exception:
-            # Sanitized error - don't leak deserialization details
+        except (SecurityError, Exception):
+            import traceback
+            print(traceback.format_exc())
+            # Sanitized error - don't leak details about what was blocked
             self._pending_responses.append(
                 asyncio.create_task(
                     self._return_error(
