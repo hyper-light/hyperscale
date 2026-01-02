@@ -241,21 +241,15 @@ def setup_client(
         client._connection_options = ConnectionOptions()
 
     elif isinstance(client, MercurySyncSFTPConnction):
-        try:
+        client._concurrency = vus
+        client._semaphore = asyncio.Semaphore(vus)
 
-            client._concurrency = vus
-            client._semaphore = asyncio.Semaphore(vus)
+        client._connections = [
+            SFTPConnection()
+            for _ in range(vus)
+        ]
 
-            client._connections = [
-                SFTPConnection()
-                for _ in range(vus)
-            ]
-
-            client._connection_options = ConnectionOptions()
-
-        except Exception:
-            import traceback
-            print(traceback.format_exc())
+        client._connection_options = ConnectionOptions()
 
     elif isinstance(client, MercurySyncSMTPConnection):
         ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
