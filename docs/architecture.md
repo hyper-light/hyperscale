@@ -334,6 +334,125 @@ def _has_quorum_available(self) -> bool:
 - Leadership re-election via `LocalLeaderElection` (same as managers)
 - Pre-voting and term-based resolution prevent split-brain
 
+### AD-14: CRDT-Based Cross-DC Statistics
+
+**Decision**: Use Conflict-free Replicated Data Types (CRDTs) for cross-datacenter job statistics.
+
+**Rationale**:
+- Cross-DC coordination is expensive (10-100ms+ RTT)
+- Stats like `completed_count` and `failed_count` are monotonic and perfect for G-Counters
+- CRDTs allow coordination-free updates with guaranteed eventual consistency
+- Merge is always safe - gates can combine stats from any subset of DCs
+
+**Implementation**:
+```python
+class GCounter:
+    """Grow-only counter - each DC has its own slot."""
+    counts: dict[str, int]  # dc_id -> count
+    
+    def increment(self, dc_id: str, amount: int = 1) -> None
+    def merge(self, other: "GCounter") -> "GCounter"  # commutative, associative, idempotent
+    @property
+    def value(self) -> int  # sum of all slots
+
+class JobStatsCRDT:
+    """CRDT-based job statistics."""
+    completed: GCounter  # Monotonic - perfect for G-Counter
+    failed: GCounter     # Monotonic - perfect for G-Counter
+    rates: dict[str, tuple[float, int]]  # dc -> (rate, lamport_timestamp) - LWW register
+```
+
+### AD-15: Tiered Update Strategy for Cross-DC Stats
+
+**Decision**: Use tiered update frequency based on stat criticality.
+
+**Rationale**:
+- Not all stats need real-time updates
+- Critical events (completion, failure) need immediate notification
+- Aggregate stats can be batched for efficiency
+- Detailed stats should be pull-based to avoid overhead
+
+**Tiers**:
+| Tier | Stats | Frequency | Transport |
+|------|-------|-----------|-----------|
+| Immediate | Job completion, failure, critical alerts | Event-driven | TCP push |
+| Periodic | Workflow progress, aggregate rates | Every 1-5s | TCP batch |
+| On-Demand | Step-level stats, historical data | Client request | TCP pull |
+
+**Implementation**:
+- `_send_immediate_update()` for tier 1 events
+- `_batch_stats_loop()` aggregates tier 2 stats periodically
+- `receive_job_status_request()` fetches tier 3 on demand
+
+### AD-16: Datacenter Health Classification
+
+**Decision**: Classify datacenter health into four distinct states to enable intelligent routing.
+
+**Rationale**:
+- BUSY ≠ UNHEALTHY (critical distinction)
+- BUSY = transient, will clear when workflows complete → accept job (queued)
+- UNHEALTHY = structural problem, requires intervention → try fallback
+- Only fail job if ALL datacenters are UNHEALTHY, not just busy
+
+**States**:
+| State | Definition | Accept Jobs? |
+|-------|------------|--------------|
+| HEALTHY | Managers responding, workers available, capacity exists | YES |
+| BUSY | Managers responding, workers available, no immediate capacity | YES (queued) |
+| DEGRADED | Some managers responding, reduced capacity | YES (with warning) |
+| UNHEALTHY | No managers responding OR all workers down | NO - try fallback |
+
+**Implementation**:
+```python
+class DatacenterHealth(Enum):
+    HEALTHY = "healthy"
+    BUSY = "busy"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
+
+def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
+    # Check manager liveness via SWIM
+    # Check worker availability from ManagerHeartbeat
+    # Check capacity from available_cores
+```
+
+### AD-17: Smart Dispatch with Fallback Chain
+
+**Decision**: Implement cascading fallback for job dispatch across datacenters.
+
+**Rationale**:
+- Single DC failure shouldn't fail entire job
+- Automatic recovery without client involvement
+- Preserve user's datacenter preferences while enabling fallback
+
+**Priority Order**: HEALTHY > BUSY > DEGRADED > (fail only if ALL UNHEALTHY)
+
+**Flow**:
+1. Classify all DCs by health
+2. Select primary DCs (preferring HEALTHY with capacity)
+3. Build fallback list (remaining usable DCs)
+4. For each primary DC:
+   - If dispatch succeeds → done
+   - If DC is UNHEALTHY → try next fallback DC
+   - If DC is BUSY → accept (will be queued)
+5. Only fail job if ALL DCs are UNHEALTHY
+
+**Implementation**:
+```python
+def _select_datacenters_with_fallback(
+    self,
+    count: int,
+    preferred: list[str] | None = None,
+) -> tuple[list[str], list[str]]:  # (primary_dcs, fallback_dcs)
+
+async def _dispatch_job_with_fallback(
+    self,
+    submission: JobSubmission,
+    primary_dcs: list[str],
+    fallback_dcs: list[str],
+) -> tuple[list[str], list[str]]:  # (successful_dcs, failed_dcs)
+```
+
 ---
 
 ## Architecture
