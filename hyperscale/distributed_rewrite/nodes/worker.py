@@ -514,36 +514,103 @@ class WorkerServer(HealthAwareServer):
         # Graceful shutdown (broadcasts leave via SWIM)
         await self.graceful_shutdown()
     
-    async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
-        """Register this worker with a manager."""
-        try:
-            registration = WorkerRegistration(
-                node=self.node_info,
-                total_cores=self._total_cores,
-                available_cores=self._available_cores,
-                memory_mb=self._get_memory_mb(),
-                available_memory_mb=self._get_available_memory_mb(),
-            )
+    async def _register_with_manager(
+        self,
+        manager_addr: tuple[str, int],
+        max_retries: int = 3,
+        base_delay: float = 0.5,
+    ) -> bool:
+        """
+        Register this worker with a manager.
+        
+        Uses exponential backoff for retries:
+        - Attempt 1: immediate
+        - Attempt 2: 0.5s delay
+        - Attempt 3: 1.0s delay
+        - Attempt 4: 2.0s delay
+        
+        Also respects the circuit breaker - if open, fails fast.
+        
+        Args:
+            manager_addr: (host, port) tuple of manager
+            max_retries: Maximum number of retry attempts (default 3)
+            base_delay: Base delay in seconds for exponential backoff (default 0.5)
             
-            # Use decorated send method - handle() will capture manager's address
-            result = await self.send_worker_register(
-                manager_addr,
-                registration.dump(),
-                timeout=5.0,
-            )
-            
-            return not isinstance(result, Exception)
-        except Exception as e:
+        Returns:
+            True if registration succeeded, False otherwise
+        """
+        # Check circuit breaker first
+        if self._is_manager_circuit_open():
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(
-                    message=f"Failed to register with manager {manager_addr}: {e}",
+                    message=f"Cannot register with {manager_addr}: circuit breaker is OPEN",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
             return False
+        
+        registration = WorkerRegistration(
+            node=self.node_info,
+            total_cores=self._total_cores,
+            available_cores=self._available_cores,
+            memory_mb=self._get_memory_mb(),
+            available_memory_mb=self._get_available_memory_mb(),
+        )
+        
+        for attempt in range(max_retries + 1):
+            try:
+                # Use decorated send method - handle() will capture manager's address
+                result = await self.send_worker_register(
+                    manager_addr,
+                    registration.dump(),
+                    timeout=5.0,
+                )
+                
+                if not isinstance(result, Exception):
+                    self._manager_circuit.record_success()
+                    if attempt > 0:
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerInfo(
+                                message=f"Registered with manager {manager_addr} after {attempt + 1} attempts",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                    return True
+                    
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Registration attempt {attempt + 1}/{max_retries + 1} failed for {manager_addr}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            
+            # Exponential backoff before retry (except after last attempt)
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+        
+        # All retries exhausted
+        self._manager_circuit.record_error()
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerError(
+                message=f"Failed to register with manager {manager_addr} after {max_retries + 1} attempts",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return False
     
     def _get_worker_state(self) -> WorkerState:
         """Determine current worker state."""

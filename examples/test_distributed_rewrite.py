@@ -4162,6 +4162,80 @@ test_worker_progress_all_checks_circuit()
 
 
 # =============================================================================
+# Worker Retry Tests
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("WORKER RETRY TESTS")
+print("=" * 70 + "\n")
+
+
+@test("Worker: _register_with_manager has retry parameters")
+def test_worker_register_has_retry_params():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    sig = inspect.signature(WorkerServer._register_with_manager)
+    params = list(sig.parameters.keys())
+    
+    assert 'max_retries' in params, \
+        "_register_with_manager should have max_retries parameter"
+    assert 'base_delay' in params, \
+        "_register_with_manager should have base_delay parameter"
+
+
+@test("Worker: _register_with_manager uses exponential backoff")
+def test_worker_register_uses_backoff():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._register_with_manager)
+    
+    # Should have retry loop
+    assert "for attempt in range" in source, \
+        "_register_with_manager should have retry loop"
+    
+    # Should have exponential backoff calculation
+    assert "2 ** attempt" in source or "2**attempt" in source, \
+        "_register_with_manager should use exponential backoff"
+    
+    # Should sleep between retries
+    assert "asyncio.sleep" in source, \
+        "_register_with_manager should sleep between retries"
+
+
+@test("Worker: _register_with_manager checks circuit breaker")
+def test_worker_register_checks_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._register_with_manager)
+    
+    assert "_is_manager_circuit_open" in source, \
+        "_register_with_manager should check circuit breaker"
+
+
+@test("Worker: _register_with_manager records circuit state")
+def test_worker_register_records_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._register_with_manager)
+    
+    assert "record_success" in source, \
+        "_register_with_manager should record success"
+    assert "record_error" in source, \
+        "_register_with_manager should record error on final failure"
+
+
+# Run Worker Retry tests
+test_worker_register_has_retry_params()
+test_worker_register_uses_backoff()
+test_worker_register_checks_circuit()
+test_worker_register_records_circuit()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 
