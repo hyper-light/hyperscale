@@ -335,8 +335,8 @@ class ManagerServer(UDPServer):
         
         # Update version tracking (fire-and-forget, no await needed for sync operation)
         # We track the worker's version so future updates with same/lower version are rejected
-        asyncio.create_task(
-            self._versioned_clock.update_entity(heartbeat.node_id, heartbeat.version)
+        self._task_runner.run(
+            self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
         )
     
     @property
@@ -1053,9 +1053,9 @@ class ManagerServer(UDPServer):
             # Unpickle workflows
             workflows = restricted_loads(submission.workflows)
             
-            # Dispatch workflows to workers
-            asyncio.create_task(
-                self._dispatch_job_workflows(submission, workflows)
+            # Dispatch workflows to workers via TaskRunner
+            self._task_runner.run(
+                self._dispatch_job_workflows, submission, workflows
             )
             
             ack = JobAck(

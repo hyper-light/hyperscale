@@ -158,9 +158,9 @@ class GateServer(UDPServer):
         self._datacenter_status[heartbeat.datacenter] = heartbeat
         self._datacenter_last_status[heartbeat.datacenter] = time.monotonic()
         
-        # Update version tracking
-        asyncio.create_task(
-            self._versioned_clock.update_entity(dc_key, heartbeat.version)
+        # Update version tracking via TaskRunner
+        self._task_runner.run(
+            self._versioned_clock.update_entity, dc_key, heartbeat.version
         )
     
     @property
@@ -596,9 +596,9 @@ class GateServer(UDPServer):
             self._jobs[submission.job_id] = job
             self._increment_version()
             
-            # Dispatch to each DC (in background)
-            asyncio.create_task(
-                self._dispatch_job_to_datacenters(submission, target_dcs)
+            # Dispatch to each DC (in background via TaskRunner)
+            self._task_runner.run(
+                self._dispatch_job_to_datacenters, submission, target_dcs
             )
             
             ack = JobAck(

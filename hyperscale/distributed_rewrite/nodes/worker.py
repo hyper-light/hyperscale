@@ -109,7 +109,7 @@ class WorkerServer(UDPServer):
         
         # Workflow execution state
         self._active_workflows: dict[str, WorkflowProgress] = {}
-        self._workflow_tasks: dict[str, asyncio.Task] = {}
+        self._workflow_tokens: dict[str, str] = {}  # workflow_id -> TaskRunner token
         self._workflow_cancel_events: dict[str, asyncio.Event] = {}
         
         # State versioning (Lamport clock extension)
@@ -182,8 +182,8 @@ class WorkerServer(UDPServer):
     
     async def stop(self) -> None:
         """Stop the worker server."""
-        # Cancel all active workflows
-        for workflow_id in list(self._workflow_tasks.keys()):
+        # Cancel all active workflows via TaskRunner
+        for workflow_id in list(self._workflow_tokens.keys()):
             await self._cancel_workflow(workflow_id, "server_shutdown")
         
         # Graceful shutdown broadcasts leave via UDP (SWIM)
@@ -380,29 +380,23 @@ class WorkerServer(UDPServer):
     
     async def _cancel_workflow(self, workflow_id: str, reason: str) -> bool:
         """Cancel a running workflow."""
-        if workflow_id not in self._workflow_tasks:
+        token = self._workflow_tokens.get(workflow_id)
+        if not token:
             return False
         
-        # Signal cancellation
+        # Signal cancellation via event
         cancel_event = self._workflow_cancel_events.get(workflow_id)
         if cancel_event:
             cancel_event.set()
         
-        # Cancel the task
-        task = self._workflow_tasks.get(workflow_id)
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        # Cancel the task via TaskRunner
+        await self._task_runner.cancel(token)
         
         # Update state
         if workflow_id in self._active_workflows:
             self._active_workflows[workflow_id].status = WorkflowStatus.CANCELLED.value
         
-        # Free cores
-        # (Would need to track cores per workflow)
+        # Note: Core cleanup is handled in _execute_workflow finally block
         
         self._increment_version()
         return True
@@ -496,11 +490,16 @@ class WorkerServer(UDPServer):
             cancel_event = asyncio.Event()
             self._workflow_cancel_events[dispatch.workflow_id] = cancel_event
             
-            # Start execution task
-            task = asyncio.create_task(
-                self._execute_workflow(dispatch, progress, cancel_event)
+            # Start execution task via TaskRunner
+            # Use workflow_id as alias for cancellation tracking
+            token = self._task_runner.run(
+                self._execute_workflow,
+                dispatch,
+                progress,
+                cancel_event,
+                alias=f"workflow:{dispatch.workflow_id}",
             )
-            self._workflow_tasks[dispatch.workflow_id] = task
+            self._workflow_tokens[dispatch.workflow_id] = token
             
             # Return acknowledgment
             ack = WorkflowDispatchAck(
@@ -576,7 +575,7 @@ class WorkerServer(UDPServer):
             self._increment_version()
             
             # Cleanup all workflow state
-            self._workflow_tasks.pop(dispatch.workflow_id, None)
+            self._workflow_tokens.pop(dispatch.workflow_id, None)
             self._workflow_cancel_events.pop(dispatch.workflow_id, None)
             self._active_workflows.pop(dispatch.workflow_id, None)
     
