@@ -4377,6 +4377,54 @@ test_manager_dispatch_uses_circuit()
 
 
 # =============================================================================
+# Manager Retry Tests
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("MANAGER RETRY TESTS")
+print("=" * 70 + "\n")
+
+
+@test("Manager: _dispatch_workflow_to_worker has retry parameters")
+def test_manager_dispatch_has_retry_params():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    sig = inspect.signature(ManagerServer._dispatch_workflow_to_worker)
+    params = list(sig.parameters.keys())
+    
+    assert 'max_retries' in params, \
+        "_dispatch_workflow_to_worker should have max_retries parameter"
+    assert 'base_delay' in params, \
+        "_dispatch_workflow_to_worker should have base_delay parameter"
+
+
+@test("Manager: _dispatch_workflow_to_worker uses exponential backoff")
+def test_manager_dispatch_uses_backoff():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._dispatch_workflow_to_worker)
+    
+    # Should have retry loop
+    assert "for attempt in range" in source, \
+        "_dispatch_workflow_to_worker should have retry loop"
+    
+    # Should have exponential backoff
+    assert "2 ** attempt" in source or "2**attempt" in source, \
+        "_dispatch_workflow_to_worker should use exponential backoff"
+    
+    # Should sleep between retries
+    assert "asyncio.sleep" in source, \
+        "_dispatch_workflow_to_worker should sleep between retries"
+
+
+# Run Manager Retry tests
+test_manager_dispatch_has_retry_params()
+test_manager_dispatch_uses_backoff()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

@@ -1452,11 +1452,27 @@ class ManagerServer(HealthAwareServer):
         self,
         worker_node_id: str,
         dispatch: WorkflowDispatch,
+        max_retries: int = 2,
+        base_delay: float = 0.3,
     ) -> WorkflowDispatchAck | None:
         """
         Dispatch a workflow to a specific worker.
         
+        Uses retries with exponential backoff:
+        - Attempt 1: immediate
+        - Attempt 2: 0.3s delay
+        - Attempt 3: 0.6s delay
+        
         Checks and updates the per-worker circuit breaker.
+        
+        Args:
+            worker_node_id: Target worker node ID
+            dispatch: Workflow dispatch message
+            max_retries: Maximum retry attempts (default 2)
+            base_delay: Base delay for exponential backoff (default 0.3s)
+            
+        Returns:
+            WorkflowDispatchAck if accepted, None otherwise
         """
         # Check circuit breaker first
         if self._is_worker_circuit_open(worker_node_id):
@@ -1478,29 +1494,54 @@ class ManagerServer(HealthAwareServer):
         worker_addr = (worker.node.host, worker.node.port)
         circuit = self._get_worker_circuit(worker_node_id)
         
-        try:
-            response = await self.send_tcp(
-                worker_addr,
-                "workflow_dispatch",
-                dispatch.dump(),
-                timeout=5.0,
-            )
+        for attempt in range(max_retries + 1):
+            try:
+                response = await self.send_tcp(
+                    worker_addr,
+                    "workflow_dispatch",
+                    dispatch.dump(),
+                    timeout=5.0,
+                )
+                
+                if isinstance(response, bytes):
+                    ack = WorkflowDispatchAck.load(response)
+                    if ack.accepted:
+                        circuit.record_success()
+                        if attempt > 0:
+                            self._task_runner.run(
+                                self._udp_logger.log,
+                                ServerInfo(
+                                    message=f"Dispatched to worker {worker_node_id} after {attempt + 1} attempts",
+                                    node_host=self._host,
+                                    node_port=self._tcp_port,
+                                    node_id=self._node_id.short,
+                                )
+                            )
+                        return ack
+                    else:
+                        # Worker rejected - don't retry (not a transient error)
+                        circuit.record_error()
+                        return ack
+                        
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Dispatch attempt {attempt + 1}/{max_retries + 1} to {worker_node_id} failed: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
             
-            if isinstance(response, bytes):
-                ack = WorkflowDispatchAck.load(response)
-                if ack.accepted:
-                    circuit.record_success()
-                else:
-                    circuit.record_error()
-                return ack
-            
-            circuit.record_error()
-            return None
-            
-        except Exception as e:
-            circuit.record_error()
-            await self.handle_exception(e, f"dispatch_to_worker_{worker_node_id}")
-            return None
+            # Exponential backoff before retry (except after last attempt)
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+        
+        # All retries exhausted
+        circuit.record_error()
+        return None
     
     async def _request_quorum_confirmation(
         self,
