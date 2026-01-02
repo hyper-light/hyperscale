@@ -361,7 +361,7 @@ class ErrorHandler:
                 pass  # Best effort - don't fail on logging errors
     
     async def _log_error(self, error: SwimError) -> None:
-        """Log error with structured context."""
+        """Log error with structured context, using appropriate level based on severity."""
         if self.logger:
             try:
                 # Build structured message with error details
@@ -373,14 +373,27 @@ class ErrorHandler:
                     message += f", context={error.context}"
                 message += ")"
                 
-                await self.logger.log(
-                    ServerError(
-                        message=message,
-                        node_id=self.node_id,
-                        node_host="",  # Not available at handler level
-                        node_port=0,
-                    )
+                # Select log model based on severity
+                # TRANSIENT = expected/normal, DEGRADED = warning, FATAL = error
+                from hyperscale.logging.hyperscale_logging_models import (
+                    ServerDebug, ServerWarning, ServerError, ServerFatal
                 )
+                
+                log_kwargs = {
+                    "message": message,
+                    "node_id": self.node_id,
+                    "node_host": "",  # Not available at handler level
+                    "node_port": 0,
+                }
+                
+                if error.severity == ErrorSeverity.TRANSIENT:
+                    log_model = ServerDebug(**log_kwargs)
+                elif error.severity == ErrorSeverity.DEGRADED:
+                    log_model = ServerWarning(**log_kwargs)
+                else:  # FATAL
+                    log_model = ServerError(**log_kwargs)
+                
+                await self.logger.log(log_model)
             except (ImportError, AttributeError, TypeError):
                 # Fallback to simple logging - if this also fails, silently ignore
                 # since logging errors shouldn't crash the application
