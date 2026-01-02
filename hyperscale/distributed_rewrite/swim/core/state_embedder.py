@@ -5,7 +5,7 @@ This module provides a composition-based approach for embedding application
 state (heartbeats) in SWIM UDP messages, enabling Serf-style passive state
 dissemination.
 
-The StateEmbedder protocol is injected into UDPServer, allowing different
+The StateEmbedder protocol is injected into HealthAwareServer, allowing different
 node types (Worker, Manager, Gate) to provide their own state without
 requiring inheritance-based overrides.
 """
@@ -52,7 +52,7 @@ class NullStateEmbedder:
     """
     Default no-op state embedder.
     
-    Used when no state embedding is needed (base UDPServer behavior).
+    Used when no state embedding is needed (base HealthAwareServer behavior).
     """
     
     def get_state(self) -> bytes | None:

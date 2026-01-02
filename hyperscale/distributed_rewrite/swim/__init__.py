@@ -13,9 +13,9 @@ Submodules:
 - leadership: Leader election with flapping detection
 
 Usage:
-    from swim import UDPServer
+    from swim import HealthAwareServer
     
-    server = UDPServer(
+    server = HealthAwareServer(
         host='localhost',
         tcp_port=8670,
         udp_port=8671,
@@ -121,5 +121,5 @@ from .leadership import (
 )
 
 # Main server
-from .udp_server import UDPServer as UDPServer
+from .health_aware_server import HealthAwareServer as HealthAwareServer
 

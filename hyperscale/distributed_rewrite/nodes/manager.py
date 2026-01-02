@@ -10,7 +10,7 @@ Managers orchestrate workflow execution within a datacenter. They:
 - Handle quorum-based confirmation for workflow provisioning
 
 Protocols:
-- UDP: SWIM healthchecks (inherited from UDPServer)
+- UDP: SWIM healthchecks (inherited from HealthAwareServer)
   - Managers probe workers to detect failures
   - Managers form a gossip cluster with other managers
   - Leader election uses SWIM membership info
@@ -32,7 +32,7 @@ import networkx
 from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
-from hyperscale.distributed_rewrite.swim import UDPServer, ManagerStateEmbedder
+from hyperscale.distributed_rewrite.swim import HealthAwareServer, ManagerStateEmbedder
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -64,7 +64,7 @@ from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 
 
-class ManagerServer(UDPServer):
+class ManagerServer(HealthAwareServer):
     """
     Manager node in the distributed Hyperscale system.
     

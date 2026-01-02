@@ -2,7 +2,7 @@
 Distributed node implementations for Hyperscale.
 
 This module provides Gate, Manager, and Worker node servers.
-All nodes inherit from the SWIM UDPServer for UDP healthchecks
+All nodes inherit from the SWIM HealthAwareServer for UDP healthchecks
 and add TCP handlers for their specific role.
 
 Architecture:

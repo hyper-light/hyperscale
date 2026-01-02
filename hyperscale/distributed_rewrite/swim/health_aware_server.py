@@ -1,8 +1,16 @@
 """
-SWIM + Lifeguard Test Server implementation.
+Health-Aware Server implementation with SWIM + Lifeguard protocol.
 
 This is the main server class that integrates all SWIM protocol
-components with Lifeguard enhancements.
+components with Lifeguard enhancements for failure detection,
+leader election, and application state embedding.
+
+This server provides:
+- SWIM protocol for failure detection (probes, indirect probes, suspicion)
+- Lifeguard enhancements (LHM, incarnation numbers, refutation)
+- Leader election with split-brain prevention
+- Serf-style state embedding in SWIM messages
+- Graceful degradation under load
 """
 
 import asyncio
@@ -70,9 +78,9 @@ from .leadership.local_leader_election import LocalLeaderElection
 from .core.state_embedder import StateEmbedder, NullStateEmbedder
 
 
-class UDPServer(MercurySyncBaseServer[Ctx]):
+class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     """
-    SWIM + Lifeguard Protocol Server with Leadership Election.
+    Health-Aware Server with SWIM + Lifeguard Protocol and Leadership Election.
     
     This server implements the SWIM failure detection protocol with
     Lifeguard enhancements including:

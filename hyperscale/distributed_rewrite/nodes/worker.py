@@ -9,11 +9,11 @@ Workers are the distributed thread/process pool. They:
 Workers are the absolute source of truth for their own state.
 
 Protocols:
-- UDP: SWIM healthchecks (inherited from UDPServer)
+- UDP: SWIM healthchecks (inherited from HealthAwareServer)
   - probe/ack for liveness detection
   - indirect probing for network partition handling
   - gossip for membership dissemination
-- TCP: Data operations
+- TCP: Data operations (inherited from MercurySyncBaseServer)
   - Status updates to managers
   - Workflow dispatch from managers
   - State sync requests
@@ -37,8 +37,8 @@ except ImportError:
     psutil = None  # type: ignore
     _PSUTIL_AVAILABLE = False
 
-from hyperscale.distributed_rewrite.server import tcp, udp
-from hyperscale.distributed_rewrite.swim import UDPServer, WorkerStateEmbedder
+from hyperscale.distributed_rewrite.server import tcp
+from hyperscale.distributed_rewrite.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -66,7 +66,7 @@ from hyperscale.core.jobs.models.env import Env as CoreEnv
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus as CoreWorkflowStatus
 
 
-class WorkerServer(UDPServer):
+class WorkerServer(HealthAwareServer):
     """
     Worker node in the distributed Hyperscale system.
     
@@ -74,7 +74,7 @@ class WorkerServer(UDPServer):
     - Receive workflow dispatches from managers via TCP
     - Execute workflows using available CPU cores via WorkflowRunner
     - Report progress back to managers via TCP (including cores_completed)
-    - Participate in SWIM healthchecks via UDP (inherited from UDPServer)
+    - Participate in SWIM healthchecks via UDP (inherited from HealthAwareServer)
     
     Workers have no knowledge of other workers - they only communicate
     with their local manager cluster.
@@ -82,7 +82,7 @@ class WorkerServer(UDPServer):
     Healthchecks (UDP - SWIM protocol):
         Workers join the manager cluster's SWIM protocol. Managers probe
         workers via UDP to detect failures. Workers respond to probes
-        automatically via the inherited UDPServer.receive() handler.
+        via the inherited HealthAwareServer.
     
     Status Updates (TCP):
         Workers send status updates to managers via TCP. These contain
@@ -106,15 +106,7 @@ class WorkerServer(UDPServer):
         total_cores: int | None = None,
         manager_addrs: list[tuple[str, int]] | None = None,
     ):
-        super().__init__(
-            host=host,
-            tcp_port=tcp_port,
-            udp_port=udp_port,
-            env=env,
-            dc_id=dc_id,
-        )
-        
-        # Core capacity
+        # Core capacity (set before super().__init__ so state embedder can access it)
         self._total_cores = total_cores or os.cpu_count() or 1
         self._available_cores = self._total_cores
         
@@ -155,8 +147,8 @@ class WorkerServer(UDPServer):
         # Queue depth tracking
         self._pending_workflows: list[WorkflowDispatch] = []
         
-        # Inject state embedder for Serf-style heartbeat embedding in SWIM messages
-        self.set_state_embedder(WorkerStateEmbedder(
+        # Create state embedder for Serf-style heartbeat embedding in SWIM messages
+        state_embedder = WorkerStateEmbedder(
             get_node_id=lambda: self._node_id.full,
             get_worker_state=lambda: self._get_worker_state().value,
             get_available_cores=lambda: self._available_cores,
@@ -167,7 +159,20 @@ class WorkerServer(UDPServer):
             get_active_workflows=lambda: {
                 wf_id: wf.status for wf_id, wf in self._active_workflows.items()
             },
-        ))
+        )
+        
+        # Initialize parent HealthAwareServer
+        super().__init__(
+            host=host,
+            tcp_port=tcp_port,
+            udp_port=udp_port,
+            env=env,
+            dc_id=dc_id,
+            state_embedder=state_embedder,
+        )
+        
+        # Register callback for manager failure detection via SWIM
+        self.register_on_node_dead(self._on_node_dead)
     
     def _get_core_env(self) -> CoreEnv:
         """
@@ -223,10 +228,8 @@ class WorkerServer(UDPServer):
     
     async def start(self) -> None:
         """Start the worker server."""
-        await super().start()
-        
-        # Register callback for manager failure detection via SWIM
-        self.register_on_node_dead(self._on_node_dead)
+        # Start parent HealthAwareServer (TCP + UDP)
+        await super().start_server()
         
         # Register with managers (TCP)
         for manager_addr in self._manager_addrs:
@@ -241,9 +244,6 @@ class WorkerServer(UDPServer):
             await self.join_cluster(manager_udp_addr)
         
         # Start SWIM probe cycle (UDP healthchecks)
-        # This makes us participate in the SWIM protocol
-        # Note: Worker state is now embedded in SWIM probe responses (Serf-style)
-        # so managers learn our capacity/status passively via the SWIM protocol
         self._task_runner.run(self.start_probe_cycle)
         
         self._task_runner.run(
@@ -267,24 +267,15 @@ class WorkerServer(UDPServer):
             return
         
         # Check if dead node is our current manager
-        # Manager UDP addr and TCP addr share the same host but may differ in port
-        # We track managers by TCP address, but SWIM uses UDP
         current_host = self._current_manager[0]
         dead_host = node_addr[0]
         
-        # Simple host-based comparison - if same host, likely same manager
-        # More robust would be to track UDP<->TCP mapping
         if current_host == dead_host:
             self._task_runner.run(self._handle_manager_failure, node_addr)
     
     async def _handle_manager_failure(self, failed_addr: tuple[str, int]) -> None:
         """
         Handle manager failure by failing over to another manager.
-        
-        The worker will:
-        1. Clear the current manager reference
-        2. Attempt to register with another manager from the list
-        3. Re-report active workflows to the new manager
         """
         self._task_runner.run(
             self._udp_logger.log,
@@ -301,7 +292,6 @@ class WorkerServer(UDPServer):
         
         # Try other managers
         for manager_addr in self._manager_addrs:
-            # Skip the failed manager
             if manager_addr == old_manager:
                 continue
             
@@ -318,11 +308,9 @@ class WorkerServer(UDPServer):
                     )
                 )
                 
-                # Re-report active workflows to new manager
                 await self._report_active_workflows_to_manager()
                 return
         
-        # No available managers
         self._task_runner.run(
             self._udp_logger.log,
             ServerError(
@@ -334,11 +322,7 @@ class WorkerServer(UDPServer):
         )
     
     async def _report_active_workflows_to_manager(self) -> None:
-        """
-        Report all active workflows to the current manager.
-        
-        Called after failover to ensure the new manager knows about our work.
-        """
+        """Report all active workflows to the current manager."""
         if not self._current_manager:
             return
         
@@ -346,7 +330,6 @@ class WorkerServer(UDPServer):
             try:
                 await self._send_progress_update(progress)
             except Exception:
-                # Non-critical - manager will detect via next heartbeat
                 pass
     
     async def stop(self) -> None:
@@ -355,10 +338,8 @@ class WorkerServer(UDPServer):
         for workflow_id in list(self._workflow_tokens.keys()):
             await self._cancel_workflow(workflow_id, "server_shutdown")
         
-        # Graceful shutdown broadcasts leave via UDP (SWIM)
+        # Graceful shutdown (broadcasts leave via SWIM)
         await self.graceful_shutdown()
-        
-        await super().stop()
     
     async def _register_with_manager(self, manager_addr: tuple[str, int]) -> bool:
         """Register this worker with a manager."""
@@ -391,20 +372,14 @@ class WorkerServer(UDPServer):
             )
             return False
     
-    # Note: Status updates are now handled via Serf-style heartbeat embedding
-    # in SWIM probe responses. The WorkerStateEmbedder provides worker capacity
-    # and status to managers through the SWIM protocol. See set_state_embedder()
-    # in __init__.
-    
     def _get_worker_state(self) -> WorkerState:
         """Determine current worker state."""
         if not self._running:
             return WorkerState.OFFLINE
         
-        # Check degradation level
-        if self._degradation.current_level.value >= 3:  # SEVERE or CRITICAL
+        if self._degradation.current_level.value >= 3:
             return WorkerState.DRAINING
-        elif self._degradation.current_level.value >= 2:  # MODERATE or above
+        elif self._degradation.current_level.value >= 2:
             return WorkerState.DEGRADED
         
         return WorkerState.HEALTHY
@@ -449,23 +424,12 @@ class WorkerServer(UDPServer):
     # =========================================================================
     
     def _allocate_cores(self, workflow_id: str, num_cores: int) -> list[int]:
-        """
-        Allocate a number of cores to a workflow.
-        
-        Args:
-            workflow_id: The workflow to allocate cores for.
-            num_cores: Number of cores to allocate.
-        
-        Returns:
-            List of allocated core indices, or empty list if not enough free.
-        """
-        # Find free cores
+        """Allocate a number of cores to a workflow."""
         free_cores = [i for i, wf_id in self._core_assignments.items() if wf_id is None]
         
         if len(free_cores) < num_cores:
             return []
         
-        # Allocate the first N free cores
         allocated = free_cores[:num_cores]
         for core_idx in allocated:
             self._core_assignments[core_idx] = workflow_id
@@ -478,15 +442,7 @@ class WorkerServer(UDPServer):
         return allocated
     
     def _free_cores(self, workflow_id: str) -> list[int]:
-        """
-        Free all cores allocated to a workflow.
-        
-        Args:
-            workflow_id: The workflow to free cores for.
-        
-        Returns:
-            List of freed core indices.
-        """
+        """Free all cores allocated to a workflow."""
         allocated = self._workflow_cores.pop(workflow_id, [])
         
         for core_idx in allocated:
@@ -521,16 +477,7 @@ class WorkerServer(UDPServer):
         core_indices: list[int],
         reason: str = "core_stop",
     ) -> list[str]:
-        """
-        Stop all workflows running on specific cores (hierarchical stop).
-        
-        Args:
-            core_indices: List of core indices to stop workflows on.
-            reason: Reason for stopping.
-        
-        Returns:
-            List of stopped workflow IDs.
-        """
+        """Stop all workflows running on specific cores (hierarchical stop)."""
         workflows = self.get_workflows_on_cores(core_indices)
         stopped = []
         
@@ -546,19 +493,14 @@ class WorkerServer(UDPServer):
         if not token:
             return False
         
-        # Signal cancellation via event
         cancel_event = self._workflow_cancel_events.get(workflow_id)
         if cancel_event:
             cancel_event.set()
         
-        # Cancel the task via TaskRunner
         await self._task_runner.cancel(token)
         
-        # Update state
         if workflow_id in self._active_workflows:
             self._active_workflows[workflow_id].status = WorkflowStatus.CANCELLED.value
-        
-        # Note: Core cleanup is handled in _execute_workflow finally block
         
         self._increment_version()
         return True
@@ -568,24 +510,13 @@ class WorkerServer(UDPServer):
     # =========================================================================
     
     @tcp.send('workflow_dispatch_response')
-    async def send_dispatch_response(
+    async def send_workflow_dispatch_response(
         self,
-        addr: tuple[str, int],
-        data: bytes,
-        timeout: int | float | None = None,
-    ):
-        """Send workflow dispatch response."""
-        return (addr, data, timeout)
-    
-    @tcp.handle('workflow_dispatch_response')
-    async def handle_dispatch_response_raw(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ):
-        """Handle raw dispatch response data."""
-        return data
+        address: tuple[str, int],
+        ack: WorkflowDispatchAck,
+    ) -> tuple[tuple[str, int], bytes]:
+        """Send workflow dispatch acknowledgment."""
+        return (address, ack.dump())
     
     @tcp.receive()
     async def receive_workflow_dispatch(
@@ -593,7 +524,7 @@ class WorkerServer(UDPServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-    ):
+    ) -> tuple[bytes, bytes]:
         """
         Receive a workflow dispatch from a manager.
         
@@ -604,13 +535,12 @@ class WorkerServer(UDPServer):
             
             # Check if we can accept this workflow
             if self._available_cores < dispatch.vus:
-                # Reject - not enough cores
                 ack = WorkflowDispatchAck(
                     workflow_id=dispatch.workflow_id,
                     accepted=False,
                     error=f"Insufficient cores: need {dispatch.vus}, have {self._available_cores}",
                 )
-                return ack.dump()
+                return (b'workflow_dispatch_response', ack.dump())
             
             # Check backpressure
             if self._get_worker_state() == WorkerState.DRAINING:
@@ -619,7 +549,7 @@ class WorkerServer(UDPServer):
                     accepted=False,
                     error="Worker is draining, not accepting new work",
                 )
-                return ack.dump()
+                return (b'workflow_dispatch_response', ack.dump())
             
             # Allocate cores to this workflow
             allocated_cores = self._allocate_cores(dispatch.workflow_id, dispatch.vus)
@@ -629,7 +559,7 @@ class WorkerServer(UDPServer):
                     accepted=False,
                     error=f"Failed to allocate {dispatch.vus} cores",
                 )
-                return ack.dump()
+                return (b'workflow_dispatch_response', ack.dump())
             
             self._increment_version()
             
@@ -637,14 +567,14 @@ class WorkerServer(UDPServer):
             progress = WorkflowProgress(
                 job_id=dispatch.job_id,
                 workflow_id=dispatch.workflow_id,
-                workflow_name="",  # Will be set after unpickling
+                workflow_name="",
                 status=WorkflowStatus.ASSIGNED.value,
                 completed_count=0,
                 failed_count=0,
                 rate_per_second=0.0,
                 elapsed_seconds=0.0,
                 timestamp=time.monotonic(),
-                assigned_cores=allocated_cores,  # Per-core tracking
+                assigned_cores=allocated_cores,
             )
             self._active_workflows[dispatch.workflow_id] = progress
             
@@ -653,7 +583,6 @@ class WorkerServer(UDPServer):
             self._workflow_cancel_events[dispatch.workflow_id] = cancel_event
             
             # Start execution task via TaskRunner
-            # Use workflow_id as alias for cancellation tracking
             token = self._task_runner.run(
                 self._execute_workflow,
                 dispatch,
@@ -669,16 +598,15 @@ class WorkerServer(UDPServer):
                 accepted=True,
                 cores_assigned=dispatch.vus,
             )
-            return ack.dump()
+            return (b'workflow_dispatch_response', ack.dump())
             
         except Exception as e:
-            await self.handle_exception(e, "receive_workflow_dispatch")
             ack = WorkflowDispatchAck(
                 workflow_id="unknown",
                 accepted=False,
                 error=str(e),
             )
-            return ack.dump()
+            return (b'workflow_dispatch_response', ack.dump())
     
     async def _execute_workflow(
         self,
@@ -686,21 +614,9 @@ class WorkerServer(UDPServer):
         progress: WorkflowProgress,
         cancel_event: asyncio.Event,
     ) -> None:
-        """
-        Execute a workflow using WorkflowRunner.
-        
-        This method:
-        1. Unpickles the workflow and context
-        2. Runs the workflow via WorkflowRunner
-        3. Reports progress updates including cores_completed
-        4. Cleans up on completion or cancellation
-        
-        The cores_completed field allows managers to start provisioning new
-        workflows as soon as cores become available, without waiting for the
-        entire workflow to complete on all assigned cores.
-        """
+        """Execute a workflow using WorkflowRunner."""
         start_time = time.monotonic()
-        run_id = hash(dispatch.workflow_id) % (2**31)  # Convert to int run_id
+        run_id = hash(dispatch.workflow_id) % (2**31)
         
         try:
             # Unpickle workflow and context
@@ -711,13 +627,13 @@ class WorkerServer(UDPServer):
             progress.status = WorkflowStatus.RUNNING.value
             self._increment_version()
             
-            # Initialize cores_completed tracking for this workflow
+            # Initialize cores_completed tracking
             self._workflow_cores_completed[dispatch.workflow_id] = set()
             
             # Get or create WorkflowRunner
             runner = self._get_workflow_runner()
             
-            # Start a background task to monitor and report progress
+            # Start progress monitor
             progress_token = self._task_runner.run(
                 self._monitor_workflow_progress,
                 dispatch,
@@ -728,8 +644,7 @@ class WorkerServer(UDPServer):
             )
             
             try:
-                # Execute the workflow using WorkflowRunner
-                # The runner handles VUs internally
+                # Execute the workflow
                 (
                     returned_run_id,
                     results,
@@ -743,10 +658,9 @@ class WorkerServer(UDPServer):
                     dispatch.vus,
                 )
                 
-                # Map core WorkflowStatus to distributed_rewrite WorkflowStatus
+                # Map status
                 if status == CoreWorkflowStatus.COMPLETED:
                     progress.status = WorkflowStatus.COMPLETED.value
-                    # All cores completed
                     progress.cores_completed = len(progress.assigned_cores)
                 elif status == CoreWorkflowStatus.FAILED:
                     progress.status = WorkflowStatus.FAILED.value
@@ -761,9 +675,7 @@ class WorkerServer(UDPServer):
                 raise
             except Exception as e:
                 progress.status = WorkflowStatus.FAILED.value
-                await self.handle_exception(e, f"execute_workflow_{dispatch.workflow_id}")
             finally:
-                # Cancel progress monitor
                 await self._task_runner.cancel(progress_token)
             
             # Final progress update
@@ -776,13 +688,10 @@ class WorkerServer(UDPServer):
             progress.status = WorkflowStatus.CANCELLED.value
         except Exception as e:
             progress.status = WorkflowStatus.FAILED.value
-            await self.handle_exception(e, f"execute_workflow_{dispatch.workflow_id}")
         finally:
-            # Free cores using per-core tracking
             self._free_cores(dispatch.workflow_id)
             self._increment_version()
             
-            # Cleanup all workflow state
             self._workflow_tokens.pop(dispatch.workflow_id, None)
             self._workflow_cancel_events.pop(dispatch.workflow_id, None)
             self._active_workflows.pop(dispatch.workflow_id, None)
@@ -796,16 +705,7 @@ class WorkerServer(UDPServer):
         run_id: int,
         cancel_event: asyncio.Event,
     ) -> None:
-        """
-        Monitor workflow progress and send updates to manager.
-        
-        This runs as a background task while the workflow executes.
-        It polls the WorkflowRunner for status updates and translates
-        them to WorkflowProgress updates for the manager.
-        
-        Key feature: Reports cores_completed to allow managers to 
-        provision new workflows as soon as cores become available.
-        """
+        """Monitor workflow progress and send updates to manager."""
         start_time = time.monotonic()
         runner = self._get_workflow_runner()
         workflow_name = progress.workflow_name
@@ -825,7 +725,7 @@ class WorkerServer(UDPServer):
                 # Get system stats
                 avg_cpu, avg_mem = runner.get_system_stats(run_id, workflow_name)
                 
-                # Update progress object
+                # Update progress
                 progress.completed_count = completed_count
                 progress.failed_count = failed_count
                 progress.elapsed_seconds = time.monotonic() - start_time
@@ -848,14 +748,9 @@ class WorkerServer(UDPServer):
                     for step_name, stats in step_stats_dict.items()
                 ]
                 
-                # Estimate cores_completed based on completion ratio
-                # This is a heuristic: if workflow is 80% complete, 
-                # roughly 80% of cores might be done
-                # More accurate tracking would require core-level instrumentation
+                # Estimate cores_completed
                 total_cores = len(progress.assigned_cores)
                 if total_cores > 0:
-                    # Use workers_completed from WorkflowRunner if available
-                    # Otherwise estimate based on completion ratio
                     estimated_complete = min(
                         total_cores,
                         int(total_cores * (completed_count / max(dispatch.vus * 100, 1)))
@@ -873,15 +768,14 @@ class WorkerServer(UDPServer):
                 elif status == CoreWorkflowStatus.PENDING:
                     progress.status = WorkflowStatus.ASSIGNED.value
                 
-                # Send update to manager
+                # Send update
                 if self._current_manager:
                     await self._send_progress_update(progress)
                     self._workflow_last_progress[dispatch.workflow_id] = time.monotonic()
                 
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                # Progress monitoring failure is not critical
+            except Exception:
                 pass
     
     async def _send_progress_update(self, progress: WorkflowProgress) -> None:
@@ -896,33 +790,12 @@ class WorkerServer(UDPServer):
                 progress.dump(),
                 timeout=1.0,
             )
-        except Exception as e:
-            # Progress update failure is not critical
+        except Exception:
             pass
     
     # =========================================================================
     # TCP Handlers - State Sync
     # =========================================================================
-    
-    @tcp.send('state_sync_response')
-    async def send_state_sync_response(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        timeout: int | float | None = None,
-    ):
-        """Send state sync response."""
-        return (addr, data, timeout)
-    
-    @tcp.handle('state_sync_response')
-    async def handle_state_sync_response_raw(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ):
-        """Handle raw state sync response."""
-        return data
     
     @tcp.receive()
     async def receive_state_sync_request(
@@ -930,46 +803,24 @@ class WorkerServer(UDPServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-    ):
+    ) -> tuple[bytes, bytes]:
         """Handle state sync request from a new manager leader."""
         try:
             request = StateSyncRequest.load(data)
             
-            # Return our current state snapshot
             response = StateSyncResponse(
                 responder_id=self._node_id.full,
                 current_version=self._state_version,
                 worker_state=self._get_state_snapshot(),
             )
-            return response.dump()
+            return (b'state_sync_response', response.dump())
             
-        except Exception as e:
-            await self.handle_exception(e, "receive_state_sync_request")
-            return b''
+        except Exception:
+            return (b'state_sync_response', b'')
     
     # =========================================================================
     # TCP Handlers - Cancellation
     # =========================================================================
-    
-    @tcp.send('cancel_ack')
-    async def send_cancel_ack(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        timeout: int | float | None = None,
-    ):
-        """Send cancellation acknowledgment."""
-        return (addr, data, timeout)
-    
-    @tcp.handle('cancel_ack')
-    async def handle_cancel_ack_raw(
-        self,
-        addr: tuple[str, int],
-        data: bytes,
-        clock_time: int,
-    ):
-        """Handle raw cancel ack."""
-        return data
     
     @tcp.receive()
     async def receive_cancel_job(
@@ -977,7 +828,7 @@ class WorkerServer(UDPServer):
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-    ):
+    ) -> tuple[bytes, bytes]:
         """Handle job cancellation request from manager."""
         try:
             cancel_request = CancelJob.load(data)
@@ -994,14 +845,12 @@ class WorkerServer(UDPServer):
                 cancelled=True,
                 workflows_cancelled=cancelled_count,
             )
-            return ack.dump()
+            return (b'cancel_ack', ack.dump())
             
         except Exception as e:
-            await self.handle_exception(e, "receive_cancel_job")
             ack = CancelAck(
                 job_id="unknown",
                 cancelled=False,
                 error=str(e),
             )
-            return ack.dump()
-
+            return (b'cancel_ack', ack.dump())

@@ -991,29 +991,29 @@ print("Leadership Callback Composition Tests")
 print("=" * 60)
 
 
-@test("UDPServer: has callback registration methods")
-def test_udp_server_callback_methods():
-    from hyperscale.distributed_rewrite.swim import UDPServer
+@test("HealthAwareServer: has callback registration methods")
+def test_health_aware_server_callback_methods():
+    from hyperscale.distributed_rewrite.swim import HealthAwareServer
     
-    assert hasattr(UDPServer, 'register_on_become_leader')
-    assert hasattr(UDPServer, 'register_on_lose_leadership')
-    assert hasattr(UDPServer, 'register_on_leader_change')
+    assert hasattr(HealthAwareServer, 'register_on_become_leader')
+    assert hasattr(HealthAwareServer, 'register_on_lose_leadership')
+    assert hasattr(HealthAwareServer, 'register_on_leader_change')
     
     # Check they are callable
-    assert callable(getattr(UDPServer, 'register_on_become_leader'))
-    assert callable(getattr(UDPServer, 'register_on_lose_leadership'))
-    assert callable(getattr(UDPServer, 'register_on_leader_change'))
+    assert callable(getattr(HealthAwareServer, 'register_on_become_leader'))
+    assert callable(getattr(HealthAwareServer, 'register_on_lose_leadership'))
+    assert callable(getattr(HealthAwareServer, 'register_on_leader_change'))
 
 
-@test("UDPServer: callback lists are initialized")
-def test_udp_server_callback_lists():
+@test("HealthAwareServer: callback lists are initialized")
+def test_health_aware_server_callback_lists():
     """Test that callback lists exist on instance."""
-    # We can't instantiate UDPServer easily without full setup,
+    # We can't instantiate HealthAwareServer easily without full setup,
     # but we can check the __init__ signature/code
     import inspect
-    from hyperscale.distributed_rewrite.swim import UDPServer
+    from hyperscale.distributed_rewrite.swim import HealthAwareServer
     
-    source = inspect.getsource(UDPServer.__init__)
+    source = inspect.getsource(HealthAwareServer.__init__)
     assert '_on_become_leader_callbacks' in source
     assert '_on_lose_leadership_callbacks' in source
     assert '_on_leader_change_callbacks' in source
@@ -1112,8 +1112,8 @@ def test_state_sync_response_manager_serde():
 
 
 # Run Leadership Callback tests
-test_udp_server_callback_methods()
-test_udp_server_callback_lists()
+test_health_aware_server_callback_methods()
+test_health_aware_server_callback_lists()
 test_manager_state_sync_methods()
 test_state_sync_request_serde()
 test_state_sync_response_worker_serde()
@@ -1129,20 +1129,20 @@ print("Worker Failure Retry Tests")
 print("=" * 60)
 
 
-@test("UDPServer: has node dead callback registration")
-def test_udp_server_node_dead_callback():
-    from hyperscale.distributed_rewrite.swim import UDPServer
-    
-    assert hasattr(UDPServer, 'register_on_node_dead')
-    assert callable(getattr(UDPServer, 'register_on_node_dead'))
+@test("HealthAwareServer: has node dead callback registration")
+def test_health_aware_server_node_dead_callback():
+    from hyperscale.distributed_rewrite.swim import HealthAwareServer
+
+    assert hasattr(HealthAwareServer, 'register_on_node_dead')
+    assert callable(getattr(HealthAwareServer, 'register_on_node_dead'))
 
 
-@test("UDPServer: node dead callback list initialized")
-def test_udp_server_node_dead_list():
+@test("HealthAwareServer: node dead callback list initialized")
+def test_health_aware_server_node_dead_list():
     import inspect
-    from hyperscale.distributed_rewrite.swim import UDPServer
+    from hyperscale.distributed_rewrite.swim import HealthAwareServer
     
-    source = inspect.getsource(UDPServer.__init__)
+    source = inspect.getsource(HealthAwareServer.__init__)
     assert '_on_node_dead_callbacks' in source
 
 
@@ -1175,8 +1175,8 @@ def test_manager_retry_config():
 
 
 # Run Worker Failure tests
-test_udp_server_node_dead_callback()
-test_udp_server_node_dead_list()
+test_health_aware_server_node_dead_callback()
+test_health_aware_server_node_dead_list()
 test_manager_retry_methods()
 test_manager_retry_config()
 
@@ -1562,9 +1562,9 @@ def test_worker_manager_failure_detection():
     assert hasattr(WorkerServer, '_handle_manager_failure')
     assert hasattr(WorkerServer, '_report_active_workflows_to_manager')
     
-    # Check that on_node_dead callback is registered in start()
-    start_source = inspect.getsource(WorkerServer.start)
-    assert 'register_on_node_dead' in start_source
+    # Check that on_node_dead callback is registered in __init__
+    init_source = inspect.getsource(WorkerServer.__init__)
+    assert 'register_on_node_dead' in init_source
 
 
 @test("WorkerServer: _handle_manager_failure attempts failover")
@@ -1735,19 +1735,19 @@ print("\nManager Peer Failure Detection Tests")
 print("=" * 40)
 
 
-@test("UDPServer: has register_on_node_join callback")
-def test_udp_server_has_node_join_callback():
-    from hyperscale.distributed_rewrite.swim.udp_server import UDPServer
+@test("HealthAwareServer: has register_on_node_join callback")
+def test_health_aware_server_has_node_join_callback():
+    from hyperscale.distributed_rewrite.swim.health_aware_server import HealthAwareServer
     
-    assert hasattr(UDPServer, 'register_on_node_join'), \
-        "UDPServer must have register_on_node_join method"
+    assert hasattr(HealthAwareServer, 'register_on_node_join'), \
+        "HealthAwareServer must have register_on_node_join method"
     
     # _on_node_join_callbacks is an instance attribute set in __init__
     # So we check the method exists and inspect its source
     import inspect
-    source = inspect.getsource(UDPServer.__init__)
+    source = inspect.getsource(HealthAwareServer.__init__)
     assert '_on_node_join_callbacks' in source, \
-        "UDPServer.__init__ must initialize _on_node_join_callbacks"
+        "HealthAwareServer.__init__ must initialize _on_node_join_callbacks"
 
 
 @test("ManagerServer: tracks manager UDP to TCP mapping")
@@ -1903,7 +1903,7 @@ def test_has_quorum_uses_active():
 
 
 # Run Manager Peer Failure tests
-test_udp_server_has_node_join_callback()
+test_health_aware_server_has_node_join_callback()
 test_manager_tracks_peer_mapping()
 test_manager_has_on_node_join()
 test_manager_has_handle_peer_failure()

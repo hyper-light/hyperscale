@@ -18,7 +18,7 @@ Architecture:
 """
 
 # Re-export SWIM for healthchecks
-from .swim import UDPServer as SwimServer
+from .swim import HealthAwareServer as SwimServer
 
 # Node types
 from .nodes import (

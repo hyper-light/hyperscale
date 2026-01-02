@@ -9,7 +9,7 @@ Gates coordinate job execution across datacenters. They:
 - Provide the global job view to clients
 
 Protocols:
-- UDP: SWIM healthchecks (inherited from UDPServer)
+- UDP: SWIM healthchecks (inherited from HealthAwareServer)
   - Gates form a gossip cluster with other gates
   - Gates probe managers to detect DC failures
   - Leader election uses SWIM membership info
@@ -27,7 +27,7 @@ from typing import Any
 
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
-from hyperscale.distributed_rewrite.swim import UDPServer, GateStateEmbedder
+from hyperscale.distributed_rewrite.swim import HealthAwareServer, GateStateEmbedder
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -52,7 +52,7 @@ from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 
 
-class GateServer(UDPServer):
+class GateServer(HealthAwareServer):
     """
     Gate node in the distributed Hyperscale system.
     
