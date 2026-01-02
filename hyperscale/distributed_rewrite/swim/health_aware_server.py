@@ -1463,11 +1463,20 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 await self.handle_exception(e, "shutdown_stop_cleanup")
         
         # 5. Log final audit event
-        self._audit_log.add_event(
+        self._audit_log.record(
             AuditEventType.NODE_LEFT,
             node=self_addr,
-            details={'reason': 'graceful_shutdown'},
+            reason='graceful_shutdown',
         )
+    
+    async def stop(self) -> None:
+        """
+        Stop the server. Alias for graceful_shutdown with minimal drain time.
+        
+        For tests or quick shutdown, use this. For production, prefer
+        graceful_shutdown() with appropriate drain_timeout.
+        """
+        await self.graceful_shutdown(drain_timeout=0.1, broadcast_leave=False)
     
     def get_current_leader(self) -> tuple[str, int] | None:
         """Get the current leader, if known."""

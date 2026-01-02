@@ -79,7 +79,7 @@ from hyperscale.distributed_rewrite.models import (
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError
 
 
 class ManagerServer(HealthAwareServer):
@@ -1915,8 +1915,28 @@ class ManagerServer(HealthAwareServer):
         """Handle raw worker register ack."""
         return data
     
+    @tcp.send('worker_discovery')
+    async def send_worker_discovery(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        timeout: int | float | None = None,
+    ):
+        """Send worker discovery broadcast to peer manager."""
+        return (addr, data, timeout)
+    
+    @tcp.handle('worker_discovery')
+    async def handle_worker_discovery_response(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Handle raw worker discovery response."""
+        return data
+    
     @tcp.receive()
-    async def receive_worker_register(
+    async def worker_register(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -1968,7 +1988,7 @@ class ManagerServer(HealthAwareServer):
             return response.dump()
             
         except Exception as e:
-            await self.handle_exception(e, "receive_worker_register")
+            await self.handle_exception(e, "worker_register")
             # Return error response
             response = RegistrationResponse(
                 accepted=False,
@@ -2010,9 +2030,10 @@ class ManagerServer(HealthAwareServer):
                 )
                 registration = WorkerRegistration(
                     node=node_info,
-                    available_cores=broadcast.available_cores,
                     total_cores=broadcast.available_cores,
-                    capacity=1.0,
+                    available_cores=broadcast.available_cores,
+                    memory_mb=0,  # Unknown from broadcast
+                    available_memory_mb=0,  # Unknown from broadcast
                 )
                 self._workers[worker_id] = registration
                 self._worker_addr_to_id[worker_tcp_addr] = worker_id
@@ -2036,6 +2057,66 @@ class ManagerServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "worker_discovery")
             return b'error'
+    
+    async def _broadcast_worker_discovery(
+        self,
+        worker_id: str,
+        worker_tcp_addr: tuple[str, int],
+        worker_udp_addr: tuple[str, int],
+        available_cores: int,
+    ) -> None:
+        """
+        Broadcast a newly discovered worker to all peer managers.
+        
+        This enables cross-manager synchronization of worker discovery.
+        When a worker registers with one manager, it gets broadcast
+        to all other managers so they can also track it.
+        
+        Args:
+            worker_id: Worker's node_id
+            worker_tcp_addr: Worker's TCP address
+            worker_udp_addr: Worker's UDP address  
+            available_cores: Worker's available cores
+        """
+        if not self._manager_peers:
+            return
+        
+        broadcast = WorkerDiscoveryBroadcast(
+            worker_id=worker_id,
+            worker_tcp_addr=worker_tcp_addr,
+            worker_udp_addr=worker_udp_addr,
+            datacenter=self._node_id.datacenter,
+            available_cores=available_cores,
+            source_manager_id=self._node_id.full,
+        )
+        
+        for peer_addr in self._manager_peers:
+            try:
+                response, _ = await self.send_worker_discovery(
+                    peer_addr,
+                    broadcast.dump(),
+                    timeout=2.0,
+                )
+                if isinstance(response, Exception):
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=f"Failed to broadcast worker {worker_id} to {peer_addr}: {response}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Error broadcasting worker {worker_id} to {peer_addr}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
     
     @tcp.receive()
     async def receive_worker_status_update(

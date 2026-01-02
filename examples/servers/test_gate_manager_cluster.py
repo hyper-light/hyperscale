@@ -377,7 +377,7 @@ async def run_test():
                 print(f"  - Gate leader issue: {gate_leaders}")
             if not gates_have_quorum:
                 print("  - Gate quorum not available")
-            if not managers_registered:
+            if not gates_have_manager_config:
                 print("  - Managers not registered with gates")
             return False
         
@@ -397,9 +397,7 @@ async def run_test():
         # Stop gates first
         for i, gate in enumerate(gates):
             try:
-                gate.stop_probe_cycle()
-                await gate.stop_leader_election()
-                await gate.shutdown()
+                await gate.graceful_shutdown()
                 print(f"  ✓ {GATE_CONFIGS[i]['name']} stopped")
             except Exception as e:
                 print(f"  ✗ {GATE_CONFIGS[i]['name']} stop failed: {e}")
@@ -407,9 +405,7 @@ async def run_test():
         # Stop managers
         for i, manager in enumerate(managers):
             try:
-                manager.stop_probe_cycle()
-                await manager.stop_leader_election()
-                await manager.shutdown()
+                await manager.graceful_shutdown()
                 print(f"  ✓ {MANAGER_CONFIGS[i]['name']} stopped")
             except Exception as e:
                 print(f"  ✗ {MANAGER_CONFIGS[i]['name']} stop failed: {e}")

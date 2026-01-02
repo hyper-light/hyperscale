@@ -219,9 +219,7 @@ async def run_test():
         # Stop gates
         for i, gate in enumerate(gates):
             try:
-                gate.stop_probe_cycle()
-                await gate.stop_leader_election()
-                await gate.shutdown()
+                await gate.graceful_shutdown()
                 print(f"  ✓ {GATE_CONFIGS[i]['name']} stopped")
             except Exception as e:
                 print(f"  ✗ {GATE_CONFIGS[i]['name']} stop failed: {e}")
