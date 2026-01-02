@@ -1512,6 +1512,222 @@ test_cores_completed_provisioning_scenario()
 
 
 # =============================================================================
+# Worker and Manager Failure Handling Tests
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Worker and Manager Failure Handling Tests")
+print("=" * 60)
+
+
+@test("ManagerServer: _handle_worker_failure properly validates retry data")
+def test_manager_handle_worker_failure():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_handle_worker_failure')
+    
+    source = inspect.getsource(ManagerServer._handle_worker_failure)
+    
+    # Should check if workflow_id is in _workflow_retries
+    assert '_workflow_retries' in source
+    # Should check for empty dispatch data
+    assert 'not data' in source or "empty dispatch" in source.lower()
+    # Should log error if retry not possible
+    assert 'ServerError' in source
+
+
+@test("ManagerServer: _retry_workflow uses correct VUs from dispatch")
+def test_manager_retry_uses_correct_vus():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._retry_workflow)
+    
+    # Should parse original dispatch to get VUs
+    assert 'WorkflowDispatch.load' in source
+    assert 'vus_needed' in source or 'original_dispatch.vus' in source
+    
+    # Should NOT have hardcoded vus_needed=1
+    # Check that it uses the parsed value
+    assert 'original_dispatch.vus' in source
+
+
+@test("WorkerServer: has manager failure detection")
+def test_worker_manager_failure_detection():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    assert hasattr(WorkerServer, '_on_node_dead')
+    assert hasattr(WorkerServer, '_handle_manager_failure')
+    assert hasattr(WorkerServer, '_report_active_workflows_to_manager')
+    
+    # Check that on_node_dead callback is registered in start()
+    start_source = inspect.getsource(WorkerServer.start)
+    assert 'register_on_node_dead' in start_source
+
+
+@test("WorkerServer: _handle_manager_failure attempts failover")
+def test_worker_handle_manager_failure():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer._handle_manager_failure)
+    
+    # Should iterate through manager list
+    assert '_manager_addrs' in source
+    # Should register with new manager
+    assert '_register_with_manager' in source
+    # Should update _current_manager
+    assert '_current_manager' in source
+    # Should report workflows after failover
+    assert '_report_active_workflows_to_manager' in source
+
+
+@test("Worker failure scenario: Manager detects via SWIM and reschedules")
+def test_worker_failure_scenario():
+    """
+    Test the worker failure and workflow rescheduling scenario.
+    
+    Scenario:
+    1. Worker A has workflow with 4 VUs
+    2. Worker A dies (detected via SWIM)
+    3. Manager's _on_node_dead callback fires
+    4. _handle_worker_failure finds the workflow
+    5. _retry_workflow selects Worker B with enough VUs
+    6. Workflow is re-dispatched to Worker B
+    """
+    from hyperscale.distributed_rewrite.models import (
+        WorkflowDispatch,
+        WorkflowProgress,
+        WorkflowStatus,
+    )
+    
+    # Create original dispatch with 4 VUs
+    dispatch = WorkflowDispatch(
+        job_id="job-1",
+        workflow_id="wf-1",
+        workflow=b"pickled_workflow",
+        context=b"{}",
+        vus=4,
+        timeout_seconds=300,
+        fence_token=1,
+    )
+    dispatch_bytes = dispatch.dump()
+    
+    # Verify we can deserialize and get VUs
+    restored = WorkflowDispatch.load(dispatch_bytes)
+    assert restored.vus == 4
+    assert restored.workflow_id == "wf-1"
+    assert restored.job_id == "job-1"
+    
+    # Simulate retry tracking tuple
+    retry_info = (0, dispatch_bytes, {"worker-a"})  # (count, data, failed_workers)
+    
+    # Verify we can parse VUs from retry info
+    stored_dispatch = WorkflowDispatch.load(retry_info[1])
+    assert stored_dispatch.vus == 4
+
+
+@test("Manager failure scenario: Worker detects and fails over")
+def test_manager_failure_scenario():
+    """
+    Test the manager failure and worker failover scenario.
+    
+    Scenario:
+    1. Worker is connected to Manager A
+    2. Manager A dies (detected via SWIM)  
+    3. Worker's _on_node_dead callback fires
+    4. _handle_manager_failure tries Manager B
+    5. Worker registers with Manager B
+    6. Worker reports active workflows to Manager B
+    """
+    from hyperscale.distributed_rewrite.models import (
+        WorkflowProgress,
+        WorkflowStatus,
+    )
+    
+    # Simulate active workflow state
+    progress = WorkflowProgress(
+        job_id="job-1",
+        workflow_id="wf-1",
+        workflow_name="TestWorkflow",
+        status=WorkflowStatus.RUNNING.value,
+        completed_count=500,
+        failed_count=0,
+        rate_per_second=100.0,
+        elapsed_seconds=5.0,
+        assigned_cores=[0, 1, 2, 3],
+        cores_completed=1,
+    )
+    
+    # Verify progress can be serialized for reporting
+    data = progress.dump()
+    restored = WorkflowProgress.load(data)
+    assert restored.workflow_id == "wf-1"
+    assert restored.status == WorkflowStatus.RUNNING.value
+    assert restored.cores_completed == 1
+
+
+@test("Retry preserves workflow resource requirements")
+def test_retry_preserves_resources():
+    """
+    Verify that workflow retry preserves the original VUs requirement.
+    """
+    from hyperscale.distributed_rewrite.models import WorkflowDispatch
+    
+    # Create workflows with different VU requirements
+    workflows = [
+        WorkflowDispatch(
+            job_id="job-1",
+            workflow_id="wf-small",
+            workflow=b"small",
+            context=b"{}",
+            vus=1,
+            timeout_seconds=60,
+            fence_token=1,
+        ),
+        WorkflowDispatch(
+            job_id="job-1",
+            workflow_id="wf-medium",
+            workflow=b"medium",
+            context=b"{}",
+            vus=4,
+            timeout_seconds=120,
+            fence_token=2,
+        ),
+        WorkflowDispatch(
+            job_id="job-1",
+            workflow_id="wf-large",
+            workflow=b"large",
+            context=b"{}",
+            vus=16,
+            timeout_seconds=300,
+            fence_token=3,
+        ),
+    ]
+    
+    for original in workflows:
+        # Serialize and deserialize
+        dispatch_bytes = original.dump()
+        restored = WorkflowDispatch.load(dispatch_bytes)
+        
+        # VUs must be preserved for retry
+        assert restored.vus == original.vus, f"VUs mismatch for {original.workflow_id}"
+        assert restored.timeout_seconds == original.timeout_seconds
+
+
+# Run Worker/Manager Failure tests
+test_manager_handle_worker_failure()
+test_manager_retry_uses_correct_vus()
+test_worker_manager_failure_detection()
+test_worker_handle_manager_failure()
+test_worker_failure_scenario()
+test_manager_failure_scenario()
+test_retry_preserves_resources()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

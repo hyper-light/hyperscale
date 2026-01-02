@@ -873,6 +873,7 @@ class ManagerServer(UDPServer):
         Attempt to retry a workflow on a different worker.
         
         Returns True if successfully rescheduled, False otherwise.
+        Uses the correct number of VUs/cores from the original dispatch.
         """
         # Find eligible workers (not in failed set and have capacity)
         job = self._jobs.get(job_id)
@@ -905,9 +906,25 @@ class ManagerServer(UDPServer):
         
         original_dispatch_bytes = retry_info[1]
         
-        # Select a new worker
+        # Parse dispatch to get actual VUs needed
+        try:
+            original_dispatch = WorkflowDispatch.load(original_dispatch_bytes)
+            vus_needed = original_dispatch.vus
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Failed to parse dispatch for workflow {workflow_id}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+        
+        # Select a new worker with correct VU requirement
         new_worker = self._select_worker_for_workflow_excluding(
-            vus_needed=1,  # Single core per workflow
+            vus_needed=vus_needed,
             exclude_workers=failed_workers,
         )
         
@@ -933,7 +950,7 @@ class ManagerServer(UDPServer):
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Retrying workflow {workflow_id} on {new_worker} (attempt {retry_count}/{self._max_workflow_retries})",
+                message=f"Retrying workflow {workflow_id} ({vus_needed} VUs) on {new_worker} (attempt {retry_count}/{self._max_workflow_retries})",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -942,8 +959,8 @@ class ManagerServer(UDPServer):
         
         # Re-dispatch the workflow to the new worker
         try:
-            # Deserialize the original dispatch and update fence token
-            original_dispatch = WorkflowDispatch.load(original_dispatch_bytes)
+            # Create new dispatch with new fence token
+            # (original_dispatch was already parsed above to get vus_needed)
             new_dispatch = WorkflowDispatch(
                 job_id=original_dispatch.job_id,
                 workflow_id=original_dispatch.workflow_id,
@@ -1026,6 +1043,9 @@ class ManagerServer(UDPServer):
         Handle a worker becoming unavailable (detected via SWIM).
         
         Reschedules all workflows assigned to that worker on other workers.
+        The workflows must have been dispatched via _dispatch_single_workflow
+        which stores the dispatch bytes in _workflow_retries for exactly this
+        scenario.
         """
         # Clean up worker from registration mappings
         worker_reg = self._workers.pop(worker_node_id, None)
@@ -1066,22 +1086,57 @@ class ManagerServer(UDPServer):
                 if job_id:
                     break
             
-            if job_id:
-                # Initialize or update retry tracking
-                if workflow_id not in self._workflow_retries:
-                    self._workflow_retries[workflow_id] = (0, b'', {worker_node_id})
-                else:
-                    count, data, failed = self._workflow_retries[workflow_id]
-                    failed.add(worker_node_id)
-                    self._workflow_retries[workflow_id] = (count, data, failed)
-                
-                # Attempt retry
-                await self._retry_workflow(
-                    workflow_id=workflow_id,
-                    job_id=job_id,
-                    failed_workers=self._workflow_retries[workflow_id][2],
-                    retry_count=self._workflow_retries[workflow_id][0] + 1,
+            if not job_id:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Cannot retry workflow {workflow_id} - job not found",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
                 )
+                continue
+            
+            # Dispatch bytes should have been stored when workflow was dispatched
+            # via _dispatch_single_workflow. If not present, we cannot retry.
+            if workflow_id not in self._workflow_retries:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Cannot retry workflow {workflow_id} - no dispatch data stored (workflow may have been dispatched through a different path)",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                continue
+            
+            # Update failed workers set
+            count, data, failed = self._workflow_retries[workflow_id]
+            if not data:
+                # Dispatch bytes are empty - cannot retry
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Cannot retry workflow {workflow_id} - empty dispatch data",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                continue
+            
+            failed.add(worker_node_id)
+            self._workflow_retries[workflow_id] = (count, data, failed)
+            
+            # Attempt retry
+            await self._retry_workflow(
+                workflow_id=workflow_id,
+                job_id=job_id,
+                failed_workers=failed,
+                retry_count=count + 1,
+            )
     
     # =========================================================================
     # Background Cleanup

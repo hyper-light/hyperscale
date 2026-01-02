@@ -225,6 +225,9 @@ class WorkerServer(UDPServer):
         """Start the worker server."""
         await super().start()
         
+        # Register callback for manager failure detection via SWIM
+        self.register_on_node_dead(self._on_node_dead)
+        
         # Register with managers (TCP)
         for manager_addr in self._manager_addrs:
             success = await self._register_with_manager(manager_addr)
@@ -252,6 +255,99 @@ class WorkerServer(UDPServer):
                 node_id=self._node_id.short,
             )
         )
+    
+    def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
+        """
+        Called when a node is marked as DEAD via SWIM.
+        
+        If the dead node is our current manager, trigger failover to another
+        manager from our list.
+        """
+        if not self._current_manager:
+            return
+        
+        # Check if dead node is our current manager
+        # Manager UDP addr and TCP addr share the same host but may differ in port
+        # We track managers by TCP address, but SWIM uses UDP
+        current_host = self._current_manager[0]
+        dead_host = node_addr[0]
+        
+        # Simple host-based comparison - if same host, likely same manager
+        # More robust would be to track UDP<->TCP mapping
+        if current_host == dead_host:
+            self._task_runner.run(self._handle_manager_failure, node_addr)
+    
+    async def _handle_manager_failure(self, failed_addr: tuple[str, int]) -> None:
+        """
+        Handle manager failure by failing over to another manager.
+        
+        The worker will:
+        1. Clear the current manager reference
+        2. Attempt to register with another manager from the list
+        3. Re-report active workflows to the new manager
+        """
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager at {failed_addr} appears to have failed, initiating failover",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        old_manager = self._current_manager
+        self._current_manager = None
+        
+        # Try other managers
+        for manager_addr in self._manager_addrs:
+            # Skip the failed manager
+            if manager_addr == old_manager:
+                continue
+            
+            success = await self._register_with_manager(manager_addr)
+            if success:
+                self._current_manager = manager_addr
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Successfully failed over to manager at {manager_addr}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                
+                # Re-report active workflows to new manager
+                await self._report_active_workflows_to_manager()
+                return
+        
+        # No available managers
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerError(
+                message="No available managers for failover - worker is orphaned",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+    
+    async def _report_active_workflows_to_manager(self) -> None:
+        """
+        Report all active workflows to the current manager.
+        
+        Called after failover to ensure the new manager knows about our work.
+        """
+        if not self._current_manager:
+            return
+        
+        for workflow_id, progress in self._active_workflows.items():
+            try:
+                await self._send_progress_update(progress)
+            except Exception:
+                # Non-critical - manager will detect via next heartbeat
+                pass
     
     async def stop(self) -> None:
         """Stop the worker server."""
