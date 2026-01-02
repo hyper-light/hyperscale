@@ -1917,6 +1917,170 @@ test_has_quorum_uses_active()
 
 
 # =============================================================================
+# State Sync and Gate Split-Brain Prevention Tests
+# =============================================================================
+
+print("\nState Sync and Gate Split-Brain Prevention Tests")
+print("=" * 50)
+
+
+@test("ManagerServer: _request_worker_state has retry logic")
+def test_manager_worker_state_retry():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._request_worker_state)
+    
+    # Should have retry loop
+    assert 'max_retries' in source, \
+        "_request_worker_state must have max_retries parameter"
+    assert 'for attempt' in source or 'range(max_retries)' in source, \
+        "_request_worker_state must have retry loop"
+    assert 'base_delay' in source, \
+        "_request_worker_state must have exponential backoff"
+
+
+@test("ManagerServer: has _sync_state_from_manager_peers")
+def test_manager_has_peer_sync():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_sync_state_from_manager_peers'), \
+        "ManagerServer must have _sync_state_from_manager_peers method"
+
+
+@test("ManagerServer: _on_manager_become_leader syncs from peers")
+def test_manager_become_leader_syncs_peers():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._on_manager_become_leader)
+    
+    assert '_sync_state_from_workers' in source, \
+        "_on_manager_become_leader must sync from workers"
+    assert '_sync_state_from_manager_peers' in source, \
+        "_on_manager_become_leader must sync from manager peers"
+
+
+@test("ManagerServer: has _request_manager_peer_state with retries")
+def test_manager_has_peer_state_request():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_request_manager_peer_state'), \
+        "ManagerServer must have _request_manager_peer_state method"
+    
+    source = inspect.getsource(ManagerServer._request_manager_peer_state)
+    
+    # Should have retry logic
+    assert 'max_retries' in source, \
+        "_request_manager_peer_state must have max_retries parameter"
+
+
+@test("ManagerServer: has _process_manager_state_response")
+def test_manager_has_process_peer_response():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_process_manager_state_response'), \
+        "ManagerServer must have _process_manager_state_response method"
+
+
+@test("GateServer: tracks gate peer addresses")
+def test_gate_tracks_peer_mapping():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer.__init__)
+    
+    assert '_gate_udp_to_tcp' in source, \
+        "GateServer.__init__ must initialize _gate_udp_to_tcp"
+    assert '_active_gate_peers' in source, \
+        "GateServer.__init__ must initialize _active_gate_peers"
+
+
+@test("GateServer: has _on_node_dead callback")
+def test_gate_has_on_node_dead():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_on_node_dead'), \
+        "GateServer must have _on_node_dead method"
+
+
+@test("GateServer: has _on_node_join callback")
+def test_gate_has_on_node_join():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_on_node_join'), \
+        "GateServer must have _on_node_join method"
+
+
+@test("GateServer: has _handle_gate_peer_failure method")
+def test_gate_has_handle_peer_failure():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_handle_gate_peer_failure'), \
+        "GateServer must have _handle_gate_peer_failure method"
+
+
+@test("GateServer: has _handle_gate_peer_recovery method")
+def test_gate_has_handle_peer_recovery():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_handle_gate_peer_recovery'), \
+        "GateServer must have _handle_gate_peer_recovery method"
+
+
+@test("GateServer: _on_node_dead checks for gate peers")
+def test_gate_on_node_dead_checks_peers():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._on_node_dead)
+    
+    assert '_gate_udp_to_tcp' in source, \
+        "_on_node_dead must check _gate_udp_to_tcp for gate peer failures"
+    assert '_handle_gate_peer_failure' in source, \
+        "_on_node_dead must call _handle_gate_peer_failure for gate peers"
+
+
+@test("GateServer: peer failure updates active peers")
+def test_gate_peer_failure_updates_active():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._handle_gate_peer_failure)
+    
+    assert 'discard' in source, \
+        "_handle_gate_peer_failure must discard from _active_gate_peers"
+
+
+@test("GateServer: peer recovery restores active peers")
+def test_gate_peer_recovery_restores_active():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._handle_gate_peer_recovery)
+    
+    assert '_active_gate_peers.add' in source, \
+        "_handle_gate_peer_recovery must add back to _active_gate_peers"
+
+
+# Run State Sync and Gate Split-Brain Prevention tests
+test_manager_worker_state_retry()
+test_manager_has_peer_sync()
+test_manager_become_leader_syncs_peers()
+test_manager_has_peer_state_request()
+test_manager_has_process_peer_response()
+test_gate_tracks_peer_mapping()
+test_gate_has_on_node_dead()
+test_gate_has_on_node_join()
+test_gate_has_handle_peer_failure()
+test_gate_has_handle_peer_recovery()
+test_gate_on_node_dead_checks_peers()
+test_gate_peer_failure_updates_active()
+test_gate_peer_recovery_restores_active()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

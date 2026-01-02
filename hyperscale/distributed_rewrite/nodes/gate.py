@@ -101,6 +101,16 @@ class GateServer(UDPServer):
         self._gate_peers = gate_peers or []  # TCP
         self._gate_udp_peers = gate_udp_peers or []  # UDP for SWIM cluster
         
+        # Track gate peer addresses for failure detection (same pattern as managers)
+        # Maps UDP addr -> TCP addr for peer gates
+        self._gate_udp_to_tcp: dict[tuple[str, int], tuple[str, int]] = {}
+        for i, tcp_addr in enumerate(self._gate_peers):
+            if i < len(self._gate_udp_peers):
+                self._gate_udp_to_tcp[self._gate_udp_peers[i]] = tcp_addr
+        
+        # Track active gate peers (removed when SWIM marks as dead)
+        self._active_gate_peers: set[tuple[str, int]] = set(self._gate_peers)
+        
         # Known datacenters and their status (from TCP updates)
         self._datacenter_status: dict[str, ManagerHeartbeat] = {}  # dc -> last status
         self._datacenter_last_status: dict[str, float] = {}  # dc -> timestamp
@@ -136,6 +146,113 @@ class GateServer(UDPServer):
             get_active_jobs=lambda: len(self._jobs),
             on_manager_heartbeat=self._handle_embedded_manager_heartbeat,
         ))
+        
+        # Register node death and join callbacks for failure/recovery handling
+        # (Same pattern as ManagerServer for split-brain prevention)
+        self.register_on_node_dead(self._on_node_dead)
+        self.register_on_node_join(self._on_node_join)
+    
+    def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
+        """
+        Called when a node is marked as DEAD via SWIM.
+        
+        Handles gate peer failures (for split-brain awareness).
+        Datacenter manager failures are handled via DC availability checks.
+        """
+        # Check if this is a gate peer
+        gate_tcp_addr = self._gate_udp_to_tcp.get(node_addr)
+        if gate_tcp_addr:
+            self._task_runner.run(self._handle_gate_peer_failure, node_addr, gate_tcp_addr)
+    
+    def _on_node_join(self, node_addr: tuple[str, int]) -> None:
+        """
+        Called when a node joins or rejoins the SWIM cluster.
+        
+        Handles gate peer recovery.
+        """
+        # Check if this is a gate peer
+        gate_tcp_addr = self._gate_udp_to_tcp.get(node_addr)
+        if gate_tcp_addr:
+            self._task_runner.run(self._handle_gate_peer_recovery, node_addr, gate_tcp_addr)
+    
+    async def _handle_gate_peer_failure(
+        self,
+        udp_addr: tuple[str, int],
+        tcp_addr: tuple[str, int],
+    ) -> None:
+        """
+        Handle a gate peer becoming unavailable (detected via SWIM).
+        
+        This is important for split-brain awareness:
+        - If we lose contact with majority of peers, we should be cautious
+        - Leadership re-election is automatic via LocalLeaderElection
+        """
+        # Remove from active peers
+        self._active_gate_peers.discard(tcp_addr)
+        
+        # Check if this was the leader
+        current_leader = self.get_current_leader()
+        was_leader = current_leader == udp_addr
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Gate peer at {tcp_addr} (UDP: {udp_addr}) marked as DEAD" +
+                        (" - was LEADER, re-election will occur" if was_leader else ""),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        # Log quorum status (gates don't use quorum for operations, but useful for monitoring)
+        active_count = len(self._active_gate_peers) + 1  # Include self
+        total_gates = len(self._gate_peers) + 1
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Gate cluster: {active_count}/{total_gates} active",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+    
+    async def _handle_gate_peer_recovery(
+        self,
+        udp_addr: tuple[str, int],
+        tcp_addr: tuple[str, int],
+    ) -> None:
+        """
+        Handle a gate peer recovering/rejoining the cluster.
+        """
+        # Add back to active peers
+        self._active_gate_peers.add(tcp_addr)
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Gate peer at {tcp_addr} (UDP: {udp_addr}) has REJOINED the cluster",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        # Log cluster status
+        active_count = len(self._active_gate_peers) + 1  # Include self
+        total_gates = len(self._gate_peers) + 1
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Gate cluster: {active_count}/{total_gates} active",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
     
     def _handle_embedded_manager_heartbeat(
         self,

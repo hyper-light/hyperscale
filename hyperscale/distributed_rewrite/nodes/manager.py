@@ -200,11 +200,13 @@ class ManagerServer(UDPServer):
         """
         Called when this manager becomes the leader.
         
-        Triggers state sync from all known workers to ensure the new leader
-        has the most current state.
+        Triggers state sync from:
+        1. All known workers to get workflow state (workers are source of truth)
+        2. Peer managers to get job-level metadata (retry counts, etc.)
         """
         # Schedule async state sync via task runner
         self._task_runner.run(self._sync_state_from_workers)
+        self._task_runner.run(self._sync_state_from_manager_peers)
     
     def _on_manager_lose_leadership(self) -> None:
         """Called when this manager loses leadership."""
@@ -382,6 +384,56 @@ class ManagerServer(UDPServer):
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
+                    message=f"Worker state sync complete: {success_count}/{len(sync_tasks)} workers responded",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+    
+    async def _sync_state_from_manager_peers(self) -> None:
+        """
+        Request job state from peer managers.
+        
+        Called when this manager becomes leader to get job-level metadata
+        (retry counts, assignments, completion status) that workers don't have.
+        """
+        if not self._manager_peers:
+            return
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"New leader syncing job state from {len(self._manager_peers)} peer managers",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        request = StateSyncRequest(
+            requester_id=self._node_id.full,
+            requester_role=NodeRole.MANAGER.value,
+            since_version=0,  # Request full state
+        )
+        
+        sync_tasks = []
+        for peer_addr in self._manager_peers:
+            sync_tasks.append(
+                self._request_manager_peer_state(peer_addr, request)
+            )
+        
+        if sync_tasks:
+            results = await asyncio.gather(*sync_tasks, return_exceptions=True)
+            
+            success_count = sum(
+                1 for r in results
+                if r is not None and not isinstance(r, Exception)
+            )
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
                     message=f"State sync complete: {success_count}/{len(sync_tasks)} workers responded",
                     node_host=self._host,
                     node_port=self._tcp_port,
@@ -393,55 +445,173 @@ class ManagerServer(UDPServer):
         self,
         worker_addr: tuple[str, int],
         request: StateSyncRequest,
+        max_retries: int = 3,
+        base_delay: float = 0.5,
     ) -> WorkerStateSnapshot | None:
-        """Request state from a single worker."""
-        try:
-            response = await self.send_tcp(
-                worker_addr,
-                action='state_sync_request',
-                data=request.dump(),
-                timeout=5.0,
+        """
+        Request state from a single worker with retries.
+        
+        Uses exponential backoff: delay = base_delay * (2 ** attempt)
+        """
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                response = await self.send_tcp(
+                    worker_addr,
+                    action='state_sync_request',
+                    data=request.dump(),
+                    timeout=5.0,
+                )
+                
+                if response and not isinstance(response, Exception):
+                    sync_response = StateSyncResponse.load(response)
+                    if sync_response.worker_state:
+                        return await self._process_worker_state_response(sync_response.worker_state)
+                
+                # No valid response, will retry
+                last_error = "Empty or invalid response"
+                
+            except Exception as e:
+                last_error = str(e)
+            
+            # Don't sleep after last attempt
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+        
+        # All retries failed
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerError(
+                message=f"State sync failed for {worker_addr} after {max_retries} attempts: {last_error}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
             )
+        )
+        return None
+    
+    async def _process_worker_state_response(
+        self,
+        worker_state: WorkerStateSnapshot,
+    ) -> WorkerStateSnapshot | None:
+        """Process a worker state response and update local tracking."""
+        # Only accept if fresher than what we have
+        if self._versioned_clock.should_accept_update(
+            worker_state.node_id,
+            worker_state.version,
+        ):
+            # Convert to heartbeat format for storage
+            heartbeat = WorkerHeartbeat(
+                node_id=worker_state.node_id,
+                state=worker_state.state,
+                available_cores=worker_state.available_cores,
+                queue_depth=0,  # Not in snapshot
+                cpu_percent=0.0,
+                memory_percent=0.0,
+                version=worker_state.version,
+                active_workflows={
+                    wf_id: progress.status
+                    for wf_id, progress in worker_state.active_workflows.items()
+                },
+            )
+            self._worker_status[worker_state.node_id] = heartbeat
             
-            if response and not isinstance(response, Exception):
-                sync_response = StateSyncResponse.load(response)
-                if sync_response.worker_state:
-                    # Update our tracking with worker's state
-                    worker_state = sync_response.worker_state
-                    
-                    # Only accept if fresher than what we have
-                    if self._versioned_clock.should_accept_update(
-                        worker_state.node_id,
-                        worker_state.version,
-                    ):
-                        # Convert to heartbeat format for storage
-                        heartbeat = WorkerHeartbeat(
-                            node_id=worker_state.node_id,
-                            state=worker_state.state,
-                            available_cores=worker_state.available_cores,
-                            queue_depth=0,  # Not in snapshot
-                            cpu_percent=0.0,  # Not in snapshot
-                            memory_percent=0.0,  # Not in snapshot
-                            version=worker_state.version,
-                            active_workflows={
-                                wf_id: wf.status
-                                for wf_id, wf in worker_state.active_workflows.items()
-                            },
-                        )
-                        self._worker_status[worker_state.node_id] = heartbeat
-                        self._worker_last_status[worker_state.node_id] = time.monotonic()
-                        await self._versioned_clock.update_entity(
-                            worker_state.node_id,
-                            worker_state.version,
-                        )
-                    
-                    return worker_state
+            # Update workflow assignments from worker's state
+            for wf_id, progress in worker_state.active_workflows.items():
+                self._workflow_assignments[wf_id] = worker_state.node_id
             
+            return worker_state
+        return None
+    
+    async def _request_manager_peer_state(
+        self,
+        peer_addr: tuple[str, int],
+        request: StateSyncRequest,
+        max_retries: int = 3,
+        base_delay: float = 0.5,
+    ) -> ManagerStateSnapshot | None:
+        """
+        Request state from a peer manager with retries.
+        
+        Uses exponential backoff: delay = base_delay * (2 ** attempt)
+        """
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                response = await self.send_tcp(
+                    peer_addr,
+                    action='state_sync_request',
+                    data=request.dump(),
+                    timeout=5.0,
+                )
+                
+                if response and not isinstance(response, Exception):
+                    sync_response = StateSyncResponse.load(response)
+                    if sync_response.manager_state:
+                        return await self._process_manager_state_response(sync_response.manager_state)
+                
+                # No valid response, will retry
+                last_error = "Empty or invalid response"
+                
+            except Exception as e:
+                last_error = str(e)
+            
+            # Don't sleep after last attempt
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+        
+        # All retries failed - log but don't fail (peer may be dead)
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager peer state sync failed for {peer_addr} after {max_retries} attempts: {last_error}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        return None
+    
+    async def _process_manager_state_response(
+        self,
+        manager_state: ManagerStateSnapshot,
+    ) -> ManagerStateSnapshot | None:
+        """
+        Process a manager state response and merge job state.
+        
+        Only merges jobs we don't know about or that have higher versions.
+        Does NOT override worker state - workers are source of truth for that.
+        """
+        # Check version for staleness
+        peer_key = f"manager:{manager_state.node_id}"
+        if self._versioned_clock.is_entity_stale(peer_key, manager_state.version):
             return None
-            
-        except Exception as e:
-            await self.handle_exception(e, f"request_worker_state:{worker_addr}")
-            return None
+        
+        # Merge job state - add jobs we don't have
+        jobs_merged = 0
+        for job_id, job_progress in manager_state.jobs.items():
+            if job_id not in self._jobs:
+                # Create JobProgress for this job
+                self._jobs[job_id] = job_progress
+                jobs_merged += 1
+        
+        if jobs_merged > 0:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Merged {jobs_merged} jobs from peer {manager_state.node_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        
+        return manager_state
+        return None
     
     def _handle_embedded_worker_heartbeat(
         self,

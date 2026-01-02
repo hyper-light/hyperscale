@@ -288,6 +288,52 @@ def _has_quorum_available(self) -> bool:
 - `is_fencing_token_valid(token)` checks `token >= current_term`
 - Included in `WorkflowDispatch`, checked by workers
 
+### AD-11: State Sync Retries with Exponential Backoff
+
+**Decision**: State sync operations use retries with exponential backoff.
+
+**Rationale**:
+- Network partitions are often transient
+- Single-attempt sync may miss temporarily unavailable workers
+- Exponential backoff prevents thundering herd on recovery
+
+**Implementation**:
+- `_request_worker_state(max_retries=3, base_delay=0.5)` retries with backoff
+- `_request_manager_peer_state(max_retries=3, base_delay=0.5)` similarly
+- Delay formula: `base_delay * (2 ** attempt)`
+- After exhausting retries, error is logged but sync continues with other peers
+
+### AD-12: Manager Peer State Sync on Leadership
+
+**Decision**: New leaders sync from both workers AND peer managers.
+
+**Rationale**:
+- Workers are source of truth for workflow execution state
+- Peer managers have job-level metadata (retry counts, completion status)
+- Both are needed for complete state recovery
+
+**Implementation**:
+- `_on_manager_become_leader()` calls both sync methods
+- `_sync_state_from_workers()` - gets workflow execution state
+- `_sync_state_from_manager_peers()` - gets job metadata
+- Both use retry logic (AD-11)
+
+### AD-13: Gate Split-Brain Prevention
+
+**Decision**: Gates use the same split-brain prevention as managers.
+
+**Rationale**:
+- Gates coordinate across datacenters - split-brain would cause duplicate jobs
+- Same SWIM-based detection works for gate clusters
+- Consistent patterns reduce complexity
+
+**Implementation**:
+- `_gate_udp_to_tcp` maps UDP addresses to TCP for peer tracking
+- `_active_gate_peers` tracks currently reachable peers
+- `_on_node_dead` / `_on_node_join` handle peer failure/recovery
+- Leadership re-election via `LocalLeaderElection` (same as managers)
+- Pre-voting and term-based resolution prevent split-brain
+
 ---
 
 ## Architecture
@@ -3209,32 +3255,6 @@ gate = GateServer(
 
 ## Known Limitations & Future Work
 
-### State Sync Retries (Not Implemented)
-
-Currently, `_sync_state_from_workers()` makes a single attempt to each worker. If a worker is temporarily unreachable, its state is not recovered.
-
-**Current behavior**:
-- Single request with 5-second timeout
-- Partial failures logged but not retried
-- New leader may have incomplete state
-
-**Recommended improvement**:
-```python
-async def _request_worker_state_with_retry(
-    self,
-    worker_addr: tuple[str, int],
-    request: StateSyncRequest,
-    max_retries: int = 3,
-    base_delay: float = 0.5,
-) -> WorkerStateSnapshot | None:
-    for attempt in range(max_retries):
-        result = await self._request_worker_state(worker_addr, request)
-        if result:
-            return result
-        await asyncio.sleep(base_delay * (2 ** attempt))
-    return None
-```
-
 ### New Manager Join Process (Partially Implemented)
 
 The architecture document describes a "SYNCING" state for new managers, but this is not fully implemented.
@@ -3248,8 +3268,9 @@ The architecture document describes a "SYNCING" state for new managers, but this
 
 **Current implementation**:
 - Manager joins SWIM and immediately participates
-- No explicit SYNCING state
-- Quorum includes new manager immediately
+- When becoming leader, syncs from workers AND peer managers
+- No explicit SYNCING state (implicit during sync)
+- Quorum includes new manager immediately (may be safe due to term-based fencing)
 
 ### Quorum Timeout Handling (Partial)
 
@@ -3259,12 +3280,6 @@ When quorum cannot be achieved (e.g., too many managers down), operations should
 - Quorum timeout returns failure
 - No circuit breaker for repeated failures
 - No automatic shedding of quorum operations when unavailable
-
-### Manager Peer State Sync (Not Implemented)
-
-When a new manager joins, it should sync job state from the leader manager, not just from workers.
-
-**Gap**: Currently new managers only sync from workers. Job-level state (retry counts, completion status) may be lost.
 
 ---
 
@@ -3276,14 +3291,17 @@ Run the test suite:
 python examples/test_distributed_rewrite.py
 ```
 
-Current test coverage: 47+ tests covering:
+Current test coverage: 86 tests covering:
 - SWIM protocol (probing, suspicion, gossip)
 - Leadership election (pre-voting, flapping)
 - State embedding (heartbeat serialization)
 - Distributed messages (all message types)
 - Worker/Manager/Gate functionality
-- State sync and retry mechanisms
+- State sync with retry mechanisms
 - Per-core workflow assignment
+- Worker/Manager failure handling
+- Manager peer failure/recovery
+- Gate split-brain prevention
 
 ---
 
