@@ -95,7 +95,6 @@ class ManagerServer(UDPServer):
         gate_udp_addrs: list[tuple[str, int]] | None = None,  # For SWIM if gates exist
         manager_peers: list[tuple[str, int]] | None = None,  # TCP addresses
         manager_udp_peers: list[tuple[str, int]] | None = None,  # UDP for SWIM cluster
-        status_update_interval: float = 1.0,  # TCP status to gates
         quorum_timeout: float = 5.0,
     ):
         super().__init__(
@@ -131,10 +130,6 @@ class ManagerServer(UDPServer):
         
         # State versioning
         self._state_version = 0
-        
-        # Status update loop (TCP to gates)
-        self._status_update_interval = status_update_interval
-        self._status_update_task: asyncio.Task | None = None
         
         # Quorum settings
         self._quorum_timeout = quorum_timeout
@@ -209,9 +204,8 @@ class ManagerServer(UDPServer):
         # Start leader election (uses SWIM membership info)
         await self.start_leader_election()
         
-        # Start status update loop (TCP to gates if present)
-        if self._gate_addrs:
-            self._status_update_task = asyncio.create_task(self._status_update_loop())
+        # Note: Status updates to gates are now handled via Serf-style heartbeat
+        # embedding in SWIM probe responses. Gates learn our state passively.
         
         self._udp_logger.log(
             ServerInfo(
@@ -224,76 +218,13 @@ class ManagerServer(UDPServer):
     
     async def stop(self) -> None:
         """Stop the manager server."""
-        if self._status_update_task:
-            self._status_update_task.cancel()
-            try:
-                await self._status_update_task
-            except asyncio.CancelledError:
-                pass
-        
         # Graceful shutdown broadcasts leave via UDP (SWIM)
         await self.graceful_shutdown()
         
         await super().stop()
     
-    async def _status_update_loop(self) -> None:
-        """
-        Send periodic status updates to gates via TCP.
-        
-        Note: This is NOT a healthcheck. Gates detect manager liveness
-        via the SWIM protocol over UDP. This loop sends job progress
-        and capacity information.
-        """
-        while self._running:
-            try:
-                await asyncio.sleep(self._status_update_interval)
-                
-                if self._gate_addrs:
-                    for gate_addr in self._gate_addrs:
-                        await self._send_status_to_gate(gate_addr)
-                        
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                await self.handle_exception(e, "manager_status_update_loop")
-    
-    async def _send_status_to_gate(self, gate_addr: tuple[str, int]) -> None:
-        """
-        Send status update to a gate via TCP.
-        
-        Contains job progress and capacity - NOT liveness.
-        Liveness is determined by SWIM over UDP.
-        """
-        # Calculate available cores across all workers
-        total_available = sum(
-            status.available_cores for status in self._worker_status.values()
-        )
-        
-        status = ManagerHeartbeat(  # Reusing struct for status, not healthcheck
-            node_id=self._node_id.full,
-            datacenter=self._node_id.datacenter,
-            is_leader=self.is_leader(),
-            term=self._leader_election.state.current_term,
-            version=self._state_version,
-            active_jobs=len(self._jobs),
-            active_workflows=sum(
-                len([w for w in job.workflows if w.status == WorkflowStatus.RUNNING.value])
-                for job in self._jobs.values()
-            ),
-            worker_count=len(self._workers),
-            available_cores=total_available,
-        )
-        
-        try:
-            await self.send_tcp(
-                gate_addr,
-                "manager_status_update",
-                status.dump(),
-                timeout=2.0,
-            )
-        except Exception as e:
-            # Status failure is not critical - SWIM handles liveness
-            await self.handle_exception(e, "status_to_gate")
+    # Note: Status updates to gates are now handled via Serf-style heartbeat
+    # embedding in SWIM probe responses. See ManagerStateEmbedder in __init__.
     
     def _get_state_snapshot(self) -> ManagerStateSnapshot:
         """Get a complete state snapshot."""

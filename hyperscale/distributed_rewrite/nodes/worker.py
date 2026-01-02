@@ -83,7 +83,6 @@ class WorkerServer(UDPServer):
         dc_id: str = "default",
         total_cores: int | None = None,
         manager_addrs: list[tuple[str, int]] | None = None,
-        status_update_interval: float = 1.0,  # Renamed from heartbeat
     ):
         super().__init__(
             host=host,
@@ -109,10 +108,6 @@ class WorkerServer(UDPServer):
         
         # State versioning (Lamport clock extension)
         self._state_version = 0
-        
-        # Status update loop (TCP) - NOT healthcheck
-        self._status_update_interval = status_update_interval
-        self._status_update_task: asyncio.Task | None = None
         
         # Queue depth tracking
         self._pending_workflows: list[WorkflowDispatch] = []
@@ -166,10 +161,9 @@ class WorkerServer(UDPServer):
         
         # Start SWIM probe cycle (UDP healthchecks)
         # This makes us participate in the SWIM protocol
+        # Note: Worker state is now embedded in SWIM probe responses (Serf-style)
+        # so managers learn our capacity/status passively via the SWIM protocol
         self._task_runner.run(self.start_probe_cycle)
-        
-        # Start status update loop (TCP - NOT healthcheck)
-        self._status_update_task = asyncio.create_task(self._status_update_loop())
         
         self._udp_logger.log(
             ServerInfo(
@@ -182,14 +176,6 @@ class WorkerServer(UDPServer):
     
     async def stop(self) -> None:
         """Stop the worker server."""
-        # Stop status updates
-        if self._status_update_task:
-            self._status_update_task.cancel()
-            try:
-                await self._status_update_task
-            except asyncio.CancelledError:
-                pass
-        
         # Cancel all active workflows
         for workflow_id in list(self._workflow_tasks.keys()):
             await self._cancel_workflow(workflow_id, "server_shutdown")
@@ -229,57 +215,10 @@ class WorkerServer(UDPServer):
             )
             return False
     
-    async def _status_update_loop(self) -> None:
-        """
-        Send periodic status updates to the current manager via TCP.
-        
-        Note: This is NOT a healthcheck. Healthchecks are handled by
-        the SWIM protocol over UDP (probes, acks, etc.). This loop
-        sends capacity and progress information.
-        """
-        while self._running:
-            try:
-                await asyncio.sleep(self._status_update_interval)
-                
-                if self._current_manager:
-                    await self._send_status_update(self._current_manager)
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                await self.handle_exception(e, "status_update_loop")
-    
-    async def _send_status_update(self, manager_addr: tuple[str, int]) -> None:
-        """
-        Send a status update to the manager via TCP.
-        
-        Contains capacity, queue depth, and workflow state - NOT liveness.
-        Liveness is determined by the SWIM protocol over UDP.
-        """
-        status = WorkerHeartbeat(  # Reusing struct, but this is status not healthcheck
-            node_id=self._node_id.full,
-            state=self._get_worker_state().value,
-            available_cores=self._available_cores,
-            queue_depth=len(self._pending_workflows),
-            cpu_percent=self._get_cpu_percent(),
-            memory_percent=self._get_memory_percent(),
-            version=self._state_version,
-            active_workflows={
-                wf_id: wf.status for wf_id, wf in self._active_workflows.items()
-            },
-        )
-        
-        try:
-            await self.send_tcp(
-                manager_addr,
-                "worker_status_update",
-                status.dump(),
-                timeout=2.0,
-            )
-        except Exception as e:
-            # Status update failure - log but don't panic
-            # SWIM UDP will detect if we're actually dead
-            await self.handle_exception(e, "status_update_send")
+    # Note: Status updates are now handled via Serf-style heartbeat embedding
+    # in SWIM probe responses. The WorkerStateEmbedder provides worker capacity
+    # and status to managers through the SWIM protocol. See set_state_embedder()
+    # in __init__.
     
     def _get_worker_state(self) -> WorkerState:
         """Determine current worker state."""

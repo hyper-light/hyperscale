@@ -82,7 +82,6 @@ class GateServer(UDPServer):
         datacenter_manager_udp: dict[str, list[tuple[str, int]]] | None = None,  # UDP for SWIM
         gate_peers: list[tuple[str, int]] | None = None,  # TCP
         gate_udp_peers: list[tuple[str, int]] | None = None,  # UDP for SWIM cluster
-        status_update_interval: float = 1.0,  # Not used by gates, they receive
         lease_timeout: float = 30.0,
     ):
         super().__init__(
@@ -116,7 +115,6 @@ class GateServer(UDPServer):
         self._state_version = 0
         
         # Configuration
-        self._status_update_interval = status_update_interval
         self._lease_timeout = lease_timeout
         
         # Background tasks
