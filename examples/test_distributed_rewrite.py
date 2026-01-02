@@ -1728,6 +1728,195 @@ test_retry_preserves_resources()
 
 
 # =============================================================================
+# Manager Peer Failure Detection Tests
+# =============================================================================
+
+print("\nManager Peer Failure Detection Tests")
+print("=" * 40)
+
+
+@test("UDPServer: has register_on_node_join callback")
+def test_udp_server_has_node_join_callback():
+    from hyperscale.distributed_rewrite.swim.udp_server import UDPServer
+    
+    assert hasattr(UDPServer, 'register_on_node_join'), \
+        "UDPServer must have register_on_node_join method"
+    
+    # _on_node_join_callbacks is an instance attribute set in __init__
+    # So we check the method exists and inspect its source
+    import inspect
+    source = inspect.getsource(UDPServer.__init__)
+    assert '_on_node_join_callbacks' in source, \
+        "UDPServer.__init__ must initialize _on_node_join_callbacks"
+
+
+@test("ManagerServer: tracks manager UDP to TCP mapping")
+def test_manager_tracks_peer_mapping():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    # These are instance attributes set in __init__
+    import inspect
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    assert '_manager_udp_to_tcp' in source, \
+        "ManagerServer.__init__ must initialize _manager_udp_to_tcp"
+    
+    assert '_active_manager_peers' in source, \
+        "ManagerServer.__init__ must initialize _active_manager_peers"
+
+
+@test("ManagerServer: has _on_node_join callback")
+def test_manager_has_on_node_join():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_on_node_join'), \
+        "ManagerServer must have _on_node_join method for peer recovery"
+
+
+@test("ManagerServer: has _handle_manager_peer_failure method")
+def test_manager_has_handle_peer_failure():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_handle_manager_peer_failure'), \
+        "ManagerServer must have _handle_manager_peer_failure method"
+
+
+@test("ManagerServer: has _handle_manager_peer_recovery method")
+def test_manager_has_handle_peer_recovery():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_handle_manager_peer_recovery'), \
+        "ManagerServer must have _handle_manager_peer_recovery method"
+
+
+@test("ManagerServer: has _has_quorum_available method")
+def test_manager_has_quorum_available():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    assert hasattr(ManagerServer, '_has_quorum_available'), \
+        "ManagerServer must have _has_quorum_available method"
+
+
+@test("ManagerServer: _on_node_dead checks for manager peers")
+def test_manager_on_node_dead_checks_peers():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._on_node_dead)
+    
+    # Should check for manager peers, not just workers
+    assert '_manager_udp_to_tcp' in source, \
+        "_on_node_dead must check _manager_udp_to_tcp for manager peer failures"
+    
+    assert '_handle_manager_peer_failure' in source, \
+        "_on_node_dead must call _handle_manager_peer_failure for manager peers"
+
+
+@test("Manager peer failure scenario: active peers updated")
+def test_manager_peer_failure_updates_active():
+    """
+    Test the conceptual flow when a manager peer dies:
+    
+    1. Manager A has peers [B, C] with all active
+    2. Manager B dies (detected via SWIM)
+    3. Manager A's _on_node_dead fires
+    4. _handle_manager_peer_failure removes B from active set
+    5. _has_quorum_available reflects new state
+    """
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    # Check the method logic conceptually via inspection
+    import inspect
+    
+    failure_source = inspect.getsource(ManagerServer._handle_manager_peer_failure)
+    
+    # Should discard from active peers
+    assert 'discard' in failure_source, \
+        "_handle_manager_peer_failure must discard from _active_manager_peers"
+    
+    # Should check if dead peer was the leader
+    assert 'get_current_leader' in failure_source, \
+        "_handle_manager_peer_failure should check if dead peer was leader"
+
+
+@test("Manager peer recovery scenario: active peers restored")
+def test_manager_peer_recovery_restores_active():
+    """
+    Test the conceptual flow when a manager peer recovers:
+    
+    1. Manager B was marked as dead
+    2. Manager B rejoins the SWIM cluster
+    3. _on_node_join fires on Manager A
+    4. _handle_manager_peer_recovery adds B back to active set
+    """
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    import inspect
+    
+    recovery_source = inspect.getsource(ManagerServer._handle_manager_peer_recovery)
+    
+    # Should add to active peers
+    assert '_active_manager_peers.add' in recovery_source, \
+        "_handle_manager_peer_recovery must add back to _active_manager_peers"
+
+
+@test("ManagerServer: quorum calculation uses configured size (not active)")
+def test_manager_quorum_uses_configured_size():
+    """
+    Verify quorum is calculated from configured peers, not just active.
+    This prevents split-brain where a partition thinks it has quorum.
+    """
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    # Get the method - need to handle if it's a property
+    quorum_method = ManagerServer._quorum_size
+    if isinstance(quorum_method, property):
+        quorum_method = quorum_method.fget
+    
+    source = inspect.getsource(quorum_method)
+    
+    # Should use _manager_peers (configured), not _active_manager_peers
+    assert '_manager_peers' in source, \
+        "_quorum_size must use _manager_peers (configured count)"
+    
+    # Should NOT use _active_manager_peers for quorum calculation
+    assert '_active_manager_peers' not in source, \
+        "_quorum_size should NOT use _active_manager_peers (prevents split-brain)"
+
+
+@test("ManagerServer: _has_quorum_available uses active peers")
+def test_has_quorum_uses_active():
+    """
+    Verify _has_quorum_available checks active count vs quorum requirement.
+    """
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._has_quorum_available)
+    
+    assert '_active_manager_peers' in source, \
+        "_has_quorum_available must check _active_manager_peers"
+    
+    assert '_quorum_size' in source, \
+        "_has_quorum_available must compare against _quorum_size()"
+
+
+# Run Manager Peer Failure tests
+test_udp_server_has_node_join_callback()
+test_manager_tracks_peer_mapping()
+test_manager_has_on_node_join()
+test_manager_has_handle_peer_failure()
+test_manager_has_handle_peer_recovery()
+test_manager_has_quorum_available()
+test_manager_on_node_dead_checks_peers()
+test_manager_peer_failure_updates_active()
+test_manager_peer_recovery_restores_active()
+test_manager_quorum_uses_configured_size()
+test_has_quorum_uses_active()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

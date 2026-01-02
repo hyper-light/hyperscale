@@ -120,6 +120,16 @@ class ManagerServer(UDPServer):
         self._manager_peers = manager_peers or []  # TCP
         self._manager_udp_peers = manager_udp_peers or []  # UDP for SWIM
         
+        # Track manager peer addresses for failure detection
+        # Maps UDP addr -> TCP addr for peer managers
+        self._manager_udp_to_tcp: dict[tuple[str, int], tuple[str, int]] = {}
+        for i, tcp_addr in enumerate(self._manager_peers):
+            if i < len(self._manager_udp_peers):
+                self._manager_udp_to_tcp[self._manager_udp_peers[i]] = tcp_addr
+        
+        # Track active manager peers (removed when SWIM marks as dead)
+        self._active_manager_peers: set[tuple[str, int]] = set(self._manager_peers)
+        
         # Registered workers (indexed by node_id)
         self._workers: dict[str, WorkerRegistration] = {}  # node_id -> registration
         self._worker_addr_to_id: dict[tuple[str, int], str] = {}  # (host, port) -> node_id (reverse mapping)
@@ -182,8 +192,9 @@ class ManagerServer(UDPServer):
         self.register_on_become_leader(self._on_manager_become_leader)
         self.register_on_lose_leadership(self._on_manager_lose_leadership)
         
-        # Register node death callback for worker failure handling
+        # Register node death and join callbacks for failure/recovery handling
         self.register_on_node_dead(self._on_node_dead)
+        self.register_on_node_join(self._on_node_join)
     
     def _on_manager_become_leader(self) -> None:
         """
@@ -204,14 +215,127 @@ class ManagerServer(UDPServer):
         """
         Called when a node is marked as DEAD via SWIM.
         
-        If the dead node is a registered worker, triggers workflow retry.
-        """
-        # O(1) lookup via reverse mapping
-        worker_node_id = self._worker_addr_to_id.get(node_addr)
+        Handles both worker and manager peer failures:
+        - Worker death → triggers workflow retry on other workers
+        - Manager peer death → updates quorum tracking, logs for debugging
         
+        Note: Leadership handling is automatic via lease expiry in LocalLeaderElection.
+        If the dead manager was the leader, lease will expire and trigger re-election.
+        """
+        # Check if this is a worker
+        worker_node_id = self._worker_addr_to_id.get(node_addr)
         if worker_node_id:
             # This is a worker - trigger failure handling
             self._task_runner.run(self._handle_worker_failure, worker_node_id)
+            return
+        
+        # Check if this is a manager peer
+        manager_tcp_addr = self._manager_udp_to_tcp.get(node_addr)
+        if manager_tcp_addr:
+            self._task_runner.run(self._handle_manager_peer_failure, node_addr, manager_tcp_addr)
+    
+    def _on_node_join(self, node_addr: tuple[str, int]) -> None:
+        """
+        Called when a node joins or rejoins the SWIM cluster.
+        
+        Handles manager peer recovery:
+        - Manager peer rejoin → adds back to active peers set for quorum
+        
+        Worker joins are handled via register_worker TCP flow, not here.
+        """
+        # Check if this is a manager peer
+        manager_tcp_addr = self._manager_udp_to_tcp.get(node_addr)
+        if manager_tcp_addr:
+            self._task_runner.run(self._handle_manager_peer_recovery, node_addr, manager_tcp_addr)
+    
+    async def _handle_manager_peer_recovery(
+        self,
+        udp_addr: tuple[str, int],
+        tcp_addr: tuple[str, int],
+    ) -> None:
+        """
+        Handle a manager peer recovering/rejoining the cluster.
+        
+        Actions:
+        1. Re-add to active peers set (restores quorum capacity)
+        2. Log the recovery for debugging
+        """
+        # Add back to active peers
+        self._active_manager_peers.add(tcp_addr)
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager peer at {tcp_addr} (UDP: {udp_addr}) has REJOINED the cluster",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        # Log quorum status
+        active_count = len(self._active_manager_peers) + 1  # Include self
+        required_quorum = self._quorum_size()
+        have_quorum = active_count >= required_quorum
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager cluster: {active_count} active, quorum={required_quorum}, have_quorum={have_quorum}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+    
+    async def _handle_manager_peer_failure(
+        self,
+        udp_addr: tuple[str, int],
+        tcp_addr: tuple[str, int],
+    ) -> None:
+        """
+        Handle a manager peer becoming unavailable (detected via SWIM).
+        
+        Actions:
+        1. Remove from active peers set (affects quorum calculation)
+        2. Log the failure for debugging
+        3. If we were waiting on quorum from this peer, those requests will timeout
+        
+        Note: Leadership re-election is automatic via LocalLeaderElection
+        when the leader's heartbeats stop (lease expiry).
+        """
+        # Remove from active peers
+        self._active_manager_peers.discard(tcp_addr)
+        
+        # Check if this was the leader
+        current_leader = self.get_current_leader()
+        was_leader = current_leader == udp_addr
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager peer at {tcp_addr} (UDP: {udp_addr}) marked as DEAD" +
+                        (" - was LEADER, re-election will occur" if was_leader else ""),
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        # Log quorum status
+        active_count = len(self._active_manager_peers) + 1  # Include self
+        required_quorum = self._quorum_size()
+        have_quorum = active_count >= required_quorum
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager cluster: {active_count} active, quorum={required_quorum}, have_quorum={have_quorum}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
     
     async def _sync_state_from_workers(self) -> None:
         """
@@ -369,9 +493,25 @@ class ManagerServer(UDPServer):
     
     @property
     def _quorum_size(self) -> int:
-        """Calculate quorum size (majority of managers)."""
+        """
+        Calculate quorum size (majority of managers).
+        
+        Quorum is based on *configured* cluster size, not active size.
+        This prevents split-brain where a partition thinks it has quorum
+        because it only sees its own subset of members.
+        """
         total_managers = len(self._manager_peers) + 1  # Include self
         return (total_managers // 2) + 1
+    
+    def _has_quorum_available(self) -> bool:
+        """
+        Check if we have enough active managers to achieve quorum.
+        
+        Returns True if the number of active managers (including self)
+        is >= the required quorum size.
+        """
+        active_count = len(self._active_manager_peers) + 1  # Include self
+        return active_count >= self._quorum_size()
     
     async def start(self) -> None:
         """Start the manager server."""

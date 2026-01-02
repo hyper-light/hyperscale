@@ -165,8 +165,9 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         self._on_leader_change_callbacks: list[Callable[[tuple[str, int] | None], None]] = []
         
         # Node status change callbacks (for composition)
-        # Called when a node's status changes (e.g., becomes DEAD)
+        # Called when a node's status changes (e.g., becomes DEAD or rejoins)
         self._on_node_dead_callbacks: list[Callable[[tuple[str, int]], None]] = []
+        self._on_node_join_callbacks: list[Callable[[tuple[str, int]], None]] = []
         
         # Set up suspicion manager callbacks
         self._suspicion_manager.set_callbacks(
@@ -235,6 +236,20 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             callback: Function receiving the dead node's address.
         """
         self._on_node_dead_callbacks.append(callback)
+    
+    def register_on_node_join(
+        self,
+        callback: Callable[[tuple[str, int]], None],
+    ) -> None:
+        """
+        Register a callback to be invoked when a node joins or rejoins the cluster.
+        
+        Use this to handle worker/peer recovery without overriding methods.
+        
+        Args:
+            callback: Function receiving the joining node's address.
+        """
+        self._on_node_join_callbacks.append(callback)
     
     def _get_lhm_multiplier(self) -> float:
         """Get the current LHM timeout multiplier."""
@@ -2426,6 +2441,15 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                         await self._safe_queue_put(nodes[target], (clock_time, b'OK'), target)
                         
                         self._probe_scheduler.add_member(target)
+                        
+                        # Invoke registered callbacks (composition pattern)
+                        for callback in self._on_node_join_callbacks:
+                            try:
+                                callback(target)
+                            except Exception as e:
+                                self._task_runner.run(
+                                    self.handle_exception, e, "on_node_join_callback"
+                                )
                         self._incarnation_tracker.update_node(target, b'OK', 0, time.monotonic())
 
                         # Include embedded state so new node learns our state
