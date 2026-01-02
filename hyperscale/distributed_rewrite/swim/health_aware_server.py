@@ -1181,8 +1181,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         
         async def attempt_join() -> bool:
             await self.send(seed_node, join_msg, timeout=timeout)
-            # Add seed to our known nodes
-            self._context.write(seed_node, b'OK')
+            # Add seed to our known nodes dict (defaultdict auto-creates Queue)
+            nodes: Nodes = self._context.read('nodes')
+            _ = nodes[seed_node]  # Access to create entry via defaultdict
             self._probe_scheduler.add_member(seed_node)
             return True
         

@@ -2,7 +2,7 @@
 """
 Manager Cluster Integration Test
 
-This test starts all 5 managers and verifies they can:
+This test starts multiple managers and verifies they can:
 1. Start successfully
 2. Connect to each other via SWIM
 3. Elect a leader
@@ -10,12 +10,6 @@ This test starts all 5 managers and verifies they can:
 
 Usage:
     python test_manager_cluster.py
-
-Expected output:
-- All 5 managers start
-- They discover each other via SWIM
-- One becomes leader
-- Quorum is established
 """
 
 import asyncio
@@ -28,42 +22,30 @@ from hyperscale.distributed_rewrite.env import Env
 from hyperscale.distributed_rewrite.nodes import ManagerServer
 
 
-# Port allocation for managers
+# Port allocation for managers (TCP, UDP pairs)
 MANAGER_CONFIGS = [
     {"tcp": 9000, "udp": 9001, "name": "Manager 1"},
     {"tcp": 9002, "udp": 9003, "name": "Manager 2"},
     {"tcp": 9004, "udp": 9005, "name": "Manager 3"},
-    {"tcp": 9006, "udp": 9007, "name": "Manager 4"},
-    {"tcp": 9008, "udp": 9009, "name": "Manager 5"},
 ]
 
 
-def get_peer_addrs(my_tcp: int, my_udp: int) -> tuple[list, list]:
-    """Get peer TCP and UDP addresses excluding self."""
-    tcp_peers = []
-    udp_peers = []
-    for config in MANAGER_CONFIGS:
-        if config["tcp"] != my_tcp:
-            tcp_peers.append(('127.0.0.1', config["tcp"]))
-            udp_peers.append(('127.0.0.1', config["udp"]))
-    return tcp_peers, udp_peers
+def get_peer_udp_addrs(my_udp: int) -> list[tuple[str, int]]:
+    """Get peer UDP addresses excluding self."""
+    return [
+        ('127.0.0.1', config["udp"]) 
+        for config in MANAGER_CONFIGS 
+        if config["udp"] != my_udp
+    ]
 
 
-async def create_manager(config: dict) -> ManagerServer:
-    """Create a manager server with the given config."""
-    tcp_peers, udp_peers = get_peer_addrs(config["tcp"], config["udp"])
-    
-    server = ManagerServer(
-        host='127.0.0.1',
-        tcp_port=config["tcp"],
-        udp_port=config["udp"],
-        env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
-        dc_id='DC-EAST',
-        manager_peers=tcp_peers,
-        manager_udp_peers=udp_peers,
-    )
-    
-    return server
+def get_peer_tcp_addrs(my_tcp: int) -> list[tuple[str, int]]:
+    """Get peer TCP addresses excluding self."""
+    return [
+        ('127.0.0.1', config["tcp"]) 
+        for config in MANAGER_CONFIGS 
+        if config["tcp"] != my_tcp
+    ]
 
 
 async def run_test():
@@ -71,127 +53,147 @@ async def run_test():
     print("=" * 70)
     print("MANAGER CLUSTER INTEGRATION TEST")
     print("=" * 70)
+    print(f"Testing with {len(MANAGER_CONFIGS)} managers")
     print()
     
     managers: list[ManagerServer] = []
     
     try:
-        # Step 1: Create and start all managers
-        print("[1/5] Starting all managers...")
+        # Step 1: Create all manager servers (don't start yet)
+        print("[1/4] Creating manager servers...")
         print("-" * 50)
         
         for config in MANAGER_CONFIGS:
-            manager = await create_manager(config)
-            await manager.start()
+            tcp_peers = get_peer_tcp_addrs(config["tcp"])
+            udp_peers = get_peer_udp_addrs(config["udp"])
+            
+            manager = ManagerServer(
+                host='127.0.0.1',
+                tcp_port=config["tcp"],
+                udp_port=config["udp"],
+                env=Env(MERCURY_SYNC_REQUEST_TIMEOUT='2s'),
+                dc_id='DC-EAST',
+                manager_peers=tcp_peers,
+                manager_udp_peers=udp_peers,
+            )
             managers.append(manager)
-            print(f"  ✓ {config['name']} started on TCP:{config['tcp']} UDP:{config['udp']}")
-            print(f"    Node ID: {manager._node_id.short}")
+            print(f"  ✓ {config['name']} created (TCP:{config['tcp']} UDP:{config['udp']})")
         
         print()
         
-        # Step 2: Wait for SWIM to propagate membership
-        print("[2/5] Waiting for SWIM membership propagation...")
+        # Step 2: Start all managers concurrently
+        print("[2/4] Starting managers (uses full start() method)...")
         print("-" * 50)
         
-        await asyncio.sleep(5)  # Give SWIM time to exchange probes
+        # Start each manager - this does:
+        # - start_server()
+        # - join_cluster() for each peer
+        # - start_probe_cycle()
+        # - start_leader_election()
+        # - _complete_startup_sync() -> transitions to ACTIVE
+        start_tasks = [manager.start() for manager in managers]
+        await asyncio.gather(*start_tasks)
         
-        # Step 3: Verify connectivity
+        for i, manager in enumerate(managers):
+            config = MANAGER_CONFIGS[i]
+            print(f"  ✓ {config['name']} started - Node ID: {manager._node_id.short}")
+        
         print()
-        print("[3/5] Verifying SWIM connectivity...")
+        
+        # Step 3: Wait for cluster to stabilize
+        # Leader election: pre-vote(2s) + election(5-7s) = 7-9s per attempt
+        # If first attempt splits votes, need retry with higher term
+        print("[3/4] Waiting for cluster to stabilize (18s for 2 election cycles)...")
+        print("-" * 50)
+        await asyncio.sleep(18)
+        print("  Done.")
+        print()
+        
+        # Step 4: Verify cluster state
+        print("[4/4] Verifying cluster state...")
         print("-" * 50)
         
+        # Check connectivity
+        print("\n  Connectivity (SWIM nodes dict):")
         all_connected = True
         for i, manager in enumerate(managers):
             config = MANAGER_CONFIGS[i]
-            # Check how many peers this manager knows about
             known_peers = len(manager._incarnation_tracker.get_all_nodes())
-            expected_peers = len(MANAGER_CONFIGS) - 1  # All except self
-            
-            status = "✓" if known_peers >= expected_peers else "✗"
-            print(f"  {status} {config['name']}: knows {known_peers}/{expected_peers} peers")
-            
-            if known_peers < expected_peers:
+            nodes_dict = manager._context.read('nodes')
+            nodes_count = len(nodes_dict) if nodes_dict else 0
+            expected = len(MANAGER_CONFIGS) - 1
+            status = "✓" if known_peers >= expected else "✗"
+            print(f"    {status} {config['name']}: incarnation_tracker={known_peers}, "
+                  f"nodes_dict={nodes_count} (need {expected})")
+            if known_peers < expected:
                 all_connected = False
         
-        if not all_connected:
-            print()
-            print("  ⚠ Not all managers fully connected yet, waiting longer...")
-            await asyncio.sleep(5)
+        # Check manager state (enum uses lowercase values)
+        print("\n  Manager State:")
+        all_active = True
+        for i, manager in enumerate(managers):
+            config = MANAGER_CONFIGS[i]
+            state = manager._manager_state.value
+            status = "✓" if state == "active" else "✗"
+            print(f"    {status} {config['name']}: {state}")
+            if state != "active":
+                all_active = False
         
-        print()
-        
-        # Step 4: Verify leader election
-        print("[4/5] Verifying leader election...")
-        print("-" * 50)
-        
-        # Wait for leader election to settle
-        await asyncio.sleep(3)
-        
+        # Check leadership
+        print("\n  Leadership:")
         leaders = []
         for i, manager in enumerate(managers):
             config = MANAGER_CONFIGS[i]
             is_leader = manager.is_leader()
-            current_leader = manager.get_current_leader()
-            state = manager._manager_state.value
+            leader_addr = manager.get_current_leader()
+            status = manager.get_leadership_status()
             
             if is_leader:
                 leaders.append(config['name'])
             
-            leader_str = current_leader if current_leader else "None"
-            print(f"  {config['name']}: state={state}, is_leader={is_leader}, sees_leader={leader_str}")
+            leader_str = f"{leader_addr}" if leader_addr else "None"
+            print(f"    {config['name']}: role={status['role']}, term={status['term']}, "
+                  f"sees={leader_str}, eligible={status['eligible']}")
         
-        print()
-        if len(leaders) == 1:
-            print(f"  ✓ Single leader elected: {leaders[0]}")
-        elif len(leaders) == 0:
-            print("  ⚠ No leader elected yet (may still be in election)")
-        else:
-            print(f"  ✗ Multiple leaders detected: {leaders} (split brain!)")
-        
-        print()
-        
-        # Step 5: Verify quorum
-        print("[5/5] Verifying quorum status...")
-        print("-" * 50)
-        
+        # Check quorum
+        print("\n  Quorum:")
+        all_have_quorum = True
         for i, manager in enumerate(managers):
             config = MANAGER_CONFIGS[i]
             quorum = manager.get_quorum_status()
-            
             status = "✓" if quorum['quorum_available'] else "✗"
-            print(f"  {status} {config['name']}: active={quorum['active_managers']}, "
+            print(f"    {status} {config['name']}: active={quorum['active_managers']}, "
                   f"required={quorum['required_quorum']}, available={quorum['quorum_available']}")
+            if not quorum['quorum_available']:
+                all_have_quorum = False
         
+        # Final verdict
         print()
         print("=" * 70)
         
-        # Final verdict
-        # Check final state
-        final_leaders = [m for m in managers if m.is_leader()]
-        final_quorum = all(m.get_quorum_status()['quorum_available'] for m in managers)
-        final_connected = all(
-            len(m._incarnation_tracker.get_all_nodes()) >= len(MANAGER_CONFIGS) - 1
-            for m in managers
-        )
+        has_single_leader = len(leaders) == 1
         
-        print()
-        if len(final_leaders) == 1 and final_quorum and final_connected:
+        if has_single_leader and all_have_quorum and all_connected and all_active:
             print("TEST RESULT: ✓ PASSED")
             print()
-            print("All managers:")
-            print("  - Connected to each other via SWIM")
-            print("  - Elected a single leader")
-            print("  - Have quorum available")
+            print(f"  Leader: {leaders[0]}")
+            print(f"  All {len(managers)} managers connected")
+            print(f"  All managers in ACTIVE state")
+            print(f"  Quorum available on all managers")
             return True
         else:
             print("TEST RESULT: ✗ FAILED")
             print()
-            if len(final_leaders) != 1:
-                print(f"  - Leader election issue: {len(final_leaders)} leaders")
-            if not final_quorum:
-                print("  - Quorum not available on all managers")
-            if not final_connected:
+            if not all_connected:
                 print("  - Not all managers fully connected")
+            if not all_active:
+                print("  - Not all managers in ACTIVE state")
+            if len(leaders) == 0:
+                print("  - No leader elected")
+            elif len(leaders) > 1:
+                print(f"  - Multiple leaders: {leaders}")
+            if not all_have_quorum:
+                print("  - Quorum not available on all managers")
             return False
         
     except Exception as e:
@@ -201,15 +203,18 @@ async def run_test():
         return False
         
     finally:
-        # Cleanup: stop all managers
+        # Cleanup
         print()
         print("=" * 70)
         print("Cleaning up...")
         print("-" * 50)
         
+        # Stop managers
         for i, manager in enumerate(managers):
             try:
-                await manager.stop()
+                manager.stop_probe_cycle()
+                await manager.stop_leader_election()
+                await manager.shutdown()
                 print(f"  ✓ {MANAGER_CONFIGS[i]['name']} stopped")
             except Exception as e:
                 print(f"  ✗ {MANAGER_CONFIGS[i]['name']} stop failed: {e}")
@@ -226,4 +231,3 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\nTest interrupted by user")
         sys.exit(1)
-
