@@ -55,6 +55,54 @@ The distributed system implements a three-tier architecture optimized for execut
 └───────────────┘  └───────────────┘  └───────────────┘
 ```
 
+### Detailed Single-Datacenter View
+
+```
+                          ┌─────────────────────────────────────────────┐
+                          │             GATE CLUSTER                    │
+                          │          (Gossip Protocol)                  │
+                          │    ┌────┐   ┌────┐   ┌────┐                 │
+                          │    │ G1 │◄─►│ G2 │◄─►│ G3 │  ← Job submit   │
+                          │    └──┬─┘   └──┬─┘   └──┬─┘    from users   │
+                          │       │        │        │                   │
+                          └───────┼────────┼────────┼───────────────────┘
+                                  │        │        │
+                           TCP (job submission) + UDP (health checks)
+                                  │        │        │
+           ┌──────────────────────┼────────┼────────┼──────────────────────┐
+           │                      ▼        ▼        ▼                      │
+           │  ┌────────────────────────────────────────────────────────┐   │
+           │  │               MANAGER CLUSTER (DC-A)                   │   │
+           │  │            (Gossip + Leader Election)                  │   │
+           │  │    ┌────┐       ┌────┐       ┌────┐                    │   │
+           │  │    │ M1 │◄─────►│ M2 │◄─────►│ M3 │                    │   │
+           │  │    │    │       │ ★  │       │    │   ★ = Leader       │   │
+           │  │    └──┬─┘       └──┬─┘       └──┬─┘                    │   │
+           │  │       │    TCP    │    TCP    │    (Full state sync)   │   │
+           │  │       └───────────┼───────────┘                        │   │
+           │  └───────────────────┼────────────────────────────────────┘   │
+           │                      │                                        │
+           │             UDP/TCP (workflow dispatch + status reports)      │
+           │                      │                                        │
+           │  ┌───────────────────┼────────────────────────────────────┐   │
+           │  │            WORKER POOL (DC-A)                          │   │
+           │  │                   │                                    │   │
+           │  │    ┌──────────────┼──────────────┐                     │   │
+           │  │    │              │              │                     │   │
+           │  │    ▼              ▼              ▼                     │   │
+           │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                 │   │
+           │  │  │ Worker1 │  │ Worker2 │  │ Worker3 │                 │   │
+           │  │  │ 8 cores │  │ 8 cores │  │ 8 cores │                 │   │
+           │  │  │[■■■■□□□□]│  │[■■□□□□□□]│  │[□□□□□□□□]│                 │   │
+           │  │  │ 4 in use│  │ 2 in use│  │ 0 idle  │                 │   │
+           │  │  └─────────┘  └─────────┘  └─────────┘                 │   │
+           │  │                                                        │   │
+           │  │  ■ = core running workflow    □ = core available       │   │
+           │  └────────────────────────────────────────────────────────┘   │
+           │                       DATACENTER A                            │
+           └───────────────────────────────────────────────────────────────┘
+```
+
 ### Key Design Principles
 
 1. **Workers are the source of truth** - Workers maintain authoritative state for their own workflows
