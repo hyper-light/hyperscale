@@ -11,3 +11,42 @@ from .restricted_unpickler import (
     restricted_loads as restricted_loads,
     SecurityError as SecurityError,
 )
+
+# Distributed system types
+from .distributed import (
+    # Enums
+    NodeRole as NodeRole,
+    JobStatus as JobStatus,
+    WorkflowStatus as WorkflowStatus,
+    WorkerState as WorkerState,
+    # Node identity
+    NodeInfo as NodeInfo,
+    WorkerRegistration as WorkerRegistration,
+    WorkerHeartbeat as WorkerHeartbeat,
+    ManagerHeartbeat as ManagerHeartbeat,
+    # Job submission
+    JobSubmission as JobSubmission,
+    JobAck as JobAck,
+    WorkflowDispatch as WorkflowDispatch,
+    WorkflowDispatchAck as WorkflowDispatchAck,
+    # Status updates
+    StepStats as StepStats,
+    WorkflowProgress as WorkflowProgress,
+    JobProgress as JobProgress,
+    GlobalJobStatus as GlobalJobStatus,
+    # State sync
+    WorkerStateSnapshot as WorkerStateSnapshot,
+    ManagerStateSnapshot as ManagerStateSnapshot,
+    StateSyncRequest as StateSyncRequest,
+    StateSyncResponse as StateSyncResponse,
+    # Quorum
+    ProvisionRequest as ProvisionRequest,
+    ProvisionConfirm as ProvisionConfirm,
+    ProvisionCommit as ProvisionCommit,
+    # Cancellation
+    CancelJob as CancelJob,
+    CancelAck as CancelAck,
+    # Lease
+    DatacenterLease as DatacenterLease,
+    LeaseTransfer as LeaseTransfer,
+)
