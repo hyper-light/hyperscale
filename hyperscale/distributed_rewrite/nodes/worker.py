@@ -4,9 +4,19 @@ Worker Node Server.
 Workers are the distributed thread/process pool. They:
 - Execute workflows assigned by managers
 - Report status via TCP to managers
-- Participate in UDP healthchecks
+- Participate in UDP healthchecks (SWIM protocol)
 
 Workers are the absolute source of truth for their own state.
+
+Protocols:
+- UDP: SWIM healthchecks (inherited from UDPServer)
+  - probe/ack for liveness detection
+  - indirect probing for network partition handling
+  - gossip for membership dissemination
+- TCP: Data operations
+  - Status updates to managers
+  - Workflow dispatch from managers
+  - State sync requests
 """
 
 import asyncio
@@ -49,10 +59,19 @@ class WorkerServer(UDPServer):
     - Receive workflow dispatches from managers via TCP
     - Execute workflows using available CPU cores
     - Report progress back to managers via TCP
-    - Participate in SWIM healthchecks via UDP
+    - Participate in SWIM healthchecks via UDP (inherited from UDPServer)
     
     Workers have no knowledge of other workers - they only communicate
     with their local manager cluster.
+    
+    Healthchecks (UDP - SWIM protocol):
+        Workers join the manager cluster's SWIM protocol. Managers probe
+        workers via UDP to detect failures. Workers respond to probes
+        automatically via the inherited UDPServer.receive() handler.
+    
+    Status Updates (TCP):
+        Workers send status updates to managers via TCP. These contain
+        capacity, queue depth, and workflow progress - NOT healthchecks.
     """
     
     def __init__(
@@ -64,7 +83,7 @@ class WorkerServer(UDPServer):
         dc_id: str = "default",
         total_cores: int | None = None,
         manager_addrs: list[tuple[str, int]] | None = None,
-        heartbeat_interval: float = 1.0,
+        status_update_interval: float = 1.0,  # Renamed from heartbeat
     ):
         super().__init__(
             host=host,
@@ -78,8 +97,9 @@ class WorkerServer(UDPServer):
         self._total_cores = total_cores or os.cpu_count() or 1
         self._available_cores = self._total_cores
         
-        # Manager discovery
-        self._manager_addrs = manager_addrs or []
+        # Manager discovery (UDP addresses for SWIM, TCP for data)
+        self._manager_addrs = manager_addrs or []  # TCP addresses
+        self._manager_udp_addrs: list[tuple[str, int]] = []  # UDP addresses for SWIM
         self._current_manager: tuple[str, int] | None = None
         
         # Workflow execution state
@@ -90,9 +110,9 @@ class WorkerServer(UDPServer):
         # State versioning (Lamport clock extension)
         self._state_version = 0
         
-        # Heartbeat
-        self._heartbeat_interval = heartbeat_interval
-        self._heartbeat_task: asyncio.Task | None = None
+        # Status update loop (TCP) - NOT healthcheck
+        self._status_update_interval = status_update_interval
+        self._status_update_task: asyncio.Task | None = None
         
         # Queue depth tracking
         self._pending_workflows: list[WorkflowDispatch] = []
@@ -118,19 +138,28 @@ class WorkerServer(UDPServer):
         """Start the worker server."""
         await super().start()
         
-        # Register with managers
+        # Register with managers (TCP)
         for manager_addr in self._manager_addrs:
             success = await self._register_with_manager(manager_addr)
             if success:
                 self._current_manager = manager_addr
                 break
         
-        # Start heartbeat loop
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # Join SWIM cluster via manager UDP addresses for healthchecks
+        # The manager will probe us via UDP to detect failures
+        for manager_udp_addr in self._manager_udp_addrs:
+            await self.join_cluster(manager_udp_addr)
+        
+        # Start SWIM probe cycle (UDP healthchecks)
+        # This makes us participate in the SWIM protocol
+        self._task_runner.run(self.start_probe_cycle)
+        
+        # Start status update loop (TCP - NOT healthcheck)
+        self._status_update_task = asyncio.create_task(self._status_update_loop())
         
         self._udp_logger.log(
             ServerInfo(
-                message=f"Worker started with {self._total_cores} cores",
+                message=f"Worker started with {self._total_cores} cores, SWIM healthcheck active",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -139,17 +168,20 @@ class WorkerServer(UDPServer):
     
     async def stop(self) -> None:
         """Stop the worker server."""
-        # Stop heartbeat
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
+        # Stop status updates
+        if self._status_update_task:
+            self._status_update_task.cancel()
             try:
-                await self._heartbeat_task
+                await self._status_update_task
             except asyncio.CancelledError:
                 pass
         
         # Cancel all active workflows
         for workflow_id in list(self._workflow_tasks.keys()):
             await self._cancel_workflow(workflow_id, "server_shutdown")
+        
+        # Graceful shutdown broadcasts leave via UDP (SWIM)
+        await self.graceful_shutdown()
         
         await super().stop()
     
@@ -183,23 +215,34 @@ class WorkerServer(UDPServer):
             )
             return False
     
-    async def _heartbeat_loop(self) -> None:
-        """Send periodic heartbeats to the current manager."""
+    async def _status_update_loop(self) -> None:
+        """
+        Send periodic status updates to the current manager via TCP.
+        
+        Note: This is NOT a healthcheck. Healthchecks are handled by
+        the SWIM protocol over UDP (probes, acks, etc.). This loop
+        sends capacity and progress information.
+        """
         while self._running:
             try:
-                await asyncio.sleep(self._heartbeat_interval)
+                await asyncio.sleep(self._status_update_interval)
                 
                 if self._current_manager:
-                    await self._send_heartbeat(self._current_manager)
+                    await self._send_status_update(self._current_manager)
                     
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                await self.handle_exception(e, "heartbeat_loop")
+                await self.handle_exception(e, "status_update_loop")
     
-    async def _send_heartbeat(self, manager_addr: tuple[str, int]) -> None:
-        """Send a heartbeat to the manager."""
-        heartbeat = WorkerHeartbeat(
+    async def _send_status_update(self, manager_addr: tuple[str, int]) -> None:
+        """
+        Send a status update to the manager via TCP.
+        
+        Contains capacity, queue depth, and workflow state - NOT liveness.
+        Liveness is determined by the SWIM protocol over UDP.
+        """
+        status = WorkerHeartbeat(  # Reusing struct, but this is status not healthcheck
             node_id=self._node_id.full,
             state=self._get_worker_state().value,
             available_cores=self._available_cores,
@@ -215,13 +258,14 @@ class WorkerServer(UDPServer):
         try:
             await self.send_tcp(
                 manager_addr,
-                "worker_heartbeat",
-                heartbeat.dump(),
+                "worker_status_update",
+                status.dump(),
                 timeout=2.0,
             )
         except Exception as e:
-            # Heartbeat failure - try to find another manager
-            await self.handle_exception(e, "heartbeat_send")
+            # Status update failure - log but don't panic
+            # SWIM UDP will detect if we're actually dead
+            await self.handle_exception(e, "status_update_send")
     
     def _get_worker_state(self) -> WorkerState:
         """Determine current worker state."""

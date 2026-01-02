@@ -7,6 +7,17 @@ Gates coordinate job execution across datacenters. They:
 - Aggregate global job status
 - Handle cross-DC retry with leases
 - Provide the global job view to clients
+
+Protocols:
+- UDP: SWIM healthchecks (inherited from UDPServer)
+  - Gates form a gossip cluster with other gates
+  - Gates probe managers to detect DC failures
+  - Leader election uses SWIM membership info
+- TCP: Data operations
+  - Job submission from clients
+  - Job dispatch to managers
+  - Status aggregation from managers
+  - Lease coordination between gates
 """
 
 import asyncio
@@ -43,17 +54,22 @@ class GateServer(UDPServer):
     Gate node in the distributed Hyperscale system.
     
     Gates:
-    - Form a gossip cluster for leader election
-    - Accept job submissions from clients
-    - Dispatch jobs to managers in target datacenters
-    - Aggregate global job status across DCs
+    - Form a gossip cluster for leader election (UDP SWIM)
+    - Accept job submissions from clients (TCP)
+    - Dispatch jobs to managers in target datacenters (TCP)
+    - Probe managers via UDP to detect DC failures (SWIM)
+    - Aggregate global job status across DCs (TCP)
     - Manage leases for at-most-once semantics
-    - Handle DC failure and retry
     
-    The leader gate is responsible for:
-    - Accepting new job submissions
-    - Managing the global job registry
-    - Coordinating lease transfers during scaling
+    Healthchecks (UDP - SWIM protocol):
+        Gates form a SWIM cluster with other gates for leader election.
+        Gates also probe datacenter managers via UDP to detect DC
+        availability. DC health is determined by SWIM probes, not TCP.
+    
+    Status Updates (TCP):
+        Managers send status updates via TCP containing job progress.
+        These are distinct from healthchecks - a DC might have stale
+        status but still be reachable (detected via UDP probes).
     """
     
     def __init__(
@@ -63,9 +79,11 @@ class GateServer(UDPServer):
         udp_port: int,
         env: Env,
         dc_id: str = "global",  # Gates typically span DCs
-        datacenter_managers: dict[str, list[tuple[str, int]]] | None = None,
-        gate_peers: list[tuple[str, int]] | None = None,
-        heartbeat_interval: float = 1.0,
+        datacenter_managers: dict[str, list[tuple[str, int]]] | None = None,  # TCP
+        datacenter_manager_udp: dict[str, list[tuple[str, int]]] | None = None,  # UDP for SWIM
+        gate_peers: list[tuple[str, int]] | None = None,  # TCP
+        gate_udp_peers: list[tuple[str, int]] | None = None,  # UDP for SWIM cluster
+        status_update_interval: float = 1.0,  # Not used by gates, they receive
         lease_timeout: float = 30.0,
     ):
         super().__init__(
@@ -77,14 +95,16 @@ class GateServer(UDPServer):
         )
         
         # Datacenter -> manager addresses mapping
-        self._datacenter_managers = datacenter_managers or {}
+        self._datacenter_managers = datacenter_managers or {}  # TCP
+        self._datacenter_manager_udp = datacenter_manager_udp or {}  # UDP for SWIM
         
         # Gate peers for clustering
-        self._gate_peers = gate_peers or []
+        self._gate_peers = gate_peers or []  # TCP
+        self._gate_udp_peers = gate_udp_peers or []  # UDP for SWIM cluster
         
-        # Known datacenters and their health
-        self._datacenter_health: dict[str, ManagerHeartbeat] = {}  # dc -> last heartbeat
-        self._datacenter_last_seen: dict[str, float] = {}  # dc -> timestamp
+        # Known datacenters and their status (from TCP updates)
+        self._datacenter_status: dict[str, ManagerHeartbeat] = {}  # dc -> last status
+        self._datacenter_last_status: dict[str, float] = {}  # dc -> timestamp
         
         # Global job state
         self._jobs: dict[str, GlobalJobStatus] = {}  # job_id -> status
@@ -97,7 +117,7 @@ class GateServer(UDPServer):
         self._state_version = 0
         
         # Configuration
-        self._heartbeat_interval = heartbeat_interval
+        self._status_update_interval = status_update_interval
         self._lease_timeout = lease_timeout
         
         # Background tasks
@@ -126,15 +146,31 @@ class GateServer(UDPServer):
         return self._fence_token
     
     def _get_available_datacenters(self) -> list[str]:
-        """Get list of healthy datacenters."""
-        now = time.monotonic()
+        """
+        Get list of healthy datacenters.
+        
+        A datacenter is healthy if:
+        1. Its manager(s) are alive per SWIM UDP probes
+        2. It has workers available (from TCP status updates)
+        """
         healthy = []
         
-        for dc, last_seen in self._datacenter_last_seen.items():
-            if now - last_seen < self._lease_timeout:
-                hb = self._datacenter_health.get(dc)
-                if hb and hb.worker_count > 0:
-                    healthy.append(dc)
+        for dc, manager_udp_addrs in self._datacenter_manager_udp.items():
+            # Check if at least one manager is alive per SWIM
+            dc_alive = False
+            for manager_addr in manager_udp_addrs:
+                node_state = self._incarnation_tracker.get_node_state(manager_addr)
+                if node_state and node_state.status == b'OK':
+                    dc_alive = True
+                    break
+            
+            if not dc_alive:
+                continue
+            
+            # Check status from TCP updates - must have workers
+            status = self._datacenter_status.get(dc)
+            if status and status.worker_count > 0:
+                healthy.append(dc)
         
         return healthy
     
@@ -172,11 +208,19 @@ class GateServer(UDPServer):
         """Start the gate server."""
         await super().start()
         
-        # Join gate cluster
-        for peer in self._gate_peers:
-            await self.join_cluster(peer)
+        # Join SWIM cluster with other gates (UDP healthchecks)
+        for peer_udp in self._gate_udp_peers:
+            await self.join_cluster(peer_udp)
         
-        # Start leader election
+        # Add datacenter managers to SWIM for health probing
+        for dc, manager_udp_addrs in self._datacenter_manager_udp.items():
+            for manager_addr in manager_udp_addrs:
+                self._probe_scheduler.add_member(manager_addr)
+        
+        # Start SWIM probe cycle (UDP healthchecks for gates + DC managers)
+        self._task_runner.run(self.start_probe_cycle)
+        
+        # Start leader election (uses SWIM membership info)
         await self.start_leader_election()
         
         # Start lease cleanup task
@@ -184,7 +228,7 @@ class GateServer(UDPServer):
         
         self._udp_logger.log(
             ServerInfo(
-                message=f"Gate started with {len(self._datacenter_managers)} configured DCs",
+                message=f"Gate started with {len(self._datacenter_managers)} configured DCs, SWIM healthcheck active",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -199,6 +243,9 @@ class GateServer(UDPServer):
                 await self._lease_cleanup_task
             except asyncio.CancelledError:
                 pass
+        
+        # Graceful shutdown broadcasts leave via UDP (SWIM)
+        await self.graceful_shutdown()
         
         await super().stop()
     
@@ -343,48 +390,53 @@ class GateServer(UDPServer):
         return job
     
     # =========================================================================
-    # TCP Handlers - Manager Heartbeats
+    # TCP Handlers - Manager Status Updates (NOT healthchecks)
     # =========================================================================
     
-    @tcp.send('manager_heartbeat_ack')
-    async def send_manager_heartbeat_ack(
+    @tcp.send('manager_status_ack')
+    async def send_manager_status_ack(
         self,
         addr: tuple[str, int],
         data: bytes,
         timeout: int | float | None = None,
     ):
-        """Send manager heartbeat ack."""
+        """Send manager status ack."""
         return (addr, data, timeout)
     
-    @tcp.handle('manager_heartbeat_ack')
-    async def handle_manager_heartbeat_ack_raw(
+    @tcp.handle('manager_status_ack')
+    async def handle_manager_status_ack_raw(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
     ):
-        """Handle raw manager heartbeat ack."""
+        """Handle raw manager status ack."""
         return data
     
     @tcp.receive()
-    async def receive_manager_heartbeat(
+    async def receive_manager_status_update(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
     ):
-        """Handle manager heartbeat."""
+        """
+        Handle manager status update via TCP.
+        
+        This is NOT a healthcheck - DC liveness is tracked via SWIM UDP probes.
+        This contains job progress and worker capacity information.
+        """
         try:
-            heartbeat = ManagerHeartbeat(**pickle.loads(data))
+            status = ManagerHeartbeat(**pickle.loads(data))
             
-            # Update DC health tracking
-            self._datacenter_health[heartbeat.datacenter] = heartbeat
-            self._datacenter_last_seen[heartbeat.datacenter] = time.monotonic()
+            # Update DC status tracking (from TCP)
+            self._datacenter_status[status.datacenter] = status
+            self._datacenter_last_status[status.datacenter] = time.monotonic()
             
             return b'ok'
             
         except Exception as e:
-            await self.handle_exception(e, "receive_manager_heartbeat")
+            await self.handle_exception(e, "receive_manager_status_update")
             return b'error'
     
     # =========================================================================

@@ -8,6 +8,18 @@ Managers orchestrate workflow execution within a datacenter. They:
 - Report to gates (if present)
 - Participate in leader election among managers
 - Handle quorum-based confirmation for workflow provisioning
+
+Protocols:
+- UDP: SWIM healthchecks (inherited from UDPServer)
+  - Managers probe workers to detect failures
+  - Managers form a gossip cluster with other managers
+  - Leader election uses SWIM membership info
+- TCP: Data operations
+  - Job submission from gates/clients
+  - Workflow dispatch to workers
+  - Status updates from workers
+  - Quorum confirmation between managers
+  - State sync for new leaders
 """
 
 import asyncio
@@ -54,16 +66,23 @@ class ManagerServer(UDPServer):
     Manager node in the distributed Hyperscale system.
     
     Managers:
-    - Form a gossip cluster for leader election
+    - Form a gossip cluster for leader election (UDP SWIM)
     - Track registered workers and their capacity
-    - Dispatch workflows to workers with quorum confirmation
-    - Aggregate workflow progress from workers
-    - Report job status to gates (if present)
+    - Probe workers for liveness via UDP (SWIM protocol)
+    - Dispatch workflows to workers with quorum confirmation (TCP)
+    - Aggregate workflow progress from workers (TCP)
+    - Report job status to gates if present (TCP)
     
-    The leader manager is responsible for:
-    - Accepting new job submissions
-    - Making provisioning decisions
-    - Coordinating quorum confirmations
+    Healthchecks (UDP - SWIM protocol):
+        Managers form a SWIM cluster with other managers for leader
+        election. They also add workers to their SWIM membership and
+        probe them to detect failures. When a worker fails probes,
+        the suspicion subprotocol kicks in.
+    
+    Status Updates (TCP):
+        Workers send status updates via TCP containing capacity and
+        progress. These are distinct from healthchecks - a worker
+        might have stale status but still be alive (detected via UDP).
     """
     
     def __init__(
@@ -74,8 +93,10 @@ class ManagerServer(UDPServer):
         env: Env,
         dc_id: str = "default",
         gate_addrs: list[tuple[str, int]] | None = None,
-        manager_peers: list[tuple[str, int]] | None = None,
-        heartbeat_interval: float = 1.0,
+        gate_udp_addrs: list[tuple[str, int]] | None = None,  # For SWIM if gates exist
+        manager_peers: list[tuple[str, int]] | None = None,  # TCP addresses
+        manager_udp_peers: list[tuple[str, int]] | None = None,  # UDP for SWIM cluster
+        status_update_interval: float = 1.0,  # TCP status to gates
         quorum_timeout: float = 5.0,
     ):
         super().__init__(
@@ -87,16 +108,18 @@ class ManagerServer(UDPServer):
         )
         
         # Gate discovery (optional)
-        self._gate_addrs = gate_addrs or []
+        self._gate_addrs = gate_addrs or []  # TCP
+        self._gate_udp_addrs = gate_udp_addrs or []  # UDP for SWIM
         self._current_gate: tuple[str, int] | None = None
         
-        # Manager peers for quorum
-        self._manager_peers = manager_peers or []
+        # Manager peers for quorum (TCP) and SWIM cluster (UDP)
+        self._manager_peers = manager_peers or []  # TCP
+        self._manager_udp_peers = manager_udp_peers or []  # UDP for SWIM
         
-        # Registered workers
+        # Registered workers (indexed by node_id)
         self._workers: dict[str, WorkerRegistration] = {}  # node_id -> registration
-        self._worker_heartbeats: dict[str, WorkerHeartbeat] = {}  # node_id -> last heartbeat
-        self._worker_last_seen: dict[str, float] = {}  # node_id -> timestamp
+        self._worker_status: dict[str, WorkerHeartbeat] = {}  # node_id -> last status
+        self._worker_last_status: dict[str, float] = {}  # node_id -> timestamp
         
         # Job and workflow state
         self._jobs: dict[str, JobProgress] = {}  # job_id -> progress
@@ -110,9 +133,9 @@ class ManagerServer(UDPServer):
         # State versioning
         self._state_version = 0
         
-        # Heartbeat
-        self._heartbeat_interval = heartbeat_interval
-        self._heartbeat_task: asyncio.Task | None = None
+        # Status update loop (TCP to gates)
+        self._status_update_interval = status_update_interval
+        self._status_update_task: asyncio.Task | None = None
         
         # Quorum settings
         self._quorum_timeout = quorum_timeout
@@ -149,20 +172,23 @@ class ManagerServer(UDPServer):
         """Start the manager server."""
         await super().start()
         
-        # Join manager cluster
-        for peer in self._manager_peers:
-            await self.join_cluster(peer)
+        # Join SWIM cluster with other managers (UDP healthchecks)
+        for peer_udp in self._manager_udp_peers:
+            await self.join_cluster(peer_udp)
         
-        # Start leader election
+        # Start SWIM probe cycle (UDP healthchecks for managers + workers)
+        self._task_runner.run(self.start_probe_cycle)
+        
+        # Start leader election (uses SWIM membership info)
         await self.start_leader_election()
         
-        # Start heartbeat loop (to gates if present)
+        # Start status update loop (TCP to gates if present)
         if self._gate_addrs:
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self._status_update_task = asyncio.create_task(self._status_update_loop())
         
         self._udp_logger.log(
             ServerInfo(
-                message=f"Manager started in DC {self._node_id.datacenter}",
+                message=f"Manager started in DC {self._node_id.datacenter}, SWIM healthcheck active",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -171,38 +197,52 @@ class ManagerServer(UDPServer):
     
     async def stop(self) -> None:
         """Stop the manager server."""
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
+        if self._status_update_task:
+            self._status_update_task.cancel()
             try:
-                await self._heartbeat_task
+                await self._status_update_task
             except asyncio.CancelledError:
                 pass
         
+        # Graceful shutdown broadcasts leave via UDP (SWIM)
+        await self.graceful_shutdown()
+        
         await super().stop()
     
-    async def _heartbeat_loop(self) -> None:
-        """Send periodic heartbeats to gates."""
+    async def _status_update_loop(self) -> None:
+        """
+        Send periodic status updates to gates via TCP.
+        
+        Note: This is NOT a healthcheck. Gates detect manager liveness
+        via the SWIM protocol over UDP. This loop sends job progress
+        and capacity information.
+        """
         while self._running:
             try:
-                await asyncio.sleep(self._heartbeat_interval)
+                await asyncio.sleep(self._status_update_interval)
                 
                 if self._gate_addrs:
                     for gate_addr in self._gate_addrs:
-                        await self._send_heartbeat_to_gate(gate_addr)
+                        await self._send_status_to_gate(gate_addr)
                         
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                await self.handle_exception(e, "manager_heartbeat_loop")
+                await self.handle_exception(e, "manager_status_update_loop")
     
-    async def _send_heartbeat_to_gate(self, gate_addr: tuple[str, int]) -> None:
-        """Send a heartbeat to a gate."""
+    async def _send_status_to_gate(self, gate_addr: tuple[str, int]) -> None:
+        """
+        Send status update to a gate via TCP.
+        
+        Contains job progress and capacity - NOT liveness.
+        Liveness is determined by SWIM over UDP.
+        """
         # Calculate available cores across all workers
         total_available = sum(
-            hb.available_cores for hb in self._worker_heartbeats.values()
+            status.available_cores for status in self._worker_status.values()
         )
         
-        heartbeat = ManagerHeartbeat(
+        status = ManagerHeartbeat(  # Reusing struct for status, not healthcheck
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
             is_leader=self.is_leader(),
@@ -220,25 +260,26 @@ class ManagerServer(UDPServer):
         try:
             await self.send_tcp(
                 gate_addr,
-                "manager_heartbeat",
-                heartbeat.dump(),
+                "manager_status_update",
+                status.dump(),
                 timeout=2.0,
             )
         except Exception as e:
-            await self.handle_exception(e, "heartbeat_to_gate")
+            # Status failure is not critical - SWIM handles liveness
+            await self.handle_exception(e, "status_to_gate")
     
     def _get_state_snapshot(self) -> ManagerStateSnapshot:
         """Get a complete state snapshot."""
         worker_snapshots = []
         for node_id, reg in self._workers.items():
-            hb = self._worker_heartbeats.get(node_id)
-            if hb:
+            status = self._worker_status.get(node_id)
+            if status:
                 worker_snapshots.append(WorkerStateSnapshot(
                     node_id=node_id,
-                    state=hb.state,
+                    state=status.state,
                     total_cores=reg.total_cores,
-                    available_cores=hb.available_cores,
-                    version=hb.version,
+                    available_cores=status.available_cores,
+                    version=status.version,
                     active_workflows={},  # Could populate from tracking
                 ))
         
@@ -257,11 +298,25 @@ class ManagerServer(UDPServer):
         Select a worker with sufficient capacity for a workflow.
         
         Uses cryptographically secure random selection among eligible workers.
+        Also checks SWIM membership - only select workers that are ALIVE.
         """
         eligible = []
-        for node_id, hb in self._worker_heartbeats.items():
-            if hb.available_cores >= vus_needed and hb.state == WorkerState.HEALTHY.value:
-                eligible.append(node_id)
+        for node_id, status in self._worker_status.items():
+            # Check capacity from status update
+            if status.available_cores < vus_needed:
+                continue
+            if status.state != WorkerState.HEALTHY.value:
+                continue
+            
+            # Check SWIM liveness - worker must be alive in SWIM cluster
+            worker_reg = self._workers.get(node_id)
+            if worker_reg:
+                worker_addr = (worker_reg.node.host, worker_reg.node.port)
+                node_state = self._incarnation_tracker.get_node_state(worker_addr)
+                if node_state and node_state.status != b'OK':
+                    continue  # Worker is suspected or dead per SWIM
+            
+            eligible.append(node_id)
         
         if not eligible:
             return None
@@ -417,18 +472,23 @@ class ManagerServer(UDPServer):
         data: bytes,
         clock_time: int,
     ):
-        """Handle worker registration."""
+        """Handle worker registration via TCP."""
         try:
             registration = WorkerRegistration(**pickle.loads(data))
             
             # Store registration
             self._workers[registration.node.node_id] = registration
-            self._worker_last_seen[registration.node.node_id] = time.monotonic()
+            self._worker_last_status[registration.node.node_id] = time.monotonic()
             self._increment_version()
+            
+            # Add worker to SWIM cluster for UDP healthchecks
+            # The worker's UDP address is derived from registration
+            worker_udp_addr = (registration.node.host, registration.node.port)
+            self._probe_scheduler.add_member(worker_udp_addr)
             
             self._udp_logger.log(
                 ServerInfo(
-                    message=f"Worker registered: {registration.node.node_id} with {registration.total_cores} cores",
+                    message=f"Worker registered: {registration.node.node_id} with {registration.total_cores} cores (SWIM probe added)",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
@@ -442,24 +502,29 @@ class ManagerServer(UDPServer):
             return b'error'
     
     @tcp.receive()
-    async def receive_worker_heartbeat(
+    async def receive_worker_status_update(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
     ):
-        """Handle worker heartbeat."""
+        """
+        Handle worker status update via TCP.
+        
+        This is NOT a healthcheck - liveness is tracked via SWIM UDP probes.
+        This contains capacity and workflow progress information.
+        """
         try:
-            heartbeat = WorkerHeartbeat(**pickle.loads(data))
+            status = WorkerHeartbeat(**pickle.loads(data))
             
-            # Update heartbeat tracking
-            self._worker_heartbeats[heartbeat.node_id] = heartbeat
-            self._worker_last_seen[heartbeat.node_id] = time.monotonic()
+            # Update status tracking
+            self._worker_status[status.node_id] = status
+            self._worker_last_status[status.node_id] = time.monotonic()
             
             return b'ok'
             
         except Exception as e:
-            await self.handle_exception(e, "receive_worker_heartbeat")
+            await self.handle_exception(e, "receive_worker_status_update")
             return b'error'
     
     @tcp.receive()
