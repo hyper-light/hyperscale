@@ -1373,13 +1373,33 @@ class ManagerServer(HealthAwareServer):
             except Exception as e:
                 await self.handle_exception(e, "gate_heartbeat_loop")
     
-    async def _send_job_progress_to_gate(self, job: JobProgress) -> None:
+    async def _send_job_progress_to_gate(
+        self,
+        job: JobProgress,
+        max_retries: int = 2,
+        base_delay: float = 0.2,
+    ) -> None:
         """
         Send job progress to the primary gate and process ack.
         
+        Uses limited retries with exponential backoff:
+        - Progress updates can be frequent, so we keep retries short
+        - Attempt 1: immediate
+        - Attempt 2: 0.2s delay
+        - Attempt 3: 0.4s delay
+        
         The gate responds with JobProgressAck containing updated
         gate topology which we use to maintain redundant channels.
+        
+        Args:
+            job: Job progress to send
+            max_retries: Maximum retry attempts (default 2)
+            base_delay: Base delay for exponential backoff (default 0.2s)
         """
+        # Check circuit breaker first
+        if self._is_gate_circuit_open():
+            return  # Fail fast
+        
         gate_addr = self._get_primary_gate_tcp_addr()
         if not gate_addr:
             # Fallback to first seed gate
@@ -1388,20 +1408,31 @@ class ManagerServer(HealthAwareServer):
             else:
                 return
         
-        try:
-            response = await self.send_tcp(
-                gate_addr,
-                "job_progress",
-                job.dump(),
-                timeout=2.0,
-            )
-            
-            # Process ack to update gate topology
-            if response and isinstance(response, bytes) and response != b'error':
-                self._process_job_progress_ack(response)
+        for attempt in range(max_retries + 1):
+            try:
+                response = await self.send_tcp(
+                    gate_addr,
+                    "job_progress",
+                    job.dump(),
+                    timeout=2.0,
+                )
                 
-        except Exception:
-            pass
+                # Process ack to update gate topology
+                if response and isinstance(response, bytes) and response != b'error':
+                    self._process_job_progress_ack(response)
+                    self._gate_circuit.record_success()
+                    return  # Success
+                    
+            except Exception:
+                pass
+            
+            # Exponential backoff before retry (except after last attempt)
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+        
+        # All retries exhausted
+        self._gate_circuit.record_error()
     
     async def _send_job_progress_to_all_gates(self, job: JobProgress) -> None:
         """

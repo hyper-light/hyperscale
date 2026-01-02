@@ -4536,6 +4536,66 @@ test_manager_gate_register_checks_circuit()
 test_manager_gate_register_records_circuit()
 
 
+@test("Manager: _send_job_progress_to_gate has retry parameters")
+def test_manager_job_progress_has_retry_params():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    sig = inspect.signature(ManagerServer._send_job_progress_to_gate)
+    params = list(sig.parameters.keys())
+    
+    assert 'max_retries' in params, \
+        "_send_job_progress_to_gate should have max_retries parameter"
+    assert 'base_delay' in params, \
+        "_send_job_progress_to_gate should have base_delay parameter"
+
+
+@test("Manager: _send_job_progress_to_gate uses exponential backoff")
+def test_manager_job_progress_uses_backoff():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._send_job_progress_to_gate)
+    
+    assert "for attempt in range" in source, \
+        "_send_job_progress_to_gate should have retry loop"
+    assert "2 ** attempt" in source or "2**attempt" in source, \
+        "_send_job_progress_to_gate should use exponential backoff"
+    assert "asyncio.sleep" in source, \
+        "_send_job_progress_to_gate should sleep between retries"
+
+
+@test("Manager: _send_job_progress_to_gate checks circuit")
+def test_manager_job_progress_checks_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._send_job_progress_to_gate)
+    
+    assert "_is_gate_circuit_open" in source, \
+        "_send_job_progress_to_gate should check circuit breaker"
+
+
+@test("Manager: _send_job_progress_to_gate records circuit state")
+def test_manager_job_progress_records_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._send_job_progress_to_gate)
+    
+    assert "record_success" in source, \
+        "_send_job_progress_to_gate should record success"
+    assert "record_error" in source, \
+        "_send_job_progress_to_gate should record error"
+
+
+# Run Manager Job Progress Retry tests
+test_manager_job_progress_has_retry_params()
+test_manager_job_progress_uses_backoff()
+test_manager_job_progress_checks_circuit()
+test_manager_job_progress_records_circuit()
+
+
 # =============================================================================
 # Summary
 # =============================================================================
