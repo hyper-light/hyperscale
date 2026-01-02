@@ -1,4 +1,3 @@
-import random
 from typing import TypeVar
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.distributed_rewrite.models import (
@@ -37,8 +36,8 @@ class MercurySyncServer(MercurySyncBaseServer):
         )
 
     def select_udp_node_subset(self):
-        required = random.randrange(1, len(self._udp_client_addrs))
-        return random.choices(self._udp_client_addrs, k=required)
+        required = self._secure_random.randrange(1, len(self._udp_client_addrs))
+        return self._secure_random.choices(list(self._udp_client_addrs), k=required)
 
     @udp.client()
     async def send_ack(
@@ -47,7 +46,7 @@ class MercurySyncServer(MercurySyncBaseServer):
         timeout: int | float | None = None,
     ) -> Message[Ack]:
         return await self.send_udp_with_message(
-            random.choice(self._udp_client_addrs),
+            self._secure_random.choice(list(self._udp_client_addrs)),
             ack,
             timeout=timeout,
         )

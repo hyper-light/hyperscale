@@ -146,6 +146,12 @@ class ServerInfo(Entry, kw_only=True):
     node_port: int
     level: LogLevel = LogLevel.INFO
 
+class ServerWarning(Entry, kw_only=True):
+    node_id: int
+    node_host: str
+    node_port: int
+    level: LogLevel = LogLevel.WARN
+
 class ServerError(Entry, kw_only=True):
     node_id: int
     node_host: str

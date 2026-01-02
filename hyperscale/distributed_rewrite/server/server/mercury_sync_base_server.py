@@ -3,9 +3,9 @@
 
 import asyncio
 import inspect
+import secrets
 import socket
 import ssl
-import random
 import traceback
 from collections import defaultdict, deque
 from typing import (
@@ -153,6 +153,7 @@ class MercurySyncBaseServer(Generic[T]):
         # Security utilities
         self._replay_guard = ReplayGuard()
         self._rate_limiter = RateLimiter()
+        self._secure_random = secrets.SystemRandom()  # Cryptographically secure RNG
         
         self._tcp_semaphore: asyncio.Semaphore | None= None
         self._udp_semaphore: asyncio.Semaphore | None= None
@@ -730,10 +731,10 @@ class MercurySyncBaseServer(Generic[T]):
         
         match selection_method:
             case "random":
-                selection = [nodes[random.randrange(0, node_max)]]
+                selection = [nodes[self._secure_random.randrange(0, node_max)]]
 
             case "subset":
-                selection = random.choices(nodes, k=max_nodes)
+                selection = self._secure_random.choices(nodes, k=max_nodes)
 
             case "all":
                 selection = nodes
@@ -823,10 +824,10 @@ class MercurySyncBaseServer(Generic[T]):
         
         match selection_method:
             case "random":
-                selection = [nodes[random.randrange(0, node_max)]]
+                selection = [nodes[self._secure_random.randrange(0, node_max)]]
 
             case "subset":
-                selection = random.choices(nodes, k=max_nodes)
+                selection = self._secure_random.choices(nodes, k=max_nodes)
 
             case "all":
                 selection = nodes
