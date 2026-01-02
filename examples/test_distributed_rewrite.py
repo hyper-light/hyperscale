@@ -2081,6 +2081,289 @@ test_gate_peer_recovery_restores_active()
 
 
 # =============================================================================
+# CRDT (Conflict-free Replicated Data Types) Tests
+# =============================================================================
+
+print("\nCRDT Tests")
+print("=" * 50)
+
+
+@test("GCounter: initial value is 0")
+def test_gcounter_initial():
+    from hyperscale.distributed_rewrite.models import GCounter
+    
+    counter = GCounter()
+    assert counter.value == 0, "Initial GCounter value should be 0"
+
+
+@test("GCounter: increment increases value")
+def test_gcounter_increment():
+    from hyperscale.distributed_rewrite.models import GCounter
+    
+    counter = GCounter()
+    counter.increment("dc-east", 5)
+    counter.increment("dc-west", 3)
+    
+    assert counter.value == 8, f"Expected 8, got {counter.value}"
+    assert counter.get_node_value("dc-east") == 5
+    assert counter.get_node_value("dc-west") == 3
+
+
+@test("GCounter: merge takes max of each slot")
+def test_gcounter_merge():
+    from hyperscale.distributed_rewrite.models import GCounter
+    
+    counter1 = GCounter()
+    counter1.increment("dc-east", 5)
+    counter1.increment("dc-west", 3)
+    
+    counter2 = GCounter()
+    counter2.increment("dc-east", 10)  # Higher than counter1
+    counter2.increment("dc-south", 2)   # Not in counter1
+    
+    merged = counter1.merge(counter2)
+    
+    assert merged.get_node_value("dc-east") == 10  # max(5, 10)
+    assert merged.get_node_value("dc-west") == 3   # only in counter1
+    assert merged.get_node_value("dc-south") == 2  # only in counter2
+    assert merged.value == 15  # 10 + 3 + 2
+
+
+@test("GCounter: merge is commutative")
+def test_gcounter_merge_commutative():
+    from hyperscale.distributed_rewrite.models import GCounter
+    
+    counter1 = GCounter(counts={"a": 5, "b": 3})
+    counter2 = GCounter(counts={"a": 10, "c": 2})
+    
+    merged1 = counter1.merge(counter2)
+    merged2 = counter2.merge(counter1)
+    
+    assert merged1.value == merged2.value
+    assert merged1.to_dict() == merged2.to_dict()
+
+
+@test("GCounter: merge is idempotent")
+def test_gcounter_merge_idempotent():
+    from hyperscale.distributed_rewrite.models import GCounter
+    
+    counter = GCounter(counts={"a": 5, "b": 3})
+    
+    merged = counter.merge(counter)
+    
+    assert merged.value == counter.value
+    assert merged.to_dict() == counter.to_dict()
+
+
+@test("GCounter: serialization round-trip")
+def test_gcounter_serialization():
+    from hyperscale.distributed_rewrite.models import GCounter
+    
+    counter = GCounter()
+    counter.increment("dc-east", 100)
+    counter.increment("dc-west", 50)
+    
+    data = counter.to_dict()
+    restored = GCounter.from_dict(data)
+    
+    assert restored.value == counter.value
+    assert restored.to_dict() == counter.to_dict()
+
+
+@test("LWWRegister: set and get value")
+def test_lww_register_basic():
+    from hyperscale.distributed_rewrite.models import LWWRegister
+    
+    reg = LWWRegister()
+    reg.set(100.5, 1, "node-1")
+    
+    assert reg.value == 100.5
+    assert reg.timestamp == 1
+
+
+@test("LWWRegister: higher timestamp wins")
+def test_lww_register_timestamp():
+    from hyperscale.distributed_rewrite.models import LWWRegister
+    
+    reg = LWWRegister()
+    reg.set(100.5, 1, "node-1")
+    reg.set(200.0, 2, "node-2")  # Higher timestamp
+    
+    assert reg.value == 200.0
+    
+    # Older timestamp rejected
+    reg.set(50.0, 1, "node-3")
+    assert reg.value == 200.0
+
+
+@test("LWWRegister: node_id breaks ties")
+def test_lww_register_tiebreak():
+    from hyperscale.distributed_rewrite.models import LWWRegister
+    
+    reg = LWWRegister()
+    reg.set(100.0, 5, "aaa")
+    reg.set(200.0, 5, "zzz")  # Same timestamp, higher node_id wins
+    
+    assert reg.value == 200.0
+
+
+@test("LWWRegister: merge keeps winner")
+def test_lww_register_merge():
+    from hyperscale.distributed_rewrite.models import LWWRegister
+    
+    reg1 = LWWRegister()
+    reg1.set(100.0, 1, "node-1")
+    
+    reg2 = LWWRegister()
+    reg2.set(200.0, 2, "node-2")
+    
+    merged = reg1.merge(reg2)
+    
+    assert merged.value == 200.0
+    assert merged.timestamp == 2
+
+
+@test("LWWMap: set and get values")
+def test_lww_map_basic():
+    from hyperscale.distributed_rewrite.models import LWWMap
+    
+    m = LWWMap()
+    m.set("dc-east", "RUNNING", 1, "manager-1")
+    m.set("dc-west", "COMPLETED", 2, "manager-2")
+    
+    assert m.get("dc-east") == "RUNNING"
+    assert m.get("dc-west") == "COMPLETED"
+    assert m.get("dc-missing") is None
+
+
+@test("LWWMap: merge combines entries")
+def test_lww_map_merge():
+    from hyperscale.distributed_rewrite.models import LWWMap
+    
+    m1 = LWWMap()
+    m1.set("dc-east", "RUNNING", 1, "m1")
+    
+    m2 = LWWMap()
+    m2.set("dc-east", "COMPLETED", 2, "m2")  # Newer
+    m2.set("dc-west", "RUNNING", 1, "m2")     # Not in m1
+    
+    merged = m1.merge(m2)
+    
+    assert merged.get("dc-east") == "COMPLETED"  # m2's newer value
+    assert merged.get("dc-west") == "RUNNING"    # from m2
+
+
+@test("JobStatsCRDT: basic operations")
+def test_job_stats_crdt_basic():
+    from hyperscale.distributed_rewrite.models import JobStatsCRDT
+    
+    stats = JobStatsCRDT(job_id="job-123")
+    
+    stats.record_completed("dc-east", 100)
+    stats.record_completed("dc-west", 50)
+    stats.record_failed("dc-west", 2)
+    stats.record_rate("dc-east", 500.0, 1)
+    stats.record_rate("dc-west", 250.0, 1)
+    stats.record_status("dc-east", "RUNNING", 1)
+    
+    assert stats.total_completed == 150
+    assert stats.total_failed == 2
+    assert stats.total_rate == 750.0
+    assert stats.get_dc_status("dc-east") == "RUNNING"
+
+
+@test("JobStatsCRDT: merge combines stats")
+def test_job_stats_crdt_merge():
+    from hyperscale.distributed_rewrite.models import JobStatsCRDT
+    
+    stats1 = JobStatsCRDT(job_id="job-123")
+    stats1.record_completed("dc-east", 100)
+    stats1.record_rate("dc-east", 500.0, 1)
+    
+    stats2 = JobStatsCRDT(job_id="job-123")
+    stats2.record_completed("dc-east", 200)  # Higher - wins
+    stats2.record_completed("dc-west", 50)   # New DC
+    stats2.record_rate("dc-east", 600.0, 2)  # Newer timestamp - wins
+    
+    merged = stats1.merge(stats2)
+    
+    assert merged.total_completed == 250  # max(100, 200) + 50
+    assert merged.get_dc_rate("dc-east") == 600.0  # Newer timestamp
+
+
+@test("JobStatsCRDT: serialization round-trip")
+def test_job_stats_crdt_serialization():
+    from hyperscale.distributed_rewrite.models import JobStatsCRDT
+    
+    stats = JobStatsCRDT(job_id="job-123")
+    stats.record_completed("dc-east", 100)
+    stats.record_failed("dc-west", 5)
+    stats.record_rate("dc-east", 500.0, 1)
+    stats.record_status("dc-east", "RUNNING", 1)
+    
+    data = stats.to_dict()
+    restored = JobStatsCRDT.from_dict(data)
+    
+    assert restored.job_id == stats.job_id
+    assert restored.total_completed == stats.total_completed
+    assert restored.total_failed == stats.total_failed
+    assert restored.total_rate == stats.total_rate
+
+
+@test("JobStatsCRDT: cross-DC merge scenario")
+def test_job_stats_crdt_cross_dc_merge():
+    """
+    Simulate a scenario where two gates have different views
+    of the same job's stats, then merge.
+    """
+    from hyperscale.distributed_rewrite.models import JobStatsCRDT
+    
+    # Gate A's view
+    gate_a_stats = JobStatsCRDT(job_id="job-123")
+    gate_a_stats.record_completed("dc-east", 100)
+    gate_a_stats.record_completed("dc-west", 50)
+    gate_a_stats.record_rate("dc-east", 500.0, 1)
+    gate_a_stats.record_status("dc-east", "RUNNING", 1)
+    
+    # Gate B's view (newer data from dc-east, new DC dc-south)
+    gate_b_stats = JobStatsCRDT(job_id="job-123")
+    gate_b_stats.record_completed("dc-east", 200)  # More progress
+    gate_b_stats.record_completed("dc-south", 75)  # New DC
+    gate_b_stats.record_rate("dc-east", 600.0, 2)  # Newer timestamp
+    gate_b_stats.record_status("dc-east", "COMPLETED", 2)  # Newer
+    
+    # Gate A merges Gate B's view
+    gate_a_stats.merge_in_place(gate_b_stats)
+    
+    # After merge, Gate A should have the most complete view
+    assert gate_a_stats.get_dc_completed("dc-east") == 200  # max
+    assert gate_a_stats.get_dc_completed("dc-west") == 50   # unchanged
+    assert gate_a_stats.get_dc_completed("dc-south") == 75  # new
+    assert gate_a_stats.total_completed == 325  # 200 + 50 + 75
+    assert gate_a_stats.get_dc_rate("dc-east") == 600.0  # newer
+    assert gate_a_stats.get_dc_status("dc-east") == "COMPLETED"  # newer
+
+
+# Run CRDT tests
+test_gcounter_initial()
+test_gcounter_increment()
+test_gcounter_merge()
+test_gcounter_merge_commutative()
+test_gcounter_merge_idempotent()
+test_gcounter_serialization()
+test_lww_register_basic()
+test_lww_register_timestamp()
+test_lww_register_tiebreak()
+test_lww_register_merge()
+test_lww_map_basic()
+test_lww_map_merge()
+test_job_stats_crdt_basic()
+test_job_stats_crdt_merge()
+test_job_stats_crdt_serialization()
+test_job_stats_crdt_cross_dc_merge()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

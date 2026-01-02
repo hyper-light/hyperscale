@@ -50,3 +50,11 @@ from .distributed import (
     DatacenterLease as DatacenterLease,
     LeaseTransfer as LeaseTransfer,
 )
+
+# CRDTs for cross-datacenter synchronization
+from .crdt import (
+    GCounter as GCounter,
+    LWWRegister as LWWRegister,
+    LWWMap as LWWMap,
+    JobStatsCRDT as JobStatsCRDT,
+)
