@@ -42,6 +42,8 @@ from hyperscale.distributed_rewrite.swim import HealthAwareServer, WorkerStateEm
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
+    ManagerInfo,
+    RegistrationResponse,
     WorkerRegistration,
     WorkerHeartbeat,
     WorkerState,
@@ -104,7 +106,7 @@ class WorkerServer(HealthAwareServer):
         env: Env,
         dc_id: str = "default",
         total_cores: int | None = None,
-        manager_addrs: list[tuple[str, int]] | None = None,
+        seed_managers: list[tuple[str, int]] | None = None,
     ):
         # Core capacity (set before super().__init__ so state embedder can access it)
         self._total_cores = total_cores or os.cpu_count() or 1
@@ -118,10 +120,15 @@ class WorkerServer(HealthAwareServer):
         # Reverse mapping: workflow_id -> list of assigned core indices
         self._workflow_cores: dict[str, list[int]] = {}
         
-        # Manager discovery (TCP addresses for registration, UDP populated via handle)
-        self._manager_addrs = manager_addrs or []  # TCP addresses
-        self._manager_udp_addrs: list[tuple[str, int]] = []  # Populated by handle_worker_register
-        self._current_manager: tuple[str, int] | None = None
+        # Manager discovery
+        # Seed managers from config (TCP addresses) - tried in order until one succeeds
+        self._seed_managers = seed_managers or []
+        # All known managers (populated from registration response and updated from acks)
+        self._known_managers: dict[str, ManagerInfo] = {}  # node_id -> ManagerInfo
+        # Set of healthy manager node_ids
+        self._healthy_manager_ids: set[str] = set()
+        # Primary manager for leader operations (set during registration)
+        self._primary_manager_id: str | None = None
         
         # Workflow execution state
         self._active_workflows: dict[str, WorkflowProgress] = {}
@@ -231,25 +238,39 @@ class WorkerServer(HealthAwareServer):
         # Start parent HealthAwareServer (TCP + UDP)
         await super().start_server()
         
-        # Register with managers (TCP)
-        for manager_addr in self._manager_addrs:
-            success = await self._register_with_manager(manager_addr)
+        # Try seed managers in order until one succeeds
+        # Registration response includes list of all healthy managers
+        registered = False
+        for seed_addr in self._seed_managers:
+            success = await self._register_with_manager(seed_addr)
             if success:
-                self._current_manager = manager_addr
+                registered = True
                 break
         
-        # Join SWIM cluster via manager UDP addresses for healthchecks
-        # The manager will probe us via UDP to detect failures
-        for manager_udp_addr in self._manager_udp_addrs:
-            await self.join_cluster(manager_udp_addr)
+        if not registered:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Failed to register with any seed manager: {self._seed_managers}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        
+        # Join SWIM cluster with all known managers for healthchecks
+        for manager in self._known_managers.values():
+            udp_addr = (manager.udp_host, manager.udp_port)
+            await self.join_cluster(udp_addr)
         
         # Start SWIM probe cycle (UDP healthchecks)
         self._task_runner.run(self.start_probe_cycle)
         
+        manager_count = len(self._known_managers)
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Worker started with {self._total_cores} cores, SWIM healthcheck active",
+                message=f"Worker started with {self._total_cores} cores, registered with {manager_count} managers",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -260,56 +281,80 @@ class WorkerServer(HealthAwareServer):
         """
         Called when a node is marked as DEAD via SWIM.
         
-        If the dead node is our current manager, trigger failover to another
-        manager from our list.
+        Marks the manager as unhealthy in our tracking.
         """
-        if not self._current_manager:
-            return
-        
-        # Check if dead node is our current manager
-        current_host = self._current_manager[0]
-        dead_host = node_addr[0]
-        
-        if current_host == dead_host:
-            self._task_runner.run(self._handle_manager_failure, node_addr)
-    
-    async def _handle_manager_failure(self, failed_addr: tuple[str, int]) -> None:
-        """
-        Handle manager failure by failing over to another manager.
-        """
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=f"Manager at {failed_addr} appears to have failed, initiating failover",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
-        )
-        
-        old_manager = self._current_manager
-        self._current_manager = None
-        
-        # Try other managers
-        for manager_addr in self._manager_addrs:
-            if manager_addr == old_manager:
-                continue
-            
-            success = await self._register_with_manager(manager_addr)
-            if success:
-                self._current_manager = manager_addr
+        # Find which manager this address belongs to
+        for manager_id, manager in self._known_managers.items():
+            if (manager.udp_host, manager.udp_port) == node_addr:
+                self._healthy_manager_ids.discard(manager_id)
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerInfo(
-                        message=f"Successfully failed over to manager at {manager_addr}",
+                        message=f"Manager {manager_id} marked unhealthy (SWIM DEAD)",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
                     )
                 )
                 
-                await self._report_active_workflows_to_manager()
+                # If this was our primary manager, select a new one
+                if manager_id == self._primary_manager_id:
+                    self._task_runner.run(self._select_new_primary_manager)
+                break
+    
+    def _on_node_alive(self, node_addr: tuple[str, int]) -> None:
+        """
+        Called when a node is confirmed ALIVE via SWIM.
+        
+        Marks the manager as healthy in our tracking.
+        """
+        # Find which manager this address belongs to
+        for manager_id, manager in self._known_managers.items():
+            if (manager.udp_host, manager.udp_port) == node_addr:
+                self._healthy_manager_ids.add(manager_id)
+                break
+    
+    async def _select_new_primary_manager(self) -> None:
+        """Select a new primary manager from healthy managers."""
+        # Prefer the leader if we know one
+        for manager_id in self._healthy_manager_ids:
+            manager = self._known_managers.get(manager_id)
+            if manager and manager.is_leader:
+                self._primary_manager_id = manager_id
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Selected new primary manager (leader): {manager_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
                 return
+        
+        # Otherwise pick any healthy manager
+        if self._healthy_manager_ids:
+            self._primary_manager_id = next(iter(self._healthy_manager_ids))
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Selected new primary manager: {self._primary_manager_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        else:
+            self._primary_manager_id = None
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message="No healthy managers available!",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
         
         self._task_runner.run(
             self._udp_logger.log,
@@ -321,16 +366,34 @@ class WorkerServer(HealthAwareServer):
             )
         )
     
-    async def _report_active_workflows_to_manager(self) -> None:
-        """Report all active workflows to the current manager."""
-        if not self._current_manager:
+    async def _report_active_workflows_to_managers(self) -> None:
+        """Report all active workflows to all healthy managers."""
+        if not self._healthy_manager_ids:
             return
         
         for workflow_id, progress in self._active_workflows.items():
             try:
-                await self._send_progress_update(progress)
+                await self._send_progress_to_all_managers(progress)
             except Exception:
                 pass
+    
+    def _get_healthy_manager_tcp_addrs(self) -> list[tuple[str, int]]:
+        """Get TCP addresses of all healthy managers."""
+        addrs = []
+        for manager_id in self._healthy_manager_ids:
+            manager = self._known_managers.get(manager_id)
+            if manager:
+                addrs.append((manager.tcp_host, manager.tcp_port))
+        return addrs
+    
+    def _get_primary_manager_tcp_addr(self) -> tuple[str, int] | None:
+        """Get TCP address of the primary manager."""
+        if not self._primary_manager_id:
+            return None
+        manager = self._known_managers.get(self._primary_manager_id)
+        if manager:
+            return (manager.tcp_host, manager.tcp_port)
+        return None
     
     async def stop(self) -> None:
         """Stop the worker server."""
@@ -547,11 +610,62 @@ class WorkerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ):
-        """Handle registration response from manager - store manager's address."""
-        # Store the manager's address for SWIM
-        if addr not in self._manager_udp_addrs:
-            self._manager_udp_addrs.append(addr)
+        """Handle registration response from manager - populate known managers."""
+        try:
+            response = RegistrationResponse.load(data)
+            
+            if response.accepted:
+                # Populate known managers from response
+                self._update_known_managers(response.healthy_managers)
+                
+                # Set primary manager (prefer leader)
+                for manager in response.healthy_managers:
+                    if manager.is_leader:
+                        self._primary_manager_id = manager.node_id
+                        break
+                else:
+                    # No leader indicated, use responding manager
+                    self._primary_manager_id = response.manager_id
+                
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Registered with {len(response.healthy_managers)} managers, primary: {self._primary_manager_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            else:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Registration rejected: {response.error}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+        except Exception as e:
+            # Fallback for simple b'ok' responses (backwards compatibility)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Registration ack from {addr} (legacy format)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        
         return data
+    
+    def _update_known_managers(self, managers: list[ManagerInfo]) -> None:
+        """Update known managers from a list (e.g., from registration or ack)."""
+        for manager in managers:
+            self._known_managers[manager.node_id] = manager
+            # Mark as healthy since we just received this info
+            self._healthy_manager_ids.add(manager.node_id)
     
     # =========================================================================
     # TCP Handlers - Manager -> Worker
@@ -729,7 +843,7 @@ class WorkerServer(HealthAwareServer):
             # Final progress update
             progress.elapsed_seconds = time.monotonic() - start_time
             progress.timestamp = time.monotonic()
-            if self._current_manager:
+            if self._healthy_manager_ids:
                 await self._send_progress_update(progress)
                 
         except asyncio.CancelledError:
@@ -817,7 +931,7 @@ class WorkerServer(HealthAwareServer):
                     progress.status = WorkflowStatus.ASSIGNED.value
                 
                 # Send update
-                if self._current_manager:
+                if self._healthy_manager_ids:
                     await self._send_progress_update(progress)
                     self._workflow_last_progress[dispatch.workflow_id] = time.monotonic()
                 
@@ -827,19 +941,33 @@ class WorkerServer(HealthAwareServer):
                 pass
     
     async def _send_progress_update(self, progress: WorkflowProgress) -> None:
-        """Send a progress update to the manager."""
-        if not self._current_manager:
+        """Send a progress update to the primary manager."""
+        manager_addr = self._get_primary_manager_tcp_addr()
+        if not manager_addr:
             return
         
         try:
             await self.send_tcp(
-                self._current_manager,
+                manager_addr,
                 "workflow_progress",
                 progress.dump(),
                 timeout=1.0,
             )
         except Exception:
             pass
+    
+    async def _send_progress_to_all_managers(self, progress: WorkflowProgress) -> None:
+        """Send a progress update to ALL healthy managers."""
+        for manager_addr in self._get_healthy_manager_tcp_addrs():
+            try:
+                await self.send_tcp(
+                    manager_addr,
+                    "workflow_progress",
+                    progress.dump(),
+                    timeout=1.0,
+                )
+            except Exception:
+                pass
     
     # =========================================================================
     # TCP Handlers - State Sync

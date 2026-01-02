@@ -1559,29 +1559,28 @@ def test_worker_manager_failure_detection():
     from hyperscale.distributed_rewrite.nodes import WorkerServer
     
     assert hasattr(WorkerServer, '_on_node_dead')
-    assert hasattr(WorkerServer, '_handle_manager_failure')
-    assert hasattr(WorkerServer, '_report_active_workflows_to_manager')
+    assert hasattr(WorkerServer, '_select_new_primary_manager')
+    assert hasattr(WorkerServer, '_report_active_workflows_to_managers')
     
     # Check that on_node_dead callback is registered in __init__
     init_source = inspect.getsource(WorkerServer.__init__)
     assert 'register_on_node_dead' in init_source
 
 
-@test("WorkerServer: _handle_manager_failure attempts failover")
-def test_worker_handle_manager_failure():
+@test("WorkerServer: manager tracking uses new architecture")
+def test_worker_manager_tracking():
     import inspect
     from hyperscale.distributed_rewrite.nodes import WorkerServer
     
-    source = inspect.getsource(WorkerServer._handle_manager_failure)
+    # Check for new manager tracking attributes
+    assert hasattr(WorkerServer, '_update_known_managers')
+    assert hasattr(WorkerServer, '_get_healthy_manager_tcp_addrs')
+    assert hasattr(WorkerServer, '_get_primary_manager_tcp_addr')
     
-    # Should iterate through manager list
-    assert '_manager_addrs' in source
-    # Should register with new manager
-    assert '_register_with_manager' in source
-    # Should update _current_manager
-    assert '_current_manager' in source
-    # Should report workflows after failover
-    assert '_report_active_workflows_to_manager' in source
+    # Check _on_node_dead handles manager health
+    source = inspect.getsource(WorkerServer._on_node_dead)
+    assert '_healthy_manager_ids' in source
+    assert '_select_new_primary_manager' in source
 
 
 @test("Worker failure scenario: Manager detects via SWIM and reschedules")
@@ -1635,12 +1634,12 @@ def test_manager_failure_scenario():
     Test the manager failure and worker failover scenario.
     
     Scenario:
-    1. Worker is connected to Manager A
+    1. Worker tracks multiple managers via _known_managers
     2. Manager A dies (detected via SWIM)  
     3. Worker's _on_node_dead callback fires
-    4. _handle_manager_failure tries Manager B
-    5. Worker registers with Manager B
-    6. Worker reports active workflows to Manager B
+    4. Manager A removed from _healthy_manager_ids
+    5. _select_new_primary_manager picks Manager B
+    6. Worker continues with Manager B as primary
     """
     from hyperscale.distributed_rewrite.models import (
         WorkflowProgress,
@@ -1721,7 +1720,7 @@ def test_retry_preserves_resources():
 test_manager_handle_worker_failure()
 test_manager_retry_uses_correct_vus()
 test_worker_manager_failure_detection()
-test_worker_handle_manager_failure()
+test_worker_manager_tracking()
 test_worker_failure_scenario()
 test_manager_failure_scenario()
 test_retry_preserves_resources()

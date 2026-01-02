@@ -36,6 +36,8 @@ from hyperscale.distributed_rewrite.swim import HealthAwareServer, ManagerStateE
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
+    ManagerInfo,
+    RegistrationResponse,
     WorkerRegistration,
     WorkerHeartbeat,
     WorkerState,
@@ -683,6 +685,47 @@ class ManagerServer(HealthAwareServer):
         active_count = len(self._active_manager_peers) + 1  # Include self
         return active_count >= self._quorum_size()
     
+    def _get_healthy_managers(self) -> list[ManagerInfo]:
+        """
+        Build list of all known healthy managers for worker discovery.
+        
+        Includes self and all active peer managers. Workers use this
+        to maintain redundant communication channels.
+        """
+        managers: list[ManagerInfo] = []
+        
+        # Add self
+        managers.append(ManagerInfo(
+            node_id=self._node_id.full,
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
+            udp_host=self._host,
+            udp_port=self._udp_port,
+            datacenter=self._node_id.datacenter,
+            is_leader=self.is_leader(),
+        ))
+        
+        # Add active peer managers
+        for tcp_addr in self._active_manager_peers:
+            # Find UDP addr for this peer
+            udp_addr = tcp_addr  # Default to same
+            for udp, tcp in self._manager_udp_to_tcp.items():
+                if tcp == tcp_addr:
+                    udp_addr = udp
+                    break
+            
+            managers.append(ManagerInfo(
+                node_id=f"manager-{tcp_addr[0]}:{tcp_addr[1]}",  # Synthetic ID
+                tcp_host=tcp_addr[0],
+                tcp_port=tcp_addr[1],
+                udp_host=udp_addr[0],
+                udp_port=udp_addr[1],
+                datacenter=self._node_id.datacenter,  # Assume same DC
+                is_leader=False,  # We are the one responding, we know if we're leader
+            ))
+        
+        return managers
+    
     async def start(self) -> None:
         """Start the manager server."""
         await super().start()
@@ -1005,26 +1048,24 @@ class ManagerServer(HealthAwareServer):
                 )
             )
             
-            # Return ack with Manager's UDP address so Worker can join SWIM
-            ack = RegistrationAck(
+            # Return response with list of all healthy managers
+            response = RegistrationResponse(
                 accepted=True,
-                manager_node_id=self._node_id.full,
-                manager_udp_host=self._host,
-                manager_udp_port=self._udp_port,
+                manager_id=self._node_id.full,
+                healthy_managers=self._get_healthy_managers(),
             )
-            return ack.dump()
+            return response.dump()
             
         except Exception as e:
             await self.handle_exception(e, "receive_worker_register")
-            # Return error ack
-            ack = RegistrationAck(
+            # Return error response
+            response = RegistrationResponse(
                 accepted=False,
-                manager_node_id=self._node_id.full,
-                manager_udp_host=self._host,
-                manager_udp_port=self._udp_port,
+                manager_id=self._node_id.full,
+                healthy_managers=[],
                 error=str(e),
             )
-            return ack.dump()
+            return response.dump()
     
     @tcp.receive()
     async def receive_worker_status_update(

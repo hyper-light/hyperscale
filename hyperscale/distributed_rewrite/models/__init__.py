@@ -23,6 +23,8 @@ from .distributed import (
     UpdateTier as UpdateTier,
     # Node identity
     NodeInfo as NodeInfo,
+    ManagerInfo as ManagerInfo,
+    RegistrationResponse as RegistrationResponse,
     WorkerRegistration as WorkerRegistration,
     WorkerHeartbeat as WorkerHeartbeat,
     ManagerHeartbeat as ManagerHeartbeat,

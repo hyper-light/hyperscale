@@ -102,6 +102,37 @@ class NodeInfo(Message):
 
 
 @dataclass(slots=True)
+class ManagerInfo(Message):
+    """
+    Manager identity and address information for worker discovery.
+    
+    Workers use this to maintain a list of known managers for
+    redundant communication and failover.
+    """
+    node_id: str                 # Manager's unique identifier
+    tcp_host: str                # TCP host for data operations
+    tcp_port: int                # TCP port for data operations
+    udp_host: str                # UDP host for SWIM healthchecks
+    udp_port: int                # UDP port for SWIM healthchecks
+    datacenter: str              # Datacenter identifier
+    is_leader: bool = False      # Whether this manager is the current leader
+
+
+@dataclass(slots=True, kw_only=True)
+class RegistrationResponse(Message):
+    """
+    Registration acknowledgment from manager to worker.
+    
+    Contains list of all known healthy managers so worker can
+    establish redundant communication channels.
+    """
+    accepted: bool                          # Whether registration was accepted
+    manager_id: str                         # Responding manager's node_id
+    healthy_managers: list[ManagerInfo]     # All known healthy managers (including self)
+    error: str | None = None                # Error message if not accepted
+
+
+@dataclass(slots=True)
 class WorkerRegistration(Message):
     """
     Worker registration message sent to managers.
@@ -113,21 +144,6 @@ class WorkerRegistration(Message):
     available_cores: int         # Currently free cores
     memory_mb: int               # Total memory in MB
     available_memory_mb: int     # Currently free memory
-
-
-@dataclass(slots=True, kw_only=True)
-class RegistrationAck(Message):
-    """
-    Registration acknowledgment from manager to worker.
-    
-    Contains manager's UDP address so worker can join SWIM cluster
-    and push heartbeats.
-    """
-    accepted: bool               # Whether registration was accepted
-    manager_node_id: str         # Manager's node identifier
-    manager_udp_host: str        # Manager's UDP host for SWIM
-    manager_udp_port: int        # Manager's UDP port for SWIM
-    error: str | None = None     # Error message if not accepted
 
 
 @dataclass(slots=True)
