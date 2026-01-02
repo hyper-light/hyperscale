@@ -1200,33 +1200,93 @@ class ManagerServer(HealthAwareServer):
     async def _try_register_with_gate(
         self,
         gate_addr: tuple[str, int],
+        max_retries: int = 3,
+        base_delay: float = 0.5,
     ) -> ManagerRegistrationResponse | None:
-        """Try to register with a single gate."""
-        try:
-            heartbeat = self._build_manager_heartbeat()
+        """
+        Try to register with a single gate.
+        
+        Uses retries with exponential backoff:
+        - Attempt 1: immediate
+        - Attempt 2: 0.5s delay
+        - Attempt 3: 1.0s delay
+        - Attempt 4: 2.0s delay
+        
+        Also respects the circuit breaker - if open, fails fast.
+        
+        Args:
+            gate_addr: (host, port) tuple of gate
+            max_retries: Maximum retry attempts (default 3)
+            base_delay: Base delay for exponential backoff (default 0.5s)
             
-            response = await self.send_tcp(
-                gate_addr,
-                "manager_register",
-                heartbeat.dump(),
-                timeout=5.0,
-            )
-            
-            if isinstance(response, Exception):
-                raise response
-            
-            return ManagerRegistrationResponse.load(response)
-        except Exception as e:
+        Returns:
+            ManagerRegistrationResponse if successful, None otherwise
+        """
+        # Check circuit breaker first
+        if self._is_gate_circuit_open():
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(
-                    message=f"Failed to register with gate {gate_addr}: {e}",
+                    message=f"Cannot register with gate {gate_addr}: circuit breaker is OPEN",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
             return None
+        
+        heartbeat = self._build_manager_heartbeat()
+        
+        for attempt in range(max_retries + 1):
+            try:
+                response = await self.send_tcp(
+                    gate_addr,
+                    "manager_register",
+                    heartbeat.dump(),
+                    timeout=5.0,
+                )
+                
+                if isinstance(response, Exception):
+                    raise response
+                
+                result = ManagerRegistrationResponse.load(response)
+                if result.accepted:
+                    self._gate_circuit.record_success()
+                    if attempt > 0:
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerInfo(
+                                message=f"Registered with gate {gate_addr} after {attempt + 1} attempts",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                    return result
+                else:
+                    # Gate rejected registration - don't retry
+                    self._gate_circuit.record_error()
+                    return result
+                    
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Gate registration attempt {attempt + 1}/{max_retries + 1} to {gate_addr} failed: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            
+            # Exponential backoff before retry (except after last attempt)
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+        
+        # All retries exhausted
+        self._gate_circuit.record_error()
+        return None
     
     async def stop(self) -> None:
         """Stop the manager server."""

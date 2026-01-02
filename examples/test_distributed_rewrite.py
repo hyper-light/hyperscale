@@ -4476,6 +4476,66 @@ test_manager_has_gate_circuit_open()
 test_manager_has_gate_circuit_status()
 
 
+@test("Manager: _try_register_with_gate has retry parameters")
+def test_manager_gate_register_has_retry_params():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    sig = inspect.signature(ManagerServer._try_register_with_gate)
+    params = list(sig.parameters.keys())
+    
+    assert 'max_retries' in params, \
+        "_try_register_with_gate should have max_retries parameter"
+    assert 'base_delay' in params, \
+        "_try_register_with_gate should have base_delay parameter"
+
+
+@test("Manager: _try_register_with_gate uses exponential backoff")
+def test_manager_gate_register_uses_backoff():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._try_register_with_gate)
+    
+    assert "for attempt in range" in source, \
+        "_try_register_with_gate should have retry loop"
+    assert "2 ** attempt" in source or "2**attempt" in source, \
+        "_try_register_with_gate should use exponential backoff"
+    assert "asyncio.sleep" in source, \
+        "_try_register_with_gate should sleep between retries"
+
+
+@test("Manager: _try_register_with_gate checks circuit")
+def test_manager_gate_register_checks_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._try_register_with_gate)
+    
+    assert "_is_gate_circuit_open" in source, \
+        "_try_register_with_gate should check circuit breaker"
+
+
+@test("Manager: _try_register_with_gate records circuit state")
+def test_manager_gate_register_records_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._try_register_with_gate)
+    
+    assert "record_success" in source, \
+        "_try_register_with_gate should record success"
+    assert "record_error" in source, \
+        "_try_register_with_gate should record error"
+
+
+# Run Manager Gate Registration Retry tests
+test_manager_gate_register_has_retry_params()
+test_manager_gate_register_uses_backoff()
+test_manager_gate_register_checks_circuit()
+test_manager_gate_register_records_circuit()
+
+
 # =============================================================================
 # Summary
 # =============================================================================
