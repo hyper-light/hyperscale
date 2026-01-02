@@ -21,7 +21,6 @@ Protocols:
 """
 
 import asyncio
-import pickle
 import secrets
 import time
 from typing import Any
@@ -322,7 +321,7 @@ class GateServer(UDPServer):
                 )
                 
                 if isinstance(response, bytes):
-                    ack = JobAck(**pickle.loads(response))
+                    ack = JobAck.load(response)
                     if ack.accepted:
                         return True
                     # If not leader, try another
@@ -359,7 +358,7 @@ class GateServer(UDPServer):
                     )
                     
                     if isinstance(response, bytes) and response:
-                        progress = JobProgress(**pickle.loads(response))
+                        progress = JobProgress.load(response)
                         dc_progress.append(progress)
                         break
                         
@@ -427,7 +426,7 @@ class GateServer(UDPServer):
         This contains job progress and worker capacity information.
         """
         try:
-            status = ManagerHeartbeat(**pickle.loads(data))
+            status = ManagerHeartbeat.load(data)
             
             # Update DC status tracking (from TCP)
             self._datacenter_status[status.datacenter] = status
@@ -472,7 +471,7 @@ class GateServer(UDPServer):
     ):
         """Handle job submission from client."""
         try:
-            submission = JobSubmission(**pickle.loads(data))
+            submission = JobSubmission.load(data)
             
             # Only leader accepts jobs
             if not self.is_leader():
@@ -614,7 +613,7 @@ class GateServer(UDPServer):
     ):
         """Handle job progress update from manager."""
         try:
-            progress = JobProgress(**pickle.loads(data))
+            progress = JobProgress.load(data)
             
             job = self._jobs.get(progress.job_id)
             if job:
@@ -653,7 +652,7 @@ class GateServer(UDPServer):
     ):
         """Handle job cancellation from client."""
         try:
-            cancel = CancelJob(**pickle.loads(data))
+            cancel = CancelJob.load(data)
             
             job = self._jobs.get(cancel.job_id)
             if not job:
@@ -677,7 +676,7 @@ class GateServer(UDPServer):
                             timeout=2.0,
                         )
                         if isinstance(response, bytes):
-                            dc_ack = CancelAck(**pickle.loads(response))
+                            dc_ack = CancelAck.load(response)
                             cancelled_workflows += dc_ack.workflows_cancelled
                             break
                     except Exception:
@@ -735,7 +734,7 @@ class GateServer(UDPServer):
     ):
         """Handle lease transfer during gate scaling."""
         try:
-            transfer = LeaseTransfer(**pickle.loads(data))
+            transfer = LeaseTransfer.load(data)
             
             # Accept the lease
             lease = DatacenterLease(

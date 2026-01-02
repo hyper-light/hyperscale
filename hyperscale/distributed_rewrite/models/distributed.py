@@ -7,7 +7,9 @@ in the distributed Hyperscale architecture.
 
 from enum import Enum
 from typing import Literal
-import msgspec
+import cloudpickle
+from hyperscale.core.graph.workflow import Workflow
+from .message import Message
 
 
 # =============================================================================
@@ -56,7 +58,7 @@ class WorkerState(str, Enum):
 # Node Identity and Registration
 # =============================================================================
 
-class NodeInfo(msgspec.Struct, kw_only=True):
+class NodeInfo(Message, kw_only=True):
     """
     Identity information for any node in the cluster.
     
@@ -70,7 +72,7 @@ class NodeInfo(msgspec.Struct, kw_only=True):
     version: int = 0             # State version (Lamport clock)
 
 
-class WorkerRegistration(msgspec.Struct, kw_only=True):
+class WorkerRegistration(Message, kw_only=True):
     """
     Worker registration message sent to managers.
     
@@ -83,7 +85,7 @@ class WorkerRegistration(msgspec.Struct, kw_only=True):
     available_memory_mb: int     # Currently free memory
 
 
-class WorkerHeartbeat(msgspec.Struct, kw_only=True):
+class WorkerHeartbeat(Message, kw_only=True):
     """
     Periodic heartbeat from worker to manager.
     
@@ -100,7 +102,7 @@ class WorkerHeartbeat(msgspec.Struct, kw_only=True):
     active_workflows: dict[str, str] = {}  # workflow_id -> WorkflowStatus
 
 
-class ManagerHeartbeat(msgspec.Struct, kw_only=True):
+class ManagerHeartbeat(Message, kw_only=True):
     """
     Periodic heartbeat from manager to gates (if gates present).
     
@@ -121,7 +123,7 @@ class ManagerHeartbeat(msgspec.Struct, kw_only=True):
 # Job Submission and Dispatch
 # =============================================================================
 
-class JobSubmission(msgspec.Struct, kw_only=True):
+class JobSubmission(Message, kw_only=True):
     """
     Job submission from client to gate or manager.
     
@@ -134,8 +136,7 @@ class JobSubmission(msgspec.Struct, kw_only=True):
     datacenter_count: int = 1    # Number of DCs to run in (gates only)
     datacenters: list[str] = []  # Specific DCs (empty = auto-select)
 
-
-class JobAck(msgspec.Struct, kw_only=True):
+class JobAck(Message, kw_only=True):
     """
     Acknowledgment of job submission.
     
@@ -147,7 +148,7 @@ class JobAck(msgspec.Struct, kw_only=True):
     queued_position: int = 0     # Position in queue (if queued)
 
 
-class WorkflowDispatch(msgspec.Struct, kw_only=True):
+class WorkflowDispatch(Message, kw_only=True):
     """
     Dispatch a single workflow to a worker.
     
@@ -162,7 +163,7 @@ class WorkflowDispatch(msgspec.Struct, kw_only=True):
     fence_token: int             # Fencing token for at-most-once
 
 
-class WorkflowDispatchAck(msgspec.Struct, kw_only=True):
+class WorkflowDispatchAck(Message, kw_only=True):
     """
     Worker acknowledgment of workflow dispatch.
     """
@@ -176,7 +177,7 @@ class WorkflowDispatchAck(msgspec.Struct, kw_only=True):
 # Status Updates and Reporting
 # =============================================================================
 
-class StepStats(msgspec.Struct, kw_only=True):
+class StepStats(Message, kw_only=True):
     """
     Statistics for a single workflow step.
     """
@@ -186,7 +187,7 @@ class StepStats(msgspec.Struct, kw_only=True):
     total_count: int = 0         # Total attempts
 
 
-class WorkflowProgress(msgspec.Struct, kw_only=True):
+class WorkflowProgress(Message, kw_only=True):
     """
     Progress update for a running workflow.
     
@@ -204,7 +205,7 @@ class WorkflowProgress(msgspec.Struct, kw_only=True):
     timestamp: float = 0.0       # Monotonic timestamp
 
 
-class JobProgress(msgspec.Struct, kw_only=True):
+class JobProgress(Message, kw_only=True):
     """
     Aggregated job progress from manager to gate.
     
@@ -221,7 +222,7 @@ class JobProgress(msgspec.Struct, kw_only=True):
     timestamp: float = 0.0       # Monotonic timestamp
 
 
-class GlobalJobStatus(msgspec.Struct, kw_only=True):
+class GlobalJobStatus(Message, kw_only=True):
     """
     Global job status aggregated by gate across datacenters.
     
@@ -242,7 +243,7 @@ class GlobalJobStatus(msgspec.Struct, kw_only=True):
 # State Synchronization
 # =============================================================================
 
-class WorkerStateSnapshot(msgspec.Struct, kw_only=True):
+class WorkerStateSnapshot(Message, kw_only=True):
     """
     Complete state snapshot from a worker.
     
@@ -256,7 +257,7 @@ class WorkerStateSnapshot(msgspec.Struct, kw_only=True):
     active_workflows: dict[str, WorkflowProgress] = {}  # workflow_id -> progress
 
 
-class ManagerStateSnapshot(msgspec.Struct, kw_only=True):
+class ManagerStateSnapshot(Message, kw_only=True):
     """
     Complete state snapshot from a manager.
     
@@ -271,7 +272,7 @@ class ManagerStateSnapshot(msgspec.Struct, kw_only=True):
     jobs: dict[str, JobProgress] = {}  # Active jobs
 
 
-class StateSyncRequest(msgspec.Struct, kw_only=True):
+class StateSyncRequest(Message, kw_only=True):
     """
     Request for state synchronization.
     
@@ -282,7 +283,7 @@ class StateSyncRequest(msgspec.Struct, kw_only=True):
     since_version: int = 0       # Only send updates after this version
 
 
-class StateSyncResponse(msgspec.Struct, kw_only=True):
+class StateSyncResponse(Message, kw_only=True):
     """
     Response to state sync request.
     """
@@ -297,7 +298,7 @@ class StateSyncResponse(msgspec.Struct, kw_only=True):
 # Quorum and Confirmation
 # =============================================================================
 
-class ProvisionRequest(msgspec.Struct, kw_only=True):
+class ProvisionRequest(Message, kw_only=True):
     """
     Request to provision a workflow across the cluster.
     
@@ -311,7 +312,7 @@ class ProvisionRequest(msgspec.Struct, kw_only=True):
     version: int                 # State version for this decision
 
 
-class ProvisionConfirm(msgspec.Struct, kw_only=True):
+class ProvisionConfirm(Message, kw_only=True):
     """
     Confirmation of provision request.
     
@@ -325,7 +326,7 @@ class ProvisionConfirm(msgspec.Struct, kw_only=True):
     error: str | None = None     # Error if not confirmed
 
 
-class ProvisionCommit(msgspec.Struct, kw_only=True):
+class ProvisionCommit(Message, kw_only=True):
     """
     Commit message after quorum achieved.
     
@@ -343,7 +344,7 @@ class ProvisionCommit(msgspec.Struct, kw_only=True):
 # Cancellation
 # =============================================================================
 
-class CancelJob(msgspec.Struct, kw_only=True):
+class CancelJob(Message, kw_only=True):
     """
     Request to cancel a job.
     
@@ -355,7 +356,7 @@ class CancelJob(msgspec.Struct, kw_only=True):
     fence_token: int = 0         # Fencing token for validation
 
 
-class CancelAck(msgspec.Struct, kw_only=True):
+class CancelAck(Message, kw_only=True):
     """
     Acknowledgment of cancellation.
     """
@@ -369,7 +370,7 @@ class CancelAck(msgspec.Struct, kw_only=True):
 # Lease Management (for Gates)
 # =============================================================================
 
-class DatacenterLease(msgspec.Struct, kw_only=True):
+class DatacenterLease(Message, kw_only=True):
     """
     Lease for job execution in a datacenter.
     
@@ -383,7 +384,7 @@ class DatacenterLease(msgspec.Struct, kw_only=True):
     version: int                 # Lease version
 
 
-class LeaseTransfer(msgspec.Struct, kw_only=True):
+class LeaseTransfer(Message, kw_only=True):
     """
     Transfer a lease to another gate (during scaling).
     """

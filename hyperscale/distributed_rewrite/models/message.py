@@ -1,16 +1,13 @@
-import orjson
 import msgspec
 
 
 class Message(msgspec.Struct):
 
     @classmethod
-    def load(self, data: bytes):
-        return type(self.__class__.__name__, self, orjson.loads(data))
+    def load(cls, data: bytes):
+        """Deserialize bytes to this Message type."""
+        return msgspec.json.decode(data, type=cls)
     
-    def dump(self):
-        return orjson.dumps(
-            msgspec.structs.asdict(self)
-        )
-    
-    
+    def dump(self) -> bytes:
+        """Serialize this Message to bytes."""
+        return msgspec.json.encode(self)

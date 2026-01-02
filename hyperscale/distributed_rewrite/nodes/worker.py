@@ -21,7 +21,6 @@ Protocols:
 
 import asyncio
 import os
-import pickle
 import time
 from typing import Any
 
@@ -389,7 +388,7 @@ class WorkerServer(UDPServer):
         This is the main entry point for work arriving at the worker.
         """
         try:
-            dispatch = WorkflowDispatch(**pickle.loads(data))
+            dispatch = WorkflowDispatch.load(data)
             
             # Check if we can accept this workflow
             if self._available_cores < dispatch.vus:
@@ -564,7 +563,7 @@ class WorkerServer(UDPServer):
     ):
         """Handle state sync request from a new manager leader."""
         try:
-            request = StateSyncRequest(**pickle.loads(data))
+            request = StateSyncRequest.load(data)
             
             # Return our current state snapshot
             response = StateSyncResponse(
@@ -611,7 +610,7 @@ class WorkerServer(UDPServer):
     ):
         """Handle job cancellation request from manager."""
         try:
-            cancel_request = CancelJob(**pickle.loads(data))
+            cancel_request = CancelJob.load(data)
             
             # Find and cancel all workflows for this job
             cancelled_count = 0

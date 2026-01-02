@@ -23,7 +23,6 @@ Protocols:
 """
 
 import asyncio
-import pickle
 import secrets
 import time
 from typing import Any
@@ -345,7 +344,7 @@ class ManagerServer(UDPServer):
             )
             
             if isinstance(response, bytes):
-                return WorkflowDispatchAck(**pickle.loads(response))
+                return WorkflowDispatchAck.load(response)
             return None
             
         except Exception as e:
@@ -405,7 +404,7 @@ class ManagerServer(UDPServer):
             )
             
             if isinstance(response, bytes):
-                confirm = ProvisionConfirm(**pickle.loads(response))
+                confirm = ProvisionConfirm.load(response)
                 if confirm.confirmed:
                     self._provision_confirmations[provision.workflow_id].add(confirm.confirming_node)
                     return True
@@ -474,7 +473,7 @@ class ManagerServer(UDPServer):
     ):
         """Handle worker registration via TCP."""
         try:
-            registration = WorkerRegistration(**pickle.loads(data))
+            registration = WorkerRegistration.load(data)
             
             # Store registration
             self._workers[registration.node.node_id] = registration
@@ -515,7 +514,7 @@ class ManagerServer(UDPServer):
         This contains capacity and workflow progress information.
         """
         try:
-            status = WorkerHeartbeat(**pickle.loads(data))
+            status = WorkerHeartbeat.load(data)
             
             # Update status tracking
             self._worker_status[status.node_id] = status
@@ -536,7 +535,7 @@ class ManagerServer(UDPServer):
     ):
         """Handle workflow progress update from worker."""
         try:
-            progress = WorkflowProgress(**pickle.loads(data))
+            progress = WorkflowProgress.load(data)
             
             # Update job progress
             job = self._jobs.get(progress.job_id)
@@ -597,7 +596,7 @@ class ManagerServer(UDPServer):
     ):
         """Handle job submission from gate or client."""
         try:
-            submission = JobSubmission(**pickle.loads(data))
+            submission = JobSubmission.load(data)
             
             # Only leader accepts new jobs
             if not self.is_leader():
@@ -745,7 +744,7 @@ class ManagerServer(UDPServer):
     ):
         """Handle provision request from leader for quorum."""
         try:
-            request = ProvisionRequest(**pickle.loads(data))
+            request = ProvisionRequest.load(data)
             
             # Check if we can confirm (worker exists and has capacity)
             worker_hb = self._worker_heartbeats.get(request.target_worker)
@@ -786,7 +785,7 @@ class ManagerServer(UDPServer):
     ):
         """Handle provision commit from leader."""
         try:
-            commit = ProvisionCommit(**pickle.loads(data))
+            commit = ProvisionCommit.load(data)
             
             # Update our tracking
             self._workflow_assignments[commit.workflow_id] = commit.target_worker
@@ -831,7 +830,7 @@ class ManagerServer(UDPServer):
     ):
         """Handle state sync request (when new leader needs current state)."""
         try:
-            request = StateSyncRequest(**pickle.loads(data))
+            request = StateSyncRequest.load(data)
             
             response = StateSyncResponse(
                 responder_id=self._node_id.full,
@@ -857,7 +856,7 @@ class ManagerServer(UDPServer):
     ):
         """Handle job cancellation (from gate or client)."""
         try:
-            cancel = CancelJob(**pickle.loads(data))
+            cancel = CancelJob.load(data)
             
             job = self._jobs.get(cancel.job_id)
             if not job:
