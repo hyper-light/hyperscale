@@ -1170,6 +1170,100 @@ test_manager_retry_config()
 
 
 # =============================================================================
+# Per-Core Workflow Assignment Tests
+# =============================================================================
+
+print("\n" + "=" * 60)
+print("Per-Core Workflow Assignment Tests")
+print("=" * 60)
+
+
+@test("WorkerServer: has per-core tracking methods")
+def test_worker_per_core_methods():
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    assert hasattr(WorkerServer, '_allocate_cores')
+    assert hasattr(WorkerServer, '_free_cores')
+    assert hasattr(WorkerServer, '_get_workflow_cores')
+    assert hasattr(WorkerServer, 'get_core_assignments')
+    assert hasattr(WorkerServer, 'get_workflows_on_cores')
+    assert hasattr(WorkerServer, 'stop_workflows_on_cores')
+
+
+@test("WorkerServer: has per-core data structures")
+def test_worker_per_core_data():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import WorkerServer
+    
+    source = inspect.getsource(WorkerServer.__init__)
+    assert '_core_assignments' in source
+    assert '_workflow_cores' in source
+
+
+@test("WorkflowProgress: has assigned_cores field")
+def test_workflow_progress_cores():
+    from hyperscale.distributed_rewrite.models import WorkflowProgress
+    
+    # Create with default (empty list)
+    progress = WorkflowProgress(
+        job_id="job-1",
+        workflow_id="wf-1",
+        workflow_name="TestWorkflow",
+        status="running",
+        completed_count=0,
+        failed_count=0,
+        rate_per_second=0.0,
+        elapsed_seconds=0.0,
+    )
+    assert progress.assigned_cores == []
+    
+    # Create with specific cores
+    progress_with_cores = WorkflowProgress(
+        job_id="job-1",
+        workflow_id="wf-1",
+        workflow_name="TestWorkflow",
+        status="running",
+        completed_count=0,
+        failed_count=0,
+        rate_per_second=0.0,
+        elapsed_seconds=0.0,
+        assigned_cores=[0, 1, 2, 3],
+    )
+    assert progress_with_cores.assigned_cores == [0, 1, 2, 3]
+
+
+@test("WorkflowProgress: serialization with assigned_cores")
+def test_workflow_progress_cores_serde():
+    from hyperscale.distributed_rewrite.models import WorkflowProgress
+    
+    original = WorkflowProgress(
+        job_id="job-1",
+        workflow_id="wf-1",
+        workflow_name="TestWorkflow",
+        status="running",
+        completed_count=100,
+        failed_count=5,
+        rate_per_second=50.0,
+        elapsed_seconds=2.0,
+        assigned_cores=[0, 2, 4, 6],
+    )
+    
+    data = original.dump()
+    loaded = WorkflowProgress.load(data)
+    
+    assert loaded.assigned_cores == [0, 2, 4, 6]
+    assert loaded.workflow_id == "wf-1"
+    assert loaded.completed_count == 100
+
+
+# Run Per-Core tests
+test_worker_per_core_methods()
+test_worker_per_core_data()
+test_workflow_progress_cores()
+test_workflow_progress_cores_serde()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

@@ -96,6 +96,14 @@ class WorkerServer(UDPServer):
         self._total_cores = total_cores or os.cpu_count() or 1
         self._available_cores = self._total_cores
         
+        # Per-core workflow assignment tracking
+        # Maps core_index -> workflow_id (None if core is free)
+        self._core_assignments: dict[int, str | None] = {
+            i: None for i in range(self._total_cores)
+        }
+        # Reverse mapping: workflow_id -> list of assigned core indices
+        self._workflow_cores: dict[str, list[int]] = {}
+        
         # Manager discovery (UDP addresses for SWIM, TCP for data)
         self._manager_addrs = manager_addrs or []  # TCP addresses
         self._manager_udp_addrs: list[tuple[str, int]] = []  # UDP addresses for SWIM
@@ -276,6 +284,102 @@ class WorkerServer(UDPServer):
             active_workflows=dict(self._active_workflows),
         )
     
+    # =========================================================================
+    # Per-Core Assignment Tracking
+    # =========================================================================
+    
+    def _allocate_cores(self, workflow_id: str, num_cores: int) -> list[int]:
+        """
+        Allocate a number of cores to a workflow.
+        
+        Args:
+            workflow_id: The workflow to allocate cores for.
+            num_cores: Number of cores to allocate.
+        
+        Returns:
+            List of allocated core indices, or empty list if not enough free.
+        """
+        # Find free cores
+        free_cores = [i for i, wf_id in self._core_assignments.items() if wf_id is None]
+        
+        if len(free_cores) < num_cores:
+            return []
+        
+        # Allocate the first N free cores
+        allocated = free_cores[:num_cores]
+        for core_idx in allocated:
+            self._core_assignments[core_idx] = workflow_id
+        
+        self._workflow_cores[workflow_id] = allocated
+        self._available_cores = len(
+            [i for i, wf_id in self._core_assignments.items() if wf_id is None]
+        )
+        
+        return allocated
+    
+    def _free_cores(self, workflow_id: str) -> list[int]:
+        """
+        Free all cores allocated to a workflow.
+        
+        Args:
+            workflow_id: The workflow to free cores for.
+        
+        Returns:
+            List of freed core indices.
+        """
+        allocated = self._workflow_cores.pop(workflow_id, [])
+        
+        for core_idx in allocated:
+            if self._core_assignments.get(core_idx) == workflow_id:
+                self._core_assignments[core_idx] = None
+        
+        self._available_cores = len(
+            [i for i, wf_id in self._core_assignments.items() if wf_id is None]
+        )
+        
+        return allocated
+    
+    def _get_workflow_cores(self, workflow_id: str) -> list[int]:
+        """Get the core indices assigned to a workflow."""
+        return self._workflow_cores.get(workflow_id, [])
+    
+    def get_core_assignments(self) -> dict[int, str | None]:
+        """Get a copy of the current core assignments."""
+        return dict(self._core_assignments)
+    
+    def get_workflows_on_cores(self, core_indices: list[int]) -> set[str]:
+        """Get workflows running on specific cores."""
+        workflows = set()
+        for core_idx in core_indices:
+            wf_id = self._core_assignments.get(core_idx)
+            if wf_id:
+                workflows.add(wf_id)
+        return workflows
+    
+    async def stop_workflows_on_cores(
+        self,
+        core_indices: list[int],
+        reason: str = "core_stop",
+    ) -> list[str]:
+        """
+        Stop all workflows running on specific cores (hierarchical stop).
+        
+        Args:
+            core_indices: List of core indices to stop workflows on.
+            reason: Reason for stopping.
+        
+        Returns:
+            List of stopped workflow IDs.
+        """
+        workflows = self.get_workflows_on_cores(core_indices)
+        stopped = []
+        
+        for wf_id in workflows:
+            if await self._cancel_workflow(wf_id, reason):
+                stopped.append(wf_id)
+        
+        return stopped
+    
     async def _cancel_workflow(self, workflow_id: str, reason: str) -> bool:
         """Cancel a running workflow."""
         if workflow_id not in self._workflow_tasks:
@@ -363,11 +467,19 @@ class WorkerServer(UDPServer):
                 )
                 return ack.dump()
             
-            # Accept the workflow
-            self._available_cores -= dispatch.vus
+            # Allocate cores to this workflow
+            allocated_cores = self._allocate_cores(dispatch.workflow_id, dispatch.vus)
+            if not allocated_cores:
+                ack = WorkflowDispatchAck(
+                    workflow_id=dispatch.workflow_id,
+                    accepted=False,
+                    error=f"Failed to allocate {dispatch.vus} cores",
+                )
+                return ack.dump()
+            
             self._increment_version()
             
-            # Create progress tracker
+            # Create progress tracker with assigned cores
             progress = WorkflowProgress(
                 job_id=dispatch.job_id,
                 workflow_id=dispatch.workflow_id,
@@ -378,6 +490,7 @@ class WorkerServer(UDPServer):
                 rate_per_second=0.0,
                 elapsed_seconds=0.0,
                 timestamp=time.monotonic(),
+                assigned_cores=allocated_cores,  # Per-core tracking
             )
             self._active_workflows[dispatch.workflow_id] = progress
             
@@ -460,8 +573,8 @@ class WorkerServer(UDPServer):
             progress.status = WorkflowStatus.FAILED.value
             await self.handle_exception(e, f"execute_workflow_{dispatch.workflow_id}")
         finally:
-            # Free cores
-            self._available_cores += dispatch.vus
+            # Free cores using per-core tracking
+            self._free_cores(dispatch.workflow_id)
             self._increment_version()
             
             # Cleanup

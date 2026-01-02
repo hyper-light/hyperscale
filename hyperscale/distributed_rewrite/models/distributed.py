@@ -212,6 +212,7 @@ class WorkflowProgress(Message):
     elapsed_seconds: float       # Time since start
     step_stats: list["StepStats"] = field(default_factory=list)
     timestamp: float = 0.0       # Monotonic timestamp
+    assigned_cores: list[int] = field(default_factory=list)  # Per-core assignment
 
 
 @dataclass(slots=True)
