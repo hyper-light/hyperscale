@@ -3506,6 +3506,66 @@ _dispatch_workflow_to_worker(worker_id, dispatch, max_retries=2, base_delay=0.3)
 - Per-worker circuits prevent one bad worker from affecting others
 - Exponential backoff prevents thundering herd on recovery
 
+### Manager ↔ Gate Communication Resilience (✅ Implemented)
+
+All Manager ↔ Gate communication now uses retries with exponential backoff and circuit breakers.
+
+#### Manager → Gate Communication
+
+**Circuit Breaker**:
+- `_gate_circuit`: ErrorStats tracking failures to gates
+- `_is_gate_circuit_open()`: Check if circuit is open (fail-fast mode)
+- `get_gate_circuit_status()`: Observability endpoint
+- Settings: Opens after 3 failures in 30s, recovers after 10s
+
+**Registration with Retries**:
+```python
+_try_register_with_gate(gate_addr, max_retries=3, base_delay=0.5)
+# Delays: 0.5s → 1.0s → 2.0s
+# Checks circuit breaker before attempting
+# Records success/error for circuit state
+# Gate rejection (not accepted) does NOT trigger retry
+```
+
+**Job Progress with Retries**:
+```python
+_send_job_progress_to_gate(job, max_retries=2, base_delay=0.2)
+# Delays: 0.2s → 0.4s (shorter for frequent updates)
+# Checks circuit breaker before attempting
+# Records success/error for circuit state
+```
+
+#### Gate → Manager Communication
+
+**Per-Manager Circuit Breakers**:
+- `_manager_circuits: dict[tuple[str, int], ErrorStats]`: One circuit per manager
+- `_get_manager_circuit()`: Get or create circuit for a manager
+- `_is_manager_circuit_open()`: Check if manager's circuit is open
+- `get_manager_circuit_status()`: Status for specific manager
+- `get_all_manager_circuit_status()`: Status for all managers
+
+**Dispatch with Retries**:
+```python
+_try_dispatch_to_manager(manager_addr, submission, max_retries=2, base_delay=0.3)
+# Delays: 0.3s → 0.6s
+# Checks per-manager circuit before attempting
+# Records success/error for per-manager circuit
+# Manager rejection (not accepted, not busy) does NOT trigger retry
+# BUSY response treated as success (job will be queued)
+```
+
+**DC-Level Dispatch**:
+- `_try_dispatch_to_dc()`: Iterates managers, uses `_try_dispatch_to_manager`
+- `_dispatch_job_with_fallback()`: Handles DC-level fallback chain
+- Per-manager failures don't affect other managers in same DC
+- If all managers in DC fail, tries fallback DCs
+
+**Benefits**:
+- Transient network failures retried automatically
+- Per-manager circuits prevent one bad manager from affecting others
+- DC-level fallback ensures jobs reach healthy DCs
+- Exponential backoff prevents thundering herd on recovery
+
 ### Client Push Notifications (Implemented)
 
 Client push notifications allow Gates and Managers to push job status updates directly to clients, eliminating the need for polling.
@@ -3593,7 +3653,7 @@ Run the test suite:
 python examples/test_distributed_rewrite.py
 ```
 
-Current test coverage: 230+ tests covering:
+Current test coverage: 254+ tests covering:
 - SWIM protocol (probing, suspicion, gossip)
 - Leadership election (pre-voting, flapping)
 - State embedding (heartbeat serialization)
@@ -3615,6 +3675,10 @@ Current test coverage: 230+ tests covering:
 - Worker retries with exponential backoff (registration, progress)
 - Manager per-worker circuit breakers
 - Manager retries with exponential backoff (workflow dispatch)
+- Manager circuit breaker for gate communication
+- Manager retries with exponential backoff (gate registration, job progress)
+- Gate per-manager circuit breakers
+- Gate retries with exponential backoff (manager dispatch)
 
 ---
 
