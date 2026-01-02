@@ -25,8 +25,6 @@ import os
 import time
 from typing import Any
 
-import cloudpickle
-
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.distributed_rewrite.swim import UDPServer, WorkerStateEmbedder
 from hyperscale.distributed_rewrite.models import (
@@ -577,9 +575,10 @@ class WorkerServer(UDPServer):
             self._free_cores(dispatch.workflow_id)
             self._increment_version()
             
-            # Cleanup
+            # Cleanup all workflow state
             self._workflow_tasks.pop(dispatch.workflow_id, None)
             self._workflow_cancel_events.pop(dispatch.workflow_id, None)
+            self._active_workflows.pop(dispatch.workflow_id, None)
     
     async def _send_progress_update(self, progress: WorkflowProgress) -> None:
         """Send a progress update to the manager."""
