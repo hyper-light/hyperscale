@@ -4055,6 +4055,43 @@ def test_gate_dispatch_records_circuit():
         "_dispatch_job_to_datacenters should record circuit state"
 
 
+@test("GateServer: raises QuorumCircuitOpenError when circuit is open")
+def test_gate_raises_circuit_open_error():
+    import pathlib
+    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    
+    source_file = pathlib.Path(gate_module.__file__)
+    source = source_file.read_text()
+    
+    assert "raise QuorumCircuitOpenError" in source, \
+        "receive_job_submission should raise QuorumCircuitOpenError when circuit is open"
+
+
+@test("GateServer: raises QuorumUnavailableError when quorum unavailable")
+def test_gate_raises_quorum_unavailable_error():
+    import pathlib
+    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    
+    source_file = pathlib.Path(gate_module.__file__)
+    source = source_file.read_text()
+    
+    assert "raise QuorumUnavailableError" in source, \
+        "receive_job_submission should raise QuorumUnavailableError when quorum unavailable"
+
+
+@test("GateServer: handles QuorumCircuitOpenError without recording error")
+def test_gate_handles_circuit_open_error():
+    import pathlib
+    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    
+    source_file = pathlib.Path(gate_module.__file__)
+    source = source_file.read_text()
+    
+    # Should have separate except block for QuorumCircuitOpenError
+    assert "except QuorumCircuitOpenError" in source, \
+        "Should have separate handler for QuorumCircuitOpenError"
+
+
 # Run Gate State and Quorum tests
 test_gate_state_enum()
 test_gate_heartbeat_has_state()
@@ -4070,6 +4107,9 @@ test_gate_job_submission_checks_quorum()
 test_gate_start_calls_sync()
 test_gate_embedder_includes_state()
 test_gate_dispatch_records_circuit()
+test_gate_raises_circuit_open_error()
+test_gate_raises_quorum_unavailable_error()
+test_gate_handles_circuit_open_error()
 
 
 # =============================================================================

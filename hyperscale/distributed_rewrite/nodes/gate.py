@@ -1805,21 +1805,21 @@ class GateServer(HealthAwareServer):
             
             # Check quorum circuit breaker (fail-fast)
             if self._quorum_circuit.circuit_state == CircuitState.OPEN:
-                ack = JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error="Quorum circuit breaker is OPEN - too many recent failures",
+                # Calculate retry_after from half_open_after setting
+                retry_after = self._quorum_circuit.half_open_after
+                raise QuorumCircuitOpenError(
+                    recent_failures=self._quorum_circuit.error_count,
+                    window_seconds=self._quorum_circuit.window_seconds,
+                    retry_after_seconds=retry_after,
                 )
-                return ack.dump()
             
             # Check if quorum is available (multi-gate deployments)
             if len(self._active_gate_peers) > 0 and not self._has_quorum_available():
-                ack = JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error=f"Quorum unavailable: {len(self._active_gate_peers) + 1} gates, need {self._quorum_size()}",
+                active_gates = len(self._active_gate_peers) + 1  # +1 for self
+                raise QuorumUnavailableError(
+                    active_managers=active_gates,  # Using same field name for consistency
+                    required_quorum=self._quorum_size(),
                 )
-                return ack.dump()
             
             # Select datacenters
             target_dcs = self._select_datacenters(
@@ -1865,7 +1865,16 @@ class GateServer(HealthAwareServer):
             )
             return ack.dump()
             
+        except QuorumCircuitOpenError as e:
+            # Circuit already open - don't record another error (would extend open state)
+            ack = JobAck(
+                job_id=submission.job_id if 'submission' in dir() else "unknown",
+                accepted=False,
+                error=str(e),
+            )
+            return ack.dump()
         except QuorumError as e:
+            # Record error for circuit breaker (QuorumUnavailableError, etc.)
             self._quorum_circuit.record_error()
             ack = JobAck(
                 job_id=submission.job_id if 'submission' in dir() else "unknown",
