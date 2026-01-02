@@ -2974,7 +2974,7 @@ class ManagerServer(HealthAwareServer):
         return data
     
     @tcp.receive()
-    async def receive_job_submission(
+    async def job_submission(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -3026,7 +3026,7 @@ class ManagerServer(HealthAwareServer):
             return ack.dump()
             
         except Exception as e:
-            await self.handle_exception(e, "receive_job_submission")
+            await self.handle_exception(e, "job_submission")
             ack = JobAck(
                 job_id="unknown",
                 accepted=False,

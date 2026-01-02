@@ -665,6 +665,45 @@ Execute actual workflow code on CPU cores.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### TCP Length-Prefixed Framing
+
+TCP is a stream protocol, not a message protocol. Data can arrive fragmented across multiple `data_received` callbacks, especially for large payloads like cloudpickled workflow classes. To ensure reliable message delivery, all TCP messages use **length-prefixed framing**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TCP MESSAGE FRAMING                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Wire Format:                                                    │
+│  ┌──────────────┬────────────────────────────────────────────┐  │
+│  │ Length (4B)  │              Payload (N bytes)              │  │
+│  │  big-endian  │  [encrypted(compressed(addr<action<data))]  │  │
+│  └──────────────┴────────────────────────────────────────────┘  │
+│                                                                  │
+│  Processing Flow:                                                │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                                                             │ │
+│  │  1. Buffer incoming data in ReceiveBuffer                  │ │
+│  │  2. Read 4-byte length prefix (big-endian uint32)          │ │
+│  │  3. Wait for complete message (length prefix + payload)    │ │
+│  │  4. Extract and process complete message                   │ │
+│  │  5. Repeat for any remaining buffered data                 │ │
+│  │                                                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  Design Rationale:                                               │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                                                             │ │
+│  │  • 4-byte prefix supports messages up to ~4GB              │ │
+│  │  • Handles arbitrary-sized cloudpickled classes            │ │
+│  │  • Prevents pickle truncation on large payloads            │ │
+│  │  • Applied after compression/encryption (framing is outer) │ │
+│  │                                                             │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ### Leadership Election
 
 Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibility:
@@ -2864,9 +2903,10 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │                                                                  │
 │  Message Size Limits:                                            │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │ • MAX_MESSAGE_SIZE: 10MB                                  │  │
-│  │ • MAX_DECOMPRESSED_SIZE: 100MB                            │  │
-│  │ • Compression bomb detection                              │  │
+│  │ • MAX_MESSAGE_SIZE: 1MB (compressed)                      │  │
+│  │ • MAX_DECOMPRESSED_SIZE: 50MB                             │  │
+│  │ • Compression bomb detection (max ratio: 100x)            │  │
+│  │ • Large enough for cloudpickled workflow classes          │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  Serialization Security:                                         │

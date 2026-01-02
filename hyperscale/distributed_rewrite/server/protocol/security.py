@@ -24,8 +24,9 @@ from hyperscale.core.jobs.protocols.rate_limiter import (
 
 
 # Message size limits
-MAX_MESSAGE_SIZE = 64 * 1024  # 64KB - maximum compressed message size
-MAX_DECOMPRESSED_SIZE = 10 * 1024 * 1024  # 10MB - maximum decompressed size
+# Job submissions with workflow classes can be large when pickled
+MAX_MESSAGE_SIZE = 1 * 1024 * 1024  # 1MB - maximum compressed message size
+MAX_DECOMPRESSED_SIZE = 50 * 1024 * 1024  # 50MB - maximum decompressed size
 MAX_COMPRESSION_RATIO = 100  # Maximum decompression ratio (compression bomb protection)
 
 

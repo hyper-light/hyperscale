@@ -47,6 +47,7 @@ from hyperscale.distributed_rewrite.server.protocol import (
     AddressValidationError,
     MAX_MESSAGE_SIZE,
     MAX_DECOMPRESSED_SIZE,
+    frame_message,
 )
 from hyperscale.distributed_rewrite.server.events import LamportClock
 from hyperscale.distributed_rewrite.server.hooks.task import (
@@ -732,11 +733,16 @@ class MercurySyncBaseServer(Generic[T]):
                 if isinstance(data, Message):
                     data = data.dump()
 
-                transport.write(
-                    self._encryptor.encrypt(
-                        self._compressor.compress(self._tcp_addr_slug + b'<' + encoded_action +  b'<' + data  + b'<' + clock.to_bytes(64) )
-                    ),
+                # Build the message payload
+                payload = self._tcp_addr_slug + b'<' + encoded_action + b'<' + data + b'<' + clock.to_bytes(64)
+                
+                # Compress and encrypt
+                encrypted = self._encryptor.encrypt(
+                    self._compressor.compress(payload)
                 )
+                
+                # Frame with length prefix for proper TCP stream handling
+                transport.write(frame_message(encrypted))
 
 
                 host, port = address
@@ -1122,7 +1128,8 @@ class MercurySyncBaseServer(Generic[T]):
                 )
             )
 
-            transport.write(response_payload)
+            # Frame with length prefix for proper TCP stream handling
+            transport.write(frame_message(response_payload))
 
         except Exception as e:
             # Log security event - could be decryption failure, malformed message, etc.
@@ -1138,7 +1145,8 @@ class MercurySyncBaseServer(Generic[T]):
                         self._tcp_addr_slug + b'<' + handler_name + b'<Request processing failed<' + error_time.to_bytes(64),
                     )
                 )
-                transport.write(error_response)
+                # Frame with length prefix for proper TCP stream handling
+                transport.write(frame_message(error_response))
             except Exception:
                 pass  # Best effort error response
 

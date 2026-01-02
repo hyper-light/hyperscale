@@ -64,10 +64,20 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
         self.scheme = "mtcps" if is_ssl(transport) else "mtcp"
 
     def data_received(self, data: bytes):
-        self.read(
-            data,
-            self.transport,
-        )
+        # Buffer incoming data for length-prefixed framing
+        self._receive_buffer += data
+        
+        # Process all complete messages in the buffer
+        while True:
+            message = self._receive_buffer.maybe_extract_framed()
+            if message is None:
+                break
+            
+            # Pass complete message to handler
+            self.read(
+                message,
+                self.transport,
+            )
 
     def connection_lost(self, exc: Exception | None):
         self.connections.discard(self)

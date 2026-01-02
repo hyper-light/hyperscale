@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# Length prefix size (4 bytes = 32-bit unsigned integer, supports up to ~4GB messages)
+LENGTH_PREFIX_SIZE = 4
+
 
 class ReceiveBuffer:
     def __init__(self) -> None:
@@ -53,8 +56,45 @@ class ReceiveBuffer:
         self._multiple_lines_search = 0
 
         return out
+
+    def maybe_extract_framed(self) -> bytes | None:
+        """
+        Extract a length-prefixed message from the buffer.
+        
+        Message format: [4-byte length prefix (big-endian)] + [payload]
+        
+        Returns the payload (without length prefix) if complete message is available,
+        otherwise returns None.
+        """
+        # Need at least the length prefix to know message size
+        if len(self.buffer) < LENGTH_PREFIX_SIZE:
+            return None
+        
+        # Read the length prefix (4 bytes, big-endian unsigned int)
+        message_length = int.from_bytes(self.buffer[:LENGTH_PREFIX_SIZE], 'big')
+        
+        # Check if we have the complete message
+        total_length = LENGTH_PREFIX_SIZE + message_length
+        if len(self.buffer) < total_length:
+            return None
+        
+        # Extract the complete message (skip the length prefix)
+        self._extract(LENGTH_PREFIX_SIZE)  # Remove length prefix
+        payload = bytes(self._extract(message_length))  # Extract payload
+        
+        return payload
     
     def clear(self):
         self.buffer.clear()
         self._next_line_search = 0
         self._multiple_lines_search = 0
+
+
+def frame_message(data: bytes) -> bytes:
+    """
+    Frame a message with a length prefix for TCP transmission.
+    
+    Returns: [4-byte length prefix (big-endian)] + [data]
+    """
+    length_prefix = len(data).to_bytes(LENGTH_PREFIX_SIZE, 'big')
+    return length_prefix + data
