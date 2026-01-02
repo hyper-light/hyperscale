@@ -52,6 +52,22 @@ class WorkerState(str, Enum):
     OFFLINE = "offline"          # Not responding
 
 
+class DatacenterHealth(str, Enum):
+    """
+    Health classification for datacenter routing decisions.
+    
+    Key insight: BUSY ≠ UNHEALTHY
+    - BUSY = transient, will clear when workflows complete → accept job (queued)
+    - UNHEALTHY = structural problem, requires intervention → try fallback
+    
+    See AD-16 in docs/architecture.md for design rationale.
+    """
+    HEALTHY = "healthy"      # Managers responding, workers available, capacity exists
+    BUSY = "busy"            # Managers responding, workers available, no immediate capacity
+    DEGRADED = "degraded"    # Some managers responding, reduced capacity
+    UNHEALTHY = "unhealthy"  # No managers responding OR all workers down
+
+
 # =============================================================================
 # Node Identity and Registration
 # =============================================================================
@@ -428,3 +444,26 @@ class LeaseTransfer(Message):
     to_gate: str                 # New holder
     new_fence_token: int         # New fencing token
     version: int                 # Transfer version
+
+
+# =============================================================================
+# Datacenter Health & Routing
+# =============================================================================
+
+@dataclass(slots=True, kw_only=True)
+class DatacenterStatus(Message):
+    """
+    Status of a datacenter for routing decisions.
+    
+    Used by gates to classify datacenter health and make
+    intelligent routing decisions with fallback support.
+    
+    See AD-16 in docs/architecture.md for design rationale.
+    """
+    dc_id: str                       # Datacenter identifier
+    health: str                      # DatacenterHealth value
+    available_capacity: int = 0      # Estimated available cores
+    queue_depth: int = 0             # Jobs waiting
+    manager_count: int = 0           # Responding managers (via SWIM)
+    worker_count: int = 0            # Available workers
+    last_update: float = 0.0         # Timestamp of last status update

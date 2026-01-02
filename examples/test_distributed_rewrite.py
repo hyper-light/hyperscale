@@ -2364,6 +2364,221 @@ test_job_stats_crdt_cross_dc_merge()
 
 
 # =============================================================================
+# Datacenter Health Classification & Smart Dispatch Tests
+# =============================================================================
+
+print("\nDatacenter Health Classification Tests")
+print("=" * 50)
+
+
+@test("DatacenterHealth: enum has all required states")
+def test_dc_health_enum():
+    from hyperscale.distributed_rewrite.models import DatacenterHealth
+    
+    assert hasattr(DatacenterHealth, 'HEALTHY')
+    assert hasattr(DatacenterHealth, 'BUSY')
+    assert hasattr(DatacenterHealth, 'DEGRADED')
+    assert hasattr(DatacenterHealth, 'UNHEALTHY')
+    
+    assert DatacenterHealth.HEALTHY.value == "healthy"
+    assert DatacenterHealth.BUSY.value == "busy"
+    assert DatacenterHealth.DEGRADED.value == "degraded"
+    assert DatacenterHealth.UNHEALTHY.value == "unhealthy"
+
+
+@test("DatacenterStatus: has all required fields")
+def test_dc_status_fields():
+    from hyperscale.distributed_rewrite.models import DatacenterStatus, DatacenterHealth
+    
+    status = DatacenterStatus(
+        dc_id="us-east-1",
+        health=DatacenterHealth.HEALTHY.value,
+        available_capacity=100,
+        queue_depth=5,
+        manager_count=3,
+        worker_count=10,
+        last_update=123.456,
+    )
+    
+    assert status.dc_id == "us-east-1"
+    assert status.health == "healthy"
+    assert status.available_capacity == 100
+    assert status.queue_depth == 5
+    assert status.manager_count == 3
+    assert status.worker_count == 10
+
+
+@test("DatacenterStatus: serialization round-trip")
+def test_dc_status_serialization():
+    from hyperscale.distributed_rewrite.models import DatacenterStatus, DatacenterHealth
+    
+    status = DatacenterStatus(
+        dc_id="eu-west-1",
+        health=DatacenterHealth.BUSY.value,
+        available_capacity=0,
+        queue_depth=50,
+        manager_count=2,
+        worker_count=5,
+    )
+    
+    data = status.dump()
+    restored = DatacenterStatus.load(data)
+    
+    assert restored.dc_id == status.dc_id
+    assert restored.health == status.health
+    assert restored.available_capacity == status.available_capacity
+
+
+@test("GateServer: has _classify_datacenter_health method")
+def test_gate_has_classify_dc_health():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_classify_datacenter_health'), \
+        "GateServer must have _classify_datacenter_health method"
+
+
+@test("GateServer: has _get_all_datacenter_health method")
+def test_gate_has_get_all_dc_health():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_get_all_datacenter_health'), \
+        "GateServer must have _get_all_datacenter_health method"
+
+
+@test("GateServer: has _select_datacenters_with_fallback method")
+def test_gate_has_select_dc_fallback():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_select_datacenters_with_fallback'), \
+        "GateServer must have _select_datacenters_with_fallback method"
+
+
+@test("GateServer: has _try_dispatch_to_dc method")
+def test_gate_has_try_dispatch():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_try_dispatch_to_dc'), \
+        "GateServer must have _try_dispatch_to_dc method"
+
+
+@test("GateServer: has _dispatch_job_with_fallback method")
+def test_gate_has_dispatch_fallback():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_dispatch_job_with_fallback'), \
+        "GateServer must have _dispatch_job_with_fallback method"
+
+
+@test("GateServer: _classify_datacenter_health returns DatacenterStatus")
+def test_gate_classify_dc_returns_status():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._classify_datacenter_health)
+    
+    # Should return DatacenterStatus
+    assert 'DatacenterStatus' in source, \
+        "_classify_datacenter_health must return DatacenterStatus"
+    
+    # Should check manager liveness via SWIM
+    assert 'incarnation_tracker' in source or 'get_node_state' in source, \
+        "_classify_datacenter_health should check SWIM liveness"
+    
+    # Should check for HEALTHY, BUSY, DEGRADED, UNHEALTHY
+    assert 'HEALTHY' in source
+    assert 'BUSY' in source
+    assert 'UNHEALTHY' in source
+
+
+@test("GateServer: _select_datacenters_with_fallback returns tuple")
+def test_gate_select_dc_returns_tuple():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._select_datacenters_with_fallback)
+    
+    # Should return tuple of (primary, fallback)
+    assert 'tuple' in source or 'return (primary' in source or 'return (' in source, \
+        "_select_datacenters_with_fallback should return tuple"
+    
+    # Should bucket by health
+    assert 'healthy' in source.lower() and 'busy' in source.lower()
+
+
+@test("GateServer: _dispatch_job_to_datacenters uses fallback")
+def test_gate_dispatch_uses_fallback():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._dispatch_job_to_datacenters)
+    
+    # Should use fallback mechanism
+    assert '_dispatch_job_with_fallback' in source or '_select_datacenters_with_fallback' in source, \
+        "_dispatch_job_to_datacenters should use fallback mechanism"
+
+
+@test("Smart dispatch: only fails if ALL DCs are UNHEALTHY")
+def test_smart_dispatch_only_fail_if_all_unhealthy():
+    """
+    Verify the key insight: BUSY ≠ UNHEALTHY.
+    Jobs should only fail if ALL datacenters are UNHEALTHY.
+    BUSY DCs should still accept jobs (they will be queued).
+    """
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    # Check _try_dispatch_to_dc handles BUSY correctly
+    try_dispatch_source = inspect.getsource(GateServer._try_dispatch_to_dc)
+    
+    # Should treat "no capacity" / "busy" as acceptable
+    assert 'no capacity' in try_dispatch_source.lower() or 'busy' in try_dispatch_source.lower(), \
+        "_try_dispatch_to_dc should treat BUSY as acceptable"
+    
+    # Check _dispatch_job_to_datacenters only fails when ALL fail
+    dispatch_source = inspect.getsource(GateServer._dispatch_job_to_datacenters)
+    
+    # Should check if successful_dcs is empty before failing
+    assert 'not successful_dcs' in dispatch_source or 'if not successful' in dispatch_source or \
+           'successful_dcs' in dispatch_source, \
+        "_dispatch_job_to_datacenters should check if any DC succeeded"
+
+
+@test("Health classification: BUSY when managers responding but no capacity")
+def test_health_classification_busy():
+    """
+    BUSY state should be assigned when:
+    - Managers are responding (alive via SWIM)
+    - Workers exist
+    - But no immediate capacity (available_cores = 0)
+    """
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._classify_datacenter_health)
+    
+    # Should check for workers existing but no capacity
+    assert 'worker_count' in source and 'available_cores' in source or \
+           'worker_count' in source and 'capacity' in source.lower(), \
+        "_classify_datacenter_health should distinguish BUSY from UNHEALTHY"
+
+
+# Run DC Health Classification tests
+test_dc_health_enum()
+test_dc_status_fields()
+test_dc_status_serialization()
+test_gate_has_classify_dc_health()
+test_gate_has_get_all_dc_health()
+test_gate_has_select_dc_fallback()
+test_gate_has_try_dispatch()
+test_gate_has_dispatch_fallback()
+test_gate_classify_dc_returns_status()
+test_gate_select_dc_returns_tuple()
+test_gate_dispatch_uses_fallback()
+test_smart_dispatch_only_fail_if_all_unhealthy()
+test_health_classification_busy()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

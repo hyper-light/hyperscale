@@ -43,6 +43,8 @@ from hyperscale.distributed_rewrite.models import (
     CancelAck,
     DatacenterLease,
     LeaseTransfer,
+    DatacenterHealth,
+    DatacenterStatus,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -302,34 +304,164 @@ class GateServer(UDPServer):
         self._fence_token += 1
         return self._fence_token
     
+    def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
+        """
+        Classify datacenter health based on SWIM probes and status updates.
+        
+        Health States:
+        - HEALTHY: Managers responding, workers available, capacity exists
+        - BUSY: Managers responding, workers available, no immediate capacity
+        - DEGRADED: Some managers responding, reduced capacity
+        - UNHEALTHY: No managers responding OR all workers down
+        
+        Key insight: BUSY ≠ UNHEALTHY
+        - BUSY = transient, will clear → accept job (queued)
+        - UNHEALTHY = structural problem → try fallback
+        
+        See AD-16 in docs/architecture.md.
+        """
+        # Check manager liveness via SWIM
+        manager_udp_addrs = self._datacenter_manager_udp.get(dc_id, [])
+        alive_managers = 0
+        for addr in manager_udp_addrs:
+            node_state = self._incarnation_tracker.get_node_state(addr)
+            if node_state and node_state.status == b'OK':
+                alive_managers += 1
+        
+        # Get status from TCP heartbeats
+        status = self._datacenter_status.get(dc_id)
+        
+        # No managers responding = UNHEALTHY
+        if alive_managers == 0:
+            return DatacenterStatus(
+                dc_id=dc_id,
+                health=DatacenterHealth.UNHEALTHY.value,
+                available_capacity=0,
+                queue_depth=0,
+                manager_count=0,
+                worker_count=0,
+                last_update=time.monotonic(),
+            )
+        
+        # No status update or no workers = UNHEALTHY
+        if not status or status.worker_count == 0:
+            return DatacenterStatus(
+                dc_id=dc_id,
+                health=DatacenterHealth.UNHEALTHY.value,
+                available_capacity=0,
+                queue_depth=0,
+                manager_count=alive_managers,
+                worker_count=0,
+                last_update=time.monotonic(),
+            )
+        
+        # Determine health based on capacity
+        if status.available_cores > 0:
+            health = DatacenterHealth.HEALTHY
+        elif status.worker_count > 0:
+            # Workers exist but no capacity = BUSY (not unhealthy!)
+            health = DatacenterHealth.BUSY
+        else:
+            health = DatacenterHealth.DEGRADED
+        
+        # Partial manager response = DEGRADED
+        if len(manager_udp_addrs) > 0 and alive_managers < len(manager_udp_addrs) // 2 + 1:
+            health = DatacenterHealth.DEGRADED
+        
+        return DatacenterStatus(
+            dc_id=dc_id,
+            health=health.value,
+            available_capacity=status.available_cores,
+            queue_depth=getattr(status, 'queue_depth', 0),
+            manager_count=alive_managers,
+            worker_count=status.worker_count,
+            last_update=time.monotonic(),
+        )
+    
+    def _get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
+        """Get health classification for all configured datacenters."""
+        return {
+            dc_id: self._classify_datacenter_health(dc_id)
+            for dc_id in self._datacenter_managers.keys()
+        }
+    
     def _get_available_datacenters(self) -> list[str]:
         """
-        Get list of healthy datacenters.
+        Get list of healthy datacenters (for backwards compatibility).
         
         A datacenter is healthy if:
         1. Its manager(s) are alive per SWIM UDP probes
         2. It has workers available (from TCP status updates)
         """
         healthy = []
-        
-        for dc, manager_udp_addrs in self._datacenter_manager_udp.items():
-            # Check if at least one manager is alive per SWIM
-            dc_alive = False
-            for manager_addr in manager_udp_addrs:
-                node_state = self._incarnation_tracker.get_node_state(manager_addr)
-                if node_state and node_state.status == b'OK':
-                    dc_alive = True
-                    break
-            
-            if not dc_alive:
-                continue
-            
-            # Check status from TCP updates - must have workers
-            status = self._datacenter_status.get(dc)
-            if status and status.worker_count > 0:
-                healthy.append(dc)
-        
+        for dc_id in self._datacenter_managers.keys():
+            status = self._classify_datacenter_health(dc_id)
+            if status.health != DatacenterHealth.UNHEALTHY.value:
+                healthy.append(dc_id)
         return healthy
+    
+    def _select_datacenters_with_fallback(
+        self,
+        count: int,
+        preferred: list[str] | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """
+        Select datacenters with fallback list for resilient routing.
+        
+        Priority order: HEALTHY > BUSY > DEGRADED
+        Only UNHEALTHY DCs are excluded entirely.
+        
+        Args:
+            count: Number of primary DCs to select
+            preferred: Optional list of preferred DCs
+            
+        Returns:
+            (primary_dcs, fallback_dcs)
+        """
+        # Classify all DCs
+        dc_health = self._get_all_datacenter_health()
+        
+        # Bucket by health
+        healthy = []
+        busy = []
+        degraded = []
+        
+        for dc_id, status in dc_health.items():
+            if status.health == DatacenterHealth.HEALTHY.value:
+                healthy.append((dc_id, status))
+            elif status.health == DatacenterHealth.BUSY.value:
+                busy.append((dc_id, status))
+            elif status.health == DatacenterHealth.DEGRADED.value:
+                degraded.append((dc_id, status))
+            # UNHEALTHY DCs are excluded
+        
+        # Sort healthy by capacity (highest first)
+        healthy.sort(key=lambda x: x[1].available_capacity, reverse=True)
+        
+        # Extract just DC IDs
+        healthy_ids = [dc for dc, _ in healthy]
+        busy_ids = [dc for dc, _ in busy]
+        degraded_ids = [dc for dc, _ in degraded]
+        
+        # Respect preferences within healthy
+        if preferred:
+            preferred_healthy = [dc for dc in preferred if dc in healthy_ids]
+            other_healthy = [dc for dc in healthy_ids if dc not in preferred]
+            healthy_ids = preferred_healthy + other_healthy
+        
+        # Build selection: HEALTHY first, then BUSY, then DEGRADED
+        all_usable = healthy_ids + busy_ids + degraded_ids
+        
+        if len(all_usable) == 0:
+            # All DCs are UNHEALTHY - will cause job failure
+            return ([], [])
+        
+        # Primary = first `count` DCs
+        primary = all_usable[:count]
+        # Fallback = remaining usable DCs
+        fallback = all_usable[count:]
+        
+        return (primary, fallback)
     
     def _select_datacenters(
         self,
@@ -337,29 +469,116 @@ class GateServer(UDPServer):
         preferred: list[str] | None = None,
     ) -> list[str]:
         """
-        Select datacenters for job execution.
+        Select datacenters for job execution (backwards compatible).
         
-        Uses cryptographically secure random selection.
+        Uses cryptographically secure random selection for HEALTHY DCs,
+        with fallback to BUSY and DEGRADED DCs.
         """
-        available = self._get_available_datacenters()
+        primary, _ = self._select_datacenters_with_fallback(count, preferred)
+        return primary
+    
+    async def _try_dispatch_to_dc(
+        self,
+        job_id: str,
+        dc: str,
+        submission: JobSubmission,
+    ) -> tuple[bool, str | None]:
+        """
+        Try to dispatch job to a single datacenter.
         
-        if preferred:
-            # Use preferred if available
-            selected = [dc for dc in preferred if dc in available]
-            if len(selected) >= count:
-                return selected[:count]
-            # Fill with others
-            remaining = [dc for dc in available if dc not in selected]
-            selected.extend(secrets.SystemRandom().sample(
-                remaining,
-                min(count - len(selected), len(remaining))
-            ))
-            return selected
+        Returns:
+            (success: bool, error: str | None)
+            - True if DC accepted (even if queued)
+            - False only if DC is UNHEALTHY (should try fallback)
+        """
+        managers = self._datacenter_managers.get(dc, [])
         
-        # Random selection
-        if len(available) <= count:
-            return available
-        return secrets.SystemRandom().sample(available, count)
+        for manager_addr in managers:
+            try:
+                response = await self.send_tcp(
+                    manager_addr,
+                    "job_submission",
+                    submission.dump(),
+                    timeout=5.0,
+                )
+                
+                if isinstance(response, bytes):
+                    ack = JobAck.load(response)
+                    if ack.accepted:
+                        return (True, None)
+                    # Check if it's a capacity issue vs unhealthy
+                    if ack.error:
+                        error_lower = ack.error.lower()
+                        if "no capacity" in error_lower or "busy" in error_lower:
+                            # BUSY is still acceptable - job will be queued
+                            return (True, None)
+                    # Other errors = try next manager
+                    
+            except Exception as e:
+                # Connection error = manager might be down
+                continue
+        
+        # All managers failed = DC is UNHEALTHY for this dispatch
+        return (False, f"All managers in {dc} failed to accept job")
+    
+    async def _dispatch_job_with_fallback(
+        self,
+        submission: JobSubmission,
+        primary_dcs: list[str],
+        fallback_dcs: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """
+        Dispatch job to datacenters with automatic fallback.
+        
+        Priority: HEALTHY > BUSY > DEGRADED
+        Only fails if ALL DCs are UNHEALTHY.
+        
+        Args:
+            submission: The job submission
+            primary_dcs: Primary target DCs
+            fallback_dcs: Fallback DCs to try if primary fails
+            
+        Returns:
+            (successful_dcs, failed_dcs)
+        """
+        successful = []
+        failed = []
+        fallback_queue = list(fallback_dcs)
+        
+        for dc in primary_dcs:
+            success, error = await self._try_dispatch_to_dc(
+                submission.job_id, dc, submission
+            )
+            
+            if success:
+                successful.append(dc)
+            else:
+                # Try fallback
+                fallback_success = False
+                while fallback_queue:
+                    fallback_dc = fallback_queue.pop(0)
+                    fb_success, fb_error = await self._try_dispatch_to_dc(
+                        submission.job_id, fallback_dc, submission
+                    )
+                    if fb_success:
+                        successful.append(fallback_dc)
+                        fallback_success = True
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerInfo(
+                                message=f"Job {submission.job_id}: Fallback from {dc} to {fallback_dc}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                        break
+                
+                if not fallback_success:
+                    # No fallback worked
+                    failed.append(dc)
+        
+        return (successful, failed)
     
     async def start(self) -> None:
         """Start the gate server."""
@@ -741,7 +960,16 @@ class GateServer(UDPServer):
         submission: JobSubmission,
         target_dcs: list[str],
     ) -> None:
-        """Dispatch job to all target datacenters."""
+        """
+        Dispatch job to all target datacenters with fallback support.
+        
+        Uses _select_datacenters_with_fallback to get primary and fallback DCs,
+        then uses _dispatch_job_with_fallback for resilient dispatch.
+        
+        Key behavior (per AD-17):
+        - Only fails if ALL DCs are UNHEALTHY
+        - BUSY DCs are acceptable (job will be queued)
+        """
         job = self._jobs.get(submission.job_id)
         if not job:
             return
@@ -749,21 +977,64 @@ class GateServer(UDPServer):
         job.status = JobStatus.DISPATCHING.value
         self._increment_version()
         
-        failed_dcs = []
-        for dc in target_dcs:
-            success = await self._dispatch_job_to_datacenter(
-                submission.job_id,
-                dc,
-                submission,
-            )
-            if not success:
-                failed_dcs.append(dc)
+        # Get primary and fallback DCs based on health classification
+        primary_dcs, fallback_dcs = self._select_datacenters_with_fallback(
+            len(target_dcs),
+            target_dcs if target_dcs else None,
+        )
         
-        if failed_dcs and len(failed_dcs) == len(target_dcs):
-            # All DCs failed
+        # If we have no usable DCs at all, fail immediately
+        if not primary_dcs and not fallback_dcs:
             job.status = JobStatus.FAILED.value
+            job.failed_datacenters = len(target_dcs)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Job {submission.job_id}: All datacenters are UNHEALTHY",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            self._increment_version()
+            return
+        
+        # Dispatch with fallback support
+        successful_dcs, failed_dcs = await self._dispatch_job_with_fallback(
+            submission,
+            primary_dcs,
+            fallback_dcs,
+        )
+        
+        if not successful_dcs:
+            # All DCs failed (all UNHEALTHY)
+            job.status = JobStatus.FAILED.value
+            job.failed_datacenters = len(failed_dcs)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Job {submission.job_id}: Failed to dispatch to any datacenter",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
         else:
             job.status = JobStatus.RUNNING.value
+            job.completed_datacenters = 0
+            job.failed_datacenters = len(failed_dcs)
+            
+            if failed_dcs:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Job {submission.job_id}: Dispatched to {len(successful_dcs)} DCs, "
+                                f"{len(failed_dcs)} DCs failed (all UNHEALTHY)",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
         
         self._increment_version()
     

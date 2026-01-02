@@ -19,6 +19,7 @@ from .distributed import (
     JobStatus as JobStatus,
     WorkflowStatus as WorkflowStatus,
     WorkerState as WorkerState,
+    DatacenterHealth as DatacenterHealth,
     # Node identity
     NodeInfo as NodeInfo,
     WorkerRegistration as WorkerRegistration,
@@ -49,6 +50,8 @@ from .distributed import (
     # Lease
     DatacenterLease as DatacenterLease,
     LeaseTransfer as LeaseTransfer,
+    # Datacenter health
+    DatacenterStatus as DatacenterStatus,
 )
 
 # CRDTs for cross-datacenter synchronization
