@@ -122,8 +122,9 @@ class GateServer(UDPServer):
         # Configuration
         self._lease_timeout = lease_timeout
         
-        # Background tasks
-        self._lease_cleanup_task: asyncio.Task | None = None
+        # Job cleanup configuration
+        self._job_max_age: float = 3600.0  # 1 hour max age for completed jobs
+        self._job_cleanup_interval: float = 60.0  # Check every minute
         
         # Inject state embedder for Serf-style heartbeat embedding in SWIM messages
         self.set_state_embedder(GateStateEmbedder(
@@ -262,8 +263,9 @@ class GateServer(UDPServer):
         # Start leader election (uses SWIM membership info)
         await self.start_leader_election()
         
-        # Start lease cleanup task
-        self._lease_cleanup_task = asyncio.create_task(self._lease_cleanup_loop())
+        # Start background cleanup tasks via TaskRunner
+        self._task_runner.run(self._lease_cleanup_loop)
+        self._task_runner.run(self._job_cleanup_loop)
         
         self._udp_logger.log(
             ServerInfo(
@@ -276,13 +278,7 @@ class GateServer(UDPServer):
     
     async def stop(self) -> None:
         """Stop the gate server."""
-        if self._lease_cleanup_task:
-            self._lease_cleanup_task.cancel()
-            try:
-                await self._lease_cleanup_task
-            except asyncio.CancelledError:
-                pass
-        
+        # TaskRunner handles cleanup task cancellation
         # Graceful shutdown broadcasts leave via UDP (SWIM)
         await self.graceful_shutdown()
         
@@ -307,6 +303,59 @@ class GateServer(UDPServer):
                 break
             except Exception as e:
                 await self.handle_exception(e, "lease_cleanup_loop")
+    
+    async def _job_cleanup_loop(self) -> None:
+        """
+        Periodically clean up completed/failed jobs.
+        
+        Removes jobs that have been in a terminal state for longer than _job_max_age.
+        """
+        terminal_states = {
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
+        }
+        
+        while self._running:
+            try:
+                await asyncio.sleep(self._job_cleanup_interval)
+                
+                now = time.monotonic()
+                jobs_to_remove = []
+                
+                for job_id, job in self._jobs.items():
+                    if job.status in terminal_states:
+                        # Check age - use elapsed_seconds as relative timestamp
+                        # or timestamp if available
+                        age = now - getattr(job, 'timestamp', now)
+                        if age > self._job_max_age:
+                            jobs_to_remove.append(job_id)
+                
+                for job_id in jobs_to_remove:
+                    self._jobs.pop(job_id, None)
+                    # Also clean up any leases for this job
+                    lease_keys_to_remove = [
+                        key for key in self._leases
+                        if key.startswith(f"{job_id}:")
+                    ]
+                    for key in lease_keys_to_remove:
+                        self._leases.pop(key, None)
+                
+                if jobs_to_remove:
+                    self._udp_logger.log(
+                        ServerInfo(
+                            message=f"Cleaned up {len(jobs_to_remove)} completed jobs",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.handle_exception(e, "job_cleanup_loop")
     
     def _create_lease(self, job_id: str, datacenter: str) -> DatacenterLease:
         """Create a new lease for a job in a datacenter."""

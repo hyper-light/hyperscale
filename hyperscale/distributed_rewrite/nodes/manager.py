@@ -147,6 +147,10 @@ class ManagerServer(UDPServer):
         # Quorum settings
         self._quorum_timeout = quorum_timeout
         
+        # Job cleanup configuration
+        self._job_max_age: float = 3600.0  # 1 hour max age for completed jobs
+        self._job_cleanup_interval: float = 60.0  # Check every minute
+        
         # Inject state embedder for Serf-style heartbeat embedding in SWIM messages
         self.set_state_embedder(ManagerStateEmbedder(
             get_node_id=lambda: self._node_id.full,
@@ -376,6 +380,9 @@ class ManagerServer(UDPServer):
         
         # Start leader election (uses SWIM membership info)
         await self.start_leader_election()
+        
+        # Start background cleanup for completed jobs
+        self._task_runner.run(self._job_cleanup_loop)
         
         # Note: Status updates to gates are now handled via Serf-style heartbeat
         # embedding in SWIM probe responses. Gates learn our state passively.
@@ -915,6 +922,77 @@ class ManagerServer(UDPServer):
                     failed_workers=self._workflow_retries[workflow_id][2],
                     retry_count=self._workflow_retries[workflow_id][0] + 1,
                 )
+    
+    # =========================================================================
+    # Background Cleanup
+    # =========================================================================
+    
+    async def _job_cleanup_loop(self) -> None:
+        """
+        Periodically clean up completed/failed jobs and their associated state.
+        
+        Removes jobs that have been in a terminal state for longer than _job_max_age.
+        Also cleans up workflow_assignments and workflow_retries for those jobs.
+        """
+        terminal_states = {
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+            JobStatus.TIMEOUT.value,
+        }
+        
+        while self._running:
+            try:
+                await asyncio.sleep(self._job_cleanup_interval)
+                
+                now = time.monotonic()
+                jobs_to_remove = []
+                
+                for job_id, job in self._jobs.items():
+                    if job.status in terminal_states:
+                        # Check age based on timestamp
+                        age = now - job.timestamp
+                        if age > self._job_max_age:
+                            jobs_to_remove.append(job_id)
+                
+                for job_id in jobs_to_remove:
+                    self._cleanup_job(job_id)
+                
+                if jobs_to_remove:
+                    self._udp_logger.log(
+                        ServerInfo(
+                            message=f"Cleaned up {len(jobs_to_remove)} completed jobs",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.handle_exception(e, "job_cleanup_loop")
+    
+    def _cleanup_job(self, job_id: str) -> None:
+        """
+        Clean up all state associated with a job.
+        
+        Removes:
+        - The job itself from _jobs
+        - All workflow assignments for this job
+        - All workflow retries for this job
+        """
+        # Remove job
+        self._jobs.pop(job_id, None)
+        
+        # Find and remove workflow assignments for this job
+        workflow_ids_to_remove = [
+            wf_id for wf_id in self._workflow_assignments
+            if wf_id.startswith(f"{job_id}:")
+        ]
+        for wf_id in workflow_ids_to_remove:
+            self._workflow_assignments.pop(wf_id, None)
+            self._workflow_retries.pop(wf_id, None)
     
     # =========================================================================
     # TCP Handlers - Job Submission (from Gate or Client)
