@@ -116,6 +116,10 @@ class GateServer(HealthAwareServer):
         self._datacenter_managers = datacenter_managers or {}  # TCP
         self._datacenter_manager_udp = datacenter_manager_udp or {}  # UDP for SWIM
         
+        # Per-manager circuit breakers for dispatch failures
+        # Key is manager TCP address tuple, value is ErrorStats
+        self._manager_circuits: dict[tuple[str, int], ErrorStats] = {}
+        
         # Gate peers for clustering
         self._gate_peers = gate_peers or []  # TCP
         self._gate_udp_peers = gate_udp_peers or []  # UDP for SWIM cluster
@@ -559,6 +563,57 @@ class GateServer(HealthAwareServer):
         
         self._increment_version()
     
+    def _get_manager_circuit(self, manager_addr: tuple[str, int]) -> ErrorStats:
+        """
+        Get or create a circuit breaker for a specific manager.
+        
+        Each manager has its own circuit breaker so that failures to one
+        manager don't affect dispatch to other managers.
+        """
+        if manager_addr not in self._manager_circuits:
+            self._manager_circuits[manager_addr] = ErrorStats(
+                error_threshold=3,      # Open after 3 failures
+                window_seconds=30.0,    # Within 30 second window
+                half_open_after=10.0,   # Allow retry after 10 seconds
+            )
+        return self._manager_circuits[manager_addr]
+    
+    def _is_manager_circuit_open(self, manager_addr: tuple[str, int]) -> bool:
+        """Check if a manager's circuit breaker is open."""
+        circuit = self._manager_circuits.get(manager_addr)
+        if not circuit:
+            return False
+        return circuit.circuit_state == CircuitState.OPEN
+    
+    def get_manager_circuit_status(self, manager_addr: tuple[str, int]) -> dict | None:
+        """
+        Get circuit breaker status for a specific manager.
+        
+        Returns None if manager has no circuit breaker (never had failures).
+        """
+        circuit = self._manager_circuits.get(manager_addr)
+        if not circuit:
+            return None
+        return {
+            "manager_addr": f"{manager_addr[0]}:{manager_addr[1]}",
+            "circuit_state": circuit.circuit_state.name,
+            "error_count": circuit.error_count,
+            "error_rate": circuit.error_rate,
+        }
+    
+    def get_all_manager_circuit_status(self) -> dict:
+        """Get circuit breaker status for all managers."""
+        return {
+            "managers": {
+                f"{addr[0]}:{addr[1]}": self.get_manager_circuit_status(addr)
+                for addr in self._manager_circuits.keys()
+            },
+            "open_circuits": [
+                f"{addr[0]}:{addr[1]}" for addr in self._manager_circuits.keys()
+                if self._is_manager_circuit_open(addr)
+            ],
+        }
+    
     def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
         """
         Classify datacenter health based on SWIM probes and status updates.
@@ -741,6 +796,9 @@ class GateServer(HealthAwareServer):
         """
         Try to dispatch job to a single datacenter.
         
+        Iterates through managers in the DC, skipping those with open circuits.
+        Records success/error for per-manager circuit breakers.
+        
         Returns:
             (success: bool, error: str | None)
             - True if DC accepted (even if queued)
@@ -749,6 +807,12 @@ class GateServer(HealthAwareServer):
         managers = self._datacenter_managers.get(dc, [])
         
         for manager_addr in managers:
+            # Skip managers with open circuits
+            if self._is_manager_circuit_open(manager_addr):
+                continue
+            
+            circuit = self._get_manager_circuit(manager_addr)
+            
             try:
                 response = await self.send_tcp(
                     manager_addr,
@@ -760,17 +824,23 @@ class GateServer(HealthAwareServer):
                 if isinstance(response, bytes):
                     ack = JobAck.load(response)
                     if ack.accepted:
+                        circuit.record_success()
                         return (True, None)
                     # Check if it's a capacity issue vs unhealthy
                     if ack.error:
                         error_lower = ack.error.lower()
                         if "no capacity" in error_lower or "busy" in error_lower:
                             # BUSY is still acceptable - job will be queued
+                            circuit.record_success()
                             return (True, None)
                     # Other errors = try next manager
+                    circuit.record_error()
+                else:
+                    circuit.record_error()
                     
-            except Exception as e:
+            except Exception:
                 # Connection error = manager might be down
+                circuit.record_error()
                 continue
         
         # All managers failed = DC is UNHEALTHY for this dispatch

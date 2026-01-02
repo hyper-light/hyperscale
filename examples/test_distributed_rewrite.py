@@ -4597,6 +4597,94 @@ test_manager_job_progress_records_circuit()
 
 
 # =============================================================================
+# Gate Per-Manager Circuit Breaker Tests
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("GATE PER-MANAGER CIRCUIT BREAKER TESTS")
+print("=" * 70 + "\n")
+
+
+@test("Gate: has _manager_circuits dict")
+def test_gate_has_manager_circuits():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer.__init__)
+    
+    assert "_manager_circuits" in source, \
+        "GateServer should have _manager_circuits dict"
+
+
+@test("Gate: has _get_manager_circuit method")
+def test_gate_has_get_manager_circuit():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_get_manager_circuit'), \
+        "GateServer should have _get_manager_circuit method"
+
+
+@test("Gate: has _is_manager_circuit_open method")
+def test_gate_has_is_manager_circuit_open():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_is_manager_circuit_open'), \
+        "GateServer should have _is_manager_circuit_open method"
+
+
+@test("Gate: has get_manager_circuit_status method")
+def test_gate_has_manager_circuit_status():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, 'get_manager_circuit_status'), \
+        "GateServer should have get_manager_circuit_status method"
+
+
+@test("Gate: has get_all_manager_circuit_status method")
+def test_gate_has_all_manager_circuit_status():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, 'get_all_manager_circuit_status'), \
+        "GateServer should have get_all_manager_circuit_status method"
+
+
+@test("Gate: _try_dispatch_to_dc checks circuit")
+def test_gate_dispatch_checks_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._try_dispatch_to_dc)
+    
+    assert "_is_manager_circuit_open" in source, \
+        "_try_dispatch_to_dc should check circuit breaker"
+
+
+@test("Gate: _try_dispatch_to_dc uses circuit")
+def test_gate_dispatch_uses_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._try_dispatch_to_dc)
+    
+    assert "_get_manager_circuit" in source, \
+        "_try_dispatch_to_dc should get circuit breaker"
+    assert "record_success" in source, \
+        "_try_dispatch_to_dc should record success"
+    assert "record_error" in source, \
+        "_try_dispatch_to_dc should record error"
+
+
+# Run Gate Per-Manager Circuit Breaker tests
+test_gate_has_manager_circuits()
+test_gate_has_get_manager_circuit()
+test_gate_has_is_manager_circuit_open()
+test_gate_has_manager_circuit_status()
+test_gate_has_all_manager_circuit_status()
+test_gate_dispatch_checks_circuit()
+test_gate_dispatch_uses_circuit()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 
