@@ -364,18 +364,24 @@ class ErrorHandler:
         """Log error with structured context."""
         if self.logger:
             try:
-                # Try to use structured logging
+                # Build structured message with error details
+                message = (
+                    f"[{error.__class__.__name__}] {error} "
+                    f"(category={error.category.name}, severity={error.severity.name}"
+                )
+                if error.context:
+                    message += f", context={error.context}"
+                message += ")"
+                
                 await self.logger.log(
                     ServerError(
-                        message=str(error),
+                        message=message,
                         node_id=self.node_id,
-                        error_type=error.__class__.__name__,
-                        error_category=error.category.name,
-                        error_severity=error.severity.name,
-                        error_context=error.context,
+                        node_host="",  # Not available at handler level
+                        node_port=0,
                     )
                 )
-            except (ImportError, AttributeError):
+            except (ImportError, AttributeError, TypeError):
                 # Fallback to simple logging - if this also fails, silently ignore
                 # since logging errors shouldn't crash the application
                 try:
@@ -386,7 +392,7 @@ class ErrorHandler:
     async def _log_circuit_open(self, category: ErrorCategory, stats: ErrorStats) -> None:
         """Log circuit breaker opening."""
         message = (
-            f"Circuit breaker OPEN for {category.name}: "
+            f"[CircuitBreakerOpen] Circuit breaker OPEN for {category.name}: "
             f"{stats.error_count} errors, rate={stats.error_rate:.2f}/s"
         )
         if self.logger:
@@ -396,11 +402,11 @@ class ErrorHandler:
                     ServerError(
                         message=message,
                         node_id=self.node_id,
-                        error_type="CircuitBreakerOpen",
-                        error_category=category.name,
+                        node_host="",  # Not available at handler level
+                        node_port=0,
                     )
                 )
-            except (ImportError, AttributeError):
+            except (ImportError, AttributeError, TypeError):
                 # Fallback to simple logging - if this also fails, silently ignore
                 try:
                     await self.logger.log(message)

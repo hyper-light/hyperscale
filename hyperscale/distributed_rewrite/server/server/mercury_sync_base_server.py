@@ -1177,12 +1177,12 @@ class MercurySyncBaseServer(Generic[T]):
             transport.sendto(response_payload, parsed_addr)
 
         except Exception as e:
-            # Log security event
+            # Log security event - don't leak internal details
             await self._log_security_warning(
                 f"UDP server request failed: {type(e).__name__}",
                 protocol="udp",
             )
-            # Sanitized error response - don't leak internal details
+            # Sanitized error response
             response_payload = self._encryptor.encrypt(
                 self._compressor.compress(
                     b's<' + self._udp_addr_slug + b'<' + handler_name + b'<Request processing failed<' + next_time.to_bytes(64),
