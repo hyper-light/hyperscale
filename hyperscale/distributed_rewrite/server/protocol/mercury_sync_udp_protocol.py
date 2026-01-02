@@ -64,6 +64,7 @@ class MercurySyncUDPProtocol(asyncio.DatagramProtocol, Generic[T]):
         self.conn.read_udp(
             data,
             self.transport,
+            addr,
         )
 
     def connection_lost(self, exc: Exception | None) -> None:

@@ -4,6 +4,7 @@ import cloudpickle
 from hyperscale.core.state import Context
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.graph.dependent_workflow import DependentWorkflow
+from .restricted_unpickler import restricted_loads
 
 
 class Job(msgspec.Struct):
@@ -12,12 +13,14 @@ class Job(msgspec.Struct):
     workflow: str
 
     def load_context(self) -> Context:
-        return cloudpickle.loads(
+        # Use restricted unpickler to prevent arbitrary code execution
+        return restricted_loads(
             self.context.encode(),
         )
 
     def load_workflow(self) -> Workflow | DependentWorkflow:
-        return cloudpickle.loads(
+        # Use restricted unpickler to prevent arbitrary code execution
+        return restricted_loads(
             self.workflow.encode(),
         )
     

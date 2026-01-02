@@ -7,3 +7,7 @@ from .internal import Leave as Leave
 from .internal import Nack as Nack
 from .internal import Probe as Probe
 from .message import Message as Message
+from .restricted_unpickler import (
+    restricted_loads as restricted_loads,
+    SecurityError as SecurityError,
+)

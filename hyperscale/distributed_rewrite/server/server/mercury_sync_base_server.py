@@ -40,6 +40,11 @@ from hyperscale.distributed_rewrite.models import (
 from hyperscale.distributed_rewrite.server.protocol import (
     MercurySyncTCPProtocol,
     MercurySyncUDPProtocol,
+    ReplayGuard,
+    RateLimiter,
+    validate_message_size,
+    MAX_MESSAGE_SIZE,
+    MAX_DECOMPRESSED_SIZE,
 )
 from hyperscale.distributed_rewrite.server.events import LamportClock
 from hyperscale.distributed_rewrite.server.hooks.task import (
@@ -144,6 +149,10 @@ class MercurySyncBaseServer(Generic[T]):
         self._udp_ssl_context: Union[ssl.SSLContext, None] = None
 
         self._encryptor = AESGCMFernet(env)
+        
+        # Security utilities
+        self._replay_guard = ReplayGuard()
+        self._rate_limiter = RateLimiter()
         
         self._tcp_semaphore: asyncio.Semaphore | None= None
         self._udp_semaphore: asyncio.Semaphore | None= None
@@ -904,12 +913,25 @@ class MercurySyncBaseServer(Generic[T]):
         self,
         data: bytes,
         transport: asyncio.Transport,
+        sender_addr: tuple[str, int] | None = None,
     ):
         try:
+            # Rate limiting (if sender address available)
+            if sender_addr is not None:
+                if not self._rate_limiter.check(sender_addr):
+                    return  # Rate limited - silently drop
+            
+            # Message size validation (before decompression)
+            if len(data) > MAX_MESSAGE_SIZE:
+                return  # Message too large - silently drop
 
-            decrypted = self._decompressor.decompress(
-                self._encryptor.decrypt(data),
-            )
+            decrypted_data = self._encryptor.decrypt(data)
+            
+            decrypted = self._decompressor.decompress(decrypted_data)
+            
+            # Validate decompressed size
+            if len(decrypted) > MAX_DECOMPRESSED_SIZE:
+                return  # Decompressed message too large - silently drop
 
             request_type, addr, handler_name, payload = decrypted.split(b'<', maxsplit=3)
 
@@ -990,14 +1012,26 @@ class MercurySyncBaseServer(Generic[T]):
         data: bytes,
         transport: asyncio.Transport,
     ):
+        # Get client address for rate limiting
+        peername = transport.get_extra_info('peername')
         
         try:
+            # Rate limiting
+            if peername is not None:
+                if not self._rate_limiter.check(peername):
+                    return  # Rate limited - silently drop
+            
+            # Message size validation
+            if len(data) > MAX_MESSAGE_SIZE:
+                return  # Message too large - silently drop
+            
+            decrypted_data = self._encryptor.decrypt(data)
 
-            decrypted = self._decompressor.decompress(
-                self._encryptor.decrypt(
-                    data,
-                )
-            )
+            decrypted = self._decompressor.decompress(decrypted_data)
+            
+            # Validate decompressed size
+            if len(decrypted) > MAX_DECOMPRESSED_SIZE:
+                return  # Decompressed message too large - silently drop
 
             handler_name, address_bytes, payload, clock = decrypted.split(b'<', maxsplit=3)
             clock_time = int.from_bytes(clock)
@@ -1032,15 +1066,18 @@ class MercurySyncBaseServer(Generic[T]):
 
             transport.write(response_payload)
 
-        except Exception as error:
-
-            response_payload = self._encryptor.encrypt(
-                self._compressor.compress(
-                    self._tcp_addr_slug + b'<' + response_handler + b'<' + str(error) + b'<' + next_time.to_bytes(64),
+        except Exception:
+            # Sanitized error response - don't leak internal details
+            try:
+                error_time = await self._tcp_clock.tick()
+                error_response = self._encryptor.encrypt(
+                    self._compressor.compress(
+                        self._tcp_addr_slug + b'<error<Request processing failed<' + error_time.to_bytes(64),
+                    )
                 )
-            )
-
-            transport.write(response_payload)
+                transport.write(error_response)
+            except Exception:
+                pass  # Best effort error response
 
     async def process_udp_server_request(
         self,
