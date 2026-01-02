@@ -26,6 +26,7 @@ import time
 from typing import Any
 
 from hyperscale.distributed_rewrite.server import tcp, udp
+from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import UDPServer, GateStateEmbedder
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
@@ -104,6 +105,10 @@ class GateServer(UDPServer):
         self._datacenter_status: dict[str, ManagerHeartbeat] = {}  # dc -> last status
         self._datacenter_last_status: dict[str, float] = {}  # dc -> timestamp
         
+        # Versioned state clock for rejecting stale updates
+        # Tracks per-datacenter versions using Lamport timestamps
+        self._versioned_clock = VersionedStateClock()
+        
         # Global job state
         self._jobs: dict[str, GlobalJobStatus] = {}  # job_id -> status
         
@@ -111,7 +116,7 @@ class GateServer(UDPServer):
         self._leases: dict[str, DatacenterLease] = {}  # job_id:dc -> lease
         self._fence_token = 0
         
-        # State versioning
+        # State versioning (local gate state version)
         self._state_version = 0
         
         # Configuration
@@ -136,9 +141,26 @@ class GateServer(UDPServer):
         heartbeat: ManagerHeartbeat,
         source_addr: tuple[str, int],
     ) -> None:
-        """Handle ManagerHeartbeat received via SWIM message embedding."""
+        """
+        Handle ManagerHeartbeat received via SWIM message embedding.
+        
+        Uses versioned clock to reject stale updates - if the incoming
+        heartbeat has a version <= our tracked version for this DC, it's discarded.
+        """
+        # Check if update is stale using versioned clock
+        dc_key = f"dc:{heartbeat.datacenter}"
+        if self._versioned_clock.is_entity_stale(dc_key, heartbeat.version):
+            # Stale update - discard
+            return
+        
+        # Accept update
         self._datacenter_status[heartbeat.datacenter] = heartbeat
         self._datacenter_last_status[heartbeat.datacenter] = time.monotonic()
+        
+        # Update version tracking
+        asyncio.create_task(
+            self._versioned_clock.update_entity(dc_key, heartbeat.version)
+        )
     
     @property
     def node_info(self) -> NodeInfo:

@@ -28,6 +28,7 @@ import time
 from typing import Any
 
 from hyperscale.distributed_rewrite.server import tcp, udp
+from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import UDPServer, ManagerStateEmbedder
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
@@ -119,6 +120,10 @@ class ManagerServer(UDPServer):
         self._worker_status: dict[str, WorkerHeartbeat] = {}  # node_id -> last status
         self._worker_last_status: dict[str, float] = {}  # node_id -> timestamp
         
+        # Versioned state clock for rejecting stale updates
+        # Tracks per-worker and per-job versions using Lamport timestamps
+        self._versioned_clock = VersionedStateClock()
+        
         # Job and workflow state
         self._jobs: dict[str, JobProgress] = {}  # job_id -> progress
         self._workflow_assignments: dict[str, str] = {}  # workflow_id -> worker_node_id
@@ -128,7 +133,7 @@ class ManagerServer(UDPServer):
         # Fencing tokens for at-most-once
         self._fence_token = 0
         
-        # State versioning
+        # State versioning (local manager state version)
         self._state_version = 0
         
         # Quorum settings
@@ -158,9 +163,26 @@ class ManagerServer(UDPServer):
         heartbeat: WorkerHeartbeat,
         source_addr: tuple[str, int],
     ) -> None:
-        """Handle WorkerHeartbeat received via SWIM message embedding."""
+        """
+        Handle WorkerHeartbeat received via SWIM message embedding.
+        
+        Uses versioned clock to reject stale updates - if the incoming
+        heartbeat has a version <= our tracked version, it's discarded.
+        """
+        # Check if update is stale using versioned clock
+        if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
+            # Stale update - discard
+            return
+        
+        # Accept update
         self._worker_status[heartbeat.node_id] = heartbeat
         self._worker_last_status[heartbeat.node_id] = time.monotonic()
+        
+        # Update version tracking (fire-and-forget, no await needed for sync operation)
+        # We track the worker's version so future updates with same/lower version are rejected
+        asyncio.create_task(
+            self._versioned_clock.update_entity(heartbeat.node_id, heartbeat.version)
+        )
     
     @property
     def node_info(self) -> NodeInfo:
