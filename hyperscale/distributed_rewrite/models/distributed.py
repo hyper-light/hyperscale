@@ -291,6 +291,9 @@ class JobSubmission(Message):
     Job submission from client to gate or manager.
     
     A job contains one or more workflow classes to execute.
+    
+    If callback_addr is provided, the gate/manager will push status
+    updates to the client via TCP instead of requiring polling.
     """
     job_id: str                  # Unique job identifier
     workflows: bytes             # Cloudpickled list of Workflow classes
@@ -298,6 +301,9 @@ class JobSubmission(Message):
     timeout_seconds: float       # Maximum execution time
     datacenter_count: int = 1    # Number of DCs to run in (gates only)
     datacenters: list[str] = field(default_factory=list)
+    # Optional callback address for push notifications
+    # If set, server pushes status updates to this address
+    callback_addr: tuple[str, int] | None = None
 
 
 @dataclass(slots=True)
@@ -422,6 +428,49 @@ class GlobalJobStatus(Message):
     elapsed_seconds: float = 0.0 # Time since submission
     completed_datacenters: int = 0  # DCs finished
     failed_datacenters: int = 0  # DCs failed
+
+
+# =============================================================================
+# Client Push Notifications
+# =============================================================================
+
+@dataclass(slots=True)
+class JobStatusPush(Message):
+    """
+    Push notification for job status changes.
+    
+    Sent from Gate/Manager to Client when significant status changes occur.
+    This is a Tier 1 (immediate) notification for:
+    - Job started
+    - Job completed
+    - Job failed
+    - Datacenter completion
+    """
+    job_id: str                  # Job identifier
+    status: str                  # JobStatus value
+    message: str                 # Human-readable status message
+    total_completed: int = 0     # Completed count
+    total_failed: int = 0        # Failed count
+    overall_rate: float = 0.0    # Current rate
+    elapsed_seconds: float = 0.0 # Time since submission
+    is_final: bool = False       # True if job is complete (no more updates)
+
+
+@dataclass(slots=True)
+class JobBatchPush(Message):
+    """
+    Batched statistics push notification.
+    
+    Sent periodically (Tier 2) with aggregated progress data.
+    Contains step-level statistics and detailed progress.
+    """
+    job_id: str                  # Job identifier
+    status: str                  # Current JobStatus
+    step_stats: list["StepStats"] = field(default_factory=list)
+    total_completed: int = 0
+    total_failed: int = 0
+    overall_rate: float = 0.0
+    elapsed_seconds: float = 0.0
 
 
 # =============================================================================

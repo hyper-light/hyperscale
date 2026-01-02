@@ -41,6 +41,8 @@ from hyperscale.distributed_rewrite.models import (
     JobStatus,
     JobProgress,
     GlobalJobStatus,
+    JobStatusPush,
+    JobBatchPush,
     StateSyncRequest,
     StateSyncResponse,
     GateStateSnapshot,
@@ -133,6 +135,10 @@ class GateServer(HealthAwareServer):
         
         # Global job state
         self._jobs: dict[str, GlobalJobStatus] = {}  # job_id -> status
+        
+        # Client push notification callbacks
+        # job_id -> callback address for push notifications
+        self._job_callbacks: dict[str, tuple[str, int]] = {}
         
         # Lease management for at-most-once
         self._leases: dict[str, DatacenterLease] = {}  # job_id:dc -> lease
@@ -854,55 +860,118 @@ class GateServer(HealthAwareServer):
         - Job completion
         - Job failure
         - Critical alerts
+        
+        If client provided a callback_addr at submission time, pushes
+        JobStatusPush to that address via TCP.
         """
         job = self._jobs.get(job_id)
         if not job:
             return
         
+        callback = self._job_callbacks.get(job_id)
+        
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Job {job_id}: Immediate update - {event_type}",
+                message=f"Job {job_id}: Immediate update - {event_type}" +
+                        (f" (pushing to {callback})" if callback else " (no callback)"),
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             )
         )
         
-        # In a real implementation, this would push to subscribed clients
-        # For now, we just track that we would send it
-        # Future: WebSocket push, SSE, or callback webhook
+        # Push to client if callback is registered
+        if callback:
+            is_final = job.status in (
+                JobStatus.COMPLETED.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+            )
+            
+            push = JobStatusPush(
+                job_id=job_id,
+                status=job.status,
+                message=event_type,
+                total_completed=job.total_completed,
+                total_failed=job.total_failed,
+                overall_rate=job.overall_rate,
+                elapsed_seconds=job.elapsed_seconds,
+                is_final=is_final,
+            )
+            
+            try:
+                await self.send_tcp(
+                    callback,
+                    "job_status_push",
+                    push.dump(),
+                    timeout=2.0,
+                )
+            except Exception:
+                # Client unreachable - don't block on this
+                pass
+            
+            # Clean up callback if job is final
+            if is_final:
+                self._job_callbacks.pop(job_id, None)
     
     async def _batch_stats_update(self) -> None:
         """
         Process a batch of Tier 2 (Periodic) updates.
         
-        Aggregates pending progress updates and sends them in a single batch.
-        More efficient than sending each update individually.
+        Aggregates pending progress updates and pushes to clients
+        that have registered callbacks. This is more efficient than
+        sending each update individually.
         """
-        # Collect pending updates
-        pending_jobs = []
+        # Collect running jobs with callbacks
+        jobs_with_callbacks = []
         for job_id, job in self._jobs.items():
             if job.status == JobStatus.RUNNING.value:
-                pending_jobs.append((job_id, job))
+                callback = self._job_callbacks.get(job_id)
+                if callback:
+                    jobs_with_callbacks.append((job_id, job, callback))
         
-        if not pending_jobs:
+        if not jobs_with_callbacks:
             return
-        
-        # In a real implementation, this would:
-        # 1. Aggregate stats from multiple DCs using CRDTs
-        # 2. Batch into a single message
-        # 3. Send to subscribed clients
         
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Batch stats update: {len(pending_jobs)} jobs",
+                message=f"Batch stats update: pushing to {len(jobs_with_callbacks)} clients",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             )
         )
+        
+        # Push batched stats to each client
+        for job_id, job, callback in jobs_with_callbacks:
+            # Aggregate step stats from all DC progress
+            all_step_stats = []
+            for dc_progress in job.datacenters:
+                if hasattr(dc_progress, 'step_stats') and dc_progress.step_stats:
+                    all_step_stats.extend(dc_progress.step_stats)
+            
+            batch_push = JobBatchPush(
+                job_id=job_id,
+                status=job.status,
+                step_stats=all_step_stats,
+                total_completed=job.total_completed,
+                total_failed=job.total_failed,
+                overall_rate=job.overall_rate,
+                elapsed_seconds=job.elapsed_seconds,
+            )
+            
+            try:
+                await self.send_tcp(
+                    callback,
+                    "job_batch_push",
+                    batch_push.dump(),
+                    timeout=2.0,
+                )
+            except Exception:
+                # Client unreachable - continue with others
+                pass
     
     async def _batch_stats_loop(self) -> None:
         """
@@ -1367,6 +1436,11 @@ class GateServer(HealthAwareServer):
                 timestamp=time.monotonic(),
             )
             self._jobs[submission.job_id] = job
+            
+            # Store callback for push notifications (if provided)
+            if submission.callback_addr:
+                self._job_callbacks[submission.job_id] = submission.callback_addr
+            
             self._increment_version()
             
             # Dispatch to each DC (in background via TaskRunner)

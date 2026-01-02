@@ -3668,6 +3668,213 @@ test_manager_dispatch_handles_quorum_errors()
 
 
 # =============================================================================
+# Client Push Notifications Tests
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("CLIENT PUSH NOTIFICATIONS TESTS")
+print("=" * 70 + "\n")
+
+
+@test("JobSubmission: has callback_addr field")
+def test_job_submission_callback_addr():
+    from hyperscale.distributed_rewrite.models import JobSubmission
+    import dataclasses
+    
+    fields = {f.name for f in dataclasses.fields(JobSubmission)}
+    
+    assert "callback_addr" in fields, \
+        "JobSubmission should have callback_addr field"
+
+
+@test("JobStatusPush: model exists")
+def test_job_status_push_model():
+    from hyperscale.distributed_rewrite.models import JobStatusPush
+    import dataclasses
+    
+    fields = {f.name for f in dataclasses.fields(JobStatusPush)}
+    
+    assert "job_id" in fields
+    assert "status" in fields
+    assert "message" in fields
+    assert "is_final" in fields
+
+
+@test("JobBatchPush: model exists")
+def test_job_batch_push_model():
+    from hyperscale.distributed_rewrite.models import JobBatchPush
+    import dataclasses
+    
+    fields = {f.name for f in dataclasses.fields(JobBatchPush)}
+    
+    assert "job_id" in fields
+    assert "status" in fields
+    assert "step_stats" in fields
+
+
+@test("GateServer: has _job_callbacks dict")
+def test_gate_has_job_callbacks():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer.__init__)
+    
+    assert "_job_callbacks" in source, \
+        "GateServer should have _job_callbacks dict"
+
+
+@test("GateServer: receive_job_submission stores callback")
+def test_gate_stores_callback():
+    import pathlib
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    import hyperscale.distributed_rewrite.nodes.gate as gate_module
+    source_file = pathlib.Path(gate_module.__file__)
+    source = source_file.read_text()
+    
+    # Find receive_job_submission and check it stores callback
+    assert "callback_addr" in source
+    assert "_job_callbacks[submission.job_id]" in source or \
+           "_job_callbacks.get" in source
+
+
+@test("GateServer: _send_immediate_update pushes to client")
+def test_gate_immediate_push():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._send_immediate_update)
+    
+    assert "JobStatusPush" in source, \
+        "_send_immediate_update should create JobStatusPush"
+    assert "job_status_push" in source, \
+        "_send_immediate_update should call send_tcp with 'job_status_push'"
+    assert "is_final" in source, \
+        "_send_immediate_update should track is_final state"
+
+
+@test("GateServer: _batch_stats_update pushes to clients")
+def test_gate_batch_push():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._batch_stats_update)
+    
+    assert "JobBatchPush" in source, \
+        "_batch_stats_update should create JobBatchPush"
+    assert "job_batch_push" in source, \
+        "_batch_stats_update should call send_tcp with 'job_batch_push'"
+
+
+@test("ManagerServer: has _job_callbacks dict")
+def test_manager_has_job_callbacks():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    assert "_job_callbacks" in source, \
+        "ManagerServer should have _job_callbacks dict"
+
+
+@test("ManagerServer: receive_job_submission stores callback")
+def test_manager_stores_callback():
+    import pathlib
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    import hyperscale.distributed_rewrite.nodes.manager as manager_module
+    source_file = pathlib.Path(manager_module.__file__)
+    source = source_file.read_text()
+    
+    assert "_job_callbacks[submission.job_id]" in source or \
+           "_job_callbacks.get" in source
+
+
+@test("ManagerServer: has _push_job_status_to_client method")
+def test_manager_has_push_status():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, '_push_job_status_to_client'), \
+        "ManagerServer should have _push_job_status_to_client method"
+    
+    source = inspect.getsource(ManagerServer._push_job_status_to_client)
+    
+    assert "JobStatusPush" in source
+    assert "job_status_push" in source
+
+
+@test("ManagerServer: has _push_batch_stats_to_clients method")
+def test_manager_has_push_batch():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, '_push_batch_stats_to_clients'), \
+        "ManagerServer should have _push_batch_stats_to_clients method"
+    
+    source = inspect.getsource(ManagerServer._push_batch_stats_to_clients)
+    
+    assert "JobBatchPush" in source
+    assert "job_batch_push" in source
+
+
+@test("ManagerServer: has _client_batch_push_loop method")
+def test_manager_has_batch_loop():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, '_client_batch_push_loop'), \
+        "ManagerServer should have _client_batch_push_loop method"
+    
+    source = inspect.getsource(ManagerServer._client_batch_push_loop)
+    
+    assert "_push_batch_stats_to_clients" in source
+
+
+@test("ManagerServer: has _check_job_completion method")
+def test_manager_has_check_completion():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, '_check_job_completion'), \
+        "ManagerServer should have _check_job_completion method"
+    
+    source = inspect.getsource(ManagerServer._check_job_completion)
+    
+    assert "_push_job_status_to_client" in source
+
+
+@test("ManagerServer: start enables batch push loop when no gates")
+def test_manager_start_enables_batch_loop():
+    import pathlib
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    import hyperscale.distributed_rewrite.nodes.manager as manager_module
+    source_file = pathlib.Path(manager_module.__file__)
+    source = source_file.read_text()
+    
+    assert "_client_batch_push_loop" in source
+    assert "client push notifications enabled" in source
+
+
+# Run Client Push Notifications tests
+test_job_submission_callback_addr()
+test_job_status_push_model()
+test_job_batch_push_model()
+test_gate_has_job_callbacks()
+test_gate_stores_callback()
+test_gate_immediate_push()
+test_gate_batch_push()
+test_manager_has_job_callbacks()
+test_manager_stores_callback()
+test_manager_has_push_status()
+test_manager_has_push_batch()
+test_manager_has_batch_loop()
+test_manager_has_check_completion()
+test_manager_start_enables_batch_loop()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

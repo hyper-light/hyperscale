@@ -3412,19 +3412,82 @@ When quorum cannot be achieved (e.g., too many managers down), operations fail f
 3. Attempt quorum → `QuorumTimeoutError` if timeout without enough confirmations
 4. Record success/failure for circuit breaker state transitions
 
-### Client Push Notifications (Not Implemented)
+### Client Push Notifications (Implemented)
 
-The tiered update strategy (AD-15) is implemented server-side, but client push is not yet implemented.
+Client push notifications allow Gates and Managers to push job status updates directly to clients, eliminating the need for polling.
 
-**Current behavior**:
-- Tier 1 (Immediate) updates are logged but not pushed to clients
-- Tier 2 (Periodic) batch loop runs but doesn't push to clients
-- Clients must poll for status updates
+**Architecture**:
 
-**Future work**:
-- WebSocket support for real-time updates
-- Server-Sent Events (SSE) alternative
-- Webhook callbacks for job completion
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   Push Notification Flow                      │
+├──────────────────────────────────────────────────────────────┤
+│  1. Client starts a TCP listener                             │
+│  2. Client → Gate/Manager: JobSubmission(callback_addr=...)  │
+│  3. Gate/Manager stores callback in _job_callbacks           │
+│  4. On Tier 1 events (completion/failure):                   │
+│     Gate/Manager → Client: JobStatusPush                     │
+│  5. On Tier 2 interval (every 2s):                           │
+│     Gate/Manager → Client: JobBatchPush                      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Message Types**:
+
+- `JobStatusPush`: Tier 1 immediate updates for critical events (started, completed, failed)
+  - `job_id`, `status`, `message`, `total_completed`, `total_failed`, `overall_rate`, `elapsed_seconds`, `is_final`
+- `JobBatchPush`: Tier 2 periodic updates with aggregated stats
+  - `job_id`, `status`, `step_stats[]`, `total_completed`, `total_failed`, `overall_rate`, `elapsed_seconds`
+
+**JobSubmission Extension**:
+
+```python
+@dataclass
+class JobSubmission(Message):
+    job_id: str
+    workflows: bytes
+    # ... other fields ...
+    callback_addr: tuple[str, int] | None = None  # Optional push callback
+```
+
+**Gate Implementation** (`GateServer`):
+
+- `_job_callbacks: dict[str, tuple[str, int]]` - Stores callbacks by job_id
+- `_send_immediate_update()` - Pushes `JobStatusPush` on critical events
+- `_batch_stats_update()` - Pushes `JobBatchPush` to all callbacks for running jobs
+
+**Manager Implementation** (`ManagerServer`):
+
+- `_job_callbacks: dict[str, tuple[str, int]]` - Stores callbacks by job_id
+- `_push_job_status_to_client()` - Pushes `JobStatusPush` on critical events
+- `_push_batch_stats_to_clients()` - Pushes `JobBatchPush` periodically
+- `_client_batch_push_loop()` - Background loop for Tier 2 updates (only when no gates)
+- `_check_job_completion()` - Detects job completion and triggers push
+
+**Client Implementation**:
+
+Clients that want push notifications must implement TCP receivers:
+
+```python
+class JobStatusClient(MercurySyncBaseServer):
+    @tcp.receive()
+    async def receive_job_status_push(self, addr, data, clock_time):
+        status = JobStatusPush.load(data)
+        # Handle immediate status update
+        return b'ok'
+    
+    @tcp.receive()
+    async def receive_job_batch_push(self, addr, data, clock_time):
+        batch = JobBatchPush.load(data)
+        # Handle batched progress update
+        return b'ok'
+```
+
+**Behavior**:
+
+- Gate mode: Gates push to clients, managers forward to gates
+- Direct mode: Managers push directly to clients (when no gates configured)
+- Callbacks are automatically cleaned up when jobs reach final state
 
 ---
 
@@ -3436,7 +3499,7 @@ Run the test suite:
 python examples/test_distributed_rewrite.py
 ```
 
-Current test coverage: 125 tests covering:
+Current test coverage: 130+ tests covering:
 - SWIM protocol (probing, suspicion, gossip)
 - Leadership election (pre-voting, flapping)
 - State embedding (heartbeat serialization)
@@ -3451,6 +3514,7 @@ Current test coverage: 125 tests covering:
 - Datacenter health classification (HEALTHY/BUSY/DEGRADED/UNHEALTHY)
 - Smart dispatch with fallback chain
 - Tiered update strategy
+- Client push notifications (JobStatusPush, JobBatchPush)
 
 ---
 

@@ -45,6 +45,9 @@ from .distributed import (
     WorkflowProgress as WorkflowProgress,
     JobProgress as JobProgress,
     GlobalJobStatus as GlobalJobStatus,
+    # Client push notifications
+    JobStatusPush as JobStatusPush,
+    JobBatchPush as JobBatchPush,
     # State sync
     WorkerStateSnapshot as WorkerStateSnapshot,
     ManagerStateSnapshot as ManagerStateSnapshot,

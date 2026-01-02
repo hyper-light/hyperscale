@@ -60,6 +60,8 @@ from hyperscale.distributed_rewrite.models import (
     JobSubmission,
     JobAck,
     JobStatus,
+    JobStatusPush,
+    JobBatchPush,
     WorkflowDispatch,
     WorkflowDispatchAck,
     WorkflowProgress,
@@ -172,6 +174,10 @@ class ManagerServer(HealthAwareServer):
         self._workflow_assignments: dict[str, str] = {}  # workflow_id -> worker_node_id
         self._pending_provisions: dict[str, ProvisionRequest] = {}  # workflow_id -> request
         self._provision_confirmations: dict[str, set[str]] = {}  # workflow_id -> confirming nodes
+        
+        # Client push notification callbacks (when gates not present)
+        # job_id -> callback address for push notifications
+        self._job_callbacks: dict[str, tuple[str, int]] = {}
         
         # Workflow retry tracking
         # Maps workflow_id -> (retry_count, original_dispatch, failed_workers)
@@ -1028,12 +1034,16 @@ class ManagerServer(HealthAwareServer):
         # TCP provides reliability for critical status updates
         if self._gate_addrs or self._known_gates:
             self._task_runner.run(self._gate_heartbeat_loop)
+        else:
+            # No gates - start batch push loop for direct client connections
+            self._task_runner.run(self._client_batch_push_loop)
         
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
                 message=f"Manager started in DC {self._node_id.datacenter}, state={self._manager_state.value}" +
-                        (f", primary gate: {self._primary_gate_id}" if self._primary_gate_id else ""),
+                        (f", primary gate: {self._primary_gate_id}" if self._primary_gate_id else "") +
+                        (", client push notifications enabled" if not (self._gate_addrs or self._known_gates) else ""),
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -1740,6 +1750,10 @@ class ManagerServer(HealthAwareServer):
                 # Forward job progress to gates (if connected)
                 if self._known_gates or self._gate_addrs:
                     self._task_runner.run(self._send_job_progress_to_gate, job)
+                
+                # Check for job completion and push to client (if no gates)
+                if not (self._known_gates or self._gate_addrs):
+                    self._check_job_completion(progress.job_id)
             
             # Return ack with current manager topology for worker to update
             ack = WorkflowProgressAck(
@@ -1852,6 +1866,169 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
+    
+    # =========================================================================
+    # Client Push Notifications (when gates not present)
+    # =========================================================================
+    
+    async def _push_job_status_to_client(
+        self,
+        job_id: str,
+        event_type: str,
+    ) -> None:
+        """
+        Push job status to client callback (Tier 1 immediate update).
+        
+        Used when manager receives jobs directly from clients (no gates).
+        Pushes JobStatusPush for critical events like completion/failure.
+        """
+        job = self._jobs.get(job_id)
+        if not job:
+            return
+        
+        callback = self._job_callbacks.get(job_id)
+        if not callback:
+            return  # No callback registered
+        
+        is_final = job.status in (
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+        )
+        
+        push = JobStatusPush(
+            job_id=job_id,
+            status=job.status,
+            message=event_type,
+            total_completed=job.total_completed,
+            total_failed=job.total_failed,
+            overall_rate=job.overall_rate,
+            elapsed_seconds=time.monotonic() - job.timestamp,
+            is_final=is_final,
+        )
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Job {job_id}: pushing {event_type} to client {callback}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        try:
+            await self.send_tcp(
+                callback,
+                "job_status_push",
+                push.dump(),
+                timeout=2.0,
+            )
+        except Exception:
+            # Client unreachable - don't block
+            pass
+        
+        # Clean up callback if job is final
+        if is_final:
+            self._job_callbacks.pop(job_id, None)
+    
+    async def _push_batch_stats_to_clients(self) -> None:
+        """
+        Push batched stats to all clients with callbacks (Tier 2 periodic update).
+        
+        Called periodically to send progress updates to clients.
+        """
+        # Collect running jobs with callbacks
+        jobs_with_callbacks = []
+        for job_id, job in self._jobs.items():
+            if job.status == JobStatus.RUNNING.value:
+                callback = self._job_callbacks.get(job_id)
+                if callback:
+                    jobs_with_callbacks.append((job_id, job, callback))
+        
+        if not jobs_with_callbacks:
+            return
+        
+        for job_id, job, callback in jobs_with_callbacks:
+            batch_push = JobBatchPush(
+                job_id=job_id,
+                status=job.status,
+                step_stats=job.step_stats if hasattr(job, 'step_stats') else [],
+                total_completed=job.total_completed,
+                total_failed=job.total_failed,
+                overall_rate=job.overall_rate,
+                elapsed_seconds=time.monotonic() - job.timestamp,
+            )
+            
+            try:
+                await self.send_tcp(
+                    callback,
+                    "job_batch_push",
+                    batch_push.dump(),
+                    timeout=2.0,
+                )
+            except Exception:
+                # Client unreachable - continue with others
+                pass
+    
+    def _check_job_completion(self, job_id: str) -> None:
+        """
+        Check if a job has completed and push status if callback registered.
+        
+        Called after workflow progress updates to detect job completion.
+        """
+        job = self._jobs.get(job_id)
+        if not job:
+            return
+        
+        # Check if all workflows are complete
+        all_done = all(
+            w.status in (WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value)
+            for w in job.workflows
+        ) if job.workflows else False
+        
+        if all_done and job.status == JobStatus.RUNNING.value:
+            # Determine final status
+            any_failed = any(
+                w.status == WorkflowStatus.FAILED.value
+                for w in job.workflows
+            )
+            job.status = JobStatus.FAILED.value if any_failed else JobStatus.COMPLETED.value
+            
+            # Push final status to client
+            if self._job_callbacks.get(job_id):
+                self._task_runner.run(
+                    self._push_job_status_to_client,
+                    job_id,
+                    f"Job {job.status}",
+                )
+    
+    async def _client_batch_push_loop(self) -> None:
+        """
+        Background loop for Tier 2 (Periodic) client push updates.
+        
+        Only runs when manager operates without gates (direct client mode).
+        Sends batched progress updates to clients every few seconds.
+        """
+        batch_interval = getattr(self, '_batch_push_interval', 2.0)
+        
+        while True:
+            try:
+                await asyncio.sleep(batch_interval)
+                await self._push_batch_stats_to_clients()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Client batch push loop error: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                await asyncio.sleep(batch_interval)
     
     # =========================================================================
     # Workflow Failure Retry Logic
@@ -2320,6 +2497,11 @@ class ManagerServer(HealthAwareServer):
                 timestamp=time.monotonic(),
             )
             self._jobs[submission.job_id] = job
+            
+            # Store callback for push notifications (if provided)
+            if submission.callback_addr:
+                self._job_callbacks[submission.job_id] = submission.callback_addr
+            
             self._increment_version()
             
             # Unpickle workflows
