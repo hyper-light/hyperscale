@@ -3393,14 +3393,24 @@ New managers join the cluster in a SYNCING state before becoming ACTIVE:
 - `_complete_startup_sync()` handles non-leader state sync on startup
 - `_has_quorum_available()` excludes SYNCING managers from quorum count
 
-### Quorum Timeout Handling (Partial)
+### Quorum Timeout Handling (✅ Implemented)
 
-When quorum cannot be achieved (e.g., too many managers down), operations should fail fast with clear errors.
+When quorum cannot be achieved (e.g., too many managers down), operations fail fast with clear errors.
 
-**Current behavior**:
-- Quorum timeout returns failure
-- No circuit breaker for repeated failures
-- No automatic shedding of quorum operations when unavailable
+**Implementation**:
+- Circuit breaker pattern prevents cascading failures during degraded cluster state
+- Three specific quorum error types provide clear diagnostics:
+  - `QuorumUnavailableError`: Not enough active managers (structural issue)
+  - `QuorumTimeoutError`: Managers available but didn't respond in time
+  - `QuorumCircuitOpenError`: Too many recent failures, failing fast
+- Circuit breaker settings: Opens after 3 failures in 30s window, recovers after 10s
+- `get_quorum_status()` method provides observability into circuit state
+
+**Error Flow**:
+1. Check circuit breaker first → `QuorumCircuitOpenError` if OPEN
+2. Check if quorum possible → `QuorumUnavailableError` if insufficient managers
+3. Attempt quorum → `QuorumTimeoutError` if timeout without enough confirmations
+4. Record success/failure for circuit breaker state transitions
 
 ### Client Push Notifications (Not Implemented)
 

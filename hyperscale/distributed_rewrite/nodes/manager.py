@@ -33,6 +33,13 @@ from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, ManagerStateEmbedder
+from hyperscale.distributed_rewrite.swim.core import (
+    ErrorStats,
+    CircuitState,
+    QuorumUnavailableError,
+    QuorumTimeoutError,
+    QuorumCircuitOpenError,
+)
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -188,6 +195,14 @@ class ManagerServer(HealthAwareServer):
         
         # Quorum settings
         self._quorum_timeout = quorum_timeout
+        
+        # Quorum circuit breaker - prevents repeated attempts when quorum unavailable
+        # Opens after 3 failures within 30 seconds, recovers after 10 seconds
+        self._quorum_circuit = ErrorStats(
+            window_seconds=30.0,
+            max_errors=3,
+            half_open_after=10.0,
+        )
         
         # Job cleanup configuration
         self._job_max_age: float = 3600.0  # 1 hour max age for completed jobs
@@ -872,6 +887,34 @@ class ManagerServer(HealthAwareServer):
         active_count = len(self._active_manager_peers) + 1  # Include self
         return active_count >= self._quorum_size()
     
+    def get_quorum_status(self) -> dict:
+        """
+        Get current quorum and circuit breaker status.
+        
+        Returns a dict with:
+        - active_managers: Number of active managers
+        - required_quorum: Number needed for quorum
+        - quorum_available: Whether quorum operations can proceed
+        - circuit_state: Current circuit breaker state (CLOSED/OPEN/HALF_OPEN)
+        - circuit_failures: Number of recent failures in window
+        - circuit_error_rate: Errors per second in window
+        
+        This is useful for monitoring and debugging cluster health.
+        """
+        active_count = len(self._active_manager_peers) + 1
+        required = self._quorum_size()
+        circuit_state = self._quorum_circuit.circuit_state
+        
+        return {
+            "active_managers": active_count,
+            "required_quorum": required,
+            "quorum_available": self._has_quorum_available(),
+            "circuit_state": circuit_state.name,
+            "circuit_failures": self._quorum_circuit.error_count,
+            "circuit_error_rate": self._quorum_circuit.error_rate,
+            "manager_state": self._manager_state.value,
+        }
+    
     def _get_healthy_managers(self) -> list[ManagerInfo]:
         """
         Build list of all known healthy managers for worker discovery.
@@ -1370,8 +1413,62 @@ class ManagerServer(HealthAwareServer):
         """
         Request quorum confirmation for a provisioning decision.
         
+        Uses circuit breaker pattern to fail fast when quorum is repeatedly
+        unavailable. This prevents cascading failures when the cluster is
+        in a degraded state.
+        
         Returns True if quorum is achieved, False otherwise.
+        
+        Raises:
+            QuorumCircuitOpenError: Circuit breaker is open due to repeated failures
+            QuorumUnavailableError: Not enough active managers for quorum
         """
+        # Check circuit breaker first - fail fast if too many recent failures
+        circuit_state = self._quorum_circuit.circuit_state
+        if circuit_state == CircuitState.OPEN:
+            # Calculate retry time
+            retry_after = self._quorum_circuit.half_open_after
+            if self._quorum_circuit._circuit_opened_at:
+                elapsed = time.monotonic() - self._quorum_circuit._circuit_opened_at
+                retry_after = max(0.0, self._quorum_circuit.half_open_after - elapsed)
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Quorum circuit breaker OPEN - failing fast (retry in {retry_after:.1f}s)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            raise QuorumCircuitOpenError(
+                recent_failures=self._quorum_circuit.error_count,
+                window_seconds=self._quorum_circuit.window_seconds,
+                retry_after_seconds=retry_after,
+            )
+        
+        # Check if quorum is even possible
+        if not self._has_quorum_available():
+            active_count = len(self._active_manager_peers) + 1
+            required = self._quorum_size()
+            
+            # Record failure for circuit breaker
+            self._quorum_circuit.record_error()
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Quorum unavailable: {active_count} active, need {required}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            raise QuorumUnavailableError(
+                active_managers=active_count,
+                required_quorum=required,
+            )
+        
         self._pending_provisions[provision.workflow_id] = provision
         self._provision_confirmations[provision.workflow_id] = {self._node_id.full}  # Self-confirm
         
@@ -1391,11 +1488,35 @@ class ManagerServer(HealthAwareServer):
             
             # Check if we have quorum
             confirmed = self._provision_confirmations.get(provision.workflow_id, set())
-            return len(confirmed) >= self._quorum_size
+            quorum_achieved = len(confirmed) >= self._quorum_size
+            
+            if quorum_achieved:
+                # Success - record for circuit breaker recovery
+                self._quorum_circuit.record_success()
+                return True
+            else:
+                # Failed to get quorum
+                self._quorum_circuit.record_error()
+                raise QuorumTimeoutError(
+                    confirmations_received=len(confirmed),
+                    required_quorum=self._quorum_size(),
+                    timeout=self._quorum_timeout,
+                )
             
         except asyncio.TimeoutError:
             confirmed = self._provision_confirmations.get(provision.workflow_id, set())
-            return len(confirmed) >= self._quorum_size
+            quorum_achieved = len(confirmed) >= self._quorum_size
+            
+            if quorum_achieved:
+                self._quorum_circuit.record_success()
+                return True
+            else:
+                self._quorum_circuit.record_error()
+                raise QuorumTimeoutError(
+                    confirmations_received=len(confirmed),
+                    required_quorum=self._quorum_size(),
+                    timeout=self._quorum_timeout,
+                )
         finally:
             # Cleanup
             self._pending_provisions.pop(provision.workflow_id, None)
@@ -2454,12 +2575,22 @@ class ManagerServer(HealthAwareServer):
         
         # Request quorum (skip if only one manager)
         if self._manager_peers:
-            confirmed = await self._request_quorum_confirmation(provision)
-            if not confirmed:
+            try:
+                await self._request_quorum_confirmation(provision)
+                # Send commit to all managers on success
+                await self._send_provision_commit(provision)
+            except (QuorumCircuitOpenError, QuorumUnavailableError, QuorumTimeoutError) as e:
+                # Log the specific quorum failure and return False
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Quorum failed for {workflow_id}: {e.message}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
                 return False
-            
-            # Send commit to all managers
-            await self._send_provision_commit(provision)
         
         # Dispatch to worker
         dispatch = WorkflowDispatch(

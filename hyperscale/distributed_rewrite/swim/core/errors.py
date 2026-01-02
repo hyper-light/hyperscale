@@ -398,6 +398,105 @@ class NotEligibleError(ElectionError):
 
 
 # =============================================================================
+# Quorum Errors - Distributed consensus failures
+# =============================================================================
+
+class QuorumError(SwimError):
+    """
+    Base class for quorum-related errors.
+    
+    These errors occur when distributed consensus cannot be achieved,
+    such as when too many managers are down or unreachable.
+    """
+    
+    def __init__(
+        self,
+        message: str,
+        severity: ErrorSeverity = ErrorSeverity.DEGRADED,
+        cause: BaseException | None = None,
+        **context: Any,
+    ):
+        super().__init__(
+            message=message,
+            category=ErrorCategory.PROTOCOL,
+            severity=severity,
+            context=context,
+            cause=cause,
+        )
+
+
+class QuorumUnavailableError(QuorumError):
+    """
+    Quorum cannot be achieved due to insufficient active managers.
+    
+    This is a structural issue - there simply aren't enough managers
+    available to form a quorum. Operations requiring quorum should
+    fail fast with this error.
+    """
+    
+    def __init__(
+        self,
+        active_managers: int,
+        required_quorum: int,
+        reason: str = "insufficient active managers",
+    ):
+        super().__init__(
+            message=f"Quorum unavailable: {reason} ({active_managers} active, need {required_quorum})",
+            severity=ErrorSeverity.DEGRADED,
+            active_managers=active_managers,
+            required_quorum=required_quorum,
+            reason=reason,
+        )
+
+
+class QuorumTimeoutError(QuorumError):
+    """
+    Quorum confirmation timed out.
+    
+    Managers are available but didn't respond in time. This could be
+    due to network issues or high load.
+    """
+    
+    def __init__(
+        self,
+        confirmations_received: int,
+        required_quorum: int,
+        timeout: float,
+    ):
+        super().__init__(
+            message=f"Quorum timeout: got {confirmations_received} confirmations, need {required_quorum} (timeout={timeout}s)",
+            severity=ErrorSeverity.TRANSIENT,
+            confirmations_received=confirmations_received,
+            required_quorum=required_quorum,
+            timeout=timeout,
+        )
+
+
+class QuorumCircuitOpenError(QuorumError):
+    """
+    Quorum circuit breaker is open due to repeated failures.
+    
+    Too many recent quorum operations have failed. The circuit breaker
+    has opened to prevent cascading failures. Operations should fail
+    fast with this error until the circuit closes.
+    """
+    
+    def __init__(
+        self,
+        recent_failures: int,
+        window_seconds: float,
+        retry_after_seconds: float,
+    ):
+        super().__init__(
+            message=f"Quorum circuit breaker OPEN: {recent_failures} failures in {window_seconds}s window. Retry after {retry_after_seconds:.1f}s",
+            severity=ErrorSeverity.DEGRADED,
+            recent_failures=recent_failures,
+            window_seconds=window_seconds,
+            retry_after_seconds=retry_after_seconds,
+        )
+
+
+# =============================================================================
 # Internal Errors - Bugs and unexpected conditions
 # =============================================================================
 

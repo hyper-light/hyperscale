@@ -37,6 +37,10 @@ from .errors import (
     ElectionTimeoutError,
     SplitBrainError,
     NotEligibleError,
+    QuorumError,
+    QuorumUnavailableError,
+    QuorumTimeoutError,
+    QuorumCircuitOpenError,
     InternalError,
     UnexpectedError,
 )

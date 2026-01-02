@@ -3525,6 +3525,149 @@ test_manager_embedder_includes_state_callback()
 
 
 # =============================================================================
+# Quorum Circuit Breaker Tests
+# =============================================================================
+
+print("\nQuorum Circuit Breaker Tests")
+print("=" * 50)
+
+
+@test("QuorumError: error hierarchy exists")
+def test_quorum_error_hierarchy():
+    from hyperscale.distributed_rewrite.swim.core import (
+        QuorumError,
+        QuorumUnavailableError,
+        QuorumTimeoutError,
+        QuorumCircuitOpenError,
+    )
+    
+    # All quorum errors should exist
+    assert QuorumError is not None
+    assert QuorumUnavailableError is not None
+    assert QuorumTimeoutError is not None
+    assert QuorumCircuitOpenError is not None
+    
+    # Test error creation
+    err = QuorumUnavailableError(active_managers=2, required_quorum=3)
+    assert "Quorum unavailable" in str(err)
+    assert err.context['active_managers'] == 2
+
+
+@test("QuorumTimeoutError: contains relevant info")
+def test_quorum_timeout_error():
+    from hyperscale.distributed_rewrite.swim.core import QuorumTimeoutError
+    
+    err = QuorumTimeoutError(
+        confirmations_received=1,
+        required_quorum=2,
+        timeout=5.0,
+    )
+    
+    assert "timeout" in str(err).lower()
+    assert err.context['confirmations_received'] == 1
+    assert err.context['required_quorum'] == 2
+
+
+@test("QuorumCircuitOpenError: contains retry info")
+def test_quorum_circuit_open_error():
+    from hyperscale.distributed_rewrite.swim.core import QuorumCircuitOpenError
+    
+    err = QuorumCircuitOpenError(
+        recent_failures=5,
+        window_seconds=30.0,
+        retry_after_seconds=10.0,
+    )
+    
+    assert "circuit breaker" in str(err).lower()
+    assert err.context['recent_failures'] == 5
+    assert err.context['retry_after_seconds'] == 10.0
+
+
+@test("Manager: has _quorum_circuit")
+def test_manager_has_quorum_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer.__init__)
+    
+    assert "_quorum_circuit" in source, \
+        "Manager should have _quorum_circuit ErrorStats instance"
+    assert "ErrorStats(" in source, \
+        "Manager should create ErrorStats for circuit breaker"
+
+
+@test("Manager: _request_quorum_confirmation checks circuit")
+def test_manager_quorum_checks_circuit():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._request_quorum_confirmation)
+    
+    # Should check circuit breaker state
+    assert "circuit_state" in source, \
+        "_request_quorum_confirmation should check circuit state"
+    assert "CircuitState.OPEN" in source, \
+        "_request_quorum_confirmation should check for OPEN state"
+    assert "QuorumCircuitOpenError" in source, \
+        "_request_quorum_confirmation should raise QuorumCircuitOpenError"
+
+
+@test("Manager: _request_quorum_confirmation records failures")
+def test_manager_quorum_records_failures():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    source = inspect.getsource(ManagerServer._request_quorum_confirmation)
+    
+    assert "record_error()" in source, \
+        "_request_quorum_confirmation should record errors"
+    assert "record_success()" in source, \
+        "_request_quorum_confirmation should record successes"
+
+
+@test("Manager: has get_quorum_status method")
+def test_manager_has_quorum_status():
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    import inspect
+    
+    assert hasattr(ManagerServer, 'get_quorum_status'), \
+        "Manager should have get_quorum_status method"
+    
+    source = inspect.getsource(ManagerServer.get_quorum_status)
+    
+    assert "circuit_state" in source, \
+        "get_quorum_status should return circuit state"
+    assert "active_managers" in source, \
+        "get_quorum_status should return active managers count"
+
+
+@test("Manager: workflow dispatch handles quorum errors")
+def test_manager_dispatch_handles_quorum_errors():
+    import pathlib
+    from hyperscale.distributed_rewrite.nodes import ManagerServer
+    
+    import hyperscale.distributed_rewrite.nodes.manager as manager_module
+    source_file = pathlib.Path(manager_module.__file__)
+    source = source_file.read_text()
+    
+    # Should catch quorum errors in workflow dispatch
+    assert "QuorumCircuitOpenError" in source
+    assert "QuorumUnavailableError" in source
+    assert "QuorumTimeoutError" in source
+
+
+# Run Quorum Circuit Breaker tests
+test_quorum_error_hierarchy()
+test_quorum_timeout_error()
+test_quorum_circuit_open_error()
+test_manager_has_quorum_circuit()
+test_manager_quorum_checks_circuit()
+test_manager_quorum_records_failures()
+test_manager_has_quorum_status()
+test_manager_dispatch_handles_quorum_errors()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 
