@@ -219,7 +219,8 @@ class ManagerServer(UDPServer):
         if not self._workers:
             return
         
-        self._udp_logger.log(
+        self._task_runner.run(
+            self._udp_logger.log,
             ServerInfo(
                 message=f"New leader syncing state from {len(self._workers)} workers",
                 node_host=self._host,
@@ -250,7 +251,8 @@ class ManagerServer(UDPServer):
                 if r is not None and not isinstance(r, Exception)
             )
             
-            self._udp_logger.log(
+            self._task_runner.run(
+                self._udp_logger.log,
                 ServerInfo(
                     message=f"State sync complete: {success_count}/{len(sync_tasks)} workers responded",
                     node_host=self._host,
@@ -387,7 +389,8 @@ class ManagerServer(UDPServer):
         # Note: Status updates to gates are now handled via Serf-style heartbeat
         # embedding in SWIM probe responses. Gates learn our state passively.
         
-        self._udp_logger.log(
+        self._task_runner.run(
+            self._udp_logger.log,
             ServerInfo(
                 message=f"Manager started in DC {self._node_id.datacenter}, SWIM healthcheck active",
                 node_host=self._host,
@@ -624,7 +627,8 @@ class ManagerServer(UDPServer):
             worker_udp_addr = (registration.node.host, registration.node.port)
             self._probe_scheduler.add_member(worker_udp_addr)
             
-            self._udp_logger.log(
+            self._task_runner.run(
+                self._udp_logger.log,
                 ServerInfo(
                     message=f"Worker registered: {registration.node.node_id} with {registration.total_cores} cores (SWIM probe added)",
                     node_host=self._host,
@@ -734,7 +738,8 @@ class ManagerServer(UDPServer):
         
         # Get retry info (should have been stored on initial dispatch)
         if workflow_id not in self._workflow_retries:
-            self._udp_logger.log(
+            self._task_runner.run(
+                self._udp_logger.log,
                 ServerError(
                     message=f"No retry info for failed workflow {workflow_id}",
                     node_host=self._host,
@@ -751,7 +756,8 @@ class ManagerServer(UDPServer):
         
         # Check if we've exceeded max retries
         if retry_count >= self._max_workflow_retries:
-            self._udp_logger.log(
+            self._task_runner.run(
+                self._udp_logger.log,
                 ServerError(
                     message=f"Workflow {workflow_id} failed after {retry_count} retries",
                     node_host=self._host,
@@ -801,7 +807,8 @@ class ManagerServer(UDPServer):
         # Get stored dispatch data from retry info
         retry_info = self._workflow_retries.get(workflow_id)
         if not retry_info or not retry_info[1]:
-            self._udp_logger.log(
+            self._task_runner.run(
+                self._udp_logger.log,
                 ServerError(
                     message=f"No dispatch data for workflow {workflow_id} retry",
                     node_host=self._host,
@@ -820,7 +827,8 @@ class ManagerServer(UDPServer):
         )
         
         if not new_worker:
-            self._udp_logger.log(
+            self._task_runner.run(
+                self._udp_logger.log,
                 ServerError(
                     message=f"No eligible workers for workflow {workflow_id} retry (attempt {retry_count})",
                     node_host=self._host,
@@ -837,7 +845,8 @@ class ManagerServer(UDPServer):
         self._workflow_retries[workflow_id] = (retry_count, original_dispatch_bytes, failed_workers)
         self._workflow_assignments[workflow_id] = new_worker
         
-        self._udp_logger.log(
+        self._task_runner.run(
+            self._udp_logger.log,
             ServerInfo(
                 message=f"Retrying workflow {workflow_id} on {new_worker} (attempt {retry_count}/{self._max_workflow_retries})",
                 node_host=self._host,
@@ -935,7 +944,8 @@ class ManagerServer(UDPServer):
         if not workflows_to_retry:
             return
         
-        self._udp_logger.log(
+        self._task_runner.run(
+            self._udp_logger.log,
             ServerInfo(
                 message=f"Worker {worker_node_id} failed, rescheduling {len(workflows_to_retry)} workflows",
                 node_host=self._host,
@@ -1009,7 +1019,8 @@ class ManagerServer(UDPServer):
                     self._cleanup_job(job_id)
                 
                 if jobs_to_remove:
-                    self._udp_logger.log(
+                    self._task_runner.run(
+                        self._udp_logger.log,
                         ServerInfo(
                             message=f"Cleaned up {len(jobs_to_remove)} completed jobs",
                             node_host=self._host,

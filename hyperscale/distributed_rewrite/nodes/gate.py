@@ -267,7 +267,8 @@ class GateServer(UDPServer):
         self._task_runner.run(self._lease_cleanup_loop)
         self._task_runner.run(self._job_cleanup_loop)
         
-        self._udp_logger.log(
+        self._task_runner.run(
+            self._udp_logger.log,
             ServerInfo(
                 message=f"Gate started with {len(self._datacenter_managers)} configured DCs, SWIM healthcheck active",
                 node_host=self._host,
@@ -343,7 +344,8 @@ class GateServer(UDPServer):
                         self._leases.pop(key, None)
                 
                 if jobs_to_remove:
-                    self._udp_logger.log(
+                    self._task_runner.run(
+                        self._udp_logger.log,
                         ServerInfo(
                             message=f"Cleaned up {len(jobs_to_remove)} completed jobs",
                             node_host=self._host,

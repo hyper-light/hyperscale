@@ -171,7 +171,8 @@ class WorkerServer(UDPServer):
         # so managers learn our capacity/status passively via the SWIM protocol
         self._task_runner.run(self.start_probe_cycle)
         
-        self._udp_logger.log(
+        self._task_runner.run(
+            self._udp_logger.log,
             ServerInfo(
                 message=f"Worker started with {self._total_cores} cores, SWIM healthcheck active",
                 node_host=self._host,
@@ -211,7 +212,8 @@ class WorkerServer(UDPServer):
             
             return not isinstance(result, Exception)
         except Exception as e:
-            self._udp_logger.log(
+            self._task_runner.run(
+                self._udp_logger.log,
                 ServerError(
                     message=f"Failed to register with manager {manager_addr}: {e}",
                     node_host=self._host,
