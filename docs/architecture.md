@@ -126,6 +126,167 @@ The distributed system implements a three-tier architecture optimized for execut
 3. **Quorum-based provisioning** - Manager decisions require quorum confirmation
 4. **Lease-based execution** - Gates use leases for at-most-once DC semantics
 5. **Graceful degradation** - Load shedding under pressure, LHM-aware timeouts
+6. **Composition over inheritance** - All extensibility via callbacks, not method overriding
+7. **TaskRunner for lifecycle management** - All background tasks managed via TaskRunner
+8. **Quorum uses configured size** - Prevents split-brain in partitions (see below)
+
+---
+
+## Architectural Decisions
+
+This section documents key architectural decisions made during development.
+
+### AD-1: Composition Over Inheritance
+
+**Decision**: All extensibility is via callbacks and composition, never method overriding.
+
+**Rationale**: 
+- Prevents fragile base class problems
+- Makes dependencies explicit
+- Easier to test individual components
+- Allows runtime reconfiguration
+
+**Implementation**:
+- `StateEmbedder` protocol for heartbeat embedding
+- Leadership callbacks: `register_on_become_leader()`, `register_on_lose_leadership()`
+- Node status callbacks: `register_on_node_dead()`, `register_on_node_join()`
+- All node types (Worker, Manager, Gate) use these instead of overriding UDPServer methods
+
+### AD-2: TaskRunner for All Background Tasks
+
+**Decision**: All background/async tasks must be managed through TaskRunner, not raw `asyncio.create_task()`.
+
+**Rationale**:
+- Prevents orphaned tasks on shutdown
+- Provides cancellation via tokens
+- Enables task lifecycle monitoring
+- Centralizes cleanup logic
+
+**Implementation**:
+- `self._task_runner.run(coro, *args)` returns a token
+- `self._task_runner.cancel(token)` for cancellation
+- Cleanup loops, state sync, progress reporting all use TaskRunner
+
+### AD-3: Quorum Uses Configured Cluster Size
+
+**Decision**: Quorum calculation uses the **configured** cluster size, not the **active** member count.
+
+**Rationale**:
+- Prevents split-brain in network partitions
+- A partition with 1 of 3 managers won't think it has quorum
+- Standard Raft/Paxos behavior
+
+**Implementation**:
+```python
+def _quorum_size(self) -> int:
+    """Uses CONFIGURED peer count."""
+    total_managers = len(self._manager_peers) + 1  # Include self
+    return (total_managers // 2) + 1
+
+def _has_quorum_available(self) -> bool:
+    """Uses ACTIVE peer count for monitoring only."""
+    active_count = len(self._active_manager_peers) + 1
+    return active_count >= self._quorum_size()
+```
+
+### AD-4: Workers Are Source of Truth
+
+**Decision**: Workers maintain authoritative state for their workflows. Managers rebuild state from workers on leader election.
+
+**Rationale**:
+- Workers have the actual running processes
+- Eliminates single point of failure for state
+- New leader can recover without distributed log
+
+**Implementation**:
+- `_on_manager_become_leader()` triggers `_sync_state_from_workers()`
+- Workers respond with `WorkerStateSnapshot` containing `active_workflows`
+- Manager rebuilds `_workflow_assignments` from worker responses
+
+### AD-5: Pre-Voting for Split-Brain Prevention
+
+**Decision**: Leader election uses a pre-vote phase before the actual election.
+
+**Rationale**:
+- Pre-vote doesn't increment term (prevents term explosion)
+- Candidate checks if it would win before disrupting cluster
+- Nodes only grant pre-vote if no healthy leader exists
+
+**Implementation**:
+- `_run_pre_vote()` gathers pre-votes without changing state
+- Only proceeds to real election if pre-vote majority achieved
+- If pre-vote fails, election is aborted
+
+### AD-6: Manager Peer Failure Detection
+
+**Decision**: Managers track peer liveness and quorum availability separately.
+
+**Rationale**:
+- Need to know if quorum operations will succeed
+- Leadership re-election is automatic via lease expiry
+- Logging quorum status aids debugging
+
+**Implementation**:
+- `_manager_udp_to_tcp`: Maps UDP addresses to TCP addresses
+- `_active_manager_peers`: Set of currently live peers
+- `_on_node_dead()` checks both workers AND manager peers
+- `_handle_manager_peer_failure()` updates active set
+
+### AD-7: Worker Manager Failover
+
+**Decision**: Workers detect manager failure via SWIM and automatically failover to backup managers.
+
+**Rationale**:
+- Workers must continue operating during manager transitions
+- Active workflows shouldn't be lost on manager failure
+- New manager needs to know about in-flight work
+
+**Implementation**:
+- Worker registers `_handle_manager_failure` as `on_node_dead` callback
+- On manager death: clear current manager, try alternatives
+- On successful failover: call `_report_active_workflows_to_manager()`
+
+### AD-8: Cores Completed for Faster Provisioning
+
+**Decision**: Workers report `cores_completed` in progress updates; managers optimistically update available cores.
+
+**Rationale**:
+- Don't wait for entire workflow to complete before provisioning
+- Enables pipelining of workflow execution
+- Better utilization of worker capacity
+
+**Implementation**:
+- `WorkflowProgress.cores_completed` field
+- Manager's `_update_worker_cores_from_progress()` calculates freed cores
+- Optimistic update may be superseded by next heartbeat (acceptable)
+
+### AD-9: Retry Data Preserved at Dispatch
+
+**Decision**: Original `WorkflowDispatch` bytes are stored when workflow is first dispatched, not reconstructed on retry.
+
+**Rationale**:
+- Ensures retry has exact same parameters (VUs, timeout, context)
+- Avoids serialization round-trip errors
+- Simplifies retry logic
+
+**Implementation**:
+- `_workflow_retries[workflow_id] = (count, original_dispatch_bytes, failed_workers)`
+- On retry: deserialize original, create new dispatch with updated fence_token
+- `failed_workers` set prevents re-dispatching to same worker
+
+### AD-10: Fencing Tokens from Terms
+
+**Decision**: Fencing tokens are derived from election terms.
+
+**Rationale**:
+- Monotonically increasing
+- Tied to leadership changes
+- Workers can reject stale leader operations
+
+**Implementation**:
+- `get_fencing_token()` returns current term
+- `is_fencing_token_valid(token)` checks `token >= current_term`
+- Included in `WorkflowDispatch`, checked by workers
 
 ---
 
@@ -1639,16 +1800,58 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │                                                                  │
 │  Detection: SWIM cluster among managers                          │
 │                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ PEER TRACKING (each manager maintains):                   │  │
+│  │                                                            │  │
+│  │ _manager_udp_to_tcp: dict[(host,port) → (host,port)]     │  │
+│  │   Maps SWIM UDP addresses to TCP addresses                │  │
+│  │                                                            │  │
+│  │ _active_manager_peers: set[(host,port)]                   │  │
+│  │   Currently live peer managers (updated via callbacks)    │  │
+│  │                                                            │  │
+│  │ _on_node_dead() checks BOTH:                              │  │
+│  │   • _worker_addr_to_id (for worker failure)               │  │
+│  │   • _manager_udp_to_tcp (for peer manager failure)        │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
 │  New Leader Election:                                            │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │ 1. Leader failure detected via SWIM                       │  │
-│  │ 2. Pre-voting phase among eligible managers               │  │
-│  │ 3. Candidate with lowest LHM + highest priority wins      │  │
-│  │ 4. New leader announces with new term number              │  │
+│  │ 2. Leader's heartbeats stop → lease expires on followers  │  │
+│  │ 3. Pre-voting phase among eligible managers               │  │
+│  │ 4. Candidate with lowest LHM + highest priority wins      │  │
+│  │ 5. New leader announces with new term number              │  │
+│  │                                                            │  │
+│  │ Note: Leadership re-election is AUTOMATIC via lease       │  │
+│  │ expiry in LocalLeaderElection - no manual intervention    │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                            │                                     │
 │                            ▼                                     │
-│  State Synchronization:                                          │
+│  Peer Manager Failure:                                           │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ _handle_manager_peer_failure():                           │  │
+│  │                                                            │  │
+│  │ 1. Remove from _active_manager_peers                      │  │
+│  │ 2. Check if dead peer was the leader                      │  │
+│  │ 3. Log quorum status for monitoring                       │  │
+│  │                                                            │  │
+│  │ Quorum calculation:                                        │  │
+│  │ • Uses CONFIGURED peer count (prevents split-brain)       │  │
+│  │ • _has_quorum_available() checks ACTIVE vs required       │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                            │                                     │
+│                            ▼                                     │
+│  Peer Manager Recovery:                                          │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ _handle_manager_peer_recovery() (via on_node_join):       │  │
+│  │                                                            │  │
+│  │ 1. Add back to _active_manager_peers                      │  │
+│  │ 2. Log recovery and quorum status                         │  │
+│  │ 3. Quorum capacity restored                               │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                            │                                     │
+│                            ▼                                     │
+│  State Synchronization (new leader only):                        │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │ _on_manager_become_leader() callback:                     │  │
 │  │                                                            │  │
@@ -1665,6 +1868,68 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  │ • Pending provisions: timeout and client retries          │  │
 │  │ • Running workflows: continue on workers (unaffected)     │  │
 │  │ • Progress updates: resume after new leader sync          │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Worker Manager Failover
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 WORKER MANAGER FAILOVER                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  When a worker detects its assigned manager has failed:          │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ _handle_manager_failure() (via on_node_dead callback):    │  │
+│  │                                                            │  │
+│  │ 1. Check if dead node is current manager                  │  │
+│  │ 2. Clear _current_manager reference                       │  │
+│  │ 3. Iterate through _manager_addrs backup list             │  │
+│  │ 4. Skip the failed manager                                │  │
+│  │ 5. Attempt registration with each alternative             │  │
+│  │ 6. On success: set _current_manager, report workflows     │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                            │                                     │
+│                            ▼                                     │
+│  Report Active Workflows:                                        │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ _report_active_workflows_to_manager():                    │  │
+│  │                                                            │  │
+│  │ For each workflow in _active_workflows:                   │  │
+│  │   • Send WorkflowProgress to new manager                  │  │
+│  │   • Ensures new manager is aware of in-flight work        │  │
+│  │   • No workflow interruption during failover              │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  Timeline:                                                       │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                                                            │  │
+│  │  Manager A dies                                            │  │
+│  │       │                                                    │  │
+│  │       ▼                                                    │  │
+│  │  SWIM detects (probe → indirect → suspicion → DEAD)       │  │
+│  │       │                                                    │  │
+│  │       ▼                                                    │  │
+│  │  Worker._on_node_dead(Manager A addr)                     │  │
+│  │       │                                                    │  │
+│  │       ▼                                                    │  │
+│  │  _handle_manager_failure() runs                           │  │
+│  │       │                                                    │  │
+│  │       ▼                                                    │  │
+│  │  Try Manager B from _manager_addrs                        │  │
+│  │       │                                                    │  │
+│  │       ▼                                                    │  │
+│  │  Registration succeeds → _current_manager = B             │  │
+│  │       │                                                    │  │
+│  │       ▼                                                    │  │
+│  │  _report_active_workflows_to_manager()                    │  │
+│  │       │                                                    │  │
+│  │       ▼                                                    │  │
+│  │  Normal operation resumes with Manager B                  │  │
+│  │                                                            │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -2161,13 +2426,13 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  │      │ ② UDP: Ack + members  │                                           ││
 │  │      │◄──────────────────────│                                           ││
 │  │      │                       │                                           ││
-│  │      │ STATE: SYNCING        │                                           ││
-│  │      │ (not counted in quorum)                                          ││
+│  │      │ ★ CURRENT: Immediately joins quorum                              ││
+│  │      │ ★ FUTURE: STATE: SYNCING (not in quorum until sync done)        ││
 │  │      │                       │                                           ││
-│  │      │ ③ TCP: StateSyncRequest                                          ││
-│  │      │──────────────────────►│ (to leader)                               ││
+│  │      │ ③ TCP: StateSyncRequest (NOT YET IMPLEMENTED)                    ││
+│  │      │──────────────────────►│ (to leader, should get manager state)    ││
 │  │      │                       │                                           ││
-│  │      │ ④ TCP: ManagerStateSnapshot                                      ││
+│  │      │ ④ TCP: ManagerStateSnapshot (NOT YET IMPLEMENTED)                ││
 │  │      │◄──────────────────────│                                           ││
 │  │      │                       │                                           ││
 │  │      │ Apply state snapshot  │                                           ││
@@ -2939,6 +3204,67 @@ gate = GateServer(
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Known Limitations & Future Work
+
+### State Sync Retries (Not Implemented)
+
+Currently, `_sync_state_from_workers()` makes a single attempt to each worker. If a worker is temporarily unreachable, its state is not recovered.
+
+**Current behavior**:
+- Single request with 5-second timeout
+- Partial failures logged but not retried
+- New leader may have incomplete state
+
+**Recommended improvement**:
+```python
+async def _request_worker_state_with_retry(
+    self,
+    worker_addr: tuple[str, int],
+    request: StateSyncRequest,
+    max_retries: int = 3,
+    base_delay: float = 0.5,
+) -> WorkerStateSnapshot | None:
+    for attempt in range(max_retries):
+        result = await self._request_worker_state(worker_addr, request)
+        if result:
+            return result
+        await asyncio.sleep(base_delay * (2 ** attempt))
+    return None
+```
+
+### New Manager Join Process (Partially Implemented)
+
+The architecture document describes a "SYNCING" state for new managers, but this is not fully implemented.
+
+**Documented flow (not yet implemented)**:
+1. New manager joins SWIM cluster
+2. State = SYNCING (not counted in quorum)
+3. Request state sync from leader
+4. Apply state snapshot
+5. State = ACTIVE (now in quorum)
+
+**Current implementation**:
+- Manager joins SWIM and immediately participates
+- No explicit SYNCING state
+- Quorum includes new manager immediately
+
+### Quorum Timeout Handling (Partial)
+
+When quorum cannot be achieved (e.g., too many managers down), operations should fail fast with clear errors.
+
+**Current behavior**:
+- Quorum timeout returns failure
+- No circuit breaker for repeated failures
+- No automatic shedding of quorum operations when unavailable
+
+### Manager Peer State Sync (Not Implemented)
+
+When a new manager joins, it should sync job state from the leader manager, not just from workers.
+
+**Gap**: Currently new managers only sync from workers. Job-level state (retry counts, completion status) may be lost.
 
 ---
 
