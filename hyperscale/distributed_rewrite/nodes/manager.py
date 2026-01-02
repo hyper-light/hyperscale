@@ -747,7 +747,7 @@ class ManagerServer(UDPServer):
             request = ProvisionRequest.load(data)
             
             # Check if we can confirm (worker exists and has capacity)
-            worker_hb = self._worker_heartbeats.get(request.target_worker)
+            worker_hb = self._worker_status.get(request.target_worker)
             can_confirm = (
                 worker_hb is not None and
                 worker_hb.available_cores >= request.cores_required and
