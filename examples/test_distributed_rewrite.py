@@ -4820,6 +4820,64 @@ test_gate_dispatch_dc_uses_dispatch_manager()
 
 
 # =============================================================================
+# Message Security Tests
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("MESSAGE SECURITY TESTS")
+print("=" * 70 + "\n")
+
+
+@test("Message.load: uses RestrictedUnpickler")
+def test_message_load_uses_restricted():
+    import inspect
+    from hyperscale.distributed_rewrite.models import Message
+    
+    source = inspect.getsource(Message.load)
+    
+    assert "RestrictedUnpickler" in source, \
+        "Message.load should use RestrictedUnpickler for secure deserialization"
+
+
+@test("Message.load: imports RestrictedUnpickler")
+def test_message_imports_restricted():
+    import pathlib
+    import hyperscale.distributed_rewrite.models.message as message_module
+    
+    source_file = pathlib.Path(message_module.__file__)
+    source = source_file.read_text()
+    
+    assert "from hyperscale.distributed_rewrite.models.restricted_unpickler import RestrictedUnpickler" in source, \
+        "message.py should import RestrictedUnpickler"
+
+
+@test("Message subclass serialization roundtrip")
+def test_message_roundtrip():
+    from hyperscale.distributed_rewrite.models import JobAck
+    
+    # Create a message
+    original = JobAck(
+        job_id="test-job-123",
+        accepted=True,
+        queued_position=5,
+    )
+    
+    # Serialize and deserialize
+    data = original.dump()
+    loaded = JobAck.load(data)
+    
+    assert loaded.job_id == original.job_id
+    assert loaded.accepted == original.accepted
+    assert loaded.queued_position == original.queued_position
+
+
+# Run Message Security tests
+test_message_load_uses_restricted()
+test_message_imports_restricted()
+test_message_roundtrip()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

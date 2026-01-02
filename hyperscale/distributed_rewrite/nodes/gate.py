@@ -54,7 +54,6 @@ from hyperscale.distributed_rewrite.models import (
     DatacenterHealth,
     DatacenterStatus,
     UpdateTier,
-    restricted_loads,
 )
 from hyperscale.distributed_rewrite.swim.core import (
     QuorumError,
@@ -547,7 +546,6 @@ class GateServer(HealthAwareServer):
         Apply a state snapshot from another gate.
         
         Merges job state, preferring entries with higher versions.
-        Uses restricted_loads for any serialized workflow data.
         """
         # Merge jobs - keep newer versions
         for job_id, job in snapshot.jobs.items():
