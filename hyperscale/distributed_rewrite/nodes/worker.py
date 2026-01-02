@@ -135,10 +135,11 @@ class WorkerServer(HealthAwareServer):
         
         # Circuit breaker for manager communication
         # Tracks failures and implements fail-fast when managers are unreachable
+        cb_config = env.get_circuit_breaker_config()
         self._manager_circuit = ErrorStats(
-            error_threshold=3,      # Open after 3 failures
-            window_seconds=30.0,    # Within 30 second window
-            half_open_after=10.0,   # Allow retry after 10 seconds
+            max_errors=cb_config['max_errors'],
+            window_seconds=cb_config['window_seconds'],
+            half_open_after=cb_config['half_open_after'],
         )
         
         # Workflow execution state
@@ -270,8 +271,9 @@ class WorkerServer(HealthAwareServer):
     
     async def start(self) -> None:
         """Start the worker server."""
-        # Start parent HealthAwareServer (TCP + UDP)
-        await super().start_server()
+        # Start the underlying server (TCP/UDP listeners, task runner, etc.)
+        # Uses SWIM settings from Env configuration
+        await self.start_server(init_context=self.env.get_swim_init_context())
         
         # Try seed managers in order until one succeeds
         # Registration response includes list of all healthy managers

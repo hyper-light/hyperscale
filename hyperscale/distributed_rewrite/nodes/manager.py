@@ -139,10 +139,11 @@ class ManagerServer(HealthAwareServer):
         
         # Circuit breaker for gate communication
         # Tracks failures and implements fail-fast when gates are unreachable
+        cb_config = env.get_circuit_breaker_config()
         self._gate_circuit = ErrorStats(
-            error_threshold=3,      # Open after 3 failures
-            window_seconds=30.0,    # Within 30 second window
-            half_open_after=10.0,   # Allow retry after 10 seconds
+            max_errors=cb_config['max_errors'],
+            window_seconds=cb_config['window_seconds'],
+            half_open_after=cb_config['half_open_after'],
         )
         
         # Backwards compat: keep for initial iteration through seed addresses
@@ -337,7 +338,7 @@ class ManagerServer(HealthAwareServer):
         
         # Log quorum status
         active_count = len(self._active_manager_peers) + 1  # Include self
-        required_quorum = self._quorum_size()
+        required_quorum = self._quorum_size
         have_quorum = active_count >= required_quorum
         
         self._task_runner.run(
@@ -386,7 +387,7 @@ class ManagerServer(HealthAwareServer):
         
         # Log quorum status
         active_count = len(self._active_manager_peers) + 1  # Include self
-        required_quorum = self._quorum_size()
+        required_quorum = self._quorum_size
         have_quorum = active_count >= required_quorum
         
         self._task_runner.run(
@@ -903,7 +904,7 @@ class ManagerServer(HealthAwareServer):
             return False
         
         active_count = len(self._active_manager_peers) + 1  # Include self
-        return active_count >= self._quorum_size()
+        return active_count >= self._quorum_size
     
     def get_quorum_status(self) -> dict:
         """
@@ -920,7 +921,7 @@ class ManagerServer(HealthAwareServer):
         This is useful for monitoring and debugging cluster health.
         """
         active_count = len(self._active_manager_peers) + 1
-        required = self._quorum_size()
+        required = self._quorum_size
         circuit_state = self._quorum_circuit.circuit_state
         
         return {
@@ -1001,13 +1002,17 @@ class ManagerServer(HealthAwareServer):
         Start the manager server.
         
         New Manager Join Process:
-        1. Manager joins SWIM cluster → State = SYNCING
-        2. Start leader election
-        3. If leader: immediately become ACTIVE (leader syncs state in _on_manager_become_leader)
-        4. If not leader: request state sync from leader, then become ACTIVE
-        5. SYNCING managers are NOT counted in quorum
+        1. Start TCP/UDP server
+        2. Join SWIM cluster with other managers
+        3. Start probe cycle
+        4. Start leader election
+        5. Complete startup sync and transition to ACTIVE
+        
+        SYNCING managers are NOT counted in quorum.
         """
-        await super().start()
+        # Start the underlying server (TCP/UDP listeners, task runner, etc.)
+        # Uses SWIM settings from Env configuration
+        await self.start_server(init_context=self.env.get_swim_init_context())
         
         self._task_runner.run(
             self._udp_logger.log,
@@ -1491,10 +1496,11 @@ class ManagerServer(HealthAwareServer):
         worker don't affect dispatch to other workers.
         """
         if worker_id not in self._worker_circuits:
+            cb_config = self.env.get_circuit_breaker_config()
             self._worker_circuits[worker_id] = ErrorStats(
-                error_threshold=3,      # Open after 3 failures
-                window_seconds=30.0,    # Within 30 second window
-                half_open_after=10.0,   # Allow retry after 10 seconds
+                max_errors=cb_config['max_errors'],
+                window_seconds=cb_config['window_seconds'],
+                half_open_after=cb_config['half_open_after'],
             )
         return self._worker_circuits[worker_id]
     
@@ -1709,7 +1715,7 @@ class ManagerServer(HealthAwareServer):
         # Check if quorum is even possible
         if not self._has_quorum_available():
             active_count = len(self._active_manager_peers) + 1
-            required = self._quorum_size()
+            required = self._quorum_size
             
             # Record failure for circuit breaker
             self._quorum_circuit.record_error()
@@ -1758,7 +1764,7 @@ class ManagerServer(HealthAwareServer):
                 self._quorum_circuit.record_error()
                 raise QuorumTimeoutError(
                     confirmations_received=len(confirmed),
-                    required_quorum=self._quorum_size(),
+                    required_quorum=self._quorum_size,
                     timeout=self._quorum_timeout,
                 )
             
@@ -1773,7 +1779,7 @@ class ManagerServer(HealthAwareServer):
                 self._quorum_circuit.record_error()
                 raise QuorumTimeoutError(
                     confirmations_received=len(confirmed),
-                    required_quorum=self._quorum_size(),
+                    required_quorum=self._quorum_size,
                     timeout=self._quorum_timeout,
                 )
         finally:
