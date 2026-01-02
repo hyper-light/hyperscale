@@ -357,6 +357,118 @@ def test_complex_dependency_chain():
     print("\n✓ Complex dependency structure correctly resolved")
 
 
+def test_resource_waiting_with_backoff():
+    """
+    Test that workflows wait for resources with exponential backoff.
+    
+    Simulates the scenario where:
+    1. All cores are initially in use
+    2. A workflow needs more cores than available
+    3. The workflow waits (with backoff) until cores free up
+    4. Once cores are available, the workflow dispatches
+    """
+    print("\n" + "=" * 60)
+    print("TEST: Resource Waiting with Backoff")
+    print("=" * 60)
+    
+    total_cores = 8
+    
+    # Simulate a scenario where all cores are in use
+    class MockResourceTracker:
+        def __init__(self, total: int):
+            self.total = total
+            self.used = 0
+            
+        def available(self) -> int:
+            return self.total - self.used
+        
+        def allocate(self, cores: int) -> bool:
+            if cores <= self.available():
+                self.used += cores
+                return True
+            return False
+        
+        def release(self, cores: int):
+            self.used -= cores
+    
+    tracker = MockResourceTracker(total_cores)
+    
+    # Simulate existing workflows using all 8 cores
+    tracker.allocate(4)  # wf1
+    tracker.allocate(4)  # wf2
+    
+    print(f"Initial state: {tracker.used}/{tracker.total} cores in use")
+    
+    # Workflow 3 needs 6 cores
+    wf3_cores = 6
+    
+    # Simulate backoff loop
+    max_wait = 10.0  # seconds
+    waited = 0.0
+    backoff = 0.5
+    max_backoff = 5.0
+    attempts = 0
+    
+    print(f"\nWorkflow 3 needs {wf3_cores} cores:")
+    
+    while waited < max_wait:
+        attempts += 1
+        if wf3_cores <= tracker.available():
+            print(f"  ✓ Attempt {attempts}: Found {tracker.available()} cores available after {waited:.1f}s")
+            tracker.allocate(wf3_cores)
+            break
+        
+        print(f"  Attempt {attempts}: Only {tracker.available()} cores available, waiting {backoff:.1f}s...")
+        
+        # Simulate time passing and wf2 completing after 2 seconds
+        if waited + backoff >= 2.0 and tracker.used == 8:
+            tracker.release(4)  # wf2 completes
+            print(f"  [Event] Workflow 2 completed, freed 4 cores")
+        
+        # Simulate wf1 completing after 4 seconds
+        if waited + backoff >= 4.0 and tracker.used == 4:
+            tracker.release(4)  # wf1 completes
+            print(f"  [Event] Workflow 1 completed, freed 4 cores")
+        
+        waited += backoff
+        backoff = min(backoff * 1.5, max_backoff)
+    else:
+        print(f"  ✗ Timeout after {waited:.1f}s")
+        assert False, "Workflow should have been dispatched"
+    
+    print(f"\nFinal state: {tracker.used}/{tracker.total} cores in use")
+    assert tracker.used == wf3_cores, f"Expected {wf3_cores} cores in use"
+    
+    print("\n✓ Resource waiting with backoff works correctly")
+    print("✓ Exponential backoff increases wait time between attempts")
+
+
+def test_backoff_calculation():
+    """Test the exponential backoff calculation."""
+    print("\n" + "=" * 60)
+    print("TEST: Exponential Backoff Calculation")
+    print("=" * 60)
+    
+    backoff = 0.5  # Initial backoff
+    max_backoff = 5.0  # Maximum backoff
+    
+    print(f"Initial backoff: {backoff}s")
+    print(f"Maximum backoff: {max_backoff}s")
+    print("\nBackoff progression:")
+    
+    total_wait = 0.0
+    for i in range(10):
+        total_wait += backoff
+        print(f"  Attempt {i+1}: wait {backoff:.2f}s (total: {total_wait:.2f}s)")
+        backoff = min(backoff * 1.5, max_backoff)
+    
+    # Verify backoff reaches max
+    assert backoff == max_backoff, "Backoff should reach max"
+    
+    print(f"\nBackoff correctly capped at {max_backoff}s")
+    print("✓ Exponential backoff calculation is correct")
+
+
 def main():
     """Run all tests."""
     print("\n" + "=" * 60)
@@ -368,6 +480,8 @@ def main():
         test_resource_constraints_scenario()
         test_circular_dependency_detection()
         test_complex_dependency_chain()
+        test_resource_waiting_with_backoff()
+        test_backoff_calculation()
         
         print("\n" + "=" * 60)
         print("ALL TESTS PASSED ✓")

@@ -1319,25 +1319,67 @@ class ManagerServer(UDPServer):
         cloudpickle,
     ) -> bool:
         """
-        Dispatch a single workflow to a worker.
+        Dispatch a single workflow to a worker with resource-aware waiting.
+        
+        If no worker has sufficient capacity, waits with exponential backoff
+        until resources become available or timeout is reached.
         
         Returns True if dispatch succeeded, False otherwise.
         """
         workflow_id = f"{submission.job_id}:{idx}"
         
-        # Select worker with sufficient capacity
-        worker_id = self._select_worker_for_workflow(cores_needed)
+        # Resource-aware waiting with exponential backoff
+        max_wait = submission.timeout_seconds
+        waited = 0.0
+        backoff = 0.5  # Start with 500ms
+        max_backoff = 5.0  # Cap at 5 seconds
+        
+        worker_id = None
+        while waited < max_wait:
+            # Try to select a worker with sufficient capacity
+            worker_id = self._select_worker_for_workflow(cores_needed)
+            if worker_id:
+                break
+            
+            # Log that we're waiting for resources
+            if waited == 0:  # Only log on first attempt
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Waiting for {cores_needed} cores for {workflow_id} (none available)",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
+            
+            # Wait with exponential backoff
+            await asyncio.sleep(backoff)
+            waited += backoff
+            backoff = min(backoff * 1.5, max_backoff)
+        
         if not worker_id:
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(
-                    message=f"No worker with {cores_needed} available cores for {workflow_id}",
+                    message=f"Timeout waiting for {cores_needed} cores for {workflow_id} after {waited:.1f}s",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 ),
             )
             return False
+        
+        if waited > 0:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Found worker for {workflow_id} after {waited:.1f}s wait",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                ),
+            )
         
         # Create provision request for quorum
         provision = ProvisionRequest(
