@@ -3400,6 +3400,20 @@ When quorum cannot be achieved (e.g., too many managers down), operations should
 - No circuit breaker for repeated failures
 - No automatic shedding of quorum operations when unavailable
 
+### Client Push Notifications (Not Implemented)
+
+The tiered update strategy (AD-15) is implemented server-side, but client push is not yet implemented.
+
+**Current behavior**:
+- Tier 1 (Immediate) updates are logged but not pushed to clients
+- Tier 2 (Periodic) batch loop runs but doesn't push to clients
+- Clients must poll for status updates
+
+**Future work**:
+- WebSocket support for real-time updates
+- Server-Sent Events (SSE) alternative
+- Webhook callbacks for job completion
+
 ---
 
 ## Testing
@@ -3410,7 +3424,7 @@ Run the test suite:
 python examples/test_distributed_rewrite.py
 ```
 
-Current test coverage: 86 tests covering:
+Current test coverage: 125 tests covering:
 - SWIM protocol (probing, suspicion, gossip)
 - Leadership election (pre-voting, flapping)
 - State embedding (heartbeat serialization)
@@ -3421,6 +3435,10 @@ Current test coverage: 86 tests covering:
 - Worker/Manager failure handling
 - Manager peer failure/recovery
 - Gate split-brain prevention
+- CRDTs (GCounter, LWWRegister, LWWMap, JobStatsCRDT)
+- Datacenter health classification (HEALTHY/BUSY/DEGRADED/UNHEALTHY)
+- Smart dispatch with fallback chain
+- Tiered update strategy
 
 ---
 
