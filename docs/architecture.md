@@ -10,10 +10,26 @@ A high-performance, fault-tolerant distributed workflow execution system designe
   - [Communication Protocols](#communication-protocols)
   - [Leadership Election](#leadership-election)
 - [Component Diagrams](#component-diagrams)
+- [State Machines](#state-machines)
+  - [SWIM Node States](#swim-node-states)
+  - [Worker States](#worker-states)
+  - [Job Lifecycle](#job-lifecycle)
+  - [Workflow Lifecycle](#workflow-lifecycle)
+  - [Leadership States](#leadership-states)
 - [Data Flow](#data-flow)
+- [Timing Diagrams](#timing-diagrams)
+  - [SWIM Probe Cycle](#swim-probe-cycle)
+  - [Quorum Confirmation](#quorum-confirmation)
+  - [Leader Election Sequence](#leader-election-sequence)
 - [Failure Handling](#failure-handling)
+  - [Failure Recovery Flows](#failure-recovery-flows)
+  - [Network Partition Handling](#network-partition-handling)
+  - [Cascading Failure Protection](#cascading-failure-protection)
+- [Backpressure & Degradation](#backpressure--degradation)
+- [Scaling Operations](#scaling-operations)
 - [State Management](#state-management)
 - [Security](#security)
+- [Message Protocol Reference](#message-protocol-reference)
 - [Module Structure](#module-structure)
 
 ---
@@ -90,12 +106,12 @@ The distributed system implements a three-tier architecture optimized for execut
            │  │    ┌──────────────┼──────────────┐                     │   │
            │  │    │              │              │                     │   │
            │  │    ▼              ▼              ▼                     │   │
-           │  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                 │   │
-           │  │  │ Worker1 │  │ Worker2 │  │ Worker3 │                 │   │
-           │  │  │ 8 cores │  │ 8 cores │  │ 8 cores │                 │   │
-           │  │  │[■■■■□□□□]│  │[■■□□□□□□]│  │[□□□□□□□□]│                 │   │
-           │  │  │ 4 in use│  │ 2 in use│  │ 0 idle  │                 │   │
-           │  │  └─────────┘  └─────────┘  └─────────┘                 │   │
+           │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │   │
+           │  │  │ Worker1  │  │ Worker2  │  │ Worker3  │              │   │
+           │  │  │ 8 cores  │  │ 8 cores  │  │ 8 cores  │              │   │
+           │  │  │[■■■■□□□□]│  │[■■□□□□□□]│  │[□□□□□□□□]│              │   │
+           │  │  │ 4 in use │  │ 2 in use │  │ 0 idle   │              │   │
+           │  │  └──────────┘  └──────────┘  └──────────┘              │   │
            │  │                                                        │   │
            │  │  ■ = core running workflow    □ = core available       │   │
            │  └────────────────────────────────────────────────────────┘   │
@@ -290,7 +306,7 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    LEADERSHIP ELECTION                           │
+│                    LEADERSHIP ELECTION                          │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  ┌────────────────────────────────────────────────────────────┐ │
@@ -754,7 +770,7 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │    ▼                                                                         │
 │  GATE (Leader)                                                               │
 │    │                                                                         │
-│    ├─► Create leases for target DCs                                         │
+│    ├─► Create leases for target DCs                                          │
 │    │                                                                         │
 │    │ ② JobSubmission + fence_token (per DC)                                 │
 │    ├──────────────────┬──────────────────┐                                  │
@@ -797,6 +813,387 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │      • queue_depth                 • is_leader                               │
 │      • cpu/mem percent             • job/workflow counts                     │
 │      • active_workflows            • worker_count                            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## State Machines
+
+### SWIM Node States
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         SWIM NODE STATE MACHINE                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│                              ┌─────────┐                                     │
+│                              │ UNKNOWN │                                     │
+│                              └────┬────┘                                     │
+│                                   │                                          │
+│                          join / probe response                               │
+│                                   │                                          │
+│                                   ▼                                          │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                         │ │
+│  │   ┌───────────────────────────────────────────────────────────────┐    │ │
+│  │   │                         ALIVE                                  │    │ │
+│  │   │                                                                │    │ │
+│  │   │  • Responds to probes                                         │    │ │
+│  │   │  • Participates in gossip                                     │    │ │
+│  │   │  • Eligible for work dispatch                                 │    │ │
+│  │   └───────────────────────────────┬───────────────────────────────┘    │ │
+│  │                                   │                                     │ │
+│  │                    probe timeout / suspect message                      │ │
+│  │                    (incarnation ≥ current)                              │ │
+│  │                                   │                                     │ │
+│  │                                   ▼                                     │ │
+│  │   ┌───────────────────────────────────────────────────────────────┐    │ │
+│  │   │                        SUSPECT                                 │    │ │
+│  │   │                                                                │    │ │
+│  │   │  • Suspicion timer started: T = k × log(n) × LHM              │    │ │
+│  │   │  • Can be refuted with higher incarnation                     │    │ │
+│  │   │  • Confirmations accelerate timeout                           │    │ │
+│  │   └──────────┬─────────────────────────────────┬──────────────────┘    │ │
+│  │              │                                 │                        │ │
+│  │   refutation (higher incarnation)     suspicion timeout expired         │ │
+│  │   or alive message                    (no refutation received)          │ │
+│  │              │                                 │                        │ │
+│  │              ▼                                 ▼                        │ │
+│  │   ┌─────────────────┐               ┌─────────────────┐                │ │
+│  │   │     ALIVE       │               │      DEAD       │                │ │
+│  │   │   (restored)    │               │                 │                │ │
+│  │   └─────────────────┘               │  • Removed from │                │ │
+│  │                                     │    membership   │                │ │
+│  │                                     │  • Gossip DEAD  │                │ │
+│  │                                     │    propagated   │                │ │
+│  │                                     └────────┬────────┘                │ │
+│  │                                              │                          │ │
+│  └──────────────────────────────────────────────┼──────────────────────────┘ │
+│                                                 │                            │
+│                                      cleanup after TTL                       │
+│                                                 │                            │
+│                                                 ▼                            │
+│                                          ┌───────────┐                       │
+│                                          │  REMOVED  │                       │
+│                                          │ (garbage  │                       │
+│                                          │ collected)│                       │
+│                                          └───────────┘                       │
+│                                                                              │
+│  Transitions:                                                                │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │  UNKNOWN → ALIVE    : First probe response or join acknowledgment      │ │
+│  │  ALIVE   → SUSPECT  : Probe timeout OR suspect gossip with inc ≥ curr  │ │
+│  │  SUSPECT → ALIVE    : Refutation with incarnation > current            │ │
+│  │  SUSPECT → DEAD     : Suspicion timer expires without refutation       │ │
+│  │  DEAD    → REMOVED  : Cleanup task removes after TTL                   │ │
+│  │  DEAD    → ALIVE    : Rejoin with higher incarnation (rare)            │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Worker States
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         WORKER STATE MACHINE                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│                           ┌──────────────┐                                   │
+│                           │  REGISTERING │                                   │
+│                           └──────┬───────┘                                   │
+│                                  │                                           │
+│                      manager acknowledges registration                       │
+│                                  │                                           │
+│                                  ▼                                           │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                         │ │
+│  │   ┌───────────────────────────────────────────────────────────────┐    │ │
+│  │   │                        HEALTHY                                 │    │ │
+│  │   │                                                                │    │ │
+│  │   │  Conditions:                                                   │    │ │
+│  │   │  • CPU < 80%                                                  │    │ │
+│  │   │  • Memory < 85%                                               │    │ │
+│  │   │  • Queue depth < soft_limit                                   │    │ │
+│  │   │  • LHM score < 4                                              │    │ │
+│  │   │                                                                │    │ │
+│  │   │  Behavior: Accepts new workflows normally                     │    │ │
+│  │   └────────────────────────────┬──────────────────────────────────┘    │ │
+│  │                                │                                        │ │
+│  │              resource pressure increases                                │ │
+│  │              (CPU ≥ 80% OR memory ≥ 85% OR queue ≥ soft_limit)         │ │
+│  │                                │                                        │ │
+│  │                                ▼                                        │ │
+│  │   ┌───────────────────────────────────────────────────────────────┐    │ │
+│  │   │                       DEGRADED                                 │    │ │
+│  │   │                                                                │    │ │
+│  │   │  Conditions:                                                   │    │ │
+│  │   │  • CPU 80-95% OR Memory 85-95% OR Queue at soft_limit         │    │ │
+│  │   │  • LHM score 4-6                                              │    │ │
+│  │   │                                                                │    │ │
+│  │   │  Behavior:                                                     │    │ │
+│  │   │  • Accepts work with backpressure signaling                   │    │ │
+│  │   │  • Manager deprioritizes in worker selection                  │    │ │
+│  │   │  • Extended timeouts via LHM                                  │    │ │
+│  │   └──────────┬─────────────────────────────────┬──────────────────┘    │ │
+│  │              │                                 │                        │ │
+│  │    pressure relieved                  pressure critical                 │ │
+│  │    (metrics return to normal)         (CPU > 95% OR OOM risk)          │ │
+│  │              │                                 │                        │ │
+│  │              ▼                                 ▼                        │ │
+│  │   ┌─────────────────┐               ┌─────────────────┐                │ │
+│  │   │     HEALTHY     │               │    DRAINING     │                │ │
+│  │   │   (restored)    │               │                 │                │ │
+│  │   └─────────────────┘               │  • No new work  │                │ │
+│  │                                     │  • Complete     │                │ │
+│  │          ▲                          │    existing     │                │ │
+│  │          │                          │  • Report drain │                │ │
+│  │   all work completed                │    to manager   │                │ │
+│  │   AND healthy metrics               └────────┬────────┘                │ │
+│  │          │                                   │                          │ │
+│  │          │                        shutdown requested OR                 │ │
+│  │          │                        unrecoverable error                   │ │
+│  │          │                                   │                          │ │
+│  │          │                                   ▼                          │ │
+│  │          │                          ┌─────────────────┐                │ │
+│  │          └──────────────────────────│    OFFLINE      │                │ │
+│  │                                     │                 │                │ │
+│  │                                     │  • Not in SWIM  │                │ │
+│  │                                     │  • Cleanup done │                │ │
+│  │                                     └─────────────────┘                │ │
+│  │                                                                         │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  State reported in WorkerHeartbeat.state for manager visibility             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Job Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           JOB STATE MACHINE                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Client submits JobSubmission                                                │
+│            │                                                                 │
+│            ▼                                                                 │
+│  ┌─────────────────┐                                                        │
+│  │    SUBMITTED    │  Job received by Gate/Manager                          │
+│  └────────┬────────┘                                                        │
+│           │                                                                  │
+│           │ validate & queue                                                 │
+│           ▼                                                                  │
+│  ┌─────────────────┐                                                        │
+│  │     QUEUED      │  Waiting for resources                                 │
+│  └────────┬────────┘                                                        │
+│           │                                                                  │
+│           │ resources available, begin dispatch                              │
+│           ▼                                                                  │
+│  ┌─────────────────┐                                                        │
+│  │   DISPATCHING   │  Workflows being sent to workers                       │
+│  │                 │  (quorum confirmation in progress)                     │
+│  └────────┬────────┘                                                        │
+│           │                                                                  │
+│           │ all workflows dispatched                                         │
+│           ▼                                                                  │
+│  ┌─────────────────┐                                                        │
+│  │     RUNNING     │  Workflows executing on workers                        │
+│  │                 │  Progress updates flowing                              │
+│  └────────┬────────┘                                                        │
+│           │                                                                  │
+│           ├─────────────────────────────────────────┐                       │
+│           │                                         │                       │
+│           │ all workflows complete                  │ user cancellation     │
+│           ▼                                         ▼                       │
+│  ┌─────────────────┐                       ┌─────────────────┐              │
+│  │   COMPLETING    │                       │   CANCELLING    │              │
+│  │                 │                       │                 │              │
+│  │ Aggregating     │                       │ Sending cancel  │              │
+│  │ final results   │                       │ to all workers  │              │
+│  └────────┬────────┘                       └────────┬────────┘              │
+│           │                                         │                       │
+│           │ results aggregated                      │ all cancelled         │
+│           ▼                                         ▼                       │
+│  ┌─────────────────┐                       ┌─────────────────┐              │
+│  │    COMPLETED    │                       │    CANCELLED    │              │
+│  │                 │                       │                 │              │
+│  │ Success!        │                       │ User stopped    │              │
+│  │ Results ready   │                       │                 │              │
+│  └─────────────────┘                       └─────────────────┘              │
+│                                                                              │
+│           │ (alternate paths from RUNNING)                                  │
+│           │                                                                  │
+│           ├─────────────────────────────────────────┐                       │
+│           │                                         │                       │
+│           │ unrecoverable errors                    │ timeout exceeded      │
+│           ▼                                         ▼                       │
+│  ┌─────────────────┐                       ┌─────────────────┐              │
+│  │     FAILED      │                       │     TIMEOUT     │              │
+│  │                 │                       │                 │              │
+│  │ Max retries     │                       │ Exceeded        │              │
+│  │ exhausted       │                       │ timeout_seconds │              │
+│  └─────────────────┘                       └─────────────────┘              │
+│                                                                              │
+│  Terminal states: COMPLETED, CANCELLED, FAILED, TIMEOUT                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Workflow Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        WORKFLOW STATE MACHINE                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Part of Job dispatching                                                     │
+│            │                                                                 │
+│            ▼                                                                 │
+│  ┌─────────────────┐                                                        │
+│  │     PENDING     │  Workflow created, not yet dispatched                  │
+│  └────────┬────────┘                                                        │
+│           │                                                                  │
+│           │ worker selected, dispatch sent                                   │
+│           ▼                                                                  │
+│  ┌─────────────────┐                                                        │
+│  │    ASSIGNED     │  Sent to worker, awaiting ack                          │
+│  └────────┬────────┘                                                        │
+│           │                                                                  │
+│           ├─────────────────────────────────────────┐                       │
+│           │                                         │                       │
+│           │ worker accepts (cores allocated)        │ worker rejects        │
+│           ▼                                         ▼                       │
+│  ┌─────────────────┐                       ┌─────────────────┐              │
+│  │     RUNNING     │                       │   RE-DISPATCH   │              │
+│  │                 │                       │                 │              │
+│  │ Executing on    │                       │ Select another  │──┐           │
+│  │ allocated cores │                       │ worker          │  │           │
+│  │                 │                       └─────────────────┘  │           │
+│  │ Progress:       │                              ▲              │           │
+│  │ • completed_cnt │                              │              │           │
+│  │ • failed_cnt    │                              │              │           │
+│  │ • rate/second   │                              │              │           │
+│  │ • step_stats[]  │                              │ retry < max  │           │
+│  └────────┬────────┘                              │              │           │
+│           │                                       │              │           │
+│           ├─────────────────────────────────┬─────┘              │           │
+│           │                                 │                    │           │
+│           │ all actions complete            │ worker fails       │           │
+│           │ successfully                    │ (SWIM DEAD)        │           │
+│           ▼                                 ▼                    │           │
+│  ┌─────────────────┐               ┌─────────────────┐          │           │
+│  │    COMPLETED    │               │  WORKER_FAILED  │──────────┘           │
+│  │                 │               │                 │                      │
+│  │ Success!        │               │ Retry on        │                      │
+│  │ Results in      │               │ different       │                      │
+│  │ WorkflowProgress│               │ worker          │                      │
+│  └─────────────────┘               └────────┬────────┘                      │
+│                                             │                                │
+│                                             │ retry >= max                   │
+│                                             ▼                                │
+│                                    ┌─────────────────┐                      │
+│                                    │     FAILED      │                      │
+│                                    │                 │                      │
+│                                    │ Max retries     │                      │
+│                                    │ exhausted       │                      │
+│                                    └─────────────────┘                      │
+│                                                                              │
+│  Also from RUNNING:                                                          │
+│  ┌─────────────────┐                                                        │
+│  │    CANCELLED    │  ← Cancel request received                             │
+│  └─────────────────┘                                                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Leadership States
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      LEADERSHIP STATE MACHINE                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│                              ┌──────────────┐                                │
+│                              │   INITIAL    │                                │
+│                              └──────┬───────┘                                │
+│                                     │                                        │
+│                          join cluster / startup                              │
+│                                     │                                        │
+│                                     ▼                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                         │ │
+│  │   ┌───────────────────────────────────────────────────────────────┐    │ │
+│  │   │                        FOLLOWER                                │    │ │
+│  │   │                                                                │    │ │
+│  │   │  • Accepts leader heartbeats                                  │    │ │
+│  │   │  • Forwards requests to leader                                │    │ │
+│  │   │  • Responds to pre-vote requests                              │    │ │
+│  │   │  • Monitors leader liveness                                   │    │ │
+│  │   └────────────────────────────┬──────────────────────────────────┘    │ │
+│  │                                │                                        │ │
+│  │              leader timeout expired AND                                 │ │
+│  │              self is eligible (LHM ≤ max_leader_lhm)                   │ │
+│  │                                │                                        │ │
+│  │                                ▼                                        │ │
+│  │   ┌───────────────────────────────────────────────────────────────┐    │ │
+│  │   │                      PRE_CANDIDATE                             │    │ │
+│  │   │                                                                │    │ │
+│  │   │  • Sends pre-vote requests to all members                     │    │ │
+│  │   │  • Collects pre-vote responses                                │    │ │
+│  │   │  • Does NOT increment term yet (prevents disruption)          │    │ │
+│  │   │  • Timeout: pre_vote_timeout                                  │    │ │
+│  │   └──────────┬─────────────────────────────────┬──────────────────┘    │ │
+│  │              │                                 │                        │ │
+│  │   pre-vote majority granted              pre-vote denied OR             │ │
+│  │   (> n/2 nodes agree)                    timeout OR higher term         │ │
+│  │              │                                 │                        │ │
+│  │              ▼                                 ▼                        │ │
+│  │   ┌─────────────────┐               ┌─────────────────┐                │ │
+│  │   │    CANDIDATE    │               │    FOLLOWER     │                │ │
+│  │   │                 │               │   (step down)   │                │ │
+│  │   │ • Increment term│               └─────────────────┘                │ │
+│  │   │ • Vote for self │                                                   │ │
+│  │   │ • Request votes │                                                   │ │
+│  │   │   from peers    │                                                   │ │
+│  │   └────────┬────────┘                                                   │ │
+│  │            │                                                            │ │
+│  │            ├─────────────────────────────────────────┐                 │ │
+│  │            │                                         │                 │ │
+│  │   vote majority granted                     vote denied OR             │ │
+│  │   (> n/2 votes for self)                    higher term seen           │ │
+│  │            │                                         │                 │ │
+│  │            ▼                                         ▼                 │ │
+│  │   ┌─────────────────┐                       ┌─────────────────┐        │ │
+│  │   │     LEADER      │                       │    FOLLOWER     │        │ │
+│  │   │                 │                       │   (step down)   │        │ │
+│  │   │ • Broadcast win │                       └─────────────────┘        │ │
+│  │   │ • Send heartbeat│                                                   │ │
+│  │   │ • Handle requests                                                   │ │
+│  │   │ • State sync    │                                                   │ │
+│  │   └────────┬────────┘                                                   │ │
+│  │            │                                                            │ │
+│  │   ┌────────┴────────────────────────────────────────────┐              │ │
+│  │   │                                                      │              │ │
+│  │   │ LHM exceeds threshold     higher term         network partition    │ │
+│  │   │ (unhealthy leader)        discovered          (loses majority)     │ │
+│  │   │                                                      │              │ │
+│  │   ▼                           ▼                          ▼              │ │
+│  │   ┌──────────────────────────────────────────────────────────────┐     │ │
+│  │   │                        FOLLOWER                               │     │ │
+│  │   │                       (step down)                             │     │ │
+│  │   └──────────────────────────────────────────────────────────────┘     │ │
+│  │                                                                         │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  Flapping Protection:                                                        │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │  If leadership changes > threshold in window → cooldown period         │ │
+│  │  During cooldown: no new elections initiated                           │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -904,6 +1301,281 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Timing Diagrams
+
+### SWIM Probe Cycle
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         SWIM PROBE CYCLE TIMING                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Time ─────────────────────────────────────────────────────────────────────► │
+│                                                                              │
+│  Node A          Node B          Node C (proxy)         Node D               │
+│    │                │                  │                   │                 │
+│    │ ① probe        │                  │                   │                 │
+│    │───────────────►│                  │                   │                 │
+│    │                │                  │                   │                 │
+│    │                │                  │                   │                 │
+│    │ ② ack + HB     │                  │                   │                 │
+│    │◄───────────────│                  │                   │                 │
+│    │                │                  │                   │                 │
+│  ──┴────────────────┴──────────────────┴───────────────────┴──────────────── │
+│                                                                              │
+│    SUCCESSFUL PROBE: base_timeout × LHM_multiplier                          │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════ │
+│                                                                              │
+│  Time ─────────────────────────────────────────────────────────────────────► │
+│                                                                              │
+│  Node A          Node B (slow)       Node C (proxy)         Node D           │
+│    │                │                     │                   │              │
+│    │ ① probe        │                     │                   │              │
+│    │───────────────►│                     │                   │              │
+│    │                │                     │                   │              │
+│    │      ┌─────────┼─────────────────────┼───────────────────┼────┐         │
+│    │      │ TIMEOUT │ (no response)       │                   │    │         │
+│    │      └─────────┼─────────────────────┼───────────────────┼────┘         │
+│    │                │                     │                   │              │
+│    │ ② ping-req (indirect probe)         │                   │              │
+│    │─────────────────────────────────────►│                   │              │
+│    │                │                     │                   │              │
+│    │                │    ③ probe          │                   │              │
+│    │                │◄────────────────────│                   │              │
+│    │                │                     │                   │              │
+│    │                │    ④ ack            │                   │              │
+│    │                │────────────────────►│                   │              │
+│    │                │                     │                   │              │
+│    │ ⑤ ack (indirect)                     │                   │              │
+│    │◄─────────────────────────────────────│                   │              │
+│    │                │                     │                   │              │
+│  ──┴────────────────┴─────────────────────┴───────────────────┴───────────── │
+│                                                                              │
+│    INDIRECT PROBE SUCCESS: Node B is alive but slow                          │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════ │
+│                                                                              │
+│  Time ─────────────────────────────────────────────────────────────────────► │
+│                                                                              │
+│  Node A          Node B (dead)       Node C (proxy)         Node D           │
+│    │                ╳                     │                   │              │
+│    │ ① probe        ╳                     │                   │              │
+│    │───────────────►╳                     │                   │              │
+│    │                ╳                     │                   │              │
+│    │      ┌─────────┼─────────────────────┼────┐              │              │
+│    │      │ TIMEOUT │                     │    │              │              │
+│    │      └─────────┼─────────────────────┼────┘              │              │
+│    │                ╳                     │                   │              │
+│    │ ② ping-req     ╳                     │                   │              │
+│    │─────────────────────────────────────►│                   │              │
+│    │                ╳                     │                   │              │
+│    │                ╳    ③ probe          │                   │              │
+│    │                ╳◄────────────────────│                   │              │
+│    │                ╳                     │                   │              │
+│    │                ╳     ┌───────────────┼────┐              │              │
+│    │                ╳     │ TIMEOUT       │    │              │              │
+│    │                ╳     └───────────────┼────┘              │              │
+│    │                ╳                     │                   │              │
+│    │ ④ nack (indirect failed)             │                   │              │
+│    │◄─────────────────────────────────────│                   │              │
+│    │                ╳                     │                   │              │
+│    │ ⑤ START SUSPICION                    │                   │              │
+│    │ broadcast suspect msg                │                   │              │
+│    │─────────────────────────────────────►│──────────────────►│              │
+│    │                ╳                     │                   │              │
+│    │      ┌─────────┼─────────────────────┼───────────────────┼────┐         │
+│    │      │ SUSPICION TIMEOUT             │                   │    │         │
+│    │      │ T = k × log(n) × LHM          │                   │    │         │
+│    │      └─────────┼─────────────────────┼───────────────────┼────┘         │
+│    │                ╳                     │                   │              │
+│    │ ⑥ MARK DEAD    ╳                     │                   │              │
+│    │ broadcast dead msg                   │                   │              │
+│    │─────────────────────────────────────►│──────────────────►│              │
+│    │                ╳                     │                   │              │
+│  ──┴────────────────╳─────────────────────┴───────────────────┴───────────── │
+│                                                                              │
+│    FAILURE DETECTION: Direct → Indirect → Suspicion → Dead                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Quorum Confirmation
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      QUORUM CONFIRMATION TIMING                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Time ─────────────────────────────────────────────────────────────────────► │
+│                                                                              │
+│  Manager 1         Manager 2 (★)        Manager 3           Worker           │
+│  (follower)        (leader)             (follower)                           │
+│     │                  │                    │                   │            │
+│     │                  │ ① Job received     │                   │            │
+│     │                  │◄═══════════════════│                   │            │
+│     │                  │                    │                   │            │
+│     │                  │ Select worker      │                   │            │
+│     │                  │ Create provision   │                   │            │
+│     │                  │                    │                   │            │
+│     │ ② ProvisionReq   │                    │                   │            │
+│     │◄─────────────────│                    │                   │            │
+│     │                  │ ② ProvisionReq     │                   │            │
+│     │                  │───────────────────►│                   │            │
+│     │                  │                    │                   │            │
+│     │ Validate:        │                    │ Validate:         │            │
+│     │ • Worker alive?  │                    │ • Worker alive?   │            │
+│     │ • Version fresh? │                    │ • Version fresh?  │            │
+│     │ • Capacity ok?   │                    │ • Capacity ok?    │            │
+│     │                  │                    │                   │            │
+│     │ ③ ProvisionConf  │                    │                   │            │
+│     │─────────────────►│                    │                   │            │
+│     │                  │ ③ ProvisionConf    │                   │            │
+│     │                  │◄───────────────────│                   │            │
+│     │                  │                    │                   │            │
+│     │                  │ QUORUM ACHIEVED    │                   │            │
+│     │                  │ (2/3 = majority)   │                   │            │
+│     │                  │                    │                   │            │
+│     │ ④ ProvisionCommit│                    │                   │            │
+│     │◄─────────────────│                    │                   │            │
+│     │                  │ ④ ProvisionCommit  │                   │            │
+│     │                  │───────────────────►│                   │            │
+│     │                  │                    │                   │            │
+│     │                  │ ⑤ WorkflowDispatch │                   │            │
+│     │                  │────────────────────────────────────────►            │
+│     │                  │                    │                   │            │
+│     │                  │ ⑥ DispatchAck      │                   │            │
+│     │                  │◄────────────────────────────────────────            │
+│     │                  │                    │                   │            │
+│  ───┴──────────────────┴────────────────────┴───────────────────┴─────────── │
+│                                                                              │
+│    SUCCESS: Quorum (n/2 + 1) confirmations → commit → dispatch               │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════ │
+│                                                                              │
+│  TIMEOUT SCENARIO:                                                           │
+│                                                                              │
+│  Manager 1         Manager 2 (★)        Manager 3 (slow)      Worker         │
+│     │                  │                    │                   │            │
+│     │ ② ProvisionReq   │                    │                   │            │
+│     │◄─────────────────│                    │                   │            │
+│     │                  │ ② ProvisionReq     │                   │            │
+│     │                  │───────────────────►│                   │            │
+│     │                  │                    │                   │            │
+│     │ ③ ProvisionConf  │                    │                   │            │
+│     │─────────────────►│                    │ (processing...)   │            │
+│     │                  │                    │                   │            │
+│     │                  │      ┌─────────────┼────┐              │            │
+│     │                  │      │ TIMEOUT     │    │              │            │
+│     │                  │      └─────────────┼────┘              │            │
+│     │                  │                    │                   │            │
+│     │                  │ Only 1/3 confirm   │                   │            │
+│     │                  │ (no quorum)        │                   │            │
+│     │                  │                    │                   │            │
+│     │ ④ ProvisionAbort │                    │                   │            │
+│     │◄─────────────────│                    │                   │            │
+│     │                  │                    │                   │            │
+│     │                  │ Retry with         │                   │            │
+│     │                  │ different worker   │                   │            │
+│     │                  │                    │                   │            │
+│  ───┴──────────────────┴────────────────────┴───────────────────┴─────────── │
+│                                                                              │
+│    FAILURE: Quorum timeout → abort → retry (different worker if available)  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Leader Election Sequence
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      LEADER ELECTION SEQUENCE                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Time ─────────────────────────────────────────────────────────────────────► │
+│                                                                              │
+│  TERM: 5           Node A (★ old)      Node B           Node C               │
+│                       │                   │                │                 │
+│                       ╳ CRASH             │                │                 │
+│                       ╳                   │                │                 │
+│                       ╳                   │                │                 │
+│                       ╳     ┌─────────────┼────────────────┼────┐            │
+│                       ╳     │ LEADER      │                │    │            │
+│                       ╳     │ TIMEOUT     │                │    │            │
+│                       ╳     └─────────────┼────────────────┼────┘            │
+│                       ╳                   │                │                 │
+│  ─────────────────────╳───────────────────┴────────────────┴──────────────── │
+│                       ╳                                                      │
+│  PRE-VOTE PHASE       ╳                                                      │
+│                       ╳                                                      │
+│  TERM: 5 (unchanged)  ╳    Node B             Node C                         │
+│                       ╳       │                  │                           │
+│                       ╳       │ Check eligibility│                           │
+│                       ╳       │ (LHM ≤ 4.0 ✓)    │                           │
+│                       ╳       │                  │                           │
+│                       ╳       │ ① pre-vote-req (term=5)                      │
+│                       ╳       │─────────────────►│                           │
+│                       ╳       │                  │                           │
+│                       ╳       │                  │ Compare:                  │
+│                       ╳       │                  │ • No current leader       │
+│                       ╳       │                  │ • B is eligible           │
+│                       ╳       │                  │                           │
+│                       ╳       │ ② pre-vote-grant │                           │
+│                       ╳       │◄─────────────────│                           │
+│                       ╳       │                  │                           │
+│                       ╳       │ Pre-vote majority│                           │
+│                       ╳       │ (2/2 = 100%)     │                           │
+│                       ╳       │                  │                           │
+│  ─────────────────────╳───────┴──────────────────┴────────────────────────── │
+│                       ╳                                                      │
+│  VOTE PHASE           ╳                                                      │
+│                       ╳                                                      │
+│  TERM: 6 (incremented)╳    Node B             Node C                         │
+│                       ╳       │                  │                           │
+│                       ╳       │ Increment term   │                           │
+│                       ╳       │ Vote for self    │                           │
+│                       ╳       │                  │                           │
+│                       ╳       │ ③ vote-req (term=6)                          │
+│                       ╳       │─────────────────►│                           │
+│                       ╳       │                  │                           │
+│                       ╳       │                  │ Term 6 > my term 5        │
+│                       ╳       │                  │ Grant vote                │
+│                       ╳       │                  │                           │
+│                       ╳       │ ④ vote-grant     │                           │
+│                       ╳       │◄─────────────────│                           │
+│                       ╳       │                  │                           │
+│                       ╳       │ Vote majority    │                           │
+│                       ╳       │ (2/2 = 100%)     │                           │
+│                       ╳       │                  │                           │
+│  ─────────────────────╳───────┴──────────────────┴────────────────────────── │
+│                       ╳                                                      │
+│  LEADER ANNOUNCEMENT  ╳                                                      │
+│                       ╳                                                      │
+│  TERM: 6              ╳    Node B (★ new)     Node C                         │
+│                       ╳       │                  │                           │
+│                       ╳       │ ⑤ leader-announce│                           │
+│                       ╳       │─────────────────►│                           │
+│                       ╳       │                  │                           │
+│                       ╳       │ Trigger:         │                           │
+│                       ╳       │ _on_become_leader│                           │
+│                       ╳       │                  │ Trigger:                  │
+│                       ╳       │                  │ _on_leader_change         │
+│                       ╳       │                  │                           │
+│                       ╳       │ Begin state sync │                           │
+│                       ╳       │ from workers     │                           │
+│                       ╳       │                  │                           │
+│  ─────────────────────╳───────┴──────────────────┴────────────────────────── │
+│                                                                              │
+│  SPLIT-BRAIN PREVENTION:                                                     │
+│  • Pre-vote phase doesn't increment term (prevents term explosion)           │
+│  • Candidate must get pre-vote majority before real election                │
+│  • Nodes only grant pre-vote if no current leader OR candidate is better    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1025,6 +1697,570 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
+```
+
+### Failure Recovery Flows
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       FAILURE RECOVERY MATRIX                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────┬─────────────────────┬──────────────────────────────────┐│
+│  │ FAILURE TYPE   │ DETECTION           │ RECOVERY ACTION                  ││
+│  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
+│  │                │                     │                                  ││
+│  │ Worker crash   │ SWIM probe timeout  │ Retry workflow on another worker ││
+│  │                │ + indirect probe    │ Exclude failed worker from retry ││
+│  │                │ + suspicion expiry  │ Mark workflow FAILED if max retry││
+│  │                │                     │                                  ││
+│  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
+│  │                │                     │                                  ││
+│  │ Worker         │ WorkerHeartbeat     │ Deprioritize in worker selection ││
+│  │ overloaded     │ state = DEGRADED    │ Apply backpressure signaling     ││
+│  │                │ OR queue_depth high │ Extend timeouts via LHM          ││
+│  │                │                     │                                  ││
+│  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
+│  │                │                     │                                  ││
+│  │ Manager        │ SWIM detects DEAD   │ Pre-vote → elect new leader      ││
+│  │ leader crash   │ among manager peers │ New leader syncs state from      ││
+│  │                │                     │ all workers (source of truth)    ││
+│  │                │                     │                                  ││
+│  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
+│  │                │                     │                                  ││
+│  │ Manager        │ Quorum timeout      │ Retry with original quorum       ││
+│  │ follower crash │ for confirmation    │ If quorum impossible → abort job ││
+│  │                │                     │ New manager syncs when joins     ││
+│  │                │                     │                                  ││
+│  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
+│  │                │                     │                                  ││
+│  │ Gate leader    │ SWIM among gates    │ New gate leader elected          ││
+│  │ crash          │                     │ Lease transfer to new leader     ││
+│  │                │                     │ Jobs continue with new gate      ││
+│  │                │                     │                                  ││
+│  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
+│  │                │                     │                                  ││
+│  │ Datacenter     │ All managers DEAD   │ Gate marks DC as failed          ││
+│  │ total failure  │ No ManagerHeartbeat │ Lease expires → job FAILED       ││
+│  │                │                     │ Return failure to client         ││
+│  │                │                     │                                  ││
+│  ├────────────────┼─────────────────────┼──────────────────────────────────┤│
+│  │                │                     │                                  ││
+│  │ Network        │ Partial SWIM        │ Pre-vote prevents split-brain    ││
+│  │ partition      │ connectivity        │ Minority partition steps down    ││
+│  │                │                     │ Majority continues operation     ││
+│  │                │                     │                                  ││
+│  └────────────────┴─────────────────────┴──────────────────────────────────┘│
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Network Partition Handling
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     NETWORK PARTITION SCENARIOS                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  SCENARIO 1: Manager Cluster Partition (2+1)                                 │
+│  ════════════════════════════════════════════                                │
+│                                                                              │
+│     ┌─────────────────────────┐       ║      ┌─────────────────┐            │
+│     │      PARTITION A        │       ║      │   PARTITION B   │            │
+│     │   (majority: 2 nodes)   │       ║      │ (minority: 1)   │            │
+│     │                         │       ║      │                 │            │
+│     │   ┌────┐     ┌────┐    │       ║      │     ┌────┐      │            │
+│     │   │ M1 │◄───►│ M2 │    │       ║      │     │ M3 │      │            │
+│     │   │ ★  │     │    │    │       ║      │     │    │      │            │
+│     │   └────┘     └────┘    │       ║      │     └────┘      │            │
+│     │                         │       ║      │                 │            │
+│     │   Maintains leadership  │       ║      │  Steps down     │            │
+│     │   Continues operation   │       ║      │  (no majority)  │            │
+│     │                         │       ║      │                 │            │
+│     └─────────────────────────┘       ║      └─────────────────┘            │
+│                                       ║                                      │
+│                              NETWORK PARTITION                               │
+│                                                                              │
+│  Behavior:                                                                   │
+│  • M3 cannot reach M1/M2, loses leader heartbeats                           │
+│  • M3 starts pre-vote, but cannot get majority (only self)                  │
+│  • M3 remains follower, does not disrupt cluster                            │
+│  • M1 (leader) continues with M2 (2/3 = quorum for confirmations)           │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════ │
+│                                                                              │
+│  SCENARIO 2: Worker Isolation                                                │
+│  ════════════════════════════════                                            │
+│                                                                              │
+│     ┌─────────────────────────┐       ║      ┌─────────────────┐            │
+│     │      MANAGER SIDE       │       ║      │  ISOLATED       │            │
+│     │                         │       ║      │  WORKER         │            │
+│     │   ┌────┐     ┌────┐    │       ║      │                 │            │
+│     │   │ M1 │     │ M2 │    │       ║      │     ┌────┐      │            │
+│     │   │ ★  │     │    │    │       ║      │     │ W3 │      │            │
+│     │   └──┬─┘     └────┘    │       ║      │     │    │      │            │
+│     │      │                  │       ║      │     └────┘      │            │
+│     │      ▼                  │       ║      │                 │            │
+│     │   ┌────┐     ┌────┐    │       ║      │  Continues      │            │
+│     │   │ W1 │     │ W2 │    │       ║      │  executing      │            │
+│     │   └────┘     └────┘    │       ║      │  (timeout will  │            │
+│     │                         │       ║      │  eventually     │            │
+│     │   Reschedule W3 work   │       ║      │  cancel)        │            │
+│     │   on W1 or W2          │       ║      │                 │            │
+│     └─────────────────────────┘       ║      └─────────────────┘            │
+│                                       ║                                      │
+│                                                                              │
+│  Behavior:                                                                   │
+│  • Manager probes W3 → timeout → indirect probe → suspicion → DEAD          │
+│  • Manager triggers _on_node_dead callback                                  │
+│  • Workflows on W3 are retried on W1/W2 (excluding W3)                      │
+│  • If partition heals before W3 timeout, W3 may complete redundantly        │
+│  • Fence tokens prevent duplicate commits                                   │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════════ │
+│                                                                              │
+│  SCENARIO 3: Gate-to-DC Partition                                            │
+│  ════════════════════════════════════                                        │
+│                                                                              │
+│     ┌─────────────────┐               ║      ┌─────────────────┐            │
+│     │   GATE CLUSTER  │               ║      │  DATACENTER A   │            │
+│     │                 │               ║      │                 │            │
+│     │   ┌────┐       │               ║      │   ┌────┐        │            │
+│     │   │ G1 │        │               ║      │   │ M1 │        │            │
+│     │   │ ★  │        │               ║      │   │ ★  │        │            │
+│     │   └────┘        │               ║      │   └──┬─┘        │            │
+│     │                 │               ║      │      ▼          │            │
+│     │   Jobs for DC-A │               ║      │   ┌────┐        │            │
+│     │   marked FAILED │               ║      │   │ W1 │        │            │
+│     │   (lease expiry)│               ║      │   └────┘        │            │
+│     │                 │               ║      │                 │            │
+│     └─────────────────┘               ║      │ DC continues    │            │
+│                                       ║      │ until timeout   │            │
+│                                       ║      └─────────────────┘            │
+│                                                                              │
+│  Behavior:                                                                   │
+│  • Gate stops receiving ManagerHeartbeat from DC-A                          │
+│  • Gate marks DC-A managers as DEAD via SWIM                                │
+│  • Lease for DC-A jobs expires                                              │
+│  • Gate returns job failure to client (no cross-DC retry)                   │
+│  • DC-A workflows eventually timeout or complete (ignored by gate)          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cascading Failure Protection
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     CASCADING FAILURE PROTECTION                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PROTECTION MECHANISMS:                                                      │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. LOCAL HEALTH MULTIPLIER (LHM)                                       │ │
+│  │                                                                         │ │
+│  │    ┌──────────────────────────────────────────────────────────────┐    │ │
+│  │    │                                                               │    │ │
+│  │    │   Probe fails ──► LHM increases ──► Timeouts extend           │    │ │
+│  │    │        ▲                                    │                 │    │ │
+│  │    │        │                                    ▼                 │    │ │
+│  │    │        └────────── Prevents ◄─── False positives reduced      │    │ │
+│  │    │                    cascade                                    │    │ │
+│  │    │                                                               │    │ │
+│  │    └──────────────────────────────────────────────────────────────┘    │ │
+│  │                                                                         │ │
+│  │    If one node is slow, we don't mark it dead prematurely              │ │
+│  │    → Prevents triggering retry storm on healthy workers                │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 2. GRACEFUL DEGRADATION                                                │ │
+│  │                                                                         │ │
+│  │    Load Level     │ Action                                             │ │
+│  │    ───────────────┼─────────────────────────────────────────────────── │ │
+│  │    NORMAL         │ Full operation                                     │ │
+│  │    ELEVATED       │ Reduce gossip frequency                            │ │
+│  │    HIGH           │ Skip non-essential probes                          │ │
+│  │    SEVERE         │ Leader considers stepping down                     │ │
+│  │    CRITICAL       │ Reject new work, focus on completing existing      │ │
+│  │                                                                         │ │
+│  │    Prevents: Overloaded node being marked dead due to slow responses   │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 3. BACKPRESSURE SIGNALING                                              │ │
+│  │                                                                         │ │
+│  │    Worker queue_depth ──► Embedded in WorkerHeartbeat                  │ │
+│  │                                    │                                    │ │
+│  │                                    ▼                                    │ │
+│  │                           Manager respects soft_limit                   │ │
+│  │                                    │                                    │ │
+│  │                                    ▼                                    │ │
+│  │                           New work → other workers                      │ │
+│  │                                                                         │ │
+│  │    Prevents: Overloading already-stressed workers                      │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 4. RETRY LIMITS & EXCLUSION                                            │ │
+│  │                                                                         │ │
+│  │    Workflow fails on Worker A                                          │ │
+│  │         │                                                               │ │
+│  │         ▼                                                               │ │
+│  │    Retry 1: Select from {B, C, D} (A excluded)                         │ │
+│  │         │                                                               │ │
+│  │    Fails on Worker B                                                    │ │
+│  │         │                                                               │ │
+│  │         ▼                                                               │ │
+│  │    Retry 2: Select from {C, D} (A, B excluded)                         │ │
+│  │         │                                                               │ │
+│  │    Fails on Worker C                                                    │ │
+│  │         │                                                               │ │
+│  │         ▼                                                               │ │
+│  │    max_retries reached → FAILED (no more attempts)                      │ │
+│  │                                                                         │ │
+│  │    Prevents: Infinite retry loops, same worker repeated failure        │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 5. CIRCUIT BREAKERS                                                    │ │
+│  │                                                                         │ │
+│  │    ErrorHandler tracks errors by category:                              │ │
+│  │                                                                         │ │
+│  │    NETWORK errors ──► threshold exceeded ──► circuit OPEN              │ │
+│  │                                                   │                     │ │
+│  │                                                   ▼                     │ │
+│  │                                           Fail fast (no retry)          │ │
+│  │                                                   │                     │ │
+│  │                                           cooldown period               │ │
+│  │                                                   │                     │ │
+│  │                                                   ▼                     │ │
+│  │                                           circuit HALF-OPEN             │ │
+│  │                                                   │                     │ │
+│  │                                           test request                  │ │
+│  │                                                   │                     │ │
+│  │                                    success ──► CLOSED   failure ──► OPEN│ │
+│  │                                                                         │ │
+│  │    Prevents: Repeated attempts to failing resources                    │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 6. FLAPPING DETECTION                                                  │ │
+│  │                                                                         │ │
+│  │    Leadership changes in sliding window:                                │ │
+│  │                                                                         │ │
+│  │    Time: ─────────[change]───[change]───[change]───[change]─────►       │ │
+│  │                                                          │              │ │
+│  │                                            4 changes in 60s             │ │
+│  │                                                          │              │ │
+│  │                                                          ▼              │ │
+│  │                                               COOLDOWN ACTIVATED        │ │
+│  │                                               (no new elections)        │ │
+│  │                                                          │              │ │
+│  │                                               cooldown expires          │ │
+│  │                                                          │              │ │
+│  │                                                          ▼              │ │
+│  │                                               Normal operation          │ │
+│  │                                                                         │ │
+│  │    Prevents: Leadership oscillation under unstable conditions          │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Backpressure & Degradation
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    BACKPRESSURE & GRACEFUL DEGRADATION                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  DEGRADATION LEVELS:                                                         │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                          ││
+│  │  Level      │ LHM   │ Event Loop │ Actions                              ││
+│  │             │ Score │ Lag Ratio  │                                       ││
+│  │  ───────────┼───────┼────────────┼────────────────────────────────────── ││
+│  │  NORMAL     │ 0-2   │ < 0.5      │ Full operation                       ││
+│  │             │       │            │                                       ││
+│  │  ELEVATED   │ 2-4   │ 0.5-1.0    │ • Extend timeouts by 1.25x           ││
+│  │             │       │            │ • Reduce gossip rate                 ││
+│  │             │       │            │                                       ││
+│  │  HIGH       │ 4-6   │ 1.0-2.0    │ • Extend timeouts by 1.5x            ││
+│  │             │       │            │ • Skip 25% of probes                 ││
+│  │             │       │            │ • Reduce piggyback size              ││
+│  │             │       │            │                                       ││
+│  │  SEVERE     │ 6-7   │ 2.0-4.0    │ • Extend timeouts by 2x              ││
+│  │             │       │            │ • Skip 50% of probes                 ││
+│  │             │       │            │ • Consider leadership stepdown       ││
+│  │             │       │            │                                       ││
+│  │  CRITICAL   │ 7-8   │ > 4.0      │ • Extend timeouts by 3x              ││
+│  │             │       │            │ • Skip all non-essential probes      ││
+│  │             │       │            │ • Force leadership stepdown          ││
+│  │             │       │            │ • Reject new work                    ││
+│  │                                                                          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  BACKPRESSURE FLOW:                                                          │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                          ││
+│  │   Worker              Manager              Gate                Client   ││
+│  │     │                    │                   │                   │      ││
+│  │     │ WorkerHeartbeat    │                   │                   │      ││
+│  │     │ {queue_depth: 45}  │                   │                   │      ││
+│  │     │───────────────────►│                   │                   │      ││
+│  │     │                    │                   │                   │      ││
+│  │     │                    │ Check soft_limit  │                   │      ││
+│  │     │                    │ (e.g., 50)        │                   │      ││
+│  │     │                    │                   │                   │      ││
+│  │     │                    │ Worker approaching│                   │      ││
+│  │     │                    │ limit - depriori- │                   │      ││
+│  │     │                    │ tize in selection │                   │      ││
+│  │     │                    │                   │                   │      ││
+│  │     │                    │◄──────────────────│ New job           │      ││
+│  │     │                    │                   │                   │      ││
+│  │     │                    │ Select different  │                   │      ││
+│  │     │                    │ worker with lower │                   │      ││
+│  │     │                    │ queue_depth       │                   │      ││
+│  │     │                    │                   │                   │      ││
+│  │  ───┴────────────────────┴───────────────────┴───────────────────┴───── ││
+│  │                                                                          ││
+│  │   If ALL workers at capacity:                                            ││
+│  │                                                                          ││
+│  │   Worker 1            Worker 2            Worker 3                       ││
+│  │   queue: 50           queue: 48           queue: 50                      ││
+│  │   (at limit)          (near limit)        (at limit)                     ││
+│  │       │                   │                   │                          ││
+│  │       └───────────────────┼───────────────────┘                          ││
+│  │                           │                                              ││
+│  │                           ▼                                              ││
+│  │                    Manager rejects                                        ││
+│  │                    new workflow with                                      ││
+│  │                    backpressure error                                     ││
+│  │                           │                                              ││
+│  │                           ▼                                              ││
+│  │                    Gate/Client receives                                   ││
+│  │                    "capacity exceeded"                                    ││
+│  │                           │                                              ││
+│  │                           ▼                                              ││
+│  │                    Client implements                                      ││
+│  │                    exponential backoff                                    ││
+│  │                                                                          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  LHM ADJUSTMENT FLOW:                                                        │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                          ││
+│  │   Event                        │ LHM Change                             ││
+│  │   ─────────────────────────────┼──────────────────────────────────────  ││
+│  │   Probe success                │ Decrement by 1 (min 0)                 ││
+│  │   Probe failure                │ Increment by 1                         ││
+│  │   Indirect probe required      │ Increment by 1                         ││
+│  │   Event loop lag detected      │ Increment by 1-2                       ││
+│  │   Event loop recovered         │ Decrement by 1                         ││
+│  │   Suspicion started            │ Increment by 1                         ││
+│  │   Refutation successful        │ Decrement by 1                         ││
+│  │                                                                          ││
+│  │   Timeout Calculation:                                                   ││
+│  │   effective_timeout = base_timeout × (1 + LHM_score × 0.25)             ││
+│  │                                                                          ││
+│  │   Example (base_timeout = 500ms):                                        ││
+│  │   • LHM 0 → 500ms                                                        ││
+│  │   • LHM 2 → 750ms                                                        ││
+│  │   • LHM 4 → 1000ms                                                       ││
+│  │   • LHM 8 → 1500ms                                                       ││
+│  │                                                                          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Scaling Operations
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         SCALING OPERATIONS                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ADDING A WORKER:                                                            │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                          ││
+│  │   New Worker              Manager (Leader)                               ││
+│  │      │                          │                                        ││
+│  │      │ ① TCP: WorkerRegistration│                                        ││
+│  │      │ {node, total_cores, ...} │                                        ││
+│  │      │─────────────────────────►│                                        ││
+│  │      │                          │                                        ││
+│  │      │                          │ Add to _workers                        ││
+│  │      │                          │ Add to probe_scheduler                 ││
+│  │      │                          │                                        ││
+│  │      │ ② TCP: RegistrationAck   │                                        ││
+│  │      │◄─────────────────────────│                                        ││
+│  │      │                          │                                        ││
+│  │      │ ③ UDP: Join SWIM cluster │                                        ││
+│  │      │─────────────────────────►│                                        ││
+│  │      │                          │                                        ││
+│  │      │ ④ UDP: Ack + member list │                                        ││
+│  │      │◄─────────────────────────│                                        ││
+│  │      │                          │                                        ││
+│  │      │      ════════════════════│═══════════════════                     ││
+│  │      │         Worker now ACTIVE and receiving work                      ││
+│  │      │                          │                                        ││
+│  │                                                                          ││
+│  │   Time: ~1-2 seconds from registration to first workflow                ││
+│  │                                                                          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  REMOVING A WORKER (GRACEFUL):                                               │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                          ││
+│  │   Worker                    Manager (Leader)                             ││
+│  │      │                          │                                        ││
+│  │      │ ① Set state = DRAINING   │                                        ││
+│  │      │                          │                                        ││
+│  │      │ ② UDP: WorkerHeartbeat   │                                        ││
+│  │      │ {state: DRAINING}        │                                        ││
+│  │      │─────────────────────────►│                                        ││
+│  │      │                          │                                        ││
+│  │      │                          │ Stop sending new work                  ││
+│  │      │                          │                                        ││
+│  │      │ ③ Complete existing workflows                                    ││
+│  │      │                          │                                        ││
+│  │      │ ④ TCP: All workflows done│                                        ││
+│  │      │─────────────────────────►│                                        ││
+│  │      │                          │                                        ││
+│  │      │ ⑤ UDP: Leave message     │                                        ││
+│  │      │─────────────────────────►│                                        ││
+│  │      │                          │                                        ││
+│  │      │                          │ Remove from _workers                   ││
+│  │      │                          │ Gossip leave to cluster                ││
+│  │      │                          │                                        ││
+│  │      ╳ Shutdown                 │                                        ││
+│  │                                                                          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  ADDING A MANAGER:                                                           │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                          ││
+│  │   New Manager           Existing Managers                                ││
+│  │      │                       │                                           ││
+│  │      │ ① UDP: Join SWIM cluster                                         ││
+│  │      │──────────────────────►│                                           ││
+│  │      │                       │                                           ││
+│  │      │ ② UDP: Ack + members  │                                           ││
+│  │      │◄──────────────────────│                                           ││
+│  │      │                       │                                           ││
+│  │      │ STATE: SYNCING        │                                           ││
+│  │      │ (not counted in quorum)                                          ││
+│  │      │                       │                                           ││
+│  │      │ ③ TCP: StateSyncRequest                                          ││
+│  │      │──────────────────────►│ (to leader)                               ││
+│  │      │                       │                                           ││
+│  │      │ ④ TCP: ManagerStateSnapshot                                      ││
+│  │      │◄──────────────────────│                                           ││
+│  │      │                       │                                           ││
+│  │      │ Apply state snapshot  │                                           ││
+│  │      │ Verify consistency    │                                           ││
+│  │      │                       │                                           ││
+│  │      │ STATE: ACTIVE         │                                           ││
+│  │      │ (counted in quorum)   │                                           ││
+│  │      │                       │                                           ││
+│  │      │      ════════════════════════════════════                         ││
+│  │      │         New manager now participates in quorum                    ││
+│  │      │         (n/2 + 1 threshold recalculated)                         ││
+│  │      │                       │                                           ││
+│  │                                                                          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  REMOVING A MANAGER (GRACEFUL):                                              │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                          ││
+│  │   Leaving Manager           Other Managers                               ││
+│  │      │                          │                                        ││
+│  │      │ ① STATE: LEAVING         │                                        ││
+│  │      │                          │                                        ││
+│  │      │ If leader:               │                                        ││
+│  │      │ ② Trigger pre-vote for   │                                        ││
+│  │      │    new leader            │                                        ││
+│  │      │──────────────────────────►│                                        ││
+│  │      │                          │                                        ││
+│  │      │ ③ Wait for new leader    │                                        ││
+│  │      │◄──────────────────────────│                                        ││
+│  │      │                          │                                        ││
+│  │      │ ④ Confirm pending work   │                                        ││
+│  │      │    completes or transfers│                                        ││
+│  │      │                          │                                        ││
+│  │      │ ⑤ UDP: Leave message     │                                        ││
+│  │      │──────────────────────────►│                                        ││
+│  │      │                          │                                        ││
+│  │      │                          │ Recalculate quorum                     ││
+│  │      │                          │ (new work uses new quorum)             ││
+│  │      │                          │                                        ││
+│  │      ╳ Shutdown                 │                                        ││
+│  │                                                                          ││
+│  │   Note: In-flight work uses original quorum until completion            ││
+│  │                                                                          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  ADDING A GATE:                                                              │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                          ││
+│  │   New Gate              Existing Gates                                   ││
+│  │      │                       │                                           ││
+│  │      │ ① UDP: Join SWIM cluster                                         ││
+│  │      │──────────────────────►│                                           ││
+│  │      │                       │                                           ││
+│  │      │ ② TCP: StateSyncRequest                                          ││
+│  │      │──────────────────────►│ (to leader)                               ││
+│  │      │                       │                                           ││
+│  │      │ ③ TCP: GlobalJobStatus[]│                                         ││
+│  │      │◄──────────────────────│ + DatacenterLease[]                       ││
+│  │      │                       │                                           ││
+│  │      │ Apply state           │                                           ││
+│  │      │                       │                                           ││
+│  │      │ STATE: ACTIVE         │                                           ││
+│  │      │ (can become leader)   │                                           ││
+│  │      │                       │                                           ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+│  REMOVING A GATE (GRACEFUL):                                                 │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                                                                          ││
+│  │   Leaving Gate (★)          Other Gates                                  ││
+│  │      │                          │                                        ││
+│  │      │ ① Transfer leases        │                                        ││
+│  │      │    to new leader         │                                        ││
+│  │      │──────────────────────────►│                                        ││
+│  │      │                          │                                        ││
+│  │      │ ② LeaseTransfer ack      │                                        ││
+│  │      │◄──────────────────────────│                                        ││
+│  │      │                          │                                        ││
+│  │      │ ③ Update registry        │                                        ││
+│  │      │    (clients should       │                                        ││
+│  │      │    reconnect to new gate)│                                        ││
+│  │      │                          │                                        ││
+│  │      │ ④ UDP: Leave message     │                                        ││
+│  │      │──────────────────────────►│                                        ││
+│  │      │                          │                                        ││
+│  │      ╳ Shutdown                 │                                        ││
+│  │                                                                          ││
+│  └─────────────────────────────────────────────────────────────────────────┘│
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -1309,6 +2545,399 @@ gate = GateServer(
         "eu-west-1": [("manager1.eu-west.local", 9001)],
     },
 )
+```
+
+---
+
+## Message Protocol Reference
+
+### TCP Messages (Data Transfer)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         TCP MESSAGE TYPES                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ JOB LIFECYCLE MESSAGES                                                 │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  JobSubmission                                                          │ │
+│  │  ├─ job_id: str                    # Unique job identifier              │ │
+│  │  ├─ workflows: bytes               # Cloudpickled Workflow classes      │ │
+│  │  ├─ vus: int                       # Cores per workflow                 │ │
+│  │  ├─ timeout_seconds: float         # Max execution time                 │ │
+│  │  ├─ datacenter_count: int = 1      # Target DC count (gates only)       │ │
+│  │  └─ datacenters: list[str] = []    # Specific DCs (empty = auto)        │ │
+│  │                                                                         │ │
+│  │  JobAck                                                                  │ │
+│  │  ├─ job_id: str                    # Job identifier                     │ │
+│  │  ├─ accepted: bool                 # Whether accepted                   │ │
+│  │  ├─ error: str | None = None       # Error if rejected                  │ │
+│  │  └─ queued_position: int = 0       # Queue position                     │ │
+│  │                                                                         │ │
+│  │  CancelJob                                                               │ │
+│  │  ├─ job_id: str                    # Job to cancel                      │ │
+│  │  ├─ reason: str = ""               # Cancellation reason                │ │
+│  │  └─ fence_token: int = 0           # Fencing token                      │ │
+│  │                                                                         │ │
+│  │  CancelAck                                                               │ │
+│  │  ├─ job_id: str                    # Job identifier                     │ │
+│  │  ├─ cancelled: bool                # Success                            │ │
+│  │  ├─ workflows_cancelled: int = 0   # Count stopped                      │ │
+│  │  └─ error: str | None = None       # Error if failed                    │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ WORKFLOW DISPATCH MESSAGES                                             │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  WorkflowDispatch                                                        │ │
+│  │  ├─ job_id: str                    # Parent job                         │ │
+│  │  ├─ workflow_id: str               # Unique workflow instance           │ │
+│  │  ├─ workflow: bytes                # Cloudpickled Workflow class        │ │
+│  │  ├─ context: bytes                 # Cloudpickled context dict          │ │
+│  │  ├─ vus: int                       # Cores to use                       │ │
+│  │  ├─ timeout_seconds: float         # Execution timeout                  │ │
+│  │  └─ fence_token: int               # At-most-once fencing               │ │
+│  │                                                                         │ │
+│  │  WorkflowDispatchAck                                                     │ │
+│  │  ├─ workflow_id: str               # Workflow identifier                │ │
+│  │  ├─ accepted: bool                 # Whether accepted                   │ │
+│  │  ├─ error: str | None = None       # Error if rejected                  │ │
+│  │  └─ cores_assigned: int = 0        # Actual cores                       │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ PROGRESS & STATUS MESSAGES                                             │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  StepStats                                                               │ │
+│  │  ├─ step_name: str                 # Step method name                   │ │
+│  │  ├─ completed_count: int = 0       # Successful executions              │ │
+│  │  ├─ failed_count: int = 0          # Failed executions                  │ │
+│  │  └─ total_count: int = 0           # Total attempts                     │ │
+│  │                                                                         │ │
+│  │  WorkflowProgress                                                        │ │
+│  │  ├─ job_id: str                    # Parent job                         │ │
+│  │  ├─ workflow_id: str               # Workflow instance                  │ │
+│  │  ├─ workflow_name: str             # Workflow class name                │ │
+│  │  ├─ status: str                    # WorkflowStatus value               │ │
+│  │  ├─ completed_count: int           # Actions completed                  │ │
+│  │  ├─ failed_count: int              # Actions failed                     │ │
+│  │  ├─ rate_per_second: float         # Current rate                       │ │
+│  │  ├─ elapsed_seconds: float         # Time since start                   │ │
+│  │  ├─ step_stats: list[StepStats]    # Per-step breakdown                 │ │
+│  │  ├─ timestamp: float = 0.0         # Monotonic timestamp                │ │
+│  │  └─ assigned_cores: list[int] = [] # Core indices                       │ │
+│  │                                                                         │ │
+│  │  JobProgress                                                             │ │
+│  │  ├─ job_id: str                    # Job identifier                     │ │
+│  │  ├─ datacenter: str                # Reporting DC                       │ │
+│  │  ├─ status: str                    # JobStatus value                    │ │
+│  │  ├─ workflows: list[WorkflowProgress]  # Per-workflow                   │ │
+│  │  ├─ total_completed: int = 0       # Total actions                      │ │
+│  │  ├─ total_failed: int = 0          # Total failed                       │ │
+│  │  ├─ overall_rate: float = 0.0      # Aggregate rate                     │ │
+│  │  ├─ elapsed_seconds: float = 0.0   # Job runtime                        │ │
+│  │  └─ timestamp: float = 0.0         # Monotonic timestamp                │ │
+│  │                                                                         │ │
+│  │  GlobalJobStatus                                                         │ │
+│  │  ├─ job_id: str                    # Job identifier                     │ │
+│  │  ├─ status: str                    # JobStatus value                    │ │
+│  │  ├─ datacenters: list[JobProgress] # Per-DC progress                    │ │
+│  │  ├─ total_completed: int = 0       # Global total                       │ │
+│  │  ├─ total_failed: int = 0          # Global failed                      │ │
+│  │  ├─ overall_rate: float = 0.0      # Global rate                        │ │
+│  │  ├─ elapsed_seconds: float = 0.0   # Since submission                   │ │
+│  │  ├─ completed_datacenters: int = 0 # DCs finished                       │ │
+│  │  └─ failed_datacenters: int = 0    # DCs failed                         │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ QUORUM & PROVISIONING MESSAGES                                         │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  ProvisionRequest                                                        │ │
+│  │  ├─ job_id: str                    # Job identifier                     │ │
+│  │  ├─ workflow_id: str               # Workflow to provision              │ │
+│  │  ├─ target_worker: str             # Selected worker node_id            │ │
+│  │  ├─ cores_required: int            # Cores needed                       │ │
+│  │  ├─ fence_token: int               # Fencing token                      │ │
+│  │  └─ version: int                   # State version                      │ │
+│  │                                                                         │ │
+│  │  ProvisionConfirm                                                        │ │
+│  │  ├─ job_id: str                    # Job identifier                     │ │
+│  │  ├─ workflow_id: str               # Workflow                           │ │
+│  │  ├─ confirming_node: str           # Confirming manager                 │ │
+│  │  ├─ confirmed: bool                # Whether confirmed                  │ │
+│  │  ├─ version: int                   # Node's version                     │ │
+│  │  └─ error: str | None = None       # Error if not confirmed             │ │
+│  │                                                                         │ │
+│  │  ProvisionCommit                                                         │ │
+│  │  ├─ job_id: str                    # Job identifier                     │ │
+│  │  ├─ workflow_id: str               # Workflow                           │ │
+│  │  ├─ target_worker: str             # Final worker                       │ │
+│  │  ├─ cores_assigned: int            # Cores allocated                    │ │
+│  │  ├─ fence_token: int               # Fencing token                      │ │
+│  │  └─ committed_version: int         # Version at commit                  │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ STATE SYNC MESSAGES                                                    │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  StateSyncRequest                                                        │ │
+│  │  ├─ requester_id: str              # Requesting node                    │ │
+│  │  ├─ requester_role: str            # NodeRole value                     │ │
+│  │  └─ since_version: int = 0         # Only updates after this            │ │
+│  │                                                                         │ │
+│  │  StateSyncResponse                                                       │ │
+│  │  ├─ responder_id: str              # Responding node                    │ │
+│  │  ├─ current_version: int           # Current state version              │ │
+│  │  ├─ worker_state: WorkerStateSnapshot | None  # If worker               │ │
+│  │  └─ manager_state: ManagerStateSnapshot | None # If manager             │ │
+│  │                                                                         │ │
+│  │  WorkerStateSnapshot                                                     │ │
+│  │  ├─ node_id: str                   # Worker identifier                  │ │
+│  │  ├─ state: str                     # WorkerState value                  │ │
+│  │  ├─ total_cores: int               # Total cores                        │ │
+│  │  ├─ available_cores: int           # Free cores                         │ │
+│  │  ├─ version: int                   # State version                      │ │
+│  │  └─ active_workflows: dict[str, WorkflowProgress]                       │ │
+│  │                                                                         │ │
+│  │  ManagerStateSnapshot                                                    │ │
+│  │  ├─ node_id: str                   # Manager identifier                 │ │
+│  │  ├─ datacenter: str                # Datacenter                         │ │
+│  │  ├─ is_leader: bool                # Leadership status                  │ │
+│  │  ├─ term: int                      # Current term                       │ │
+│  │  ├─ version: int                   # State version                      │ │
+│  │  ├─ workers: list[WorkerStateSnapshot]  # Registered workers            │ │
+│  │  └─ jobs: dict[str, JobProgress]   # Active jobs                        │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ LEASE MESSAGES (Gates only)                                            │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  DatacenterLease                                                         │ │
+│  │  ├─ job_id: str                    # Job identifier                     │ │
+│  │  ├─ datacenter: str                # Datacenter holding lease           │ │
+│  │  ├─ lease_holder: str              # Gate node_id                       │ │
+│  │  ├─ fence_token: int               # Fencing token                      │ │
+│  │  ├─ expires_at: float              # Monotonic expiration               │ │
+│  │  └─ version: int                   # Lease version                      │ │
+│  │                                                                         │ │
+│  │  LeaseTransfer                                                           │ │
+│  │  ├─ job_id: str                    # Job identifier                     │ │
+│  │  ├─ datacenter: str                # Datacenter                         │ │
+│  │  ├─ from_gate: str                 # Current holder                     │ │
+│  │  ├─ to_gate: str                   # New holder                         │ │
+│  │  ├─ new_fence_token: int           # New fencing token                  │ │
+│  │  └─ version: int                   # Transfer version                   │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### UDP Messages (SWIM Protocol)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         UDP MESSAGE TYPES                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ PROBE MESSAGES                                                         │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  Format: message_type>target_host:target_port[#base64_state]            │ │
+│  │                                                                         │ │
+│  │  probe>192.168.1.10:8001                                                │ │
+│  │  └───┬─┘└────────────────┘                                              │ │
+│  │      │        │                                                         │ │
+│  │      │        └─ Target address                                         │ │
+│  │      └─ Message type                                                    │ │
+│  │                                                                         │ │
+│  │  ack>192.168.1.5:8000#eyJub2RlX2lkIjoiLi4uIn0=                          │ │
+│  │  └─┬┘└──────────────┘ └────────────────────────┘                        │ │
+│  │    │        │                    │                                      │ │
+│  │    │        │                    └─ Base64-encoded embedded state       │ │
+│  │    │        └─ Sender address                                           │ │
+│  │    └─ Message type                                                      │ │
+│  │                                                                         │ │
+│  │  ping-req>192.168.1.15:8002                                             │ │
+│  │  └──────┘ (indirect probe via proxy node)                               │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ MEMBERSHIP MESSAGES                                                    │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  join>192.168.1.5:8000                                                  │ │
+│  │  └──┘ (request to join cluster)                                         │ │
+│  │                                                                         │ │
+│  │  leave>192.168.1.5:8000                                                 │ │
+│  │  └───┘ (graceful departure)                                             │ │
+│  │                                                                         │ │
+│  │  alive:5>192.168.1.5:8000                                               │ │
+│  │  └───┘ │ (refutation with incarnation 5)                                │ │
+│  │        │                                                                │ │
+│  │        └─ Incarnation number                                            │ │
+│  │                                                                         │ │
+│  │  suspect:3>192.168.1.10:8001                                            │ │
+│  │  └─────┘ │ (suspicion with incarnation 3)                               │ │
+│  │          │                                                              │ │
+│  │          └─ Target node's last known incarnation                        │ │
+│  │                                                                         │ │
+│  │  dead:3>192.168.1.10:8001                                               │ │
+│  │  └──┘ (node marked dead after suspicion expired)                        │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ LEADERSHIP MESSAGES                                                    │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  pre-vote:5>192.168.1.5:8000                                            │ │
+│  │  └──────┘ │ (pre-vote request for term 5)                               │ │
+│  │           │                                                             │ │
+│  │           └─ Proposed term                                              │ │
+│  │                                                                         │ │
+│  │  pre-vote-response:5:true>192.168.1.10:8001                             │ │
+│  │                    │  │                                                 │ │
+│  │                    │  └─ Granted (true/false)                           │ │
+│  │                    └─ Term                                              │ │
+│  │                                                                         │ │
+│  │  vote-req:6>192.168.1.5:8000                                            │ │
+│  │  └──────┘ (vote request for term 6)                                     │ │
+│  │                                                                         │ │
+│  │  vote-response:6:true>192.168.1.10:8001                                 │ │
+│  │  (vote granted for term 6)                                              │ │
+│  │                                                                         │ │
+│  │  leader:6>192.168.1.5:8000                                              │ │
+│  │  └────┘ (leader announcement for term 6)                                │ │
+│  │                                                                         │ │
+│  │  heartbeat:6>192.168.1.5:8000                                           │ │
+│  │  └───────┘ (leader heartbeat for term 6)                                │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GOSSIP PIGGYBACK FORMAT                                                │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  Piggybacked updates are appended to messages:                          │ │
+│  │                                                                         │ │
+│  │  ack>192.168.1.5:8000|J:192.168.1.20:8003:0|A:192.168.1.10:8001:5       │ │
+│  │                     └─────────────────────────────────────────────┘     │ │
+│  │                                         │                               │ │
+│  │                           Piggybacked gossip updates                    │ │
+│  │                                                                         │ │
+│  │  Update format: TYPE:HOST:PORT:INCARNATION                              │ │
+│  │                                                                         │ │
+│  │  Types:                                                                  │ │
+│  │  • J = JOIN (highest priority)                                          │ │
+│  │  • L = LEAVE                                                            │ │
+│  │  • A = ALIVE                                                            │ │
+│  │  • S = SUSPECT                                                          │ │
+│  │  • D = DEAD (lowest priority)                                           │ │
+│  │                                                                         │ │
+│  │  Priority ensures important updates propagate first when space limited  │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ EMBEDDED STATE (Serf-style Heartbeats)                                 │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  State embedded in ack responses after '#' separator:                   │ │
+│  │                                                                         │ │
+│  │  ack>192.168.1.5:8000#eyJub2RlX2lkIjogIndvcmtlci0xIiwgLi4ufQ==          │ │
+│  │                      └────────────────────────────────────────┘         │ │
+│  │                                   Base64(cloudpickle(Heartbeat))        │ │
+│  │                                                                         │ │
+│  │  WorkerHeartbeat (embedded by workers):                                 │ │
+│  │  ├─ node_id: str                                                        │ │
+│  │  ├─ state: str                   # HEALTHY|DEGRADED|DRAINING|OFFLINE    │ │
+│  │  ├─ available_cores: int                                                │ │
+│  │  ├─ queue_depth: int                                                    │ │
+│  │  ├─ cpu_percent: float                                                  │ │
+│  │  ├─ memory_percent: float                                               │ │
+│  │  ├─ version: int                                                        │ │
+│  │  └─ active_workflows: dict[str, str]  # workflow_id → status            │ │
+│  │                                                                         │ │
+│  │  ManagerHeartbeat (embedded by managers):                               │ │
+│  │  ├─ node_id: str                                                        │ │
+│  │  ├─ datacenter: str                                                     │ │
+│  │  ├─ is_leader: bool                                                     │ │
+│  │  ├─ term: int                                                           │ │
+│  │  ├─ version: int                                                        │ │
+│  │  ├─ active_jobs: int                                                    │ │
+│  │  ├─ active_workflows: int                                               │ │
+│  │  ├─ worker_count: int                                                   │ │
+│  │  └─ available_cores: int                                                │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Enums Reference
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           ENUM VALUES                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  NodeRole           │ Description                                           │
+│  ───────────────────┼────────────────────────────────────────────────────── │
+│  GATE               │ Cross-DC coordination node                            │
+│  MANAGER            │ Datacenter workflow orchestrator                      │
+│  WORKER             │ Workflow execution node                               │
+│                                                                              │
+│  ───────────────────────────────────────────────────────────────────────────│
+│                                                                              │
+│  JobStatus          │ Description                                           │
+│  ───────────────────┼────────────────────────────────────────────────────── │
+│  SUBMITTED          │ Job received, not yet dispatched                      │
+│  QUEUED             │ Waiting for resources                                 │
+│  DISPATCHING        │ Workflows being sent to workers                       │
+│  RUNNING            │ Active execution                                      │
+│  COMPLETING         │ Gathering final results                               │
+│  COMPLETED          │ Successfully finished                                 │
+│  FAILED             │ Failed (max retries exhausted)                        │
+│  CANCELLED          │ User cancelled                                        │
+│  TIMEOUT            │ Exceeded timeout_seconds                              │
+│                                                                              │
+│  ───────────────────────────────────────────────────────────────────────────│
+│                                                                              │
+│  WorkflowStatus     │ Description                                           │
+│  ───────────────────┼────────────────────────────────────────────────────── │
+│  PENDING            │ Not yet started                                       │
+│  ASSIGNED           │ Sent to worker, awaiting ack                          │
+│  RUNNING            │ Executing on worker                                   │
+│  COMPLETED          │ Finished successfully                                 │
+│  FAILED             │ Failed                                                │
+│  CANCELLED          │ Cancelled                                             │
+│                                                                              │
+│  ───────────────────────────────────────────────────────────────────────────│
+│                                                                              │
+│  WorkerState        │ Description                                           │
+│  ───────────────────┼────────────────────────────────────────────────────── │
+│  HEALTHY            │ Normal operation, accepts work                        │
+│  DEGRADED           │ High load, accepts with backpressure                  │
+│  DRAINING           │ Not accepting new work                                │
+│  OFFLINE            │ Not responding / shutdown                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
