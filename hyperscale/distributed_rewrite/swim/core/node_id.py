@@ -77,6 +77,11 @@ class NodeId:
         return f"{self.datacenter}-{self.priority:02d}-{self.random[:4]}"
     
     @property
+    def full(self) -> str:
+        """Full string representation of the node ID (alias for str())."""
+        return str(self)
+    
+    @property
     def age_seconds(self) -> float:
         """How old this node ID is in seconds."""
         return (time.time() * 1000 - self.created_ms) / 1000
