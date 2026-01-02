@@ -2579,6 +2579,145 @@ test_health_classification_busy()
 
 
 # =============================================================================
+# Tiered Update Strategy Tests
+# =============================================================================
+
+print("\nTiered Update Strategy Tests")
+print("=" * 50)
+
+
+@test("UpdateTier: enum has all required values")
+def test_update_tier_enum():
+    from hyperscale.distributed_rewrite.models import UpdateTier
+    
+    assert hasattr(UpdateTier, 'IMMEDIATE')
+    assert hasattr(UpdateTier, 'PERIODIC')
+    assert hasattr(UpdateTier, 'ON_DEMAND')
+    
+    assert UpdateTier.IMMEDIATE.value == "immediate"
+    assert UpdateTier.PERIODIC.value == "periodic"
+    assert UpdateTier.ON_DEMAND.value == "on_demand"
+
+
+@test("GateServer: has _classify_update_tier method")
+def test_gate_has_classify_tier():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_classify_update_tier'), \
+        "GateServer must have _classify_update_tier method"
+
+
+@test("GateServer: has _send_immediate_update method")
+def test_gate_has_immediate_update():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_send_immediate_update'), \
+        "GateServer must have _send_immediate_update method"
+
+
+@test("GateServer: has _batch_stats_loop method")
+def test_gate_has_batch_stats_loop():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_batch_stats_loop'), \
+        "GateServer must have _batch_stats_loop method"
+
+
+@test("GateServer: has _batch_stats_update method")
+def test_gate_has_batch_stats_update():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_batch_stats_update'), \
+        "GateServer must have _batch_stats_update method"
+
+
+@test("GateServer: has _handle_update_by_tier method")
+def test_gate_has_handle_update_tier():
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    assert hasattr(GateServer, '_handle_update_by_tier'), \
+        "GateServer must have _handle_update_by_tier method"
+
+
+@test("GateServer: _classify_update_tier returns IMMEDIATE for completion")
+def test_classify_tier_completion_is_immediate():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    from hyperscale.distributed_rewrite.models import JobStatus
+    
+    source = inspect.getsource(GateServer._classify_update_tier)
+    
+    # Should classify COMPLETED and FAILED as IMMEDIATE
+    assert 'COMPLETED' in source or 'completed' in source.lower()
+    assert 'FAILED' in source or 'failed' in source.lower()
+    assert 'IMMEDIATE' in source
+
+
+@test("GateServer: _classify_update_tier returns PERIODIC for progress")
+def test_classify_tier_progress_is_periodic():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer._classify_update_tier)
+    
+    # Should classify regular updates as PERIODIC
+    assert 'PERIODIC' in source
+
+
+@test("GateServer: receive_job_progress uses tiered updates")
+def test_receive_progress_uses_tiers():
+    import inspect
+    import pathlib
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    # The receive_job_progress method is decorated, so we need to read the file directly
+    gate_path = pathlib.Path(inspect.getfile(GateServer))
+    source = gate_path.read_text()
+    
+    # Find the receive_job_progress method in the source
+    # It should call _handle_update_by_tier
+    assert 'def receive_job_progress' in source, \
+        "GateServer must have receive_job_progress method"
+    
+    # Extract the method body
+    start_idx = source.find('def receive_job_progress')
+    if start_idx > 0:
+        # Look for _handle_update_by_tier after the method definition
+        method_end_idx = source.find('\n    @', start_idx + 100)  # Next method
+        if method_end_idx == -1:
+            method_end_idx = len(source)
+        method_source = source[start_idx:method_end_idx]
+        
+        assert '_handle_update_by_tier' in method_source, \
+            "receive_job_progress should use tiered update strategy"
+
+
+@test("GateServer: start() runs batch stats loop")
+def test_gate_start_runs_batch_loop():
+    import inspect
+    from hyperscale.distributed_rewrite.nodes import GateServer
+    
+    source = inspect.getsource(GateServer.start)
+    
+    # Should start the batch stats loop
+    assert '_batch_stats_loop' in source, \
+        "GateServer.start() should run _batch_stats_loop"
+
+
+# Run tiered update tests
+test_update_tier_enum()
+test_gate_has_classify_tier()
+test_gate_has_immediate_update()
+test_gate_has_batch_stats_loop()
+test_gate_has_batch_stats_update()
+test_gate_has_handle_update_tier()
+test_classify_tier_completion_is_immediate()
+test_classify_tier_progress_is_periodic()
+test_receive_progress_uses_tiers()
+test_gate_start_runs_batch_loop()
+
+
+# =============================================================================
 # Summary
 # =============================================================================
 

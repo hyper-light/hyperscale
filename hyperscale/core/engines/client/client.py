@@ -43,7 +43,7 @@ class Client(Generic[Unpack[T]]):
         self.http3 = MercurySyncHTTP3Connection()
         self.playwright = MercurySyncPlaywrightConnection()
         self.scp = MercurySyncSCPConnection()
-        # self.sftp = MercurySyncSFTPConnction()
+        self.sftp = MercurySyncSFTPConnction()
         self.smtp = MercurySyncSMTPConnection()
         self.tcp = MercurySyncTCPConnection()
         self.udp = MercurySyncUDPConnection()
@@ -79,7 +79,7 @@ class Client(Generic[Unpack[T]]):
             self.http3,
             self.playwright,
             self.scp,
-            # self.sftp,
+            self.sftp,
             self.smtp,
             self.tcp,
             self.udp,
@@ -121,8 +121,8 @@ class Client(Generic[Unpack[T]]):
             case RequestType.SCP:
                 return self.scp
             
-            # case RequestType.SFTP:
-            #     return self.sftp
+            case RequestType.SFTP:
+                return self.sftp
             
             case RequestType.SMTP:
                 return self.smtp
@@ -165,7 +165,7 @@ class Client(Generic[Unpack[T]]):
             self.http3,
             self.playwright,
             self.scp,
-            # self.sftp,
+            self.sftp,
             self.smtp,
             self.tcp,
             self.udp,

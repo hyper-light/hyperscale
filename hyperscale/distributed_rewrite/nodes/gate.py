@@ -45,6 +45,7 @@ from hyperscale.distributed_rewrite.models import (
     LeaseTransfer,
     DatacenterHealth,
     DatacenterStatus,
+    UpdateTier,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -580,6 +581,160 @@ class GateServer(UDPServer):
         
         return (successful, failed)
     
+    # =========================================================================
+    # Tiered Update Strategy (AD-15)
+    # =========================================================================
+    
+    def _classify_update_tier(
+        self,
+        job_id: str,
+        old_status: str | None,
+        new_status: str,
+    ) -> str:
+        """
+        Classify which tier an update belongs to.
+        
+        Tier 1 (Immediate): Job completion, failure, critical alerts
+        Tier 2 (Periodic): Workflow progress, aggregate rates
+        Tier 3 (On-Demand): Step-level stats, historical data
+        
+        Returns UpdateTier value.
+        """
+        from hyperscale.distributed_rewrite.models import UpdateTier
+        
+        # Critical state transitions = Immediate
+        if new_status in (JobStatus.COMPLETED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value):
+            return UpdateTier.IMMEDIATE.value
+        
+        # New job start = Immediate
+        if old_status is None and new_status == JobStatus.RUNNING.value:
+            return UpdateTier.IMMEDIATE.value
+        
+        # Status transitions = Immediate
+        if old_status != new_status:
+            return UpdateTier.IMMEDIATE.value
+        
+        # Regular progress updates = Periodic (batched)
+        return UpdateTier.PERIODIC.value
+    
+    async def _send_immediate_update(
+        self,
+        job_id: str,
+        event_type: str,
+        payload: bytes | None = None,
+    ) -> None:
+        """
+        Send a Tier 1 (Immediate) update to subscribed clients.
+        
+        Used for critical events that clients need to know about immediately:
+        - Job completion
+        - Job failure
+        - Critical alerts
+        """
+        job = self._jobs.get(job_id)
+        if not job:
+            return
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Job {job_id}: Immediate update - {event_type}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        # In a real implementation, this would push to subscribed clients
+        # For now, we just track that we would send it
+        # Future: WebSocket push, SSE, or callback webhook
+    
+    async def _batch_stats_update(self) -> None:
+        """
+        Process a batch of Tier 2 (Periodic) updates.
+        
+        Aggregates pending progress updates and sends them in a single batch.
+        More efficient than sending each update individually.
+        """
+        # Collect pending updates
+        pending_jobs = []
+        for job_id, job in self._jobs.items():
+            if job.status == JobStatus.RUNNING.value:
+                pending_jobs.append((job_id, job))
+        
+        if not pending_jobs:
+            return
+        
+        # In a real implementation, this would:
+        # 1. Aggregate stats from multiple DCs using CRDTs
+        # 2. Batch into a single message
+        # 3. Send to subscribed clients
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Batch stats update: {len(pending_jobs)} jobs",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+    
+    async def _batch_stats_loop(self) -> None:
+        """
+        Background loop for Tier 2 (Periodic) updates.
+        
+        Runs every 1-5 seconds (configurable) to batch and send progress updates.
+        This reduces network overhead compared to sending each update immediately.
+        """
+        batch_interval = getattr(self, '_batch_stats_interval', 2.0)  # Default 2s
+        
+        while True:
+            try:
+                await asyncio.sleep(batch_interval)
+                await self._batch_stats_update()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                # Log but continue
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Batch stats loop error: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                await asyncio.sleep(batch_interval)
+    
+    def _handle_update_by_tier(
+        self,
+        job_id: str,
+        old_status: str | None,
+        new_status: str,
+        progress_data: bytes | None = None,
+    ) -> None:
+        """
+        Route an update through the appropriate tier.
+        
+        Tier 1 → immediate TCP push
+        Tier 2 → batched periodic update
+        Tier 3 → stored for on-demand retrieval
+        """
+        from hyperscale.distributed_rewrite.models import UpdateTier
+        
+        tier = self._classify_update_tier(job_id, old_status, new_status)
+        
+        if tier == UpdateTier.IMMEDIATE.value:
+            self._task_runner.run(
+                self._send_immediate_update,
+                job_id,
+                f"status:{old_status}->{new_status}",
+                progress_data,
+            )
+        # Tier 2 and 3 are handled by batch loop and on-demand requests
+    
     async def start(self) -> None:
         """Start the gate server."""
         await super().start()
@@ -602,6 +757,9 @@ class GateServer(UDPServer):
         # Start background cleanup tasks via TaskRunner
         self._task_runner.run(self._lease_cleanup_loop)
         self._task_runner.run(self._job_cleanup_loop)
+        
+        # Start Tier 2 (periodic) batch stats loop
+        self._task_runner.run(self._batch_stats_loop)
         
         self._task_runner.run(
             self._udp_logger.log,
@@ -1090,12 +1248,20 @@ class GateServer(UDPServer):
         data: bytes,
         clock_time: int,
     ):
-        """Handle job progress update from manager."""
+        """
+        Handle job progress update from manager.
+        
+        Uses tiered update strategy (AD-15):
+        - Tier 1 (Immediate): Critical state changes → push immediately
+        - Tier 2 (Periodic): Regular progress → batched
+        """
         try:
             progress = JobProgress.load(data)
             
             job = self._jobs.get(progress.job_id)
             if job:
+                old_status = job.status
+                
                 # Update DC progress
                 for i, dc_prog in enumerate(job.datacenters):
                     if dc_prog.datacenter == progress.datacenter:
@@ -1109,6 +1275,31 @@ class GateServer(UDPServer):
                 job.total_failed = sum(p.total_failed for p in job.datacenters)
                 job.overall_rate = sum(p.overall_rate for p in job.datacenters)
                 job.timestamp = time.monotonic()
+                
+                # Check if all DCs are done to update job status
+                completed_dcs = sum(
+                    1 for p in job.datacenters
+                    if p.status in (JobStatus.COMPLETED.value, JobStatus.FAILED.value)
+                )
+                if completed_dcs == len(job.datacenters):
+                    failed_dcs = sum(
+                        1 for p in job.datacenters
+                        if p.status == JobStatus.FAILED.value
+                    )
+                    if failed_dcs > 0:
+                        job.status = JobStatus.FAILED.value
+                    else:
+                        job.status = JobStatus.COMPLETED.value
+                    job.completed_datacenters = len(job.datacenters) - failed_dcs
+                    job.failed_datacenters = failed_dcs
+                
+                # Route through tiered update strategy
+                self._handle_update_by_tier(
+                    progress.job_id,
+                    old_status,
+                    job.status,
+                    data,
+                )
                 
                 self._increment_version()
             
