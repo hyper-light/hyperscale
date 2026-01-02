@@ -241,9 +241,9 @@ class ManagerServer(HealthAwareServer):
                 for job in self._jobs.values()
             ),
             get_worker_count=lambda: len(self._workers),
-            get_available_cores=lambda: sum(
-                status.available_cores for status in self._worker_status.values()
-            ),
+            get_healthy_worker_count=lambda: len(self._get_healthy_worker_ids()),
+            get_available_cores=lambda: self._get_available_cores_for_healthy_workers(),
+            get_total_cores=self._get_total_cores,
             on_worker_heartbeat=self._handle_embedded_worker_heartbeat,
             on_manager_heartbeat=self._handle_manager_peer_heartbeat,
             on_gate_heartbeat=self._handle_gate_heartbeat,
@@ -1376,8 +1376,47 @@ class ManagerServer(HealthAwareServer):
             "primary_gate": self._primary_gate_id,
         }
     
+    def _get_healthy_worker_ids(self) -> list[str]:
+        """
+        Get list of worker IDs that are healthy according to SWIM probes.
+        
+        A worker is healthy if SWIM reports it as 'OK' (alive).
+        """
+        healthy = []
+        for node_id, registration in self._workers.items():
+            worker_addr = (registration.node.host, registration.node.port)
+            node_state = self._incarnation_tracker.get_node_state(worker_addr)
+            if node_state and node_state.status == b'OK':
+                healthy.append(node_id)
+        return healthy
+    
+    def _get_total_cores(self) -> int:
+        """Get total cores across all registered workers."""
+        return sum(
+            registration.total_cores
+            for registration in self._workers.values()
+        )
+    
+    def _get_available_cores_for_healthy_workers(self) -> int:
+        """
+        Get available cores only from healthy workers.
+        
+        This is the source of truth for datacenter "BUSY" state:
+        - If this returns 0 but we have healthy workers → BUSY
+        - If we have no healthy workers → DEGRADED/UNHEALTHY
+        """
+        healthy_ids = set(self._get_healthy_worker_ids())
+        return sum(
+            status.available_cores
+            for node_id, status in self._worker_status.items()
+            if node_id in healthy_ids
+        )
+    
     def _build_manager_heartbeat(self) -> ManagerHeartbeat:
         """Build a ManagerHeartbeat with current state."""
+        healthy_worker_ids = self._get_healthy_worker_ids()
+        healthy_ids_set = set(healthy_worker_ids)
+        
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -1389,10 +1428,13 @@ class ManagerServer(HealthAwareServer):
                 len(job.workflows) for job in self._jobs.values()
             ),
             worker_count=len(self._workers),
+            healthy_worker_count=len(healthy_worker_ids),
             available_cores=sum(
                 status.available_cores
-                for status in self._worker_status.values()
+                for node_id, status in self._worker_status.items()
+                if node_id in healthy_ids_set
             ),
+            total_cores=self._get_total_cores(),
             state=self._manager_state.value,
         )
     

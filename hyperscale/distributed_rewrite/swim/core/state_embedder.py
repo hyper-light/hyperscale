@@ -168,7 +168,9 @@ class ManagerStateEmbedder:
     get_active_jobs: Callable[[], int]
     get_active_workflows: Callable[[], int]
     get_worker_count: Callable[[], int]
+    get_healthy_worker_count: Callable[[], int]
     get_available_cores: Callable[[], int]
+    get_total_cores: Callable[[], int]
     on_worker_heartbeat: Callable[[Any, tuple[str, int]], None]
     on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
@@ -185,7 +187,9 @@ class ManagerStateEmbedder:
             active_jobs=self.get_active_jobs(),
             active_workflows=self.get_active_workflows(),
             worker_count=self.get_worker_count(),
+            healthy_worker_count=self.get_healthy_worker_count(),
             available_cores=self.get_available_cores(),
+            total_cores=self.get_total_cores(),
             state=self.get_manager_state() if self.get_manager_state else "active",
         )
         return heartbeat.dump()

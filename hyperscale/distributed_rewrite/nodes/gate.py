@@ -669,30 +669,32 @@ class GateServer(HealthAwareServer):
         """
         Classify datacenter health based on SWIM probes and status updates.
         
-        Health States:
-        - HEALTHY: Managers responding, workers available, capacity exists
-        - BUSY: Managers responding, workers available, no immediate capacity
-        - DEGRADED: Some managers responding, reduced capacity
-        - UNHEALTHY: No managers responding OR all workers down
+        Health States (evaluated in order):
+        1. UNHEALTHY: No managers responding OR no workers registered
+        2. DEGRADED: Majority of workers unhealthy OR majority of managers unhealthy
+        3. BUSY: NOT degraded AND available_cores == 0 (transient, will clear)
+        4. HEALTHY: NOT degraded AND available_cores > 0
         
         Key insight: BUSY ≠ UNHEALTHY
         - BUSY = transient, will clear → accept job (queued)
-        - UNHEALTHY = structural problem → try fallback
+        - DEGRADED = structural problem, reduced capacity → may need intervention
+        - UNHEALTHY = severe problem → try fallback datacenter
         
         See AD-16 in docs/architecture.md.
         """
         # Check manager liveness via SWIM
         manager_udp_addrs = self._datacenter_manager_udp.get(dc_id, [])
+        total_managers = len(manager_udp_addrs)
         alive_managers = 0
         for addr in manager_udp_addrs:
             node_state = self._incarnation_tracker.get_node_state(addr)
             if node_state and node_state.status == b'OK':
                 alive_managers += 1
         
-        # Get status from TCP heartbeats
+        # Get status from TCP heartbeats (contains worker info from managers)
         status = self._datacenter_status.get(dc_id)
         
-        # No managers responding = UNHEALTHY
+        # === UNHEALTHY: No managers responding ===
         if alive_managers == 0:
             return DatacenterStatus(
                 dc_id=dc_id,
@@ -704,7 +706,7 @@ class GateServer(HealthAwareServer):
                 last_update=time.monotonic(),
             )
         
-        # No status update or no workers = UNHEALTHY
+        # === UNHEALTHY: No status update or no workers registered ===
         if not status or status.worker_count == 0:
             return DatacenterStatus(
                 dc_id=dc_id,
@@ -716,26 +718,42 @@ class GateServer(HealthAwareServer):
                 last_update=time.monotonic(),
             )
         
-        # Determine health based on capacity
-        if status.available_cores > 0:
-            health = DatacenterHealth.HEALTHY
-        elif status.worker_count > 0:
-            # Workers exist but no capacity = BUSY (not unhealthy!)
+        # Extract worker health info from status
+        # ManagerHeartbeat includes healthy_worker_count (workers responding to SWIM)
+        total_workers = status.worker_count
+        healthy_workers = getattr(status, 'healthy_worker_count', total_workers)
+        available_cores = status.available_cores
+        
+        # === Check for DEGRADED state ===
+        is_degraded = False
+        
+        # Majority of managers unhealthy?
+        manager_quorum = total_managers // 2 + 1
+        if total_managers > 0 and alive_managers < manager_quorum:
+            is_degraded = True
+        
+        # Majority of workers unhealthy?
+        worker_quorum = total_workers // 2 + 1
+        if total_workers > 0 and healthy_workers < worker_quorum:
+            is_degraded = True
+        
+        # === Determine final health state ===
+        if is_degraded:
+            health = DatacenterHealth.DEGRADED
+        elif available_cores == 0:
+            # Not degraded, but no capacity = BUSY (transient)
             health = DatacenterHealth.BUSY
         else:
-            health = DatacenterHealth.DEGRADED
-        
-        # Partial manager response = DEGRADED
-        if len(manager_udp_addrs) > 0 and alive_managers < len(manager_udp_addrs) // 2 + 1:
-            health = DatacenterHealth.DEGRADED
+            # Not degraded, has capacity = HEALTHY
+            health = DatacenterHealth.HEALTHY
         
         return DatacenterStatus(
             dc_id=dc_id,
             health=health.value,
-            available_capacity=status.available_cores,
+            available_capacity=available_cores,
             queue_depth=getattr(status, 'queue_depth', 0),
             manager_count=alive_managers,
-            worker_count=status.worker_count,
+            worker_count=healthy_workers,  # Report healthy workers, not total
             last_update=time.monotonic(),
         )
     

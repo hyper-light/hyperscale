@@ -135,9 +135,9 @@ async def run_test():
         # ==============================================================
         # STEP 3: Wait for manager cluster to stabilize
         # ==============================================================
-        print("[3/6] Waiting for manager cluster to stabilize (5s)...")
+        print("[3/6] Waiting for manager cluster to stabilize (15s)...")
         print("-" * 50)
-        await asyncio.sleep(5)
+        await asyncio.sleep(15)
         print("  Done.")
         print()
         

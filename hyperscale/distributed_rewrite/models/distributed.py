@@ -320,6 +320,17 @@ class ManagerHeartbeat(Message):
     Periodic heartbeat from manager to gates (if gates present).
     
     Contains datacenter-level job status summary.
+    
+    Datacenter Health Classification (evaluated in order):
+    1. DEGRADED: majority of workers unhealthy (healthy_worker_count < worker_count // 2 + 1)
+       OR majority of managers unhealthy (alive_managers < total_managers // 2 + 1)
+       (structural problem - reduced capacity, may need intervention)
+    2. BUSY: NOT degraded AND available_cores == 0
+       (transient - all cores occupied, jobs will be queued until capacity frees up)
+    3. HEALTHY: NOT degraded AND available_cores > 0
+       (normal operation - capacity available for new jobs)
+    4. UNHEALTHY: no managers responding OR no workers registered
+       (severe - cannot process jobs)
     """
     node_id: str                 # Manager identifier
     datacenter: str              # Datacenter identifier
@@ -328,8 +339,10 @@ class ManagerHeartbeat(Message):
     version: int                 # State version
     active_jobs: int             # Number of active jobs
     active_workflows: int        # Number of active workflows
-    worker_count: int            # Number of registered workers
-    available_cores: int         # Total available cores across workers
+    worker_count: int            # Number of registered workers (total)
+    healthy_worker_count: int    # Number of workers responding to SWIM probes
+    available_cores: int         # Total available cores across healthy workers
+    total_cores: int             # Total cores across all registered workers
     state: str = "active"        # ManagerState value (syncing/active/draining)
 
 
