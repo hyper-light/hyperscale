@@ -2417,7 +2417,7 @@ class ManagerServer(HealthAwareServer):
             return b'error'
     
     @tcp.receive()
-    async def receive_workflow_progress(
+    async def workflow_progress(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -2431,8 +2431,11 @@ class ManagerServer(HealthAwareServer):
         of a workflow, we can immediately consider those cores available
         for new workflows, without waiting for the entire workflow to complete.
         """
+        import sys
+        print(f"[DEBUG manager.workflow_progress] Received from {addr}", file=sys.stderr, flush=True)
         try:
             progress = WorkflowProgress.load(data)
+            print(f"[DEBUG manager.workflow_progress] job={progress.job_id}, wf={progress.workflow_id}, completed={progress.completed_count}, failed={progress.failed_count}", file=sys.stderr, flush=True)
             
             # Update job progress
             job = self._jobs.get(progress.job_id)

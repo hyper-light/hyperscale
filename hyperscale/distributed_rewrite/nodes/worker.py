@@ -1278,6 +1278,8 @@ class WorkerServer(HealthAwareServer):
         cancel_event: asyncio.Event,
     ) -> None:
         """Monitor workflow progress and send updates to manager."""
+        import sys
+        print(f"[DEBUG worker._monitor_workflow_progress] Starting for {dispatch.workflow_id}", file=sys.stderr, flush=True)
         start_time = time.monotonic()
         workflow_name = progress.workflow_name
         
@@ -1343,8 +1345,11 @@ class WorkerServer(HealthAwareServer):
                 
                 # Send update
                 if self._healthy_manager_ids:
+                    print(f"[DEBUG worker._monitor_workflow_progress] Sending progress: completed={progress.completed_count}, failed={progress.failed_count}", file=sys.stderr, flush=True)
                     await self._send_progress_update(progress)
                     self._workflow_last_progress[dispatch.workflow_id] = time.monotonic()
+                else:
+                    print(f"[DEBUG worker._monitor_workflow_progress] No healthy managers to send to", file=sys.stderr, flush=True)
                 
             except asyncio.CancelledError:
                 break
