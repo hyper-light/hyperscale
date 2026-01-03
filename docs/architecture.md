@@ -3761,6 +3761,2032 @@ Current test coverage: 254+ tests covering:
 
 ---
 
+## Manager Workflow Execution Architecture
+
+This section documents how Managers handle workflow execution, mirroring the `RemoteGraphManager` architecture for distributed execution.
+
+### Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     MANAGER WORKFLOW EXECUTION FLOW                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  JobSubmission                                                               │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 1. WORKFLOW CLASSIFICATION                                           │    │
+│  │    • Detect test workflows (have HookType.TEST hooks)               │    │
+│  │    • Build dependency graph (DependentWorkflow relationships)       │    │
+│  │    • Determine execution order (BFS traversal)                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 2. PRIORITY-BASED THREAD ALLOCATION                                  │    │
+│  │    • Calculate thread range from TOTAL pool (not available)         │    │
+│  │    • Use StagePriority.get_worker_allocation_range()                │    │
+│  │    • Provisioner.partion_by_priority() returns batches              │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 3. VU PROVISIONING                                                   │    │
+│  │    • vus_per_thread = workflow.vus / threads                        │    │
+│  │    • Distribute remainder to last thread                            │    │
+│  │    • Store workflow_vus: dict[workflow_name, list[int]]            │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 4. CAPACITY CHECK & WORKER SELECTION                                 │    │
+│  │    • Check if workers have enough AVAILABLE cores for threads      │    │
+│  │    • Select workers via crypto-random (avoid bias)                  │    │
+│  │    • If insufficient capacity → queue job (BUSY) or fail (DEGRADED)│    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 5. QUORUM CONFIRMATION & DISPATCH                                    │    │
+│  │    • Request quorum confirmation from peer managers                 │    │
+│  │    • On quorum: commit provisioning                                 │    │
+│  │    • Dispatch WorkflowDispatch to selected workers                  │    │
+│  │    • Include context for dependent workflows                        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 6. EXECUTION & CONTEXT SYNCHRONIZATION                               │    │
+│  │    • Workers execute workflows                                      │    │
+│  │    • Workers send WorkflowProgress with context updates             │    │
+│  │    • Manager syncs context updates to peers                         │    │
+│  │    • Dependent workflows receive context from predecessors          │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 1: Workflow Classification
+
+A workflow is classified as a **test workflow** if it has at least one hook with `HookType.TEST`.
+
+**Detection Logic** (from `RemoteGraphManager` lines 499-508):
+
+```python
+def _classify_workflow(self, workflow: Workflow) -> bool:
+    """Determine if workflow is a test workflow."""
+    hooks: dict[str, Hook] = {
+        name: hook
+        for name, hook in inspect.getmembers(
+            workflow,
+            predicate=lambda member: isinstance(member, Hook),
+        )
+    }
+    
+    is_test_workflow = len([
+        hook for hook in hooks.values()
+        if hook.hook_type == HookType.TEST
+    ]) > 0
+    
+    return is_test_workflow
+```
+
+**HookType.TEST Criteria** (from `hook.py` lines 161-172):
+
+A hook becomes `HookType.TEST` when:
+1. Method is decorated with `@step()` (is_test=True)
+2. AND return type is subclass of `CallResult` or `CustomResult` (e.g., `HTTPResponse`)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         WORKFLOW CLASSIFICATION                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ TEST WORKFLOW                                                          │ │
+│  │                                                                         │ │
+│  │  class LoadTestWorkflow(Workflow):                                     │ │
+│  │      @step()                                                            │ │
+│  │      async def get_users(self) -> HTTPResponse:  # ← HookType.TEST     │ │
+│  │          return await self.client.get('/users')                        │ │
+│  │                                                                         │ │
+│  │  Characteristics:                                                       │ │
+│  │  • Has @step() decorated methods with CallResult return types          │ │
+│  │  • Participates in thread allocation via StagePriority                 │ │
+│  │  • VUs are distributed across allocated threads                        │ │
+│  │  • Uses workflow.vus / threads for per-thread VU calculation          │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ NON-TEST WORKFLOW (Setup/Teardown/Utility)                             │ │
+│  │                                                                         │ │
+│  │  class SetupWorkflow(Workflow):                                        │ │
+│  │      @action()                                                          │ │
+│  │      async def setup_data(self) -> None:  # ← HookType.ACTION          │ │
+│  │          self.context['data'] = load_test_data()                       │ │
+│  │                                                                         │ │
+│  │  Characteristics:                                                       │ │
+│  │  • Only has @action(), @check(), or @metric() hooks                    │ │
+│  │  • Gets threads = 0 in provisioning (bypasses partition)              │ │
+│  │  • Runs on single thread                                               │ │
+│  │  • Primarily for context setup/teardown                                │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 2: Priority-Based Thread Allocation
+
+**Critical**: Thread allocation is calculated from the **TOTAL pool size** (all registered workers' cores), NOT available cores. This determines how many cores the workflow MAY request.
+
+**StagePriority Allocation Ranges**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    PRIORITY → THREAD ALLOCATION                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  TOTAL_POOL = sum(worker.total_cores for all registered workers)           │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Priority    │ Min Threads         │ Max Threads                    │    │
+│  │  ────────────┼─────────────────────┼────────────────────────────────│    │
+│  │  LOW         │ 1                   │ ceil(TOTAL_POOL × 0.25)       │    │
+│  │  NORMAL      │ ceil(TOTAL_POOL×0.25)│ ceil(TOTAL_POOL × 0.75)      │    │
+│  │  HIGH        │ ceil(TOTAL_POOL×0.75)│ TOTAL_POOL                   │    │
+│  │  EXCLUSIVE   │ TOTAL_POOL          │ TOTAL_POOL (100%)             │    │
+│  │  AUTO        │ 1                   │ TOTAL_POOL                    │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Example: TOTAL_POOL = 24 cores (3 workers × 8 cores each)                  │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Priority    │ Min Threads │ Max Threads                            │    │
+│  │  ────────────┼─────────────┼────────────────────────────────────────│    │
+│  │  LOW         │ 1           │ 6  (25% of 24)                         │    │
+│  │  NORMAL      │ 6           │ 18 (75% of 24)                         │    │
+│  │  HIGH        │ 18          │ 24 (100% of 24)                        │    │
+│  │  EXCLUSIVE   │ 24          │ 24 (takes all cores)                   │    │
+│  │  AUTO        │ 1           │ 24                                     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ⚠️  IMPORTANT: This is the ALLOCATION RANGE, not the final count.         │
+│      The Provisioner bins multiple workflows into batches that fit          │
+│      within TOTAL_POOL, distributing threads within these ranges.           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Provisioner.partion_by_priority() Algorithm**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    PROVISIONER PARTITIONING                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Input: List of workflow configs:                                           │
+│  [                                                                           │
+│    {"workflow_name": "LoadTest", "priority": HIGH, "is_test": True},        │
+│    {"workflow_name": "DataLoad", "priority": AUTO, "is_test": False},       │
+│    {"workflow_name": "Metrics",  "priority": LOW,  "is_test": True},        │
+│  ]                                                                           │
+│                                                                              │
+│  Algorithm:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 1. Sort by priority (HIGH first), then by is_test                   │    │
+│  │                                                                      │    │
+│  │ 2. Non-test workflows → bypass batch (threads = 0, run sequentially)│    │
+│  │                                                                      │    │
+│  │ 3. For test workflows:                                               │    │
+│  │    a. Calculate min/max threads from priority + TOTAL_POOL          │    │
+│  │    b. Group workflows into batches that fit within TOTAL_POOL       │    │
+│  │    c. Higher priority gets more threads within range                │    │
+│  │    d. Distribute remaining threads to higher priority workflows     │    │
+│  │                                                                      │    │
+│  │ 4. Return: List[List[Tuple[workflow_name, priority, threads]]]      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Output Example (TOTAL_POOL = 24):                                          │
+│  [                                                                           │
+│    [("DataLoad", AUTO, 0)],           # Non-test: bypass batch             │
+│    [("LoadTest", HIGH, 18),           # HIGH gets 18 threads               │
+│     ("Metrics", LOW, 6)],             # LOW gets remaining 6               │
+│  ]                                                                           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 3: VU Provisioning
+
+After thread allocation, VUs are distributed among the allocated threads.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         VU PROVISIONING                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Formula:                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  vus_per_thread = workflow.vus // threads                           │    │
+│  │  remainder_vus  = workflow.vus % threads                            │    │
+│  │                                                                      │    │
+│  │  # Each thread gets vus_per_thread                                  │    │
+│  │  # Last thread gets vus_per_thread + remainder_vus                  │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Example: workflow.vus = 2000, threads = 6                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  vus_per_thread = 2000 // 6 = 333                                   │    │
+│  │  remainder_vus  = 2000 % 6  = 2                                     │    │
+│  │                                                                      │    │
+│  │  workflow_vus = [333, 333, 333, 333, 333, 335]                      │    │
+│  │                  ↑    ↑    ↑    ↑    ↑    ↑                         │    │
+│  │                  T1   T2   T3   T4   T5   T6 (gets remainder)       │    │
+│  │                                                                      │    │
+│  │  Total: 333×5 + 335 = 1665 + 335 = 2000 ✓                          │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Result Structure:                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  workflow_vus: Dict[str, List[int]] = {                             │    │
+│  │      "LoadTest": [333, 333, 333, 333, 333, 335],  # 6 threads       │    │
+│  │      "Metrics":  [166, 167],                       # 2 threads       │    │
+│  │  }                                                                   │    │
+│  │                                                                      │    │
+│  │  Each list entry = VUs for that thread/worker                       │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 4: Dependency Graph & Execution Order
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     DEPENDENCY GRAPH CONSTRUCTION                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Input Workflows:                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Workflow("Setup")                                                   │    │
+│  │  Workflow("LoadTest")                                                │    │
+│  │  DependentWorkflow(                                                  │    │
+│  │      workflow=Workflow("Validate"),                                  │    │
+│  │      dependencies=["LoadTest"]                                       │    │
+│  │  )                                                                   │    │
+│  │  DependentWorkflow(                                                  │    │
+│  │      workflow=Workflow("Report"),                                    │    │
+│  │      dependencies=["Validate", "LoadTest"]                           │    │
+│  │  )                                                                   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Constructed Graph (networkx.DiGraph):                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │      Setup ─────────┐                                               │    │
+│  │                     │                                               │    │
+│  │      LoadTest ──────┼──────► Validate ──────► Report                │    │
+│  │            │        │              │              ▲                 │    │
+│  │            │        │              │              │                 │    │
+│  │            └────────┼──────────────┼──────────────┘                 │    │
+│  │                     │                                               │    │
+│  │  Sources: [Setup, LoadTest]                                         │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  BFS Traversal Order:                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Layer 0: {Setup, LoadTest}     # Run in parallel (no deps)         │    │
+│  │  Layer 1: {Validate}            # Waits for LoadTest                │    │
+│  │  Layer 2: {Report}              # Waits for Validate + LoadTest     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Execution:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Time ────────────────────────────────────────────────────────────► │    │
+│  │                                                                      │    │
+│  │  Layer 0:  [Setup]──────►                                           │    │
+│  │            [LoadTest]────────────►                                  │    │
+│  │                                                                      │    │
+│  │  Layer 1:                         [Validate]──────►                 │    │
+│  │                                   (receives LoadTest context)       │    │
+│  │                                                                      │    │
+│  │  Layer 2:                                          [Report]──────►  │    │
+│  │                                                    (receives both)  │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 5: Context Management
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        CONTEXT FLOW                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Context Structure:                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  class Context:                                                      │    │
+│  │      _context: Dict[str, WorkflowContext]                           │    │
+│  │      # workflow_name → {key: value, ...}                            │    │
+│  │                                                                      │    │
+│  │  class WorkflowContext:                                              │    │
+│  │      _values: Dict[str, Tuple[Any, int]]  # key → (value, timestamp)│    │
+│  │                                                                      │    │
+│  │  # Timestamps ensure LWW (Last-Write-Wins) for conflict resolution  │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Context Hooks (Using @context() decorator):                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  class LoadTestWorkflow(Workflow):                                  │    │
+│  │                                                                      │    │
+│  │      @context()                                                      │    │
+│  │      async def provide_results(self) -> Provide[Dict]:              │    │
+│  │          # StateAction.PROVIDE - writes to context                  │    │
+│  │          return {"total_requests": 10000, "success_rate": 0.99}     │    │
+│  │                                                                      │    │
+│  │  class ValidateWorkflow(Workflow):                                  │    │
+│  │                                                                      │    │
+│  │      @context(workflows=["LoadTestWorkflow"])                       │    │
+│  │      async def use_results(self, *, data: Dict) -> Use[bool]:       │    │
+│  │          # StateAction.USE - reads from specified workflow context  │    │
+│  │          return data["success_rate"] > 0.95                         │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Flow:                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  Worker 1                Manager                Worker 2             │    │
+│  │     │                       │                      │                 │    │
+│  │     │ Run LoadTest          │                      │                 │    │
+│  │     │                       │                      │                 │    │
+│  │     │ ① Workflow completes  │                      │                 │    │
+│  │     │    context updated    │                      │                 │    │
+│  │     │                       │                      │                 │    │
+│  │     │ ② WorkflowProgress    │                      │                 │    │
+│  │     │   + context_updates   │                      │                 │    │
+│  │     │──────────────────────►│                      │                 │    │
+│  │     │                       │                      │                 │    │
+│  │     │                       │ ③ Store context      │                 │    │
+│  │     │                       │    Sync to peers     │                 │    │
+│  │     │                       │────────────────────► │                 │    │
+│  │     │                       │    (ContextUpdate)   │                 │    │
+│  │     │                       │                      │                 │    │
+│  │     │                       │ ④ Dispatch Validate  │                 │    │
+│  │     │                       │    + LoadTest context│                 │    │
+│  │     │                       │─────────────────────►│                 │    │
+│  │     │                       │                      │                 │    │
+│  │     │                       │                      │ ⑤ Validate runs │    │
+│  │     │                       │                      │    uses context │    │
+│  │     │                       │                      │                 │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Manager State for Workflow Execution
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    MANAGER WORKFLOW EXECUTION STATE                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  class ManagerServer:                                                        │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ # Core tracking                                                      │    │
+│  │ _jobs: Dict[str, JobProgress]                                       │    │
+│  │   # job_id → aggregated progress                                    │    │
+│  │                                                                      │    │
+│  │ _workflow_assignments: Dict[str, str]                               │    │
+│  │   # workflow_id → worker_node_id                                    │    │
+│  │                                                                      │    │
+│  │ _workflow_retries: Dict[str, Tuple[int, bytes, set[str]]]          │    │
+│  │   # workflow_id → (retry_count, original_dispatch, failed_workers)  │    │
+│  │   # NOTE: Only for WORKER FAILURE (SWIM dead), NOT workflow errors  │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ # NEW: Provisioning state                                            │    │
+│  │                                                                      │    │
+│  │ _provisioner: Provisioner                                           │    │
+│  │   # Thread allocation calculator (uses TOTAL pool)                  │    │
+│  │                                                                      │    │
+│  │ _total_pool_size: int                                               │    │
+│  │   # Sum of total_cores from all registered workers (cached)        │    │
+│  │   # Updated on worker registration/death                            │    │
+│  │                                                                      │    │
+│  │ _job_workflow_configs: Dict[str, Dict[str, WorkflowConfig]]        │    │
+│  │   # job_id → {workflow_name: config}                                │    │
+│  │   # Config: {priority, is_test, threads, vus_per_thread}           │    │
+│  │                                                                      │    │
+│  │ _job_dependency_graphs: Dict[str, List[Dict[str, Workflow]]]       │    │
+│  │   # job_id → execution layers (BFS traversal order)                 │    │
+│  │                                                                      │    │
+│  │ _job_current_layer: Dict[str, int]                                  │    │
+│  │   # job_id → current executing layer index                          │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ # NEW: Context state                                                 │    │
+│  │                                                                      │    │
+│  │ _job_contexts: Dict[str, Context]                                   │    │
+│  │   # job_id → Context object (shared across workflows in job)       │    │
+│  │                                                                      │    │
+│  │ _context_clock: Dict[str, Dict[str, int]]                           │    │
+│  │   # job_id → {workflow_name: lamport_timestamp}                     │    │
+│  │   # For conflict resolution in context updates                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete Job Execution State Machine
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    JOB EXECUTION STATE MACHINE (Manager)                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│                           ┌──────────────────┐                               │
+│                           │    SUBMITTED     │                               │
+│                           │                  │                               │
+│                           │ • Receive job    │                               │
+│                           │ • Parse workflows│                               │
+│                           └────────┬─────────┘                               │
+│                                    │                                         │
+│                         classify & provision                                 │
+│                                    │                                         │
+│                                    ▼                                         │
+│                           ┌──────────────────┐                               │
+│                           │   CLASSIFYING    │                               │
+│                           │                  │                               │
+│                           │ • Detect is_test │                               │
+│                           │ • Build dep graph│                               │
+│                           │ • BFS traversal  │                               │
+│                           └────────┬─────────┘                               │
+│                                    │                                         │
+│                                    ▼                                         │
+│                           ┌──────────────────┐                               │
+│                           │   PROVISIONING   │                               │
+│                           │                  │                               │
+│                           │ • Calc threads   │                               │
+│                           │   from TOTAL pool│                               │
+│                           │ • Calc VUs/thread│                               │
+│                           └────────┬─────────┘                               │
+│                                    │                                         │
+│                   ┌────────────────┼────────────────┐                        │
+│                   │                │                │                        │
+│                   ▼                ▼                ▼                        │
+│          ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
+│          │   QUEUED     │  │  DISPATCHING │  │   FAILED     │               │
+│          │              │  │              │  │              │               │
+│          │ Insufficient │  │ Capacity OK  │  │ No workers   │               │
+│          │ capacity     │  │ • Quorum req │  │ available    │               │
+│          └──────┬───────┘  │ • Dispatch   │  └──────────────┘               │
+│                 │          └──────┬───────┘                                  │
+│                 │                 │                                          │
+│        capacity available         │                                          │
+│                 │                 ▼                                          │
+│                 └────────► ┌──────────────────┐                              │
+│                            │     RUNNING      │                              │
+│                            │                  │                              │
+│                            │ • Per-layer exec │                              │
+│                            │ • Context sync   │                              │
+│                            │ • Progress track │                              │
+│                            └────────┬─────────┘                              │
+│                                     │                                        │
+│                   ┌─────────────────┼─────────────────┐                      │
+│                   │                 │                 │                      │
+│                   ▼                 ▼                 ▼                      │
+│          ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
+│          │  COMPLETING  │  │   FAILED     │  │  CANCELLED   │               │
+│          │              │  │              │  │              │               │
+│          │ All layers   │  │ Workflow     │  │ User cancel  │               │
+│          │ complete     │  │ error        │  │              │               │
+│          └──────┬───────┘  └──────────────┘  └──────────────┘               │
+│                 │                                                            │
+│                 ▼                                                            │
+│          ┌──────────────┐                                                    │
+│          │  COMPLETED   │                                                    │
+│          │              │                                                    │
+│          │ Success!     │                                                    │
+│          │ Results ready│                                                    │
+│          └──────────────┘                                                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Layer-Based Execution Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    LAYER-BASED EXECUTION FLOW                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Manager executes dependency layers sequentially, workflows within          │
+│  each layer in parallel:                                                     │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  async def _execute_job(self, job_id: str):                         │    │
+│  │      layers = self._job_dependency_graphs[job_id]                   │    │
+│  │      context = self._job_contexts[job_id]                           │    │
+│  │                                                                      │    │
+│  │      for layer_idx, layer_workflows in enumerate(layers):           │    │
+│  │          self._job_current_layer[job_id] = layer_idx                │    │
+│  │                                                                      │    │
+│  │          # Dispatch all workflows in layer (parallel)               │    │
+│  │          dispatch_tasks = []                                         │    │
+│  │          for workflow_name, workflow in layer_workflows.items():    │    │
+│  │              # Get predecessor context for dependent workflows      │    │
+│  │              dep_context = self._get_dependency_context(            │    │
+│  │                  job_id, workflow                                    │    │
+│  │              )                                                       │    │
+│  │                                                                      │    │
+│  │              # Dispatch with VUs from provisioning                  │    │
+│  │              config = self._job_workflow_configs[job_id][name]     │    │
+│  │              dispatch_tasks.append(                                  │    │
+│  │                  self._dispatch_workflow(                            │    │
+│  │                      job_id, workflow, config, dep_context          │    │
+│  │                  )                                                   │    │
+│  │              )                                                       │    │
+│  │                                                                      │    │
+│  │          # Wait for all workflows in layer to complete              │    │
+│  │          await asyncio.gather(*dispatch_tasks)                      │    │
+│  │                                                                      │    │
+│  │          # Sync context updates from completed workflows            │    │
+│  │          await self._sync_layer_context(job_id, layer_idx)          │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Example Timeline (3 workers, 24 cores total):                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Time ────────────────────────────────────────────────────────────► │    │
+│  │                                                                      │    │
+│  │  Layer 0:                                                            │    │
+│  │  ┌────────────────────────────────────────────────────┐              │    │
+│  │  │ Setup (1 thread, non-test) ─────►                  │              │    │
+│  │  │ LoadTest (18 threads, HIGH, 333 VUs/thread) ──────────────►│     │    │
+│  │  │ Analytics (6 threads, LOW, 166 VUs/thread) ───────────────►│     │    │
+│  │  └────────────────────────────────────────────────────┘              │    │
+│  │                                     ↓ context synced                 │    │
+│  │  Layer 1:                                                            │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐   │    │
+│  │  │ Validate (6 threads, receives LoadTest context) ──────►      │   │    │
+│  │  └──────────────────────────────────────────────────────────────┘   │    │
+│  │                                     ↓ context synced                 │    │
+│  │  Layer 2:                                                            │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐   │    │
+│  │  │ Report (1 thread, receives all context) ─────►               │   │    │
+│  │  └──────────────────────────────────────────────────────────────┘   │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cross-Manager Context Synchronization
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CROSS-MANAGER CONTEXT SYNC                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  When a workflow completes, its context updates must be synchronized        │
+│  to peer managers for fault tolerance:                                       │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  ContextUpdate (new message type):                                  │    │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │    │
+│  │  │  job_id: str                                                    │ │    │
+│  │  │  workflow_name: str                                             │ │    │
+│  │  │  context_values: Dict[str, Tuple[Any, int]]  # key→(val, ts)  │ │    │
+│  │  │  source_manager: str                                            │ │    │
+│  │  │  lamport_clock: int                                             │ │    │
+│  │  └────────────────────────────────────────────────────────────────┘ │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Sync Flow:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  Manager 1 (Leader)        Manager 2            Manager 3           │    │
+│  │       │                        │                    │               │    │
+│  │       │ Workflow completes     │                    │               │    │
+│  │       │ with context update    │                    │               │    │
+│  │       │                        │                    │               │    │
+│  │       │ ① Update local context │                    │               │    │
+│  │       │    with timestamp      │                    │               │    │
+│  │       │                        │                    │               │    │
+│  │       │ ② ContextUpdate        │                    │               │    │
+│  │       │───────────────────────►│                    │               │    │
+│  │       │                        │                    │               │    │
+│  │       │ ② ContextUpdate        │                    │               │    │
+│  │       │────────────────────────────────────────────►│               │    │
+│  │       │                        │                    │               │    │
+│  │       │                        │ ③ Apply if ts >    │               │    │
+│  │       │                        │    current ts      │               │    │
+│  │       │                        │                    │ ③ Apply if    │    │
+│  │       │                        │                    │    ts > curr  │    │
+│  │       │                        │                    │               │    │
+│  │                                                                      │    │
+│  │  Conflict Resolution: Last-Write-Wins (LWW) using Lamport timestamps│    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Handler in Manager:                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  @tcp.receive()                                                      │    │
+│  │  async def context_update(self, addr, data, clock_time):            │    │
+│  │      update = ContextUpdate.load(data)                              │    │
+│  │                                                                      │    │
+│  │      # Only apply if newer than our current context                 │    │
+│  │      current_ts = self._context_clock.get(                          │    │
+│  │          update.job_id, {}                                          │    │
+│  │      ).get(update.workflow_name, 0)                                 │    │
+│  │                                                                      │    │
+│  │      if update.lamport_clock > current_ts:                          │    │
+│  │          context = self._job_contexts[update.job_id]                │    │
+│  │          for key, (value, ts) in update.context_values.items():     │    │
+│  │              await context.update(                                   │    │
+│  │                  update.workflow_name, key, value, timestamp=ts     │    │
+│  │              )                                                       │    │
+│  │          self._context_clock[update.job_id][update.workflow_name] = │    │
+│  │              update.lamport_clock                                    │    │
+│  │                                                                      │    │
+│  │      return b'ok'                                                    │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Implementation Order
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    IMPLEMENTATION ORDER                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Phase 1: Workflow Classification & Provisioning                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 1.1 Add _classify_workflow() method to detect test workflows        │    │
+│  │     • Inspect hooks for HookType.TEST                               │    │
+│  │     • Return bool indicating is_test                                │    │
+│  │                                                                      │    │
+│  │ 1.2 Add _calculate_total_pool_size() method                         │    │
+│  │     • Sum total_cores from all registered workers                   │    │
+│  │     • Cache in _total_pool_size, update on worker changes           │    │
+│  │                                                                      │    │
+│  │ 1.3 Add _provision_workflows() method                               │    │
+│  │     • Create configs with is_test, priority                         │    │
+│  │     • Call Provisioner.partion_by_priority(configs)                 │    │
+│  │     • Calculate VUs per thread for each workflow                    │    │
+│  │     • Store in _job_workflow_configs                                │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Phase 2: Dependency Graph & Execution Order                                │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 2.1 Add _build_dependency_graph() method                            │    │
+│  │     • Parse DependentWorkflow relationships                         │    │
+│  │     • Build networkx.DiGraph                                        │    │
+│  │     • BFS traversal to get execution layers                         │    │
+│  │     • Store in _job_dependency_graphs                               │    │
+│  │                                                                      │    │
+│  │ 2.2 Update job_submission handler                                   │    │
+│  │     • Classify workflows                                            │    │
+│  │     • Build dependency graph                                        │    │
+│  │     • Provision threads and VUs                                     │    │
+│  │     • Check capacity before accepting                               │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Phase 3: Context Management                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 3.1 Add ContextUpdate message type                                  │    │
+│  │     • job_id, workflow_name, context_values, lamport_clock          │    │
+│  │                                                                      │    │
+│  │ 3.2 Add context_update handler                                      │    │
+│  │     • Receive from peer managers                                    │    │
+│  │     • Apply with LWW conflict resolution                            │    │
+│  │                                                                      │    │
+│  │ 3.3 Update workflow_progress handler                                │    │
+│  │     • Extract context updates from WorkflowProgress                 │    │
+│  │     • Store in _job_contexts                                        │    │
+│  │     • Broadcast to peer managers                                    │    │
+│  │                                                                      │    │
+│  │ 3.4 Update WorkflowDispatch to include dep context                  │    │
+│  │     • Serialize relevant context for dependent workflows            │    │
+│  │     • Worker deserializes and uses in execution                     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Phase 4: Layer-Based Execution                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 4.1 Add _execute_job_layer() method                                 │    │
+│  │     • Dispatch all workflows in current layer                       │    │
+│  │     • Wait for layer completion                                     │    │
+│  │     • Sync context before next layer                                │    │
+│  │                                                                      │    │
+│  │ 4.2 Add _advance_to_next_layer() method                             │    │
+│  │     • Check all layer workflows complete                            │    │
+│  │     • Increment _job_current_layer                                  │    │
+│  │     • Dispatch next layer if exists                                 │    │
+│  │                                                                      │    │
+│  │ 4.3 Update workflow completion handling                             │    │
+│  │     • Track per-layer completion                                    │    │
+│  │     • Trigger next layer when current completes                     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Phase 5: Worker Integration                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │ 5.1 Update WorkflowDispatch message                                 │    │
+│  │     • Add dependency_context field (serialized Context)            │    │
+│  │     • Add vus_per_thread field (calculated VUs)                    │    │
+│  │                                                                      │    │
+│  │ 5.2 Update WorkflowProgress message                                 │    │
+│  │     • Add context_updates field (for Provide hooks)                │    │
+│  │     • Include Lamport timestamps                                    │    │
+│  │                                                                      │    │
+│  │ 5.3 Worker uses context in execution                                │    │
+│  │     • Deserialize dependency context                                │    │
+│  │     • Make available to Use hooks                                   │    │
+│  │     • Serialize Provide hook results                                │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Final Results Flow
+
+This section documents how workflow results, context, and errors flow back through the system after execution completes.
+
+### Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      FINAL RESULTS FLOW OVERVIEW                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Worker                  Manager                  Gate                Client │
+│    │                        │                       │                    │   │
+│    │ Execute workflow       │                       │                    │   │
+│    │                        │                       │                    │   │
+│    │ ① WorkflowFinalResult  │                       │                    │   │
+│    │   (results, context,   │                       │                    │   │
+│    │    error)              │                       │                    │   │
+│    │───────────────────────►│                       │                    │   │
+│    │                        │                       │                    │   │
+│    │                        │ Store context         │                    │   │
+│    │                        │ Sync to peers         │                    │   │
+│    │                        │ Advance layers        │                    │   │
+│    │                        │                       │                    │   │
+│    │                        │ ② JobFinalResult      │                    │   │
+│    │                        │   (per-DC results)    │                    │   │
+│    │                        │──────────────────────►│                    │   │
+│    │                        │                       │                    │   │
+│    │                        │       OR (no gates)   │                    │   │
+│    │                        │───────────────────────────────────────────►│   │
+│    │                        │                       │                    │   │
+│    │                        │                       │ ③ GlobalJobResult  │   │
+│    │                        │                       │   (aggregated +    │   │
+│    │                        │                       │    per-DC results) │   │
+│    │                        │                       │───────────────────►│   │
+│    │                        │                       │                    │   │
+│                                                                              │
+│  Key Principle: Workflow is NOT complete until final result is received     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Message Types
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      FINAL RESULT MESSAGE TYPES                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ WorkflowFinalResult (Worker → Manager)                                 │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  @dataclass                                                             │ │
+│  │  class WorkflowFinalResult(Message):                                   │ │
+│  │      job_id: str                                                        │ │
+│  │      workflow_id: str                                                   │ │
+│  │      status: str              # COMPLETED | FAILED                      │ │
+│  │      results: bytes           # Cloudpickled WorkflowStats             │ │
+│  │      context_updates: bytes   # Cloudpickled context dict              │ │
+│  │      error: str | None = None # Error message (no traceback)           │ │
+│  │                                                                         │ │
+│  │  Note: WorkflowStats already contains:                                 │ │
+│  │    • run_id: int              # Execution instance ID                  │ │
+│  │    • elapsed: float           # Execution time                         │ │
+│  │    • results: List[ResultSet] # Per-step results with stats           │ │
+│  │    • metrics: List[MetricsSet]                                         │ │
+│  │    • checks: List[CheckSet]                                            │ │
+│  │    • aps: float               # Actions per second                     │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ JobFinalResult (Manager → Gate OR Client)                              │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  @dataclass                                                             │ │
+│  │  class JobFinalResult(Message):                                        │ │
+│  │      job_id: str                                                        │ │
+│  │      datacenter: str                                                    │ │
+│  │      status: str              # COMPLETED | FAILED | PARTIAL           │ │
+│  │      workflow_results: list[WorkflowResult]  # Per-workflow results    │ │
+│  │      total_completed: int     # Total successful actions               │ │
+│  │      total_failed: int        # Total failed actions                   │ │
+│  │      errors: list[str]        # All error messages                     │ │
+│  │      elapsed_seconds: float   # Max elapsed across workflows           │ │
+│  │                                                                         │ │
+│  │  @dataclass                                                             │ │
+│  │  class WorkflowResult(Message):                                        │ │
+│  │      workflow_id: str                                                   │ │
+│  │      workflow_name: str                                                 │ │
+│  │      status: str              # COMPLETED | FAILED                      │ │
+│  │      results: bytes           # Cloudpickled WorkflowStats             │ │
+│  │      error: str | None                                                  │ │
+│  │                                                                         │ │
+│  │  Note: Context is NOT included - gates don't need it                   │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GlobalJobResult (Gate → Client)                                        │ │
+│  ├────────────────────────────────────────────────────────────────────────┤ │
+│  │                                                                         │ │
+│  │  @dataclass                                                             │ │
+│  │  class GlobalJobResult(Message):                                       │ │
+│  │      job_id: str                                                        │ │
+│  │      status: str              # COMPLETED | FAILED | PARTIAL           │ │
+│  │                                                                         │ │
+│  │      # Per-datacenter breakdown                                         │ │
+│  │      per_datacenter_results: list[JobFinalResult]                      │ │
+│  │                                                                         │ │
+│  │      # Cross-DC aggregated stats                                        │ │
+│  │      aggregated: AggregatedJobStats                                    │ │
+│  │                                                                         │ │
+│  │      # Summary                                                          │ │
+│  │      total_completed: int     # Sum across all DCs                     │ │
+│  │      total_failed: int        # Sum across all DCs                     │ │
+│  │      successful_datacenters: int                                        │ │
+│  │      failed_datacenters: int                                            │ │
+│  │      errors: list[str]        # All errors from all DCs                │ │
+│  │      elapsed_seconds: float   # Max elapsed across all DCs             │ │
+│  │                                                                         │ │
+│  │  @dataclass                                                             │ │
+│  │  class AggregatedJobStats(Message):                                    │ │
+│  │      total_requests: int                                                │ │
+│  │      successful_requests: int                                           │ │
+│  │      failed_requests: int                                               │ │
+│  │      overall_rate: float      # Combined rate (requests/sec)           │ │
+│  │      avg_latency_ms: float                                              │ │
+│  │      p50_latency_ms: float                                              │ │
+│  │      p95_latency_ms: float                                              │ │
+│  │      p99_latency_ms: float                                              │ │
+│  │                                                                         │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 1: Worker Sends Final Result
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    WORKER FINAL RESULT FLOW                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Workflow execution completes:                                               │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  (results_run_id, results, context, error, status) =                │    │
+│  │      await self._remote_manger.execute_workflow(...)                │    │
+│  │                                                                      │    │
+│  │  # results: WorkflowStats (has run_id, elapsed, step stats, etc.)  │    │
+│  │  # context: Context (updated by Provide hooks)                      │    │
+│  │  # error: Exception | None                                          │    │
+│  │  # status: CoreWorkflowStatus                                       │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Worker sends final result:                                                  │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  final_result = WorkflowFinalResult(                                │    │
+│  │      job_id=dispatch.job_id,                                        │    │
+│  │      workflow_id=dispatch.workflow_id,                              │    │
+│  │      status=WorkflowStatus.COMPLETED.value if not error             │    │
+│  │             else WorkflowStatus.FAILED.value,                       │    │
+│  │      results=cloudpickle.dumps(results),  # WorkflowStats           │    │
+│  │      context_updates=cloudpickle.dumps(                             │    │
+│  │          context.dict() if context else {}                          │    │
+│  │      ),                                                              │    │
+│  │      error=str(error) if error else None,                           │    │
+│  │  )                                                                   │    │
+│  │                                                                      │    │
+│  │  await self._send_final_result(final_result)                        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Core freeing (always in finally block):                                    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  finally:                                                            │    │
+│  │      self._free_cores(dispatch.workflow_id)  # ← ALWAYS called      │    │
+│  │      self._increment_version()                                       │    │
+│  │      # ... cleanup tracking dicts                                    │    │
+│  │                                                                      │    │
+│  │  Cores freed on:                                                     │    │
+│  │    ✓ COMPLETED (success)                                            │    │
+│  │    ✓ FAILED (error)                                                 │    │
+│  │    ✓ CANCELLED (user cancel)                                        │    │
+│  │    ✓ Any exception                                                  │    │
+│  │                                                                      │    │
+│  │  Note: Cores freed AFTER sending final result but REGARDLESS of     │    │
+│  │        whether send succeeded. This prevents core leaks.            │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 2: Manager Processes Final Result
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    MANAGER FINAL RESULT PROCESSING                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  @tcp.receive()                                                      │    │
+│  │  async def workflow_final_result(self, addr, data, clock_time):     │    │
+│  │      result = WorkflowFinalResult.load(data)                        │    │
+│  │                                                                      │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      # 1. Handle error case (NO RETRY - just mark as failed)       │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      if result.error:                                                │    │
+│  │          # Mark workflow as FAILED immediately - no retry           │    │
+│  │          self._workflow_final_results[result.workflow_id] = result  │    │
+│  │          if self._is_job_complete(result.job_id):                   │    │
+│  │              await self._send_job_final_result(result.job_id)       │    │
+│  │          return                                                      │    │
+│  │                                                                      │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      # 2. Store context for dependent workflows                     │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      context_updates = cloudpickle.loads(result.context_updates)    │    │
+│  │      job_context = self._job_contexts[result.job_id]                │    │
+│  │      workflow_name = self._get_workflow_name(result.workflow_id)    │    │
+│  │                                                                      │    │
+│  │      for key, value in context_updates.items():                     │    │
+│  │          await job_context.update(workflow_name, key, value)        │    │
+│  │                                                                      │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      # 3. Sync context to peer managers                             │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      await self._broadcast_context_update(                          │    │
+│  │          result.job_id, workflow_name, context_updates              │    │
+│  │      )                                                               │    │
+│  │                                                                      │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      # 4. Store final result                                        │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      self._workflow_final_results[result.workflow_id] = result      │    │
+│  │                                                                      │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      # 5. Check layer completion → advance                          │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      if self._is_layer_complete(result.job_id):                     │    │
+│  │          await self._advance_to_next_layer(result.job_id)           │    │
+│  │                                                                      │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      # 6. Check job completion → send final result                  │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      if self._is_job_complete(result.job_id):                       │    │
+│  │          await self._send_job_final_result(result.job_id)           │    │
+│  │                                                                      │    │
+│  │      return b'ok'                                                    │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Key Principle:                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  Workflow is NOT complete until:                                    │    │
+│  │    1. Worker sends WorkflowFinalResult                              │    │
+│  │    2. Manager receives and processes it                             │    │
+│  │    3. Manager stores in _workflow_final_results                     │    │
+│  │                                                                      │    │
+│  │  Progress updates (WorkflowProgress) are for monitoring only.       │    │
+│  │  Final result is required for job completion.                       │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 3: Manager Sends Job Result
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    MANAGER SENDS JOB FINAL RESULT                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  When all workflows in a job complete (or fail):                            │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  async def _send_job_final_result(self, job_id: str):               │    │
+│  │      # Gather all workflow results                                   │    │
+│  │      workflow_results = []                                           │    │
+│  │      total_completed = 0                                             │    │
+│  │      total_failed = 0                                                │    │
+│  │      errors = []                                                     │    │
+│  │      max_elapsed = 0.0                                               │    │
+│  │                                                                      │    │
+│  │      for wf_id, wf_result in self._workflow_final_results.items():  │    │
+│  │          if wf_result.job_id != job_id:                             │    │
+│  │              continue                                                │    │
+│  │                                                                      │    │
+│  │          stats = cloudpickle.loads(wf_result.results)               │    │
+│  │          workflow_results.append(WorkflowResult(                    │    │
+│  │              workflow_id=wf_id,                                      │    │
+│  │              workflow_name=stats.get("workflow", ""),               │    │
+│  │              status=wf_result.status,                                │    │
+│  │              results=wf_result.results,  # Keep pickled             │    │
+│  │              error=wf_result.error,                                  │    │
+│  │          ))                                                          │    │
+│  │                                                                      │    │
+│  │          total_completed += stats.get("stats", {}).get("succeeded")│    │
+│  │          total_failed += stats.get("stats", {}).get("failed", 0)   │    │
+│  │          max_elapsed = max(max_elapsed, stats.get("elapsed", 0))   │    │
+│  │          if wf_result.error:                                         │    │
+│  │              errors.append(wf_result.error)                          │    │
+│  │                                                                      │    │
+│  │      # Determine job status                                          │    │
+│  │      if all(r.status == "completed" for r in workflow_results):    │    │
+│  │          status = "completed"                                        │    │
+│  │      elif all(r.status == "failed" for r in workflow_results):     │    │
+│  │          status = "failed"                                           │    │
+│  │      else:                                                           │    │
+│  │          status = "partial"                                          │    │
+│  │                                                                      │    │
+│  │      job_result = JobFinalResult(                                   │    │
+│  │          job_id=job_id,                                              │    │
+│  │          datacenter=self._dc_id,                                     │    │
+│  │          status=status,                                              │    │
+│  │          workflow_results=workflow_results,                          │    │
+│  │          total_completed=total_completed,                            │    │
+│  │          total_failed=total_failed,                                  │    │
+│  │          errors=errors,                                              │    │
+│  │          elapsed_seconds=max_elapsed,                                │    │
+│  │      )                                                               │    │
+│  │                                                                      │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      # Send to Gate OR Client                                       │    │
+│  │      # ─────────────────────────────────────────────────────────    │    │
+│  │      if self._known_gates:                                           │    │
+│  │          await self._send_to_primary_gate(job_result)               │    │
+│  │      else:                                                           │    │
+│  │          # Direct client mode                                        │    │
+│  │          callback = self._job_callbacks.get(job_id)                 │    │
+│  │          if callback:                                                │    │
+│  │              await self._send_to_client(callback, job_result)       │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Note: Context is NOT included in JobFinalResult                            │
+│  Gates do not need context - it's internal to manager execution             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Step 4: Gate Aggregates and Sends to Client
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    GATE CROSS-DC AGGREGATION                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Gate receives JobFinalResult from each datacenter:                         │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  @tcp.receive()                                                      │    │
+│  │  async def job_final_result(self, addr, data, clock_time):          │    │
+│  │      result = JobFinalResult.load(data)                             │    │
+│  │                                                                      │    │
+│  │      # Store per-DC result                                          │    │
+│  │      self._dc_final_results[result.job_id][result.datacenter] = result│   │
+│  │                                                                      │    │
+│  │      # Check if all DCs complete                                    │    │
+│  │      if self._all_datacenters_complete(result.job_id):              │    │
+│  │          await self._send_global_result_to_client(result.job_id)    │    │
+│  │                                                                      │    │
+│  │      return b'ok'                                                    │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Aggregation logic:                                                          │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  async def _send_global_result_to_client(self, job_id: str):        │    │
+│  │      dc_results = self._dc_final_results[job_id]                    │    │
+│  │                                                                      │    │
+│  │      # Aggregate stats across DCs                                   │    │
+│  │      total_completed = sum(r.total_completed for r in dc_results)   │    │
+│  │      total_failed = sum(r.total_failed for r in dc_results)         │    │
+│  │      all_errors = [e for r in dc_results for e in r.errors]        │    │
+│  │      max_elapsed = max(r.elapsed_seconds for r in dc_results)       │    │
+│  │                                                                      │    │
+│  │      successful_dcs = sum(1 for r in dc_results if r.status == "completed")│
+│  │      failed_dcs = sum(1 for r in dc_results if r.status == "failed")│    │
+│  │                                                                      │    │
+│  │      # Determine global status                                       │    │
+│  │      if failed_dcs == len(dc_results):                              │    │
+│  │          status = "failed"                                           │    │
+│  │      elif successful_dcs == len(dc_results):                        │    │
+│  │          status = "completed"                                        │    │
+│  │      else:                                                           │    │
+│  │          status = "partial"                                          │    │
+│  │                                                                      │    │
+│  │      # Build aggregated stats                                        │    │
+│  │      aggregated = self._compute_aggregated_stats(dc_results)        │    │
+│  │                                                                      │    │
+│  │      global_result = GlobalJobResult(                               │    │
+│  │          job_id=job_id,                                              │    │
+│  │          status=status,                                              │    │
+│  │          per_datacenter_results=list(dc_results.values()),          │    │
+│  │          aggregated=aggregated,                                      │    │
+│  │          total_completed=total_completed,                            │    │
+│  │          total_failed=total_failed,                                  │    │
+│  │          successful_datacenters=successful_dcs,                      │    │
+│  │          failed_datacenters=failed_dcs,                              │    │
+│  │          errors=all_errors,                                          │    │
+│  │          elapsed_seconds=max_elapsed,                                │    │
+│  │      )                                                               │    │
+│  │                                                                      │    │
+│  │      callback = self._job_callbacks.get(job_id)                     │    │
+│  │      if callback:                                                    │    │
+│  │          await self._send_to_client(callback, global_result)        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Client receives:                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  GlobalJobResult:                                                    │    │
+│  │  ├── status: "completed" | "failed" | "partial"                     │    │
+│  │  ├── per_datacenter_results: [                                      │    │
+│  │  │     JobFinalResult(datacenter="us-east-1", ...),                 │    │
+│  │  │     JobFinalResult(datacenter="eu-west-1", ...),                 │    │
+│  │  │   ]                                                               │    │
+│  │  ├── aggregated: AggregatedJobStats(                                │    │
+│  │  │     total_requests=50000,                                        │    │
+│  │  │     successful_requests=49500,                                   │    │
+│  │  │     overall_rate=5000.0,  # Combined across DCs                 │    │
+│  │  │     avg_latency_ms=45.2,                                         │    │
+│  │  │     p99_latency_ms=210.5,                                        │    │
+│  │  │   )                                                               │    │
+│  │  ├── errors: ["Workflow X failed: connection timeout", ...]        │    │
+│  │  └── elapsed_seconds: 10.5                                          │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Error Handling Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         ERROR HANDLING FLOW                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  Worker: Workflow fails with error                                  │    │
+│  │           │                                                          │    │
+│  │           ▼                                                          │    │
+│  │  WorkflowFinalResult(status="failed", error="...", results=...)    │    │
+│  │           │                                                          │    │
+│  │           ▼                                                          │    │
+│  │  ─────────────────────────────────────────────────────────────────  │    │
+│  │                                                                      │    │
+│  │  Manager: Receives error result                                     │    │
+│  │           │                                                          │    │
+│  │           │  NO RETRY on workflow errors:                           │    │
+│  │           │                                                          │    │
+│  │           ├─► Mark workflow as FAILED immediately                   │    │
+│  │           ├─► Store error in _workflow_final_results                │    │
+│  │           └─► Check job completion                                  │    │
+│  │               │                                                      │    │
+│  │               ▼                                                      │    │
+│  │  ─────────────────────────────────────────────────────────────────  │    │
+│  │                                                                      │    │
+│  │  Job complete with errors:                                          │    │
+│  │           │                                                          │    │
+│  │           ├───► Gates present?                                      │    │
+│  │           │         │                                                │    │
+│  │           │    YES: │                                                │    │
+│  │           │         └─► Send JobFinalResult(status="failed"|"partial")│   │
+│  │           │                to Gate                                   │    │
+│  │           │                   │                                      │    │
+│  │           │                   ▼                                      │    │
+│  │           │             Gate aggregates, sends GlobalJobResult      │    │
+│  │           │             to Client with error details                │    │
+│  │           │                                                          │    │
+│  │           │    NO (direct client mode):                             │    │
+│  │           │         └─► Send JobFinalResult(status="failed"|"partial")│   │
+│  │           │                directly to Client                       │    │
+│  │           │                                                          │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Status Definitions:                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  COMPLETED: All workflows in all DCs succeeded                      │    │
+│  │  FAILED:    All workflows in ALL DCs failed (no usable results)    │    │
+│  │  PARTIAL:   Some workflows/DCs succeeded, some failed              │    │
+│  │             (partial results available)                             │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Important Distinction - Error vs Worker Failure:                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                                                                      │    │
+│  │  WORKFLOW ERROR (workflow returns error result):                    │    │
+│  │    • NO RETRY - error is final                                      │    │
+│  │    • Workflow marked FAILED immediately                             │    │
+│  │    • Error included in final result to client                       │    │
+│  │                                                                      │    │
+│  │  WORKER FAILURE (SWIM detects worker is DEAD):                      │    │
+│  │    • Retry workflow on different worker (see Worker Failure section)│    │
+│  │    • Worker excluded from future dispatch for this workflow        │    │
+│  │    • If max retries exhausted, then mark FAILED                    │    │
+│  │                                                                      │    │
+│  │  Rationale:                                                          │    │
+│  │    • Worker failure = work never completed (worker crashed)         │    │
+│  │    • Workflow error = work completed with error (retrying futile)  │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete Final Results State Machine
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    FINAL RESULTS STATE MACHINE                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│                        ┌──────────────────┐                                  │
+│                        │    DISPATCHED    │                                  │
+│                        │                  │                                  │
+│                        │ Workflow sent to │                                  │
+│                        │ worker           │                                  │
+│                        └────────┬─────────┘                                  │
+│                                 │                                            │
+│                     worker executes                                          │
+│                     sends WorkflowFinalResult                                │
+│                                 │                                            │
+│              ┌──────────────────┼──────────────────┐                         │
+│              │                  │                  │                         │
+│              ▼                  ▼                  ▼                         │
+│    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐                   │
+│    │ RESULT_OK    │   │ RESULT_ERROR │   │ NO_RESULT    │                   │
+│    │              │   │              │   │ (timeout)    │                   │
+│    │ • Store      │   │ • NO RETRY   │   │              │                   │
+│    │   results    │   │ • Mark as    │   │ • Treat as   │                   │
+│    │ • Store      │   │   FAILED     │   │   failure    │                   │
+│    │   context    │   │ • Store error│   │              │                   │
+│    └──────┬───────┘   └──────┬───────┘   └──────┬───────┘                   │
+│           │                  │                  │                           │
+│           │                  │                  │                           │
+│           ▼                  ▼                  ▼                           │
+│    ┌─────────────────────────────────────────────────────────────────┐      │
+│    │                    WORKFLOW COMPLETE                             │      │
+│    │                                                                  │      │
+│    │  Workflow is marked complete when:                              │      │
+│    │  • WorkflowFinalResult received with status=COMPLETED           │      │
+│    │  • OR WorkflowFinalResult received with status=FAILED           │      │
+│    │  • OR timeout waiting for result (treated as FAILED)            │      │
+│    │                                                                  │      │
+│    │  NO RETRY on workflow errors - errors are final.                │      │
+│    │                                                                  │      │
+│    │  Cores freed: In worker's finally block (always)               │      │
+│    └─────────────────────────────────────────────────────────────────┘      │
+│                          │                                                   │
+│                          │ all workflows complete                            │
+│                          ▼                                                   │
+│    ┌─────────────────────────────────────────────────────────────────┐      │
+│    │                      JOB COMPLETE                                │      │
+│    │                                                                  │      │
+│    │  Manager builds JobFinalResult:                                 │      │
+│    │  • Aggregates all workflow results                              │      │
+│    │  • Collects all errors                                          │      │
+│    │  • Determines status (completed|failed|partial)                 │      │
+│    │  • Sends to Gate (or Client if no gates)                        │      │
+│    └─────────────────────────────────────────────────────────────────┘      │
+│                          │                                                   │
+│                          │ Gate receives from all DCs                        │
+│                          ▼                                                   │
+│    ┌─────────────────────────────────────────────────────────────────┐      │
+│    │                    GLOBAL JOB COMPLETE                           │      │
+│    │                                                                  │      │
+│    │  Gate builds GlobalJobResult:                                   │      │
+│    │  • Per-datacenter results (detailed)                            │      │
+│    │  • Cross-DC aggregated stats                                    │      │
+│    │  • Combined errors list                                         │      │
+│    │  • Sends to Client                                              │      │
+│    └─────────────────────────────────────────────────────────────────┘      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Context Flow Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CONTEXT VS RESULTS FLOW                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                          CONTEXT                                     │    │
+│  │                                                                      │    │
+│  │  Purpose: Share state between dependent workflows                   │    │
+│  │                                                                      │    │
+│  │  Flow:                                                               │    │
+│  │    Worker ──context_updates──► Manager                              │    │
+│  │                                   │                                  │    │
+│  │                     ┌─────────────┼─────────────┐                   │    │
+│  │                     ▼             ▼             ▼                   │    │
+│  │               Store in     Sync to peer   Include in               │    │
+│  │            _job_contexts    managers     dependent                  │    │
+│  │                                          workflow                   │    │
+│  │                                          dispatch                   │    │
+│  │                                                                      │    │
+│  │  NOT sent to: Gates, Clients                                        │    │
+│  │  Gates don't need context - it's internal execution state          │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                          RESULTS                                     │    │
+│  │                                                                      │    │
+│  │  Purpose: Report execution stats, errors, metrics                   │    │
+│  │                                                                      │    │
+│  │  Flow:                                                               │    │
+│  │    Worker ──WorkflowStats──► Manager                                │    │
+│  │                                 │                                    │    │
+│  │                     ┌───────────┴───────────┐                       │    │
+│  │                     ▼                       ▼                       │    │
+│  │            JobFinalResult           JobFinalResult                  │    │
+│  │            (to Gate)                (to Client, no gates)           │    │
+│  │                 │                                                    │    │
+│  │                 ▼                                                    │    │
+│  │          GlobalJobResult                                            │    │
+│  │          (to Client)                                                │    │
+│  │                                                                      │    │
+│  │  Sent to: Gates AND Clients                                         │    │
+│  │  Contains: WorkflowStats (stats, metrics, errors, timing)          │    │
+│  │                                                                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Context Consistency Protocol
+
+This section details how context is synchronized across managers to ensure dependent
+workflows always see the correct, latest context from their dependencies.
+
+### The Problem
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CONTEXT SYNC RACE CONDITION                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Timeline (problematic):                                                     │
+│  ───────────────────────────────────────────────────────────────────────    │
+│  Manager A                      Manager B                    Worker (on B)   │
+│  ───────────────────────────────────────────────────────────────────────    │
+│  WorkflowFinalResult                                                         │
+│    (context: {auth: token123})                                              │
+│      │                                                                       │
+│      ├─► Store context locally                                              │
+│      │                                                                       │
+│      ├─► Broadcast to B ──────────► (in flight...)                          │
+│      │                                                                       │
+│      ├─► Advance to layer 2                                                 │
+│      │                                                                       │
+│      ├─► Dispatch DependentWorkflow ──────────────────────► Receives!       │
+│      │   to Worker on Manager B                              But context    │
+│                                        │                     hasn't arrived │
+│                                        ▼                     at Manager B!  │
+│                                    Receives context                          │
+│                                    (too late!)                               │
+│  ───────────────────────────────────────────────────────────────────────    │
+│                                                                              │
+│  Result: DependentWorkflow executes with STALE or MISSING context!          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Distributed Consistency Approaches Analyzed
+
+Before choosing our approach, we analyzed how major distributed systems solve this:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              DISTRIBUTED CONSISTENCY APPROACHES COMPARISON                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. REDIS SENTINEL / REDIS CLUSTER                                           │
+│  ────────────────────────────────────────────────────────────────────────   │
+│  Mechanism:                                                                  │
+│    • Asynchronous replication from master to replicas                       │
+│    • Gossip-based cluster state                                             │
+│    • Failover via Sentinel consensus                                        │
+│                                                                              │
+│  For Context Sync:                                                           │
+│    ❌ Async replication means writes can be lost during failover            │
+│    ❌ We can't afford lost context updates                                  │
+│                                                                              │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  2. ETCD / RAFT CONSENSUS                                                    │
+│  ────────────────────────────────────────────────────────────────────────   │
+│  Mechanism:                                                                  │
+│    • Strong consistency via Raft log replication                            │
+│    • Every write goes through leader                                        │
+│    • Leader replicates log entry to majority BEFORE acknowledging           │
+│    • Committed = in majority's log                                          │
+│                                                                              │
+│  For Context Sync:                                                           │
+│    ✅ Strong consistency - no lost writes                                   │
+│    ✅ We already have leader election                                       │
+│    ❌ Every context key update would need consensus (high latency)          │
+│    ❌ Log grows unbounded (need compaction)                                 │
+│                                                                              │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  3. COCKROACHDB / SPANNER - HYBRID LOGICAL CLOCKS (HLC)                      │
+│  ────────────────────────────────────────────────────────────────────────   │
+│  Mechanism:                                                                  │
+│    • HLC = max(physical_time, last_hlc) + logical_counter                   │
+│    • Combines wall-clock ordering with logical consistency                  │
+│    • MVCC: reads at timestamp T see consistent snapshot as of T            │
+│    • Spanner uses TrueTime (GPS + atomic clocks) for global ordering        │
+│                                                                              │
+│  For Context Sync:                                                           │
+│    ✅ Global ordering without coordination                                  │
+│    ✅ Physical time component aids debugging                                │
+│    ✅ Snapshot reads at specific version                                    │
+│    ❌ Requires reasonably synchronized clocks (NTP usually sufficient)      │
+│                                                                              │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  4. CASSANDRA - TUNABLE CONSISTENCY WITH LWW                                 │
+│  ────────────────────────────────────────────────────────────────────────   │
+│  Mechanism:                                                                  │
+│    • Write to N replicas, wait for W acknowledgments                        │
+│    • Read from R replicas, return highest timestamp                         │
+│    • Consistency levels: ONE, QUORUM, ALL                                   │
+│    • Last-Write-Wins (LWW) with timestamps for conflict resolution          │
+│                                                                              │
+│  For Context Sync:                                                           │
+│    ✅ Flexible consistency levels                                           │
+│    ✅ Quorum writes ensure durability                                       │
+│    ✅ LWW handles concurrent writes                                         │
+│    ❌ Wall-clock skew can cause "wrong" winner                              │
+│                                                                              │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  5. DYNAMODB / RIAK - VECTOR CLOCKS + APPLICATION RESOLUTION                 │
+│  ────────────────────────────────────────────────────────────────────────   │
+│  Mechanism:                                                                  │
+│    • Vector clock per key tracks causal history                             │
+│    • On conflict, ALL versions returned to application                      │
+│    • Application decides how to merge                                       │
+│    • Anti-entropy (Merkle trees) for background sync                        │
+│                                                                              │
+│  For Context Sync:                                                           │
+│    ✅ Precise causal tracking                                               │
+│    ✅ No lost updates (all kept until resolved)                             │
+│    ❌ Complex: application must handle conflicts                            │
+│    ❌ Vector clock size grows with writers                                  │
+│                                                                              │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  6. CRDTs (CONFLICT-FREE REPLICATED DATA TYPES)                              │
+│  ────────────────────────────────────────────────────────────────────────   │
+│  Mechanism:                                                                  │
+│    • Data structures with mathematically-proven merge functions             │
+│    • LWWRegister: Last-writer-wins with timestamp                           │
+│    • GCounter: Grow-only counter (sum of per-node counters)                 │
+│    • Merge is associative, commutative, idempotent                          │
+│                                                                              │
+│  For Context Sync:                                                           │
+│    ✅ No coordination needed - always merge                                 │
+│    ✅ Eventually consistent automatically                                   │
+│    ❌ Limited to CRDT-compatible types                                      │
+│    ❌ "Eventually" may not be fast enough                                   │
+│                                                                              │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  7. SINGLE-WRITER PATTERN (KAFKA PARTITION LEADER)                           │
+│  ────────────────────────────────────────────────────────────────────────   │
+│  Mechanism:                                                                  │
+│    • Each partition has exactly one leader                                  │
+│    • Only leader accepts writes                                             │
+│    • Followers replicate from leader                                        │
+│    • No conflicts possible (single source of truth)                         │
+│                                                                              │
+│  For Context Sync:                                                           │
+│    ✅ Simplest consistency model                                            │
+│    ✅ No conflicts by design                                                │
+│    ✅ We already have job leader                                            │
+│    ❌ Leader is bottleneck/SPOF for that job                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Comparison Matrix
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         APPROACH COMPARISON MATRIX                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Approach              │ Consistency │ Latency │ Complexity │ Failure       │
+│  ──────────────────────┼─────────────┼─────────┼────────────┼──────────────│
+│  Async Replication     │ Eventual    │ Low     │ Low        │ May lose     │
+│  (Redis)               │             │         │            │ writes       │
+│  ──────────────────────┼─────────────┼─────────┼────────────┼──────────────│
+│  Raft Log              │ Strong      │ High    │ High       │ Leader       │
+│  (etcd)                │ (linear.)   │         │            │ election     │
+│  ──────────────────────┼─────────────┼─────────┼────────────┼──────────────│
+│  HLC + MVCC            │ Strong      │ Medium  │ Medium     │ Timestamp    │
+│  (Spanner)             │             │         │            │ based        │
+│  ──────────────────────┼─────────────┼─────────┼────────────┼──────────────│
+│  Quorum + LWW          │ Tunable     │ Medium  │ Medium     │ Quorum       │
+│  (Cassandra)           │             │         │            │ tolerant     │
+│  ──────────────────────┼─────────────┼─────────┼────────────┼──────────────│
+│  Vector Clocks         │ Causal      │ Low     │ High       │ App          │
+│  (Dynamo)              │             │         │            │ resolves     │
+│  ──────────────────────┼─────────────┼─────────┼────────────┼──────────────│
+│  CRDTs                 │ Eventual    │ Low     │ Medium     │ Automatic    │
+│                        │             │         │            │ merge        │
+│  ──────────────────────┼─────────────┼─────────┼────────────┼──────────────│
+│  Single-Writer         │ Strong      │ Low     │ Low        │ Leader       │
+│                        │             │         │            │ recovery     │
+│  ──────────────────────┴─────────────┴─────────┴────────────┴──────────────│
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Chosen Approach: Hybrid Single-Writer + Quorum Replication
+
+We combine the best properties from multiple approaches:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     CHOSEN: HYBRID APPROACH                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  From etcd/Raft:                                                             │
+│    → Single leader (job leader) is source of truth                          │
+│    → Quorum confirmation before advancing                                   │
+│                                                                              │
+│  From Cassandra:                                                             │
+│    → Tunable consistency (QUORUM for context sync)                          │
+│    → LWW for any edge-case conflicts                                        │
+│                                                                              │
+│  From Spanner:                                                               │
+│    → Context embedded in dispatch (like snapshot reads)                     │
+│    → Version number for stale detection                                     │
+│                                                                              │
+│  From Kafka:                                                                 │
+│    → Single-writer per partition (job)                                      │
+│    → No conflicts by construction                                           │
+│                                                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Key Insight: Layers are natural synchronization points.                     │
+│  A dependent workflow in layer N+1 can ONLY depend on workflows             │
+│  from layers ≤ N. Therefore: sync context at layer boundaries.              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Protocol Specification
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CONTEXT CONSISTENCY PROTOCOL                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Principle: Single-Writer + Quorum Replication + Embedded Context            │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                      │   │
+│  │  1. Job leader is SINGLE WRITER for job's context                   │   │
+│  │     → No conflicts possible (only one writer)                       │   │
+│  │     → Simplest consistency model                                    │   │
+│  │                                                                      │   │
+│  │  2. Workers send results to their manager                           │   │
+│  │     → Manager forwards context updates to job leader                │   │
+│  │     → Only leader applies updates to authoritative context          │   │
+│  │                                                                      │   │
+│  │  3. Layer boundaries trigger quorum sync                            │   │
+│  │     → Leader creates versioned snapshot                             │   │
+│  │     → Leader broadcasts to peers, waits for quorum ack              │   │
+│  │     → Peers store snapshot (for failover)                           │   │
+│  │                                                                      │   │
+│  │  4. Dispatch includes context snapshot                              │   │
+│  │     → No extra fetch needed                                         │   │
+│  │     → Version number for stale detection                            │   │
+│  │                                                                      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Manager State (New Fields):                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                      │   │
+│  │  _job_contexts: Dict[job_id, Context]                               │   │
+│  │    # Authoritative context (only job leader writes)                 │   │
+│  │                                                                      │   │
+│  │  _job_layer_version: Dict[job_id, int]                              │   │
+│  │    # Monotonically increasing per job                               │   │
+│  │    # Incremented when layer completes and context is synced         │   │
+│  │                                                                      │   │
+│  │  _job_leaders: Dict[job_id, str]                                    │   │
+│  │    # job_id → leader_node_id                                        │   │
+│  │    # Set when job is first accepted                                 │   │
+│  │                                                                      │   │
+│  │  _context_lamport_clock: int                                        │   │
+│  │    # For per-key LWW timestamps (edge cases)                        │   │
+│  │                                                                      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Protocol Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         PROTOCOL FLOW                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Step 1: Workflow Completes with Context Updates                            │
+│  ────────────────────────────────────────────────────────────────────────   │
+│                                                                              │
+│  WorkflowFinalResult includes:                                               │
+│    context_updates: bytes      # Serialized Dict[key, value]                │
+│    context_timestamps: bytes   # Serialized Dict[key, lamport_clock]        │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  # On receiving manager (may or may not be job leader):             │   │
+│  │                                                                      │   │
+│  │  async def workflow_final_result(self, addr, data, clock_time):     │   │
+│  │      result = WorkflowFinalResult.load(data)                        │   │
+│  │      job_leader = self._job_leaders[result.job_id]                  │   │
+│  │                                                                      │   │
+│  │      if self._node_id != job_leader:                                │   │
+│  │          # Forward context to job leader                            │   │
+│  │          await self._forward_context_to_leader(                     │   │
+│  │              result.job_id, result.context_updates,                 │   │
+│  │              result.context_timestamps                              │   │
+│  │          )                                                          │   │
+│  │      else:                                                          │   │
+│  │          # We are job leader - apply directly                       │   │
+│  │          await self._apply_context_updates(                         │   │
+│  │              result.job_id, result.workflow_id,                     │   │
+│  │              result.context_updates, result.context_timestamps      │   │
+│  │          )                                                          │   │
+│  │                                                                      │   │
+│  │      # ... rest of result handling                                  │   │
+│  │                                                                      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Step 2: Job Leader Applies Context (LWW)                                    │
+│  ────────────────────────────────────────────────────────────────────────   │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  async def _apply_context_updates(                                  │   │
+│  │      self, job_id, workflow_id, updates_bytes, timestamps_bytes     │   │
+│  │  ):                                                                 │   │
+│  │      updates = cloudpickle.loads(updates_bytes)                     │   │
+│  │      timestamps = cloudpickle.loads(timestamps_bytes)               │   │
+│  │      context = self._job_contexts[job_id]                           │   │
+│  │      workflow_name = self._get_workflow_name(workflow_id)           │   │
+│  │                                                                      │   │
+│  │      for key, value in updates.items():                             │   │
+│  │          timestamp = timestamps.get(key, self._context_lamport_clock)│   │
+│  │          await context.update(                                      │   │
+│  │              workflow_name, key, value,                             │   │
+│  │              timestamp=timestamp,                                   │   │
+│  │              source_node=self._node_id                              │   │
+│  │          )                                                          │   │
+│  │                                                                      │   │
+│  │      self._context_lamport_clock += 1                               │   │
+│  │                                                                      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Step 3: Layer Completion Triggers Quorum Sync                               │
+│  ────────────────────────────────────────────────────────────────────────   │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  async def _sync_context_and_advance(self, job_id: str):             │   │
+│  │      # Only job leader does this                                    │   │
+│  │      assert self._job_leaders[job_id] == self._node_id              │   │
+│  │                                                                      │   │
+│  │      # 1. Increment layer version                                   │   │
+│  │      new_version = self._job_layer_version[job_id] + 1              │   │
+│  │      self._job_layer_version[job_id] = new_version                  │   │
+│  │                                                                      │   │
+│  │      # 2. Create context snapshot                                   │   │
+│  │      context = self._job_contexts[job_id]                           │   │
+│  │      snapshot = ContextLayerSync(                                   │   │
+│  │          job_id=job_id,                                             │   │
+│  │          layer_version=new_version,                                 │   │
+│  │          context_snapshot=cloudpickle.dumps(context.dict()),       │   │
+│  │          source_node_id=self._node_id                               │   │
+│  │      )                                                              │   │
+│  │                                                                      │   │
+│  │      # 3. Broadcast to peers and WAIT for quorum                    │   │
+│  │      confirmations = await self._broadcast_context_sync(snapshot)   │   │
+│  │                                                                      │   │
+│  │      if confirmations < self._quorum_size:                          │   │
+│  │          raise QuorumTimeoutError("Context sync failed")            │   │
+│  │                                                                      │   │
+│  │      # 4. ONLY THEN advance to next layer                           │   │
+│  │      await self._dispatch_next_layer(job_id)                        │   │
+│  │                                                                      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Step 4: Dependent Workflow Dispatch Includes Context                        │
+│  ────────────────────────────────────────────────────────────────────────   │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  WorkflowDispatch (updated fields):                                  │   │
+│  │    ...                                                               │   │
+│  │    context_version: int           # Expected layer version          │   │
+│  │    dependency_context: bytes      # Context from dependencies       │   │
+│  │                                                                      │   │
+│  │  # Extracting just what the workflow needs:                         │   │
+│  │  def _extract_dependency_context(self, job_id, workflow_name):      │   │
+│  │      dependencies = self._get_workflow_dependencies(workflow_name)   │   │
+│  │      context = self._job_contexts[job_id]                           │   │
+│  │      relevant = {}                                                   │   │
+│  │      for dep_workflow in dependencies:                              │   │
+│  │          if dep_workflow in context._context:                       │   │
+│  │              relevant[dep_workflow] = context[dep_workflow].dict()  │   │
+│  │      return cloudpickle.dumps(relevant)                             │   │
+│  │                                                                      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### New Messages
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         CONTEXT SYNC MESSAGES                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  @dataclass                                                                  │
+│  class ContextForward(Message):                                              │
+│      """Non-leader forwards context updates to job leader"""                │
+│      job_id: str                                                             │
+│      workflow_id: str                                                        │
+│      context_updates: bytes      # Serialized dict                          │
+│      context_timestamps: bytes   # Per-key Lamport timestamps               │
+│      source_manager: str         # Who received from worker                 │
+│                                                                              │
+│  @dataclass                                                                  │
+│  class ContextLayerSync(Message):                                            │
+│      """Job leader broadcasts at layer completion"""                        │
+│      job_id: str                                                             │
+│      layer_version: int          # Monotonic per job                        │
+│      context_snapshot: bytes     # Full context as of this layer            │
+│      source_node_id: str         # Job leader's node ID                     │
+│                                                                              │
+│  @dataclass                                                                  │
+│  class ContextLayerSyncAck(Message):                                         │
+│      """Peer confirms receipt of context sync"""                            │
+│      job_id: str                                                             │
+│      layer_version: int                                                      │
+│      applied: bool               # True if applied, False if stale          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Conflict Resolution (Edge Cases)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    LWW CONFLICT RESOLUTION                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Already implemented in WorkflowContext.set():                               │
+│    • If new_timestamp > existing_timestamp: accept                          │
+│    • If new_timestamp <= existing_timestamp: reject (stale)                 │
+│                                                                              │
+│  Enhanced for tie-breaking (same timestamp):                                 │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                      │   │
+│  │  async def set(self, key, value, timestamp, source_node=None):       │   │
+│  │      async with self._write_lock:                                    │   │
+│  │          existing_ts = self._timestamps.get(key)                     │   │
+│  │          existing_src = self._sources.get(key)                       │   │
+│  │                                                                      │   │
+│  │          should_update = (                                           │   │
+│  │              existing_ts is None or                                  │   │
+│  │              timestamp > existing_ts or                              │   │
+│  │              (timestamp == existing_ts and                           │   │
+│  │               source_node and existing_src and                       │   │
+│  │               source_node > existing_src)  # Tiebreaker             │   │
+│  │          )                                                           │   │
+│  │                                                                      │   │
+│  │          if should_update:                                           │   │
+│  │              self._context[key] = value                              │   │
+│  │              self._timestamps[key] = timestamp                       │   │
+│  │              self._sources[key] = source_node                        │   │
+│  │                                                                      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Note: With single-writer (job leader), conflicts should not occur.         │
+│  LWW is defensive programming for edge cases (leader failover, etc.)        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Correctness Guarantees
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       CORRECTNESS GUARANTEES                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. ORDERING                                                                 │
+│     Layer N+1 workflows NEVER execute before layer N context is             │
+│     synced to quorum.                                                        │
+│                                                                              │
+│  2. CONSISTENCY                                                              │
+│     Single writer (job leader) means no conflicts. LWW with                 │
+│     timestamps handles edge cases (failover).                               │
+│                                                                              │
+│  3. DURABILITY                                                               │
+│     Quorum confirmation means majority has context before advancing.        │
+│     If leader fails, another manager has the snapshot.                      │
+│                                                                              │
+│  4. NO EXTRA FETCHES                                                         │
+│     Context is embedded in WorkflowDispatch. Worker has everything          │
+│     it needs immediately.                                                    │
+│                                                                              │
+│  5. VERSION VERIFICATION                                                     │
+│     context_version in dispatch allows worker to detect stale               │
+│     dispatches (e.g., from a lagging manager).                              │
+│                                                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Corrected Timeline:                                                         │
+│  ───────────────────────────────────────────────────────────────────────    │
+│  Job Leader (A)              Manager B                                       │
+│  ───────────────────────────────────────────────────────────────────────    │
+│  WorkflowFinalResult                                                         │
+│    (context: {auth: token123})                                              │
+│      │                                                                       │
+│      ├─► Store context locally                                              │
+│      │                                                                       │
+│      ├─► Layer complete!                                                    │
+│      │                                                                       │
+│      ├─► Broadcast ContextLayerSync ──────► Receives, stores                │
+│      │                                          │                            │
+│      │   ◄──────────────────────────────────── Sends ack                    │
+│      │                                                                       │
+│      ├─► Quorum reached ✓                                                   │
+│      │                                                                       │
+│      ├─► NOW dispatch layer 2 ────────────► Receives dispatch               │
+│      │   (includes context_version=2,       (has correct context!)          │
+│      │    dependency_context={auth: ...})                                   │
+│  ───────────────────────────────────────────────────────────────────────    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Drawbacks and Mitigations
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              DRAWBACKS                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. LEADER BOTTLENECK                                                        │
+│     ────────────────────────────────────────────────────────────────────    │
+│     • All context updates funnel through job leader                         │
+│     • Leader does more work than peers                                      │
+│                                                                              │
+│     Mitigation: Layer batching reduces frequency. One leader per JOB,       │
+│                 not per cluster - load distributed across jobs.             │
+│                                                                              │
+│  2. LEADER FAILURE RECOVERY                                                  │
+│     ────────────────────────────────────────────────────────────────────    │
+│     • If leader fails mid-layer, context updates in flight may be lost     │
+│     • New leader must recover from last quorum-synced snapshot              │
+│                                                                              │
+│     Mitigation: Layer snapshots are quorum-replicated. Worst case:          │
+│                 re-execute current layer (idempotent workflows help).       │
+│                                                                              │
+│  3. QUORUM UNAVAILABILITY                                                    │
+│     ────────────────────────────────────────────────────────────────────    │
+│     • If < quorum managers available, can't advance layers                  │
+│     • Job blocks waiting for quorum                                         │
+│                                                                              │
+│     Mitigation: Circuit breaker + configurable timeout. Return partial      │
+│                 results or fail job with clear error.                       │
+│                                                                              │
+│  4. INCREASED MESSAGE SIZE                                                   │
+│     ────────────────────────────────────────────────────────────────────    │
+│     • Context embedded in every WorkflowDispatch                            │
+│     • Large contexts = larger messages                                      │
+│                                                                              │
+│     Mitigation: Only include dependencies' context, not full context.       │
+│                 Compress large contexts.                                     │
+│                                                                              │
+│  5. NOT SUITABLE FOR FINE-GRAINED UPDATES                                    │
+│     ────────────────────────────────────────────────────────────────────    │
+│     • Designed for layer-boundary sync                                      │
+│     • High-frequency mid-workflow updates would be slow                     │
+│                                                                              │
+│     Mitigation: Context is for workflow outputs, not streaming data.        │
+│                 Use separate mechanism for real-time data if needed.        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Integration with Existing Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DATACENTER ROUTING COMPATIBILITY                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Impact Analysis:                                                            │
+│                                                                              │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │ Component              │ Impact      │ Notes                         │  │
+│  ├────────────────────────┼─────────────┼───────────────────────────────┤  │
+│  │ Gate → Manager submit  │ None        │ Context sync is internal      │  │
+│  ├────────────────────────┼─────────────┼───────────────────────────────┤  │
+│  │ DC health routing      │ Integrates  │ Quorum issues = degraded DC   │  │
+│  ├────────────────────────┼─────────────┼───────────────────────────────┤  │
+│  │ Manager → Worker       │ Larger msgs │ Context embedded in dispatch  │  │
+│  ├────────────────────────┼─────────────┼───────────────────────────────┤  │
+│  │ Worker → Manager       │ Extra hop   │ Non-leader forwards to leader │  │
+│  ├────────────────────────┼─────────────┼───────────────────────────────┤  │
+│  │ Cross-DC dependencies  │ N/A         │ Not supported (each DC indep) │  │
+│  ├────────────────────────┼─────────────┼───────────────────────────────┤  │
+│  │ Fencing tokens         │ Synergistic │ Both provide staleness detect │  │
+│  ├────────────────────────┼─────────────┼───────────────────────────────┤  │
+│  │ Progress deduplication │ Minor fix   │ Use layer_version as key      │  │
+│  └────────────────────────┴─────────────┴───────────────────────────────┘  │
+│                                                                              │
+│  Limitation: Cross-DC Context Sync                                           │
+│  ────────────────────────────────────────────────────────────────────────   │
+│  NOT SUPPORTED: Workflows in DC-1 depending on context from DC-2            │
+│  Current design: Each DC runs full job independently                        │
+│  If needed: Gate becomes cross-DC coordinator (significant change)          │
+│                                                                              │
+│  Two Types of Leaders (Clarification):                                       │
+│  ────────────────────────────────────────────────────────────────────────   │
+│  CLUSTER LEADER: One per manager cluster, handles cluster ops (SWIM)        │
+│  JOB LEADER: One per job per DC, handles that job's context                 │
+│                                                                              │
+│  These are different roles - a follower manager can be job leader:          │
+│    Manager A: Cluster Leader, Job Leader for Job-1, Job-3                   │
+│    Manager B: Follower,       Job Leader for Job-2                          │
+│    Manager C: Follower,       Job Leader for Job-4, Job-5                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## License
 
 See the main project LICENSE file.
