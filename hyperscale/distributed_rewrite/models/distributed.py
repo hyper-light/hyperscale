@@ -642,15 +642,34 @@ class JobStatusPush(Message):
     - Job completed
     - Job failed
     - Datacenter completion
+    
+    Includes both aggregated totals AND per-DC breakdown for visibility.
     """
     job_id: str                  # Job identifier
     status: str                  # JobStatus value
     message: str                 # Human-readable status message
-    total_completed: int = 0     # Completed count
-    total_failed: int = 0        # Failed count
-    overall_rate: float = 0.0    # Current rate
+    total_completed: int = 0     # Completed count (aggregated across all DCs)
+    total_failed: int = 0        # Failed count (aggregated across all DCs)
+    overall_rate: float = 0.0    # Current rate (aggregated across all DCs)
     elapsed_seconds: float = 0.0 # Time since submission
     is_final: bool = False       # True if job is complete (no more updates)
+    # Per-datacenter breakdown (for clients that want granular visibility)
+    per_dc_stats: list["DCStats"] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class DCStats(Message):
+    """
+    Per-datacenter statistics for real-time status updates.
+    
+    Used in JobStatusPush to provide per-DC visibility without
+    the full detail of JobProgress (which includes workflow-level stats).
+    """
+    datacenter: str              # Datacenter identifier
+    status: str                  # DC-specific status
+    completed: int = 0           # Completed in this DC
+    failed: int = 0              # Failed in this DC
+    rate: float = 0.0            # Rate in this DC
 
 
 @dataclass(slots=True)
@@ -660,14 +679,17 @@ class JobBatchPush(Message):
     
     Sent periodically (Tier 2) with aggregated progress data.
     Contains step-level statistics and detailed progress.
+    Includes per-DC breakdown for granular visibility.
     """
     job_id: str                  # Job identifier
     status: str                  # Current JobStatus
     step_stats: list["StepStats"] = field(default_factory=list)
-    total_completed: int = 0
-    total_failed: int = 0
-    overall_rate: float = 0.0
+    total_completed: int = 0     # Aggregated across all DCs
+    total_failed: int = 0        # Aggregated across all DCs
+    overall_rate: float = 0.0    # Aggregated across all DCs
     elapsed_seconds: float = 0.0
+    # Per-datacenter breakdown (for clients that want granular visibility)
+    per_dc_stats: list["DCStats"] = field(default_factory=list)
 
 
 # =============================================================================

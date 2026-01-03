@@ -55,6 +55,7 @@ from .distributed import (
     GlobalJobStatus as GlobalJobStatus,
     # Client push notifications
     JobStatusPush as JobStatusPush,
+    DCStats as DCStats,
     JobBatchPush as JobBatchPush,
     # State sync
     WorkerStateSnapshot as WorkerStateSnapshot,

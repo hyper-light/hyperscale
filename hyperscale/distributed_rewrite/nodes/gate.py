@@ -22,10 +22,16 @@ Protocols:
 
 import asyncio
 import secrets
+import statistics
 import time
+from collections import defaultdict
 from typing import Any
 
+import cloudpickle
+
 from hyperscale.distributed_rewrite.server import tcp, udp
+from hyperscale.reporting.results import Results
+from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, GateStateEmbedder
 from hyperscale.distributed_rewrite.models import (
@@ -44,6 +50,7 @@ from hyperscale.distributed_rewrite.models import (
     JobProgress,
     GlobalJobStatus,
     JobStatusPush,
+    DCStats,
     JobBatchPush,
     JobFinalResult,
     GlobalJobResult,
@@ -1189,6 +1196,18 @@ class GateServer(HealthAwareServer):
                 JobStatus.CANCELLED.value,
             )
             
+            # Build per-DC stats for granular visibility
+            per_dc_stats = [
+                DCStats(
+                    datacenter=dc_prog.datacenter,
+                    status=dc_prog.status,
+                    completed=dc_prog.total_completed,
+                    failed=dc_prog.total_failed,
+                    rate=dc_prog.overall_rate,
+                )
+                for dc_prog in job.datacenters
+            ]
+            
             push = JobStatusPush(
                 job_id=job_id,
                 status=job.status,
@@ -1198,6 +1217,7 @@ class GateServer(HealthAwareServer):
                 overall_rate=job.overall_rate,
                 elapsed_seconds=job.elapsed_seconds,
                 is_final=is_final,
+                per_dc_stats=per_dc_stats,
             )
             
             try:
@@ -1252,6 +1272,18 @@ class GateServer(HealthAwareServer):
                 if hasattr(dc_progress, 'step_stats') and dc_progress.step_stats:
                     all_step_stats.extend(dc_progress.step_stats)
             
+            # Build per-DC stats for granular visibility
+            per_dc_stats = [
+                DCStats(
+                    datacenter=dc_prog.datacenter,
+                    status=dc_prog.status,
+                    completed=dc_prog.total_completed,
+                    failed=dc_prog.total_failed,
+                    rate=dc_prog.overall_rate,
+                )
+                for dc_prog in job.datacenters
+            ]
+            
             batch_push = JobBatchPush(
                 job_id=job_id,
                 status=job.status,
@@ -1260,6 +1292,7 @@ class GateServer(HealthAwareServer):
                 total_failed=job.total_failed,
                 overall_rate=job.overall_rate,
                 elapsed_seconds=job.elapsed_seconds,
+                per_dc_stats=per_dc_stats,
             )
             
             try:
@@ -2637,7 +2670,12 @@ class GateServer(HealthAwareServer):
             return b'error'
     
     async def _send_global_job_result(self, job_id: str) -> None:
-        """Aggregate DC results and send GlobalJobResult to client."""
+        """
+        Aggregate DC results and send GlobalJobResult to client.
+        
+        Uses Results.merge_results() to properly aggregate WorkflowStats
+        from all datacenters, including timing percentiles (p50, p95, p99).
+        """
         dc_results = self._job_dc_results.get(job_id, {})
         if not dc_results:
             return
@@ -2668,15 +2706,97 @@ class GateServer(HealthAwareServer):
         else:
             overall_status = "PARTIAL"
         
-        # Build aggregated stats (simplified - real impl would compute from WorkflowStats)
+        # =================================================================
+        # Aggregate WorkflowStats using Results.merge_results()
+        # =================================================================
+        
+        # 1. Collect all WorkflowStats from all DCs, grouped by workflow name
+        all_workflow_stats: dict[str, list[WorkflowStats]] = defaultdict(list)
+        
+        for dc_result in all_dc_results:
+            for wf_result in dc_result.workflow_results:
+                try:
+                    # Unpickle WorkflowStats from the workflow result
+                    workflow_stats: WorkflowStats = cloudpickle.loads(wf_result.results)
+                    all_workflow_stats[wf_result.workflow_name].append(workflow_stats)
+                except Exception as e:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=f"Failed to unpickle WorkflowStats for {wf_result.workflow_name}: {e}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+        
+        # 2. Merge WorkflowStats per workflow using Results.merge_results()
+        merged_workflow_stats: list[WorkflowStats] = []
+        aggregator = Results()
+        
+        for workflow_name, stats_list in all_workflow_stats.items():
+            if len(stats_list) > 1:
+                # Multiple DCs ran this workflow - merge their stats
+                merged = aggregator.merge_results(stats_list)
+            elif len(stats_list) == 1:
+                merged = stats_list[0]
+            else:
+                continue
+            merged_workflow_stats.append(merged)
+        
+        # 3. Extract aggregated latency stats from merged results
+        avg_latencies: list[float] = []
+        p50_latencies: list[float] = []
+        p95_latencies: list[float] = []
+        p99_latencies: list[float] = []
+        total_aps: float = 0.0
+        
+        for ws in merged_workflow_stats:
+            # Accumulate actions per second
+            total_aps += ws.get("aps", 0.0)
+            
+            # Extract timing stats from test results
+            for result_set in ws.get("results", []):
+                timings = result_set.get("timings", {})
+                total_timing = timings.get("total", {})
+                
+                if total_timing:
+                    if "mean" in total_timing:
+                        avg_latencies.append(total_timing["mean"])
+                    if "med" in total_timing:
+                        p50_latencies.append(total_timing["med"])
+                    if "95th_quantile" in total_timing:
+                        p95_latencies.append(total_timing["95th_quantile"])
+                    if "99th_quantile" in total_timing:
+                        p99_latencies.append(total_timing["99th_quantile"])
+        
+        # 4. Calculate aggregated latencies (median of medians for percentiles)
+        avg_latency_ms = statistics.mean(avg_latencies) * 1000 if avg_latencies else 0.0
+        p50_latency_ms = statistics.median(p50_latencies) * 1000 if p50_latencies else 0.0
+        p95_latency_ms = statistics.median(p95_latencies) * 1000 if p95_latencies else 0.0
+        p99_latency_ms = statistics.median(p99_latencies) * 1000 if p99_latencies else 0.0
+        
+        # 5. Build aggregated stats with real values
         aggregated = AggregatedJobStats(
             total_requests=total_completed + total_failed,
             successful_requests=total_completed,
             failed_requests=total_failed,
-            overall_rate=sum(
-                sum(wf.rate_per_second for wf in self._jobs.get(job_id, GlobalJobStatus(job_id=job_id, status="")).datacenters)
-                for _ in [1]  # Just to handle the case where job exists
-            ) if job_id in self._jobs else 0.0,
+            overall_rate=total_aps,
+            avg_latency_ms=avg_latency_ms,
+            p50_latency_ms=p50_latency_ms,
+            p95_latency_ms=p95_latency_ms,
+            p99_latency_ms=p99_latency_ms,
+        )
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Aggregated job {job_id}: {len(merged_workflow_stats)} workflows, "
+                        f"rate={total_aps:.2f}/s, p50={p50_latency_ms:.2f}ms, p99={p99_latency_ms:.2f}ms",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
         )
         
         # Build GlobalJobResult
