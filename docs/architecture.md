@@ -3829,72 +3829,283 @@ This section documents how Managers handle workflow execution, mirroring the `Re
 
 ### Step 1: Workflow Classification
 
-A workflow is classified as a **test workflow** if it has at least one hook with `HookType.TEST`.
+A workflow is classified as a **test workflow** if it has at least one hook with `HookType.TEST`. This classification is **critical** because it determines how many CPU cores the workflow receives:
 
-**Detection Logic** (from `RemoteGraphManager` lines 499-508):
+- **Test workflows**: Get cores based on priority (can use up to 100% of pool)
+- **Non-test workflows**: Always get 1 core (they don't parallelize load testing)
+
+---
+
+#### How HookType.TEST is Determined
+
+A hook's type is set automatically by the `Hook` class based on the **return type annotation** of the decorated method.
+
+**The Hook Type Decision Tree** (from `hook.py` lines 161-189):
 
 ```python
-def _classify_workflow(self, workflow: Workflow) -> bool:
-    """Determine if workflow is a test workflow."""
-    hooks: dict[str, Hook] = {
-        name: hook
-        for name, hook in inspect.getmembers(
-            workflow,
-            predicate=lambda member: isinstance(member, Hook),
-        )
-    }
+# Simplified logic from Hook.__init__()
+if is_test and self.return_type in CallResult.__subclasses__():
+    self.hook_type = HookType.TEST        # ← Test action (load testing)
     
-    is_test_workflow = len([
-        hook for hook in hooks.values()
-        if hook.hook_type == HookType.TEST
-    ]) > 0
+elif is_test and self.return_type in CustomResult.__subclasses__():
+    self.hook_type = HookType.TEST        # ← Custom test action
     
-    return is_test_workflow
+elif is_check:
+    self.hook_type = HookType.CHECK       # ← Validation/assertion
+    
+elif is_metric:
+    self.hook_type = HookType.METRIC      # ← Custom metric collection
+    
+else:
+    self.hook_type = HookType.ACTION      # ← General action (setup/teardown)
 ```
 
-**HookType.TEST Criteria** (from `hook.py` lines 161-172):
+**Key Insight**: The `@step()` decorator alone does NOT make a test workflow. The **return type** must be a `CallResult` subclass (like `HTTPResponse`, `GraphQLResponse`, etc.) for the hook to become `HookType.TEST`.
 
-A hook becomes `HookType.TEST` when:
-1. Method is decorated with `@step()` (is_test=True)
-2. AND return type is subclass of `CallResult` or `CustomResult` (e.g., `HTTPResponse`)
+---
+
+#### CallResult Subclasses (Test Return Types)
+
+These return types indicate the method is a load test action:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                         WORKFLOW CLASSIFICATION                              │
+│                     CALLRESULT SUBCLASSES (TEST TYPES)                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  HTTP Testing:                                                               │
+│  • HTTPResponse      - Standard HTTP response                               │
+│  • HTTP2Response     - HTTP/2 response                                      │
+│  • HTTP3Response     - HTTP/3 (QUIC) response                               │
+│                                                                              │
+│  API Testing:                                                                │
+│  • GraphQLResponse   - GraphQL query response                               │
+│  • GRPCResponse      - gRPC call response                                   │
+│                                                                              │
+│  Database Testing:                                                           │
+│  • MySQLResponse     - MySQL query response                                 │
+│  • PostgresResponse  - PostgreSQL query response                            │
+│  • MongoDBResponse   - MongoDB operation response                           │
+│  • RedisResponse     - Redis command response                               │
+│                                                                              │
+│  Messaging Testing:                                                          │
+│  • KafkaResponse     - Kafka produce/consume response                       │
+│  • RabbitMQResponse  - RabbitMQ message response                            │
+│                                                                              │
+│  WebSocket/Realtime:                                                         │
+│  • WebsocketResponse - WebSocket message response                           │
+│  • UDPResponse       - UDP packet response                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Complete Example: Test vs Non-Test Workflows
+
+```python
+from hyperscale.graph import Workflow, step, action, depends
+from hyperscale.testing import URL, HTTPResponse, Headers
+
+
+class LoadTestWorkflow(Workflow):
+    """
+    TEST WORKFLOW - Gets multiple cores based on priority.
+    
+    This is a test workflow because:
+    1. Has @step() decorated method
+    2. Return type is HTTPResponse (a CallResult subclass)
+    3. Calls self.client.http.get() which returns HTTPResponse
+    
+    Result: HookType.TEST → participates in priority-based core allocation
+    """
+    vus = 10000           # Virtual users (can be large!)
+    duration = "5m"
+    priority = "high"     # Optional: LOW, NORMAL, HIGH, EXCLUSIVE, AUTO (default)
+    
+    @step()
+    async def test_api_endpoint(
+        self,
+        url: URL = 'https://api.example.com/users',
+        headers: Headers = {'Authorization': 'Bearer token123'}
+    ) -> HTTPResponse:    # ← This return type makes it HookType.TEST
+        """Load test the users API endpoint."""
+        return await self.client.http.get(url, headers=headers)
+    
+    @step()
+    async def test_post_data(
+        self,
+        url: URL = 'https://api.example.com/data',
+    ) -> HTTPResponse:    # ← Also HookType.TEST
+        """Load test data submission."""
+        return await self.client.http.post(url, json={"key": "value"})
+
+
+class SetupWorkflow(Workflow):
+    """
+    NON-TEST WORKFLOW - Always gets 1 core.
+    
+    This is NOT a test workflow because:
+    1. Uses @action() decorator (not @step())
+    2. Return type is None (not a CallResult)
+    
+    Result: HookType.ACTION → single core, runs sequentially
+    """
+    vus = 1
+    duration = "30s"
+    
+    @action()
+    async def setup_test_data(self) -> None:  # ← None return = HookType.ACTION
+        """Prepare test data before load testing."""
+        # This runs on a single core
+        self.context['api_key'] = 'test-key-123'
+        self.context['base_url'] = 'https://api.example.com'
+
+
+class UtilityWorkflow(Workflow):
+    """
+    NON-TEST WORKFLOW - @step() with dict return.
+    
+    This is NOT a test workflow because:
+    1. Has @step() decorated method
+    2. BUT return type is dict (NOT a CallResult subclass)
+    
+    Result: HookType.ACTION → single core
+    """
+    vus = 1000  # VUs don't matter - still gets 1 core
+    duration = "1m"
+    
+    @step()
+    async def process_data(self) -> dict:     # ← dict return = HookType.ACTION
+        """Process data - not a load test."""
+        await asyncio.sleep(0.1)
+        return {"processed": True, "count": 100}
+
+
+@depends('SetupWorkflow')
+class DependentLoadTest(Workflow):
+    """
+    TEST WORKFLOW with dependency.
+    
+    This workflow:
+    1. Waits for SetupWorkflow to complete
+    2. Receives context from SetupWorkflow
+    3. Is a test workflow (HTTPResponse return)
+    """
+    vus = 5000
+    duration = "3m"
+    
+    @step()
+    async def authenticated_request(
+        self,
+        url: URL = 'https://api.example.com/protected',
+    ) -> HTTPResponse:
+        """Use context from SetupWorkflow."""
+        api_key = self.context.get('api_key', '')
+        return await self.client.http.get(
+            url, 
+            headers={'X-API-Key': api_key}
+        )
+```
+
+---
+
+#### Detection Logic in Distributed Manager
+
+```python
+def _is_test_workflow(self, workflow) -> bool:
+    """
+    Determine if a workflow is a test workflow.
+    
+    A workflow is a test workflow if it has ANY hook with
+    hook_type == HookType.TEST. The Hook class sets this
+    automatically based on return type annotations.
+    """
+    import inspect
+    from hyperscale.core.hooks import Hook
+    
+    for name, member in inspect.getmembers(workflow):
+        if isinstance(member, Hook) and member.hook_type == HookType.TEST:
+            return True
+    return False
+```
+
+---
+
+#### Core Allocation Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      CORE ALLOCATION BY WORKFLOW TYPE                        │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
 │  │ TEST WORKFLOW                                                          │ │
 │  │                                                                         │ │
-│  │  class LoadTestWorkflow(Workflow):                                     │ │
-│  │      @step()                                                            │ │
-│  │      async def get_users(self) -> HTTPResponse:  # ← HookType.TEST     │ │
-│  │          return await self.client.get('/users')                        │ │
+│  │  Detection:                                                             │ │
+│  │  • @step() decorator + CallResult return type (HTTPResponse, etc.)     │ │
+│  │  • Hook.hook_type == HookType.TEST                                      │ │
 │  │                                                                         │ │
-│  │  Characteristics:                                                       │ │
-│  │  • Has @step() decorated methods with CallResult return types          │ │
-│  │  • Participates in thread allocation via StagePriority                 │ │
-│  │  • VUs are distributed across allocated threads                        │ │
-│  │  • Uses workflow.vus / threads for per-thread VU calculation          │ │
+│  │  Core Allocation:                                                       │ │
+│  │  • Based on workflow.priority (default: AUTO)                          │ │
+│  │  • AUTO: 1 to 100% of pool (single workflow gets all cores)            │ │
+│  │  • LOW:  1 to 25% of pool                                               │ │
+│  │  • NORMAL: 25% to 75% of pool                                           │ │
+│  │  • HIGH: 75% to 100% of pool                                            │ │
+│  │  • EXCLUSIVE: 100% of pool                                              │ │
+│  │                                                                         │ │
+│  │  Example: pool=8 cores, priority=NORMAL, vus=50000                      │ │
+│  │  → Gets 2-6 cores (25-75% of 8)                                         │ │
+│  │  → 50000 VUs distributed across cores (e.g., ~8333 VUs/core)           │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ NON-TEST WORKFLOW (Setup/Teardown/Utility)                             │ │
+│  │ NON-TEST WORKFLOW                                                       │ │
 │  │                                                                         │ │
-│  │  class SetupWorkflow(Workflow):                                        │ │
-│  │      @action()                                                          │ │
-│  │      async def setup_data(self) -> None:  # ← HookType.ACTION          │ │
-│  │          self.context['data'] = load_test_data()                       │ │
+│  │  Detection:                                                             │ │
+│  │  • @step() with non-CallResult return (dict, None, etc.)               │ │
+│  │  • @action(), @check(), @metric() decorators                            │ │
+│  │  • Hook.hook_type != HookType.TEST                                      │ │
 │  │                                                                         │ │
-│  │  Characteristics:                                                       │ │
-│  │  • Only has @action(), @check(), or @metric() hooks                    │ │
-│  │  • Gets threads = 0 in provisioning (bypasses partition)              │ │
-│  │  • Runs on single thread                                               │ │
-│  │  • Primarily for context setup/teardown                                │ │
+│  │  Core Allocation:                                                       │ │
+│  │  • ALWAYS 1 core (regardless of vus, priority, or pool size)           │ │
+│  │  • Non-test workflows don't parallelize load testing                   │ │
+│  │  • Used for setup, teardown, data processing, etc.                     │ │
+│  │                                                                         │ │
+│  │  Example: pool=8 cores, vus=10000                                       │ │
+│  │  → Gets 1 core (VUs don't affect allocation for non-test)              │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ⚠️  IMPORTANT: VUs ≠ Cores                                                 │
+│      VUs (virtual users) can be 50,000+ and are distributed across cores.   │
+│      Core allocation is determined by priority, NOT by VU count.            │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+#### WorkflowDispatch Message Structure
+
+The manager sends both `vus` and `cores` to workers:
+
+```python
+@dataclass(slots=True)
+class WorkflowDispatch(Message):
+    """Dispatch a single workflow to a worker."""
+    job_id: str              # Parent job identifier
+    workflow_id: str         # Unique workflow instance ID
+    workflow: bytes          # Cloudpickled Workflow class
+    context: bytes           # Cloudpickled context dict
+    vus: int                 # Virtual users (can be 50k+)
+    cores: int               # CPU cores to allocate (from priority)
+    timeout_seconds: float   # Execution timeout
+    fence_token: int         # Fencing token for at-most-once
+    context_version: int     # Layer version for staleness detection
+    dependency_context: bytes # Context from dependencies
+```
+
+Workers allocate `cores` CPU cores and distribute `vus` virtual users across them.
 
 ### Step 2: Priority-Based Thread Allocation
 
