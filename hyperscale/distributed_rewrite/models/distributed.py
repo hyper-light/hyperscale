@@ -404,6 +404,13 @@ class WorkflowDispatch(Message):
     
     Sent from manager to worker for execution.
     
+    Resource Model:
+    - vus: Virtual users (can be large, e.g., 50,000)
+    - cores: CPU cores to allocate (determined by workflow priority)
+    
+    VUs are distributed across the allocated cores. For example:
+    - 50,000 VUs / 4 cores = 12,500 VUs per core
+    
     Context Consistency Protocol:
     - context_version: The layer version this dispatch is for
     - dependency_context: Context from dependencies (subset of full context)
@@ -414,7 +421,8 @@ class WorkflowDispatch(Message):
     workflow_id: str             # Unique workflow instance ID
     workflow: bytes              # Cloudpickled Workflow class
     context: bytes               # Cloudpickled context dict (legacy, may be empty)
-    vus: int                     # Cores to use
+    vus: int                     # Virtual users (can be 50k+)
+    cores: int                   # CPU cores to allocate (from priority)
     timeout_seconds: float       # Execution timeout
     fence_token: int             # Fencing token for at-most-once
     # Context Consistency Protocol fields

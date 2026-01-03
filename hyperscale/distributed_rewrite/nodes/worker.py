@@ -1052,14 +1052,16 @@ class WorkerServer(HealthAwareServer):
         try:
             dispatch = WorkflowDispatch.load(data)
 
-            allocated_vus = dispatch.vus
+            # VUs are the virtual users, cores are the CPU cores to allocate
+            vus_for_workflow = dispatch.vus
+            cores_to_allocate = dispatch.cores
             
             # Check if we can accept this workflow
-            if self._available_cores < dispatch.vus:
+            if self._available_cores < cores_to_allocate:
                 ack = WorkflowDispatchAck(
                     workflow_id=dispatch.workflow_id,
                     accepted=False,
-                    error=f"Insufficient cores: need {dispatch.vus}, have {self._available_cores}",
+                    error=f"Insufficient cores: need {cores_to_allocate}, have {self._available_cores}",
                 )
                 return ack.dump()
             
@@ -1072,13 +1074,13 @@ class WorkerServer(HealthAwareServer):
                 )
                 return ack.dump()
             
-            # Allocate cores to this workflow
-            allocated_cores = self._allocate_cores(dispatch.workflow_id, dispatch.vus)
+            # Allocate cores to this workflow (cores, not VUs!)
+            allocated_cores = self._allocate_cores(dispatch.workflow_id, cores_to_allocate)
             if not allocated_cores:
                 ack = WorkflowDispatchAck(
                     workflow_id=dispatch.workflow_id,
                     accepted=False,
-                    error=f"Failed to allocate {dispatch.vus} cores",
+                    error=f"Failed to allocate {cores_to_allocate} cores",
                 )
                 return ack.dump()
             
@@ -1104,13 +1106,15 @@ class WorkerServer(HealthAwareServer):
             self._workflow_cancel_events[dispatch.workflow_id] = cancel_event
             
             # Start execution task via TaskRunner
+            # vus_for_workflow = VUs (virtual users, can be 50k+)
+            # len(allocated_cores) = CPU cores (from priority, e.g., 4)
             token = self._task_runner.run(
                 self._execute_workflow,
                 dispatch,
                 progress,
                 cancel_event,
-                allocated_vus,
-                len(allocated_cores),  # Pass count, not the list
+                vus_for_workflow,  # VUs for the workflow
+                len(allocated_cores),  # CPU cores allocated
                 alias=f"workflow:{dispatch.workflow_id}",
             )
             self._workflow_tokens[dispatch.workflow_id] = token
@@ -1119,7 +1123,7 @@ class WorkerServer(HealthAwareServer):
             ack = WorkflowDispatchAck(
                 workflow_id=dispatch.workflow_id,
                 accepted=True,
-                cores_assigned=dispatch.vus,
+                cores_assigned=cores_to_allocate,
             )
             return ack.dump()
             
@@ -1302,12 +1306,14 @@ class WorkerServer(HealthAwareServer):
                     for step_name, stats in workflow_status_update.step_stats.items()
                 ]
                 
-                # Estimate cores_completed
+                # Estimate cores_completed based on work completed
                 total_cores = len(progress.assigned_cores)
                 if total_cores > 0:
+                    # Use VUs as the total work units for estimation
+                    total_work = max(dispatch.vus * 100, 1)  # VUs * iterations estimate
                     estimated_complete = min(
                         total_cores,
-                        int(total_cores * (workflow_status_update.completed_count / max(dispatch.vus * 100, 1)))
+                        int(total_cores * (workflow_status_update.completed_count / total_work))
                     )
                     progress.cores_completed = estimated_complete
                 

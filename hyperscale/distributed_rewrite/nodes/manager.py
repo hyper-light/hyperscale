@@ -32,6 +32,8 @@ import networkx
 
 from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.state.context import Context
+from hyperscale.core.jobs.workers.stage_priority import StagePriority
+from hyperscale.core.hooks import HookType
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, ManagerStateEmbedder
@@ -1484,6 +1486,125 @@ class ManagerServer(HealthAwareServer):
             for node_id, status in self._worker_status.items()
             if node_id in healthy_ids
         )
+    
+    def _get_total_available_cores(self) -> int:
+        """Get total available cores across all healthy workers for priority calculation."""
+        return self._get_available_cores_for_healthy_workers()
+    
+    def _get_workflow_priority(self, workflow) -> StagePriority:
+        """
+        Get the priority of a workflow.
+        
+        Workflows can specify priority via a 'priority' attribute.
+        If not specified, defaults to AUTO.
+        """
+        priority_attr = getattr(workflow, 'priority', None)
+        if priority_attr is None:
+            return StagePriority.AUTO
+        
+        if isinstance(priority_attr, StagePriority):
+            return priority_attr
+        
+        if isinstance(priority_attr, str):
+            return StagePriority.map(priority_attr.lower())
+        
+        return StagePriority.AUTO
+    
+    def _is_test_workflow(self, workflow) -> bool:
+        """
+        Determine if a workflow is a test workflow.
+        
+        A workflow is considered a test workflow if it has any hooks
+        with hook_type == HookType.TEST.
+        """
+        import inspect
+        from hyperscale.core.hooks import Hook
+        
+        for name, member in inspect.getmembers(workflow):
+            if isinstance(member, Hook) and member.hook_type == HookType.TEST:
+                return True
+        return False
+    
+    def _calculate_priority_based_cores(
+        self,
+        workflow_by_name: dict[str, tuple[int, Any]],
+        workflow_priorities: dict[str, StagePriority],
+        workflow_is_test: dict[str, bool],
+        total_pool: int,
+    ) -> dict[str, int]:
+        """
+        Calculate cores for each workflow based on priority.
+        
+        This mirrors the logic in Provisioner.partion_by_priority:
+        - Priority determines what % of the pool a workflow can use
+        - LOW: 1 to 25% of pool
+        - NORMAL: 25% to 75% of pool
+        - HIGH: 75% to 100% of pool
+        - EXCLUSIVE: 100% of pool
+        - AUTO: 1 to 100% of pool
+        
+        Non-test workflows get 1 core (they don't parallelize).
+        """
+        import math
+        
+        workflow_cores: dict[str, int] = {}
+        workflows_list = list(workflow_by_name.keys())
+        
+        if not workflows_list:
+            return workflow_cores
+        
+        # Separate test and non-test workflows
+        test_workflows = [name for name in workflows_list if workflow_is_test.get(name, False)]
+        non_test_workflows = [name for name in workflows_list if not workflow_is_test.get(name, False)]
+        
+        # Non-test workflows always get 1 core (they don't benefit from parallelization)
+        for name in non_test_workflows:
+            workflow_cores[name] = 1
+        
+        if not test_workflows:
+            return workflow_cores
+        
+        # For test workflows, calculate based on priority
+        if len(test_workflows) == 1:
+            # Single test workflow gets its priority's max allocation
+            name = test_workflows[0]
+            priority = workflow_priorities.get(name, StagePriority.AUTO)
+            min_cores, max_cores = StagePriority.get_worker_allocation_range(priority, total_pool)
+            workflow_cores[name] = max(max_cores, 1)
+        else:
+            # Multiple test workflows: distribute based on priority
+            # Higher priority workflows get more cores
+            
+            # Get min/max for each workflow
+            allocations: dict[str, tuple[int, int]] = {}
+            for name in test_workflows:
+                priority = workflow_priorities.get(name, StagePriority.AUTO)
+                min_cores, max_cores = StagePriority.get_worker_allocation_range(priority, total_pool)
+                allocations[name] = (min_cores, max_cores)
+            
+            # Sort by priority (highest first)
+            sorted_workflows = sorted(
+                test_workflows,
+                key=lambda n: workflow_priorities.get(n, StagePriority.AUTO).value,
+                reverse=True
+            )
+            
+            # Allocate cores, starting with highest priority
+            remaining_cores = total_pool
+            for name in sorted_workflows:
+                min_cores, max_cores = allocations[name]
+                # Allocate as much as possible up to max, but leave room for others
+                others_min = sum(
+                    allocations[n][0] 
+                    for n in sorted_workflows 
+                    if n != name and n not in workflow_cores
+                )
+                available = remaining_cores - others_min
+                cores = max(min(available, max_cores), min_cores, 1)
+                workflow_cores[name] = cores
+                remaining_cores -= cores
+        
+        return workflow_cores
     
     # =========================================================================
     # Job Leader Helpers (Context Consistency Protocol)
@@ -3640,13 +3761,14 @@ class ManagerServer(HealthAwareServer):
         # Re-dispatch the workflow to the new worker
         try:
             # Create new dispatch with new fence token
-            # (original_dispatch was already parsed above to get vus_needed)
+            # (original_dispatch was already parsed above to get cores_needed)
             new_dispatch = WorkflowDispatch(
                 job_id=original_dispatch.job_id,
                 workflow_id=original_dispatch.workflow_id,
                 workflow=original_dispatch.workflow,
                 context=original_dispatch.context,
                 vus=original_dispatch.vus,
+                cores=original_dispatch.cores,
                 timeout_seconds=original_dispatch.timeout_seconds,
                 fence_token=new_fence_token,
                 # Preserve context from original dispatch
@@ -4037,7 +4159,9 @@ class ManagerServer(HealthAwareServer):
         # Build dependency graph
         workflow_graph = networkx.DiGraph()
         workflow_by_name: dict[str, tuple[int, Any]] = {}  # name -> (index, workflow)
-        workflow_cores: dict[str, int] = {}  # name -> cores needed
+        workflow_vus: dict[str, int] = {}  # name -> vus (for passing to worker)
+        workflow_priorities: dict[str, StagePriority] = {}  # name -> priority
+        workflow_is_test: dict[str, bool] = {}  # name -> is_test_workflow
         sources: list[str] = []  # Workflows with no dependencies
         
         for i, workflow in enumerate(workflows):
@@ -4075,8 +4199,9 @@ class ManagerServer(HealthAwareServer):
                     inner_wf = inner_wf()
                 name = inner_wf.name
                 workflow_by_name[name] = (i, inner_wf)
-                # Use workflow's vus if specified, otherwise use submission default
-                workflow_cores[name] = getattr(inner_wf, 'vus', submission.vus)
+                workflow_vus[name] = getattr(inner_wf, 'vus', submission.vus)
+                workflow_priorities[name] = self._get_workflow_priority(inner_wf)
+                workflow_is_test[name] = self._is_test_workflow(inner_wf)
                 workflow_graph.add_node(name)
                 for dep in workflow.dependencies:
                     workflow_graph.add_edge(dep, name)
@@ -4084,9 +4209,34 @@ class ManagerServer(HealthAwareServer):
                 # Regular workflow (no dependencies)
                 name = workflow.name
                 workflow_by_name[name] = (i, workflow)
-                workflow_cores[name] = getattr(workflow, 'vus', submission.vus)
+                workflow_vus[name] = getattr(workflow, 'vus', submission.vus)
+                workflow_priorities[name] = self._get_workflow_priority(workflow)
+                workflow_is_test[name] = self._is_test_workflow(workflow)
                 workflow_graph.add_node(name)
                 sources.append(name)
+        
+        # Calculate cores based on priority (NOT vus!)
+        # Total pool = sum of available cores across all healthy workers
+        total_pool = self._get_total_available_cores()
+        if total_pool == 0:
+            total_pool = 1  # Fallback to at least 1 core
+        
+        workflow_cores = self._calculate_priority_based_cores(
+            workflow_by_name,
+            workflow_priorities,
+            workflow_is_test,
+            total_pool,
+        )
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Core allocation for job {submission.job_id}: pool={total_pool}, allocations={workflow_cores}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
         
         # If no sources, all workflows have dependencies - find roots
         if not sources:
@@ -4184,10 +4334,11 @@ class ManagerServer(HealthAwareServer):
                 for wf_name in layer:
                     idx, wf = workflow_by_name[wf_name]
                     cores_needed = workflow_cores[wf_name]
+                    vus_for_workflow = workflow_vus[wf_name]
                     self._task_runner.run(
                         self._udp_logger.log,
                         ServerInfo(
-                            message=f"Creating dispatch task for {wf_name} (idx={idx}, cores={cores_needed})",
+                            message=f"Creating dispatch task for {wf_name} (idx={idx}, cores={cores_needed}, vus={vus_for_workflow})",
                             node_host=self._host,
                             node_port=self._tcp_port,
                             node_id=self._node_id.short,
@@ -4195,7 +4346,7 @@ class ManagerServer(HealthAwareServer):
                     )
                     dispatch_tasks.append(
                         self._dispatch_single_workflow(
-                            submission, idx, wf, cores_needed, cloudpickle
+                            submission, idx, wf, cores_needed, vus_for_workflow, cloudpickle
                         )
                     )
                 
@@ -4243,10 +4394,19 @@ class ManagerServer(HealthAwareServer):
         idx: int,
         workflow: Any,
         cores_needed: int,
+        vus: int,
         cloudpickle,
     ) -> bool:
         """
         Dispatch a single workflow to a worker with resource-aware waiting.
+        
+        Args:
+            submission: The job submission
+            idx: Workflow index within the job
+            workflow: The workflow instance
+            cores_needed: CPU cores to allocate (from priority calculation)
+            vus: Virtual users (can be large, e.g., 50,000)
+            cloudpickle: The cloudpickle module for serialization
         
         If no worker has sufficient capacity, waits with exponential backoff
         until resources become available or timeout is reached.
@@ -4396,7 +4556,8 @@ class ManagerServer(HealthAwareServer):
             workflow_id=workflow_id,
             workflow=cloudpickle.dumps(workflow),
             context=cloudpickle.dumps({}),  # Legacy field, kept for compatibility
-            vus=cores_needed,
+            vus=vus,  # Virtual users (can be 50k+)
+            cores=cores_needed,  # CPU cores (from priority calculation)
             timeout_seconds=submission.timeout_seconds,
             fence_token=provision.fence_token,
             context_version=context_version,
