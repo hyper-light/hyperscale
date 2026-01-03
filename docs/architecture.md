@@ -4478,6 +4478,346 @@ class URL(OptimizedArg):
 
 ---
 
+### Step Dependencies and the Step DAG
+
+Steps within a workflow can depend on other steps, forming a **Directed Acyclic Graph (DAG)**. This determines execution order within each VU's loop.
+
+#### Declaring Step Dependencies
+
+Pass string names of other steps to `@step()`:
+
+```python
+from hyperscale.graph import Workflow, step
+from hyperscale.testing import URL, HTTPResponse
+
+
+class APITestWorkflow(Workflow):
+    """
+    Step DAG:
+    
+            authenticate
+            /          \
+       get_users    get_config    ← Run in parallel (same dependency)
+            \          /
+           process_data
+    """
+    vus = 5000
+    duration = "3m"
+    
+    @step()  # No args = root step (no dependencies)
+    async def authenticate(
+        self,
+        url: URL = 'https://api.example.com/auth',
+    ) -> HTTPResponse:
+        """First step - authenticates and returns token."""
+        return await self.client.http.post(url, json={"user": "test"})
+    
+    @step('authenticate')  # Depends on 'authenticate'
+    async def get_users(
+        self,
+        url: URL = 'https://api.example.com/users',
+        authenticate: HTTPResponse | None = None,  # ← Gets authenticate's result!
+    ) -> HTTPResponse:
+        """Runs after authenticate. Can access auth response via kwarg."""
+        # authenticate kwarg contains the HTTPResponse from authenticate step
+        token = authenticate.json().get('token') if authenticate else None
+        return await self.client.http.get(url)
+    
+    @step('authenticate')  # Also depends on 'authenticate' (parallel to get_users)
+    async def get_config(
+        self,
+        url: URL = 'https://api.example.com/config',
+    ) -> HTTPResponse:
+        """Runs in parallel with get_users (both depend only on authenticate)."""
+        return await self.client.http.get(url)
+    
+    @step('get_users', 'get_config')  # Depends on BOTH get_users AND get_config
+    async def process_data(
+        self,
+        url: URL = 'https://api.example.com/process',
+        get_users: HTTPResponse | None = None,    # ← Gets get_users result
+        get_config: HTTPResponse | None = None,   # ← Gets get_config result
+    ) -> HTTPResponse:
+        """Final step - waits for both parallel steps to complete."""
+        # Can access results from both previous steps
+        users = get_users.json() if get_users else []
+        config = get_config.json() if get_config else {}
+        return await self.client.http.post(url, json={"users": users})
+```
+
+---
+
+#### DAG Execution Order
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         STEP DAG EXECUTION                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Each VU executes the DAG in topological order:                             │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Layer 0: [authenticate]           ← Execute, store result          │    │
+│  │                  │                                                   │    │
+│  │                  ▼                                                   │    │
+│  │  Layer 1: [get_users, get_config]  ← Execute in parallel            │    │
+│  │                  │                                                   │    │
+│  │                  ▼                                                   │    │
+│  │  Layer 2: [process_data]           ← Wait for both, then execute    │    │
+│  │                  │                                                   │    │
+│  │                  ▼                                                   │    │
+│  │  Loop back to Layer 0 until duration expires                        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Steps in the same layer (same dependencies) run concurrently.              │
+│  Metrics are collected for each step separately.                            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Dependency Rules
+
+| Pattern | Meaning |
+|---------|---------|
+| `@step()` | Root step, no dependencies |
+| `@step('a')` | Depends on step `a` |
+| `@step('a', 'b')` | Depends on BOTH `a` AND `b` |
+| `@step('a')` + `@step('a')` | Both depend on `a`, run in parallel |
+
+**Important Constraints**:
+
+1. **Workflow Islands**: Steps can ONLY reference other steps within the SAME workflow class. Cross-workflow data sharing uses `@state()` methods only.
+
+2. **Acyclic Only**: Dependencies must form a DAG. Circular dependencies will cause errors.
+
+3. **String Names**: Dependencies are the **function names** as strings, not the functions themselves.
+
+---
+
+### VU-Isolated Context and Step Data Passing
+
+#### Each VU Gets an Isolated Context Copy
+
+When a VU starts its loop iteration, it receives a **shallow copy** of the workflow context:
+
+```python
+# From WorkflowRunner._spawn_vu()
+context: Dict[str, Any] = dict(context)  # ← Fresh copy for this VU
+```
+
+This ensures:
+- **No cross-VU interference**: VU #1's step results don't affect VU #2
+- **Clean slate each iteration**: Each loop starts fresh
+- **Thread safety**: No shared mutable state between concurrent VUs
+
+---
+
+#### Step Results Stored Under Function Name
+
+After each step completes, its result is stored in the VU's context under the step's function name:
+
+```python
+# From WorkflowRunner._spawn_vu()
+for complete in completed:
+    step_name = complete.get_name()       # e.g., "authenticate"
+    result = complete.result()            # HTTPResponse object
+    context[step_name] = result           # context["authenticate"] = HTTPResponse
+```
+
+---
+
+#### Accessing Previous Step Data
+
+Subsequent steps access previous results via **keyword arguments** with matching names:
+
+```python
+# Hyperscale matches kwarg names to context keys
+for hook in hook_set.values():
+    hook.context_args.update(
+        {key: context[key] for key in context if key in hook.kwarg_names}
+    )
+```
+
+**Example**:
+
+```python
+@step('authenticate')
+async def get_users(
+    self,
+    url: URL = 'https://api.example.com/users',
+    authenticate: HTTPResponse | None = None,  # ← Matches context['authenticate']
+) -> HTTPResponse:
+    """
+    The 'authenticate' kwarg will receive the HTTPResponse
+    from the authenticate() step because:
+    1. 'authenticate' is in hook.kwarg_names
+    2. context['authenticate'] exists (from previous step)
+    3. Hyperscale passes context['authenticate'] to this kwarg
+    """
+    if authenticate and authenticate.status_code == 200:
+        token = authenticate.json().get('token')
+        # Use token in this request
+    return await self.client.http.get(url)
+```
+
+---
+
+#### Optimized Args Override Context
+
+**Important**: If a keyword argument has an `OptimizedArg` type hint (`URL`, `Headers`, `Data`, etc.), the optimized value takes precedence over context lookup.
+
+```python
+@step('step_one')
+async def step_two(
+    self,
+    url: URL = 'https://api.example.com',  # ← OptimizedArg - NOT from context!
+    step_one: HTTPResponse | None = None,   # ← From context (not OptimizedArg type)
+) -> HTTPResponse:
+    # 'url' uses the pre-optimized URL value
+    # 'step_one' gets the HTTPResponse from step_one's execution
+    return await self.client.http.get(url)
+```
+
+---
+
+#### Complete Data Flow Example
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    VU DATA FLOW THROUGH STEP DAG                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  VU #42 Loop Iteration:                                                     │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  1. VU starts with fresh context copy:                              │    │
+│  │     context = {}                                                     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                            │                                                 │
+│                            ▼                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  2. Execute authenticate():                                          │    │
+│  │     result = HTTPResponse(status=200, body={"token": "abc123"})     │    │
+│  │     context["authenticate"] = result                                 │    │
+│  │                                                                      │    │
+│  │     context = {"authenticate": HTTPResponse(...)}                   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                            │                                                 │
+│                            ▼                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  3. Execute get_users(authenticate=context["authenticate"]):        │    │
+│  │     # authenticate kwarg receives the HTTPResponse from step 2      │    │
+│  │     result = HTTPResponse(status=200, body=[{user1}, {user2}])      │    │
+│  │     context["get_users"] = result                                   │    │
+│  │                                                                      │    │
+│  │  3. Execute get_config() in PARALLEL:                               │    │
+│  │     result = HTTPResponse(status=200, body={"theme": "dark"})       │    │
+│  │     context["get_config"] = result                                  │    │
+│  │                                                                      │    │
+│  │     context = {                                                      │    │
+│  │       "authenticate": HTTPResponse(...),                            │    │
+│  │       "get_users": HTTPResponse(...),                               │    │
+│  │       "get_config": HTTPResponse(...)                               │    │
+│  │     }                                                                │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                            │                                                 │
+│                            ▼                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  4. Execute process_data(                                            │    │
+│  │       get_users=context["get_users"],                               │    │
+│  │       get_config=context["get_config"]                              │    │
+│  │     ):                                                               │    │
+│  │     # Both kwargs receive results from parallel steps               │    │
+│  │     result = HTTPResponse(status=201, body={"processed": True})     │    │
+│  │     context["process_data"] = result                                │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                            │                                                 │
+│                            ▼                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  5. Loop complete - VU #42 starts fresh iteration                   │    │
+│  │     (context reset for next loop)                                   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Meanwhile, VU #1, #2, ... #41, #43, ... #5000 are doing the same thing    │
+│  with their own isolated context copies.                                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### One Client Return Per Test Step
+
+Each test step can make multiple client calls, but only **ONE** response can be returned for metrics:
+
+```python
+@step()
+async def multi_call_step(
+    self,
+    url1: URL = 'https://api.example.com/check',
+    url2: URL = 'https://api.example.com/data',
+) -> HTTPResponse:
+    """
+    Can call multiple clients, but only return one for metrics.
+    """
+    # Call 1 - not measured (result discarded for metrics)
+    check_response = await self.client.http.get(url1)
+    
+    if check_response.status_code != 200:
+        # Early exit - still need to return HTTPResponse
+        return check_response
+    
+    # Call 2 - THIS is what gets measured (returned)
+    return await self.client.http.post(url2, json={"checked": True})
+```
+
+**Best Practice**: One client call per step for clear metrics.
+
+---
+
+#### Workflows Are Islands
+
+Steps can ONLY depend on other steps within the **same workflow class**:
+
+```python
+class WorkflowA(Workflow):
+    @step()
+    async def step_a(self) -> HTTPResponse: ...
+
+class WorkflowB(Workflow):
+    @step('step_a')  # ❌ ERROR: Can't reference WorkflowA's step
+    async def step_b(self) -> HTTPResponse: ...
+```
+
+**Cross-workflow communication** uses `@state()` methods and workflow-level `Context`:
+
+```python
+class WorkflowA(Workflow):
+    @step()
+    async def get_data(self) -> HTTPResponse:
+        return await self.client.http.get(url)
+    
+    @state('WorkflowB')  # Share state TO WorkflowB
+    def share_token(self) -> Provide[str]:
+        return self.context.get('token', '')
+
+
+@depends('WorkflowA')
+class WorkflowB(Workflow):
+    @state('WorkflowA')  # Receive state FROM WorkflowA
+    def receive_token(self, share_token: str | None = None) -> Use[str]:
+        return share_token
+    
+    @step()
+    async def use_token(self) -> HTTPResponse:
+        token = self.context.get('share_token', '')  # From WorkflowA
+        return await self.client.http.get(url, headers={'Auth': token})
+```
+
+---
+
 ### Step 2: Priority-Based Thread Allocation
 
 **Critical**: Thread allocation is calculated from the **TOTAL pool size** (all registered workers' cores), NOT available cores. This determines how many cores the workflow MAY request.

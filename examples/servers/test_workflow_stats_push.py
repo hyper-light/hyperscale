@@ -62,7 +62,43 @@ class TestWorkflow(Workflow):
     duration = "5s"
     
     @step()
-    async def load_test(
+    async def step_one(
+        self,
+        url: URL = 'https://httpbin.org/get',
+    ) -> HTTPResponse:
+        """Test action - returns HTTPResponse from client call."""
+        # This makes it a "test workflow" because:
+        # 1. @step() decorator creates a Hook
+        # 2. Return type HTTPResponse is a CallResult subclass
+        # 3. Hook.hook_type gets set to HookType.TEST
+        return await self.client.http.get(url)
+
+    @step('step_one')
+    async def step_two(
+        self,
+        url: URL = 'https://httpbin.org/get',
+    ) -> HTTPResponse:
+        """Test action - returns HTTPResponse from client call."""
+        # This makes it a "test workflow" because:
+        # 1. @step() decorator creates a Hook
+        # 2. Return type HTTPResponse is a CallResult subclass
+        # 3. Hook.hook_type gets set to HookType.TEST
+        return await self.client.http.get(url)
+
+    @step('step_one')
+    async def step_three(
+        self,
+        url: URL = 'https://httpbin.org/get',
+    ) -> HTTPResponse:
+        """Test action - returns HTTPResponse from client call."""
+        # This makes it a "test workflow" because:
+        # 1. @step() decorator creates a Hook
+        # 2. Return type HTTPResponse is a CallResult subclass
+        # 3. Hook.hook_type gets set to HookType.TEST
+        return await self.client.http.get(url)
+    
+    @step('step_two', 'step_three')
+    async def step_four(
         self,
         url: URL = 'https://httpbin.org/get',
     ) -> HTTPResponse:
