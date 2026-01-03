@@ -2431,11 +2431,8 @@ class ManagerServer(HealthAwareServer):
         of a workflow, we can immediately consider those cores available
         for new workflows, without waiting for the entire workflow to complete.
         """
-        import sys
-        print(f"[DEBUG manager.workflow_progress] Received from {addr}", file=sys.stderr, flush=True)
         try:
             progress = WorkflowProgress.load(data)
-            print(f"[DEBUG manager.workflow_progress] job={progress.job_id}, wf={progress.workflow_id}, completed={progress.completed_count}, failed={progress.failed_count}", file=sys.stderr, flush=True)
             
             # Update job progress
             job = self._jobs.get(progress.job_id)
@@ -2516,11 +2513,8 @@ class ManagerServer(HealthAwareServer):
         3. Check job completion
         4. Forward to gates or clients if appropriate
         """
-        import sys
-        print(f"[DEBUG manager.workflow_final_result] Received from {addr}, data len={len(data)}", file=sys.stderr, flush=True)
         try:
             result = WorkflowFinalResult.load(data)
-            print(f"[DEBUG manager.workflow_final_result] Parsed: job={result.job_id}, wf={result.workflow_id}, status={result.status}", file=sys.stderr, flush=True)
             
             self._task_runner.run(
                 self._udp_logger.log,
@@ -2567,15 +2561,11 @@ class ManagerServer(HealthAwareServer):
                     self._task_runner.run(self._send_job_progress_to_gate, job)
             
             # Check if job is complete
-            is_complete = self._is_job_complete(result.job_id)
-            print(f"[DEBUG manager.workflow_final_result] _is_job_complete={is_complete}", file=sys.stderr, flush=True)
-            if is_complete:
-                print(f"[DEBUG manager.workflow_final_result] Calling _handle_job_completion", file=sys.stderr, flush=True)
+            if self._is_job_complete(result.job_id):
                 await self._handle_job_completion(result.job_id)
             
             self._increment_version()
             
-            print(f"[DEBUG manager.workflow_final_result] Returning b'ok'", file=sys.stderr, flush=True)
             return b'ok'
             
         except Exception as e:
@@ -2660,10 +2650,6 @@ class ManagerServer(HealthAwareServer):
         final_results = self._workflow_final_results.get(job_id, {})
         workflow_assignments = self._workflow_assignments.get(job_id, {})
         
-        import sys
-        print(f"[DEBUG manager._is_job_complete] job_id={job_id}, final_results={len(final_results)}, workflow_assignments={len(workflow_assignments)}", file=sys.stderr, flush=True)
-        print(f"[DEBUG manager._is_job_complete] _workflow_assignments keys: {list(self._workflow_assignments.keys())}", file=sys.stderr, flush=True)
-        
         # Job is complete when we have final results for all assigned workflows
         if len(workflow_assignments) == 0:
             return False
@@ -2672,11 +2658,8 @@ class ManagerServer(HealthAwareServer):
     
     async def _handle_job_completion(self, job_id: str) -> None:
         """Handle job completion - build and send JobFinalResult."""
-        import sys
-        print(f"[DEBUG manager._handle_job_completion] job_id={job_id}", file=sys.stderr, flush=True)
         job = self._jobs.get(job_id)
         if not job:
-            print(f"[DEBUG manager._handle_job_completion] Job not found!", file=sys.stderr, flush=True)
             return
         
         # Determine overall status
@@ -2745,9 +2728,7 @@ class ManagerServer(HealthAwareServer):
         
         # Send directly to client (if no gates and callback registered)
         callback = self._job_callbacks.get(job_id)
-        print(f"[DEBUG manager._handle_job_completion] callback={callback}, gates={len(self._known_gates or [])}", file=sys.stderr, flush=True)
         if callback and not (self._known_gates or self._gate_addrs):
-            print(f"[DEBUG manager._handle_job_completion] Sending to client at {callback}", file=sys.stderr, flush=True)
             await self._send_job_final_result_to_client(job_final, callback)
     
     async def _send_job_final_result_to_gates(self, job_final: JobFinalResult) -> None:

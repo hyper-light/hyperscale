@@ -1140,18 +1140,14 @@ class WorkerServer(HealthAwareServer):
         allocated_cores: int,
     ):
         """Execute a workflow using WorkflowRunner."""
-        print(f"DEBUG _execute_workflow: ENTRY workflow_id={dispatch.workflow_id}")
         start_time = time.monotonic()
         run_id = hash(dispatch.workflow_id) % (2**31)
         error: Exception | None = None
         
         try:
             # Unpickle workflow and context
-            print(f"DEBUG _execute_workflow: loading workflow")
             workflow = dispatch.load_workflow()
-            print(f"DEBUG _execute_workflow: loaded workflow {workflow.name}")
             context_dict = dispatch.load_context()
-            print(f"DEBUG _execute_workflow: loaded context")
             
             progress.workflow_name = workflow.name
             progress.status = WorkflowStatus.RUNNING.value
@@ -1177,8 +1173,6 @@ class WorkerServer(HealthAwareServer):
             
             try:
                 # Execute the workflow
-                print(f"DEBUG _execute_workflow: calling RemoteGraphManager.execute_workflow")
-                print(f"DEBUG _execute_workflow: run_id={run_id}, vus={allocated_vus}, num_cores={allocated_cores}")
                 (
                     results_run_id,
                     results,
@@ -1192,7 +1186,6 @@ class WorkerServer(HealthAwareServer):
                     allocated_vus,
                     max(allocated_cores, 1),
                 )
-                print(f"DEBUG _execute_workflow: execute_workflow returned, status={status}")
 
                 progress.cores_completed = len(progress.assigned_cores)
 
@@ -1207,14 +1200,10 @@ class WorkerServer(HealthAwareServer):
                 context_updates = cloudpickle.dumps(context.dict() if context else {})
 
             except asyncio.CancelledError:
-                print(f"DEBUG _execute_workflow: CancelledError")
                 progress.status = WorkflowStatus.CANCELLED.value
                 workflow_error = "Cancelled"
                 raise
             except Exception as e:
-                print(f"DEBUG _execute_workflow: Exception during execution: {type(e).__name__}: {e}")
-                import traceback
-                traceback.print_exc()
                 progress.status = WorkflowStatus.FAILED.value
                 workflow_error = str(e)
             finally:
@@ -1230,7 +1219,6 @@ class WorkerServer(HealthAwareServer):
                 await self._send_progress_update(progress)
             
             # Send final result to manager
-            print(f"DEBUG _execute_workflow: preparing final result")
             final_result = WorkflowFinalResult(
                 job_id=dispatch.job_id,
                 workflow_id=dispatch.workflow_id,
@@ -1240,21 +1228,14 @@ class WorkerServer(HealthAwareServer):
                 context_updates=context_updates,
                 error=workflow_error,
             )
-            print(f"DEBUG _execute_workflow: sending final result, status={progress.status}")
             await self._send_final_result(final_result)
-            print(f"DEBUG _execute_workflow: final result sent")
                 
         except asyncio.CancelledError:
-            print(f"DEBUG _execute_workflow: outer CancelledError")
             progress.status = WorkflowStatus.CANCELLED.value
         except Exception as e:
-            print(f"DEBUG _execute_workflow: outer Exception: {type(e).__name__}: {e}")
-            import traceback
-            traceback.print_exc()
             progress.status = WorkflowStatus.FAILED.value
             error = str(error) if error else "Unknown error"
         finally:
-            print(f"DEBUG _execute_workflow: finally block, status={progress.status}")
             self._free_cores(dispatch.workflow_id)
             self._increment_version()
             
@@ -1278,8 +1259,6 @@ class WorkerServer(HealthAwareServer):
         cancel_event: asyncio.Event,
     ) -> None:
         """Monitor workflow progress and send updates to manager."""
-        import sys
-        print(f"[DEBUG worker._monitor_workflow_progress] Starting for {dispatch.workflow_id}", file=sys.stderr, flush=True)
         start_time = time.monotonic()
         workflow_name = progress.workflow_name
         
@@ -1345,11 +1324,8 @@ class WorkerServer(HealthAwareServer):
                 
                 # Send update
                 if self._healthy_manager_ids:
-                    print(f"[DEBUG worker._monitor_workflow_progress] Sending progress: completed={progress.completed_count}, failed={progress.failed_count}", file=sys.stderr, flush=True)
                     await self._send_progress_update(progress)
                     self._workflow_last_progress[dispatch.workflow_id] = time.monotonic()
-                else:
-                    print(f"[DEBUG worker._monitor_workflow_progress] No healthy managers to send to", file=sys.stderr, flush=True)
                 
             except asyncio.CancelledError:
                 break
@@ -1378,18 +1354,13 @@ class WorkerServer(HealthAwareServer):
             max_retries: Maximum retry attempts (default 2)
             base_delay: Base delay for exponential backoff (default 0.2s)
         """
-        import sys
         # Check circuit breaker first
         if self._is_manager_circuit_open():
-            print(f"[DEBUG worker._send_progress_update] Circuit open, not sending", file=sys.stderr, flush=True)
             return  # Fail fast - don't attempt communication
         
         manager_addr = self._get_primary_manager_tcp_addr()
         if not manager_addr:
-            print(f"[DEBUG worker._send_progress_update] No primary manager", file=sys.stderr, flush=True)
             return
-        
-        print(f"[DEBUG worker._send_progress_update] Sending to {manager_addr}: completed={progress.completed_count}, failed={progress.failed_count}", file=sys.stderr, flush=True)
         
         for attempt in range(max_retries + 1):
             try:

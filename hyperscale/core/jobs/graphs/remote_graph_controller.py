@@ -472,8 +472,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         vus: int,
         context: Context,
     ) -> Response[JobContext[WorkflowStatusUpdate]]:
-        import sys
-        print(f"[DEBUG remote_graph_controller.submit] Starting workflow={workflow.name}, run_id={run_id}, vus={vus}", file=sys.stderr, flush=True)
         async with self._logger.context(
             name=f"workflow_run_{run_id}",
         ) as ctx:
@@ -482,7 +480,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 name="debug",
             )
 
-            print(f"[DEBUG remote_graph_controller.submit] Calling self.send('start_workflow', ...)", file=sys.stderr, flush=True)
             response: Response[JobContext[WorkflowStatusUpdate]] = await self.send(
                 "start_workflow",
                 JobContext(
@@ -494,7 +491,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     run_id=run_id,
                 ),
             )
-            print(f"[DEBUG remote_graph_controller.submit] Got response: {type(response)}", file=sys.stderr, flush=True)
 
             (shard_id, workflow_status) = response
 
@@ -670,8 +666,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         shard_id: int,
         context: JobContext[WorkflowJob],
     ) -> JobContext[WorkflowStatusUpdate]:
-        import sys
-        print(f"[DEBUG remote_graph_controller.start_workflow] shard_id={shard_id}, workflow={context.data.workflow.name}, run_id={context.run_id}", file=sys.stderr, flush=True)
         task_id = self.tasks.create_task_id()
 
         snowflake = Snowflake.parse(shard_id)
@@ -826,8 +820,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         run_id: int,
         job: WorkflowJob,
     ):
-        import sys
-        print(f"[DEBUG remote_graph_controller.run_workflow TASK] Starting node_id={node_id}, run_id={run_id}, workflow={job.workflow.name}", file=sys.stderr, flush=True)
         async with self._logger.context(
             name=f"workflow_run_{run_id}",
         ) as ctx:
@@ -837,7 +829,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     name="trace",
                 )
 
-                print(f"[DEBUG remote_graph_controller.run_workflow TASK] Calling self._workflows.run()", file=sys.stderr, flush=True)
                 (
                     run_id,
                     results,
@@ -850,12 +841,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     job.context,
                     job.vus,
                 )
-                print(f"[DEBUG remote_graph_controller.run_workflow TASK] run() returned: status={status}, error={error}", file=sys.stderr, flush=True)
 
                 if context is None:
                     context = job.context
 
-                print(f"[DEBUG remote_graph_controller.run_workflow TASK] Calling push_results()", file=sys.stderr, flush=True)
                 await self.push_results(
                     node_id,
                     WorkflowResults(
@@ -867,7 +856,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     ),
                     run_id,
                 )
-                print(f"[DEBUG remote_graph_controller.run_workflow TASK] push_results() complete", file=sys.stderr, flush=True)
             except Exception as err:
                 await self.push_results(
                     node_id,

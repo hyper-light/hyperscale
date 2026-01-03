@@ -259,9 +259,6 @@ class WorkflowRunner:
         Exception | None,
         WorkflowStatus,
     ]:
-        import sys
-        print(f"[DEBUG workflow_runner.run] Starting run_id={run_id}, workflow={workflow.name}, vus={vus}", file=sys.stderr, flush=True)
-        
         default_config = {
             "node_id": self._node_id,
             "workflow": workflow.name,
@@ -300,9 +297,7 @@ class WorkflowRunner:
         async with self._logger.context(
             name=f"{workflow_slug}_{run_id}_logger",
         ) as ctx:
-            print(f"[DEBUG workflow_runner.run] Acquiring run check lock...", file=sys.stderr, flush=True)
             await self._run_check_lock.acquire()
-            print(f"[DEBUG workflow_runner.run] Lock acquired", file=sys.stderr, flush=True)
 
             await ctx.log_prepared(
                 message=f"Run {run_id} of Workflow {workflow.name} entering pre-pnding execution check",
@@ -367,13 +362,10 @@ class WorkflowRunner:
             )
 
             self._run_check_lock.release()
-            print(f"[DEBUG workflow_runner.run] Lock released, entering PENDING state", file=sys.stderr, flush=True)
 
             self.run_statuses[run_id][workflow.name] = WorkflowStatus.PENDING
 
-            print(f"[DEBUG workflow_runner.run] Waiting for workflows semaphore...", file=sys.stderr, flush=True)
             async with self._workflows_sem:
-                print(f"[DEBUG workflow_runner.run] Got semaphore, entering CREATED state", file=sys.stderr, flush=True)
                 workflow_name = workflow.name
 
                 await ctx.log_prepared(
@@ -407,7 +399,6 @@ class WorkflowRunner:
                 self._running_workflows[run_id][workflow.name] = workflow
 
                 try:
-                    print(f"[DEBUG workflow_runner.run] Starting _run_workflow task for {workflow.name}", file=sys.stderr, flush=True)
                     self._run_tasks[run_id][workflow_name] = asyncio.ensure_future(
                         self._run_workflow(
                             run_id,
@@ -417,11 +408,9 @@ class WorkflowRunner:
                         )
                     )
 
-                    print(f"[DEBUG workflow_runner.run] Waiting for _run_workflow to complete...", file=sys.stderr, flush=True)
                     (results, updated_context) = await self._run_tasks[run_id][
                         workflow_name
                     ]
-                    print(f"[DEBUG workflow_runner.run] _run_workflow completed, got results", file=sys.stderr, flush=True)
 
                     await ctx.log_prepared(
                         message=f"Run {run_id} of Workflow {workflow.name} successfully halted run",
@@ -505,8 +494,6 @@ class WorkflowRunner:
         ],
         Context,
     ]:
-        import sys
-        print(f"[DEBUG workflow_runner._run_workflow] Starting run_id={run_id}, workflow={workflow.name}, vus={vus}", file=sys.stderr, flush=True)
         workflow_slug = workflow.name.lower()
 
         async with self._logger.context(
@@ -529,7 +516,6 @@ class WorkflowRunner:
                 name="debug",
             )
 
-            print(f"[DEBUG workflow_runner._run_workflow] Calling _setup()...", file=sys.stderr, flush=True)
             (
                 workflow,
                 hooks,
@@ -541,7 +527,6 @@ class WorkflowRunner:
                 context,
                 vus,
             )
-            print(f"[DEBUG workflow_runner._run_workflow] _setup() complete, got {len(hooks)} hooks", file=sys.stderr, flush=True)
 
             is_test_workflow = (
                 len(
@@ -549,7 +534,6 @@ class WorkflowRunner:
                 )
                 > 0
             )
-            print(f"[DEBUG workflow_runner._run_workflow] is_test_workflow={is_test_workflow}", file=sys.stderr, flush=True)
 
             if is_test_workflow:
                 await ctx.log_prepared(
@@ -557,7 +541,6 @@ class WorkflowRunner:
                     name="debug",
                 )
 
-                print(f"[DEBUG workflow_runner._run_workflow] Calling _execute_test_workflow()...", file=sys.stderr, flush=True)
                 results = await self._execute_test_workflow(
                     run_id,
                     workflow,
@@ -566,7 +549,6 @@ class WorkflowRunner:
                     context,
                     config,
                 )
-                print(f"[DEBUG workflow_runner._run_workflow] _execute_test_workflow() complete", file=sys.stderr, flush=True)
 
             else:
                 await ctx.log_prepared(
@@ -574,7 +556,6 @@ class WorkflowRunner:
                     name="debug",
                 )
 
-                print(f"[DEBUG workflow_runner._run_workflow] Calling _execute_non_test_workflow()...", file=sys.stderr, flush=True)
                 results = await self._execute_non_test_workflow(
                     run_id,
                     workflow,
