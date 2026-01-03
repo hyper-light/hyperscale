@@ -201,8 +201,8 @@ async def run_test():
         try:
             job_id = await asyncio.wait_for(
                 client.submit_job(
-                    workflows=[NonTestWorkflow],  # Non-test workflow gets 1 core
-                    vus=1000,  # VUs can be large - cores are from priority!
+                    workflows=[TestWorkflow],  # Test workflow - gets cores based on priority!
+                    vus=1000,
                     timeout_seconds=60.0,
                 ),
                 timeout=10.0,
