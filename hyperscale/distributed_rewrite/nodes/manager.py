@@ -2607,6 +2607,50 @@ class ManagerServer(HealthAwareServer):
         # Fallback: use the ID itself
         return workflow_id
     
+    async def _extract_dependency_context(
+        self,
+        job_id: str,
+        workflow: Any,
+    ) -> bytes:
+        """
+        Extract context from workflow dependencies.
+        
+        For dependent workflows, this extracts only the context values
+        from their dependencies, not the full job context.
+        
+        Args:
+            job_id: The job ID
+            workflow: The workflow object (may be DependentWorkflow)
+        
+        Returns:
+            Serialized dependency context (cloudpickle bytes)
+        """
+        context = self._job_contexts.get(job_id)
+        if not context:
+            return b''
+        
+        # Check if workflow has dependencies
+        dependencies = []
+        if isinstance(workflow, DependentWorkflow):
+            dependencies = [dep.__name__ for dep in workflow.dependencies]
+        elif hasattr(workflow, 'dependencies') and workflow.dependencies:
+            dependencies = [dep.__name__ for dep in workflow.dependencies]
+        
+        if not dependencies:
+            # No dependencies - no context needed
+            return b''
+        
+        # Extract context for each dependency
+        relevant_context = {}
+        for dep_name in dependencies:
+            if dep_name in context:
+                relevant_context[dep_name] = context[dep_name].dict()
+        
+        if not relevant_context:
+            return b''
+        
+        return cloudpickle.dumps(relevant_context)
+    
     def _get_manager_tcp_addr(self, node_id: str) -> tuple[str, int] | None:
         """Get the TCP address for a manager by node_id."""
         # Check peer info for TCP address
@@ -3262,6 +3306,9 @@ class ManagerServer(HealthAwareServer):
                 vus=original_dispatch.vus,
                 timeout_seconds=original_dispatch.timeout_seconds,
                 fence_token=new_fence_token,
+                # Preserve context from original dispatch
+                context_version=original_dispatch.context_version,
+                dependency_context=original_dispatch.dependency_context,
             )
             
             # Get worker address
@@ -3848,15 +3895,23 @@ class ManagerServer(HealthAwareServer):
                 )
                 return False
         
+        # Extract dependency context for this workflow
+        dependency_context = await self._extract_dependency_context(
+            submission.job_id, workflow
+        )
+        context_version = self._job_layer_version.get(submission.job_id, 0)
+        
         # Dispatch to worker
         dispatch = WorkflowDispatch(
             job_id=submission.job_id,
             workflow_id=workflow_id,
             workflow=cloudpickle.dumps(workflow),
-            context=b'{}',  # Context would come from job
+            context=b'{}',  # Legacy field, kept for compatibility
             vus=cores_needed,
             timeout_seconds=submission.timeout_seconds,
             fence_token=provision.fence_token,
+            context_version=context_version,
+            dependency_context=dependency_context,
         )
         
         # Store dispatch bytes for potential retry

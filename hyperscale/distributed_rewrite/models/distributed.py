@@ -401,14 +401,23 @@ class WorkflowDispatch(Message):
     Dispatch a single workflow to a worker.
     
     Sent from manager to worker for execution.
+    
+    Context Consistency Protocol:
+    - context_version: The layer version this dispatch is for
+    - dependency_context: Context from dependencies (subset of full context)
+    
+    Workers can verify they have the correct context version before execution.
     """
     job_id: str                  # Parent job identifier
     workflow_id: str             # Unique workflow instance ID
     workflow: bytes              # Cloudpickled Workflow class
-    context: bytes               # Cloudpickled context dict
+    context: bytes               # Cloudpickled context dict (legacy, may be empty)
     vus: int                     # Cores to use
     timeout_seconds: float       # Execution timeout
     fence_token: int             # Fencing token for at-most-once
+    # Context Consistency Protocol fields
+    context_version: int = 0     # Layer version for staleness detection
+    dependency_context: bytes = b''  # Context from dependencies only
 
 
 @dataclass(slots=True)
