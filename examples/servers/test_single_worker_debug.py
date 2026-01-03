@@ -128,7 +128,7 @@ async def test_worker_startup_phases():
     print("\n✓ All phases completed successfully!")
     
     # Cleanup
-    await worker.graceful_shutdown()
+    await worker.stop()
     print("✓ Worker shutdown")
 
 

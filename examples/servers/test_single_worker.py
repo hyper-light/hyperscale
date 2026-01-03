@@ -122,7 +122,7 @@ async def run_test():
         print("[4/4] Shutting down worker...")
         print("-" * 50)
         
-        await worker.graceful_shutdown()
+        await worker.stop()
         
         print(f"  ✓ Worker shutdown complete")
         print()
@@ -145,7 +145,7 @@ async def run_test():
         # Cleanup
         if worker is not None:
             try:
-                await worker.graceful_shutdown()
+                await worker.stop()
             except Exception:
                 pass
 

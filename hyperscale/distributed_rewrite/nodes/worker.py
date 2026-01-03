@@ -617,7 +617,11 @@ class WorkerServer(HealthAwareServer):
             return (manager.tcp_host, manager.tcp_port)
         return None
     
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        drain_timeout: float = 5,
+        broadcast_leave: bool = True
+    ) -> None:
         """Stop the worker server."""
         # Cancel all active workflows via TaskRunner
         for workflow_id in list(self._workflow_tokens.keys()):
@@ -634,7 +638,23 @@ class WorkerServer(HealthAwareServer):
             self._node_id.full,
         )
 
-        await self.graceful_shutdown()
+        await self._remote_manger.shutdown_workers()
+        await self._remote_manger.close()
+
+
+        loop = asyncio.get_event_loop()
+        children = await loop.run_in_executor(None, active_children)
+
+        await asyncio.gather(
+            *[loop.run_in_executor(None, child.kill) for child in children]
+        )
+
+        await self._server_pool.shutdown()
+
+        await self.graceful_shutdown(
+            drain_timeout=drain_timeout,
+            broadcast_leave=broadcast_leave,
+        )
 
     def abort(self):
 
@@ -648,6 +668,22 @@ class WorkerServer(HealthAwareServer):
             self._memory_monitor.abort_all_background_monitors()
 
         except Exception:
+            pass
+
+        try:
+            self._remote_manger.abort()
+        except Exception as e:
+            pass
+
+        except asyncio.CancelledError:
+            pass
+        
+        try:
+            self._server_pool.abort()
+        except Exception as e:
+            pass
+
+        except asyncio.CancelledError:
             pass
 
         return super().abort()

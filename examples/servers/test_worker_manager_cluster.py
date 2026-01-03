@@ -322,7 +322,7 @@ async def run_test():
         # Stop workers first
         for i, worker in enumerate(workers):
             try:
-                await worker.graceful_shutdown(drain_timeout=0.5, broadcast_leave=False)
+                await worker.stop(drain_timeout=0.5, broadcast_leave=False)
                 print(f"  ✓ {WORKER_CONFIGS[i]['name']} stopped")
             except Exception as e:
                 print(f"  ✗ {WORKER_CONFIGS[i]['name']} stop failed: {e}")

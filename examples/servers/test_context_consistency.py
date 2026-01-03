@@ -432,13 +432,13 @@ async def run_test():
         
         if client is not None:
             try:
-                await client.graceful_shutdown()
+                await client.stop()
             except Exception:
                 pass
         
         for worker in workers:
             try:
-                await worker.graceful_shutdown()
+                await worker.stop()
             except Exception:
                 pass
         
