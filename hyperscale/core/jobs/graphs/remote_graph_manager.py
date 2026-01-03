@@ -1,12 +1,13 @@
 import asyncio
 import inspect
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import (
     Any,
     Dict,
     List,
     Tuple,
+    Deque,
 )
 
 import networkx
@@ -16,6 +17,7 @@ from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models import InstanceRoleType, WorkflowStatusUpdate
+from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.jobs.workers import Provisioner, StagePriority
 from hyperscale.core.state import (
@@ -94,7 +96,8 @@ class RemoteGraphManager:
         self._controller: RemoteGraphController | None = None
         self._role = InstanceRoleType.PROVISIONER
         self._provisioner: Provisioner | None = None
-        self._graph_updates: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
+        self._graph_updates: dict[int, dict[str, asyncio.Queue[WorkflowStatusUpdate]]] = defaultdict(lambda: defaultdict(asyncio.Queue))
+        self._workflow_statuses: dict[int, dict[str, Deque[WorkflowStatusUpdate]]] = deque()
 
         self._step_traversal_orders: Dict[
             str,
@@ -116,6 +119,7 @@ class RemoteGraphManager:
         self._workflow_configs: Dict[str, Dict[str, Any]] = {}
         self._loop = asyncio.get_event_loop()
         self._logger = Logger()
+        self._status_lock: asyncio.Lock | None = None
 
     async def start(
         self,
@@ -149,6 +153,9 @@ class RemoteGraphManager:
 
             if self._provisioner is None:
                 self._provisioner = Provisioner()
+
+            if self._status_lock is None:
+                self._status_lock = asyncio.Lock()
 
             await self._controller.start_server(
                 cert_path=cert_path,
@@ -291,12 +298,12 @@ class RemoteGraphManager:
                 workflow_results.update(
                     {
                         workflow_name: results
-                        for workflow_name, results, timeout_error in results
+                        for workflow_name, results, _, timeout_error in results
                         if timeout_error is None
                     }
                 )
 
-                for workflow_name, _, timeout_error in results:
+                for workflow_name, _, _, timeout_error in results:
                     timeouts[workflow_name] = timeout_error
 
             await ctx.log_prepared(
@@ -308,6 +315,105 @@ class RemoteGraphManager:
                 "results": workflow_results,
                 "timeouts": timeouts,
             }
+        
+    async def execute_workflow(
+        self,
+        run_id: int,
+        workflow: Workflow,
+        workflow_context: Dict[str, Any],
+        vus: int,
+        threads: int,
+    ):
+        
+        await self._append_workflow_run_status(run_id, workflow.name, WorkflowStatus.QUEUED)
+
+        self._controller.create_context_from_external_store(
+            workflow.name,
+            run_id,
+            workflow_context,
+        )
+        
+        default_config = {
+            "workflow": workflow.name,
+            "run_id": run_id,
+            "workers": threads,
+            "workflow_vus": workflow.vus,
+            "duration": workflow.duration,
+        }
+
+        workflow_slug = workflow.name.lower()
+
+        self._logger.configure(
+            name=f"{workflow_slug}_logger",
+            path="hyperscale.leader.log.json",
+            template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
+            models={
+                "trace": (WorkflowTrace, default_config),
+                "debug": (
+                    WorkflowDebug,
+                    default_config,
+                ),
+                "info": (
+                    WorkflowInfo,
+                    default_config,
+                ),
+                "error": (
+                    WorkflowError,
+                    default_config,
+                ),
+                "fatal": (
+                    WorkflowFatal,
+                    default_config,
+                ),
+            },
+        )
+
+
+        run_id = self._controller.id_generator.generate()
+        async with self._logger.context(
+            name=f"{workflow_slug}_logger",
+            nested=True,
+        ) as ctx:
+            await ctx.log_prepared(
+                message=f"Received workflow {workflow.name} with {workflow.vus} on {self._threads} workers for {workflow.duration}",
+                name="info",
+            )
+
+            self._controller.create_run_contexts(run_id)
+
+
+            await self._append_workflow_run_status(run_id, workflow.name, WorkflowStatus.RUNNING)
+            
+            results =  await self._run_workflow(
+                run_id,
+                workflow,
+                threads,
+                vus,
+            )
+
+            workflow_name, results, context, error = results
+
+            status = WorkflowStatus.FAILED if error else WorkflowStatus.COMPLETED
+            await self._append_workflow_run_status(run_id, workflow.name, status)
+
+            return (
+                workflow_name,
+                results,
+                context,
+                error,
+                status,
+            )
+
+    async def _append_workflow_run_status(
+        self,
+        run_id: int,
+        workflow: str,
+        status: WorkflowStatus,
+    ):
+        if self._status_lock:
+            await self._status_lock.acquire()
+            self._workflow_statuses[run_id][workflow.name].append(status)
+            self._status_lock.release()
 
     def _create_workflow_graph(self, workflows: List[Workflow | DependentWorkflow]):
         workflow_graph = networkx.DiGraph()
@@ -361,45 +467,14 @@ class RemoteGraphManager:
         workflow: Workflow,
         threads: int,
         workflow_vus: List[int],
-    ) -> Tuple[str, WorkflowStats | WorkflowContextResult, Exception | None]:
+    ) -> Tuple[str, WorkflowStats | WorkflowContextResult, Context, Exception | None]:
         workflow_slug = workflow.name.lower()
 
         try:
-            default_config = {
-                "workflow": workflow.name,
-                "run_id": run_id,
-                "workers": threads,
-                "workflow_vus": workflow.vus,
-                "duration": workflow.duration,
-            }
-
-            self._logger.configure(
-                name=f"{workflow_slug}_logger",
-                path="hyperscale.leader.log.json",
-                template="{timestamp} - {level} - {thread_id} - {filename}:{function_name}.{line_number} - {message}",
-                models={
-                    "trace": (WorkflowTrace, default_config),
-                    "debug": (
-                        WorkflowDebug,
-                        default_config,
-                    ),
-                    "info": (
-                        WorkflowInfo,
-                        default_config,
-                    ),
-                    "error": (
-                        WorkflowError,
-                        default_config,
-                    ),
-                    "fatal": (
-                        WorkflowFatal,
-                        default_config,
-                    ),
-                },
-            )
-
+            
             async with self._logger.context(
                 name=f"{workflow_slug}_logger",
+                nested=True,
             ) as ctx:
                 await ctx.log_prepared(
                     message=f"Running workflow {workflow.name} with {workflow.vus} on {self._threads} workers for {workflow.duration}",
@@ -730,7 +805,7 @@ class RemoteGraphManager:
 
                 self._provisioner.release(threads)
 
-                return (workflow.name, execution_result, timeout_error)
+                return (workflow.name, execution_result, updated_context, timeout_error)
 
         except (
             KeyboardInterrupt,
@@ -787,13 +862,32 @@ class RemoteGraphManager:
         )
 
         return context[workflow]
+    
+    def get_last_workflow_status(self, run_id: int, workflow: str) -> WorkflowStatus:
+        statuses = self._workflow_statuses[run_id][workflow]
 
-    async def get_workflow_update(self, workflow: str) -> WorkflowStatusUpdate | None:
-        if self._graph_updates[workflow].empty() is False:
-            return await self._graph_updates[workflow].get()
+        if len(statuses) > 1:
+            return statuses.pop()
+        
+        elif len(statuses) > 0:
+            return statuses[0]
+        
+        return WorkflowStatus.UNKNOWN
+
+
+    async def get_workflow_update(self, run_id: int, workflow: str) -> WorkflowStatusUpdate | None:
+        workflow_status_update = WorkflowStatusUpdate | None = None
+        if self._graph_updates[run_id][workflow].empty() is False:
+            workflow_status_update = await self._graph_updates[run_id][workflow].get()
+
+        if self._status_lock and workflow_status_update:
+            await self._status_lock.acquire()
+            self._workflow_statuses[run_id][workflow].append(workflow_status_update.status)
+            self._status_lock.release()
 
     async def _update(
         self,
+        run_id: int,
         update: WorkflowStatusUpdate,
     ):
         if update:
@@ -845,7 +939,7 @@ class RemoteGraphManager:
 
                     self._workflow_last_elapsed[update.workflow] = time.monotonic()
 
-                self._graph_updates[update.workflow].put_nowait(update)
+                self._graph_updates[run_id][update.workflow].put_nowait(update)
 
     def _provision(
         self,

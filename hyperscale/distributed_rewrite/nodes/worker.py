@@ -37,6 +37,28 @@ except ImportError:
     psutil = None  # type: ignore
     _PSUTIL_AVAILABLE = False
 
+import asyncio
+import os
+from concurrent.futures.process import BrokenProcessPool
+from multiprocessing import (
+    ProcessError,
+    active_children,
+)
+
+from hyperscale.core.engines.client.time_parser import TimeParser
+from hyperscale.core.graph import Workflow
+from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
+from hyperscale.logging import Logger
+from hyperscale.logging.hyperscale_logging_models import (
+    WorkflowDebug,
+    WorkflowError,
+    WorkflowFatal,
+    WorkflowInfo,
+    WorkflowTrace,
+)
+from hyperscale.ui import InterfaceUpdatesController
+from hyperscale.core.monitoring import CPUMonitor, MemoryMonitor
+
 from hyperscale.distributed_rewrite.server import tcp
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, WorkerStateEmbedder
 from hyperscale.distributed_rewrite.swim.core import ErrorStats, CircuitState
@@ -66,9 +88,10 @@ from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 
 # Import WorkflowRunner for actual workflow execution
-from hyperscale.core.jobs.graphs import WorkflowRunner
 from hyperscale.core.jobs.models.env import Env as CoreEnv
+from hyperscale.core.jobs.runner.local_server_pool import LocalServerPool
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus as CoreWorkflowStatus
+from hyperscale.core.jobs.models import Env as LocalEnv
 
 
 class WorkerServer(HealthAwareServer):
@@ -112,7 +135,7 @@ class WorkerServer(HealthAwareServer):
         seed_managers: list[tuple[str, int]] | None = None,
     ):
         # Core capacity (set before super().__init__ so state embedder can access it)
-        self._total_cores = total_cores or os.cpu_count() or 1
+        self._total_cores = total_cores or self._get_os_cpus() or 1
         self._available_cores = self._total_cores
         
         # Per-core workflow assignment tracking
@@ -150,7 +173,6 @@ class WorkerServer(HealthAwareServer):
         
         # WorkflowRunner for actual workflow execution
         # Initialized lazily when first workflow is received
-        self._workflow_runner: WorkflowRunner | None = None
         self._core_env: CoreEnv | None = None
         
         # Track cores that have completed within a workflow
@@ -193,7 +215,37 @@ class WorkerServer(HealthAwareServer):
         
         # Register callback for manager failure detection via SWIM
         self.register_on_node_dead(self._on_node_dead)
+
+        self._updates = InterfaceUpdatesController()
+
+        self._remote_manger = RemoteGraphManager(self._updates, self._total_cores)
+        self._server_pool = LocalServerPool(self._total_cores)
+        self._pool_task: asyncio.Task | None = None
+        self._local_udp_port = self._udp_port + (self._total_cores ** 2)
+        self._worker_connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_SECONDS).time
+        self._local_env = LocalEnv(
+            MERCURY_SYNC_AUTH_SECRET=env.MERCURY_SYNC_AUTH_SECRET
+        )
+
+        self._env = env
+        self._cpu_monitor = CPUMonitor(env)
+        self._memory_monitor = MemoryMonitor(env)
     
+
+    def _bin_and_check_socket_range(self):
+        base_worker_port = self._local_udp_port
+        return [
+            (
+                self._host,
+                port,
+            )
+            for port in range(
+                base_worker_port,
+                base_worker_port + (self._total_cores**2),
+                self._total_cores,
+            )
+        ]
+
     def _get_core_env(self) -> CoreEnv:
         """
         Get or create a CoreEnv instance for WorkflowRunner.
@@ -213,7 +265,7 @@ class WorkerServer(HealthAwareServer):
             )
         return self._core_env
     
-    def _get_workflow_runner(self) -> WorkflowRunner:
+    def _get_server_runner(self) -> ServerRunner:
         """
         Get or create the WorkflowRunner for executing workflows.
         """
@@ -221,7 +273,7 @@ class WorkerServer(HealthAwareServer):
             core_env = self._get_core_env()
             # Use node_id instance as worker_id and node_id
             node_id_int = hash(self._node_id.full) % (2**31)
-            self._workflow_runner = WorkflowRunner(
+            self._workflow_runner = ServerRunner(
                 env=core_env,
                 worker_id=node_id_int,
                 node_id=node_id_int,
@@ -269,7 +321,54 @@ class WorkerServer(HealthAwareServer):
             "primary_manager": self._primary_manager_id,
         }
     
+    def _get_system_stats(self):
+        return (
+            self._cpu_monitor.get_moving_avg(
+                self._node_id.datacenter,
+                self._node_id.full,
+            ),
+            self._memory_monitor.get_moving_avg(
+                self._node_id.datacenter,
+                self._node_id.full,
+            ),
+        )
+    
     async def start(self) -> None:
+
+        if timeout is None:
+            timeout = self._worker_connect_timeout
+        
+        worker_ips = self._bin_and_check_socket_range()
+
+        await self._cpu_monitor.start_background_monitor(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
+
+        await self._memory_monitor.start_background_monitor(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
+
+        await self._server_pool.setup()
+
+        await self._remote_manger.start(
+            self._host,
+            self._local_udp_port,
+            self._env,
+        )
+
+        await self._server_pool.run_pool(
+            (self._host, self._udp_port),
+            worker_ips,
+            self._env,
+        )
+
+        await self._remote_manger.connect_to_workers(
+            worker_ips,
+            timeout=timeout,
+        )
+        
         """Start the worker server."""
         # Start the underlying server (TCP/UDP listeners, task runner, etc.)
         # Uses SWIM settings from Env configuration
@@ -514,7 +613,33 @@ class WorkerServer(HealthAwareServer):
             await self._cancel_workflow(workflow_id, "server_shutdown")
         
         # Graceful shutdown (broadcasts leave via SWIM)
+
+        await self._cpu_monitor.stop_background_monitor(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
+        await self._memory_monitor.stop_background_monitor(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
+
         await self.graceful_shutdown()
+
+    def abort(self):
+
+        try:
+            self._cpu_monitor.abort_all_background_monitors()
+
+        except Exception:
+            pass
+
+        try:
+            self._memory_monitor.abort_all_background_monitors()
+
+        except Exception:
+            pass
+
+        return super().abort()
     
     async def _register_with_manager(
         self,
@@ -625,6 +750,12 @@ class WorkerServer(HealthAwareServer):
             return WorkerState.DEGRADED
         
         return WorkerState.HEALTHY
+    
+    def _get_os_cpus(self) -> int:
+        if not _PSUTIL_AVAILABLE:
+            return os.cpu_count()
+        
+        return psutil.cpu_count(logical=False)
     
     def _get_memory_mb(self) -> int:
         """Get total memory in MB."""
@@ -873,6 +1004,8 @@ class WorkerServer(HealthAwareServer):
         """
         try:
             dispatch = WorkflowDispatch.load(data)
+
+            allocated_vus = dispatch.vus
             
             # Check if we can accept this workflow
             if self._available_cores < dispatch.vus:
@@ -929,6 +1062,8 @@ class WorkerServer(HealthAwareServer):
                 dispatch,
                 progress,
                 cancel_event,
+                allocated_vus,
+                allocated_cores,
                 alias=f"workflow:{dispatch.workflow_id}",
             )
             self._workflow_tokens[dispatch.workflow_id] = token
@@ -954,6 +1089,8 @@ class WorkerServer(HealthAwareServer):
         dispatch: WorkflowDispatch,
         progress: WorkflowProgress,
         cancel_event: asyncio.Event,
+        allocated_vus: int,
+        allocated_cores: int,
     ) -> None:
         """Execute a workflow using WorkflowRunner."""
         start_time = time.monotonic()
@@ -972,7 +1109,7 @@ class WorkerServer(HealthAwareServer):
             self._workflow_cores_completed[dispatch.workflow_id] = set()
             
             # Get or create WorkflowRunner
-            runner = self._get_workflow_runner()
+            runner = self._get_server_runner()
             
             # Start progress monitor
             progress_token = self._task_runner.run(
@@ -987,30 +1124,31 @@ class WorkerServer(HealthAwareServer):
             try:
                 # Execute the workflow
                 (
-                    returned_run_id,
+                    results_run_id,
                     results,
-                    result_context,
+                    context,
                     error,
                     status,
-                ) = await runner.run(
+                ) = await self._remote_manger.execute_workflow(
                     run_id,
                     workflow,
-                    context_dict if isinstance(context_dict, dict) else {},
-                    dispatch.vus,
+                    context_dict,
+                    allocated_vus,
+                    allocated_cores,
                 )
-                
-                # Map status
-                if status == CoreWorkflowStatus.COMPLETED:
-                    progress.status = WorkflowStatus.COMPLETED.value
-                    progress.cores_completed = len(progress.assigned_cores)
-                elif status == CoreWorkflowStatus.FAILED:
-                    progress.status = WorkflowStatus.FAILED.value
-                elif status == CoreWorkflowStatus.REJECTED:
-                    progress.status = WorkflowStatus.FAILED.value
-                else:
-                    progress.status = WorkflowStatus.COMPLETED.value
-                    progress.cores_completed = len(progress.assigned_cores)
+
+                progress.cores_completed = len(progress.assigned_cores)
+
+                match status:
+                    case CoreWorkflowStatus.COMPLETED:
+                        progress.status = WorkflowStatus.COMPLETED.value
                     
+                    case CoreWorkflowStatus.FAILED:
+                        progress.status = WorkflowStatus.COMPLETED.value
+
+                    case _:
+                        progress.status = WorkflowStatus.FAILED.value
+
             except asyncio.CancelledError:
                 progress.status = WorkflowStatus.CANCELLED.value
                 raise
@@ -1048,7 +1186,6 @@ class WorkerServer(HealthAwareServer):
     ) -> None:
         """Monitor workflow progress and send updates to manager."""
         start_time = time.monotonic()
-        runner = self._get_workflow_runner()
         workflow_name = progress.workflow_name
         
         while not cancel_event.is_set():
@@ -1056,22 +1193,24 @@ class WorkerServer(HealthAwareServer):
                 await asyncio.sleep(self._progress_update_interval)
                 
                 # Get stats from WorkflowRunner
-                (
-                    status,
-                    completed_count,
-                    failed_count,
-                    step_stats_dict,
-                ) = runner.get_running_workflow_stats(run_id, workflow_name)
+                workflow_status_update = await self._remote_manger.get_workflow_update(run_id, workflow_name)
+                if workflow_status_update is None:
+                    return
+
+                status = CoreWorkflowStatus(workflow_status_update.status)
                 
                 # Get system stats
-                avg_cpu, avg_mem = runner.get_system_stats(run_id, workflow_name)
+                avg_cpu, avg_mem = (
+                    await self._cpu_monitor.get_moving_avg(),
+                    await self._memory_monitor.get_moving_avg(),
+                )
                 
                 # Update progress
-                progress.completed_count = completed_count
-                progress.failed_count = failed_count
+                progress.completed_count = workflow_status_update.completed_count
+                progress.failed_count = workflow_status_update.failed_count
                 progress.elapsed_seconds = time.monotonic() - start_time
                 progress.rate_per_second = (
-                    completed_count / progress.elapsed_seconds
+                    workflow_status_update.completed_count / progress.elapsed_seconds
                     if progress.elapsed_seconds > 0 else 0.0
                 )
                 progress.timestamp = time.monotonic()
@@ -1086,7 +1225,7 @@ class WorkerServer(HealthAwareServer):
                         failed_count=stats.get("err", 0),
                         total_count=stats.get("total", 0),
                     )
-                    for step_name, stats in step_stats_dict.items()
+                    for step_name, stats in workflow_status_update.step_stats.items()
                 ]
                 
                 # Estimate cores_completed
@@ -1094,7 +1233,7 @@ class WorkerServer(HealthAwareServer):
                 if total_cores > 0:
                     estimated_complete = min(
                         total_cores,
-                        int(total_cores * (completed_count / max(dispatch.vus * 100, 1)))
+                        int(total_cores * (workflow_status_update.completed_count / max(dispatch.vus * 100, 1)))
                     )
                     progress.cores_completed = estimated_complete
                 

@@ -208,6 +208,21 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             await self._node_context[run_id].copy(context)
 
+    async def create_context_from_external_store(
+        self,
+        workflow: str,
+        run_id: int,
+        values: dict[str, Any]
+    ):
+        
+        if self._node_context.get(run_id) is not None:
+            return self._node_context.get(run_id)
+        
+        context = self._node_context[run_id]
+        self._node_context[run_id] = context.from_dict(workflow, values)
+        
+        return self._node_context[run_id]
+
     async def submit_workflow_to_workers(
         self,
         run_id: int,
@@ -215,7 +230,10 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         context: Context,
         threads: int,
         workflow_vus: List[int],
-        update_callback: Callable[[int, WorkflowStatus], Awaitable[None]],
+        update_callback: Callable[
+            [int, WorkflowStatusUpdate],
+            Awaitable[None],
+        ],
     ):
         task_id = self.id_generator.generate()
         default_config = {
@@ -926,7 +944,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         run_id: int,
         workflow: str,
         update_callback: Callable[
-            [WorkflowStatusUpdate],
+            [int, WorkflowStatusUpdate],
             Awaitable[None],
         ],
     ):
@@ -974,6 +992,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 avg_mem_usage_mb = statistics.mean(memory_usage_stats)
 
             await update_callback(
+                run_id,
                 WorkflowStatusUpdate(
                     workflow,
                     workflow_status,
@@ -982,6 +1001,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     step_stats=step_stats,
                     avg_cpu_usage=avg_cpu_usage,
                     avg_memory_usage_mb=avg_mem_usage_mb,
+                    workers_completed=len(self._completions[run_id][workflow])
                 )
             )
 

@@ -30,6 +30,14 @@ class Context:
 
     def dict(self):
         return {key: value.dict() for key, value in self._context.items()}
+    
+    def from_dict(self, workflow: str, values: dict[str, Any]):
+        if self._context.get(workflow) is None:
+            self._context[workflow] = WorkflowContext()
+
+        for key, value in values.items():
+            self._context[workflow].set(key, value)
+
 
     async def copy(self, context: Context):
         await asyncio.gather(

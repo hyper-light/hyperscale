@@ -19,6 +19,8 @@ import os
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from hyperscale.graph import Workflow, step
+from hyperscale.testing import URL, HTTPResponse
 from hyperscale.distributed_rewrite.nodes.gate import GateServer
 from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
 from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
@@ -31,17 +33,16 @@ from hyperscale.distributed_rewrite.models import GateState, ManagerState, JobSt
 # Test Workflow - Simple class that can be pickled
 # ==========================================================================
 
-class TestWorkflow:
-    """Simple test workflow that does a bit of work for testing."""
-    name = "test_workflow"
-    vus = 1
-    duration = "5s"
-    
-    def run(self) -> dict:
-        """A simple run method that does some work (sync for simple pickle)."""
-        import time
-        time.sleep(1)  # Simulate some work
-        return {"status": "completed", "iterations": 10}
+class TestWorkflow(Workflow):
+    vus = 2000
+    duration = "15s"
+
+    @step()
+    async def get_httpbin(
+        self,
+        url: URL = 'https://httpbin.org/get',
+    ) -> HTTPResponse:
+        return await self.client.http.get(url)
 
 
 # ==========================================================================
