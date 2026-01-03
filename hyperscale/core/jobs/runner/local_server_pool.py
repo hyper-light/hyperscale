@@ -58,7 +58,10 @@ async def run_server(
             await server.acknowledge_start(leader_address)
 
         except Exception:
-            pass
+            server.stop()
+            await server.close()
+
+            return
         
         await server.run_forever()
         await server.close()

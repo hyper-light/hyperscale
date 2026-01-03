@@ -237,7 +237,7 @@ class WorkerServer(HealthAwareServer):
     
 
     def _bin_and_check_socket_range(self):
-        base_worker_port = self._local_udp_port
+        base_worker_port = self._local_udp_port + (self._total_cores ** 2)
         return [
             (
                 self._host,
@@ -343,19 +343,42 @@ class WorkerServer(HealthAwareServer):
         await self._remote_manger.start(
             self._host,
             self._local_udp_port,
-            self._env,
+            self._local_env,
         )
 
+        # IMPORTANT: leader_address must match where RemoteGraphManager is listening
+        # This was previously using self._udp_port which caused workers to connect
+        # to the wrong port and hang forever in poll_for_start
         await self._server_pool.run_pool(
-            (self._host, self._udp_port),
+            (self._host, self._local_udp_port),  # Must match remote_manger.start() port!
             worker_ips,
-            self._env,
+            self._local_env,
         )
 
-        await self._remote_manger.connect_to_workers(
-            worker_ips,
-            timeout=timeout,
-        )
+        # Add timeout wrapper since poll_for_start has no internal timeout
+        try:
+            await asyncio.wait_for(
+                self._remote_manger.connect_to_workers(
+                    worker_ips,
+                    timeout=timeout,
+                ),
+                timeout=timeout + 10.0,  # Extra buffer for poll_for_start
+            )
+        except asyncio.TimeoutError:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Timeout waiting for {len(worker_ips)} worker processes to start. "
+                            f"This may indicate process spawn failures.",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            raise RuntimeError(
+                f"Worker process pool failed to start within {timeout + 10.0}s. "
+                f"Check logs for process spawn errors."
+            )
         
         # Start the worker server (TCP/UDP listeners, task runner, etc.)
         # Start the underlying server (TCP/UDP listeners, task runner, etc.)
