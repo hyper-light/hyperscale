@@ -949,6 +949,7 @@ class MercurySyncBaseServer(Generic[T]):
         data: bytes,
         transport: asyncio.Transport,
     ):
+        # print(f"DEBUG read_client_tcp: received {len(data)} bytes")
         self._pending_tcp_server_responses.append(
             asyncio.ensure_future(
                 self.process_tcp_client_resopnse(
@@ -963,6 +964,7 @@ class MercurySyncBaseServer(Generic[T]):
         data: bytes,
         transport: asyncio.Transport,
     ):
+        # print(f"DEBUG read_server_tcp: received {len(data)} bytes")
         self._pending_tcp_server_responses.append(
             asyncio.ensure_future(
                 self.process_tcp_server_request(
@@ -1141,7 +1143,9 @@ class MercurySyncBaseServer(Generic[T]):
             if request_model := self.tcp_server_request_models.get(handler_name):
                 payload = request_model.load(payload)
 
-            handler = self.tcp_handlers[handler_name]
+            handler = self.tcp_handlers.get(handler_name)
+            if handler is None:
+                return
 
             response = await handler(
                 addr,

@@ -1049,8 +1049,10 @@ class WorkerServer(HealthAwareServer):
         
         This is the main entry point for work arriving at the worker.
         """
+        print(f"DEBUG workflow_dispatch: entry, data size={len(data)}")
         try:
             dispatch = WorkflowDispatch.load(data)
+            print(f"DEBUG workflow_dispatch: loaded, workflow_id={dispatch.workflow_id}")
 
             allocated_vus = dispatch.vus
             

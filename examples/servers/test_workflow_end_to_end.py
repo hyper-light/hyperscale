@@ -125,6 +125,7 @@ async def run_test():
         
         await asyncio.wait_for(worker.start(), timeout=30.0)
         print(f"  ✓ Worker started with {worker._total_cores} cores")
+        print(f"  DEBUG: Worker TCP handlers: {list(worker.tcp_handlers.keys())}")
         
         # Wait for worker to register with manager
         await asyncio.sleep(2.0)
