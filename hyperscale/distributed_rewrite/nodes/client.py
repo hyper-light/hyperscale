@@ -153,6 +153,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         datacenter_count: int = 1,
         datacenters: list[str] | None = None,
         on_status_update: Callable[[JobStatusPush], None] | None = None,
+        max_redirects: int = 3,
     ) -> str:
         """
         Submit a job for execution.
@@ -164,6 +165,7 @@ class HyperscaleClient(MercurySyncBaseServer):
             datacenter_count: Number of datacenters to run in (gates only)
             datacenters: Specific datacenters to target (optional)
             on_status_update: Callback for status updates (optional)
+            max_redirects: Maximum leader redirects to follow
             
         Returns:
             job_id: Unique identifier for the submitted job
@@ -200,28 +202,41 @@ class HyperscaleClient(MercurySyncBaseServer):
         if on_status_update:
             self._job_callbacks[job_id] = on_status_update
         
-        # Submit to target
-        response, _ = await self.send_tcp(
-            target,
-            "job_submission",
-            submission.dump(),
-            timeout=10.0,
-        )
-        
-        if isinstance(response, Exception):
-            self._jobs[job_id].status = JobStatus.FAILED.value
-            self._jobs[job_id].error = str(response)
-            self._job_events[job_id].set()
-            raise RuntimeError(f"Job submission failed: {response}")
-        
-        ack = JobAck.load(response)
-        if not ack.accepted:
+        # Submit with leader redirect handling
+        redirects = 0
+        while redirects <= max_redirects:
+            response, _ = await self.send_tcp(
+                target,
+                "job_submission",
+                submission.dump(),
+                timeout=10.0,
+            )
+            
+            if isinstance(response, Exception):
+                self._jobs[job_id].status = JobStatus.FAILED.value
+                self._jobs[job_id].error = str(response)
+                self._job_events[job_id].set()
+                raise RuntimeError(f"Job submission failed: {response}")
+            
+            ack = JobAck.load(response)
+            
+            if ack.accepted:
+                return job_id
+            
+            # Check for leader redirect
+            if ack.leader_addr and redirects < max_redirects:
+                target = tuple(ack.leader_addr)
+                redirects += 1
+                continue
+            
+            # No redirect available or max redirects reached
             self._jobs[job_id].status = JobStatus.FAILED.value
             self._jobs[job_id].error = ack.error
             self._job_events[job_id].set()
             raise RuntimeError(f"Job rejected: {ack.error}")
         
-        return job_id
+        # Should not reach here, but handle gracefully
+        raise RuntimeError(f"Job submission failed after {max_redirects} redirects")
     
     async def wait_for_job(
         self,

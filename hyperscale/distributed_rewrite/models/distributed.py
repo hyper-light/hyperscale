@@ -245,11 +245,18 @@ class ManagerDiscoveryBroadcast(Message):
     Used for cross-gate synchronization of manager discovery.
     When a manager registers with one gate, that gate broadcasts
     to all peer gates so they can also track the manager.
+    
+    Includes manager status so peer gates can also update _datacenter_status.
     """
     datacenter: str                         # Manager's datacenter
     manager_tcp_addr: tuple[str, int]       # Manager's TCP address
     manager_udp_addr: tuple[str, int] | None = None  # Manager's UDP address (if known)
     source_gate_id: str = ""                # Gate that received the original registration
+    # Manager status info (from registration heartbeat)
+    worker_count: int = 0                   # Number of workers manager has
+    healthy_worker_count: int = 0           # Healthy workers (SWIM responding)
+    available_cores: int = 0                # Available cores for job dispatch
+    total_cores: int = 0                    # Total cores across all workers
 
 
 @dataclass(slots=True, kw_only=True)
@@ -344,6 +351,8 @@ class ManagerHeartbeat(Message):
     available_cores: int         # Total available cores across healthy workers
     total_cores: int             # Total cores across all registered workers
     state: str = "active"        # ManagerState value (syncing/active/draining)
+    tcp_host: str = ""           # Manager's TCP host (for proper storage key)
+    tcp_port: int = 0            # Manager's TCP port (for proper storage key)
 
 
 # =============================================================================
@@ -377,11 +386,13 @@ class JobAck(Message):
     Acknowledgment of job submission.
     
     Returned immediately after job is accepted for processing.
+    If rejected due to not being leader, leader_addr provides redirect target.
     """
     job_id: str                  # Job identifier
     accepted: bool               # Whether job was accepted
     error: str | None = None     # Error message if rejected
     queued_position: int = 0     # Position in queue (if queued)
+    leader_addr: tuple[str, int] | None = None  # Leader address for redirect
 
 
 @dataclass(slots=True)
@@ -493,6 +504,7 @@ class GlobalJobStatus(Message):
     elapsed_seconds: float = 0.0 # Time since submission
     completed_datacenters: int = 0  # DCs finished
     failed_datacenters: int = 0  # DCs failed
+    timestamp: float = 0.0       # Monotonic time when job was submitted
 
 
 # =============================================================================

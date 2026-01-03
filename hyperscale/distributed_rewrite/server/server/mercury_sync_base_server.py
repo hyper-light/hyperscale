@@ -343,6 +343,9 @@ class MercurySyncBaseServer(Generic[T]):
         self._get_udp_hooks()
         self._get_task_hooks()
 
+        # Mark server as running before starting network listeners
+        self._running = True
+        
         await self._start_udp_server(
             worker_socket=udp_server_worker_socket,
             worker_transport=udp_server_worker_transport,
@@ -733,8 +736,11 @@ class MercurySyncBaseServer(Generic[T]):
                 if isinstance(data, Message):
                     data = data.dump()
 
-                # Build the message payload
-                payload = self._tcp_addr_slug + b'<' + encoded_action + b'<' + data + b'<' + clock.to_bytes(64)
+                # Build the message payload with length-prefixed data to avoid delimiter issues
+                # Format: address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+                # Clock comes before data so all fixed-size fields are parsed first
+                data_len = len(data).to_bytes(4, 'big')
+                payload = self._tcp_addr_slug + b'<' + encoded_action + b'<' + clock.to_bytes(64) + data_len + data
                 
                 # Compress and encrypt
                 encrypted = self._encryptor.encrypt(
@@ -832,11 +838,13 @@ class MercurySyncBaseServer(Generic[T]):
                 if isinstance(data, Message):
                     data = data.dump()
 
-            
+                # UDP message with length-prefixed data to avoid delimiter issues
+                # Format: type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+                data_len = len(data).to_bytes(4, 'big')
                 self._udp_transport.sendto(
                     self._encryptor.encrypt(
                         self._compressor.compress(
-                            b'c<' + self._udp_addr_slug + b'<' + encoded_action + b'<' + data + b'<' + clock.to_bytes(64),
+                            b'c<' + self._udp_addr_slug + b'<' + encoded_action + b'<' + clock.to_bytes(64) + data_len + data,
                         )
                     ),
                     address,
@@ -988,13 +996,19 @@ class MercurySyncBaseServer(Generic[T]):
             if len(decrypted) > MAX_DECOMPRESSED_SIZE:
                 return  # Decompressed message too large - silently drop
 
-            request_type, addr, handler_name, payload = decrypted.split(b'<', maxsplit=3)
+            # Parse length-prefixed UDP message format:
+            # type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+            request_type, addr, handler_name, rest = decrypted.split(b'<', maxsplit=3)
 
             match request_type:
 
                 case b'c':
-                    payload, clock = payload.split(b'<', maxsplit=1)
-
+                    # Extract clock (first 64 bytes)
+                    clock = rest[:64]
+                    # Extract data length (next 4 bytes)
+                    data_len = int.from_bytes(rest[64:68], 'big')
+                    # Extract payload (remaining bytes)
+                    payload = rest[68:68 + data_len]
 
                     self._pending_udp_server_responses.append(
                         asyncio.ensure_future(
@@ -1034,8 +1048,16 @@ class MercurySyncBaseServer(Generic[T]):
             )
         )
 
-        address_bytes, handler_name, payload, clock = decrypted.split(b'<', maxsplit=3)
-        clock_time = int.from_bytes(clock)
+        # Parse length-prefixed message format:
+        # address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+        address_bytes, handler_name, rest = decrypted.split(b'<', maxsplit=2)
+        
+        # Extract clock (first 64 bytes)
+        clock_time = int.from_bytes(rest[:64])
+        # Extract data length (next 4 bytes)
+        data_len = int.from_bytes(rest[64:68], 'big')
+        # Extract payload (remaining bytes)
+        payload = rest[68:68 + data_len]
 
         await self._udp_clock.ack(clock_time)
 
@@ -1093,8 +1115,16 @@ class MercurySyncBaseServer(Generic[T]):
             if len(decrypted) > MAX_DECOMPRESSED_SIZE:
                 return  # Decompressed message too large - silently drop
 
-            address_bytes, handler_name, payload, clock = decrypted.split(b'<', maxsplit=3)
-            clock_time = int.from_bytes(clock)
+            # Parse length-prefixed message format:
+            # address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+            address_bytes, handler_name, rest = decrypted.split(b'<', maxsplit=2)
+            
+            # Extract clock (first 64 bytes)
+            clock_time = int.from_bytes(rest[:64])
+            # Extract data length (next 4 bytes)
+            data_len = int.from_bytes(rest[64:68], 'big')
+            # Extract payload (remaining bytes)
+            payload = rest[68:68 + data_len]
 
             next_time = await self._tcp_clock.update(clock_time)
 
@@ -1122,9 +1152,12 @@ class MercurySyncBaseServer(Generic[T]):
             if isinstance(response, Message):
                 response = response.dump()
 
+            # Build response with clock before length-prefixed data
+            # Format: address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+            response_len = len(response).to_bytes(4, 'big')
             response_payload = self._encryptor.encrypt(
                 self._compressor.compress(
-                    self._tcp_addr_slug + b'<' + handler_name + b'<' + response + b'<' + next_time.to_bytes(64),
+                    self._tcp_addr_slug + b'<' + handler_name + b'<' + next_time.to_bytes(64) + response_len + response,
                 )
             )
 
@@ -1140,9 +1173,11 @@ class MercurySyncBaseServer(Generic[T]):
             # Sanitized error response - don't leak internal details
             try:
                 error_time = await self._tcp_clock.tick()
+                error_msg = b'Request processing failed'
+                error_len = len(error_msg).to_bytes(4, 'big')
                 error_response = self._encryptor.encrypt(
                     self._compressor.compress(
-                        self._tcp_addr_slug + b'<' + handler_name + b'<Request processing failed<' + error_time.to_bytes(64),
+                        self._tcp_addr_slug + b'<' + handler_name + b'<' + error_time.to_bytes(64) + error_len + error_msg,
                     )
                 )
                 # Frame with length prefix for proper TCP stream handling
@@ -1184,9 +1219,12 @@ class MercurySyncBaseServer(Generic[T]):
             if isinstance(response, Message):
                 response = response.dump()
 
+            # UDP response with clock before length-prefixed data
+            # Format: type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
+            response_len = len(response).to_bytes(4, 'big')
             response_payload = self._encryptor.encrypt(
                 self._compressor.compress(
-                    b's<' + self._udp_addr_slug + b'<' + handler_name + b'<' + response + b'<' + next_time.to_bytes(64),
+                    b's<' + self._udp_addr_slug + b'<' + handler_name + b'<' + next_time.to_bytes(64) + response_len + response,
                 )
             )
 
@@ -1199,9 +1237,11 @@ class MercurySyncBaseServer(Generic[T]):
                 protocol="udp",
             )
             # Sanitized error response
+            error_msg = b'Request processing failed'
+            error_len = len(error_msg).to_bytes(4, 'big')
             response_payload = self._encryptor.encrypt(
                 self._compressor.compress(
-                    b's<' + self._udp_addr_slug + b'<' + handler_name + b'<Request processing failed<' + next_time.to_bytes(64),
+                    b's<' + self._udp_addr_slug + b'<' + handler_name + b'<' + next_time.to_bytes(64) + error_len + error_msg,
                 )
             )
 
@@ -1211,12 +1251,13 @@ class MercurySyncBaseServer(Generic[T]):
         self,
         handler_name: bytes,
         addr: bytes,
-        payload: bytes,
+        rest: bytes,
     ):
         try:
-
-            payload, clock = payload.split(b'<', maxsplit=1)
-            clock_time = int.from_bytes(clock)
+            # Parse: clock(64 bytes)data_len(4 bytes)data(N bytes)
+            clock_time = int.from_bytes(rest[:64])
+            data_len = int.from_bytes(rest[64:68], 'big')
+            payload = rest[68:68 + data_len]
 
             await self._udp_clock.ack(clock_time)
 

@@ -79,7 +79,7 @@ from hyperscale.distributed_rewrite.models import (
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 
 
 class ManagerServer(HealthAwareServer):
@@ -1101,6 +1101,15 @@ class ManagerServer(HealthAwareServer):
         # Start TCP heartbeat loop to gates (supplements SWIM embedding)
         # TCP provides reliability for critical status updates
         if self._gate_addrs or self._known_gates:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Starting gate heartbeat loop with {len(self._gate_addrs)} seed gates and {len(self._known_gates)} known gates",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             self._task_runner.run(self._gate_heartbeat_loop)
         else:
             # No gates - start batch push loop for direct client connections
@@ -1380,14 +1389,33 @@ class ManagerServer(HealthAwareServer):
         """
         Get list of worker IDs that are healthy according to SWIM probes.
         
-        A worker is healthy if SWIM reports it as 'OK' (alive).
+        A worker is healthy if:
+        1. SWIM reports it as 'OK' (alive), OR
+        2. It was recently registered (within grace period) and hasn't been marked dead
+        
+        The grace period handles the startup race where workers register but SWIM
+        probing hasn't completed yet.
         """
         healthy = []
+        now = time.monotonic()
+        grace_period = 30.0  # Consider workers healthy for 30s after registration
+        
         for node_id, registration in self._workers.items():
             worker_addr = (registration.node.host, registration.node.port)
             node_state = self._incarnation_tracker.get_node_state(worker_addr)
+            
+            # Check if SWIM says healthy
             if node_state and node_state.status == b'OK':
                 healthy.append(node_id)
+                continue
+            
+            # Check if recently registered (grace period)
+            last_seen = self._worker_last_status.get(node_id, 0)
+            if (now - last_seen) < grace_period:
+                # Not explicitly marked dead by SWIM - treat as healthy
+                if not node_state or node_state.status != b'DEAD':
+                    healthy.append(node_id)
+        
         return healthy
     
     def _get_total_cores(self) -> int:
@@ -1436,6 +1464,8 @@ class ManagerServer(HealthAwareServer):
             ),
             total_cores=self._get_total_cores(),
             state=self._manager_state.value,
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
         )
     
     async def _gate_heartbeat_loop(self) -> None:
@@ -1447,26 +1477,70 @@ class ManagerServer(HealthAwareServer):
         """
         heartbeat_interval = 5.0  # Send every 5 seconds
         
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message="Gate heartbeat loop started",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
         while self._running:
             try:
+                print(f"[{self._node_id.short}] Heartbeat loop sleeping for {heartbeat_interval}s...")
                 await asyncio.sleep(heartbeat_interval)
+                print(f"[{self._node_id.short}] Heartbeat loop woke up, building heartbeat")
                 
                 heartbeat = self._build_manager_heartbeat()
                 
                 # Send to all healthy gates (use known gates if available, else seed gates)
                 gate_addrs = self._get_healthy_gate_tcp_addrs() or self._gate_addrs
                 
+                sent_count = 0
                 for gate_addr in gate_addrs:
                     try:
-                        await self.send_tcp(
+                        response, _ = await self.send_tcp(
                             gate_addr,
                             "manager_status_update",
                             heartbeat.dump(),
                             timeout=2.0,
                         )
-                    except Exception:
+                        if isinstance(response, Exception):
+                            self._task_runner.run(
+                                self._udp_logger.log,
+                                ServerWarning(
+                                    message=f"Heartbeat to gate {gate_addr} failed: {response}",
+                                    node_host=self._host,
+                                    node_port=self._tcp_port,
+                                    node_id=self._node_id.short,
+                                )
+                            )
+                        else:
+                            sent_count += 1
+                    except Exception as e:
                         # Gate might be down - continue to others
-                        pass
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerWarning(
+                                message=f"Heartbeat to gate {gate_addr} exception: {e}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                
+                if sent_count > 0:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Sent heartbeat to {sent_count}/{len(gate_addrs)} gates (workers={heartbeat.worker_count}, cores={heartbeat.available_cores})",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
                         
             except asyncio.CancelledError:
                 break
@@ -1994,6 +2068,22 @@ class ManagerServer(HealthAwareServer):
             worker_addr = (registration.node.host, registration.node.port)
             self._worker_addr_to_id[worker_addr] = registration.node.node_id
             self._worker_last_status[registration.node.node_id] = time.monotonic()
+            
+            # Create initial worker status with all cores available
+            # This prevents race condition where SWIM hasn't exchanged heartbeats yet
+            # SWIM updates will overwrite this with real status as they arrive
+            initial_status = WorkerHeartbeat(
+                node_id=registration.node.node_id,
+                state=WorkerState.HEALTHY.value,  # Assume healthy on registration
+                available_cores=registration.available_cores,  # All cores available
+                queue_depth=0,
+                cpu_percent=0.0,
+                memory_percent=0.0,
+                version=0,  # Initial version - SWIM updates will have higher versions
+                active_workflows={},
+            )
+            self._worker_status[registration.node.node_id] = initial_status
+            
             self._increment_version()
             
             # Add worker to SWIM cluster for UDP healthchecks
@@ -2080,6 +2170,20 @@ class ManagerServer(HealthAwareServer):
                 self._workers[worker_id] = registration
                 self._worker_addr_to_id[worker_tcp_addr] = worker_id
                 self._worker_last_status[worker_id] = time.monotonic()
+                
+                # Create initial worker status with all cores available
+                # This prevents race condition where SWIM hasn't exchanged heartbeats yet
+                initial_status = WorkerHeartbeat(
+                    node_id=worker_id,
+                    state=WorkerState.HEALTHY.value,  # Assume healthy on discovery
+                    available_cores=broadcast.available_cores,  # All cores available
+                    queue_depth=0,
+                    cpu_percent=0.0,
+                    memory_percent=0.0,
+                    version=0,  # Initial version - SWIM updates will have higher versions
+                    active_workflows={},
+                )
+                self._worker_status[worker_id] = initial_status
                 
                 # Add to SWIM probing
                 self._probe_scheduler.add_member(worker_udp_addr)
@@ -2990,7 +3094,8 @@ class ManagerServer(HealthAwareServer):
                 ack = JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error=f"Not leader. Leader is {leader}" if leader else "No leader elected",
+                    error="Not leader" if leader else "No leader elected",
+                    leader_addr=leader,
                 )
                 return ack.dump()
             
@@ -3327,7 +3432,7 @@ class ManagerServer(HealthAwareServer):
         return data
     
     @tcp.receive()
-    async def receive_provision_request(
+    async def provision_request(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -3368,7 +3473,7 @@ class ManagerServer(HealthAwareServer):
             return confirm.dump()
     
     @tcp.receive()
-    async def receive_provision_commit(
+    async def provision_commit(
         self,
         addr: tuple[str, int],
         data: bytes,

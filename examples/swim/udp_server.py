@@ -1051,7 +1051,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """
         self._metrics.increment('probes_sent')
         attempt = 0
-        max_attempts = PROBE_RETRY_POLICY.max_retries + 1
+        max_attempts = PROBE_RETRY_POLICY.max_attempts + 1
         
         while attempt < max_attempts:
             try:

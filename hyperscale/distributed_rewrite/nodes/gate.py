@@ -139,8 +139,9 @@ class GateServer(HealthAwareServer):
         self._gate_peer_info: dict[tuple[str, int], GateHeartbeat] = {}
         
         # Known datacenters and their status (from TCP updates)
-        self._datacenter_status: dict[str, ManagerHeartbeat] = {}  # dc -> last status
-        self._datacenter_last_status: dict[str, float] = {}  # dc -> timestamp
+        # Stored per-datacenter, per-manager for proper aggregation
+        self._datacenter_manager_status: dict[str, dict[tuple[str, int], ManagerHeartbeat]] = {}  # dc -> {manager_addr -> heartbeat}
+        self._manager_last_status: dict[tuple[str, int], float] = {}  # manager_addr -> timestamp
         
         # Versioned state clock for rejecting stale updates
         # Tracks per-datacenter versions using Lamport timestamps
@@ -189,10 +190,7 @@ class GateServer(HealthAwareServer):
             get_state_version=lambda: self._state_version,
             get_gate_state=lambda: self._gate_state.value,
             get_active_jobs=lambda: len(self._jobs),
-            get_active_datacenters=lambda: len([
-                dc for dc, status in self._datacenter_status.items()
-                if time.monotonic() - self._datacenter_last_status.get(dc, 0) < 60.0
-            ]),
+            get_active_datacenters=lambda: self._count_active_datacenters(),
             get_manager_count=lambda: sum(
                 len(managers) for managers in self._datacenter_managers.values()
             ),
@@ -328,9 +326,14 @@ class GateServer(HealthAwareServer):
             # Stale update - discard
             return
         
-        # Accept update
-        self._datacenter_status[heartbeat.datacenter] = heartbeat
-        self._datacenter_last_status[heartbeat.datacenter] = time.monotonic()
+        # Store per-datacenter, per-manager using heartbeat's self-reported address
+        dc = heartbeat.datacenter
+        manager_addr = (heartbeat.tcp_host, heartbeat.tcp_port) if heartbeat.tcp_host else source_addr
+        
+        if dc not in self._datacenter_manager_status:
+            self._datacenter_manager_status[dc] = {}
+        self._datacenter_manager_status[dc][manager_addr] = heartbeat
+        self._manager_last_status[manager_addr] = time.monotonic()
         
         # Update version tracking via TaskRunner
         self._task_runner.run(
@@ -571,12 +574,17 @@ class GateServer(HealthAwareServer):
         datacenter: str,
         manager_tcp_addr: tuple[str, int],
         manager_udp_addr: tuple[str, int] | None = None,
+        worker_count: int = 0,
+        healthy_worker_count: int = 0,
+        available_cores: int = 0,
+        total_cores: int = 0,
     ) -> None:
         """
         Broadcast a newly discovered manager to all peer gates.
         
         Called when a manager registers with this gate. Ensures all gates
         learn about the manager even if they don't receive direct registration.
+        Includes manager status so peer gates can update their datacenter health.
         """
         if not self._active_gate_peers:
             return
@@ -586,6 +594,10 @@ class GateServer(HealthAwareServer):
             manager_tcp_addr=manager_tcp_addr,
             manager_udp_addr=manager_udp_addr,
             source_gate_id=self._node_id.full,
+            worker_count=worker_count,
+            healthy_worker_count=healthy_worker_count,
+            available_cores=available_cores,
+            total_cores=total_cores,
         )
         
         broadcast_count = 0
@@ -665,12 +677,69 @@ class GateServer(HealthAwareServer):
             ],
         }
     
+    def _count_active_datacenters(self) -> int:
+        """
+        Count datacenters with at least one fresh manager heartbeat.
+        
+        A datacenter is active if any manager has sent a heartbeat in the last 60s.
+        """
+        now = time.monotonic()
+        active_count = 0
+        for dc_id in self._datacenter_manager_status:
+            for manager_addr in self._datacenter_manager_status[dc_id]:
+                if now - self._manager_last_status.get(manager_addr, 0) < 60.0:
+                    active_count += 1
+                    break  # Only count DC once
+        return active_count
+    
+    def _get_best_manager_heartbeat(self, dc_id: str) -> tuple[ManagerHeartbeat | None, int, int]:
+        """
+        Get the most authoritative manager heartbeat for a datacenter.
+        
+        Strategy:
+        1. Prefer the LEADER's heartbeat if fresh (within 30s)
+        2. Fall back to any fresh manager heartbeat
+        3. Return None if no fresh heartbeats
+        
+        Returns:
+            tuple of (best_heartbeat, alive_manager_count, total_manager_count)
+        """
+        manager_statuses = self._datacenter_manager_status.get(dc_id, {})
+        now = time.monotonic()
+        heartbeat_timeout = 30.0  # Heartbeats older than 30s are considered stale
+        
+        best_heartbeat: ManagerHeartbeat | None = None
+        leader_heartbeat: ManagerHeartbeat | None = None
+        alive_count = 0
+        
+        for manager_addr, heartbeat in manager_statuses.items():
+            last_seen = self._manager_last_status.get(manager_addr, 0)
+            is_fresh = (now - last_seen) < heartbeat_timeout
+            
+            if is_fresh:
+                alive_count += 1
+                
+                # Track leader heartbeat separately
+                if heartbeat.is_leader:
+                    leader_heartbeat = heartbeat
+                
+                # Keep any fresh heartbeat as fallback
+                if best_heartbeat is None:
+                    best_heartbeat = heartbeat
+        
+        # Prefer leader if available
+        if leader_heartbeat is not None:
+            best_heartbeat = leader_heartbeat
+        
+        total_managers = len(self._datacenter_managers.get(dc_id, []))
+        return best_heartbeat, alive_count, total_managers
+    
     def _classify_datacenter_health(self, dc_id: str) -> DatacenterStatus:
         """
-        Classify datacenter health based on SWIM probes and status updates.
+        Classify datacenter health based on TCP heartbeats from managers.
         
         Health States (evaluated in order):
-        1. UNHEALTHY: No managers responding OR no workers registered
+        1. UNHEALTHY: No managers registered OR no workers registered
         2. DEGRADED: Majority of workers unhealthy OR majority of managers unhealthy
         3. BUSY: NOT degraded AND available_cores == 0 (transient, will clear)
         4. HEALTHY: NOT degraded AND available_cores > 0
@@ -680,22 +749,20 @@ class GateServer(HealthAwareServer):
         - DEGRADED = structural problem, reduced capacity → may need intervention
         - UNHEALTHY = severe problem → try fallback datacenter
         
+        Note: Gates and managers are in different SWIM clusters, so we can't use
+        SWIM probes for cross-cluster health. We use TCP heartbeats instead.
+        Manager liveness is determined by recent TCP heartbeats per-manager.
+        
+        Uses the LEADER's heartbeat as the authoritative source for worker info.
+        Falls back to any fresh manager heartbeat if leader is stale.
+        
         See AD-16 in docs/architecture.md.
         """
-        # Check manager liveness via SWIM
-        manager_udp_addrs = self._datacenter_manager_udp.get(dc_id, [])
-        total_managers = len(manager_udp_addrs)
-        alive_managers = 0
-        for addr in manager_udp_addrs:
-            node_state = self._incarnation_tracker.get_node_state(addr)
-            if node_state and node_state.status == b'OK':
-                alive_managers += 1
+        # Get best manager heartbeat (prefers leader, falls back to any fresh)
+        status, alive_managers, total_managers = self._get_best_manager_heartbeat(dc_id)
         
-        # Get status from TCP heartbeats (contains worker info from managers)
-        status = self._datacenter_status.get(dc_id)
-        
-        # === UNHEALTHY: No managers responding ===
-        if alive_managers == 0:
+        # === UNHEALTHY: No managers registered ===
+        if total_managers == 0:
             return DatacenterStatus(
                 dc_id=dc_id,
                 health=DatacenterHealth.UNHEALTHY.value,
@@ -706,7 +773,7 @@ class GateServer(HealthAwareServer):
                 last_update=time.monotonic(),
             )
         
-        # === UNHEALTHY: No status update or no workers registered ===
+        # === UNHEALTHY: No fresh heartbeats or no workers registered ===
         if not status or status.worker_count == 0:
             return DatacenterStatus(
                 dc_id=dc_id,
@@ -809,9 +876,9 @@ class GateServer(HealthAwareServer):
         dc_health = self._get_all_datacenter_health()
         
         # Bucket by health
-        healthy = []
-        busy = []
-        degraded = []
+        healthy: list[tuple[str, DatacenterStatus]] = []
+        busy: list[tuple[str, DatacenterStatus]] = []
+        degraded: list[tuple[str, DatacenterStatus]] = []
         unhealthy_count = 0
         
         for dc_id, status in dc_health.items():
@@ -1792,7 +1859,7 @@ class GateServer(HealthAwareServer):
         return data
     
     @tcp.receive()
-    async def receive_manager_status_update(
+    async def manager_status_update(
         self,
         addr: tuple[str, int],
         data: bytes,
@@ -1801,20 +1868,28 @@ class GateServer(HealthAwareServer):
         """
         Handle manager status update via TCP.
         
-        This is NOT a healthcheck - DC liveness is tracked via SWIM UDP probes.
+        This is NOT a healthcheck - DC liveness is tracked via per-manager heartbeat freshness.
         This contains job progress and worker capacity information.
+        
+        Stored per-datacenter, per-manager to enable proper aggregation.
         """
         try:
             status = ManagerHeartbeat.load(data)
             
-            # Update DC status tracking (from TCP)
-            self._datacenter_status[status.datacenter] = status
-            self._datacenter_last_status[status.datacenter] = time.monotonic()
+            # Store per-datacenter, per-manager using manager's self-reported address
+            # (TCP source addr is ephemeral, not the manager's listening address)
+            dc = status.datacenter
+            manager_addr = (status.tcp_host, status.tcp_port)
+            
+            if dc not in self._datacenter_manager_status:
+                self._datacenter_manager_status[dc] = {}
+            self._datacenter_manager_status[dc][manager_addr] = status
+            self._manager_last_status[manager_addr] = time.monotonic()
             
             return b'ok'
             
         except Exception as e:
-            await self.handle_exception(e, "receive_manager_status_update")
+            await self.handle_exception(e, "manager_status_update")
             return b'error'
     
     @tcp.receive()
@@ -1831,19 +1906,22 @@ class GateServer(HealthAwareServer):
         This is analogous to Workers registering with Managers.
         """
         try:
-
             heartbeat = ManagerHeartbeat.load(data)
             
-            # Update DC status tracking
-            self._datacenter_status[heartbeat.datacenter] = heartbeat
-            self._datacenter_last_status[heartbeat.datacenter] = time.monotonic()
+            # Store per-datacenter, per-manager using manager's self-reported address
+            dc = heartbeat.datacenter
+            manager_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+            
+            if dc not in self._datacenter_manager_status:
+                self._datacenter_manager_status[dc] = {}
+            self._datacenter_manager_status[dc][manager_addr] = heartbeat
+            self._manager_last_status[manager_addr] = time.monotonic()
             
             # Add manager address to datacenter managers (if not already tracked)
-            dc = heartbeat.datacenter
             if dc not in self._datacenter_managers:
                 self._datacenter_managers[dc] = []
-            if addr not in self._datacenter_managers[dc]:
-                self._datacenter_managers[dc].append(addr)
+            if manager_addr not in self._datacenter_managers[dc]:
+                self._datacenter_managers[dc].append(manager_addr)
             
             self._task_runner.run(
                 self._udp_logger.log,
@@ -1862,8 +1940,17 @@ class GateServer(HealthAwareServer):
                 healthy_gates=self._get_healthy_gates(),
             )
             
-            # Broadcast this manager discovery to peer gates
-            self._task_runner.run(self._broadcast_manager_discovery, dc, addr)
+            # Broadcast this manager discovery to peer gates (include status info)
+            self._task_runner.run(
+                self._broadcast_manager_discovery,
+                dc,
+                manager_addr,
+                None,  # manager_udp_addr not available from heartbeat
+                heartbeat.worker_count,
+                getattr(heartbeat, 'healthy_worker_count', heartbeat.worker_count),
+                heartbeat.available_cores,
+                getattr(heartbeat, 'total_cores', 0),
+            )
             
             return response.dump()
             
@@ -1888,7 +1975,8 @@ class GateServer(HealthAwareServer):
         Handle manager discovery broadcast from a peer gate.
         
         When another gate receives a manager registration, it broadcasts
-        to all peers. This handler adds the manager to our tracking.
+        to all peers. This handler adds the manager to our tracking and
+        updates datacenter status from the included manager heartbeat info.
         """
         try:
             broadcast = ManagerDiscoveryBroadcast.load(data)
@@ -1921,6 +2009,28 @@ class GateServer(HealthAwareServer):
                     )
                 )
             
+            # Store per-datacenter, per-manager status
+            # Create a synthetic ManagerHeartbeat for the discovered manager
+            if dc not in self._datacenter_manager_status:
+                self._datacenter_manager_status[dc] = {}
+            
+            synthetic_heartbeat = ManagerHeartbeat(
+                node_id=f"discovered-via-{broadcast.source_gate_id}",
+                datacenter=dc,
+                is_leader=False,  # Unknown from broadcast
+                term=0,
+                version=0,
+                active_jobs=0,
+                active_workflows=0,
+                worker_count=broadcast.worker_count,
+                healthy_worker_count=broadcast.healthy_worker_count,
+                available_cores=broadcast.available_cores,
+                total_cores=broadcast.total_cores,
+                state="active",
+            )
+            self._datacenter_manager_status[dc][manager_addr] = synthetic_heartbeat
+            self._manager_last_status[manager_addr] = time.monotonic()
+            
             return b'ok'
             
         except Exception as e:
@@ -1952,23 +2062,28 @@ class GateServer(HealthAwareServer):
         return data
     
     @tcp.receive()
-    async def receive_job_submission(
+    async def job_submission(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
     ):
-        """Handle job submission from client."""
+        """Handle job submission from client.
+        
+        Only the cluster leader accepts new jobs. Non-leaders redirect
+        clients to the current leader for consistent job coordination.
+        """
         try:
             submission = JobSubmission.load(data)
             
-            # Only leader accepts jobs
+            # Only leader accepts new jobs
             if not self.is_leader():
                 leader = self.get_current_leader()
                 ack = JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error=f"Not leader. Leader is {leader}" if leader else "No leader",
+                    error=f"Not leader" if leader else "No leader elected",
+                    leader_addr=leader,
                 )
                 return ack.dump()
             
@@ -2052,7 +2167,7 @@ class GateServer(HealthAwareServer):
             )
             return ack.dump()
         except Exception as e:
-            await self.handle_exception(e, "receive_job_submission")
+            await self.handle_exception(e, "job_submission")
             ack = JobAck(
                 job_id="unknown",
                 accepted=False,

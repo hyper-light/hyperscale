@@ -860,12 +860,12 @@ class WorkerServer(HealthAwareServer):
         return (address, ack.dump())
     
     @tcp.receive()
-    async def receive_workflow_dispatch(
+    async def workflow_dispatch(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-    ) -> tuple[bytes, bytes]:
+    ) -> bytes:
         """
         Receive a workflow dispatch from a manager.
         
@@ -881,7 +881,7 @@ class WorkerServer(HealthAwareServer):
                     accepted=False,
                     error=f"Insufficient cores: need {dispatch.vus}, have {self._available_cores}",
                 )
-                return (b'workflow_dispatch_response', ack.dump())
+                return ack.dump()
             
             # Check backpressure
             if self._get_worker_state() == WorkerState.DRAINING:
@@ -890,7 +890,7 @@ class WorkerServer(HealthAwareServer):
                     accepted=False,
                     error="Worker is draining, not accepting new work",
                 )
-                return (b'workflow_dispatch_response', ack.dump())
+                return ack.dump()
             
             # Allocate cores to this workflow
             allocated_cores = self._allocate_cores(dispatch.workflow_id, dispatch.vus)
@@ -900,7 +900,7 @@ class WorkerServer(HealthAwareServer):
                     accepted=False,
                     error=f"Failed to allocate {dispatch.vus} cores",
                 )
-                return (b'workflow_dispatch_response', ack.dump())
+                return ack.dump()
             
             self._increment_version()
             
@@ -939,7 +939,7 @@ class WorkerServer(HealthAwareServer):
                 accepted=True,
                 cores_assigned=dispatch.vus,
             )
-            return (b'workflow_dispatch_response', ack.dump())
+            return ack.dump()
             
         except Exception as e:
             ack = WorkflowDispatchAck(
@@ -947,7 +947,7 @@ class WorkerServer(HealthAwareServer):
                 accepted=False,
                 error=str(e),
             )
-            return (b'workflow_dispatch_response', ack.dump())
+            return ack.dump()
     
     async def _execute_workflow(
         self,
