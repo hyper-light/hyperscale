@@ -583,6 +583,10 @@ class ManagerStateSnapshot(Message):
     version: int                 # State version
     workers: list["WorkerStateSnapshot"] = field(default_factory=list)
     jobs: dict[str, "JobProgress"] = field(default_factory=dict)
+    # Context consistency protocol state
+    job_leaders: dict[str, str] = field(default_factory=dict)  # job_id -> leader_node_id
+    job_layer_versions: dict[str, int] = field(default_factory=dict)  # job_id -> layer version
+    job_contexts: bytes = b''  # Serialized contexts (cloudpickle)
 
 
 @dataclass(slots=True)

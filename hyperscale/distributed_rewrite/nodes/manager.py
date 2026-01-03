@@ -27,9 +27,11 @@ import secrets
 import time
 from typing import Any
 
+import cloudpickle
 import networkx
 
 from hyperscale.core.graph.dependent_workflow import DependentWorkflow
+from hyperscale.core.state.context import Context
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, ManagerStateEmbedder
@@ -76,6 +78,9 @@ from hyperscale.distributed_rewrite.models import (
     CancelJob,
     CancelAck,
     WorkerDiscoveryBroadcast,
+    ContextForward,
+    ContextLayerSync,
+    ContextLayerSyncAck,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -188,6 +193,13 @@ class ManagerServer(HealthAwareServer):
         self._workflow_assignments: dict[str, str] = {}  # workflow_id -> worker_node_id
         self._pending_provisions: dict[str, ProvisionRequest] = {}  # workflow_id -> request
         self._provision_confirmations: dict[str, set[str]] = {}  # workflow_id -> confirming nodes
+        
+        # Job leader tracking (Context Consistency Protocol)
+        # Each job has one leader manager responsible for context consistency
+        self._job_leaders: dict[str, str] = {}  # job_id -> leader_node_id
+        self._job_layer_version: dict[str, int] = {}  # job_id -> monotonic layer version
+        self._job_contexts: dict[str, Context] = {}  # job_id -> Context for dependent workflows
+        self._context_lamport_clock: int = 0  # For generating timestamps on context updates
         
         # Client push notification callbacks (when gates not present)
         # job_id -> callback address for push notifications
@@ -661,6 +673,32 @@ class ManagerServer(HealthAwareServer):
                 self._jobs[job_id] = job_progress
                 jobs_merged += 1
         
+        # Merge job leader tracking (Context Consistency Protocol)
+        for job_id, leader_id in manager_state.job_leaders.items():
+            if job_id not in self._job_leaders:
+                self._job_leaders[job_id] = leader_id
+        
+        for job_id, layer_version in manager_state.job_layer_versions.items():
+            # Accept higher layer versions
+            current = self._job_layer_version.get(job_id, -1)
+            if layer_version > current:
+                self._job_layer_version[job_id] = layer_version
+        
+        # Deserialize and merge job contexts
+        if manager_state.job_contexts:
+            try:
+                contexts_data = cloudpickle.loads(manager_state.job_contexts)
+                for job_id, context_dict in contexts_data.items():
+                    if job_id not in self._job_contexts:
+                        self._job_contexts[job_id] = Context()
+                    # Apply context values (from_dict is async, run in task)
+                    for workflow, values in context_dict.items():
+                        self._task_runner.run(
+                            self._job_contexts[job_id].from_dict, workflow, values
+                        )
+            except Exception:
+                pass  # Ignore deserialization errors
+        
         if jobs_merged > 0:
             self._task_runner.run(
                 self._udp_logger.log,
@@ -673,7 +711,6 @@ class ManagerServer(HealthAwareServer):
             )
         
         return manager_state
-        return None
     
     def _handle_embedded_worker_heartbeat(
         self,
@@ -1440,6 +1477,27 @@ class ManagerServer(HealthAwareServer):
             if node_id in healthy_ids
         )
     
+    # =========================================================================
+    # Job Leader Helpers (Context Consistency Protocol)
+    # =========================================================================
+    
+    def _is_job_leader(self, job_id: str) -> bool:
+        """Check if this manager is the leader for the given job."""
+        return self._job_leaders.get(job_id) == self._node_id.full
+    
+    def _get_job_leader(self, job_id: str) -> str | None:
+        """Get the node_id of the job leader, or None if unknown."""
+        return self._job_leaders.get(job_id)
+    
+    def _get_job_context(self, job_id: str) -> Context | None:
+        """Get the context for a job, or None if job unknown."""
+        return self._job_contexts.get(job_id)
+    
+    def _get_next_context_timestamp(self) -> int:
+        """Get the next Lamport timestamp for context updates."""
+        self._context_lamport_clock += 1
+        return self._context_lamport_clock
+    
     def _build_manager_heartbeat(self) -> ManagerHeartbeat:
         """Build a ManagerHeartbeat with current state."""
         healthy_worker_ids = self._get_healthy_worker_ids()
@@ -1647,6 +1705,11 @@ class ManagerServer(HealthAwareServer):
                     active_workflows={},  # Could populate from tracking
                 ))
         
+        # Serialize job contexts for state sync
+        contexts_data = {}
+        for job_id, context in self._job_contexts.items():
+            contexts_data[job_id] = context.dict()
+        
         return ManagerStateSnapshot(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -1655,6 +1718,9 @@ class ManagerServer(HealthAwareServer):
             version=self._state_version,
             workers=worker_snapshots,
             jobs=dict(self._jobs),
+            job_leaders=dict(self._job_leaders),
+            job_layer_versions=dict(self._job_layer_version),
+            job_contexts=cloudpickle.dumps(contexts_data),
         )
     
     def _get_worker_circuit(self, worker_id: str) -> ErrorStats:
@@ -3108,6 +3174,11 @@ class ManagerServer(HealthAwareServer):
                 timestamp=time.monotonic(),
             )
             self._jobs[submission.job_id] = job
+            
+            # Set this manager as job leader (first to accept = job leader)
+            self._job_leaders[submission.job_id] = self._node_id.full
+            self._job_layer_version[submission.job_id] = 0  # Start at layer 0
+            self._job_contexts[submission.job_id] = Context()  # Empty context
             
             # Store callback for push notifications (if provided)
             if submission.callback_addr:
