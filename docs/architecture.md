@@ -4107,6 +4107,377 @@ class WorkflowDispatch(Message):
 
 Workers allocate `cores` CPU cores and distribute `vus` virtual users across them.
 
+---
+
+### Virtual Users (VUs) and Steps
+
+#### What is a Virtual User (VU)?
+
+A **Virtual User (VU)** represents a single, continuously looping instance of a workflow. Each VU simulates one user performing a sequence of steps repeatedly for the duration of the test.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           VIRTUAL USER CONCEPT                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  workflow.vus = 10000    →   10,000 simulated users                         │
+│  workflow.duration = "5m" →   Each user runs for 5 minutes                  │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  VU #1                                                              │    │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │    │
+│  │  │  Loop until duration expires:                                   │ │    │
+│  │  │    → Execute @step() method 1                                   │ │    │
+│  │  │    → Execute @step() method 2                                   │ │    │
+│  │  │    → Execute @step() method N                                   │ │    │
+│  │  │    → Record metrics (latency, status, etc.)                     │ │    │
+│  │  │    → Repeat...                                                  │ │    │
+│  │  └────────────────────────────────────────────────────────────────┘ │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ... × 10,000 concurrent virtual users                                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**VU Distribution Across Cores**:
+
+When a test workflow gets multiple cores (based on priority), VUs are evenly distributed:
+
+```
+Example: vus=10000, cores=4
+
+  Core 0: 2,500 VUs running in parallel
+  Core 1: 2,500 VUs running in parallel
+  Core 2: 2,500 VUs running in parallel
+  Core 3: 2,500 VUs running in parallel
+  ─────────────────────────────────────
+  Total:  10,000 VUs across 4 cores
+```
+
+---
+
+#### What is a Step?
+
+A **Step** is an async method decorated with `@step()` that defines a single action in the workflow loop. Steps are the building blocks of load tests.
+
+```python
+from hyperscale.graph import Workflow, step
+from hyperscale.testing import URL, Headers, HTTPResponse
+
+
+class APILoadTest(Workflow):
+    vus = 5000
+    duration = "3m"
+    
+    @step()
+    async def get_users(
+        self,
+        url: URL = 'https://api.example.com/users',
+    ) -> HTTPResponse:
+        """Each VU calls this step repeatedly for 3 minutes."""
+        return await self.client.http.get(url)
+    
+    @step()
+    async def get_user_details(
+        self,
+        url: URL = 'https://api.example.com/users/1',
+    ) -> HTTPResponse:
+        """Called after get_users, then loop restarts."""
+        return await self.client.http.get(url)
+```
+
+**Step Execution Order**:
+
+```
+VU Loop Iteration:
+  1. Execute get_users() → record metrics
+  2. Execute get_user_details() → record metrics
+  3. Repeat until duration expires
+```
+
+---
+
+#### Optimized Args (Performance Optimization)
+
+**The Problem**: Load testing overhead can skew results. When testing API performance, we don't want to measure:
+- DNS lookup time
+- Header serialization time
+- JSON encoding time
+- SSL handshake overhead (for new connections)
+
+These are test infrastructure costs, not the target system's actual performance.
+
+**The Solution**: Hyperscale uses **Optimized Args** - special type-annotated keyword arguments that are pre-processed BEFORE the test loop starts.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         OPTIMIZED ARGS CONCEPT                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  BEFORE WORKFLOW EXECUTION (once, at startup):                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  1. Parse @step() method signatures                                  │    │
+│  │  2. Find keyword args with Optimized type hints (URL, Headers, etc.)│    │
+│  │  3. Extract default values                                           │    │
+│  │  4. Call .optimize() on each:                                        │    │
+│  │     • URL: DNS lookup, address resolution                           │    │
+│  │     • Headers: Serialize to bytes/string format                     │    │
+│  │     • Data: JSON encode, compute content-length                     │    │
+│  │  5. Store optimized values for reuse                                 │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                            │                                                 │
+│                            ▼                                                 │
+│  DURING WORKFLOW EXECUTION (every loop iteration):                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  1. Use pre-resolved IP address (skip DNS)                          │    │
+│  │  2. Use pre-serialized headers (skip encoding)                      │    │
+│  │  3. Use pre-encoded data (skip JSON serialization)                  │    │
+│  │  4. Measure ONLY the actual HTTP request/response time              │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Result: Metrics reflect true target system performance,                    │
+│          not test infrastructure overhead.                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Available Optimized Arg Types
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        OPTIMIZED ARG TYPES                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  HTTP/Network:                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  URL       │ Pre-resolves DNS, caches IP address                    │    │
+│  │            │ Supports HTTP, HTTP2, HTTP3, GraphQL, WebSocket, etc. │    │
+│  │            │                                                         │    │
+│  │  Headers   │ Pre-serializes headers to wire format                  │    │
+│  │            │ HTTP/1.1: "Key: Value\r\n" string                      │    │
+│  │            │ HTTP/2+: [(b'key', b'value'), ...] tuples              │    │
+│  │            │                                                         │    │
+│  │  Data      │ Pre-encodes request body                               │    │
+│  │            │ dict/list → JSON bytes (via orjson)                    │    │
+│  │            │ Pydantic model → JSON bytes                            │    │
+│  │            │ Computes content-length and content-type               │    │
+│  │            │                                                         │    │
+│  │  Params    │ Pre-encodes URL query parameters                       │    │
+│  │            │ {"key": "value"} → "?key=value"                        │    │
+│  │            │                                                         │    │
+│  │  Cookies   │ Pre-formats cookie header                              │    │
+│  │            │ {"session": "abc"} → "session=abc"                     │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Authentication:                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Auth      │ Pre-computes authentication headers                    │    │
+│  │            │ Basic, Bearer, OAuth, etc.                             │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  GraphQL:                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Query     │ Pre-validates and formats GraphQL query                │    │
+│  │  Mutation  │ Pre-validates and formats GraphQL mutation             │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  File Transfer:                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  File      │ Pre-reads file content, computes metadata              │    │
+│  │  Directory │ Pre-scans directory structure                          │    │
+│  │  FileGlob  │ Pre-resolves glob patterns                             │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  gRPC/Protobuf:                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Protobuf  │ Pre-validates protobuf message structure               │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Email/SMTP:                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │  Email     │ Pre-formats email message (MIME encoding, etc.)        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Complete Example with Optimized Args
+
+```python
+from hyperscale.graph import Workflow, step
+from hyperscale.testing import (
+    URL,
+    Headers,
+    Data,
+    Params,
+    Cookies,
+    Auth,
+    HTTPResponse,
+)
+
+
+class OptimizedAPITest(Workflow):
+    """
+    Load test demonstrating all major optimized arg types.
+    
+    BEFORE execution starts, Hyperscale:
+    1. Resolves 'api.example.com' → 93.184.216.34
+    2. Serializes headers → "Authorization: Bearer token\r\n..."
+    3. JSON-encodes data → b'{"action":"create"}'
+    4. Encodes params → "?page=1&limit=100"
+    5. Formats cookies → "session=abc123"
+    
+    DURING execution:
+    - Uses cached IP (no DNS lookup per request)
+    - Uses pre-serialized headers (no encoding per request)
+    - Uses pre-encoded JSON (no serialization per request)
+    - Metrics measure ONLY actual HTTP latency
+    """
+    vus = 10000
+    duration = "5m"
+    priority = "high"
+    
+    @step()
+    async def get_with_auth(
+        self,
+        url: URL = 'https://api.example.com/users',
+        headers: Headers = {
+            'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIs...',
+            'Accept': 'application/json',
+        },
+        params: Params = {'page': 1, 'limit': 100},
+    ) -> HTTPResponse:
+        """
+        GET request with pre-optimized:
+        - URL (DNS pre-resolved)
+        - Headers (pre-serialized)
+        - Query params (pre-encoded)
+        """
+        return await self.client.http.get(
+            url,
+            headers=headers,
+            params=params,
+        )
+    
+    @step()
+    async def post_json_data(
+        self,
+        url: URL = 'https://api.example.com/actions',
+        headers: Headers = {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIs...',
+        },
+        data: Data = {
+            'action': 'create',
+            'resource': 'user',
+            'metadata': {'source': 'load_test'},
+        },
+    ) -> HTTPResponse:
+        """
+        POST request with pre-optimized:
+        - URL (DNS pre-resolved)
+        - Headers (pre-serialized)
+        - JSON body (pre-encoded via orjson)
+        - Content-Length (pre-computed)
+        """
+        return await self.client.http.post(
+            url,
+            headers=headers,
+            data=data,
+        )
+    
+    @step()
+    async def request_with_cookies(
+        self,
+        url: URL = 'https://api.example.com/session',
+        cookies: Cookies = {
+            'session_id': 'abc123xyz',
+            'user_pref': 'dark_mode',
+        },
+    ) -> HTTPResponse:
+        """
+        Request with pre-formatted cookies.
+        """
+        return await self.client.http.get(url, cookies=cookies)
+```
+
+---
+
+#### How Optimization Works (URL Example)
+
+```python
+# From hyperscale/core/testing/models/url/url.py
+
+class URL(OptimizedArg):
+    def __init__(self, url: str):
+        self.data = url
+        self.optimized: Optional[OptimizedUrl] = None
+    
+    async def optimize(self, request_type: RequestType):
+        """Called ONCE before workflow execution starts."""
+        if self.optimized is not None:
+            return  # Already optimized, skip
+        
+        # Create optimized URL with correct protocol
+        self.optimized = OptimizedUrl(
+            self.data,
+            family=address_family,  # IPv4/IPv6
+            protocol=protocol,       # TCP/UDP/QUIC
+        )
+        
+        # Pre-resolve DNS based on request type
+        match request_type:
+            case RequestType.HTTP | RequestType.HTTP2 | RequestType.HTTP3:
+                await self.optimized.lookup()  # DNS → IP address
+            case RequestType.FTP:
+                await self.optimized.lookup_ftp()
+            case RequestType.SMTP:
+                await self.optimized.lookup_smtp()
+            # ... etc.
+```
+
+**Timeline**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        OPTIMIZATION TIMELINE                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  T=0: Workflow submitted                                                     │
+│       │                                                                      │
+│       ▼                                                                      │
+│  T=1: Parse @step() signatures, extract optimized args                      │
+│       │                                                                      │
+│       ▼                                                                      │
+│  T=2: url.optimize() → DNS lookup (50-200ms typically)                      │
+│       headers.optimize() → serialize (< 1ms)                                │
+│       data.optimize() → JSON encode (< 1ms)                                 │
+│       │                                                                      │
+│       ▼                                                                      │
+│  T=3: START metrics collection                                              │
+│       │                                                                      │
+│       ├──► VU 1:    HTTP GET (uses cached IP, pre-serialized headers)      │
+│       │              └─ Latency: 15ms (measured)                            │
+│       │                                                                      │
+│       ├──► VU 2:    HTTP GET (uses cached IP, pre-serialized headers)      │
+│       │              └─ Latency: 12ms (measured)                            │
+│       │                                                                      │
+│       └──► VU N:    ... (all use same optimized values)                     │
+│                                                                              │
+│  DNS lookup cost (200ms) paid ONCE, not per request.                        │
+│  With 10,000 VUs × 100 requests each = 1,000,000 requests                   │
+│  Savings: 200ms × 1,000,000 = 55+ hours of DNS overhead eliminated!         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ### Step 2: Priority-Based Thread Allocation
 
 **Critical**: Thread allocation is calculated from the **TOTAL pool size** (all registered workers' cores), NOT available cores. This determines how many cores the workflow MAY request.
