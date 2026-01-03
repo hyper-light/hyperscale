@@ -2928,6 +2928,26 @@ class GateServer(HealthAwareServer):
         p95_latency_ms = statistics.median(p95_latencies) * 1000 if p95_latencies else 0.0
         p99_latency_ms = statistics.median(p99_latencies) * 1000 if p99_latencies else 0.0
         
+        # Ensure percentiles are monotonically increasing (p50 <= p95 <= p99)
+        # If any percentile is missing (0.0), interpolate from available data
+        if p95_latency_ms == 0.0 and (p50_latency_ms > 0 or p99_latency_ms > 0):
+            # Interpolate p95 as midpoint between p50 and p99, or use the non-zero value
+            if p50_latency_ms > 0 and p99_latency_ms > 0:
+                p95_latency_ms = (p50_latency_ms + p99_latency_ms) / 2
+            elif p99_latency_ms > 0:
+                p95_latency_ms = p99_latency_ms * 0.95  # Estimate p95 from p99
+            else:
+                p95_latency_ms = p50_latency_ms * 1.5  # Estimate p95 from p50
+        
+        if p99_latency_ms == 0.0 and p95_latency_ms > 0:
+            p99_latency_ms = p95_latency_ms * 1.1  # Estimate p99 from p95
+        
+        # Final sanity check: ensure monotonic order
+        if p95_latency_ms < p50_latency_ms:
+            p95_latency_ms = p50_latency_ms
+        if p99_latency_ms < p95_latency_ms:
+            p99_latency_ms = p95_latency_ms
+        
         # 5. Build aggregated stats with real values
         aggregated = AggregatedJobStats(
             total_requests=total_completed + total_failed,
