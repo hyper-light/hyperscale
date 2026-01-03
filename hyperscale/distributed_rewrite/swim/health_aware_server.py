@@ -1370,6 +1370,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     async def stop_leader_election(self) -> None:
         """Stop the leader election process."""
         await self._leader_election.stop()
+
+    async def shutdown(self):
+        await super().shutdown()
+
+        await self.stop()
     
     async def graceful_shutdown(
         self,

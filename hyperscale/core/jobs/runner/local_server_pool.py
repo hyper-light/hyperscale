@@ -288,24 +288,25 @@ class LocalServerPool:
                 )
             )
 
+            # Cancel the pool task first
             try:
-                if self._pool_task:
-                    self._pool_task.set_result(None)
+                if self._pool_task and not self._pool_task.done():
+                    self._pool_task.cancel()
+                    try:
+                        await asyncio.wait_for(self._pool_task, timeout=2.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
 
-            except Exception:
+            except (Exception, asyncio.CancelledError, asyncio.InvalidStateError):
                 pass
 
-            except asyncio.CancelledError:
-                pass
-
-            except asyncio.InvalidStateError:
-                pass
-
+            # Shutdown executor with wait=True to allow proper cleanup of semaphores
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
 
-                    if self._executor._processes and len(self._executor._processes) > 0:
+                    if self._executor and self._executor._processes:
+                        # First cancel futures
                         await self._loop.run_in_executor(
                             None,
                             functools.partial(
@@ -314,6 +315,28 @@ class LocalServerPool:
                                 cancel_futures=True,
                             ),
                         )
+                        
+                        # Give processes time to terminate gracefully
+                        await asyncio.sleep(0.5)
+                        
+                        # Force kill any remaining processes
+                        for pid, proc in list(self._executor._processes.items()):
+                            if proc.is_alive():
+                                try:
+                                    proc.terminate()
+                                except Exception:
+                                    pass
+                        
+                        # Wait briefly for termination
+                        await asyncio.sleep(0.2)
+                        
+                        # Kill any that didn't terminate
+                        for pid, proc in list(self._executor._processes.items()):
+                            if proc.is_alive():
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
 
             except (
                 Exception,
@@ -321,18 +344,12 @@ class LocalServerPool:
                 asyncio.CancelledError,
                 asyncio.InvalidStateError,
             ):
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-
-                    if self._executor._processes and len(self._executor._processes) > 0:
-                        await self._loop.run_in_executor(
-                            None,
-                            functools.partial(
-                                self._executor.shutdown,
-                                wait=False,
-                                cancel_futures=True,
-                            ),
-                        )
+                # Last resort: force shutdown without wait
+                try:
+                    if self._executor:
+                        self._executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
 
             await ctx.log(
                 Entry(
@@ -343,23 +360,25 @@ class LocalServerPool:
 
     def abort(self):
         try:
-            if self._pool_task:
-                self._pool_task.set_result(None)
-
-        except Exception:
-            pass
-
-        except asyncio.CancelledError:
-            pass
-
-        except asyncio.InvalidStateError:
+            if self._pool_task and not self._pool_task.done():
+                self._pool_task.cancel()
+        except (Exception, asyncio.CancelledError, asyncio.InvalidStateError):
             pass
 
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
 
-                if self._executor._processes and len(self._executor._processes) > 0:
+                if self._executor and self._executor._processes:
+                    # Force kill all processes immediately
+                    for pid, proc in list(self._executor._processes.items()):
+                        try:
+                            if proc.is_alive():
+                                proc.kill()
+                        except Exception:
+                            pass
+                    
+                    # Shutdown executor
                     self._executor.shutdown(wait=False, cancel_futures=True)
 
         except Exception:
