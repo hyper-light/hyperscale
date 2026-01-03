@@ -34,15 +34,16 @@ from hyperscale.graph import Workflow, step
 
 class LongRunningWorkflow(Workflow):
     """Workflow that runs long enough for progress updates to be sent."""
-    vus = 10  # More VUs to generate more stats
-    duration = "10s"
+    vus = 2  # Keep VUs low since we only have 4 cores
+    duration = "5s"  # Short duration but enough for progress updates
     
     @step()
     async def test_action(self) -> dict:
         """Action that takes enough time for progress monitoring."""
-        # Do some "work" - this will generate completed counts
-        await asyncio.sleep(0.2)
-        return {"iteration": 1, "status": "completed"}
+        # Do some "work" - multiple iterations for more stats
+        for i in range(5):
+            await asyncio.sleep(0.3)
+        return {"iteration": 5, "status": "completed"}
 
 
 # =============================================================================
@@ -173,7 +174,7 @@ async def run_test():
             job_id = await asyncio.wait_for(
                 client.submit_job(
                     workflows=[LongRunningWorkflow],
-                    vus=10,
+                    vus=2,  # Match workflow VUs to worker cores
                     timeout_seconds=60.0,
                 ),
                 timeout=10.0,
