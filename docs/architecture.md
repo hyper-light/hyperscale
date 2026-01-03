@@ -6898,6 +6898,632 @@ We combine the best properties from multiple approaches:
 
 ---
 
+## Gate Per-Job Leadership Architecture
+
+This section documents the distributed job ownership model for gates, enabling horizontal scaling and fault tolerance without single-leader bottlenecks.
+
+### Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    GATE PER-JOB LEADERSHIP MODEL                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PROBLEM: Single cluster-leader model bottlenecks at high job volumes       │
+│  SOLUTION: Each job has its own leader gate, distributed via consistent hash│
+│                                                                              │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐                 │
+│  │  Gate-1  │   │  Gate-2  │   │  Gate-3  │   │  Gate-4  │                 │
+│  │ [0-25%]  │   │ [25-50%] │   │ [50-75%] │   │ [75-100%]│                 │
+│  └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘                 │
+│       │              │              │              │                        │
+│       │    Job-abc ──┴──────────────│              │                        │
+│       │    (owner: Gate-2)          │              │                        │
+│       │                             │              │                        │
+│       └── Job-xyz ──────────────────┴──────────────│                        │
+│           (owner: Gate-3)                          │                        │
+│                                                    │                        │
+│                                                    └── Job-123              │
+│                                                        (owner: Gate-4)      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Architecture Components
+
+The architecture consists of five key components that work together:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      COMPONENT SUMMARY                                       │
+├───────────────────────┬─────────────────────────────────────────────────────┤
+│  Component            │  Status         │  Description                      │
+├───────────────────────┼─────────────────┼───────────────────────────────────┤
+│  1. Consistent Hashing│  UNIMPLEMENTED  │  Foundation for job distribution  │
+│  2. Lease-Based Owner │  UNIMPLEMENTED  │  Job ownership with TTL           │
+│  3. Direct DC Routing │  UNIMPLEMENTED  │  DC managers send to job leader   │
+│  4. Client Reconnect  │  UNIMPLEMENTED  │  Client computes job owner        │
+│  5. Fencing Tokens    │  UNIMPLEMENTED  │  Stale update protection          │
+└───────────────────────┴─────────────────┴───────────────────────────────────┘
+```
+
+---
+
+### Component 1: Consistent Hashing Ring
+
+**Status: UNIMPLEMENTED**
+
+**Decision**: Sophisticated approach - Use consistent hashing to deterministically map jobs to gates.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CONSISTENT HASHING RING                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  How It Works:                                                               │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  1. Each gate is assigned a position on a virtual ring (0 to 2^32-1)        │
+│  2. Jobs are hashed to a position on the same ring                          │
+│  3. Job owner = first gate clockwise from job's hash position               │
+│  4. Backup = next gate clockwise (for failover)                             │
+│                                                                              │
+│  Ring Visualization:                                                         │
+│                          0                                                   │
+│                          │                                                   │
+│                    ┌─────┼─────┐                                             │
+│                   /      │      \                                            │
+│                 Gate-1   │       Gate-2                                      │
+│                /         │          \                                        │
+│              /           │            \                                      │
+│  270° ─────┼─────────────┼─────────────┼───── 90°                           │
+│              \           │            /                                      │
+│                \         │          /                                        │
+│                 Gate-4   │     Gate-3                                        │
+│                   \      │      /                                            │
+│                    └─────┼─────┘                                             │
+│                          │                                                   │
+│                         180                                                  │
+│                                                                              │
+│  Example:                                                                    │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  hash("job-abc") = 135° → Owner: Gate-2 (at 90°), Backup: Gate-3 (at 180°) │
+│  hash("job-xyz") = 315° → Owner: Gate-1 (at 0°),  Backup: Gate-2 (at 90°)  │
+│                                                                              │
+│  Benefits:                                                                   │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  • Adding/removing gate only affects ~1/N of jobs                           │
+│  • Deterministic - any node can compute ownership without coordination      │
+│  • Client can compute owner directly (no queries needed)                    │
+│  • Natural load balancing across gates                                       │
+│                                                                              │
+│  Data Structures:                                                            │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  class ConsistentHashRing:                                                   │
+│      """Consistent hash ring for gate job distribution"""                   │
+│                                                                              │
+│      def __init__(self, virtual_nodes: int = 150):                          │
+│          self._ring: dict[int, str] = {}    # hash → node_id               │
+│          self._sorted_keys: list[int] = []  # sorted hash positions         │
+│          self._virtual_nodes = virtual_nodes                                 │
+│                                                                              │
+│      def add_node(self, node_id: str) -> None:                              │
+│          """Add a gate to the ring with virtual nodes"""                    │
+│          for i in range(self._virtual_nodes):                                │
+│              key = hash(f"{node_id}:{i}") % (2**32)                         │
+│              self._ring[key] = node_id                                       │
+│          self._sorted_keys = sorted(self._ring.keys())                       │
+│                                                                              │
+│      def remove_node(self, node_id: str) -> None:                           │
+│          """Remove a gate from the ring"""                                  │
+│          self._ring = {k: v for k, v in self._ring.items()                  │
+│                       if v != node_id}                                       │
+│          self._sorted_keys = sorted(self._ring.keys())                       │
+│                                                                              │
+│      def get_node(self, key: str) -> str:                                   │
+│          """Get the owner gate for a job_id"""                              │
+│          if not self._ring:                                                  │
+│              raise NoGatesAvailable()                                        │
+│          hash_val = hash(key) % (2**32)                                      │
+│          idx = bisect.bisect(self._sorted_keys, hash_val)                    │
+│          if idx == len(self._sorted_keys):                                   │
+│              idx = 0                                                         │
+│          return self._ring[self._sorted_keys[idx]]                           │
+│                                                                              │
+│      def get_nodes(self, key: str, count: int = 2) -> list[str]:            │
+│          """Get owner and N-1 backup gates for a job_id"""                  │
+│          nodes = []                                                          │
+│          hash_val = hash(key) % (2**32)                                      │
+│          idx = bisect.bisect(self._sorted_keys, hash_val)                    │
+│          while len(nodes) < count and len(nodes) < len(set(self._ring)):    │
+│              if idx >= len(self._sorted_keys):                               │
+│                  idx = 0                                                     │
+│              node = self._ring[self._sorted_keys[idx]]                       │
+│              if node not in nodes:                                           │
+│                  nodes.append(node)                                          │
+│              idx += 1                                                        │
+│          return nodes                                                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Component 2: Lease-Based Job Ownership
+
+**Status: UNIMPLEMENTED**
+
+**Decision**: Sophisticated approach - Jobs have leases with TTL that must be renewed.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    LEASE-BASED JOB OWNERSHIP                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Why Leases:                                                                 │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  • Consistent hash determines INITIAL owner                                 │
+│  • Lease confirms ACTIVE ownership                                          │
+│  • If owner fails, lease expires and backup can claim                       │
+│  • Prevents split-brain: only one lease holder at a time                    │
+│                                                                              │
+│  Lease Lifecycle:                                                            │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                    │
+│  │   CLAIMED   │────▶│   ACTIVE    │────▶│   EXPIRED   │                    │
+│  │             │     │             │     │             │                    │
+│  │ fence_token │     │ renewing... │     │ backup can  │                    │
+│  │ assigned    │     │             │     │ claim       │                    │
+│  └─────────────┘     └──────┬──────┘     └─────────────┘                    │
+│         ▲                   │                   │                            │
+│         │                   │ renewal           │ backup claims              │
+│         │                   ▼                   ▼                            │
+│         │            ┌─────────────┐     ┌─────────────┐                    │
+│         │            │   ACTIVE    │     │   CLAIMED   │                    │
+│         │            │  (renewed)  │     │  (new owner)│                    │
+│         │            └─────────────┘     │ fence+1     │                    │
+│         │                                └─────────────┘                    │
+│         │                                       │                            │
+│         └───────────────────────────────────────┘                            │
+│                        (cycle continues)                                     │
+│                                                                              │
+│  Lease State:                                                                │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  @dataclass(slots=True)                                                      │
+│  class GateJobLease:                                                         │
+│      """Lease for job ownership"""                                          │
+│      job_id: str                                                             │
+│      owner_node_id: str           # Current lease holder                    │
+│      fence_token: int             # Monotonic, increments on ownership change│
+│      lease_acquired: float        # time.monotonic() when acquired          │
+│      lease_duration: float = 30.0 # TTL in seconds                          │
+│      backup_node_id: str | None = None  # Next in consistent hash ring      │
+│                                                                              │
+│      @property                                                               │
+│      def is_expired(self) -> bool:                                          │
+│          return time.monotonic() > self.lease_acquired + self.lease_duration│
+│                                                                              │
+│      def renew(self) -> None:                                                │
+│          self.lease_acquired = time.monotonic()                              │
+│                                                                              │
+│  Lease Operations:                                                           │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  async def claim_job_lease(self, job_id: str) -> GateJobLease:              │
+│      """Claim ownership of a job (on first submission)"""                   │
+│      nodes = self._hash_ring.get_nodes(job_id, count=2)                     │
+│      owner = nodes[0]                                                        │
+│      backup = nodes[1] if len(nodes) > 1 else None                          │
+│                                                                              │
+│      lease = GateJobLease(                                                   │
+│          job_id=job_id,                                                      │
+│          owner_node_id=owner,                                                │
+│          fence_token=1,                                                      │
+│          lease_acquired=time.monotonic(),                                    │
+│          backup_node_id=backup,                                              │
+│      )                                                                       │
+│      self._job_leases[job_id] = lease                                        │
+│      return lease                                                            │
+│                                                                              │
+│  async def claim_expired_lease(self, job_id: str) -> GateJobLease | None:   │
+│      """Backup claims an expired lease"""                                   │
+│      lease = self._job_leases.get(job_id)                                   │
+│      if not lease or not lease.is_expired:                                   │
+│          return None                                                         │
+│      if lease.backup_node_id != self._node_id.full:                         │
+│          return None  # Not the backup                                       │
+│                                                                              │
+│      # Claim with incremented fence token                                    │
+│      new_backup = self._hash_ring.get_nodes(job_id, count=3)[2:]            │
+│      new_lease = GateJobLease(                                               │
+│          job_id=job_id,                                                      │
+│          owner_node_id=self._node_id.full,                                   │
+│          fence_token=lease.fence_token + 1,                                  │
+│          lease_acquired=time.monotonic(),                                    │
+│          backup_node_id=new_backup[0] if new_backup else None,              │
+│      )                                                                       │
+│      self._job_leases[job_id] = new_lease                                    │
+│      return new_lease                                                        │
+│                                                                              │
+│  Lease Renewal Loop:                                                         │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  async def _lease_renewal_loop(self):                                        │
+│      """Background task to renew leases for owned jobs"""                   │
+│      while self._running:                                                    │
+│          for job_id, lease in list(self._job_leases.items()):               │
+│              if lease.owner_node_id == self._node_id.full:                   │
+│                  if not lease.is_expired:                                    │
+│                      lease.renew()                                           │
+│          await asyncio.sleep(lease.lease_duration / 3)  # Renew at 1/3 TTL  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Component 3: Direct DC-to-Job-Leader Result Routing
+
+**Status: UNIMPLEMENTED**
+
+**Decision**: Sophisticated approach - DC managers send results directly to job leader gate.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DIRECT RESULT ROUTING                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Why Direct Routing:                                                         │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  • No intermediate hops = lower latency                                     │
+│  • Job leader gate aggregates results directly                              │
+│  • Less load on cluster leader gate                                         │
+│                                                                              │
+│  Flow Diagram:                                                               │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│                    ┌─────────────────────────────────────┐                   │
+│                    │         Gate Cluster                │                   │
+│                    │  ┌──────┐  ┌──────┐  ┌──────┐      │                   │
+│                    │  │Gate-1│  │Gate-2│  │Gate-3│      │                   │
+│                    │  │      │  │ (job │  │      │      │                   │
+│                    │  │      │  │leader)│  │      │      │                   │
+│                    │  └──────┘  └───▲──┘  └──────┘      │                   │
+│                    └────────────────┼───────────────────┘                   │
+│                                     │                                        │
+│         ┌───────────────────────────┼───────────────────────────┐           │
+│         │                           │                           │           │
+│         │ JobFinalResult            │ JobFinalResult            │           │
+│         │                           │                           │           │
+│  ┌──────┴──────┐             ┌──────┴──────┐             ┌──────┴──────┐   │
+│  │   DC-ALPHA  │             │   DC-BETA   │             │   DC-GAMMA  │   │
+│  │   Manager   │             │   Manager   │             │   Manager   │   │
+│  │   Cluster   │             │   Cluster   │             │   Cluster   │   │
+│  └─────────────┘             └─────────────┘             └─────────────┘   │
+│                                                                              │
+│  Manager-Side Implementation:                                                │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  # Managers need to know job → gate owner mapping                           │
+│  # This is embedded in the job dispatch from gate                           │
+│                                                                              │
+│  async def send_job_final_result(self, job_id: str, result: JobFinalResult):│
+│      # Get job leader gate from stored job info                             │
+│      job_info = self._job_info[job_id]                                       │
+│      job_leader_gate = job_info.origin_gate  # Stored when job dispatched   │
+│                                                                              │
+│      # Send directly to job leader gate                                      │
+│      await self.send_tcp(                                                    │
+│          job_leader_gate,                                                    │
+│          "job_final_result",                                                 │
+│          result.dump(),                                                      │
+│      )                                                                       │
+│                                                                              │
+│  Gate-Side Implementation:                                                   │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  async def job_final_result(self, addr, data, clock_time):                  │
+│      result = JobFinalResult.load(data)                                      │
+│      lease = self._job_leases.get(result.job_id)                            │
+│                                                                              │
+│      # Verify we're the owner (fence token check)                           │
+│      if not self._owns_job(result.job_id, result.fence_token):              │
+│          # Ring changed or lease transferred                                 │
+│          actual_owner = self._hash_ring.get_node(result.job_id)             │
+│          await self.forward_result(actual_owner, result)                     │
+│          return b'forwarded'                                                 │
+│                                                                              │
+│      # Aggregate with other DC results                                       │
+│      await self._aggregate_dc_result(result)                                 │
+│                                                                              │
+│  Edge Case - Ring Changed:                                                   │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  If gate added/removed while job running:                                    │
+│  1. DC manager sends to old owner (from stored job_info)                    │
+│  2. Old owner detects "I don't own this" via hash ring                      │
+│  3. Old owner forwards to new owner                                          │
+│  4. New owner processes (fence token prevents duplicates)                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Component 4: Client Reconnection
+
+**Status: UNIMPLEMENTED**
+
+**Decision**: Sophisticated approach - Clients compute job owner deterministically.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CLIENT RECONNECTION                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Why Client Computes Owner:                                                  │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  • After disconnect, client knows exactly where to reconnect                │
+│  • No need to query gates for "who owns my job?"                            │
+│  • Client maintains same hash ring as gates                                  │
+│                                                                              │
+│  Client State:                                                               │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  class HyperscaleClient:                                                     │
+│      def __init__(self, gate_addrs: list[tuple[str, int]]):                 │
+│          self._gate_addrs = gate_addrs                                       │
+│          self._hash_ring = ConsistentHashRing()                              │
+│          self._job_callbacks: dict[str, asyncio.Future] = {}                │
+│                                                                              │
+│          # Initialize ring with known gates                                  │
+│          for host, port in gate_addrs:                                       │
+│              self._hash_ring.add_node(f"{host}:{port}")                      │
+│                                                                              │
+│      async def submit_job(self, job: Job) -> JobAck:                        │
+│          # Compute owner from job_id                                         │
+│          owner = self._hash_ring.get_node(job.job_id)                        │
+│          host, port = owner.split(":")                                       │
+│                                                                              │
+│          # Submit to owner                                                   │
+│          return await self.send_tcp(                                         │
+│              (host, int(port)),                                              │
+│              "job_submission",                                               │
+│              job.dump(),                                                     │
+│          )                                                                   │
+│                                                                              │
+│  Reconnection Logic:                                                         │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  async def reconnect_to_job(self, job_id: str, max_retries: int = 3):       │
+│      """Reconnect to job after disconnect"""                                │
+│      for attempt in range(max_retries):                                      │
+│          owner = self._hash_ring.get_node(job_id)                            │
+│          host, port = owner.split(":")                                       │
+│                                                                              │
+│          try:                                                                │
+│              response = await self.send_tcp(                                 │
+│                  (host, int(port)),                                          │
+│                  "register_callback",                                        │
+│                  RegisterCallback(job_id=job_id).dump(),                     │
+│              )                                                               │
+│              if response.success:                                            │
+│                  return True                                                 │
+│          except (ConnectionError, TimeoutError):                             │
+│              pass                                                            │
+│                                                                              │
+│          # Gate might have failed, wait for lease transfer                   │
+│          await asyncio.sleep(LEASE_DURATION / 2)                             │
+│                                                                              │
+│      raise ReconnectFailed(job_id)                                           │
+│                                                                              │
+│  Ring Update Protocol:                                                       │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  Clients receive ring updates via push notifications:                        │
+│                                                                              │
+│  async def handle_ring_update(self, update: RingUpdate):                    │
+│      """Gate cluster sends ring updates to clients"""                       │
+│      if update.type == "add":                                                │
+│          self._hash_ring.add_node(update.node_id)                            │
+│      elif update.type == "remove":                                           │
+│          self._hash_ring.remove_node(update.node_id)                         │
+│                                                                              │
+│  Timeline (Reconnect After Gate Failure):                                    │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  t=0    Client connected to Gate-2 for job-abc                               │
+│  t=5    Gate-2 crashes                                                       │
+│  t=5    Client detects disconnect                                            │
+│  t=6    Client computes owner: hash("job-abc") → Gate-2 (still in ring)     │
+│  t=6    Client tries Gate-2, fails                                           │
+│  t=6    Client waits LEASE_DURATION/2 = 15s                                  │
+│  t=21   Client retries: Gate-3 now owns (lease transferred)                 │
+│  t=21   Client connects to Gate-3, registers callback                       │
+│  t=21   Client receives remaining updates ✓                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Component 5: Fencing Tokens
+
+**Status: UNIMPLEMENTED**
+
+**Decision**: Simple approach - Monotonic fence tokens reject stale operations.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    FENCING TOKENS                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Why Fencing Tokens:                                                         │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  • Prevent stale updates from old owner after lease transfer                │
+│  • Simple, proven pattern (used in ZooKeeper, etcd, etc.)                   │
+│  • No consensus needed - just monotonic comparison                          │
+│                                                                              │
+│  How It Works:                                                               │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  1. Job created with fence_token = 1                                         │
+│  2. Each ownership transfer increments fence_token                           │
+│  3. All operations include fence_token                                       │
+│  4. Receiver rejects if received_token < current_token                       │
+│                                                                              │
+│  Fence Token in Messages:                                                    │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  # All job-related messages include fence token                              │
+│                                                                              │
+│  @dataclass(slots=True)                                                      │
+│  class JobDispatch(Message):                                                 │
+│      job_id: str                                                             │
+│      fence_token: int  # ← Must match current owner's token                 │
+│      workflows: list[bytes]                                                  │
+│      # ...                                                                   │
+│                                                                              │
+│  @dataclass(slots=True)                                                      │
+│  class JobFinalResult(Message):                                              │
+│      job_id: str                                                             │
+│      fence_token: int  # ← Proves result is from valid ownership period     │
+│      datacenter: str                                                         │
+│      # ...                                                                   │
+│                                                                              │
+│  @dataclass(slots=True)                                                      │
+│  class JobStatusPush(Message):                                               │
+│      job_id: str                                                             │
+│      fence_token: int  # ← Client can detect ownership changes              │
+│      # ...                                                                   │
+│                                                                              │
+│  Validation Logic:                                                           │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  def validate_fence_token(self, job_id: str, received_token: int) -> bool:  │
+│      """Reject operations with stale fence tokens"""                        │
+│      lease = self._job_leases.get(job_id)                                    │
+│      if not lease:                                                           │
+│          return False  # Unknown job                                         │
+│      if received_token < lease.fence_token:                                  │
+│          return False  # Stale token from old owner                         │
+│      if received_token > lease.fence_token:                                  │
+│          # Future token - might be from new owner we don't know yet         │
+│          # Accept and update our lease info                                  │
+│          self._update_lease_from_newer_token(job_id, received_token)         │
+│      return True                                                             │
+│                                                                              │
+│  Scenario: Stale Update Rejected                                             │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  t=0    Gate-2 owns job-abc (fence=1)                                        │
+│  t=1    Gate-2 dispatches to DC-ALPHA (fence=1)                             │
+│  t=2    Gate-2 crashes                                                       │
+│  t=5    Gate-3 claims lease (fence=2)                                        │
+│  t=10   DC-ALPHA returns result (fence=1)  ← STALE!                         │
+│  t=10   Gate-3 rejects: received_token(1) < current(2)                       │
+│  t=11   DC-ALPHA retries with updated fence from Gate-3                     │
+│                                                                              │
+│  Scenario: Split-Brain Prevention                                            │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  t=0    Gate-2 owns job-abc (fence=1)                                        │
+│  t=1    Network partition: Gate-2 isolated from Gate-3                      │
+│  t=2    Gate-2 thinks it still owns job (lease not expired locally)         │
+│  t=2    Gate-3 claims lease (fence=2) - sees Gate-2 as dead                 │
+│  t=3    Gate-2 sends update (fence=1)                                        │
+│  t=3    Receiver rejects: fence=1 < current=2                                │
+│  t=4    Gate-2 learns it's not owner anymore, stops processing              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Component Interactions
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    COMPONENT SYNERGIES                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────┐                                                         │
+│  │ Consistent Hash │─────────────────────────────────────┐                  │
+│  │    (Foundation) │                                     │                  │
+│  └────────┬────────┘                                     │                  │
+│           │ determines initial                           │                  │
+│           │ owner & backup                               │                  │
+│           ▼                                              ▼                  │
+│  ┌─────────────────┐                            ┌─────────────────┐         │
+│  │  Lease-Based    │                            │ Client Reconnect│         │
+│  │  Ownership      │                            │ (computes owner)│         │
+│  └────────┬────────┘                            └────────┬────────┘         │
+│           │ fence token                                  │ queries          │
+│           │ assigned                                     │ job owner        │
+│           ▼                                              │                  │
+│  ┌─────────────────┐                                     │                  │
+│  │ Fencing Tokens  │◀────────────────────────────────────┘                  │
+│  │ (prevents stale)│                                                         │
+│  └────────┬────────┘                                                         │
+│           │ validates                                                        │
+│           │ operations                                                       │
+│           ▼                                                                  │
+│  ┌─────────────────┐                                                         │
+│  │ Direct DC Route │                                                         │
+│  │ (low latency)   │                                                         │
+│  └─────────────────┘                                                         │
+│                                                                              │
+│  Data Flow:                                                                  │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  1. Client submits job → hash_ring.get_node(job_id) → Gate-X               │
+│  2. Gate-X claims lease → fence_token=1                                     │
+│  3. Gate-X dispatches to DCs → includes fence_token                         │
+│  4. DCs complete → send results to Gate-X (job leader)                      │
+│  5. Gate-X aggregates, sends to client                                       │
+│                                                                              │
+│  Failure Handling:                                                           │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  • Gate-X fails → lease expires → Gate-Y (backup) claims → fence+1         │
+│  • Stale results from DCs (fence=1) rejected by Gate-Y (fence=2)           │
+│  • Client reconnects to Gate-Y (computed via hash ring)                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Implementation Order
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    IMPLEMENTATION ROADMAP                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Order  │ Component           │ Depends On       │ Status                   │
+│  ───────┼─────────────────────┼──────────────────┼────────────────────────  │
+│  1      │ Consistent Hashing  │ None             │ UNIMPLEMENTED            │
+│  2      │ Lease-Based Owner   │ #1               │ UNIMPLEMENTED            │
+│  3      │ Fencing Tokens      │ #2               │ UNIMPLEMENTED            │
+│  4      │ Direct DC Routing   │ #1, #2, #3       │ UNIMPLEMENTED            │
+│  5      │ Client Reconnect    │ #1, #3           │ UNIMPLEMENTED            │
+│                                                                              │
+│  Each component will be:                                                     │
+│  1. Implemented                                                              │
+│  2. Tested with integration test                                             │
+│  3. Debugged and fixed                                                       │
+│  4. Committed                                                                │
+│  5. Marked as IMPLEMENTED in this document                                   │
+│  6. Committed again with documentation update                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## License
 
 See the main project LICENSE file.
