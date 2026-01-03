@@ -1324,9 +1324,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 if attempt < max_attempts:
                     # Exponential backoff with jitter before retry
                     backoff = PROBE_RETRY_POLICY.base_delay * (
-                        PROBE_RETRY_POLICY.backoff_multiplier ** (attempt - 1)
+                        PROBE_RETRY_POLICY.exponential_base ** (attempt - 1)
                     )
-                    jitter = random.uniform(0, PROBE_RETRY_POLICY.jitter_factor * backoff)
+                    jitter = random.uniform(0, PROBE_RETRY_POLICY.jitter * backoff)
                     await asyncio.sleep(backoff + jitter)
                     
             except asyncio.TimeoutError:
@@ -1685,7 +1685,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 StaleMessageError(
                     node,
                     incarnation,
-                    self._incarnation_tracker.get_incarnation(node),
+                    self._incarnation_tracker.get_node_incarnation(node),
                 ),
             )
         return is_fresh
@@ -1857,7 +1857,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if node in self._suspicion_manager.suspicions:
             await self._suspicion_manager.refute_suspicion(
                 node,
-                self._incarnation_tracker.get_incarnation(node) + 1,
+                self._incarnation_tracker.get_node_incarnation(node) + 1,
             )
         
         # Clear any pending indirect probes

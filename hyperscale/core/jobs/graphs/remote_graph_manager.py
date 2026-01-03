@@ -97,7 +97,7 @@ class RemoteGraphManager:
         self._role = InstanceRoleType.PROVISIONER
         self._provisioner: Provisioner | None = None
         self._graph_updates: dict[int, dict[str, asyncio.Queue[WorkflowStatusUpdate]]] = defaultdict(lambda: defaultdict(asyncio.Queue))
-        self._workflow_statuses: dict[int, dict[str, Deque[WorkflowStatusUpdate]]] = deque()
+        self._workflow_statuses: dict[int, dict[str, Deque[WorkflowStatusUpdate]]] = defaultdict(lambda: defaultdict(deque))
 
         self._step_traversal_orders: Dict[
             str,
@@ -324,7 +324,6 @@ class RemoteGraphManager:
         vus: int,
         threads: int,
     ):
-        
         await self._append_workflow_run_status(run_id, workflow.name, WorkflowStatus.QUEUED)
 
         self._controller.create_context_from_external_store(
@@ -337,7 +336,7 @@ class RemoteGraphManager:
             "workflow": workflow.name,
             "run_id": run_id,
             "workers": threads,
-            "workflow_vus": workflow.vus,
+            "workflow_vus": vus,
             "duration": workflow.duration,
         }
 
@@ -380,6 +379,9 @@ class RemoteGraphManager:
             )
 
             self._controller.create_run_contexts(run_id)
+            _, workflow_vus = self._provision({
+                workflow.name: workflow,
+            }, threads=threads)
 
 
             await self._append_workflow_run_status(run_id, workflow.name, WorkflowStatus.RUNNING)
@@ -388,10 +390,9 @@ class RemoteGraphManager:
                 run_id,
                 workflow,
                 threads,
-                vus,
+                workflow_vus[workflow.name],
                 skip_reporting=True,
             )
-
             workflow_name, results, context, error = results
 
             status = WorkflowStatus.FAILED if error else WorkflowStatus.COMPLETED
@@ -413,7 +414,7 @@ class RemoteGraphManager:
     ):
         if self._status_lock:
             await self._status_lock.acquire()
-            self._workflow_statuses[run_id][workflow.name].append(status)
+            self._workflow_statuses[run_id][workflow].append(status)
             self._status_lock.release()
 
     def _create_workflow_graph(self, workflows: List[Workflow | DependentWorkflow]):
@@ -554,7 +555,7 @@ class RemoteGraphManager:
                 context = self._controller.assign_context(
                     run_id,
                     workflow.name,
-                    threads,
+                    threads if is_test_workflow else 1,
                 )
 
                 loaded_context = await self._use_context(
@@ -587,7 +588,7 @@ class RemoteGraphManager:
                     run_id,
                     workflow,
                     loaded_context,
-                    threads,
+                    threads if is_test_workflow else 1,
                     workflow_vus,
                     self._update,
                 )
@@ -665,8 +666,8 @@ class RemoteGraphManager:
                         )
                     ).pop()
 
-                elif len(results) > 1:
-                    _, execution_result = results.pop()
+                elif len(results) > 0:
+                    execution_result = results.pop()
 
                 else:
                     await ctx.log_prepared(
@@ -954,10 +955,15 @@ class RemoteGraphManager:
     def _provision(
         self,
         workflows: Dict[str, Workflow],
+        threads: int | None = None,
     ) -> Tuple[ProvisionedBatch, WorkflowVUs]:
+        if threads is None:
+            threads = self._threads    
+
+
         configs = {
             workflow_name: {
-                "threads": self._threads,
+                "threads": threads,
                 "vus": 1000,
             }
             for workflow_name in workflows
@@ -974,7 +980,7 @@ class RemoteGraphManager:
                 }
             )
 
-            config["threads"] = min(config["threads"], self._threads)
+            config["threads"] = min(config["threads"], threads)
 
         workflow_hooks: Dict[str, Dict[str, Hook]] = {
             workflow_name: {
@@ -1007,7 +1013,7 @@ class RemoteGraphManager:
                         "threads",
                     )
                     if config.get("threads")
-                    else self._threads
+                    else threads
                     if test_workflows[workflow_name]
                     else 1,
                 }
@@ -1018,13 +1024,15 @@ class RemoteGraphManager:
         workflow_vus: Dict[str, List[int]] = defaultdict(list)
 
         for batch in provisioned_workers:
-            for workflow_name, _, threads in batch:
+            for workflow_name, _, batch_threads in batch:
                 workflow_config = configs[workflow_name]
 
-                vus = int(workflow_config["vus"] / threads)
-                remainder_vus = workflow_config["vus"] % threads
+                batch_threads = max(batch_threads, 1)
 
-                workflow_vus[workflow_name].extend([vus for _ in range(threads)])
+                vus = int(workflow_config["vus"] / batch_threads)
+                remainder_vus = workflow_config["vus"] % batch_threads
+
+                workflow_vus[workflow_name].extend([vus for _ in range(batch_threads)])
 
                 workflow = workflows.get(workflow_name)
 

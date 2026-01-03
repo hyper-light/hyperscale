@@ -1138,17 +1138,18 @@ class WorkerServer(HealthAwareServer):
         cancel_event: asyncio.Event,
         allocated_vus: int,
         allocated_cores: int,
-    ) -> None:
+    ):
         """Execute a workflow using WorkflowRunner."""
         start_time = time.monotonic()
         run_id = hash(dispatch.workflow_id) % (2**31)
+        error: Exception | None = None
         
         try:
             # Unpickle workflow and context
-            workflow = restricted_loads(dispatch.workflow)
-            context_dict = restricted_loads(dispatch.context)
+            workflow = dispatch.load_workflow()
+            context_dict = dispatch.load_context()
             
-            progress.workflow_name = getattr(workflow, 'name', workflow.__class__.__name__)
+            progress.workflow_name = workflow.name
             progress.status = WorkflowStatus.RUNNING.value
             self._increment_version()
             
@@ -1165,6 +1166,7 @@ class WorkerServer(HealthAwareServer):
                 alias=f"progress:{dispatch.workflow_id}",
             )
             
+
             workflow_error: str | None = None
             workflow_results: bytes = b''
             context_updates: bytes = b''
@@ -1182,23 +1184,17 @@ class WorkerServer(HealthAwareServer):
                     workflow,
                     context_dict,
                     allocated_vus,
-                    allocated_cores,
+                    max(allocated_cores, 1),
                 )
 
                 progress.cores_completed = len(progress.assigned_cores)
 
-                match status:
-                    case CoreWorkflowStatus.COMPLETED:
-                        progress.status = WorkflowStatus.COMPLETED.value
-                    
-                    case CoreWorkflowStatus.FAILED:
-                        progress.status = WorkflowStatus.FAILED.value
-                        workflow_error = str(error) if error else "Unknown error"
 
-                    case _:
-                        progress.status = WorkflowStatus.FAILED.value
-                        workflow_error = str(error) if error else "Unknown status"
-                
+                progress.status = WorkflowStatus.COMPLETED.value
+                if status != CoreWorkflowStatus.COMPLETED:
+                    progress.status = WorkflowStatus.FAILED.value
+                    workflow_error = str(error) if error else "Unknown error"
+
                 # Serialize results and context for final result
                 workflow_results = cloudpickle.dumps(results) if results else b''
                 context_updates = cloudpickle.dumps(context.dict() if context else {})
@@ -1235,6 +1231,7 @@ class WorkerServer(HealthAwareServer):
             progress.status = WorkflowStatus.CANCELLED.value
         except Exception as e:
             progress.status = WorkflowStatus.FAILED.value
+            error = str(error) if error else "Unknown error"
         finally:
             self._free_cores(dispatch.workflow_id)
             self._increment_version()
@@ -1244,6 +1241,12 @@ class WorkerServer(HealthAwareServer):
             self._active_workflows.pop(dispatch.workflow_id, None)
             self._workflow_last_progress.pop(dispatch.workflow_id, None)
             self._workflow_cores_completed.pop(dispatch.workflow_id, None)
+
+        return (
+            progress,
+            error,
+
+        )
     
     async def _monitor_workflow_progress(
         self,
@@ -1546,12 +1549,12 @@ class WorkerServer(HealthAwareServer):
     # =========================================================================
     
     @tcp.receive()
-    async def receive_state_sync_request(
+    async def state_sync_request(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-    ) -> tuple[bytes, bytes]:
+    ) -> bytes:
         """Handle state sync request from a new manager leader."""
         try:
             request = StateSyncRequest.load(data)
@@ -1561,22 +1564,22 @@ class WorkerServer(HealthAwareServer):
                 current_version=self._state_version,
                 worker_state=self._get_state_snapshot(),
             )
-            return (b'state_sync_response', response.dump())
+            return response.dump()
             
         except Exception:
-            return (b'state_sync_response', b'')
+            return b''
     
     # =========================================================================
     # TCP Handlers - Cancellation
     # =========================================================================
     
     @tcp.receive()
-    async def receive_cancel_job(
+    async def cancel_job(
         self,
         addr: tuple[str, int],
         data: bytes,
         clock_time: int,
-    ) -> tuple[bytes, bytes]:
+    ) -> bytes:
         """Handle job cancellation request from manager."""
         try:
             cancel_request = CancelJob.load(data)
@@ -1593,7 +1596,7 @@ class WorkerServer(HealthAwareServer):
                 cancelled=True,
                 workflows_cancelled=cancelled_count,
             )
-            return (b'cancel_ack', ack.dump())
+            return ack.dump()
             
         except Exception as e:
             ack = CancelAck(
@@ -1601,4 +1604,4 @@ class WorkerServer(HealthAwareServer):
                 cancelled=False,
                 error=str(e),
             )
-            return (b'cancel_ack', ack.dump())
+            return ack.dump()

@@ -7,6 +7,8 @@ in the distributed Hyperscale architecture.
 
 from dataclasses import dataclass, field
 from enum import Enum
+from hyperscale.core.graph import Workflow
+from hyperscale.core.state import Context
 from .message import Message
 
 
@@ -418,6 +420,12 @@ class WorkflowDispatch(Message):
     # Context Consistency Protocol fields
     context_version: int = 0     # Layer version for staleness detection
     dependency_context: bytes = b''  # Context from dependencies only
+
+    def load_workflow(self) -> Workflow:
+        return Message.load(self.workflow)
+    
+    def load_context(self) -> Context:
+        return Message.load(self.context)
 
 
 @dataclass(slots=True)

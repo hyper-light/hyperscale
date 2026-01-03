@@ -219,7 +219,7 @@ class SuspicionManager:
                 keep_policy='COUNT_AND_AGE',
             )
             if run:
-                self._timer_tokens[state.node] = f"{run.name}:{run.run_id}"
+                self._timer_tokens[state.node] = f"{run.task_name}:{run.run_id}"
         else:
             # Fallback to raw asyncio task
             state._timer_task = asyncio.create_task(expire_suspicion())
@@ -242,7 +242,7 @@ class SuspicionManager:
                     keep_policy='COUNT_AND_AGE',
                 )
                 if run:
-                    self._timer_tokens[state.node] = f"{run.name}:{run.run_id}"
+                    self._timer_tokens[state.node] = f"{run.task_name}:{run.run_id}"
             else:
                 state._timer_task = asyncio.create_task(expire_suspicion())
         else:
