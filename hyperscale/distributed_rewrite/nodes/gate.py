@@ -80,6 +80,8 @@ from hyperscale.distributed_rewrite.swim.core import (
     CircuitState,
 )
 from hyperscale.distributed_rewrite.env import Env
+from hyperscale.distributed_rewrite.routing import ConsistentHashRing
+from hyperscale.distributed_rewrite.leases import LeaseManager, JobLease
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 
 
@@ -199,11 +201,41 @@ class GateServer(HealthAwareServer):
         
         # Configuration
         self._lease_timeout = lease_timeout
-        
+
         # Job cleanup configuration
         self._job_max_age: float = 3600.0  # 1 hour max age for completed jobs
         self._job_cleanup_interval: float = 60.0  # Check every minute
-        
+
+        # =================================================================
+        # Per-Job Leadership: Consistent Hashing + Lease Management
+        # =================================================================
+        # Get configuration from env
+        job_routing_config = env.get_job_routing_config()
+
+        # Hash ring for deterministic job-to-gate assignment
+        # Each job has a primary owner gate determined by consistent hashing
+        self._job_hash_ring = ConsistentHashRing(
+            virtual_nodes=job_routing_config['hash_ring_virtual_nodes']
+        )
+
+        # Add self to the ring
+        self._my_ring_id = f"{host}:{tcp_port}"
+        self._job_hash_ring.add_node(self._my_ring_id)
+
+        # Add known gate peers to the ring
+        for peer_addr in self._gate_peers:
+            peer_ring_id = f"{peer_addr[0]}:{peer_addr[1]}"
+            self._job_hash_ring.add_node(peer_ring_id)
+
+        # Lease manager for time-bounded job ownership
+        # Prevents split-brain by requiring lease renewal
+        self._job_lease_manager = LeaseManager(
+            node_id=self._my_ring_id,
+            default_duration=job_routing_config['lease_duration'],
+            cleanup_interval=job_routing_config['lease_cleanup_interval'],
+            on_lease_expired=self._on_job_lease_expired,
+        )
+
         # Inject state embedder for Serf-style heartbeat embedding in SWIM messages
         self.set_state_embedder(GateStateEmbedder(
             get_node_id=lambda: self._node_id.full,
@@ -277,15 +309,19 @@ class GateServer(HealthAwareServer):
         """
         # Remove from active peers
         self._active_gate_peers.discard(tcp_addr)
-        
+
+        # Remove from hash ring - jobs owned by this gate can now be claimed
+        peer_ring_id = f"{tcp_addr[0]}:{tcp_addr[1]}"
+        self._job_hash_ring.remove_node(peer_ring_id)
+
         # Check if this was the leader
         current_leader = self.get_current_leader()
         was_leader = current_leader == udp_addr
-        
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Gate peer at {tcp_addr} (UDP: {udp_addr}) marked as DEAD" +
+                message=f"Gate peer at {tcp_addr} (UDP: {udp_addr}) marked as DEAD, removed from hash ring" +
                         (" - was LEADER, re-election will occur" if was_leader else ""),
                 node_host=self._host,
                 node_port=self._tcp_port,
@@ -317,11 +353,15 @@ class GateServer(HealthAwareServer):
         """
         # Add back to active peers
         self._active_gate_peers.add(tcp_addr)
-        
+
+        # Add back to hash ring - this gate can now own jobs again
+        peer_ring_id = f"{tcp_addr[0]}:{tcp_addr[1]}"
+        self._job_hash_ring.add_node(peer_ring_id)
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Gate peer at {tcp_addr} (UDP: {udp_addr}) has REJOINED the cluster",
+                message=f"Gate peer at {tcp_addr} (UDP: {udp_addr}) has REJOINED the cluster, added to hash ring",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -530,7 +570,27 @@ class GateServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-    
+
+    def _on_job_lease_expired(self, lease: JobLease) -> None:
+        """
+        Called when a job lease expires.
+
+        This happens when we fail to renew the lease in time, which could
+        indicate this gate is overloaded or experiencing issues. The job
+        can now be claimed by another gate (the backup per consistent hashing).
+        """
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerWarning(
+                message=f"Job lease expired for {lease.job_id}, was held since fence_token={lease.fence_token}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        # Note: We don't remove job state here - the job may still be running
+        # in the DCs. The backup gate will claim ownership and continue tracking.
+
     async def _sync_state_from_gate_peers(self) -> None:
         """
         Sync state from active gate peers when becoming leader.
@@ -1687,7 +1747,10 @@ class GateServer(HealthAwareServer):
                 self._dc_health_monitor.add_datacenter(dc, manager_udp_addrs[0])
         
         await self._dc_health_monitor.start()
-        
+
+        # Start job lease manager cleanup task (for per-job ownership)
+        await self._job_lease_manager.start_cleanup_task()
+
         # Start background cleanup tasks via TaskRunner
         self._task_runner.run(self._lease_cleanup_loop)
         self._task_runner.run(self._job_cleanup_loop)
@@ -1711,11 +1774,14 @@ class GateServer(HealthAwareServer):
         """Stop the gate server."""
         # Stop federated health monitor
         await self._dc_health_monitor.stop()
-        
+
+        # Stop job lease manager cleanup task
+        await self._job_lease_manager.stop_cleanup_task()
+
         # TaskRunner handles cleanup task cancellation
         # Graceful shutdown broadcasts leave via UDP (SWIM)
         await self.graceful_shutdown()
-        
+
         await super().stop()
     
     async def _send_xprobe(self, target: tuple[str, int], data: bytes) -> bool:
@@ -2265,56 +2331,92 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job submission from client.
-        
-        Only the cluster leader accepts new jobs. Non-leaders redirect
-        clients to the current leader for consistent job coordination.
+
+        Uses per-job leadership via consistent hashing:
+        - Each job has a designated owner gate determined by hash(job_id)
+        - If we're not the owner, redirect to the correct gate
+        - If we are the owner, acquire lease and process the job
         """
         try:
             submission = JobSubmission.load(data)
-            
-            # Only leader accepts new jobs
-            if not self.is_leader():
-                leader = self.get_current_leader()
+
+            # =================================================================
+            # Per-Job Ownership Check via Consistent Hashing
+            # =================================================================
+            job_owner = self._job_hash_ring.get_node(submission.job_id)
+
+            if job_owner != self._my_ring_id:
+                # We're not the owner - redirect to correct gate
+                # Parse the owner address from ring ID (format: "host:port")
+                if job_owner:
+                    owner_parts = job_owner.split(":")
+                    owner_addr = (owner_parts[0], int(owner_parts[1]))
+                else:
+                    owner_addr = None
+
                 ack = JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error=f"Not leader" if leader else "No leader elected",
-                    leader_addr=leader,
+                    error=f"Not job owner (owner: {job_owner})" if job_owner else "No gates available",
+                    leader_addr=owner_addr,  # Reuse leader_addr field for job owner
                 )
                 return ack.dump()
-            
+
+            # =================================================================
+            # Acquire Job Lease
+            # =================================================================
+            lease_result = self._job_lease_manager.acquire(submission.job_id)
+
+            if not lease_result.success:
+                # Another gate holds the lease (shouldn't happen if hash ring is consistent)
+                ack = JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=f"Job lease held by {lease_result.current_owner}, expires in {lease_result.expires_in:.1f}s",
+                )
+                return ack.dump()
+
+            # =================================================================
+            # Standard Job Processing (unchanged)
+            # =================================================================
+
             # Check quorum circuit breaker (fail-fast)
             if self._quorum_circuit.circuit_state == CircuitState.OPEN:
-                # Calculate retry_after from half_open_after setting
+                # Release lease since we can't process
+                self._job_lease_manager.release(submission.job_id)
                 retry_after = self._quorum_circuit.half_open_after
                 raise QuorumCircuitOpenError(
                     recent_failures=self._quorum_circuit.error_count,
                     window_seconds=self._quorum_circuit.window_seconds,
                     retry_after_seconds=retry_after,
                 )
-            
+
             # Check if quorum is available (multi-gate deployments)
             if len(self._active_gate_peers) > 0 and not self._has_quorum_available():
+                # Release lease since we can't process
+                self._job_lease_manager.release(submission.job_id)
                 active_gates = len(self._active_gate_peers) + 1  # +1 for self
                 raise QuorumUnavailableError(
-                    active_managers=active_gates,  # Using same field name for consistency
+                    active_managers=active_gates,
                     required_quorum=self._quorum_size(),
                 )
-            
+
             # Select datacenters
             target_dcs = self._select_datacenters(
                 submission.datacenter_count,
                 submission.datacenters if submission.datacenters else None,
             )
-            
+
             if not target_dcs:
+                # Release lease since job can't be dispatched
+                self._job_lease_manager.release(submission.job_id)
                 ack = JobAck(
                     job_id=submission.job_id,
                     accepted=False,
                     error="No available datacenters",
                 )
                 return ack.dump()
-            
+
             # Create global job tracking
             job = GlobalJobStatus(
                 job_id=submission.job_id,
@@ -2323,14 +2425,14 @@ class GateServer(HealthAwareServer):
                 timestamp=time.monotonic(),
             )
             self._jobs[submission.job_id] = job
-            
+
             # Track which DCs this job targets (for completion detection)
             self._job_target_dcs[submission.job_id] = set(target_dcs)
-            
+
             # Store callback for push notifications (if provided)
             if submission.callback_addr:
                 self._job_callbacks[submission.job_id] = submission.callback_addr
-            
+
             self._increment_version()
             
             # Record success for circuit breaker
@@ -2548,11 +2650,14 @@ class GateServer(HealthAwareServer):
         """
         try:
             progress = JobProgress.load(data)
-            
+
+            # Renew job lease if we own it (keep ownership while job is active)
+            self._job_lease_manager.renew(progress.job_id)
+
             job = self._jobs.get(progress.job_id)
             if job:
                 old_status = job.status
-                
+
                 # Update DC progress
                 for i, dc_prog in enumerate(job.datacenters):
                     if dc_prog.datacenter == progress.datacenter:
@@ -2651,7 +2756,10 @@ class GateServer(HealthAwareServer):
             
             job.status = JobStatus.CANCELLED.value
             self._increment_version()
-            
+
+            # Release job lease now that job is cancelled
+            self._job_lease_manager.release(cancel.job_id)
+
             ack = CancelAck(
                 job_id=cancel.job_id,
                 cancelled=True,
@@ -3018,7 +3126,10 @@ class GateServer(HealthAwareServer):
         # Update job status
         if job_id in self._jobs:
             self._jobs[job_id].status = overall_status
-        
+
         # Clean up
         self._job_dc_results.pop(job_id, None)
+
+        # Release job lease now that job is complete
+        self._job_lease_manager.release(job_id)
 

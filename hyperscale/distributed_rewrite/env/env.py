@@ -72,6 +72,12 @@ class Env(BaseModel):
     CIRCUIT_BREAKER_WINDOW_SECONDS: StrictFloat = 30.0
     CIRCUIT_BREAKER_HALF_OPEN_AFTER: StrictFloat = 10.0
 
+    # Job Routing Settings (Consistent Hashing + Lease Management)
+    # Used by gates for per-job leadership distribution
+    JOB_HASH_RING_VIRTUAL_NODES: StrictInt = 150  # Virtual nodes per gate for even distribution
+    JOB_LEASE_DURATION: StrictFloat = 30.0  # Seconds before job lease expires
+    JOB_LEASE_CLEANUP_INTERVAL: StrictFloat = 10.0  # Seconds between lease cleanup checks
+
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
@@ -119,6 +125,10 @@ class Env(BaseModel):
             "FEDERATED_PROBE_TIMEOUT": float,
             "FEDERATED_SUSPICION_TIMEOUT": float,
             "FEDERATED_MAX_CONSECUTIVE_FAILURES": int,
+            # Job routing settings
+            "JOB_HASH_RING_VIRTUAL_NODES": int,
+            "JOB_LEASE_DURATION": float,
+            "JOB_LEASE_CLEANUP_INTERVAL": float,
         }
     
     def get_swim_init_context(self) -> dict:
@@ -183,4 +193,18 @@ class Env(BaseModel):
             'probe_timeout': self.FEDERATED_PROBE_TIMEOUT,
             'suspicion_timeout': self.FEDERATED_SUSPICION_TIMEOUT,
             'max_consecutive_failures': self.FEDERATED_MAX_CONSECUTIVE_FAILURES,
+        }
+
+    def get_job_routing_config(self) -> dict:
+        """
+        Get job routing configuration for per-job leadership.
+
+        These settings control how gates distribute job ownership:
+        - Consistent hashing for deterministic job-to-gate assignment
+        - Lease-based ownership for failover handling
+        """
+        return {
+            'hash_ring_virtual_nodes': self.JOB_HASH_RING_VIRTUAL_NODES,
+            'lease_duration': self.JOB_LEASE_DURATION,
+            'lease_cleanup_interval': self.JOB_LEASE_CLEANUP_INTERVAL,
         }
