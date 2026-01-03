@@ -219,7 +219,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             return self._node_context.get(run_id)
         
         context = self._node_context[run_id]
-        self._node_context[run_id] = context.from_dict(workflow, values)
+        self._node_context[run_id] = await context.from_dict(workflow, values)
         
         return self._node_context[run_id]
 
