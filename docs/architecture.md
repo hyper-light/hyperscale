@@ -5169,6 +5169,195 @@ This section documents how workflow results, context, and errors flow back throu
 This section details how context is synchronized across managers to ensure dependent
 workflows always see the correct, latest context from their dependencies.
 
+### Workflow Context API
+
+Context enables workflows to share state with their dependents. This is critical for
+scenarios where one workflow produces data (e.g., authentication tokens, session IDs)
+that subsequent workflows need to consume.
+
+#### Decorators and Type Hints
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       WORKFLOW CONTEXT API                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Decorators:                                                                 │
+│  ────────────────────────────────────────────────────────────────────────   │
+│                                                                              │
+│    @state('WorkflowName', ...)                                               │
+│      • Marks a method for context interaction                               │
+│      • MUST specify target workflow name(s) as string arguments             │
+│      • If no args provided → no context flows (nothing to select from)      │
+│                                                                              │
+│    @depends('WorkflowName', ...)                                             │
+│      • Wraps a Workflow class to declare execution dependencies             │
+│      • Dependent workflow executes AFTER all specified dependencies         │
+│      • Can specify multiple dependencies as separate string arguments       │
+│                                                                              │
+│  Type Hints (Return Types):                                                  │
+│  ────────────────────────────────────────────────────────────────────────   │
+│                                                                              │
+│    Provide[T]                                                                │
+│      • Indicates the method PROVIDES context to specified workflow(s)       │
+│      • Return value is stored in context                                    │
+│      • Method name becomes the context KEY                                  │
+│                                                                              │
+│    Use[T]                                                                    │
+│      • Indicates the method USES context from specified workflow(s)         │
+│      • Keyword argument names must match context keys                       │
+│      • Values are injected from context; use default for missing keys       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Complete Example
+
+```python
+from hyperscale import Workflow, depends, state, step
+from hyperscale.core.hooks import Provide, Use
+
+
+class AuthWorkflow(Workflow):
+    """First workflow - authenticates and provides token to dependents."""
+    vus = 100
+    duration = "30s"
+
+    @step()
+    async def login(self, url: URL = 'https://api.example.com/login') -> HTTPResponse:
+        return await self.client.http.post(url, json={"user": "test"})
+    
+    @state('DataWorkflow')  # ← Share WITH DataWorkflow
+    def auth_token(self) -> Provide[str]:  # ← Method name = context key
+        """Provides authentication token to DataWorkflow."""
+        return self.login.response.json()['token']
+
+
+@depends('AuthWorkflow')  # ← Wait for AuthWorkflow to complete first
+class DataWorkflow(Workflow):
+    """Second workflow - uses token from AuthWorkflow."""
+    vus = 100
+    duration = "30s"
+
+    @state('AuthWorkflow')  # ← Receive FROM AuthWorkflow
+    def get_token(self, auth_token: str | None = None) -> Use[str]:  # ← kwarg matches key
+        """Receives authentication token from AuthWorkflow."""
+        return auth_token  # Will be injected with the token value
+
+    @step()
+    async def fetch_data(self, url: URL = 'https://api.example.com/data') -> HTTPResponse:
+        token = self.get_token()  # Access the consumed token
+        return await self.client.http.get(
+            url, 
+            headers={"Authorization": f"Bearer {token}"}
+        )
+```
+
+#### Context Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         CONTEXT FLOW                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Execution Order (determined by @depends):                                   │
+│                                                                              │
+│  ┌─────────────────────┐                                                    │
+│  │  Layer 0            │                                                    │
+│  │  ─────────────────  │                                                    │
+│  │  AuthWorkflow runs  │                                                    │
+│  │  (no dependencies)  │                                                    │
+│  └──────────┬──────────┘                                                    │
+│             │                                                                │
+│             │  @state('DataWorkflow')                                       │
+│             │  def auth_token() -> Provide[str]:                            │
+│             │      return 'eyJhbGc...'                                      │
+│             │                                                                │
+│             ▼                                                                │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                     CONTEXT STORAGE                                  │    │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │    │
+│  │  │  context['AuthWorkflow']['auth_token'] = 'eyJhbGc...'       │    │    │
+│  │  └─────────────────────────────────────────────────────────────┘    │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│             │                                                                │
+│             │  ┌──────────────────────────────────────────┐                 │
+│             │  │  DISTRIBUTED: Quorum sync at layer      │                 │
+│             │  │  boundary ensures all managers have     │                 │
+│             │  │  context before Layer 1 dispatches      │                 │
+│             │  └──────────────────────────────────────────┘                 │
+│             │                                                                │
+│             ▼                                                                │
+│  ┌─────────────────────┐                                                    │
+│  │  Layer 1            │                                                    │
+│  │  ─────────────────  │                                                    │
+│  │  DataWorkflow runs  │                                                    │
+│  │  @depends('Auth')   │                                                    │
+│  └──────────┬──────────┘                                                    │
+│             │                                                                │
+│             │  @state('AuthWorkflow')                                       │
+│             │  def get_token(auth_token=None) -> Use[str]:                  │
+│             │                     ▲                                         │
+│             │                     │                                         │
+│             │          ┌──────────┴──────────┐                              │
+│             │          │  Kwarg 'auth_token' │                              │
+│             │          │  matches context    │                              │
+│             │          │  key 'auth_token'   │                              │
+│             │          │  ─────────────────  │                              │
+│             │          │  Injected value:    │                              │
+│             │          │  'eyJhbGc...'       │                              │
+│             │          └─────────────────────┘                              │
+│             │                                                                │
+│             ▼                                                                │
+│       DataWorkflow.get_token() returns 'eyJhbGc...'                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Context API Rules Summary
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       CONTEXT API RULES                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PROVIDER (sends context):                                                   │
+│  ────────────────────────────────────────────────────────────────────────   │
+│    @state('TargetWorkflow')      ← Specify WHO receives this context        │
+│    def method_name(...):         ← Method name becomes context KEY          │
+│        -> Provide[T]             ← Declares providing intent                │
+│        return value              ← Return value is stored as context VALUE  │
+│                                                                              │
+│  CONSUMER (receives context):                                                │
+│  ────────────────────────────────────────────────────────────────────────   │
+│    @depends('SourceWorkflow')    ← Ensures source runs first (class level) │
+│    @state('SourceWorkflow')      ← Specify WHO to receive FROM              │
+│    def consume(                                                              │
+│        kwarg_name: T | None = None  ← Kwarg name MUST match context key    │
+│    ):                                                                        │
+│        -> Use[T]                 ← Declares consuming intent                │
+│        return kwarg_name         ← Use the injected value                   │
+│                                                                              │
+│  KEY MATCHING:                                                               │
+│  ────────────────────────────────────────────────────────────────────────   │
+│    Provider method name  ──────────────►  Consumer kwarg name               │
+│    e.g., 'auth_token'    ◄─── MUST MATCH ───►  'auth_token'                 │
+│                                                                              │
+│  BIDIRECTIONAL CONTRACT:                                                     │
+│  ────────────────────────────────────────────────────────────────────────   │
+│    • Provider MUST name the target: @state('ConsumerWorkflow')              │
+│    • Consumer MUST name the source: @state('ProviderWorkflow')              │
+│    • Context only flows when BOTH sides agree on the relationship           │
+│    • @state() with NO args = no context flows (no workflow selected)        │
+│                                                                              │
+│  MULTIPLE TARGETS/SOURCES:                                                   │
+│  ────────────────────────────────────────────────────────────────────────   │
+│    @state('WorkflowA', 'WorkflowB')  ← Share with multiple workflows        │
+│    @depends('WorkflowA', 'WorkflowB') ← Depend on multiple workflows        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### The Problem
 
 ```
