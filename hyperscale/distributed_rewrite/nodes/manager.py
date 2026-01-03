@@ -2978,24 +2978,24 @@ class ManagerServer(HealthAwareServer):
         job = self._jobs.get(job_id)
         if not job:
             return
-        
+
         # Determine overall status
         final_results = self._workflow_final_results.get(job_id, {})
         errors = []
         has_failures = False
         max_elapsed = 0.0
-        
+
         for wf_result in final_results.values():
             if wf_result.status == WorkflowStatus.FAILED.value:
                 has_failures = True
                 if wf_result.error:
                     errors.append(f"{wf_result.workflow_name}: {wf_result.error}")
-        
+
         # Calculate max elapsed from progress
         for wf_progress in job.workflows:
             if wf_progress.elapsed_seconds > max_elapsed:
                 max_elapsed = wf_progress.elapsed_seconds
-        
+
         # Build workflow results (without context for gates)
         workflow_results = []
         for wf_id, wf_result in final_results.items():
@@ -3006,25 +3006,45 @@ class ManagerServer(HealthAwareServer):
                 results=wf_result.results,  # Already cloudpickled WorkflowStats
                 error=wf_result.error,
             ))
-        
+
         # Determine final status
         if has_failures:
             job_status = JobStatus.FAILED.value if len(errors) == len(final_results) else "PARTIAL"
         else:
             job_status = JobStatus.COMPLETED.value
-        
+
         job.status = job_status
         job.elapsed_seconds = max_elapsed
         job.timestamp = time.monotonic()
-        
+
+        # Extract completion counts from WorkflowStats if progress-based counts are zero.
+        # This handles test workflows that complete before progress updates are polled.
+        # Non-test workflows will have zero counts in both places (correct behavior).
+        total_completed = job.total_completed
+        total_failed = job.total_failed
+
+        if total_completed == 0 and total_failed == 0:
+            # Try to extract from WorkflowStats in final results
+            for wf_result in final_results.values():
+                if wf_result.results and len(wf_result.results) > 0:
+                    try:
+                        workflow_stats = cloudpickle.loads(wf_result.results)
+                        if isinstance(workflow_stats, dict):
+                            stats = workflow_stats.get("stats", {})
+                            total_completed += stats.get("succeeded", 0) or 0
+                            total_failed += stats.get("failed", 0) or 0
+                    except Exception:
+                        # If unpickling fails, keep the progress-based counts
+                        pass
+
         # Build JobFinalResult
         job_final = JobFinalResult(
             job_id=job_id,
             datacenter=self._node_id.datacenter,
             status=job_status,
             workflow_results=workflow_results,
-            total_completed=job.total_completed,
-            total_failed=job.total_failed,
+            total_completed=total_completed,
+            total_failed=total_failed,
             errors=errors,
             elapsed_seconds=max_elapsed,
         )

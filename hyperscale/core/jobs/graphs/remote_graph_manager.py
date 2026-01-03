@@ -897,6 +897,8 @@ class RemoteGraphManager:
             self._workflow_statuses[run_id][workflow].append(workflow_status_update.status)
             self._status_lock.release()
 
+        return workflow_status_update
+
     async def _update(
         self,
         run_id: int,
