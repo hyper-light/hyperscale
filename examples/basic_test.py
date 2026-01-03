@@ -1,4 +1,4 @@
-from hyperscale.graph import Workflow, step
+from hyperscale.graph import Workflow, step, depends, state, Use, Provide
 from hyperscale.testing import URL, HTTPResponse, Headers
 
 
@@ -27,3 +27,25 @@ class Test(Workflow):
         url: URL = 'https://httpbin.org/get',
     ) -> HTTPResponse:
         return await self.client.http.get(url)
+    
+    @state('TestTwo')
+    def value(self) -> Provide[str]:
+        return 'test'
+
+
+@depends('Test')
+class TestTwo(Workflow):
+    vus = 2000
+    duration = "15s"
+
+    @state('Test')
+    def consume(self, value: str | None = None) -> Use[str]:
+        return value
+
+    @step()
+    async def get_httpbin(
+        self,
+        url: URL = 'https://httpbin.org/get',
+    ) -> HTTPResponse:
+        return await self.client.http.get(url)
+        

@@ -389,6 +389,7 @@ class RemoteGraphManager:
                 workflow,
                 threads,
                 vus,
+                skip_reporting=True,
             )
 
             workflow_name, results, context, error = results
@@ -467,7 +468,8 @@ class RemoteGraphManager:
         workflow: Workflow,
         threads: int,
         workflow_vus: List[int],
-    ) -> Tuple[str, WorkflowStats | WorkflowContextResult, Context, Exception | None]:
+        skip_reporting: bool = False,
+    ) -> Tuple[str, WorkflowStats, Context, Exception | None]:
         workflow_slug = workflow.name.lower()
 
         try:
@@ -696,6 +698,14 @@ class RemoteGraphManager:
                     name="trace",
                 )
 
+                if skip_reporting:
+                    return  (
+                        workflow.name,
+                        execution_result,
+                        updated_context,
+                        timeout_error,
+                    )
+
                 reporting = workflow.reporting
 
                 options: list[ReporterConfig] = []
@@ -876,7 +886,7 @@ class RemoteGraphManager:
 
 
     async def get_workflow_update(self, run_id: int, workflow: str) -> WorkflowStatusUpdate | None:
-        workflow_status_update = WorkflowStatusUpdate | None = None
+        workflow_status_update: WorkflowStatusUpdate | None = None
         if self._graph_updates[run_id][workflow].empty() is False:
             workflow_status_update = await self._graph_updates[run_id][workflow].get()
 
