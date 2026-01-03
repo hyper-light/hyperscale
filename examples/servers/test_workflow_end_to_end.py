@@ -95,12 +95,16 @@ async def run_test():
         await asyncio.wait_for(manager.start(), timeout=15.0)
         print(f"  ✓ Manager started on TCP:{manager_tcp} UDP:{manager_udp}")
         
-        # Wait for manager to become leader (single manager = instant leader)
-        await asyncio.sleep(2.0)
+        # Wait for manager to become leader (single manager should become leader quickly)
+        leader_wait = 0
+        while not manager.is_leader() and leader_wait < 30:
+            await asyncio.sleep(1.0)
+            leader_wait += 1
+        
         if manager.is_leader():
-            print(f"  ✓ Manager is leader")
+            print(f"  ✓ Manager is leader (after {leader_wait}s)")
         else:
-            print(f"  ✗ Manager failed to become leader")
+            print(f"  ✗ Manager failed to become leader after {leader_wait}s")
             all_passed = False
         
         # ---------------------------------------------------------------------
@@ -154,6 +158,12 @@ async def run_test():
         # ---------------------------------------------------------------------
         print("\n[4/6] Submitting job with SimpleTestWorkflow...")
         print("-" * 50)
+        
+        # Debug: print manager state before submission
+        print(f"  DEBUG: Workers registered: {len(manager._workers)}")
+        print(f"  DEBUG: Worker status entries: {len(manager._worker_status)}")
+        for wid, ws in manager._worker_status.items():
+            print(f"    - {wid}: state={ws.state}, cores={ws.available_cores}/{getattr(ws, 'total_cores', 'N/A')}")
         
         try:
             job_id = await asyncio.wait_for(

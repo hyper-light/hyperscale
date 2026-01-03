@@ -3912,6 +3912,16 @@ class ManagerServer(HealthAwareServer):
             # Unpickle workflows
             workflows = restricted_loads(submission.workflows)
             
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Job {submission.job_id} unpickled {len(workflows)} workflows, dispatching...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            
             # Dispatch workflows to workers via TaskRunner
             self._task_runner.run(
                 self._dispatch_job_workflows, submission, workflows
@@ -3948,6 +3958,16 @@ class ManagerServer(HealthAwareServer):
         """
         import cloudpickle
         
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"_dispatch_job_workflows called for job {submission.job_id} with {len(workflows)} workflows",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
         job = self._jobs.get(submission.job_id)
         if not job:
             return
@@ -3962,12 +3982,19 @@ class ManagerServer(HealthAwareServer):
         sources: list[str] = []  # Workflows with no dependencies
         
         for i, workflow in enumerate(workflows):
+            # Instantiate if it's a class (client sends classes, not instances)
+            if isinstance(workflow, type):
+                workflow = workflow()
+            
             if isinstance(workflow, DependentWorkflow) and len(workflow.dependencies) > 0:
                 # DependentWorkflow wraps the actual workflow
-                name = workflow.dependent_workflow.name
-                workflow_by_name[name] = (i, workflow.dependent_workflow)
+                inner_wf = workflow.dependent_workflow
+                if isinstance(inner_wf, type):
+                    inner_wf = inner_wf()
+                name = inner_wf.name
+                workflow_by_name[name] = (i, inner_wf)
                 # Use workflow's vus if specified, otherwise use submission default
-                workflow_cores[name] = getattr(workflow.dependent_workflow, 'vus', submission.vus)
+                workflow_cores[name] = getattr(inner_wf, 'vus', submission.vus)
                 workflow_graph.add_node(name)
                 for dep in workflow.dependencies:
                     workflow_graph.add_edge(dep, name)
