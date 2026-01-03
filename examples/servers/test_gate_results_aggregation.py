@@ -55,8 +55,8 @@ class TestWorkflow(Workflow):
     Test workflow that makes HTTP calls.
     Will be distributed across DCs and workers.
     """
-    vus = 100
-    duration = "10s"
+    vus = 2  # Small number for testing
+    duration = "2s"  # Short duration for testing
     
     @step()
     async def load_test_step(
@@ -307,13 +307,14 @@ async def run_test():
         await client.start()
         print(f"  ✓ Client started on port {client_port}")
         
-        # Submit job
+        # Submit job - target BOTH datacenters for aggregation testing
         try:
             job_id = await asyncio.wait_for(
                 client.submit_job(
                     workflows=[TestWorkflow],
-                    vus=100,
+                    vus=2,  # Match workflow VUs
                     timeout_seconds=60.0,
+                    datacenter_count=2,  # Target both DC-ALPHA and DC-BETA
                 ),
                 timeout=15.0,
             )

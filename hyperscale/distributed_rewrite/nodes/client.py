@@ -50,7 +50,12 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 
 @dataclass
 class JobResult:
-    """Result of a completed job."""
+    """
+    Result of a completed job.
+    
+    For single-DC jobs, only basic fields are populated.
+    For multi-DC jobs (via gates), per_datacenter_results and aggregated are populated.
+    """
     job_id: str
     status: str  # JobStatus value
     total_completed: int = 0
@@ -58,6 +63,9 @@ class JobResult:
     overall_rate: float = 0.0
     elapsed_seconds: float = 0.0
     error: str | None = None
+    # Multi-DC fields (populated when result comes from a gate)
+    per_datacenter_results: list = field(default_factory=list)  # list[JobFinalResult]
+    aggregated: Any = None  # AggregatedJobStats
 
 
 class HyperscaleClient(MercurySyncBaseServer):
@@ -398,6 +406,10 @@ class HyperscaleClient(MercurySyncBaseServer):
                 job.elapsed_seconds = result.elapsed_seconds
                 if result.errors:
                     job.error = "; ".join(result.errors)
+                
+                # Multi-DC fields
+                job.per_datacenter_results = result.per_datacenter_results
+                job.aggregated = result.aggregated
                 
                 # Signal completion
                 event = self._job_events.get(result.job_id)

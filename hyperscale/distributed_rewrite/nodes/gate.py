@@ -80,7 +80,7 @@ from hyperscale.distributed_rewrite.swim.core import (
     CircuitState,
 )
 from hyperscale.distributed_rewrite.env import Env
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 
 
 class GateServer(HealthAwareServer):
