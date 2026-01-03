@@ -1378,13 +1378,18 @@ class WorkerServer(HealthAwareServer):
             max_retries: Maximum retry attempts (default 2)
             base_delay: Base delay for exponential backoff (default 0.2s)
         """
+        import sys
         # Check circuit breaker first
         if self._is_manager_circuit_open():
+            print(f"[DEBUG worker._send_progress_update] Circuit open, not sending", file=sys.stderr, flush=True)
             return  # Fail fast - don't attempt communication
         
         manager_addr = self._get_primary_manager_tcp_addr()
         if not manager_addr:
+            print(f"[DEBUG worker._send_progress_update] No primary manager", file=sys.stderr, flush=True)
             return
+        
+        print(f"[DEBUG worker._send_progress_update] Sending to {manager_addr}: completed={progress.completed_count}, failed={progress.failed_count}", file=sys.stderr, flush=True)
         
         for attempt in range(max_retries + 1):
             try:
