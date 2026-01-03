@@ -2437,6 +2437,255 @@ class ManagerServer(HealthAwareServer):
             await self.handle_exception(e, "receive_workflow_progress")
             return b'error'
     
+    # =========================================================================
+    # Context Forwarding (Context Consistency Protocol)
+    # =========================================================================
+    
+    @tcp.receive()
+    async def context_forward(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle context forwarded from a non-leader manager.
+        
+        Only the job leader should receive these messages. The leader applies
+        the context updates using LWW conflict resolution.
+        """
+        try:
+            forward = ContextForward.load(data)
+            
+            # Verify we are the job leader
+            if not self._is_job_leader(forward.job_id):
+                # We're not the leader - this shouldn't happen normally
+                # Log and return error
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Received context_forward but not job leader for {forward.job_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return b'not_leader'
+            
+            # Apply the context updates
+            await self._apply_context_updates(
+                forward.job_id,
+                forward.workflow_id,
+                forward.context_updates,
+                forward.context_timestamps,
+            )
+            
+            return b'ok'
+            
+        except Exception as e:
+            await self.handle_exception(e, "context_forward")
+            return b'error'
+    
+    async def _apply_context_updates(
+        self,
+        job_id: str,
+        workflow_id: str,
+        updates_bytes: bytes,
+        timestamps_bytes: bytes,
+    ) -> None:
+        """
+        Apply context updates from a completed workflow.
+        
+        Uses LWW conflict resolution with Lamport timestamps.
+        Only the job leader should call this directly; non-leaders forward.
+        """
+        context = self._job_contexts.get(job_id)
+        if not context:
+            # Create context if missing (shouldn't happen normally)
+            context = Context()
+            self._job_contexts[job_id] = context
+        
+        # Deserialize updates
+        updates = cloudpickle.loads(updates_bytes)
+        timestamps = cloudpickle.loads(timestamps_bytes) if timestamps_bytes else {}
+        
+        # Get workflow name from ID (for context keying)
+        workflow_name = self._get_workflow_name_from_id(workflow_id)
+        
+        # Apply each update with LWW
+        for key, value in updates.items():
+            timestamp = timestamps.get(key, self._get_next_context_timestamp())
+            await context.update(
+                workflow_name,
+                key,
+                value,
+                timestamp=timestamp,
+                source_node=self._node_id.full,
+            )
+    
+    async def _forward_context_to_leader(
+        self,
+        job_id: str,
+        workflow_id: str,
+        context_updates: bytes,
+        context_timestamps: bytes,
+    ) -> bool:
+        """
+        Forward context updates to the job leader.
+        
+        Called by non-leader managers when they receive workflow completion
+        with context updates. Returns True if forwarding succeeded.
+        """
+        leader_id = self._get_job_leader(job_id)
+        if not leader_id:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Cannot forward context - no leader for job {job_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+        
+        # Find leader's address from peer info
+        leader_addr = self._get_manager_tcp_addr(leader_id)
+        if not leader_addr:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Cannot forward context - unknown address for leader {leader_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+        
+        forward = ContextForward(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            context_updates=context_updates,
+            context_timestamps=context_timestamps,
+            source_manager=self._node_id.full,
+        )
+        
+        try:
+            response, _ = await self.send_tcp(
+                leader_addr,
+                action='context_forward',
+                data=forward.dump(),
+                timeout=5.0,
+            )
+            return response == b'ok'
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Context forward to leader failed: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+    
+    def _get_workflow_name_from_id(self, workflow_id: str) -> str:
+        """
+        Get the workflow name from a workflow ID.
+        
+        Workflow IDs are typically formatted as job_id:workflow_name or similar.
+        This extracts the name portion for context keying.
+        """
+        # Try to find in job progress
+        for job in self._jobs.values():
+            for wf in job.workflows:
+                if wf.workflow_id == workflow_id:
+                    return wf.workflow_name
+        
+        # Fallback: use the ID itself
+        return workflow_id
+    
+    def _get_manager_tcp_addr(self, node_id: str) -> tuple[str, int] | None:
+        """Get the TCP address for a manager by node_id."""
+        # Check peer info for TCP address
+        peer_info = self._manager_peer_info.get(node_id)
+        if peer_info:
+            # ManagerHeartbeat has tcp_host and tcp_port
+            return (peer_info.tcp_host, peer_info.tcp_port)
+        
+        # Check manager peers by matching node_id prefix
+        for tcp_addr, udp_addr in self._manager_tcp_to_udp.items():
+            # This is less reliable - would need node_id mapping
+            pass
+        
+        return None
+    
+    @tcp.receive()
+    async def context_layer_sync(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle context layer sync from job leader.
+        
+        The job leader broadcasts this at layer completion to ensure all
+        managers have the latest context before dependent workflows dispatch.
+        """
+        try:
+            sync = ContextLayerSync.load(data)
+            
+            # Check if this is a newer layer version
+            current_version = self._job_layer_version.get(sync.job_id, -1)
+            if sync.layer_version <= current_version:
+                # Stale sync - already have this or newer
+                ack = ContextLayerSyncAck(
+                    job_id=sync.job_id,
+                    layer_version=sync.layer_version,
+                    applied=False,
+                    responder_id=self._node_id.full,
+                )
+                return ack.dump()
+            
+            # Apply the context snapshot
+            context_dict = cloudpickle.loads(sync.context_snapshot)
+            
+            # Create or update context
+            if sync.job_id not in self._job_contexts:
+                self._job_contexts[sync.job_id] = Context()
+            
+            context = self._job_contexts[sync.job_id]
+            for workflow_name, values in context_dict.items():
+                await context.from_dict(workflow_name, values)
+            
+            # Update layer version
+            self._job_layer_version[sync.job_id] = sync.layer_version
+            
+            # Update job leader if not set
+            if sync.job_id not in self._job_leaders:
+                self._job_leaders[sync.job_id] = sync.source_node_id
+            
+            ack = ContextLayerSyncAck(
+                job_id=sync.job_id,
+                layer_version=sync.layer_version,
+                applied=True,
+                responder_id=self._node_id.full,
+            )
+            return ack.dump()
+            
+        except Exception as e:
+            await self.handle_exception(e, "context_layer_sync")
+            ack = ContextLayerSyncAck(
+                job_id="unknown",
+                layer_version=-1,
+                applied=False,
+                responder_id=self._node_id.full,
+            )
+            return ack.dump()
+    
     def _aggregate_step_stats(
         self,
         workflows: list[WorkflowProgress],
