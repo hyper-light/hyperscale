@@ -46,6 +46,7 @@ from .distributed import (
     # Status updates
     StepStats as StepStats,
     WorkflowProgress as WorkflowProgress,
+    WorkflowFinalResult as WorkflowFinalResult,
     JobProgress as JobProgress,
     GlobalJobStatus as GlobalJobStatus,
     # Client push notifications

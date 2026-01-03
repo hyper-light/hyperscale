@@ -32,6 +32,11 @@ from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
 from hyperscale.distributed_rewrite.nodes.client import HyperscaleClient
 from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.distributed_rewrite.models import ManagerState, JobStatus
+from hyperscale.logging.config.logging_config import LoggingConfig
+
+# Initialize logging directory (required for server pool)
+_logging_config = LoggingConfig()
+_logging_config.update(log_directory=os.getcwd())
 
 
 # ==========================================================================

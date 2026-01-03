@@ -478,6 +478,28 @@ class WorkflowProgress(Message):
 
 
 @dataclass(slots=True)
+class WorkflowFinalResult(Message):
+    """
+    Final result of a workflow execution.
+    
+    Sent from worker to manager when a workflow completes (success or failure).
+    This triggers:
+    1. Context storage (for dependent workflows)
+    2. Job completion check
+    3. Final result aggregation
+    
+    Note: WorkflowStats already contains run_id, elapsed, and step results.
+    """
+    job_id: str                  # Parent job
+    workflow_id: str             # Workflow instance
+    workflow_name: str           # Workflow class name
+    status: str                  # COMPLETED | FAILED
+    results: bytes               # Cloudpickled WorkflowStats
+    context_updates: bytes       # Cloudpickled context dict (for Provide hooks)
+    error: str | None = None     # Error message if failed (no traceback)
+
+
+@dataclass(slots=True)
 class JobProgress(Message):
     """
     Aggregated job progress from manager to gate.

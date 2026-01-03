@@ -29,6 +29,8 @@ import os
 import time
 from typing import Any
 
+import cloudpickle
+
 # Optional psutil import for system metrics
 try:
     import psutil
@@ -48,6 +50,7 @@ from multiprocessing import (
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph import Workflow
 from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
+from hyperscale.core.jobs.graphs.workflow_runner import WorkflowRunner
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
     WorkflowDebug,
@@ -76,6 +79,7 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowDispatch,
     WorkflowDispatchAck,
     WorkflowProgress,
+    WorkflowFinalResult,
     WorkflowStatus,
     StepStats,
     StateSyncRequest,
@@ -85,7 +89,7 @@ from hyperscale.distributed_rewrite.models import (
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
-from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
+from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError, ServerWarning, ServerDebug
 
 # Import WorkflowRunner for actual workflow execution
 from hyperscale.core.jobs.models.env import Env as CoreEnv
@@ -265,22 +269,6 @@ class WorkerServer(HealthAwareServer):
             )
         return self._core_env
     
-    def _get_server_runner(self) -> ServerRunner:
-        """
-        Get or create the WorkflowRunner for executing workflows.
-        """
-        if self._workflow_runner is None:
-            core_env = self._get_core_env()
-            # Use node_id instance as worker_id and node_id
-            node_id_int = hash(self._node_id.full) % (2**31)
-            self._workflow_runner = ServerRunner(
-                env=core_env,
-                worker_id=node_id_int,
-                node_id=node_id_int,
-            )
-            self._workflow_runner.setup()
-        return self._workflow_runner
-    
     @property
     def node_info(self) -> NodeInfo:
         """Get this worker's node info."""
@@ -338,39 +326,36 @@ class WorkerServer(HealthAwareServer):
         if timeout is None:
             timeout = self._worker_connect_timeout
         
-        # Only set up local execution infrastructure if we have seed managers
-        # (i.e., this is a real distributed worker, not just a standalone test)
-        if self._seed_managers:
-            worker_ips = self._bin_and_check_socket_range()
+        worker_ips = self._bin_and_check_socket_range()
 
-            await self._cpu_monitor.start_background_monitor(
-                self._node_id.datacenter,
-                self._node_id.full,
-            )
+        await self._cpu_monitor.start_background_monitor(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
 
-            await self._memory_monitor.start_background_monitor(
-                self._node_id.datacenter,
-                self._node_id.full,
-            )
+        await self._memory_monitor.start_background_monitor(
+            self._node_id.datacenter,
+            self._node_id.full,
+        )
 
-            await self._server_pool.setup()
+        await self._server_pool.setup()
 
-            await self._remote_manger.start(
-                self._host,
-                self._local_udp_port,
-                self._env,
-            )
+        await self._remote_manger.start(
+            self._host,
+            self._local_udp_port,
+            self._env,
+        )
 
-            await self._server_pool.run_pool(
-                (self._host, self._udp_port),
-                worker_ips,
-                self._env,
-            )
+        await self._server_pool.run_pool(
+            (self._host, self._udp_port),
+            worker_ips,
+            self._env,
+        )
 
-            await self._remote_manger.connect_to_workers(
-                worker_ips,
-                timeout=timeout,
-            )
+        await self._remote_manger.connect_to_workers(
+            worker_ips,
+            timeout=timeout,
+        )
         
         # Start the worker server (TCP/UDP listeners, task runner, etc.)
         # Start the underlying server (TCP/UDP listeners, task runner, etc.)
@@ -1111,9 +1096,6 @@ class WorkerServer(HealthAwareServer):
             # Initialize cores_completed tracking
             self._workflow_cores_completed[dispatch.workflow_id] = set()
             
-            # Get or create WorkflowRunner
-            runner = self._get_server_runner()
-            
             # Start progress monitor
             progress_token = self._task_runner.run(
                 self._monitor_workflow_progress,
@@ -1123,6 +1105,10 @@ class WorkerServer(HealthAwareServer):
                 cancel_event,
                 alias=f"progress:{dispatch.workflow_id}",
             )
+            
+            workflow_error: str | None = None
+            workflow_results: bytes = b''
+            context_updates: bytes = b''
             
             try:
                 # Execute the workflow
@@ -1147,16 +1133,24 @@ class WorkerServer(HealthAwareServer):
                         progress.status = WorkflowStatus.COMPLETED.value
                     
                     case CoreWorkflowStatus.FAILED:
-                        progress.status = WorkflowStatus.COMPLETED.value
+                        progress.status = WorkflowStatus.FAILED.value
+                        workflow_error = str(error) if error else "Unknown error"
 
                     case _:
                         progress.status = WorkflowStatus.FAILED.value
+                        workflow_error = str(error) if error else "Unknown status"
+                
+                # Serialize results and context for final result
+                workflow_results = cloudpickle.dumps(results) if results else b''
+                context_updates = cloudpickle.dumps(context.dict() if context else {})
 
             except asyncio.CancelledError:
                 progress.status = WorkflowStatus.CANCELLED.value
+                workflow_error = "Cancelled"
                 raise
             except Exception as e:
                 progress.status = WorkflowStatus.FAILED.value
+                workflow_error = str(e)
             finally:
                 await self._task_runner.cancel(progress_token)
             
@@ -1165,6 +1159,18 @@ class WorkerServer(HealthAwareServer):
             progress.timestamp = time.monotonic()
             if self._healthy_manager_ids:
                 await self._send_progress_update(progress)
+            
+            # Send final result to manager
+            final_result = WorkflowFinalResult(
+                job_id=dispatch.job_id,
+                workflow_id=dispatch.workflow_id,
+                workflow_name=progress.workflow_name,
+                status=progress.status,
+                results=workflow_results,
+                context_updates=context_updates,
+                error=workflow_error,
+            )
+            await self._send_final_result(final_result)
                 
         except asyncio.CancelledError:
             progress.status = WorkflowStatus.CANCELLED.value
@@ -1346,6 +1352,103 @@ class WorkerServer(HealthAwareServer):
             self._manager_circuit.record_success()
         elif len(self._healthy_manager_ids) > 0:
             self._manager_circuit.record_error()
+    
+    async def _send_final_result(
+        self,
+        final_result: WorkflowFinalResult,
+        max_retries: int = 3,
+        base_delay: float = 0.5,
+    ) -> None:
+        """
+        Send workflow final result to the primary manager.
+        
+        Final results are critical - they contain:
+        - Workflow results/stats
+        - Context updates for dependent workflows
+        - Error information for failed workflows
+        
+        Uses retries with exponential backoff since this is a critical path.
+        
+        Args:
+            final_result: The final result to send
+            max_retries: Maximum retry attempts (default 3)
+            base_delay: Base delay for exponential backoff (default 0.5s)
+        """
+        # Check circuit breaker first
+        if self._is_manager_circuit_open():
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Cannot send final result for {final_result.workflow_id}: manager circuit open",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+        
+        manager_addr = self._get_primary_manager_tcp_addr()
+        if not manager_addr:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Cannot send final result for {final_result.workflow_id}: no primary manager",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+        
+        for attempt in range(max_retries + 1):
+            try:
+                response, _ = await self.send_tcp(
+                    manager_addr,
+                    "workflow_final_result",
+                    final_result.dump(),
+                    timeout=5.0,  # Longer timeout for final results
+                )
+                
+                if response and isinstance(response, bytes) and response != b'error':
+                    self._manager_circuit.record_success()
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=f"Sent final result for {final_result.workflow_id} status={final_result.status}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return  # Success
+                    
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Failed to send final result for {final_result.workflow_id} attempt {attempt+1}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            
+            # Exponential backoff before retry (except after last attempt)
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+        
+        # All retries exhausted
+        self._manager_circuit.record_error()
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerError(
+                message=f"Failed to send final result for {final_result.workflow_id} after {max_retries + 1} attempts",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
     
     def _process_workflow_progress_ack(self, data: bytes) -> None:
         """

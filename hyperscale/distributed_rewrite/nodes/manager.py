@@ -67,6 +67,7 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowDispatch,
     WorkflowDispatchAck,
     WorkflowProgress,
+    WorkflowFinalResult,
     WorkflowStatus,
     JobProgress,
     StepStats,
@@ -190,9 +191,10 @@ class ManagerServer(HealthAwareServer):
         
         # Job and workflow state
         self._jobs: dict[str, JobProgress] = {}  # job_id -> progress
-        self._workflow_assignments: dict[str, str] = {}  # workflow_id -> worker_node_id
+        self._workflow_assignments: dict[str, dict[str, str]] = {}  # job_id -> {workflow_id -> worker_node_id}
         self._pending_provisions: dict[str, ProvisionRequest] = {}  # workflow_id -> request
         self._provision_confirmations: dict[str, set[str]] = {}  # workflow_id -> confirming nodes
+        self._workflow_final_results: dict[str, dict[str, WorkflowFinalResult]] = {}  # job_id -> {workflow_id -> result}
         
         # Job leader tracking (Context Consistency Protocol)
         # Each job has one leader manager responsible for context consistency
@@ -204,6 +206,7 @@ class ManagerServer(HealthAwareServer):
         # Client push notification callbacks (when gates not present)
         # job_id -> callback address for push notifications
         self._job_callbacks: dict[str, tuple[str, int]] = {}
+        self._client_callbacks: dict[str, tuple[str, int]] = {}  # Alias for backwards compat
         
         # Workflow retry tracking
         # Maps workflow_id -> (retry_count, original_dispatch, failed_workers)
@@ -2436,6 +2439,206 @@ class ManagerServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "receive_workflow_progress")
             return b'error'
+    
+    @tcp.receive()
+    async def workflow_final_result(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle workflow final result from worker.
+        
+        This is the critical path for workflow completion:
+        1. Store the final result
+        2. Process context updates for dependent workflows
+        3. Check job completion
+        4. Forward to gates or clients if appropriate
+        """
+        try:
+            result = WorkflowFinalResult.load(data)
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Received final result for workflow {result.workflow_id} status={result.status}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            
+            # Store final result
+            if result.job_id not in self._workflow_final_results:
+                self._workflow_final_results[result.job_id] = {}
+            self._workflow_final_results[result.job_id][result.workflow_id] = result
+            
+            # Handle context updates (for dependent workflows)
+            if result.context_updates and len(result.context_updates) > 0:
+                if self._is_job_leader(result.job_id):
+                    # We are job leader - apply context directly
+                    await self._apply_context_updates_from_result(result)
+                else:
+                    # Forward context to job leader
+                    await self._forward_context_from_result(result)
+            
+            # Clean up retry tracking on any final result
+            self._workflow_retries.pop(result.workflow_id, None)
+            
+            # Signal completion for dependency tracking
+            completion_event = self._workflow_completion_events.get(result.workflow_id)
+            if completion_event:
+                completion_event.set()
+            
+            # Update job progress status
+            job = self._jobs.get(result.job_id)
+            if job:
+                for i, wf in enumerate(job.workflows):
+                    if wf.workflow_id == result.workflow_id:
+                        wf.status = result.status
+                        break
+                
+                # Forward to gates (if connected)
+                if self._known_gates or self._gate_addrs:
+                    self._task_runner.run(self._send_job_progress_to_gate, job)
+            
+            # Check if job is complete
+            if self._is_job_complete(result.job_id):
+                await self._handle_job_completion(result.job_id)
+            
+            self._increment_version()
+            
+            return b'ok'
+            
+        except Exception as e:
+            await self.handle_exception(e, "workflow_final_result")
+            return b'error'
+    
+    async def _apply_context_updates_from_result(self, result: WorkflowFinalResult) -> None:
+        """Apply context updates from a workflow final result."""
+        try:
+            context_dict = cloudpickle.loads(result.context_updates)
+            if context_dict:
+                context = self._get_job_context(result.job_id)
+                if context is None:
+                    context = Context()
+                    self._job_contexts[result.job_id] = context
+                
+                for key, value in context_dict.items():
+                    await context.update(
+                        result.workflow_name,
+                        key,
+                        value,
+                        timestamp=self._get_next_context_timestamp(),
+                        source_node=self._node_id.full,
+                    )
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to apply context from result {result.workflow_id}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+    
+    async def _forward_context_from_result(self, result: WorkflowFinalResult) -> None:
+        """Forward context updates to the job leader."""
+        leader_info = self._get_job_leader(result.job_id)
+        if not leader_info:
+            return
+        
+        leader_id, leader_tcp_port = leader_info
+        
+        # Find leader's address
+        leader_addr = None
+        for manager in self._known_managers.values():
+            if manager.node_id == leader_id:
+                leader_addr = (manager.host, manager.port)
+                break
+        
+        if not leader_addr:
+            # Check peers
+            for peer_addr in self._manager_peers:
+                leader_addr = peer_addr
+                break
+        
+        if leader_addr:
+            from hyperscale.distributed_rewrite.models import ContextForward
+            forward = ContextForward(
+                job_id=result.job_id,
+                workflow_name=result.workflow_name,
+                context_values=result.context_updates,
+                lamport_clock=self._context_lamport_clock,
+                source_node_id=self._node_id.full,
+            )
+            try:
+                await self.send_tcp(
+                    leader_addr,
+                    "context_forward",
+                    forward.dump(),
+                    timeout=2.0,
+                )
+            except Exception:
+                pass
+    
+    def _is_job_complete(self, job_id: str) -> bool:
+        """Check if all workflows in a job have completed."""
+        job = self._jobs.get(job_id)
+        if not job:
+            return False
+        
+        final_results = self._workflow_final_results.get(job_id, {})
+        workflow_assignments = self._workflow_assignments.get(job_id, {})
+        
+        # Job is complete when we have final results for all assigned workflows
+        if len(workflow_assignments) == 0:
+            return False
+        
+        return len(final_results) >= len(workflow_assignments)
+    
+    async def _handle_job_completion(self, job_id: str) -> None:
+        """Handle job completion - send results to gates or clients."""
+        job = self._jobs.get(job_id)
+        if not job:
+            return
+        
+        job.status = JobStatus.COMPLETED.value
+        job.timestamp = time.monotonic()
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Job {job_id} completed",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
+        # Forward final status to gates (if connected)
+        if self._known_gates or self._gate_addrs:
+            self._task_runner.run(self._send_job_progress_to_gate, job)
+        
+        # Push to client (if no gates and callback registered)
+        callback = self._client_callbacks.get(job_id)
+        if callback and not (self._known_gates or self._gate_addrs):
+            try:
+                push = JobStatusPush(
+                    job_id=job_id,
+                    status=job.status,
+                    workflow_count=len(job.workflows),
+                    completed_count=job.total_completed,
+                    failed_count=job.total_failed,
+                    rate_per_second=job.overall_rate,
+                    elapsed_seconds=job.elapsed_seconds,
+                    message="Job completed",
+                )
+                await self.send_tcp(callback, "job_status_push", push.dump(), timeout=2.0)
+            except Exception:
+                pass
     
     # =========================================================================
     # Context Forwarding (Context Consistency Protocol)
