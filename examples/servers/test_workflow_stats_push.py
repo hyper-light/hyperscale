@@ -34,7 +34,7 @@ from hyperscale.graph import Workflow, step
 
 class LongRunningWorkflow(Workflow):
     """Workflow that runs long enough for progress updates to be sent."""
-    vus = 2  # Keep VUs low since we only have 4 cores
+    vus = 1000  # VUs can be large - cores are determined by priority!
     duration = "5s"  # Short duration but enough for progress updates
     
     @step()
@@ -174,7 +174,7 @@ async def run_test():
             job_id = await asyncio.wait_for(
                 client.submit_job(
                     workflows=[LongRunningWorkflow],
-                    vus=2,  # Match workflow VUs to worker cores
+                    vus=1000,  # VUs can be large - cores are from priority!
                     timeout_seconds=60.0,
                 ),
                 timeout=10.0,
