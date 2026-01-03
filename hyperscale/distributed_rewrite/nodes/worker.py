@@ -1049,10 +1049,8 @@ class WorkerServer(HealthAwareServer):
         
         This is the main entry point for work arriving at the worker.
         """
-        print(f"DEBUG workflow_dispatch: entry, data size={len(data)}")
         try:
             dispatch = WorkflowDispatch.load(data)
-            print(f"DEBUG workflow_dispatch: loaded, workflow_id={dispatch.workflow_id}")
 
             allocated_vus = dispatch.vus
             
@@ -1112,7 +1110,7 @@ class WorkerServer(HealthAwareServer):
                 progress,
                 cancel_event,
                 allocated_vus,
-                allocated_cores,
+                len(allocated_cores),  # Pass count, not the list
                 alias=f"workflow:{dispatch.workflow_id}",
             )
             self._workflow_tokens[dispatch.workflow_id] = token
@@ -1142,14 +1140,18 @@ class WorkerServer(HealthAwareServer):
         allocated_cores: int,
     ):
         """Execute a workflow using WorkflowRunner."""
+        print(f"DEBUG _execute_workflow: ENTRY workflow_id={dispatch.workflow_id}")
         start_time = time.monotonic()
         run_id = hash(dispatch.workflow_id) % (2**31)
         error: Exception | None = None
         
         try:
             # Unpickle workflow and context
+            print(f"DEBUG _execute_workflow: loading workflow")
             workflow = dispatch.load_workflow()
+            print(f"DEBUG _execute_workflow: loaded workflow {workflow.name}")
             context_dict = dispatch.load_context()
+            print(f"DEBUG _execute_workflow: loaded context")
             
             progress.workflow_name = workflow.name
             progress.status = WorkflowStatus.RUNNING.value
@@ -1175,6 +1177,8 @@ class WorkerServer(HealthAwareServer):
             
             try:
                 # Execute the workflow
+                print(f"DEBUG _execute_workflow: calling RemoteGraphManager.execute_workflow")
+                print(f"DEBUG _execute_workflow: run_id={run_id}, vus={allocated_vus}, num_cores={allocated_cores}")
                 (
                     results_run_id,
                     results,
@@ -1188,6 +1192,7 @@ class WorkerServer(HealthAwareServer):
                     allocated_vus,
                     max(allocated_cores, 1),
                 )
+                print(f"DEBUG _execute_workflow: execute_workflow returned, status={status}")
 
                 progress.cores_completed = len(progress.assigned_cores)
 
@@ -1202,14 +1207,21 @@ class WorkerServer(HealthAwareServer):
                 context_updates = cloudpickle.dumps(context.dict() if context else {})
 
             except asyncio.CancelledError:
+                print(f"DEBUG _execute_workflow: CancelledError")
                 progress.status = WorkflowStatus.CANCELLED.value
                 workflow_error = "Cancelled"
                 raise
             except Exception as e:
+                print(f"DEBUG _execute_workflow: Exception during execution: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
                 progress.status = WorkflowStatus.FAILED.value
                 workflow_error = str(e)
             finally:
-                await self._task_runner.cancel(progress_token)
+                # Construct token string from Run object
+                if progress_token:
+                    token_str = f"{progress_token.task_name}:{progress_token.run_id}"
+                    await self._task_runner.cancel(token_str)
             
             # Final progress update
             progress.elapsed_seconds = time.monotonic() - start_time
@@ -1218,6 +1230,7 @@ class WorkerServer(HealthAwareServer):
                 await self._send_progress_update(progress)
             
             # Send final result to manager
+            print(f"DEBUG _execute_workflow: preparing final result")
             final_result = WorkflowFinalResult(
                 job_id=dispatch.job_id,
                 workflow_id=dispatch.workflow_id,
@@ -1227,14 +1240,21 @@ class WorkerServer(HealthAwareServer):
                 context_updates=context_updates,
                 error=workflow_error,
             )
+            print(f"DEBUG _execute_workflow: sending final result, status={progress.status}")
             await self._send_final_result(final_result)
+            print(f"DEBUG _execute_workflow: final result sent")
                 
         except asyncio.CancelledError:
+            print(f"DEBUG _execute_workflow: outer CancelledError")
             progress.status = WorkflowStatus.CANCELLED.value
         except Exception as e:
+            print(f"DEBUG _execute_workflow: outer Exception: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             progress.status = WorkflowStatus.FAILED.value
             error = str(error) if error else "Unknown error"
         finally:
+            print(f"DEBUG _execute_workflow: finally block, status={progress.status}")
             self._free_cores(dispatch.workflow_id)
             self._increment_version()
             

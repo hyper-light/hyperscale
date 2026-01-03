@@ -199,8 +199,8 @@ async def run_test():
                 print(f"    - Failed: {result.total_failed}")
                 print(f"    - Elapsed: {result.elapsed_seconds:.2f}s")
                 
-                if result.status == "COMPLETED":
-                    print(f"  ✓ Job status is COMPLETED")
+                if result.status == "completed":
+                    print(f"  ✓ Job status is completed")
                 else:
                     print(f"  ✗ Unexpected job status: {result.status}")
                     all_passed = False
@@ -225,6 +225,9 @@ async def run_test():
         # ---------------------------------------------------------------------
         print("\n[6/6] Verifying final state...")
         print("-" * 50)
+        
+        # Allow worker cleanup to complete
+        await asyncio.sleep(0.5)
         
         # Check manager job tracking
         manager_jobs = len(manager._jobs)

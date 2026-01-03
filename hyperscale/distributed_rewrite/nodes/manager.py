@@ -599,7 +599,10 @@ class ManagerServer(HealthAwareServer):
             
             # Update workflow assignments from worker's state
             for wf_id, progress in worker_state.active_workflows.items():
-                self._workflow_assignments[wf_id] = worker_state.node_id
+                job_id = wf_id.rsplit(":", 1)[0] if ":" in wf_id else wf_id
+                if job_id not in self._workflow_assignments:
+                    self._workflow_assignments[job_id] = {}
+                self._workflow_assignments[job_id][wf_id] = worker_state.node_id
             
             return worker_state
         return None
@@ -2510,8 +2513,11 @@ class ManagerServer(HealthAwareServer):
         3. Check job completion
         4. Forward to gates or clients if appropriate
         """
+        import sys
+        print(f"[DEBUG manager.workflow_final_result] Received from {addr}, data len={len(data)}", file=sys.stderr, flush=True)
         try:
             result = WorkflowFinalResult.load(data)
+            print(f"[DEBUG manager.workflow_final_result] Parsed: job={result.job_id}, wf={result.workflow_id}, status={result.status}", file=sys.stderr, flush=True)
             
             self._task_runner.run(
                 self._udp_logger.log,
@@ -2558,11 +2564,15 @@ class ManagerServer(HealthAwareServer):
                     self._task_runner.run(self._send_job_progress_to_gate, job)
             
             # Check if job is complete
-            if self._is_job_complete(result.job_id):
+            is_complete = self._is_job_complete(result.job_id)
+            print(f"[DEBUG manager.workflow_final_result] _is_job_complete={is_complete}", file=sys.stderr, flush=True)
+            if is_complete:
+                print(f"[DEBUG manager.workflow_final_result] Calling _handle_job_completion", file=sys.stderr, flush=True)
                 await self._handle_job_completion(result.job_id)
             
             self._increment_version()
             
+            print(f"[DEBUG manager.workflow_final_result] Returning b'ok'", file=sys.stderr, flush=True)
             return b'ok'
             
         except Exception as e:
@@ -2647,6 +2657,10 @@ class ManagerServer(HealthAwareServer):
         final_results = self._workflow_final_results.get(job_id, {})
         workflow_assignments = self._workflow_assignments.get(job_id, {})
         
+        import sys
+        print(f"[DEBUG manager._is_job_complete] job_id={job_id}, final_results={len(final_results)}, workflow_assignments={len(workflow_assignments)}", file=sys.stderr, flush=True)
+        print(f"[DEBUG manager._is_job_complete] _workflow_assignments keys: {list(self._workflow_assignments.keys())}", file=sys.stderr, flush=True)
+        
         # Job is complete when we have final results for all assigned workflows
         if len(workflow_assignments) == 0:
             return False
@@ -2655,8 +2669,11 @@ class ManagerServer(HealthAwareServer):
     
     async def _handle_job_completion(self, job_id: str) -> None:
         """Handle job completion - build and send JobFinalResult."""
+        import sys
+        print(f"[DEBUG manager._handle_job_completion] job_id={job_id}", file=sys.stderr, flush=True)
         job = self._jobs.get(job_id)
         if not job:
+            print(f"[DEBUG manager._handle_job_completion] Job not found!", file=sys.stderr, flush=True)
             return
         
         # Determine overall status
@@ -2724,8 +2741,10 @@ class ManagerServer(HealthAwareServer):
             await self._send_job_final_result_to_gates(job_final)
         
         # Send directly to client (if no gates and callback registered)
-        callback = self._client_callbacks.get(job_id)
+        callback = self._job_callbacks.get(job_id)
+        print(f"[DEBUG manager._handle_job_completion] callback={callback}, gates={len(self._known_gates or [])}", file=sys.stderr, flush=True)
         if callback and not (self._known_gates or self._gate_addrs):
+            print(f"[DEBUG manager._handle_job_completion] Sending to client at {callback}", file=sys.stderr, flush=True)
             await self._send_job_final_result_to_client(job_final, callback)
     
     async def _send_job_final_result_to_gates(self, job_final: JobFinalResult) -> None:
@@ -3618,7 +3637,11 @@ class ManagerServer(HealthAwareServer):
         
         # Update tracking - preserve original dispatch bytes
         self._workflow_retries[workflow_id] = (retry_count, original_dispatch_bytes, failed_workers)
-        self._workflow_assignments[workflow_id] = new_worker
+        # Extract job_id from workflow_id (format: "job_id:workflow_index")
+        job_id = workflow_id.rsplit(":", 1)[0] if ":" in workflow_id else workflow_id
+        if job_id not in self._workflow_assignments:
+            self._workflow_assignments[job_id] = {}
+        self._workflow_assignments[job_id][workflow_id] = new_worker
         
         self._task_runner.run(
             self._udp_logger.log,
@@ -4388,7 +4411,7 @@ class ManagerServer(HealthAwareServer):
             job_id=submission.job_id,
             workflow_id=workflow_id,
             workflow=cloudpickle.dumps(workflow),
-            context=b'{}',  # Legacy field, kept for compatibility
+            context=cloudpickle.dumps({}),  # Legacy field, kept for compatibility
             vus=cores_needed,
             timeout_seconds=submission.timeout_seconds,
             fence_token=provision.fence_token,
@@ -4414,7 +4437,11 @@ class ManagerServer(HealthAwareServer):
         if not ack or not ack.accepted:
             return False
         
-        self._workflow_assignments[workflow_id] = worker_id
+        # Extract job_id from workflow_id (format: "job_id:workflow_index")
+        job_id = workflow_id.rsplit(":", 1)[0] if ":" in workflow_id else workflow_id
+        if job_id not in self._workflow_assignments:
+            self._workflow_assignments[job_id] = {}
+        self._workflow_assignments[job_id][workflow_id] = worker_id
         return True
     
     # =========================================================================
@@ -4493,8 +4520,11 @@ class ManagerServer(HealthAwareServer):
         try:
             commit = ProvisionCommit.load(data)
             
-            # Update our tracking
-            self._workflow_assignments[commit.workflow_id] = commit.target_worker
+            # Update our tracking - extract job_id from workflow_id
+            job_id = commit.workflow_id.rsplit(":", 1)[0] if ":" in commit.workflow_id else commit.workflow_id
+            if job_id not in self._workflow_assignments:
+                self._workflow_assignments[job_id] = {}
+            self._workflow_assignments[job_id][commit.workflow_id] = commit.target_worker
             self._increment_version()
             
             return b'ok'

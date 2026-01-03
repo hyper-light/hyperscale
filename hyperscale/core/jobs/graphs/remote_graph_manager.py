@@ -324,13 +324,18 @@ class RemoteGraphManager:
         vus: int,
         threads: int,
     ):
+        import sys
+        print(f"[DEBUG remote_graph_manager.execute_workflow] Starting for workflow={workflow.name}, run_id={run_id}, vus={vus}, threads={threads}", file=sys.stderr, flush=True)
+        
         await self._append_workflow_run_status(run_id, workflow.name, WorkflowStatus.QUEUED)
+        print(f"[DEBUG remote_graph_manager.execute_workflow] Status set to QUEUED", file=sys.stderr, flush=True)
 
         self._controller.create_context_from_external_store(
             workflow.name,
             run_id,
             workflow_context,
         )
+        print(f"[DEBUG remote_graph_manager.execute_workflow] Context created from external store", file=sys.stderr, flush=True)
         
         default_config = {
             "workflow": workflow.name,
@@ -385,6 +390,7 @@ class RemoteGraphManager:
 
 
             await self._append_workflow_run_status(run_id, workflow.name, WorkflowStatus.RUNNING)
+            print(f"[DEBUG remote_graph_manager.execute_workflow] Status set to RUNNING, calling _run_workflow", file=sys.stderr, flush=True)
             
             results =  await self._run_workflow(
                 run_id,
@@ -393,10 +399,13 @@ class RemoteGraphManager:
                 workflow_vus[workflow.name],
                 skip_reporting=True,
             )
+            print(f"[DEBUG remote_graph_manager.execute_workflow] _run_workflow returned: {type(results)}", file=sys.stderr, flush=True)
             workflow_name, results, context, error = results
+            print(f"[DEBUG remote_graph_manager.execute_workflow] workflow_name={workflow_name}, error={error}", file=sys.stderr, flush=True)
 
             status = WorkflowStatus.FAILED if error else WorkflowStatus.COMPLETED
             await self._append_workflow_run_status(run_id, workflow.name, status)
+            print(f"[DEBUG remote_graph_manager.execute_workflow] Final status: {status}", file=sys.stderr, flush=True)
 
             return (
                 workflow_name,
@@ -471,7 +480,9 @@ class RemoteGraphManager:
         workflow_vus: List[int],
         skip_reporting: bool = False,
     ) -> Tuple[str, WorkflowStats, Context, Exception | None]:
+        import sys
         workflow_slug = workflow.name.lower()
+        print(f"[DEBUG remote_graph_manager._run_workflow] Starting workflow={workflow.name}, run_id={run_id}, threads={threads}, workflow_vus={workflow_vus}", file=sys.stderr, flush=True)
 
         try:
             
@@ -530,7 +541,9 @@ class RemoteGraphManager:
                     name="trace",
                 )
 
+                print(f"[DEBUG remote_graph_manager._run_workflow] Waiting to acquire {threads} workers from provisioner", file=sys.stderr, flush=True)
                 await self._provisioner.acquire(threads)
+                print(f"[DEBUG remote_graph_manager._run_workflow] Acquired {threads} workers", file=sys.stderr, flush=True)
 
                 await ctx.log_prepared(
                     message=f"Workflow {workflow.name} successfully assigned {threads} workers",
@@ -583,6 +596,7 @@ class RemoteGraphManager:
                 )
 
                 self._workflow_timers[workflow.name] = time.monotonic()
+                print(f"[DEBUG remote_graph_manager._run_workflow] Submitting workflow to workers", file=sys.stderr, flush=True)
 
                 await self._controller.submit_workflow_to_workers(
                     run_id,
@@ -592,6 +606,7 @@ class RemoteGraphManager:
                     workflow_vus,
                     self._update,
                 )
+                print(f"[DEBUG remote_graph_manager._run_workflow] Submitted workflow to workers, now waiting for completion", file=sys.stderr, flush=True)
 
                 await ctx.log_prepared(
                     message=f"Submitted Workflow {workflow.name} with run id {run_id}",
@@ -607,14 +622,17 @@ class RemoteGraphManager:
                     TimeParser(workflow.duration).time
                     + TimeParser(workflow.timeout).time,
                 )
+                print(f"[DEBUG remote_graph_manager._run_workflow] Waiting for workflow complete with timeout={workflow_timeout}s", file=sys.stderr, flush=True)
 
                 worker_results = await self._controller.poll_for_workflow_complete(
                     run_id,
                     workflow.name,
                     workflow_timeout,
                 )
+                print(f"[DEBUG remote_graph_manager._run_workflow] poll_for_workflow_complete returned", file=sys.stderr, flush=True)
 
                 results, run_context, timeout_error = worker_results
+                print(f"[DEBUG remote_graph_manager._run_workflow] results keys={list(results.keys()) if isinstance(results, dict) else 'not dict'}, timeout_error={timeout_error}", file=sys.stderr, flush=True)
 
                 if timeout_error:
                     await ctx.log_prepared(
