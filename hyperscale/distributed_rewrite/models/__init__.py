@@ -47,6 +47,10 @@ from .distributed import (
     StepStats as StepStats,
     WorkflowProgress as WorkflowProgress,
     WorkflowFinalResult as WorkflowFinalResult,
+    WorkflowResult as WorkflowResult,
+    JobFinalResult as JobFinalResult,
+    AggregatedJobStats as AggregatedJobStats,
+    GlobalJobResult as GlobalJobResult,
     JobProgress as JobProgress,
     GlobalJobStatus as GlobalJobStatus,
     # Client push notifications

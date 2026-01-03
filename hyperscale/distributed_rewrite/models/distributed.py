@@ -500,6 +500,79 @@ class WorkflowFinalResult(Message):
 
 
 @dataclass(slots=True)
+class WorkflowResult(Message):
+    """
+    Simplified workflow result for aggregation (without context).
+    
+    Used in JobFinalResult for Manager -> Gate communication.
+    Context is NOT included because gates don't need it.
+    """
+    workflow_id: str             # Workflow instance ID
+    workflow_name: str           # Workflow class name
+    status: str                  # COMPLETED | FAILED
+    results: bytes               # Cloudpickled WorkflowStats
+    error: str | None = None     # Error message if failed
+
+
+@dataclass(slots=True)
+class JobFinalResult(Message):
+    """
+    Final result for a job from one datacenter.
+    
+    Sent from Manager to Gate (or directly to Client if no gates).
+    Contains per-workflow results and aggregated stats.
+    """
+    job_id: str                  # Job identifier
+    datacenter: str              # Reporting datacenter
+    status: str                  # COMPLETED | FAILED | PARTIAL
+    workflow_results: list["WorkflowResult"] = field(default_factory=list)
+    total_completed: int = 0     # Total successful actions
+    total_failed: int = 0        # Total failed actions
+    errors: list[str] = field(default_factory=list)  # All error messages
+    elapsed_seconds: float = 0.0 # Max elapsed across workflows
+
+
+@dataclass(slots=True)
+class AggregatedJobStats(Message):
+    """
+    Aggregated statistics across all datacenters.
+    
+    Part of GlobalJobResult for cross-DC aggregation.
+    """
+    total_requests: int = 0      # Total actions across all DCs
+    successful_requests: int = 0 # Successful actions
+    failed_requests: int = 0     # Failed actions
+    overall_rate: float = 0.0    # Combined rate (requests/sec)
+    avg_latency_ms: float = 0.0  # Average latency
+    p50_latency_ms: float = 0.0  # Median latency
+    p95_latency_ms: float = 0.0  # 95th percentile
+    p99_latency_ms: float = 0.0  # 99th percentile
+
+
+@dataclass(slots=True)
+class GlobalJobResult(Message):
+    """
+    Global job result aggregated across all datacenters.
+    
+    Sent from Gate to Client as the final result.
+    Contains per-DC breakdown and cross-DC aggregation.
+    """
+    job_id: str                  # Job identifier
+    status: str                  # COMPLETED | FAILED | PARTIAL
+    # Per-datacenter breakdown
+    per_datacenter_results: list["JobFinalResult"] = field(default_factory=list)
+    # Cross-DC aggregated stats
+    aggregated: "AggregatedJobStats" = field(default_factory=AggregatedJobStats)
+    # Summary
+    total_completed: int = 0     # Sum across all DCs
+    total_failed: int = 0        # Sum across all DCs
+    successful_datacenters: int = 0
+    failed_datacenters: int = 0
+    errors: list[str] = field(default_factory=list)  # All errors from all DCs
+    elapsed_seconds: float = 0.0 # Max elapsed across all DCs
+
+
+@dataclass(slots=True)
 class JobProgress(Message):
     """
     Aggregated job progress from manager to gate.

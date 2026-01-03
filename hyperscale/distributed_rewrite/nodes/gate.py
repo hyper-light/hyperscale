@@ -45,6 +45,9 @@ from hyperscale.distributed_rewrite.models import (
     GlobalJobStatus,
     JobStatusPush,
     JobBatchPush,
+    JobFinalResult,
+    GlobalJobResult,
+    AggregatedJobStats,
     StateSyncRequest,
     StateSyncResponse,
     GateStateSnapshot,
@@ -149,6 +152,14 @@ class GateServer(HealthAwareServer):
         
         # Global job state
         self._jobs: dict[str, GlobalJobStatus] = {}  # job_id -> status
+        
+        # Per-DC final results for job completion aggregation
+        # job_id -> {datacenter -> JobFinalResult}
+        self._job_dc_results: dict[str, dict[str, JobFinalResult]] = {}
+        
+        # Track which DCs were assigned for each job (to know when complete)
+        # job_id -> set of datacenter IDs
+        self._job_target_dcs: dict[str, set[str]] = {}
         
         # Client push notification callbacks
         # job_id -> callback address for push notifications
@@ -2128,6 +2139,9 @@ class GateServer(HealthAwareServer):
             )
             self._jobs[submission.job_id] = job
             
+            # Track which DCs this job targets (for completion detection)
+            self._job_target_dcs[submission.job_id] = set(target_dcs)
+            
             # Store callback for push notifications (if provided)
             if submission.callback_addr:
                 self._job_callbacks[submission.job_id] = submission.callback_addr
@@ -2573,4 +2587,146 @@ class GateServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "receive_gate_state_sync_request")
             return b''
+    
+    # =========================================================================
+    # Job Final Result Handling (Manager -> Gate -> Client)
+    # =========================================================================
+    
+    @tcp.receive()
+    async def job_final_result(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle final result from a manager for a datacenter.
+        
+        Aggregates results from all DCs and sends GlobalJobResult to client.
+        """
+        try:
+            result = JobFinalResult.load(data)
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Received job final result for {result.job_id} from DC {result.datacenter}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            
+            # Store per-DC result
+            if result.job_id not in self._job_dc_results:
+                self._job_dc_results[result.job_id] = {}
+            self._job_dc_results[result.job_id][result.datacenter] = result
+            
+            # Check if we have results from all target DCs
+            target_dcs = self._job_target_dcs.get(result.job_id, set())
+            received_dcs = set(self._job_dc_results.get(result.job_id, {}).keys())
+            
+            if target_dcs and received_dcs >= target_dcs:
+                # All DCs reported - aggregate and send to client
+                await self._send_global_job_result(result.job_id)
+            
+            return b'ok'
+            
+        except Exception as e:
+            await self.handle_exception(e, "job_final_result")
+            return b'error'
+    
+    async def _send_global_job_result(self, job_id: str) -> None:
+        """Aggregate DC results and send GlobalJobResult to client."""
+        dc_results = self._job_dc_results.get(job_id, {})
+        if not dc_results:
+            return
+        
+        # Aggregate across DCs
+        all_dc_results = list(dc_results.values())
+        total_completed = sum(r.total_completed for r in all_dc_results)
+        total_failed = sum(r.total_failed for r in all_dc_results)
+        all_errors: list[str] = []
+        max_elapsed = 0.0
+        successful_dcs = 0
+        failed_dcs = 0
+        
+        for dc_result in all_dc_results:
+            all_errors.extend(dc_result.errors)
+            if dc_result.elapsed_seconds > max_elapsed:
+                max_elapsed = dc_result.elapsed_seconds
+            if dc_result.status == JobStatus.COMPLETED.value:
+                successful_dcs += 1
+            else:
+                failed_dcs += 1
+        
+        # Determine overall status
+        if failed_dcs == 0:
+            overall_status = JobStatus.COMPLETED.value
+        elif successful_dcs == 0:
+            overall_status = JobStatus.FAILED.value
+        else:
+            overall_status = "PARTIAL"
+        
+        # Build aggregated stats (simplified - real impl would compute from WorkflowStats)
+        aggregated = AggregatedJobStats(
+            total_requests=total_completed + total_failed,
+            successful_requests=total_completed,
+            failed_requests=total_failed,
+            overall_rate=sum(
+                sum(wf.rate_per_second for wf in self._jobs.get(job_id, GlobalJobStatus(job_id=job_id, status="")).datacenters)
+                for _ in [1]  # Just to handle the case where job exists
+            ) if job_id in self._jobs else 0.0,
+        )
+        
+        # Build GlobalJobResult
+        global_result = GlobalJobResult(
+            job_id=job_id,
+            status=overall_status,
+            per_datacenter_results=all_dc_results,
+            aggregated=aggregated,
+            total_completed=total_completed,
+            total_failed=total_failed,
+            successful_datacenters=successful_dcs,
+            failed_datacenters=failed_dcs,
+            errors=all_errors,
+            elapsed_seconds=max_elapsed,
+        )
+        
+        # Send to client
+        callback = self._job_callbacks.get(job_id)
+        if callback:
+            try:
+                await self.send_tcp(
+                    callback,
+                    "global_job_result",
+                    global_result.dump(),
+                    timeout=5.0,
+                )
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Sent global job result for {job_id} to client {callback}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Failed to send global job result to client {callback}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+        
+        # Update job status
+        if job_id in self._jobs:
+            self._jobs[job_id].status = overall_status
+        
+        # Clean up
+        self._job_dc_results.pop(job_id, None)
 

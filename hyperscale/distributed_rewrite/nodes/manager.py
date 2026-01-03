@@ -68,8 +68,10 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowDispatchAck,
     WorkflowProgress,
     WorkflowFinalResult,
+    WorkflowResult,
     WorkflowStatus,
     JobProgress,
+    JobFinalResult,
     StepStats,
     StateSyncRequest,
     StateSyncResponse,
@@ -2600,45 +2602,124 @@ class ManagerServer(HealthAwareServer):
         return len(final_results) >= len(workflow_assignments)
     
     async def _handle_job_completion(self, job_id: str) -> None:
-        """Handle job completion - send results to gates or clients."""
+        """Handle job completion - build and send JobFinalResult."""
         job = self._jobs.get(job_id)
         if not job:
             return
         
-        job.status = JobStatus.COMPLETED.value
+        # Determine overall status
+        final_results = self._workflow_final_results.get(job_id, {})
+        errors = []
+        has_failures = False
+        max_elapsed = 0.0
+        
+        for wf_result in final_results.values():
+            if wf_result.status == WorkflowStatus.FAILED.value:
+                has_failures = True
+                if wf_result.error:
+                    errors.append(f"{wf_result.workflow_name}: {wf_result.error}")
+        
+        # Calculate max elapsed from progress
+        for wf_progress in job.workflows:
+            if wf_progress.elapsed_seconds > max_elapsed:
+                max_elapsed = wf_progress.elapsed_seconds
+        
+        # Build workflow results (without context for gates)
+        workflow_results = []
+        for wf_id, wf_result in final_results.items():
+            workflow_results.append(WorkflowResult(
+                workflow_id=wf_id,
+                workflow_name=wf_result.workflow_name,
+                status=wf_result.status,
+                results=wf_result.results,  # Already cloudpickled WorkflowStats
+                error=wf_result.error,
+            ))
+        
+        # Determine final status
+        if has_failures:
+            job_status = JobStatus.FAILED.value if len(errors) == len(final_results) else "PARTIAL"
+        else:
+            job_status = JobStatus.COMPLETED.value
+        
+        job.status = job_status
+        job.elapsed_seconds = max_elapsed
         job.timestamp = time.monotonic()
+        
+        # Build JobFinalResult
+        job_final = JobFinalResult(
+            job_id=job_id,
+            datacenter=self._node_id.datacenter,
+            status=job_status,
+            workflow_results=workflow_results,
+            total_completed=job.total_completed,
+            total_failed=job.total_failed,
+            errors=errors,
+            elapsed_seconds=max_elapsed,
+        )
         
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Job {job_id} completed",
+                message=f"Job {job_id} completed with status={job_status}, {len(workflow_results)} workflows",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             )
         )
         
-        # Forward final status to gates (if connected)
+        # Send to gates (if connected)
         if self._known_gates or self._gate_addrs:
-            self._task_runner.run(self._send_job_progress_to_gate, job)
+            await self._send_job_final_result_to_gates(job_final)
         
-        # Push to client (if no gates and callback registered)
+        # Send directly to client (if no gates and callback registered)
         callback = self._client_callbacks.get(job_id)
         if callback and not (self._known_gates or self._gate_addrs):
+            await self._send_job_final_result_to_client(job_final, callback)
+    
+    async def _send_job_final_result_to_gates(self, job_final: JobFinalResult) -> None:
+        """Send JobFinalResult to all known gates."""
+        for gate_addr in self._gate_addrs:
             try:
-                push = JobStatusPush(
-                    job_id=job_id,
-                    status=job.status,
-                    workflow_count=len(job.workflows),
-                    completed_count=job.total_completed,
-                    failed_count=job.total_failed,
-                    rate_per_second=job.overall_rate,
-                    elapsed_seconds=job.elapsed_seconds,
-                    message="Job completed",
+                await self.send_tcp(
+                    gate_addr,
+                    "job_final_result",
+                    job_final.dump(),
+                    timeout=5.0,
                 )
-                await self.send_tcp(callback, "job_status_push", push.dump(), timeout=2.0)
-            except Exception:
-                pass
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Failed to send job final result to gate {gate_addr}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+    
+    async def _send_job_final_result_to_client(
+        self,
+        job_final: JobFinalResult,
+        callback: tuple[str, int],
+    ) -> None:
+        """Send JobFinalResult directly to client (when no gates)."""
+        try:
+            await self.send_tcp(
+                callback,
+                "job_final_result",
+                job_final.dump(),
+                timeout=5.0,
+            )
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to send job final result to client {callback}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
     
     # =========================================================================
     # Context Forwarding (Context Consistency Protocol)

@@ -41,6 +41,8 @@ from hyperscale.distributed_rewrite.models import (
     JobStatus,
     JobStatusPush,
     JobBatchPush,
+    JobFinalResult,
+    GlobalJobResult,
 )
 from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
@@ -333,6 +335,74 @@ class HyperscaleClient(MercurySyncBaseServer):
                     job.total_completed = stats.get('completed', 0)
                     job.total_failed = stats.get('failed', 0)
                     job.overall_rate = stats.get('rate', 0.0)
+            
+            return b'ok'
+            
+        except Exception as e:
+            return b'error'
+    
+    @tcp.receive()
+    async def job_final_result(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle final job result from manager (when no gates).
+        
+        This is a per-datacenter result with all workflow results.
+        """
+        try:
+            result = JobFinalResult.load(data)
+            
+            job = self._jobs.get(result.job_id)
+            if job:
+                job.status = result.status
+                job.total_completed = result.total_completed
+                job.total_failed = result.total_failed
+                job.elapsed_seconds = result.elapsed_seconds
+                if result.errors:
+                    job.error = "; ".join(result.errors)
+                
+                # Signal completion
+                event = self._job_events.get(result.job_id)
+                if event:
+                    event.set()
+            
+            return b'ok'
+            
+        except Exception as e:
+            return b'error'
+    
+    @tcp.receive()
+    async def global_job_result(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle global job result from gate.
+        
+        This is the aggregated result across all datacenters.
+        """
+        try:
+            result = GlobalJobResult.load(data)
+            
+            job = self._jobs.get(result.job_id)
+            if job:
+                job.status = result.status
+                job.total_completed = result.total_completed
+                job.total_failed = result.total_failed
+                job.elapsed_seconds = result.elapsed_seconds
+                if result.errors:
+                    job.error = "; ".join(result.errors)
+                
+                # Signal completion
+                event = self._job_events.get(result.job_id)
+                if event:
+                    event.set()
             
             return b'ok'
             
