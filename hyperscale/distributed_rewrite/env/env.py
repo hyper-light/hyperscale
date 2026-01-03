@@ -27,6 +27,23 @@ class Env(BaseModel):
     MERCURY_SYNC_VERIFY_SSL_CERT: Literal["REQUIRED", "OPTIONAL", "NONE"] = "REQUIRED"
     MERCURY_SYNC_TLS_VERIFY_HOSTNAME: StrictStr = "false"  # Set to "true" in production
     
+    # Monitor Settings (for CPU/Memory monitors in workers)
+    MERCURY_SYNC_MONITOR_SAMPLE_WINDOW: StrictStr = "5s"
+    MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL: StrictStr | StrictInt | StrictFloat = 0.1
+    MERCURY_SYNC_PROCESS_JOB_CPU_LIMIT: StrictFloat | StrictInt = 85
+    MERCURY_SYNC_PROCESS_JOB_MEMORY_LIMIT: StrictInt | StrictFloat = 2048
+    
+    # Local Server Pool / RemoteGraphManager Settings (used by workers)
+    MERCURY_SYNC_CONNECT_TIMEOUT: StrictStr = "1s"
+    MERCURY_SYNC_RETRY_INTERVAL: StrictStr = "1s"
+    MERCURY_SYNC_SEND_RETRIES: StrictInt = 3
+    MERCURY_SYNC_CONNECT_RETRIES: StrictInt = 10
+    MERCURY_SYNC_MAX_RUNNING_WORKFLOWS: StrictInt = 1
+    MERCURY_SYNC_MAX_PENDING_WORKFLOWS: StrictInt = 100
+    MERCURY_SYNC_CONTEXT_POLL_RATE: StrictStr = "0.1s"
+    MERCURY_SYNC_SHUTDOWN_POLL_RATE: StrictStr = "0.1s"
+    MERCURY_SYNC_DUPLICATE_JOB_POLICY: Literal["reject", "replace"] = "replace"
+    
     # SWIM Protocol Settings
     SWIM_MAX_PROBE_TIMEOUT: StrictInt = 10
     SWIM_MIN_PROBE_TIMEOUT: StrictInt = 1
@@ -59,6 +76,11 @@ class Env(BaseModel):
             "MERCURY_SYNC_TASK_RUNNER_MAX_THREADS": int,
             "MERCURY_SYNC_MAX_REQUEST_CACHE_SIZE": int,
             "MERCURY_SYNC_ENABLE_REQUEST_CACHING": str,
+            # Monitor settings
+            "MERCURY_SYNC_MONITOR_SAMPLE_WINDOW": str,
+            "MERCURY_SYNC_MONITOR_SAMPLE_INTERVAL": float,
+            "MERCURY_SYNC_PROCESS_JOB_CPU_LIMIT": float,
+            "MERCURY_SYNC_PROCESS_JOB_MEMORY_LIMIT": float,
             # SWIM settings
             "SWIM_MAX_PROBE_TIMEOUT": int,
             "SWIM_MIN_PROBE_TIMEOUT": int,

@@ -333,43 +333,46 @@ class WorkerServer(HealthAwareServer):
             ),
         )
     
-    async def start(self) -> None:
-
+    async def start(self, timeout: float | None = None) -> None:
+        """Start the worker server and register with managers."""
         if timeout is None:
             timeout = self._worker_connect_timeout
         
-        worker_ips = self._bin_and_check_socket_range()
+        # Only set up local execution infrastructure if we have seed managers
+        # (i.e., this is a real distributed worker, not just a standalone test)
+        if self._seed_managers:
+            worker_ips = self._bin_and_check_socket_range()
 
-        await self._cpu_monitor.start_background_monitor(
-            self._node_id.datacenter,
-            self._node_id.full,
-        )
+            await self._cpu_monitor.start_background_monitor(
+                self._node_id.datacenter,
+                self._node_id.full,
+            )
 
-        await self._memory_monitor.start_background_monitor(
-            self._node_id.datacenter,
-            self._node_id.full,
-        )
+            await self._memory_monitor.start_background_monitor(
+                self._node_id.datacenter,
+                self._node_id.full,
+            )
 
-        await self._server_pool.setup()
+            await self._server_pool.setup()
 
-        await self._remote_manger.start(
-            self._host,
-            self._local_udp_port,
-            self._env,
-        )
+            await self._remote_manger.start(
+                self._host,
+                self._local_udp_port,
+                self._env,
+            )
 
-        await self._server_pool.run_pool(
-            (self._host, self._udp_port),
-            worker_ips,
-            self._env,
-        )
+            await self._server_pool.run_pool(
+                (self._host, self._udp_port),
+                worker_ips,
+                self._env,
+            )
 
-        await self._remote_manger.connect_to_workers(
-            worker_ips,
-            timeout=timeout,
-        )
+            await self._remote_manger.connect_to_workers(
+                worker_ips,
+                timeout=timeout,
+            )
         
-        """Start the worker server."""
+        # Start the worker server (TCP/UDP listeners, task runner, etc.)
         # Start the underlying server (TCP/UDP listeners, task runner, etc.)
         # Uses SWIM settings from Env configuration
         await self.start_server(init_context=self.env.get_swim_init_context())
