@@ -26,24 +26,52 @@ from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
 from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
 from hyperscale.distributed_rewrite.nodes.client import HyperscaleClient
 from hyperscale.graph import Workflow, step
+from hyperscale.testing import URL, HTTPResponse
 
 
 # =============================================================================
-# Test Workflows - Longer running to ensure progress updates are sent
+# Test Workflows
 # =============================================================================
 
-class LongRunningWorkflow(Workflow):
-    """Workflow that runs long enough for progress updates to be sent."""
+class NonTestWorkflow(Workflow):
+    """
+    Non-test workflow (returns dict, not HTTPResponse).
+    
+    Non-test workflows get 1 core regardless of VUs because they don't
+    parallelize via multiple processes.
+    """
     vus = 1000  # VUs can be large - cores are determined by priority!
-    duration = "5s"  # Short duration but enough for progress updates
+    duration = "5s"
     
     @step()
     async def test_action(self) -> dict:
-        """Action that takes enough time for progress monitoring."""
-        # Do some "work" - multiple iterations for more stats
+        """Non-test action - returns dict, not HTTPResponse."""
         for i in range(5):
             await asyncio.sleep(0.3)
         return {"iteration": 5, "status": "completed"}
+
+
+class TestWorkflow(Workflow):
+    """
+    Test workflow (returns HTTPResponse from client call).
+    
+    Test workflows get cores based on priority (AUTO = up to 100% of pool)
+    because they parallelize load testing across multiple processes.
+    """
+    vus = 1000
+    duration = "5s"
+    
+    @step()
+    async def load_test(
+        self,
+        url: URL = 'https://httpbin.org/get',
+    ) -> HTTPResponse:
+        """Test action - returns HTTPResponse from client call."""
+        # This makes it a "test workflow" because:
+        # 1. @step() decorator creates a Hook
+        # 2. Return type HTTPResponse is a CallResult subclass
+        # 3. Hook.hook_type gets set to HookType.TEST
+        return await self.client.http.get(url)
 
 
 # =============================================================================
@@ -173,7 +201,7 @@ async def run_test():
         try:
             job_id = await asyncio.wait_for(
                 client.submit_job(
-                    workflows=[LongRunningWorkflow],
+                    workflows=[NonTestWorkflow],  # Non-test workflow gets 1 core
                     vus=1000,  # VUs can be large - cores are from priority!
                     timeout_seconds=60.0,
                 ),
