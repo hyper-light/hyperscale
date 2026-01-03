@@ -2622,6 +2622,149 @@ class ManagerServer(HealthAwareServer):
         
         return None
     
+    async def _sync_context_and_advance(self, job_id: str) -> bool:
+        """
+        Sync context to peer managers and advance to next layer.
+        
+        Called by job leader when a layer completes. This:
+        1. Increments the layer version
+        2. Creates a context snapshot
+        3. Broadcasts to all peer managers
+        4. Waits for quorum confirmation
+        5. Returns True if quorum reached, False otherwise
+        
+        IMPORTANT: Only call this when you are the job leader.
+        """
+        if not self._is_job_leader(job_id):
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"_sync_context_and_advance called but not job leader for {job_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return False
+        
+        # Check circuit breaker
+        if self._quorum_circuit.circuit_state == CircuitState.OPEN:
+            raise QuorumCircuitOpenError("Context sync circuit breaker is open")
+        
+        # Increment layer version
+        new_version = self._job_layer_version.get(job_id, 0) + 1
+        self._job_layer_version[job_id] = new_version
+        
+        # Create context snapshot
+        context = self._job_contexts.get(job_id)
+        if not context:
+            context = Context()
+            self._job_contexts[job_id] = context
+        
+        context_snapshot = cloudpickle.dumps(context.dict())
+        
+        sync_msg = ContextLayerSync(
+            job_id=job_id,
+            layer_version=new_version,
+            context_snapshot=context_snapshot,
+            source_node_id=self._node_id.full,
+        )
+        
+        # Get peer managers to sync with
+        peer_addrs = self._get_active_manager_peer_addrs()
+        if not peer_addrs:
+            # No peers - we are the only manager, sync trivially succeeds
+            return True
+        
+        # Calculate quorum (majority of active managers including self)
+        total_managers = len(peer_addrs) + 1  # +1 for self
+        quorum_needed = (total_managers // 2) + 1
+        confirmations = 1  # Count self
+        
+        # Broadcast to peers with timeout
+        sync_tasks = []
+        for peer_addr in peer_addrs:
+            sync_tasks.append(
+                self._send_context_sync_to_peer(peer_addr, sync_msg)
+            )
+        
+        # Wait for responses with timeout
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*sync_tasks, return_exceptions=True),
+                timeout=self._quorum_timeout,
+            )
+            
+            # Count successful confirmations
+            for result in results:
+                if isinstance(result, bool) and result:
+                    confirmations += 1
+            
+        except asyncio.TimeoutError:
+            # Partial results - count what we got
+            pass
+        
+        # Check if quorum reached
+        if confirmations >= quorum_needed:
+            self._quorum_circuit.record_success()
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Context sync quorum reached for job {job_id} layer {new_version}: {confirmations}/{total_managers}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return True
+        else:
+            self._quorum_circuit.record_error()
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Context sync quorum failed for job {job_id} layer {new_version}: {confirmations}/{quorum_needed} needed",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            raise QuorumTimeoutError(
+                f"Context sync quorum failed: got {confirmations}, need {quorum_needed}"
+            )
+    
+    async def _send_context_sync_to_peer(
+        self,
+        peer_addr: tuple[str, int],
+        sync_msg: ContextLayerSync,
+    ) -> bool:
+        """Send context sync to a peer and return True if acked."""
+        try:
+            response, _ = await self.send_tcp(
+                peer_addr,
+                action='context_layer_sync',
+                data=sync_msg.dump(),
+                timeout=self._quorum_timeout / 2,  # Leave time for retries
+            )
+            
+            if response and not isinstance(response, Exception):
+                ack = ContextLayerSyncAck.load(response)
+                return ack.applied
+            return False
+            
+        except Exception:
+            return False
+    
+    def _get_active_manager_peer_addrs(self) -> list[tuple[str, int]]:
+        """Get TCP addresses of active peer managers."""
+        addrs = []
+        for node_id, heartbeat in self._manager_peer_info.items():
+            if node_id == self._node_id.full:
+                continue  # Skip self
+            # Only include active managers (not SYNCING)
+            if heartbeat.manager_state == ManagerState.ACTIVE.value:
+                addrs.append((heartbeat.tcp_host, heartbeat.tcp_port))
+        return addrs
+    
     @tcp.receive()
     async def context_layer_sync(
         self,
