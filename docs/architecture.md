@@ -7532,21 +7532,20 @@ This section provides all context needed for another AI session to resume implem
 
 #### What's Working ✓
 1. **Gate-to-Manager Federated Health Monitoring**: Implemented via `FederatedHealthMonitor`
-2. **Manager-to-Gate Symmetric Monitoring**: Managers also use federated health for gate monitoring  
+2. **Manager-to-Gate Symmetric Monitoring**: Managers also use federated health for gate monitoring
 3. **Cross-Cluster Probing Protocol**: `xprobe`/`xack` messages with namespaced incarnations
 4. **Gate Results Aggregation**: Working correctly - latency percentiles interpolated, per-DC stats preserved
 5. **TCP Length-Prefixed Framing**: Reliable message delivery implemented
 6. **Priority-Based Core Allocation**: Managers allocate cores based on `StagePriority`, not VUs
 7. **Context Consistency Protocol**: LWW with timestamps and source node tiebreakers
 8. **SWIM Configuration**: Externalized to `Env` class
+9. **Workflow Execution Pipeline**: Test workflows correctly report completion counts
+   - Fixed: `RemoteGraphManager.get_workflow_update()` now returns the update
+   - Fixed: Manager extracts counts from `WorkflowStats` for fast-completing workflows
+   - Note: Non-test workflows (no `CallResult` return type) correctly report zero counts
 
 #### What's Partially Working ⚠
-1. **Workflow Execution Pipeline**: Jobs dispatch to workers, but workflow completion has issues
-   - Jobs return `PARTIAL` status instead of `COMPLETED`
-   - `total_completed=0` in aggregated results
-   - Root cause: Need to investigate worker → manager result return path
-
-2. **Manager Cleanup on Shutdown**: `Manager stop failed` warnings during test cleanup
+1. **Manager Cleanup on Shutdown**: `Manager stop failed` warnings during test cleanup
 
 #### What's Not Implemented ✗
 See "Remaining Components" below.
@@ -7833,12 +7832,13 @@ if __name__ == "__main__":
 
 ### Known Issues to Investigate
 
-1. **Workflow Execution Not Completing**
-   - Jobs return `PARTIAL` with `total_completed=0`
-   - Need to trace: worker → manager result path
-   - Check if `WorkflowFinalResult` is being sent correctly
+1. ~~**Workflow Execution Not Completing**~~ **RESOLVED**
+   - ~~Jobs return `PARTIAL` with `total_completed=0`~~
+   - **Root cause 1**: `RemoteGraphManager.get_workflow_update()` missing return statement
+   - **Root cause 2**: Manager used progress-based counts only, missing fast workflows
+   - **Fix**: Added return statement; extract counts from `WorkflowStats["stats"]`
 
-2. **Manager Shutdown Failures**  
+2. **Manager Shutdown Failures**
    - `Manager stop failed` during cleanup
    - May be race condition with background tasks
 
