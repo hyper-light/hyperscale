@@ -1780,6 +1780,39 @@ class ManagerServer(HealthAwareServer):
             ],
         }
     
+    def _get_fence_token(self) -> int:
+        """
+        Generate a fence token for at-most-once delivery.
+        
+        Uses monotonic increasing state version as the token.
+        """
+        return self._state_version
+    
+    async def _extract_dependency_context(
+        self,
+        job_id: str,
+        workflow: Any,
+    ) -> bytes:
+        """
+        Extract context values for workflow dependencies.
+        
+        Returns cloudpickled dict of context values that this workflow
+        may need from its dependencies.
+        """
+        import cloudpickle
+        
+        job_context = self._job_contexts.get(job_id)
+        if not job_context:
+            return cloudpickle.dumps({})
+        
+        # For now, return the full context dict
+        # A more sophisticated approach would filter based on @state() decorators
+        try:
+            context_dict = job_context.dict()
+            return cloudpickle.dumps(context_dict)
+        except Exception:
+            return cloudpickle.dumps({})
+    
     def _select_worker_for_workflow(self, vus_needed: int) -> str | None:
         """
         Select a worker with sufficient capacity for a workflow.
@@ -1862,8 +1895,27 @@ class ManagerServer(HealthAwareServer):
         worker_addr = (worker.node.host, worker.node.port)
         circuit = self._get_worker_circuit(worker_node_id)
         
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Sending TCP to worker at {worker_addr}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
         for attempt in range(max_retries + 1):
             try:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"TCP send attempt {attempt + 1} to {worker_addr}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
                 response, _ = await self.send_tcp(
                     worker_addr,
                     "workflow_dispatch",
@@ -3984,7 +4036,30 @@ class ManagerServer(HealthAwareServer):
         for i, workflow in enumerate(workflows):
             # Instantiate if it's a class (client sends classes, not instances)
             if isinstance(workflow, type):
-                workflow = workflow()
+                try:
+                    workflow = workflow()
+                except Exception as e:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerError(
+                            message=f"Failed to instantiate workflow {i}: {type(workflow).__name__} - {e}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    job.status = JobStatus.FAILED.value
+                    return
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Processing workflow {i}: {workflow.name}, vus={getattr(workflow, 'vus', 'N/A')}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             
             if isinstance(workflow, DependentWorkflow) and len(workflow.dependencies) > 0:
                 # DependentWorkflow wraps the actual workflow
@@ -4028,6 +4103,16 @@ class ManagerServer(HealthAwareServer):
             self._increment_version()
             return
         
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Job {submission.job_id} graph built: {len(workflow_by_name)} workflows, {len(sources)} sources",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
         # Create completion events for all workflows
         for name in workflow_by_name:
             idx, _ = workflow_by_name[name]
@@ -4036,7 +4121,18 @@ class ManagerServer(HealthAwareServer):
         
         try:
             # Dispatch in dependency order using BFS layers
+            layer_idx = 0
             for layer in networkx.bfs_layers(workflow_graph, sources):
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Processing layer {layer_idx} with {len(layer)} workflows: {list(layer)}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                layer_idx += 1
                 # Wait for dependencies of this layer to complete
                 for wf_name in layer:
                     deps = list(workflow_graph.predecessors(wf_name))
@@ -4067,10 +4163,29 @@ class ManagerServer(HealthAwareServer):
                                     return
                 
                 # Dispatch all workflows in this layer (can run in parallel)
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Dispatching {len(layer)} workflows in layer",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                
                 dispatch_tasks = []
                 for wf_name in layer:
                     idx, wf = workflow_by_name[wf_name]
                     cores_needed = workflow_cores[wf_name]
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Creating dispatch task for {wf_name} (idx={idx}, cores={cores_needed})",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
                     dispatch_tasks.append(
                         self._dispatch_single_workflow(
                             submission, idx, wf, cores_needed, cloudpickle
@@ -4078,6 +4193,15 @@ class ManagerServer(HealthAwareServer):
                     )
                 
                 # Wait for all dispatches in this layer
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Waiting for {len(dispatch_tasks)} dispatch tasks to complete",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
                 results = await asyncio.gather(*dispatch_tasks, return_exceptions=True)
                 for result in results:
                     if isinstance(result, Exception):
@@ -4124,6 +4248,16 @@ class ManagerServer(HealthAwareServer):
         """
         workflow_id = f"{submission.job_id}:{idx}"
         
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"_dispatch_single_workflow started for {workflow_id}, need {cores_needed} cores",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+        
         # Resource-aware waiting with exponential backoff
         max_wait = submission.timeout_seconds
         waited = 0.0
@@ -4135,6 +4269,15 @@ class ManagerServer(HealthAwareServer):
             # Try to select a worker with sufficient capacity
             worker_id = self._select_worker_for_workflow(cores_needed)
             if worker_id:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Selected worker {worker_id} for {workflow_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
                 break
             
             # Log that we're waiting for resources
@@ -4189,6 +4332,15 @@ class ManagerServer(HealthAwareServer):
         
         # Request quorum (skip if only one manager)
         if self._manager_peers:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Requesting quorum for {workflow_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
             try:
                 await self._request_quorum_confirmation(provision)
                 # Send commit to all managers on success
@@ -4205,8 +4357,27 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
                 return False
+        else:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Skipping quorum for {workflow_id} (single manager mode)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
         
         # Extract dependency context for this workflow
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Extracting context for {workflow_id}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
         dependency_context = await self._extract_dependency_context(
             submission.job_id, workflow
         )
@@ -4228,6 +4399,16 @@ class ManagerServer(HealthAwareServer):
         # Store dispatch bytes for potential retry
         dispatch_bytes = dispatch.dump()
         self._workflow_retries[workflow_id] = (0, dispatch_bytes, set())
+        
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Dispatching {workflow_id} to worker {worker_id}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
         
         ack = await self._dispatch_workflow_to_worker(worker_id, dispatch)
         if not ack or not ack.accepted:
