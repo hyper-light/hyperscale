@@ -34,6 +34,11 @@ from hyperscale.reporting.results import Results
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, GateStateEmbedder
+from hyperscale.distributed_rewrite.swim.health import (
+    FederatedHealthMonitor,
+    CrossClusterAck,
+    DCLeaderAnnouncement,
+)
 from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
@@ -224,6 +229,16 @@ class GateServer(HealthAwareServer):
         # Register leadership callbacks for state sync
         self.register_on_become_leader(self._on_gate_become_leader)
         self.register_on_lose_leadership(self._on_gate_lose_leadership)
+        
+        # Federated Health Monitor for cross-DC probing (Gate -> DC Leader)
+        # Uses configurable settings tuned for high-latency global links
+        fed_config = env.get_federated_health_config()
+        self._dc_health_monitor = FederatedHealthMonitor(
+            probe_interval=fed_config['probe_interval'],
+            probe_timeout=fed_config['probe_timeout'],
+            suspicion_timeout=fed_config['suspicion_timeout'],
+            max_consecutive_failures=fed_config['max_consecutive_failures'],
+        )
     
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
@@ -1641,12 +1656,11 @@ class GateServer(HealthAwareServer):
         for peer_udp in self._gate_udp_peers:
             await self.join_cluster(peer_udp)
         
-        # Add datacenter managers to SWIM for health probing
-        for dc, manager_udp_addrs in self._datacenter_manager_udp.items():
-            for manager_addr in manager_udp_addrs:
-                self._probe_scheduler.add_member(manager_addr)
+        # NOTE: Managers are NOT added to gate's SWIM probe scheduler.
+        # Managers are in their own SWIM cluster (per-datacenter).
+        # Gate-to-manager health is monitored via FederatedHealthMonitor (xprobe/xack).
         
-        # Start SWIM probe cycle (UDP healthchecks for gates + DC managers)
+        # Start SWIM probe cycle (UDP healthchecks for gates only)
         self._task_runner.run(self.start_probe_cycle)
         
         # Start leader election (uses SWIM membership info)
@@ -1657,6 +1671,22 @@ class GateServer(HealthAwareServer):
         
         # Sync state and transition to ACTIVE
         await self._complete_startup_sync()
+        
+        # Initialize and start Federated Health Monitor for DC leader probing
+        self._dc_health_monitor.set_callbacks(
+            send_udp=self._send_xprobe,
+            cluster_id=f"gate-{self._node_id.datacenter}",
+            node_id=self._node_id.full,
+            on_dc_health_change=self._on_dc_health_change,
+        )
+        
+        # Add known DC leaders to monitor (will be updated via TCP registrations)
+        for dc, manager_udp_addrs in self._datacenter_manager_udp.items():
+            if manager_udp_addrs:
+                # Start with first known manager - will update when leader is discovered
+                self._dc_health_monitor.add_datacenter(dc, manager_udp_addrs[0])
+        
+        await self._dc_health_monitor.start()
         
         # Start background cleanup tasks via TaskRunner
         self._task_runner.run(self._lease_cleanup_loop)
@@ -1669,7 +1699,8 @@ class GateServer(HealthAwareServer):
             self._udp_logger.log,
             ServerInfo(
                 message=f"Gate started with {len(self._datacenter_managers)} configured DCs, " +
-                        f"state={self._gate_state.value}, SWIM healthcheck active",
+                        f"state={self._gate_state.value}, SWIM healthcheck active, " +
+                        f"federated DC monitoring active",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -1678,11 +1709,132 @@ class GateServer(HealthAwareServer):
     
     async def stop(self) -> None:
         """Stop the gate server."""
+        # Stop federated health monitor
+        await self._dc_health_monitor.stop()
+        
         # TaskRunner handles cleanup task cancellation
         # Graceful shutdown broadcasts leave via UDP (SWIM)
         await self.graceful_shutdown()
         
         await super().stop()
+    
+    async def _send_xprobe(self, target: tuple[str, int], data: bytes) -> bool:
+        """
+        Send a cross-cluster probe to a DC leader.
+        
+        Used by FederatedHealthMonitor for DC health checking.
+        """
+        try:
+            await self.send(target, data, timeout=5)
+            return True
+        except Exception:
+            return False
+    
+    def _on_dc_health_change(self, datacenter: str, new_health: str) -> None:
+        """
+        Called when a datacenter's health status changes.
+        
+        Logs the change and updates internal tracking.
+        """
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"DC {datacenter} health changed to {new_health}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+    
+    async def _handle_xack_response(
+        self,
+        source_addr: tuple[str, int] | bytes,
+        ack_data: bytes,
+    ) -> None:
+        """
+        Handle a cross-cluster health acknowledgment from a DC leader.
+        
+        Passes the ack to the FederatedHealthMonitor for processing.
+        """
+        try:
+            ack = CrossClusterAck.load(ack_data)
+            self._dc_health_monitor.handle_ack(ack)
+            
+            # Also update DC leader info if this is a leader response
+            if ack.is_leader:
+                addr = source_addr if isinstance(source_addr, tuple) else None
+                if addr:
+                    self._dc_health_monitor.update_leader(
+                        datacenter=ack.datacenter,
+                        leader_udp_addr=addr,
+                        leader_node_id=ack.node_id,
+                        leader_term=ack.leader_term,
+                    )
+        except Exception as e:
+            await self.handle_exception(e, "handle_xack_response")
+    
+    async def _build_xprobe_response(
+        self,
+        source_addr: tuple[str, int] | bytes,
+        probe_data: bytes,
+    ) -> bytes | None:
+        """
+        Build response to cross-cluster health probe from a manager.
+        
+        Returns aggregate gate cluster health for the manager to track.
+        Only responds if we are the gate cluster leader.
+        """
+        # Only gate cluster leader responds to xprobes
+        if not self.is_leader():
+            return None
+        
+        # Get gate cluster health metrics
+        nodes = self._context.read('nodes')
+        self_addr = self._get_self_udp_addr()
+        cluster_size = 1  # Self
+        healthy_gates = 1  # Self
+        
+        if nodes:
+            for node_addr, data in nodes.items():
+                if node_addr != self_addr:
+                    cluster_size += 1
+                    if isinstance(data, tuple) and len(data) >= 2:
+                        _, status = data[:2]
+                        if status == b'OK':
+                            healthy_gates += 1
+        
+        # Count tracked DCs and their managers
+        dc_count = len(self._datacenter_manager_status)
+        total_managers = sum(
+            len(managers) for managers in self._datacenter_manager_status.values()
+        )
+        
+        # Count active jobs
+        active_jobs = len(self._jobs)
+        
+        # Determine gate cluster health
+        gate_health = "HEALTHY"
+        if healthy_gates < (cluster_size / 2):
+            gate_health = "DEGRADED"
+        
+        ack = CrossClusterAck(
+            datacenter="gate-cluster",
+            node_id=self._node_id.full,
+            incarnation=self._state_version,  # Use state version as incarnation
+            is_leader=True,
+            leader_term=self._leader_election.state.current_term,
+            cluster_size=cluster_size,
+            healthy_managers=healthy_gates,  # For gates, this is healthy_gates
+            worker_count=dc_count,  # Reuse field: number of DCs tracked
+            healthy_workers=total_managers,  # Reuse field: total managers tracked
+            total_cores=0,  # N/A for gates
+            available_cores=0,  # N/A for gates
+            active_jobs=active_jobs,
+            active_workflows=0,  # N/A for gates
+            dc_health=gate_health,
+        )
+        
+        return ack.dump()
     
     async def _lease_cleanup_loop(self) -> None:
         """Periodically clean up expired leases."""

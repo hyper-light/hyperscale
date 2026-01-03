@@ -17,6 +17,15 @@ from .graceful_degradation import (
     DEGRADATION_POLICIES,
 )
 
+from .federated_health_monitor import (
+    FederatedHealthMonitor,
+    DCHealthState,
+    DCReachability,
+    CrossClusterProbe,
+    CrossClusterAck,
+    DCLeaderAnnouncement,
+)
+
 
 __all__ = [
     # Local Health Multiplier
@@ -30,5 +39,12 @@ __all__ = [
     'DegradationLevel',
     'DegradationPolicy',
     'DEGRADATION_POLICIES',
+    # Federated Health Monitor
+    'FederatedHealthMonitor',
+    'DCHealthState',
+    'DCReachability',
+    'CrossClusterProbe',
+    'CrossClusterAck',
+    'DCLeaderAnnouncement',
 ]
 

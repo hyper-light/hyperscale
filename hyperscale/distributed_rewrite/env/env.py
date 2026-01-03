@@ -52,6 +52,21 @@ class Env(BaseModel):
     SWIM_SUSPICION_MIN_TIMEOUT: StrictFloat = 2.0
     SWIM_SUSPICION_MAX_TIMEOUT: StrictFloat = 15.0
     
+    # Leader Election Settings
+    LEADER_HEARTBEAT_INTERVAL: StrictFloat = 2.0  # Seconds between leader heartbeats
+    LEADER_ELECTION_TIMEOUT_BASE: StrictFloat = 5.0  # Base election timeout
+    LEADER_ELECTION_TIMEOUT_JITTER: StrictFloat = 2.0  # Random jitter added to timeout
+    LEADER_PRE_VOTE_TIMEOUT: StrictFloat = 2.0  # Timeout for pre-vote phase
+    LEADER_LEASE_DURATION: StrictFloat = 5.0  # Leader lease duration in seconds
+    LEADER_MAX_LHM: StrictInt = 4  # Max LHM score for leader eligibility (higher = more tolerant)
+    
+    # Federated Health Monitor Settings (Gate -> DC Leader probing)
+    # These are tuned for high-latency, globally distributed links
+    FEDERATED_PROBE_INTERVAL: StrictFloat = 2.0  # Seconds between probes to each DC
+    FEDERATED_PROBE_TIMEOUT: StrictFloat = 5.0  # Timeout for single probe (high for cross-DC)
+    FEDERATED_SUSPICION_TIMEOUT: StrictFloat = 30.0  # Time before suspected -> unreachable
+    FEDERATED_MAX_CONSECUTIVE_FAILURES: StrictInt = 5  # Failures before marking suspected
+    
     # Circuit Breaker Settings
     CIRCUIT_BREAKER_MAX_ERRORS: StrictInt = 3
     CIRCUIT_BREAKER_WINDOW_SECONDS: StrictFloat = 30.0
@@ -92,6 +107,18 @@ class Env(BaseModel):
             "CIRCUIT_BREAKER_MAX_ERRORS": int,
             "CIRCUIT_BREAKER_WINDOW_SECONDS": float,
             "CIRCUIT_BREAKER_HALF_OPEN_AFTER": float,
+            # Leader election settings
+            "LEADER_HEARTBEAT_INTERVAL": float,
+            "LEADER_ELECTION_TIMEOUT_BASE": float,
+            "LEADER_ELECTION_TIMEOUT_JITTER": float,
+            "LEADER_PRE_VOTE_TIMEOUT": float,
+            "LEADER_LEASE_DURATION": float,
+            "LEADER_MAX_LHM": int,
+            # Federated health monitor settings
+            "FEDERATED_PROBE_INTERVAL": float,
+            "FEDERATED_PROBE_TIMEOUT": float,
+            "FEDERATED_SUSPICION_TIMEOUT": float,
+            "FEDERATED_MAX_CONSECUTIVE_FAILURES": int,
         }
     
     def get_swim_init_context(self) -> dict:
@@ -120,4 +147,40 @@ class Env(BaseModel):
             'max_errors': self.CIRCUIT_BREAKER_MAX_ERRORS,
             'window_seconds': self.CIRCUIT_BREAKER_WINDOW_SECONDS,
             'half_open_after': self.CIRCUIT_BREAKER_HALF_OPEN_AFTER,
+        }
+    
+    def get_leader_election_config(self) -> dict:
+        """
+        Get leader election configuration from environment settings.
+        
+        These settings control:
+        - How often the leader sends heartbeats
+        - How long followers wait before starting an election
+        - Leader lease duration for failure detection
+        - LHM threshold for leader eligibility (higher = more tolerant to load)
+        """
+        return {
+            'heartbeat_interval': self.LEADER_HEARTBEAT_INTERVAL,
+            'election_timeout_base': self.LEADER_ELECTION_TIMEOUT_BASE,
+            'election_timeout_jitter': self.LEADER_ELECTION_TIMEOUT_JITTER,
+            'pre_vote_timeout': self.LEADER_PRE_VOTE_TIMEOUT,
+            'lease_duration': self.LEADER_LEASE_DURATION,
+            'max_leader_lhm': self.LEADER_MAX_LHM,
+        }
+    
+    def get_federated_health_config(self) -> dict:
+        """
+        Get federated health monitor configuration from environment settings.
+        
+        These settings are tuned for high-latency, globally distributed links
+        between gates and datacenter managers:
+        - Longer probe intervals (reduce cross-DC traffic)
+        - Longer timeouts (accommodate high latency)
+        - Longer suspicion period (tolerate transient issues)
+        """
+        return {
+            'probe_interval': self.FEDERATED_PROBE_INTERVAL,
+            'probe_timeout': self.FEDERATED_PROBE_TIMEOUT,
+            'suspicion_timeout': self.FEDERATED_SUSPICION_TIMEOUT,
+            'max_consecutive_failures': self.FEDERATED_MAX_CONSECUTIVE_FAILURES,
         }

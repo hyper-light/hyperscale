@@ -166,7 +166,7 @@ async def run_test():
             udp_port=manager_alpha_udp,
             env=env,
             dc_id="DC-ALPHA",
-            seed_gates=[('127.0.0.1', gate_tcp)],
+            gate_addrs=[('127.0.0.1', gate_tcp)],
         )
         
         await asyncio.wait_for(manager_alpha.start(), timeout=15.0)
@@ -196,7 +196,7 @@ async def run_test():
             udp_port=manager_beta_udp,
             env=env,
             dc_id="DC-BETA",
-            seed_gates=[('127.0.0.1', gate_tcp)],
+            gate_addrs=[('127.0.0.1', gate_tcp)],
         )
         
         await asyncio.wait_for(manager_beta.start(), timeout=15.0)
@@ -398,7 +398,7 @@ async def run_test():
                 
                 # Check latency stats are realistic (not placeholder zeros)
                 if aggregated and aggregated.avg_latency_ms > 0:
-                    print(f"  ✓ Aggregated latency stats are populated")
+                    print(f"  ✓ Aggregated latency stats are populated (avg={aggregated.avg_latency_ms:.2f}ms)")
                 else:
                     print(f"  ⚠ Aggregated latency stats may be placeholders (avg={aggregated.avg_latency_ms if aggregated else 'N/A'})")
                 
@@ -408,6 +408,32 @@ async def run_test():
                     print(f"  ✓ Per-DC stats preserved for both datacenters")
                 else:
                     print(f"  ⚠ Missing some DC stats: {dc_names}")
+                
+                # Validate AggregatedJobStats consistency
+                if aggregated:
+                    # total_requests should equal successful + failed
+                    expected_total = aggregated.successful_requests + aggregated.failed_requests
+                    if aggregated.total_requests == expected_total:
+                        print(f"  ✓ AggregatedJobStats: total_requests ({aggregated.total_requests}) = successful + failed")
+                    else:
+                        print(f"  ✗ AggregatedJobStats mismatch: total={aggregated.total_requests}, sum={expected_total}")
+                        all_passed = False
+                    
+                    # Latency percentiles should be ordered: p50 <= p95 <= p99
+                    if aggregated.p50_latency_ms <= aggregated.p95_latency_ms <= aggregated.p99_latency_ms or \
+                       (aggregated.p50_latency_ms == 0 and aggregated.p95_latency_ms == 0 and aggregated.p99_latency_ms == 0):
+                        print(f"  ✓ Latency percentiles are ordered correctly (p50 <= p95 <= p99)")
+                    else:
+                        print(f"  ✗ Latency percentiles out of order: p50={aggregated.p50_latency_ms}, p95={aggregated.p95_latency_ms}, p99={aggregated.p99_latency_ms}")
+                        all_passed = False
+                    
+                    # Overall rate should be > 0 if there are completed requests
+                    if aggregated.successful_requests > 0 and aggregated.overall_rate > 0:
+                        print(f"  ✓ Overall rate is positive ({aggregated.overall_rate:.2f}/s)")
+                    elif aggregated.successful_requests == 0:
+                        print(f"  ✓ Overall rate is 0 (no successful requests)")
+                    else:
+                        print(f"  ⚠ Overall rate is 0 despite {aggregated.successful_requests} successful requests")
                 
                 # Check job completed successfully
                 if result.status == "completed":
@@ -452,14 +478,14 @@ async def run_test():
         
         if worker_alpha:
             try:
-                await asyncio.wait_for(worker_alpha.stop(), timeout=15.0)
+                await asyncio.wait_for(worker_alpha.shutdown(), timeout=15.0)
                 print("  ✓ Worker DC-ALPHA stopped")
             except Exception as e:
                 print(f"  ✗ Worker DC-ALPHA stop failed: {e}")
         
         if worker_beta:
             try:
-                await asyncio.wait_for(worker_beta.stop(), timeout=15.0)
+                await asyncio.wait_for(worker_beta.shutdown(), timeout=15.0)
                 print("  ✓ Worker DC-BETA stopped")
             except Exception as e:
                 print(f"  ✗ Worker DC-BETA stop failed: {e}")

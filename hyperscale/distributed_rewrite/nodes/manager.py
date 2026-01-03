@@ -37,6 +37,11 @@ from hyperscale.core.hooks import HookType
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, ManagerStateEmbedder
+from hyperscale.distributed_rewrite.swim.health import (
+    FederatedHealthMonitor,
+    CrossClusterAck,
+    DCLeaderAnnouncement,
+)
 from hyperscale.distributed_rewrite.swim.core import (
     ErrorStats,
     CircuitState,
@@ -216,7 +221,22 @@ class ManagerServer(HealthAwareServer):
         # Maps workflow_id -> (retry_count, original_dispatch, failed_workers)
         self._workflow_retries: dict[str, tuple[int, bytes, set[str]]] = {}
         self._max_workflow_retries = max_workflow_retries
+        
+        # External incarnation for cross-cluster probes (xprobe)
+        # Separate from SWIM cluster incarnation - used by gates for staleness detection
+        self._external_incarnation: int = 0
         self._workflow_timeout = workflow_timeout
+        
+        # Federated Health Monitor for cross-cluster gate probing
+        # Uses xprobe/xack protocol to probe gate cluster leader
+        # This is separate from SWIM - gates are in a different SWIM cluster
+        fed_config = env.get_federated_health_config()
+        self._gate_health_monitor = FederatedHealthMonitor(
+            probe_interval=fed_config['probe_interval'],
+            probe_timeout=fed_config['probe_timeout'],
+            suspicion_timeout=fed_config['suspicion_timeout'],
+            max_consecutive_failures=fed_config['max_consecutive_failures'],
+        )
         
         # Workflow completion events for dependency tracking
         # Maps workflow_id -> asyncio.Event (set when workflow completes)
@@ -1145,7 +1165,29 @@ class ManagerServer(HealthAwareServer):
         if self._seed_gates:
             await self._register_with_gates()
         
-        # Start TCP heartbeat loop to gates (supplements SWIM embedding)
+        # Initialize Federated Health Monitor for gate probing
+        # Uses xprobe/xack protocol instead of SWIM (gates are in separate cluster)
+        self._gate_health_monitor.set_callbacks(
+            send_udp=self._send_xprobe_to_gate,
+            cluster_id=f"manager-{self._node_id.datacenter}",
+            node_id=self._node_id.full,
+            on_dc_health_change=self._on_gate_health_change,
+        )
+        
+        # Add known gate addresses to the federated health monitor
+        for gate_id, gate_info in self._known_gates.items():
+            gate_udp_addr = (gate_info.udp_host, gate_info.udp_port)
+            self._gate_health_monitor.add_datacenter(
+                datacenter="gate-cluster",  # Gates are a single cluster
+                leader_udp_addr=gate_udp_addr,
+                leader_node_id=gate_id,
+            )
+        
+        # Start federated health monitor if we have gates
+        if self._known_gates or self._gate_udp_addrs:
+            await self._gate_health_monitor.start()
+        
+        # Start TCP heartbeat loop to gates (supplements federated health probing)
         # TCP provides reliability for critical status updates
         if self._gate_addrs or self._known_gates:
             self._task_runner.run(
@@ -1280,12 +1322,17 @@ class ManagerServer(HealthAwareServer):
                     self._known_gates[gate_info.node_id] = gate_info
                     self._healthy_gate_ids.add(gate_info.node_id)
                     
-                    # Add gate's UDP address for SWIM (if not already configured)
+                    # Track gate's UDP address for federated health monitoring
+                    # NOTE: We do NOT add gates to our SWIM probe scheduler.
+                    # Gates are in a separate SWIM cluster - we use xprobe/xack
+                    # protocol via FederatedHealthMonitor instead.
                     gate_udp_addr = (gate_info.udp_host, gate_info.udp_port)
                     if gate_udp_addr not in self._gate_udp_addrs:
                         self._gate_udp_addrs.append(gate_udp_addr)
-                        # Join SWIM cluster with this gate
-                        await self.join_cluster(gate_udp_addr)
+                    
+                    # Add to federated health monitor (will be started in start())
+                    # The monitor isn't set up yet at registration time, so we
+                    # just store the addresses - start() will add them
                 
                 self._task_runner.run(
                     self._udp_logger.log,
@@ -1404,10 +1451,68 @@ class ManagerServer(HealthAwareServer):
     
     async def stop(self) -> None:
         """Stop the manager server."""
+        # Stop federated health monitor
+        await self._gate_health_monitor.stop()
+        
         # Graceful shutdown broadcasts leave via UDP (SWIM)
         await self.graceful_shutdown()
         
         await super().stop()
+    
+    async def _send_xprobe_to_gate(self, target: tuple[str, int], data: bytes) -> bool:
+        """
+        Send a cross-cluster probe to a gate.
+        
+        Used by FederatedHealthMonitor for gate health checking.
+        """
+        try:
+            await self.send(target, data, timeout=5)
+            return True
+        except Exception:
+            return False
+    
+    def _on_gate_health_change(self, datacenter: str, new_health: str) -> None:
+        """
+        Called when gate cluster health status changes.
+        
+        Logs the change and updates internal tracking.
+        """
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Gate cluster health changed to {new_health}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+    
+    async def _handle_xack_response(
+        self,
+        source_addr: tuple[str, int] | bytes,
+        ack_data: bytes,
+    ) -> None:
+        """
+        Handle a cross-cluster health acknowledgment from a gate.
+        
+        Passes the ack to the FederatedHealthMonitor for processing.
+        """
+        try:
+            ack = CrossClusterAck.load(ack_data)
+            self._gate_health_monitor.handle_ack(ack)
+            
+            # Update gate leader info if this is a leader response
+            if ack.is_leader:
+                addr = source_addr if isinstance(source_addr, tuple) else None
+                if addr:
+                    self._gate_health_monitor.update_leader(
+                        datacenter="gate-cluster",
+                        leader_udp_addr=addr,
+                        leader_node_id=ack.node_id,
+                        leader_term=ack.leader_term,
+                    )
+        except Exception as e:
+            await self.handle_exception(e, "handle_xack_response")
     
     def _is_gate_circuit_open(self) -> bool:
         """Check if gate circuit breaker is open (fail-fast mode)."""
@@ -1490,6 +1595,99 @@ class ManagerServer(HealthAwareServer):
     def _get_total_available_cores(self) -> int:
         """Get total available cores across all healthy workers for priority calculation."""
         return self._get_available_cores_for_healthy_workers()
+    
+    async def _build_xprobe_response(
+        self,
+        source_addr: tuple[str, int] | bytes,
+        probe_data: bytes,
+    ) -> bytes | None:
+        """
+        Build response to cross-cluster health probe from a gate.
+        
+        Returns aggregate datacenter health for the gate to track.
+        Only responds if we are the DC leader.
+        """
+        from hyperscale.distributed_rewrite.swim.health import CrossClusterAck
+        
+        # Only DC leader responds to xprobes
+        if not self.is_leader():
+            return None
+        
+        # Get health metrics
+        healthy_worker_ids = self._get_healthy_worker_ids()
+        healthy_workers = len(healthy_worker_ids)
+        total_workers = len(self._workers)
+        total_cores = self._get_total_cores()
+        available_cores = self._get_available_cores_for_healthy_workers()
+        
+        # Count active jobs/workflows
+        active_jobs = len(self._jobs)
+        active_workflows = sum(
+            len(job.workflows) for job in self._jobs.values()
+        )
+        
+        # Determine DC health status
+        dc_health = self._classify_dc_health(
+            healthy_workers, total_workers, available_cores, total_cores
+        )
+        
+        # Count healthy managers in cluster (from SWIM)
+        nodes = self._context.read('nodes')
+        self_addr = self._get_self_udp_addr()
+        cluster_size = 1  # Self
+        healthy_managers = 1  # Self
+        
+        if nodes:
+            for node_addr, data in nodes.items():
+                if node_addr != self_addr:
+                    cluster_size += 1
+                    if isinstance(data, tuple) and len(data) >= 2:
+                        _, status = data[:2]
+                        if status == b'OK':
+                            healthy_managers += 1
+        
+        ack = CrossClusterAck(
+            datacenter=self._dc_id,
+            node_id=self._node_id.full,
+            incarnation=self._external_incarnation,
+            is_leader=True,
+            leader_term=self._leader_election.state.current_term,
+            cluster_size=cluster_size,
+            healthy_managers=healthy_managers,
+            worker_count=total_workers,
+            healthy_workers=healthy_workers,
+            total_cores=total_cores,
+            available_cores=available_cores,
+            active_jobs=active_jobs,
+            active_workflows=active_workflows,
+            dc_health=dc_health,
+        )
+        
+        return ack.dump()
+    
+    def _classify_dc_health(
+        self,
+        healthy_workers: int,
+        total_workers: int,
+        available_cores: int,
+        total_cores: int,
+    ) -> str:
+        """Classify datacenter health based on worker status."""
+        if total_workers == 0:
+            return "UNHEALTHY"
+        
+        if healthy_workers == 0:
+            return "UNHEALTHY"
+        
+        # Majority workers unhealthy = DEGRADED
+        if healthy_workers < (total_workers / 2):
+            return "DEGRADED"
+        
+        # No available cores = BUSY
+        if available_cores == 0 and healthy_workers > 0:
+            return "BUSY"
+        
+        return "HEALTHY"
     
     def _get_workflow_priority(self, workflow) -> StagePriority:
         """
@@ -1676,9 +1874,7 @@ class ManagerServer(HealthAwareServer):
         
         while self._running:
             try:
-                print(f"[{self._node_id.short}] Heartbeat loop sleeping for {heartbeat_interval}s...")
                 await asyncio.sleep(heartbeat_interval)
-                print(f"[{self._node_id.short}] Heartbeat loop woke up, building heartbeat")
                 
                 heartbeat = self._build_manager_heartbeat()
                 

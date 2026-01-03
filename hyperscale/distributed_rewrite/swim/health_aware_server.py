@@ -128,7 +128,26 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._gossip_buffer = GossipBuffer()
         self._gossip_buffer.set_overflow_callback(self._on_gossip_overflow)
         self._probe_scheduler = ProbeScheduler()
-        self._leader_election = LocalLeaderElection(dc_id=dc_id)
+        
+        # Initialize leader election with configurable parameters from Env
+        from hyperscale.distributed_rewrite.swim.leadership.leader_state import LeaderState
+        from hyperscale.distributed_rewrite.swim.leadership.leader_eligibility import LeaderEligibility
+        
+        # Get leader election config from Env if available
+        env = kwargs.get('env')
+        if env and hasattr(env, 'get_leader_election_config'):
+            leader_config = env.get_leader_election_config()
+            self._leader_election = LocalLeaderElection(
+                dc_id=dc_id,
+                heartbeat_interval=leader_config['heartbeat_interval'],
+                election_timeout_base=leader_config['election_timeout_base'],
+                election_timeout_jitter=leader_config['election_timeout_jitter'],
+                pre_vote_timeout=leader_config['pre_vote_timeout'],
+                state=LeaderState(lease_duration=leader_config['lease_duration']),
+                eligibility=LeaderEligibility(max_leader_lhm=leader_config['max_leader_lhm']),
+            )
+        else:
+            self._leader_election = LocalLeaderElection(dc_id=dc_id)
         
         # Message deduplication - track recently seen messages to prevent duplicates
         self._seen_messages: BoundedDict[int, float] = BoundedDict(
@@ -502,6 +521,49 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             source_addr: The (host, port) of the node that sent the state.
         """
         self._state_embedder.process_state(state_data, source_addr)
+    
+    async def _build_xprobe_response(
+        self,
+        source_addr: tuple[str, int] | bytes,
+        probe_data: bytes,
+    ) -> bytes | None:
+        """
+        Build a response to a cross-cluster health probe (xprobe).
+        
+        This is a hook for subclasses (e.g., ManagerServer) to provide
+        aggregate datacenter health information to gates.
+        
+        By default, returns None (not a manager, can't respond).
+        
+        Args:
+            source_addr: The source address of the probe (gate)
+            probe_data: The probe message data
+            
+        Returns:
+            Serialized CrossClusterAck bytes, or None if can't respond.
+        """
+        # Base implementation: not a manager, don't respond
+        return None
+    
+    async def _handle_xack_response(
+        self,
+        source_addr: tuple[str, int] | bytes,
+        ack_data: bytes,
+    ) -> None:
+        """
+        Handle a cross-cluster health acknowledgment (xack).
+        
+        This is a hook for subclasses (e.g., GateServer) to process
+        health data from datacenter leaders.
+        
+        By default, does nothing (not a gate, don't care about xack).
+        
+        Args:
+            source_addr: The source address of the ack (DC leader)
+            ack_data: The ack message data
+        """
+        # Base implementation: not a gate, ignore
+        pass
     
     def _build_ack_with_state(self) -> bytes:
         """
@@ -2392,24 +2454,35 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             target: tuple[str, int] | None = None
             target_addr: bytes | None = None
             source_addr = f'{addr[0]}:{addr[1]}'
+            
+            # Check for cross-cluster messages FIRST (xprobe/xack/xnack)
+            # These have binary data after > that shouldn't be parsed as host:port
             if len(parsed) > 1:
-                message, target_addr = parsed
-                
-                # Extract embedded state from address portion (Serf-style)
-                # Format: host:port#base64_state
-                if self._STATE_SEPARATOR in target_addr:
-                    addr_part, state_part = target_addr.split(self._STATE_SEPARATOR, 1)
-                    target_addr = addr_part
-                    # Process embedded state from sender
-                    import base64
-                    try:
-                        state_data = base64.b64decode(state_part)
-                        self._process_embedded_state(state_data, addr)
-                    except Exception:
-                        pass  # Invalid state, ignore
-                
-                host, port = target_addr.decode().split(':', maxsplit=1)
-                target = (host, int(port))
+                msg_prefix = parsed[0]
+                if msg_prefix in (b'xprobe', b'xack', b'xnack'):
+                    # Cross-cluster message - data after > is pickled, not host:port
+                    message = msg_prefix
+                    target_addr = parsed[1]  # Keep as raw bytes for handler
+                    # Use source address as the target for response routing
+                    target = addr
+                else:
+                    message, target_addr = parsed
+                    
+                    # Extract embedded state from address portion (Serf-style)
+                    # Format: host:port#base64_state
+                    if self._STATE_SEPARATOR in target_addr:
+                        addr_part, state_part = target_addr.split(self._STATE_SEPARATOR, 1)
+                        target_addr = addr_part
+                        # Process embedded state from sender
+                        import base64
+                        try:
+                            state_data = base64.b64decode(state_part)
+                            self._process_embedded_state(state_data, addr)
+                        except Exception:
+                            pass  # Invalid state, ignore
+                    
+                    host, port = target_addr.decode().split(':', maxsplit=1)
+                    target = (host, int(port))
             
             # Extract message type (before first colon)
             msg_type = message.split(b':', maxsplit=1)[0]
@@ -2553,6 +2626,27 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         )
                             
                         return b'ack'
+                
+                case b'xprobe':
+                    # Cross-cluster health probe from a gate/manager
+                    # target_addr contains pickled CrossClusterProbe
+                    # Subclasses (ManagerServer, GateServer) override _build_xprobe_response
+                    xack = await self._build_xprobe_response(addr, target_addr or b'')
+                    if xack:
+                        return b'xack>' + xack
+                    return b'xnack>' + self._udp_addr_slug
+                
+                case b'xack':
+                    # Cross-cluster health acknowledgment from a DC/gate leader
+                    # target_addr contains pickled CrossClusterAck
+                    # Subclasses (GateServer, ManagerServer) override _handle_xack_response
+                    await self._handle_xack_response(addr, target_addr or b'')
+                    return b''  # No response needed
+                
+                case b'xnack':
+                    # Cross-cluster probe was rejected (not a DC leader)
+                    # Ignore silently - probe will timeout and try next
+                    return b''
                 
                 case b'ping-req':
                     async with self._context.with_value(target):
