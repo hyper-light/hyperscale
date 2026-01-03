@@ -57,6 +57,10 @@ from .distributed import (
     GateStateSnapshot as GateStateSnapshot,
     StateSyncRequest as StateSyncRequest,
     StateSyncResponse as StateSyncResponse,
+    # Context sync (layer-boundary protocol)
+    ContextForward as ContextForward,
+    ContextLayerSync as ContextLayerSync,
+    ContextLayerSyncAck as ContextLayerSyncAck,
     # Quorum
     ProvisionRequest as ProvisionRequest,
     ProvisionConfirm as ProvisionConfirm,

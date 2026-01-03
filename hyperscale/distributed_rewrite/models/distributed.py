@@ -631,6 +631,58 @@ class StateSyncResponse(Message):
 
 
 # =============================================================================
+# Context Synchronization (Layer-Boundary Sync Protocol)
+# =============================================================================
+
+@dataclass(slots=True)
+class ContextForward(Message):
+    """
+    Non-leader manager forwards context updates to job leader.
+    
+    When a worker sends WorkflowFinalResult to a manager that is NOT the
+    job leader, that manager forwards the context portion to the job leader.
+    Only the job leader applies context updates (single-writer model).
+    """
+    job_id: str                  # Job identifier
+    workflow_id: str             # Source workflow
+    context_updates: bytes       # Serialized Dict[key, value]
+    context_timestamps: bytes    # Serialized Dict[key, lamport_clock]
+    source_manager: str          # Manager node_id that received from worker
+
+
+@dataclass(slots=True)
+class ContextLayerSync(Message):
+    """
+    Job leader broadcasts at layer completion to sync context to peers.
+    
+    Before dispatching layer N+1, the job leader must:
+    1. Create a versioned snapshot of context after layer N
+    2. Broadcast to all peer managers
+    3. Wait for quorum confirmation
+    4. Only then dispatch next layer workflows
+    
+    This ensures dependent workflows always see correct context.
+    """
+    job_id: str                  # Job identifier
+    layer_version: int           # Monotonically increasing per job
+    context_snapshot: bytes      # Full context as cloudpickle.dumps(context.dict())
+    source_node_id: str          # Job leader's node_id
+
+
+@dataclass(slots=True)
+class ContextLayerSyncAck(Message):
+    """
+    Peer manager confirms receipt of context layer sync.
+    
+    Job leader waits for quorum of these before advancing to next layer.
+    """
+    job_id: str                  # Job identifier
+    layer_version: int           # Echoed back for correlation
+    applied: bool                # True if applied, False if stale/rejected
+    responder_id: str            # Responding manager's node_id
+
+
+# =============================================================================
 # Quorum and Confirmation
 # =============================================================================
 
