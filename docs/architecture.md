@@ -7524,6 +7524,350 @@ The architecture consists of five key components that work together:
 
 ---
 
+## Session Handoff: Implementation Continuation Guide
+
+This section provides all context needed for another AI session to resume implementation.
+
+### Current State (As of Last Session)
+
+#### What's Working ✓
+1. **Gate-to-Manager Federated Health Monitoring**: Implemented via `FederatedHealthMonitor`
+2. **Manager-to-Gate Symmetric Monitoring**: Managers also use federated health for gate monitoring  
+3. **Cross-Cluster Probing Protocol**: `xprobe`/`xack` messages with namespaced incarnations
+4. **Gate Results Aggregation**: Working correctly - latency percentiles interpolated, per-DC stats preserved
+5. **TCP Length-Prefixed Framing**: Reliable message delivery implemented
+6. **Priority-Based Core Allocation**: Managers allocate cores based on `StagePriority`, not VUs
+7. **Context Consistency Protocol**: LWW with timestamps and source node tiebreakers
+8. **SWIM Configuration**: Externalized to `Env` class
+
+#### What's Partially Working ⚠
+1. **Workflow Execution Pipeline**: Jobs dispatch to workers, but workflow completion has issues
+   - Jobs return `PARTIAL` status instead of `COMPLETED`
+   - `total_completed=0` in aggregated results
+   - Root cause: Need to investigate worker → manager result return path
+
+2. **Manager Cleanup on Shutdown**: `Manager stop failed` warnings during test cleanup
+
+#### What's Not Implemented ✗
+See "Remaining Components" below.
+
+---
+
+### Remaining Components (In Implementation Order)
+
+#### Component 1: Consistent Hashing Ring
+**Purpose**: Deterministic job-to-gate assignment for stable ownership
+
+**Implementation Plan**:
+```
+Location: hyperscale/distributed_rewrite/routing/consistent_hash.py
+
+class ConsistentHashRing:
+    def __init__(self, virtual_nodes: int = 100):
+        self._ring: dict[int, str] = {}  # hash -> node_id
+        self._vnodes = virtual_nodes
+    
+    def add_node(self, node_id: str) -> None:
+        for i in range(self._vnodes):
+            key = self._hash(f"{node_id}:{i}")
+            self._ring[key] = node_id
+    
+    def remove_node(self, node_id: str) -> None:
+        ...
+    
+    def get_node(self, key: str) -> str:
+        """Returns the node responsible for this key"""
+        ...
+    
+    def get_backup(self, key: str) -> str:
+        """Returns the backup node for this key"""
+        ...
+```
+
+**Integration Points**:
+- Gate uses hash ring in `job_submission` handler to determine initial owner
+- Client uses hash ring to find job owner for reconnection
+
+**Test File**: `examples/servers/test_consistent_hashing.py`
+```python
+# Test: job_id consistently maps to same gate
+# Test: node removal causes minimal key redistribution
+# Test: get_backup returns different node than primary
+```
+
+---
+
+#### Component 2: Lease-Based Job Ownership
+**Purpose**: Time-bounded ownership to prevent split-brain during failures
+
+**Implementation Plan**:
+```
+Location: hyperscale/distributed_rewrite/leases/job_lease.py
+
+@dataclass
+class JobLease:
+    job_id: str
+    owner_node: str
+    fence_token: int
+    expires_at: float  # monotonic time
+    lease_duration: float = 30.0
+    
+class LeaseManager:
+    def __init__(self, node_id: str):
+        self._leases: dict[str, JobLease] = {}
+        self._node_id = node_id
+        
+    def acquire(self, job_id: str) -> JobLease | None:
+        """Acquire lease if not held or expired"""
+        ...
+    
+    def renew(self, job_id: str) -> bool:
+        """Extend lease if still owner"""
+        ...
+    
+    def release(self, job_id: str) -> None:
+        """Explicitly release lease"""
+        ...
+    
+    def _cleanup_expired(self) -> None:
+        """Background task to clean expired leases"""
+        ...
+```
+
+**Integration Points**:
+- Gate acquires lease when becoming job owner (via hash ring or on job submission)
+- Lease renewal happens in background heartbeat loop
+- Backup gate monitors primary's lease via state sync
+
+**Test File**: `examples/servers/test_lease_ownership.py`
+```python
+# Test: lease acquisition succeeds for unclaimed job
+# Test: lease renewal extends expiry
+# Test: backup claims lease after primary expires
+# Test: fence token increments on each claim
+```
+
+---
+
+#### Component 3: Fencing Tokens
+**Purpose**: Prevent stale updates from old owners
+
+**Implementation Plan**:
+```
+Location: Integrate into existing message models
+
+# Update JobFinalResult, JobStatusPush, etc.
+@dataclass  
+class JobFinalResult(Message):
+    ...
+    fence_token: int = 0  # Add to existing model
+    
+# Gate validation
+def validate_fence_token(self, job_id: str, received_token: int) -> bool:
+    current = self._job_fence_tokens.get(job_id, 0)
+    if received_token < current:
+        return False  # Stale update, reject
+    self._job_fence_tokens[job_id] = received_token
+    return True
+```
+
+**Integration Points**:
+- Gate includes fence_token in `JobDispatch` to managers
+- Managers include fence_token in `JobFinalResult` to gates
+- Gate validates fence_token before accepting results
+
+**Test File**: `examples/servers/test_fencing_tokens.py`
+```python
+# Test: stale result (old fence) rejected
+# Test: valid result (current fence) accepted
+# Test: new owner's results (higher fence) accepted
+```
+
+---
+
+#### Component 4: Direct DC-to-Job-Leader Routing
+**Purpose**: Results go directly to job leader, not cluster leader
+
+**Implementation Plan**:
+```
+# In Manager.job_final_result handler:
+# Instead of sending to cluster leader, send to job leader
+
+def _send_job_final_result(self, job_id: str, result: JobFinalResult):
+    job_leader = self._job_leaders.get(job_id)
+    if job_leader == self._node_id.full:
+        # We are the job leader, aggregate locally
+        self._aggregate_and_forward_to_gate(result)
+    else:
+        # Forward to job leader
+        self.send_tcp(job_leader, "job_final_result", result.dump())
+
+# Similar pattern for gates forwarding to job-owning gate
+```
+
+**Integration Points**:
+- `JobDispatch` includes `job_leader_addr` field
+- DCs route results back to specified leader
+- If leader unreachable, use backup from hash ring
+
+**Test File**: `examples/servers/test_direct_routing.py`
+```python
+# Test: results route to job leader, not cluster leader
+# Test: failover to backup when leader unreachable
+```
+
+---
+
+#### Component 5: Client Reconnection
+**Purpose**: Clients can reconnect after gate failure and resume job tracking
+
+**Implementation Plan**:
+```
+Location: hyperscale/distributed_rewrite/nodes/client.py
+
+class HyperscaleClient:
+    def __init__(self, gate_addrs: list[tuple[str, int]]):
+        self._hash_ring = ConsistentHashRing()
+        for addr in gate_addrs:
+            self._hash_ring.add_node(f"{addr[0]}:{addr[1]}")
+    
+    def reconnect(self, job_id: str) -> JobResult | None:
+        """Reconnect to job owner and get current status"""
+        owner = self._hash_ring.get_node(job_id)
+        backup = self._hash_ring.get_backup(job_id)
+        
+        # Try owner first, then backup
+        for gate_addr in [owner, backup]:
+            try:
+                return self._fetch_job_status(gate_addr, job_id)
+            except ConnectionError:
+                continue
+        raise AllGatesUnreachable()
+```
+
+**Integration Points**:
+- Client stores hash ring of known gates
+- On disconnect, client computes owner and reconnects
+- Gate's `job_status_request` handler returns current status
+
+**Test File**: `examples/servers/test_client_reconnection.py`
+```python
+# Test: client reconnects after gate failure
+# Test: client finds job on backup gate
+# Test: client receives missed status updates
+```
+
+---
+
+### Testing Approach
+
+All tests follow this pattern:
+
+```python
+# examples/servers/test_<feature>.py
+
+async def main():
+    # 1. Setup cluster with appropriate logging
+    LoggingConfig.directory = os.getcwd()
+    
+    # 2. Start nodes in order: gates → managers → workers
+    gate = GateServer(...)
+    await gate.start()
+    await asyncio.sleep(3)  # Wait for leader election
+    
+    manager = ManagerServer(..., gate_addrs=[...])
+    await manager.start()
+    await asyncio.sleep(3)  # Wait for registration
+    
+    worker = WorkerServer(..., seed_managers=[...])
+    await worker.start()
+    await asyncio.sleep(2)  # Wait for registration
+    
+    # 3. Run test scenario
+    client = HyperscaleClient(gate_tcp_addrs=[...])
+    await client.start()
+    job_id = await client.submit_job(...)
+    result = await client.wait_for_completion(job_id)
+    
+    # 4. Validate results
+    assert result.status == "completed"
+    
+    # 5. Cleanup (in reverse order, with timeouts)
+    await client.stop()
+    await worker.stop()  # Note: workers use stop(), not graceful_shutdown()
+    await manager.graceful_shutdown()
+    await gate.graceful_shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+**Debug Workflow**:
+1. Run test with `timeout 180 python examples/servers/test_<name>.py 2>&1 | tail -100`
+2. Watch for warnings/exceptions
+3. Kill test if error found
+4. Fix the issue
+5. Commit with descriptive message
+6. Push to branch
+7. Repeat until test passes
+
+---
+
+### Key Files Reference
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/distributed_rewrite/nodes/gate.py` | Gate node - job dispatch, results aggregation |
+| `hyperscale/distributed_rewrite/nodes/manager.py` | Manager node - workflow dispatch, worker tracking |
+| `hyperscale/distributed_rewrite/nodes/worker.py` | Worker node - workflow execution |
+| `hyperscale/distributed_rewrite/nodes/client.py` | Client API for job submission |
+| `hyperscale/distributed_rewrite/models/distributed.py` | All message types (dataclasses) |
+| `hyperscale/distributed_rewrite/swim/health_aware_server.py` | Base server with SWIM protocol |
+| `hyperscale/distributed_rewrite/swim/health/federated_health_monitor.py` | Cross-cluster health monitoring |
+| `hyperscale/distributed_rewrite/env/env.py` | Configuration via environment variables |
+| `hyperscale/core/hooks/hook.py` | Hook types including `HookType.TEST` |
+| `hyperscale/core/jobs/workers/provisioner.py` | Priority-based core allocation |
+| `hyperscale/reporting/results.py` | Results merging and aggregation |
+
+---
+
+### Known Issues to Investigate
+
+1. **Workflow Execution Not Completing**
+   - Jobs return `PARTIAL` with `total_completed=0`
+   - Need to trace: worker → manager result path
+   - Check if `WorkflowFinalResult` is being sent correctly
+
+2. **Manager Shutdown Failures**  
+   - `Manager stop failed` during cleanup
+   - May be race condition with background tasks
+
+3. **Circuit Breaker False Positives**
+   - `[CircuitBreakerOpen] ELECTION` errors during single-node tests
+   - Single-node clusters shouldn't have election circuit breaker issues
+
+---
+
+### Commands for Quick Resume
+
+```bash
+# Run all existing tests
+python examples/servers/test_single_worker.py
+python examples/servers/test_workflow_end_to_end.py  
+python examples/servers/test_workflow_stats_push.py
+python examples/servers/test_gate_results_aggregation.py
+
+# Check for regressions
+cd /home/ada/Projects/hyperscale
+git status
+git log --oneline -10
+
+# Current branch
+git branch --show-current  # AL-distributed-wip
+```
+
+---
+
 ## License
 
 See the main project LICENSE file.
