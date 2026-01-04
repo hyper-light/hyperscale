@@ -48,7 +48,7 @@ class TaskRunner:
             config = Env()
 
         self.tasks: Dict[str, Task[Any]] = {}
-        self.results: Dict[str, Any]
+        self.results: Dict[str, Any] = {}
         self._cleanup_interval = TimeParser(config.MERCURY_SYNC_CLEANUP_INTERVAL).time
         self._cleanup_task: Optional[asyncio.Task] = None
         self._run_cleanup: bool = False
