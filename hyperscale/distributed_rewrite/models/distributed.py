@@ -767,9 +767,14 @@ class StateSyncRequest(Message):
 class StateSyncResponse(Message):
     """
     Response to state sync request.
+
+    The responder_ready field indicates whether the responder has completed
+    its own startup and is ready to serve authoritative state. If False,
+    the requester should retry after a delay.
     """
     responder_id: str            # Responding node
     current_version: int         # Current state version
+    responder_ready: bool = True # Whether responder has completed startup
     # One of these will be set based on node type
     worker_state: "WorkerStateSnapshot | None" = None
     manager_state: "ManagerStateSnapshot | None" = None

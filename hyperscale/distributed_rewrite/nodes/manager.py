@@ -655,6 +655,9 @@ class ManagerServer(HealthAwareServer):
 
         Uses exponential backoff: delay = base_delay * (2 ** attempt)
         Timeout and retries are configurable via Env.
+
+        Handles the case where the peer is not ready (still in SYNCING state)
+        by retrying until the peer becomes ACTIVE or retries are exhausted.
         """
         if max_retries is None:
             max_retries = self.env.MANAGER_STATE_SYNC_RETRIES
@@ -670,28 +673,36 @@ class ManagerServer(HealthAwareServer):
                     data=request.dump(),
                     timeout=sync_timeout,
                 )
-                
+
                 if response and not isinstance(response, Exception):
                     sync_response = StateSyncResponse.load(response)
-                    if sync_response.manager_state:
+
+                    # Check if peer is ready to serve state
+                    if not sync_response.responder_ready:
+                        last_error = "Peer not ready (still syncing)"
+                        # Retry - peer is alive but not ready yet
+                    elif sync_response.manager_state:
                         return await self._process_manager_state_response(sync_response.manager_state)
-                
-                # No valid response, will retry
-                last_error = "Empty or invalid response"
-                
+                    else:
+                        # Peer is ready but no state (fresh cluster)
+                        last_error = "Peer ready but no state available"
+                        return None
+                else:
+                    # No valid response, will retry
+                    last_error = "Empty or invalid response"
+
             except Exception as e:
                 last_error = str(e)
-            
+
             # Don't sleep after last attempt
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
                 await asyncio.sleep(delay)
-        
-        # All retries failed - log but don't fail (peer may be dead)
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=f"Manager peer state sync failed for {peer_addr} after {max_retries} attempts: {last_error}",
+
+        # All retries failed - log at warning level (expected during startup races)
+        await self._udp_logger.log(
+            ServerWarning(
+                message=f"Manager peer state sync incomplete for {peer_addr} after {max_retries} attempts: {last_error}",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -1312,10 +1323,10 @@ class ManagerServer(HealthAwareServer):
                         )
                     )
                 else:
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerError(
-                            message=f"State sync from leader failed, transitioning to ACTIVE anyway",
+                    # Expected during startup races - leader may not be ready yet
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message="State sync from leader incomplete, transitioning to ACTIVE anyway (fresh cluster or leader still starting)",
                             node_host=self._host,
                             node_port=self._tcp_port,
                             node_id=self._node_id.short,
@@ -5409,17 +5420,26 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ):
-        """Handle state sync request (when new leader needs current state)."""
+        """Handle state sync request (when new leader needs current state).
+
+        Only returns full state if this manager is ACTIVE. If still SYNCING,
+        returns responder_ready=False to indicate the requester should retry.
+        """
         try:
             request = StateSyncRequest.load(data)
-            
+
+            # Only serve state if we're ACTIVE (completed our own startup)
+            is_ready = self._manager_state == ManagerState.ACTIVE
+
             response = StateSyncResponse(
                 responder_id=self._node_id.full,
                 current_version=self._state_version,
-                manager_state=self._get_state_snapshot(),
+                responder_ready=is_ready,
+                # Only include state if we're ready
+                manager_state=self._get_state_snapshot() if is_ready else None,
             )
             return response.dump()
-            
+
         except Exception as e:
             await self.handle_exception(e, "receive_state_sync_request")
             return b''
