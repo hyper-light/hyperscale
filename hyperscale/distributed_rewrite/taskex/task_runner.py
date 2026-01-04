@@ -65,7 +65,7 @@ class TaskRunner:
                 max_workers=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
             )
 
-        self._executor_sempahore = asyncio.Semaphore(
+        self._executor_semaphore = asyncio.Semaphore(
             value=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
         )
         self._loop = asyncio.get_event_loop()
@@ -130,7 +130,7 @@ class TaskRunner:
                 command_name,
                 call,
                 self._executor,
-                self._executor_sempahore,
+                self._executor_semaphore,
                 schedule=schedule,
                 trigger=trigger,
                 repeat=repeat,
@@ -197,7 +197,7 @@ class TaskRunner:
                 command_name,
                 command,
                 self._executor,
-                self._executor_sempahore,
+                self._executor_semaphore,
                 schedule=schedule,
                 trigger=trigger,
                 repeat=repeat,
