@@ -67,8 +67,8 @@ MANAGER_CONFIGS = [
 
 # Worker configuration - 2 workers
 WORKER_CONFIGS = [
-    {"name": "Worker 1", "tcp": 9200, "udp": 9201, "cores": 4},
-    {"name": "Worker 2", "tcp": 9202, "udp": 9203, "cores": 4},
+    {"name": "Worker 1", "tcp": 9200, "udp": 9250, "cores": 4},
+    {"name": "Worker 2", "tcp": 9300, "udp": 9350, "cores": 4},
 ]
 
 # Client configuration
