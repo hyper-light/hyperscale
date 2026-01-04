@@ -238,6 +238,34 @@ async def run_test():
         print("[5/8] Submitting first job (should dispatch to BOTH workers)...")
         print("-" * 60)
 
+        # Debug: Check leadership status before submission
+        print("  Leadership status:")
+        leader_found = False
+        for i, mgr in enumerate(managers):
+            is_leader = mgr.is_leader()
+            current_leader = mgr.get_current_leader()
+            state = mgr._manager_state.value
+            print(f"    {MANAGER_CONFIGS[i]['name']}: is_leader={is_leader}, "
+                  f"current_leader={current_leader}, state={state}")
+            if is_leader:
+                leader_found = True
+
+        if not leader_found:
+            print("  WARNING: No leader found! Waiting additional 5s...")
+            await asyncio.sleep(5)
+            # Check again
+            for i, mgr in enumerate(managers):
+                if mgr.is_leader():
+                    print(f"    {MANAGER_CONFIGS[i]['name']} is now leader")
+                    leader_found = True
+                    break
+
+        if not leader_found:
+            print("  ERROR: Still no leader after additional wait")
+            return False
+
+        print()
+
         job1_id = await client.submit_job(
             workflows=[QuickWorkflow],
             timeout_seconds=60.0,
