@@ -76,6 +76,13 @@ class Env(BaseModel):
     WORKER_PROGRESS_UPDATE_INTERVAL: StrictFloat = 1.0  # How often to collect progress locally
     WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 2.0  # How often to send buffered updates to manager
 
+    # Manager Startup and Dispatch Settings
+    MANAGER_STARTUP_SYNC_DELAY: StrictFloat = 2.0  # Seconds to wait for leader election before state sync
+    MANAGER_STATE_SYNC_TIMEOUT: StrictFloat = 5.0  # Timeout for state sync request to leader
+    MANAGER_STATE_SYNC_RETRIES: StrictInt = 3  # Number of retries for state sync
+    MANAGER_DISPATCH_CORE_WAIT_TIMEOUT: StrictFloat = 5.0  # Max seconds to wait per iteration for cores
+    MANAGER_HEARTBEAT_INTERVAL: StrictFloat = 5.0  # Seconds between manager heartbeats to gates
+
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
@@ -126,6 +133,12 @@ class Env(BaseModel):
             # Worker progress update settings
             "WORKER_PROGRESS_UPDATE_INTERVAL": float,
             "WORKER_PROGRESS_FLUSH_INTERVAL": float,
+            # Manager startup and dispatch settings
+            "MANAGER_STARTUP_SYNC_DELAY": float,
+            "MANAGER_STATE_SYNC_TIMEOUT": float,
+            "MANAGER_STATE_SYNC_RETRIES": int,
+            "MANAGER_DISPATCH_CORE_WAIT_TIMEOUT": float,
+            "MANAGER_HEARTBEAT_INTERVAL": float,
         }
     
     def get_swim_init_context(self) -> dict:

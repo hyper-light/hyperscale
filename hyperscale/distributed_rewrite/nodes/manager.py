@@ -95,6 +95,7 @@ from hyperscale.distributed_rewrite.models import (
 )
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
+from hyperscale.reporting.results import Results
 
 
 class ManagerServer(HealthAwareServer):
@@ -241,7 +242,19 @@ class ManagerServer(HealthAwareServer):
         # Workflow completion events for dependency tracking
         # Maps workflow_id -> asyncio.Event (set when workflow completes)
         self._workflow_completion_events: dict[str, asyncio.Event] = {}
-        
+
+        # Multi-worker workflow dispatch tracking
+        # Maps parent workflow_id -> list of sub-workflow IDs dispatched to workers
+        self._sub_workflow_mapping: dict[str, list[str]] = {}
+        # Maps sub-workflow_id -> latest progress update from that worker
+        self._sub_workflow_progress: dict[str, WorkflowProgress] = {}
+        # Maps sub-workflow_id -> final result from that worker
+        self._sub_workflow_results: dict[str, WorkflowFinalResult] = {}
+
+        # Core availability event - signaled when cores become available
+        # Waiting workflows can wait on this instead of polling
+        self._cores_available_event: asyncio.Event = asyncio.Event()
+
         # Fencing tokens for at-most-once
         self._fence_token = 0
         
@@ -634,23 +647,28 @@ class ManagerServer(HealthAwareServer):
         self,
         peer_addr: tuple[str, int],
         request: StateSyncRequest,
-        max_retries: int = 3,
+        max_retries: int | None = None,
         base_delay: float = 0.5,
     ) -> ManagerStateSnapshot | None:
         """
         Request state from a peer manager with retries.
-        
+
         Uses exponential backoff: delay = base_delay * (2 ** attempt)
+        Timeout and retries are configurable via Env.
         """
+        if max_retries is None:
+            max_retries = self.env.MANAGER_STATE_SYNC_RETRIES
+
+        sync_timeout = self.env.MANAGER_STATE_SYNC_TIMEOUT
         last_error = None
-        
+
         for attempt in range(max_retries):
             try:
                 response, _ = await self.send_tcp(
                     peer_addr,
                     action='state_sync_request',
                     data=request.dump(),
-                    timeout=5.0,
+                    timeout=sync_timeout,
                 )
                 
                 if response and not isinstance(response, Exception):
@@ -1152,10 +1170,11 @@ class ManagerServer(HealthAwareServer):
         
         # Start leader election (uses SWIM membership info)
         await self.start_leader_election()
-        
-        # Wait a short time for leader election to stabilize
-        await asyncio.sleep(0.5)
-        
+
+        # Wait for leader election to stabilize before state sync
+        startup_sync_delay = self.env.MANAGER_STARTUP_SYNC_DELAY
+        await asyncio.sleep(startup_sync_delay)
+
         # Sync state and transition to ACTIVE
         await self._complete_startup_sync()
         
@@ -1244,11 +1263,23 @@ class ManagerServer(HealthAwareServer):
         
         # Not leader - request state sync from leader
         leader_addr = self.get_current_leader()
-        
+
         if leader_addr:
             # Find TCP address for leader (UDP -> TCP mapping)
             leader_tcp_addr = self._manager_udp_to_tcp.get(leader_addr)
-            
+
+            if not leader_tcp_addr:
+                # Log the mismatch for debugging
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Leader UDP addr {leader_addr} not in UDP->TCP map. Map keys: {list(self._manager_udp_to_tcp.keys())}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
             if leader_tcp_addr:
                 self._task_runner.run(
                     self._udp_logger.log,
@@ -1865,12 +1896,14 @@ class ManagerServer(HealthAwareServer):
     async def _gate_heartbeat_loop(self) -> None:
         """
         Periodically send ManagerHeartbeat to gates via TCP.
-        
+
         This supplements the Serf-style SWIM embedding for reliability.
         Gates use this for datacenter health classification.
+
+        Heartbeat interval is configurable via Env.MANAGER_HEARTBEAT_INTERVAL.
         """
-        heartbeat_interval = 5.0  # Send every 5 seconds
-        
+        heartbeat_interval = self.env.MANAGER_HEARTBEAT_INTERVAL
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -2180,7 +2213,75 @@ class ManagerServer(HealthAwareServer):
         
         # Cryptographically secure selection
         return secrets.choice(eligible)
-    
+
+    def _select_workers_for_workflow_pool(
+        self,
+        total_cores_needed: int,
+        excluded_workers: set[str] | None = None,
+    ) -> list[tuple[str, int]]:
+        """
+        Select multiple workers to satisfy total core requirement.
+
+        Distributes a workflow across multiple workers based on their available
+        capacity. Workers are treated as a unified pool - if we need 8 cores
+        and have 2 workers with 4 cores each, both workers are selected.
+
+        Args:
+            total_cores_needed: Total cores required across all workers
+            excluded_workers: Set of worker IDs to skip (e.g., already failed)
+
+        Returns:
+            List of (worker_id, cores_to_allocate) tuples. May be empty if
+            insufficient capacity, or may allocate fewer than requested if
+            that's all that's available.
+        """
+        if excluded_workers is None:
+            excluded_workers = set()
+
+        allocations: list[tuple[str, int]] = []
+        remaining_cores = total_cores_needed
+
+        # Build list of eligible workers with their available cores
+        eligible_workers: list[tuple[str, int]] = []
+        for node_id, status in list(self._worker_status.items()):
+            if node_id in excluded_workers:
+                continue
+
+            # Check circuit breaker
+            if self._is_worker_circuit_open(node_id):
+                continue
+
+            if status.state != WorkerState.HEALTHY.value:
+                continue
+
+            if status.available_cores <= 0:
+                continue
+
+            # Check SWIM liveness
+            worker_reg = self._workers.get(node_id)
+            if worker_reg:
+                worker_addr = (worker_reg.node.host, worker_reg.node.port)
+                node_state = self._incarnation_tracker.get_node_state(worker_addr)
+                if node_state and node_state.status != b'OK':
+                    continue
+
+            eligible_workers.append((node_id, status.available_cores))
+
+        # Sort by available cores descending (prefer workers with more capacity)
+        eligible_workers.sort(key=lambda x: x[1], reverse=True)
+
+        # Allocate cores from workers until we have enough
+        for worker_id, available in eligible_workers:
+            if remaining_cores <= 0:
+                break
+
+            # Allocate as many cores as this worker can provide
+            cores_from_worker = min(available, remaining_cores)
+            allocations.append((worker_id, cores_from_worker))
+            remaining_cores -= cores_from_worker
+
+        return allocations
+
     async def _dispatch_workflow_to_worker(
         self,
         worker_node_id: str,
@@ -2538,9 +2639,13 @@ class ManagerServer(HealthAwareServer):
                 active_workflows={},
             )
             self._worker_status[registration.node.node_id] = initial_status
-            
+
             self._increment_version()
-            
+
+            # Signal that cores are available - wake up any waiting workflows
+            if registration.available_cores > 0:
+                self._cores_available_event.set()
+
             # Add worker to SWIM cluster for UDP healthchecks
             # The worker's UDP address is derived from registration
             worker_udp_addr = (registration.node.host, registration.node.port)
@@ -2639,10 +2744,14 @@ class ManagerServer(HealthAwareServer):
                     active_workflows={},
                 )
                 self._worker_status[worker_id] = initial_status
-                
+
+                # Signal that cores are available - wake up any waiting workflows
+                if broadcast.available_cores > 0:
+                    self._cores_available_event.set()
+
                 # Add to SWIM probing
                 self._probe_scheduler.add_member(worker_udp_addr)
-                
+
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerInfo(
@@ -2754,16 +2863,44 @@ class ManagerServer(HealthAwareServer):
     ):
         """
         Handle workflow progress update from worker.
-        
+
         Key feature: Uses cores_completed to enable faster provisioning.
         When a worker reports that some cores have finished their portion
         of a workflow, we can immediately consider those cores available
         for new workflows, without waiting for the entire workflow to complete.
+
+        Multi-worker dispatch: When a workflow is split across multiple workers,
+        each worker sends progress with a sub-workflow ID (job_id:workflow_idx:worker_idx).
+        We aggregate these into unified parent workflow progress before forwarding.
         """
         try:
             progress = WorkflowProgress.load(data)
-            
-            # Update job progress
+
+            # Check if this is a sub-workflow (dispatched to multiple workers)
+            parent_workflow_id = self._get_parent_workflow_id(progress.workflow_id)
+
+            if parent_workflow_id is not None:
+                # This is a sub-workflow - store and aggregate
+                self._sub_workflow_progress[progress.workflow_id] = progress
+
+                # Update worker available cores based on cores_completed
+                await self._update_worker_cores_from_progress(progress, None)
+
+                # Aggregate progress from all sub-workflows
+                aggregated_progress = self._aggregate_sub_workflow_progress(parent_workflow_id)
+                if aggregated_progress is None:
+                    # No progress to aggregate yet
+                    ack = WorkflowProgressAck(
+                        manager_id=self._node_id.full,
+                        is_leader=self.is_leader(),
+                        healthy_managers=self._get_healthy_managers(),
+                    )
+                    return ack.dump()
+
+                # Use aggregated progress for job updates
+                progress = aggregated_progress
+
+            # Update job progress with (potentially aggregated) progress
             job = self._jobs.get(progress.job_id)
             if job:
                 # Track previous cores_completed to detect newly freed cores
@@ -2776,23 +2913,22 @@ class ManagerServer(HealthAwareServer):
                 else:
                     # New workflow progress
                     job.workflows.append(progress)
-                
+
                 # Recalculate aggregates
                 job.total_completed = sum(w.completed_count for w in job.workflows)
                 job.total_failed = sum(w.failed_count for w in job.workflows)
                 job.overall_rate = sum(w.rate_per_second for w in job.workflows)
                 job.timestamp = time.monotonic()
-                
+
                 # Aggregate step stats from all workflows
                 job.step_stats = self._aggregate_step_stats(job.workflows)
-                
-                # Update worker available cores based on cores_completed
-                # This enables faster provisioning - we don't need to wait for
-                # the entire workflow to complete to start using freed cores
-                await self._update_worker_cores_from_progress(progress, old_progress)
-                
+
+                # Update worker available cores based on cores_completed (for single-worker case)
+                if parent_workflow_id is None:
+                    await self._update_worker_cores_from_progress(progress, old_progress)
+
                 self._increment_version()
-                
+
                 # Handle workflow completion states
                 if progress.status == WorkflowStatus.FAILED.value:
                     # Check if workflow should be retried
@@ -2800,16 +2936,16 @@ class ManagerServer(HealthAwareServer):
                 elif progress.status == WorkflowStatus.COMPLETED.value:
                     # Clean up retry tracking on success
                     self._workflow_retries.pop(progress.workflow_id, None)
-                    
+
                     # Signal completion for dependency tracking
                     completion_event = self._workflow_completion_events.get(progress.workflow_id)
                     if completion_event:
                         completion_event.set()
-                
+
                 # Forward job progress to gates (if connected)
                 if self._known_gates or self._gate_addrs:
                     self._task_runner.run(self._send_job_progress_to_gate, job)
-                
+
                 # Check for job completion and push to client (if no gates)
                 if not (self._known_gates or self._gate_addrs):
                     self._check_job_completion(progress.job_id)
@@ -2835,16 +2971,20 @@ class ManagerServer(HealthAwareServer):
     ):
         """
         Handle workflow final result from worker.
-        
+
         This is the critical path for workflow completion:
         1. Store the final result
         2. Process context updates for dependent workflows
         3. Check job completion
         4. Forward to gates or clients if appropriate
+
+        Multi-worker dispatch: When a workflow is split across multiple workers,
+        each worker sends a final result with a sub-workflow ID. We aggregate
+        these using Results.merge_results() when all sub-workflows complete.
         """
         try:
             result = WorkflowFinalResult.load(data)
-            
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerDebug(
@@ -2854,29 +2994,65 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            
-            # Store final result
+
+            # Check if this is a sub-workflow (dispatched to multiple workers)
+            parent_workflow_id = self._get_parent_workflow_id(result.workflow_id)
+
+            if parent_workflow_id is not None:
+                # This is a sub-workflow - store and check if parent is complete
+                self._sub_workflow_results[result.workflow_id] = result
+
+                # Handle context updates from sub-workflow
+                if result.context_updates and len(result.context_updates) > 0:
+                    if self._is_job_leader(result.job_id):
+                        await self._apply_context_updates_from_result(result)
+                    else:
+                        await self._forward_context_from_result(result)
+
+                # Check if all sub-workflows have completed
+                if not self._is_parent_workflow_complete(parent_workflow_id):
+                    # More sub-workflows pending - just ack
+                    return b'ok'
+
+                # All sub-workflows complete - aggregate results
+                result = self._aggregate_sub_workflow_final_results(parent_workflow_id)
+                if result is None:
+                    # Aggregation failed - should not happen
+                    await self.handle_exception(
+                        Exception(f"Failed to aggregate results for {parent_workflow_id}"),
+                        "workflow_final_result"
+                    )
+                    return b'error'
+
+                # Clean up sub-workflow tracking
+                sub_workflow_ids = self._sub_workflow_mapping.pop(parent_workflow_id, [])
+                for sub_id in sub_workflow_ids:
+                    self._sub_workflow_progress.pop(sub_id, None)
+                    self._sub_workflow_results.pop(sub_id, None)
+
+            # Store final result (either original or aggregated)
             if result.job_id not in self._workflow_final_results:
                 self._workflow_final_results[result.job_id] = {}
             self._workflow_final_results[result.job_id][result.workflow_id] = result
-            
-            # Handle context updates (for dependent workflows)
-            if result.context_updates and len(result.context_updates) > 0:
+
+            # Handle context updates (for dependent workflows) - only for non-sub-workflows
+            # Sub-workflows already had context applied above
+            if parent_workflow_id is None and result.context_updates and len(result.context_updates) > 0:
                 if self._is_job_leader(result.job_id):
                     # We are job leader - apply context directly
                     await self._apply_context_updates_from_result(result)
                 else:
                     # Forward context to job leader
                     await self._forward_context_from_result(result)
-            
+
             # Clean up retry tracking on any final result
             self._workflow_retries.pop(result.workflow_id, None)
-            
+
             # Signal completion for dependency tracking
             completion_event = self._workflow_completion_events.get(result.workflow_id)
             if completion_event:
                 completion_event.set()
-            
+
             # Update job progress status
             job = self._jobs.get(result.job_id)
             if job:
@@ -2884,19 +3060,19 @@ class ManagerServer(HealthAwareServer):
                     if wf.workflow_id == result.workflow_id:
                         wf.status = result.status
                         break
-                
+
                 # Forward to gates (if connected)
                 if self._known_gates or self._gate_addrs:
                     self._task_runner.run(self._send_job_progress_to_gate, job)
-            
+
             # Check if job is complete
             if self._is_job_complete(result.job_id):
                 await self._handle_job_completion(result.job_id)
-            
+
             self._increment_version()
-            
+
             return b'ok'
-            
+
         except Exception as e:
             await self.handle_exception(e, "workflow_final_result")
             return b'error'
@@ -2975,16 +3151,238 @@ class ManagerServer(HealthAwareServer):
         job = self._jobs.get(job_id)
         if not job:
             return False
-        
+
         final_results = self._workflow_final_results.get(job_id, {})
         workflow_assignments = self._workflow_assignments.get(job_id, {})
-        
+
         # Job is complete when we have final results for all assigned workflows
         if len(workflow_assignments) == 0:
             return False
-        
+
         return len(final_results) >= len(workflow_assignments)
-    
+
+    def _get_parent_workflow_id(self, sub_workflow_id: str) -> str | None:
+        """
+        Extract parent workflow ID from a sub-workflow ID.
+
+        Sub-workflow IDs have format: job_id:workflow_idx:worker_idx
+        Parent workflow IDs have format: job_id:workflow_idx
+
+        Returns None if this is not a sub-workflow (only has 2 parts).
+        """
+        parts = sub_workflow_id.split(":")
+        if len(parts) >= 3:
+            # Has worker_idx suffix, return parent (without worker_idx)
+            return ":".join(parts[:-1])
+        return None
+
+    def _is_parent_workflow_complete(self, parent_workflow_id: str) -> bool:
+        """
+        Check if all sub-workflows for a parent workflow have completed.
+
+        Returns True if all sub-workflows have final results stored.
+        """
+        sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
+        if not sub_workflow_ids:
+            # No sub-workflows tracked - might be single-worker dispatch
+            return True
+
+        for sub_id in sub_workflow_ids:
+            if sub_id not in self._sub_workflow_results:
+                return False
+        return True
+
+    def _aggregate_sub_workflow_progress(self, parent_workflow_id: str) -> WorkflowProgress | None:
+        """
+        Aggregate progress updates from all sub-workflows into a unified progress.
+
+        Combines:
+        - completed_count: sum across all sub-workflows
+        - failed_count: sum across all sub-workflows
+        - rate_per_second: sum of rates
+        - cores_completed: sum of completed cores
+        - step_stats: merged by step name
+        - avg_cpu_percent: weighted average by cores
+        - avg_memory_mb: sum across all
+
+        Returns None if no progress available.
+        """
+        sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
+        if not sub_workflow_ids:
+            return None
+
+        progress_updates = [
+            self._sub_workflow_progress.get(sub_id)
+            for sub_id in sub_workflow_ids
+            if sub_id in self._sub_workflow_progress
+        ]
+
+        if not progress_updates:
+            return None
+
+        # Find job_id from parent workflow_id (format: job_id:workflow_idx)
+        job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
+
+        # Aggregate counts
+        total_completed = sum(p.completed_count for p in progress_updates)
+        total_failed = sum(p.failed_count for p in progress_updates)
+        total_rate = sum(p.rate_per_second for p in progress_updates)
+        max_elapsed = max(p.elapsed_seconds for p in progress_updates)
+        total_cores_completed = sum(p.cores_completed for p in progress_updates)
+
+        # Aggregate CPU/memory (weighted by assigned cores)
+        total_cores = sum(len(p.assigned_cores) for p in progress_updates if p.assigned_cores)
+        if total_cores > 0:
+            avg_cpu = sum(
+                p.avg_cpu_percent * len(p.assigned_cores)
+                for p in progress_updates
+                if p.assigned_cores
+            ) / total_cores
+        else:
+            avg_cpu = sum(p.avg_cpu_percent for p in progress_updates) / len(progress_updates)
+
+        total_memory = sum(p.avg_memory_mb for p in progress_updates)
+
+        # Merge step stats by step name
+        step_stats_by_name: dict[str, StepStats] = {}
+        for p in progress_updates:
+            for step in p.step_stats:
+                if step.step_name in step_stats_by_name:
+                    existing = step_stats_by_name[step.step_name]
+                    step_stats_by_name[step.step_name] = StepStats(
+                        step_name=step.step_name,
+                        completed_count=existing.completed_count + step.completed_count,
+                        failed_count=existing.failed_count + step.failed_count,
+                        total_count=existing.total_count + step.total_count,
+                    )
+                else:
+                    step_stats_by_name[step.step_name] = StepStats(
+                        step_name=step.step_name,
+                        completed_count=step.completed_count,
+                        failed_count=step.failed_count,
+                        total_count=step.total_count,
+                    )
+
+        # Determine overall status (worst case wins)
+        status = WorkflowStatus.RUNNING.value
+        for p in progress_updates:
+            if p.status == WorkflowStatus.FAILED.value:
+                status = WorkflowStatus.FAILED.value
+                break
+            elif p.status == WorkflowStatus.COMPLETED.value:
+                # Only set completed if all are completed
+                if all(up.status == WorkflowStatus.COMPLETED.value for up in progress_updates):
+                    status = WorkflowStatus.COMPLETED.value
+
+        # Collect all assigned cores
+        all_cores = []
+        for p in progress_updates:
+            all_cores.extend(p.assigned_cores)
+
+        return WorkflowProgress(
+            job_id=job_id,
+            workflow_id=parent_workflow_id,
+            workflow_name=progress_updates[0].workflow_name,
+            status=status,
+            completed_count=total_completed,
+            failed_count=total_failed,
+            rate_per_second=total_rate,
+            elapsed_seconds=max_elapsed,
+            step_stats=list(step_stats_by_name.values()),
+            timestamp=max(p.timestamp for p in progress_updates),
+            assigned_cores=all_cores,
+            cores_completed=total_cores_completed,
+            avg_cpu_percent=avg_cpu,
+            avg_memory_mb=total_memory,
+        )
+
+    def _aggregate_sub_workflow_final_results(
+        self,
+        parent_workflow_id: str,
+    ) -> WorkflowFinalResult | None:
+        """
+        Aggregate final results from all sub-workflows into a unified result.
+
+        Uses Results.merge_results() to combine WorkflowStats from all sub-workflows.
+        This follows the same pattern as RemoteGraphManager.
+
+        Returns None if aggregation fails.
+        """
+        sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
+        if not sub_workflow_ids:
+            return None
+
+        # Collect all sub-workflow results
+        sub_results = [
+            self._sub_workflow_results.get(sub_id)
+            for sub_id in sub_workflow_ids
+            if sub_id in self._sub_workflow_results
+        ]
+
+        if not sub_results or len(sub_results) != len(sub_workflow_ids):
+            # Not all sub-workflows have completed
+            return None
+
+        # Extract job_id from parent workflow_id (format: job_id:workflow_idx)
+        job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
+
+        # Determine overall status (any failure = failure)
+        overall_status = WorkflowStatus.COMPLETED.value
+        errors = []
+        for r in sub_results:
+            if r.status == WorkflowStatus.FAILED.value:
+                overall_status = WorkflowStatus.FAILED.value
+                if r.error:
+                    errors.append(r.error)
+
+        # Unpack and merge WorkflowStats from all sub-workflows
+        workflow_stats_list = []
+        for r in sub_results:
+            try:
+                stats = cloudpickle.loads(r.results)
+                workflow_stats_list.append(stats)
+            except Exception:
+                # Skip malformed results
+                pass
+
+        # Merge results using Results helper (same pattern as RemoteGraphManager)
+        if len(workflow_stats_list) > 1:
+            results_helper = Results(hooks=[])
+            merged_stats = results_helper.merge_results(workflow_stats_list)
+        elif len(workflow_stats_list) == 1:
+            merged_stats = workflow_stats_list[0]
+        else:
+            # No valid stats - create empty result
+            merged_stats = {
+                "workflow": sub_results[0].workflow_name,
+                "stats": {},
+                "results": [],
+                "checks": [],
+                "metrics": [],
+            }
+
+        # Merge context updates from all sub-workflows
+        merged_context = {}
+        for r in sub_results:
+            if r.context_updates and len(r.context_updates) > 0:
+                try:
+                    ctx = cloudpickle.loads(r.context_updates)
+                    if ctx:
+                        merged_context.update(ctx)
+                except Exception:
+                    pass
+
+        # Create aggregated final result
+        return WorkflowFinalResult(
+            job_id=job_id,
+            workflow_id=parent_workflow_id,
+            workflow_name=sub_results[0].workflow_name,
+            status=overall_status,
+            results=cloudpickle.dumps(merged_stats),
+            context_updates=cloudpickle.dumps(merged_context) if merged_context else b'',
+            error="; ".join(errors) if errors else None,
+        )
+
     async def _handle_job_completion(self, job_id: str) -> None:
         """Handle job completion - build and send JobFinalResult."""
         job = self._jobs.get(job_id)
@@ -3650,7 +4048,7 @@ class ManagerServer(HealthAwareServer):
                 active_workflows=worker_status.active_workflows,
             )
             self._worker_status[worker_id] = updated_status
-            
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
@@ -3660,7 +4058,10 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-    
+
+            # Signal that cores are available - wake up any waiting workflows
+            self._cores_available_event.set()
+
     # =========================================================================
     # Client Push Notifications (when gates not present)
     # =========================================================================
@@ -4646,144 +5047,118 @@ class ManagerServer(HealthAwareServer):
         cloudpickle,
     ) -> bool:
         """
-        Dispatch a single workflow to a worker with resource-aware waiting.
-        
+        Dispatch a workflow across multiple workers to satisfy core requirements.
+
+        Workers are treated as a unified pool. If a workflow needs 8 cores and
+        we have 2 workers with 4 cores each, the workflow is dispatched to BOTH
+        workers, each handling a portion of the VUs proportional to their cores.
+
         Args:
             submission: The job submission
             idx: Workflow index within the job
             workflow: The workflow instance
-            cores_needed: CPU cores to allocate (from priority calculation)
-            vus: Virtual users (can be large, e.g., 50,000)
+            cores_needed: Total CPU cores to allocate across all workers
+            vus: Total virtual users (distributed proportionally across workers)
             cloudpickle: The cloudpickle module for serialization
-        
-        If no worker has sufficient capacity, waits with exponential backoff
-        until resources become available or timeout is reached.
-        
-        Returns True if dispatch succeeded, False otherwise.
+
+        Returns True if at least one dispatch succeeded, False otherwise.
         """
         workflow_id = f"{submission.job_id}:{idx}"
-        
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"_dispatch_single_workflow started for {workflow_id}, need {cores_needed} cores",
+                message=f"_dispatch_single_workflow started for {workflow_id}, need {cores_needed} cores total",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             )
         )
-        
-        # Resource-aware waiting with exponential backoff
+
+        # Resource-aware waiting with event-driven notification
+        # When cores are freed, _cores_available_event is signaled
         max_wait = submission.timeout_seconds
-        waited = 0.0
-        backoff = 0.5  # Start with 500ms
-        max_backoff = 5.0  # Cap at 5 seconds
-        
-        worker_id = None
-        while waited < max_wait:
-            # Try to select a worker with sufficient capacity
-            worker_id = self._select_worker_for_workflow(cores_needed)
-            if worker_id:
+        start_time = time.monotonic()
+        wait_timeout = self.env.MANAGER_DISPATCH_CORE_WAIT_TIMEOUT  # Max time per wait iteration
+        logged_waiting = False
+
+        worker_allocations: list[tuple[str, int]] = []
+        while True:
+            waited = time.monotonic() - start_time
+            if waited >= max_wait:
+                break
+
+            # Try to select workers from the pool to satisfy total core requirement
+            worker_allocations = self._select_workers_for_workflow_pool(cores_needed)
+            total_allocated = sum(cores for _, cores in worker_allocations)
+
+            if total_allocated >= cores_needed:
+                workers_str = ", ".join(f"{w}({c})" for w, c in worker_allocations)
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerInfo(
-                        message=f"Selected worker {worker_id} for {workflow_id}",
+                        message=f"Selected workers for {workflow_id}: {workers_str} (total={total_allocated} cores)",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
                     )
                 )
                 break
-            
-            # Log that we're waiting for resources
-            if waited == 0:  # Only log on first attempt
+
+            # Log that we're waiting for resources (once)
+            if not logged_waiting:
+                logged_waiting = True
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerInfo(
-                        message=f"Waiting for {cores_needed} cores for {workflow_id} (none available)",
+                        message=f"Waiting for {cores_needed} cores for {workflow_id} (only {total_allocated} available)",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
                     ),
                 )
-            
-            # Wait with exponential backoff
-            await asyncio.sleep(backoff)
-            waited += backoff
-            backoff = min(backoff * 1.5, max_backoff)
-        
-        if not worker_id:
+
+            # Clear the event before waiting (so we catch new signals)
+            self._cores_available_event.clear()
+
+            # Wait for cores to become available (event-driven) or timeout
+            try:
+                remaining_time = max_wait - waited
+                actual_timeout = min(wait_timeout, remaining_time)
+                await asyncio.wait_for(
+                    self._cores_available_event.wait(),
+                    timeout=actual_timeout,
+                )
+            except asyncio.TimeoutError:
+                pass  # Timeout is expected - just re-check availability
+
+        waited = time.monotonic() - start_time
+
+        total_allocated = sum(cores for _, cores in worker_allocations)
+        if total_allocated == 0:
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(
-                    message=f"Timeout waiting for {cores_needed} cores for {workflow_id} after {waited:.1f}s",
+                    message=f"Timeout waiting for cores for {workflow_id} after {waited:.1f}s (0 available)",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 ),
             )
             return False
-        
+
         if waited > 0:
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
-                    message=f"Found worker for {workflow_id} after {waited:.1f}s wait",
+                    message=f"Found {total_allocated} cores for {workflow_id} after {waited:.1f}s wait",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 ),
             )
-        
-        # Create provision request for quorum
-        provision = ProvisionRequest(
-            job_id=submission.job_id,
-            workflow_id=workflow_id,
-            target_worker=worker_id,
-            cores_required=cores_needed,
-            fence_token=self._get_fence_token(),
-            version=self._state_version,
-        )
-        
-        # Request quorum (skip if only one manager)
-        if self._manager_peers:
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Requesting quorum for {workflow_id}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            try:
-                await self._request_quorum_confirmation(provision)
-                # Send commit to all managers on success
-                await self._send_provision_commit(provision)
-            except (QuorumCircuitOpenError, QuorumUnavailableError, QuorumTimeoutError) as e:
-                # Log the specific quorum failure and return False
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerError(
-                        message=f"Quorum failed for {workflow_id}: {e.message}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                return False
-        else:
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Skipping quorum for {workflow_id} (single manager mode)",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-        
-        # Extract dependency context for this workflow
+
+        # Extract dependency context once (shared across all worker dispatches)
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -4797,45 +5172,122 @@ class ManagerServer(HealthAwareServer):
             submission.job_id, workflow
         )
         context_version = self._job_layer_version.get(submission.job_id, 0)
-        
-        # Dispatch to worker
-        dispatch = WorkflowDispatch(
-            job_id=submission.job_id,
-            workflow_id=workflow_id,
-            workflow=cloudpickle.dumps(workflow),
-            context=cloudpickle.dumps({}),  # Legacy field, kept for compatibility
-            vus=vus,  # Virtual users (can be 50k+)
-            cores=cores_needed,  # CPU cores (from priority calculation)
-            timeout_seconds=submission.timeout_seconds,
-            fence_token=provision.fence_token,
-            context_version=context_version,
-            dependency_context=dependency_context,
-        )
-        
-        # Store dispatch bytes for potential retry
-        dispatch_bytes = dispatch.dump()
-        self._workflow_retries[workflow_id] = (0, dispatch_bytes, set())
-        
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=f"Dispatching {workflow_id} to worker {worker_id}",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
+
+        # Serialize workflow once (shared across all dispatches)
+        workflow_bytes = cloudpickle.dumps(workflow)
+        context_bytes = cloudpickle.dumps({})
+
+        # Initialize sub-workflow tracking for this parent workflow
+        self._sub_workflow_mapping[workflow_id] = []
+
+        # Dispatch to each worker with their portion of cores/vus
+        successful_dispatches = 0
+        for worker_idx, (worker_id, worker_cores) in enumerate(worker_allocations):
+            # Calculate VUs for this worker proportionally
+            # e.g., if worker gets 4 of 8 cores, it gets 50% of VUs
+            worker_vus = int(vus * (worker_cores / total_allocated))
+            # Ensure at least 1 VU if we're allocating cores
+            worker_vus = max(worker_vus, 1) if worker_cores > 0 else 0
+
+            # Create sub-workflow ID: job_id:workflow_idx:worker_idx
+            sub_workflow_id = f"{workflow_id}:{worker_idx}"
+
+            # Track this sub-workflow
+            self._sub_workflow_mapping[workflow_id].append(sub_workflow_id)
+
+            # Create provision request for quorum
+            provision = ProvisionRequest(
+                job_id=submission.job_id,
+                workflow_id=sub_workflow_id,
+                target_worker=worker_id,
+                cores_required=worker_cores,
+                fence_token=self._get_fence_token(),
+                version=self._state_version,
             )
-        )
-        
-        ack = await self._dispatch_workflow_to_worker(worker_id, dispatch)
-        if not ack or not ack.accepted:
-            return False
-        
-        # Extract job_id from workflow_id (format: "job_id:workflow_index")
-        job_id = workflow_id.rsplit(":", 1)[0] if ":" in workflow_id else workflow_id
-        if job_id not in self._workflow_assignments:
-            self._workflow_assignments[job_id] = {}
-        self._workflow_assignments[job_id][workflow_id] = worker_id
-        return True
+
+            # Request quorum (skip if only one manager)
+            if self._manager_peers:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Requesting quorum for {sub_workflow_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                try:
+                    await self._request_quorum_confirmation(provision)
+                    await self._send_provision_commit(provision)
+                except (QuorumCircuitOpenError, QuorumUnavailableError, QuorumTimeoutError) as e:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerError(
+                            message=f"Quorum failed for {sub_workflow_id}: {e.message}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    continue  # Try next worker
+            else:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Skipping quorum for {sub_workflow_id} (single manager mode)",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            # Dispatch to this worker
+            dispatch = WorkflowDispatch(
+                job_id=submission.job_id,
+                workflow_id=sub_workflow_id,
+                workflow=workflow_bytes,
+                context=context_bytes,
+                vus=worker_vus,
+                cores=worker_cores,
+                timeout_seconds=submission.timeout_seconds,
+                fence_token=provision.fence_token,
+                context_version=context_version,
+                dependency_context=dependency_context,
+            )
+
+            # Store dispatch bytes for potential retry
+            dispatch_bytes = dispatch.dump()
+            self._workflow_retries[sub_workflow_id] = (0, dispatch_bytes, set())
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Dispatching {sub_workflow_id} to worker {worker_id} (cores={worker_cores}, vus={worker_vus})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            ack = await self._dispatch_workflow_to_worker(worker_id, dispatch)
+            if ack and ack.accepted:
+                successful_dispatches += 1
+                # Track assignment for this sub-workflow
+                if submission.job_id not in self._workflow_assignments:
+                    self._workflow_assignments[submission.job_id] = {}
+                self._workflow_assignments[submission.job_id][sub_workflow_id] = worker_id
+            else:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Dispatch rejected for {sub_workflow_id} by worker {worker_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        return successful_dispatches > 0
     
     # =========================================================================
     # TCP Handlers - Quorum
