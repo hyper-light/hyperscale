@@ -89,6 +89,7 @@ from hyperscale.distributed_rewrite.models import (
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
+from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError, ServerWarning, ServerDebug
 
 # Import WorkflowRunner for actual workflow execution
@@ -323,12 +324,17 @@ class WorkerServer(HealthAwareServer):
     
     async def start(self, timeout: float | None = None) -> None:
 
+        logging_config = LoggingConfig()
+        logging_config.update(
+            log_directory=self._env.MERCURY_SYNC_LOGS_DIRECTORY,
+            log_level=self._env.MERCURY_SYNC_LOG_LEVEL,
+        )
         # Start the worker server (TCP/UDP listeners, task runner, etc.)
         # Start the underlying server (TCP/UDP listeners, task runner, etc.)
         # Uses SWIM settings from Env configuration
         await self.start_server(init_context=self.env.get_swim_init_context())
         
-        
+
         """Start the worker server and register with managers."""
         if timeout is None:
             timeout = self._worker_connect_timeout
