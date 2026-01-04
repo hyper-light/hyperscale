@@ -4228,15 +4228,23 @@ class ManagerServer(HealthAwareServer):
     def _cleanup_job(self, job_id: str) -> None:
         """
         Clean up all state associated with a job.
-        
+
         Removes:
         - The job itself from _jobs
+        - Job leadership tracking from _job_leaders
+        - Job layer version from _job_layer_version
+        - Job context from _job_contexts
+        - Job callback from _job_callbacks
         - All workflow assignments for this job
         - All workflow retries for this job
         - All workflow completion events for this job
         """
-        # Remove job
+        # Remove job and all related tracking dictionaries
         self._jobs.pop(job_id, None)
+        self._job_leaders.pop(job_id, None)
+        self._job_layer_version.pop(job_id, None)
+        self._job_contexts.pop(job_id, None)
+        self._job_callbacks.pop(job_id, None)
         
         # Find and remove workflow assignments for this job
         workflow_ids_to_remove = [
