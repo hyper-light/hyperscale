@@ -141,9 +141,6 @@ class TaskRunner:
 
             self.tasks[command_name] = task
 
-        if isinstance(timeout, str):
-            timeout = TimeParser(timeout).time
-
         if task and task.repeat == "NEVER":
             return task.run(
                 *args,
