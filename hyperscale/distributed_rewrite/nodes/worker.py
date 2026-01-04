@@ -1034,16 +1034,19 @@ class WorkerServer(HealthAwareServer):
     ) -> bytes:
         """
         Receive a workflow dispatch from a manager.
-        
+
         This is the main entry point for work arriving at the worker.
         """
+        dispatch: WorkflowDispatch | None = None
+        allocated_cores: list[int] = []
+
         try:
             dispatch = WorkflowDispatch.load(data)
 
             # VUs are the virtual users, cores are the CPU cores to allocate
             vus_for_workflow = dispatch.vus
             cores_to_allocate = dispatch.cores
-            
+
             # Check if we can accept this workflow
             if self._available_cores < cores_to_allocate:
                 ack = WorkflowDispatchAck(
@@ -1052,7 +1055,7 @@ class WorkerServer(HealthAwareServer):
                     error=f"Insufficient cores: need {cores_to_allocate}, have {self._available_cores}",
                 )
                 return ack.dump()
-            
+
             # Check backpressure
             if self._get_worker_state() == WorkerState.DRAINING:
                 ack = WorkflowDispatchAck(
@@ -1061,7 +1064,7 @@ class WorkerServer(HealthAwareServer):
                     error="Worker is draining, not accepting new work",
                 )
                 return ack.dump()
-            
+
             # Allocate cores to this workflow (cores, not VUs!)
             allocated_cores = self._allocate_cores(dispatch.workflow_id, cores_to_allocate)
             if not allocated_cores:
@@ -1071,9 +1074,9 @@ class WorkerServer(HealthAwareServer):
                     error=f"Failed to allocate {cores_to_allocate} cores",
                 )
                 return ack.dump()
-            
+
             self._increment_version()
-            
+
             # Create progress tracker with assigned cores
             progress = WorkflowProgress(
                 job_id=dispatch.job_id,
@@ -1088,11 +1091,11 @@ class WorkerServer(HealthAwareServer):
                 assigned_cores=allocated_cores,
             )
             self._active_workflows[dispatch.workflow_id] = progress
-            
+
             # Create cancellation event
             cancel_event = asyncio.Event()
             self._workflow_cancel_events[dispatch.workflow_id] = cancel_event
-            
+
             # Start execution task via TaskRunner
             # vus_for_workflow = VUs (virtual users, can be 50k+)
             # len(allocated_cores) = CPU cores (from priority, e.g., 4)
@@ -1107,7 +1110,10 @@ class WorkerServer(HealthAwareServer):
             )
             # Store the token string (not the Run object) for later cancellation
             self._workflow_tokens[dispatch.workflow_id] = run.token
-            
+
+            # Task started successfully - cores are now managed by _execute_workflow's finally block
+            allocated_cores = []  # Clear so exception handler won't free them
+
             # Return acknowledgment
             ack = WorkflowDispatchAck(
                 workflow_id=dispatch.workflow_id,
@@ -1115,10 +1121,17 @@ class WorkerServer(HealthAwareServer):
                 cores_assigned=cores_to_allocate,
             )
             return ack.dump()
-            
+
         except Exception as e:
+            # Free any allocated cores if task didn't start successfully
+            if dispatch and allocated_cores:
+                self._free_cores(dispatch.workflow_id)
+                self._workflow_cancel_events.pop(dispatch.workflow_id, None)
+                self._active_workflows.pop(dispatch.workflow_id, None)
+
+            workflow_id = dispatch.workflow_id if dispatch else "unknown"
             ack = WorkflowDispatchAck(
-                workflow_id="unknown",
+                workflow_id=workflow_id,
                 accepted=False,
                 error=str(e),
             )
