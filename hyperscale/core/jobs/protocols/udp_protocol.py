@@ -1179,11 +1179,26 @@ class UDPProtocol(Generic[T, K]):
         self._shutdown_task = asyncio.ensure_future(self._shutdown())
 
     async def _shutdown(self):
-        for response in self._pending_responses:
-            await response
-
+        # Stop accepting new work first
         self._running = False
 
+        # Cancel pending response tasks
+        pending_tasks = list(self._pending_responses)
+        for task in pending_tasks:
+            if not task.done():
+                task.cancel()
+
+        # Wait for cancelled tasks to complete (with timeout to avoid hanging)
+        if pending_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending_tasks, return_exceptions=True),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        # Signal run_forever() to exit
         if self._run_future:
             try:
                 self._run_future.set_result(None)
@@ -1204,9 +1219,9 @@ class UDPProtocol(Generic[T, K]):
             except Exception:
                 pass
 
-        if self._shutdown_task:
+        if self._shutdown_task and not self._shutdown_task.done():
             try:
-                self._shutdown_task.set_result(None)
+                self._shutdown_task.cancel()
 
             except Exception:
                 pass
