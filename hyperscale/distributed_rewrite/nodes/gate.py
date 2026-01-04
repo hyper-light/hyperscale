@@ -534,21 +534,23 @@ class GateServer(HealthAwareServer):
     async def _sync_state_from_gate_peers(self) -> None:
         """
         Sync state from active gate peers when becoming leader.
-        
+
         Uses exponential backoff for retries to handle transient failures.
+        Handles the case where peers are not ready (still in SYNCING state)
+        by retrying until the peer becomes ACTIVE or retries are exhausted.
         """
         if not self._active_gate_peers:
             return
-        
+
         request = StateSyncRequest(
             requester_id=self._node_id.full,
             requester_role=NodeRole.GATE.value,
             since_version=0,  # Get all state
         )
-        
+
         synced_count = 0
         max_retries = 3
-        
+
         for peer_addr in self._active_gate_peers:
             for attempt in range(max_retries):
                 try:
@@ -558,22 +560,39 @@ class GateServer(HealthAwareServer):
                         request.dump(),
                         timeout=5.0 * (attempt + 1),  # Exponential backoff
                     )
-                    
+
                     if isinstance(response, bytes) and response:
                         sync_response = StateSyncResponse.load(response)
+
+                        # Check if peer is ready to serve state
+                        if not sync_response.responder_ready:
+                            # Peer is alive but not ready yet - retry
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(0.5 * (2 ** attempt))
+                                continue
+                            # Last attempt - log warning and move on
+                            await self._udp_logger.log(
+                                ServerWarning(
+                                    message=f"Gate peer {peer_addr} not ready for state sync after {max_retries} attempts",
+                                    node_host=self._host,
+                                    node_port=self._tcp_port,
+                                    node_id=self._node_id.short,
+                                )
+                            )
+                            break
+
                         if sync_response.gate_state:
                             self._apply_gate_state_snapshot(sync_response.gate_state)
                             synced_count += 1
-                    break  # Success
-                    
+                    break  # Success or no state available
+
                 except Exception as e:
                     if attempt == max_retries - 1:
                         await self.handle_exception(e, f"state_sync_from_{peer_addr}")
                     else:
                         await asyncio.sleep(0.5 * (2 ** attempt))  # Backoff
-        
-        self._task_runner.run(
-            self._udp_logger.log,
+
+        await self._udp_logger.log(
             ServerInfo(
                 message=f"State sync complete: synced from {synced_count}/{len(self._active_gate_peers)} peers",
                 node_host=self._host,
@@ -2762,21 +2781,26 @@ class GateServer(HealthAwareServer):
     ):
         """
         Handle state sync request from another gate (usually new leader).
-        
+
         Returns this gate's complete state snapshot for merging.
+        Only returns full state if this gate is ACTIVE. If still SYNCING,
+        returns responder_ready=False to indicate the requester should retry.
         """
         try:
             request = StateSyncRequest.load(data)
-            
-            # Build and return state snapshot
-            snapshot = self._get_state_snapshot()
+
+            # Only serve state if we're ACTIVE (completed our own startup)
+            is_ready = self._gate_state == GateState.ACTIVE
+
             response = StateSyncResponse(
                 responder_id=self._node_id.full,
                 current_version=self._state_version,
-                gate_state=snapshot,
+                responder_ready=is_ready,
+                # Only include state if we're ready
+                gate_state=self._get_state_snapshot() if is_ready else None,
             )
             return response.dump()
-            
+
         except Exception as e:
             await self.handle_exception(e, "receive_gate_state_sync_request")
             return b''

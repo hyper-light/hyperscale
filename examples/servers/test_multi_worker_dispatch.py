@@ -169,13 +169,15 @@ async def run_test():
         print()
 
         # ==============================================================
-        # STEP 2: Start manager
+        # STEP 2: Start managers (concurrently for proper cluster formation)
         # ==============================================================
-        print("[2/8] Starting manager...")
+        print("[2/8] Starting managers...")
         print("-" * 60)
 
-        for manager in managers:
-            await manager.start()
+        # Start all managers concurrently - critical for proper SWIM cluster
+        # formation and leader election timing
+        start_tasks = [manager.start() for manager in managers]
+        await asyncio.gather(*start_tasks)
 
         for i, manager in enumerate(managers):
             config = MANAGER_CONFIGS[i]
