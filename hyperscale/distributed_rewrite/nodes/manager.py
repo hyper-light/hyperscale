@@ -4246,14 +4246,24 @@ class ManagerServer(HealthAwareServer):
         self._job_contexts.pop(job_id, None)
         self._job_callbacks.pop(job_id, None)
         
-        # Find and remove workflow assignments for this job
+        # Remove workflow assignments for this job
+        # _workflow_assignments is keyed by job_id, not workflow_id
+        self._workflow_assignments.pop(job_id, None)
+
+        # Find and remove workflow retries and completion events for this job
+        # These are keyed by workflow_id (format: "{job_id}:{idx}")
         workflow_ids_to_remove = [
-            wf_id for wf_id in self._workflow_assignments
+            wf_id for wf_id in self._workflow_retries
             if wf_id.startswith(f"{job_id}:")
         ]
         for wf_id in workflow_ids_to_remove:
-            self._workflow_assignments.pop(wf_id, None)
             self._workflow_retries.pop(wf_id, None)
+
+        workflow_ids_to_remove = [
+            wf_id for wf_id in self._workflow_completion_events
+            if wf_id.startswith(f"{job_id}:")
+        ]
+        for wf_id in workflow_ids_to_remove:
             self._workflow_completion_events.pop(wf_id, None)
     
     # =========================================================================
