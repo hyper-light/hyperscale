@@ -261,8 +261,9 @@ class FederatedHealthMonitor:
     
     def get_healthy_datacenters(self) -> list[str]:
         """Get list of DCs that can accept jobs."""
+        # Snapshot to avoid dict mutation during iteration
         return [
-            dc for dc, state in self._dc_health.items()
+            dc for dc, state in list(self._dc_health.items())
             if state.is_healthy_for_jobs
         ]
     

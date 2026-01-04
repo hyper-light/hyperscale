@@ -351,7 +351,8 @@ class SuspicionManager:
     async def clear_all(self) -> None:
         """Clear all suspicions (e.g., on shutdown)."""
         async with self._lock:
-            for state in self.suspicions.values():
+            # Snapshot to avoid dict mutation during iteration
+            for state in list(self.suspicions.values()):
                 self._cancel_timer(state)
                 state.cleanup()  # Clean up confirmers set
             self.suspicions.clear()
@@ -379,13 +380,14 @@ class SuspicionManager:
         """
         now = time.monotonic()
         cutoff = now - self.orphaned_timeout
-        
+
         to_remove = []
-        for node, state in self.suspicions.items():
+        # Snapshot to avoid dict mutation during iteration
+        for node, state in list(self.suspicions.items()):
             # Check if timer is missing or dead
             has_timer_token = node in self._timer_tokens
             has_raw_timer = state._timer_task is not None and not state._timer_task.done()
-            
+
             if not has_timer_token and not has_raw_timer:
                 # No active timer - check age
                 if state.start_time < cutoff:
@@ -435,14 +437,15 @@ class SuspicionManager:
         """
         async with self._lock:
             stale_tokens = []
-            for node in self._timer_tokens:
+            # Snapshot to avoid dict mutation during iteration
+            for node in list(self._timer_tokens.keys()):
                 if node not in self.suspicions:
                     stale_tokens.append(node)
-            
+
             for node in stale_tokens:
                 self._timer_tokens.pop(node, None)
                 self._stale_tokens_cleaned += 1
-            
+
             return len(stale_tokens)
     
     async def cleanup(self) -> dict[str, int]:

@@ -258,9 +258,10 @@ class IncarnationTracker:
         """
         now = time.monotonic()
         cutoff = now - self.dead_node_retention_seconds
-        
+
         to_remove = []
-        for node, state in self.node_states.items():
+        # Snapshot to avoid dict mutation during iteration
+        for node, state in list(self.node_states.items()):
             if state.status == b'DEAD' and state.last_update_time < cutoff:
                 to_remove.append(node)
         
@@ -297,9 +298,10 @@ class IncarnationTracker:
         
         # Sort by (status_priority, last_update_time)
         status_priority = {b'DEAD': 0, b'SUSPECT': 1, b'OK': 2, b'JOIN': 2}
-        
+
+        # Snapshot to avoid dict mutation during iteration
         sorted_nodes = sorted(
-            self.node_states.items(),
+            list(self.node_states.items()),
             key=lambda x: (
                 status_priority.get(x[1].status, 2),
                 x[1].last_update_time,
@@ -341,7 +343,8 @@ class IncarnationTracker:
     def get_stats(self) -> dict[str, int]:
         """Get tracker statistics for monitoring."""
         status_counts = {b'OK': 0, b'SUSPECT': 0, b'DEAD': 0, b'JOIN': 0}
-        for state in self.node_states.values():
+        # Snapshot to avoid dict mutation during iteration
+        for state in list(self.node_states.values()):
             status_counts[state.status] = status_counts.get(state.status, 0) + 1
         
         return {

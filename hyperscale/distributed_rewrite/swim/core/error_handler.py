@@ -327,7 +327,8 @@ class ErrorHandler:
                 'error_rate': stats.error_rate,
                 'circuit_state': stats.circuit_state.name,
             }
-            for cat, stats in self._stats.items()
+            # Snapshot to avoid dict mutation during iteration
+            for cat, stats in list(self._stats.items())
         }
     
     def reset_category(self, category: ErrorCategory) -> None:
@@ -336,7 +337,8 @@ class ErrorHandler:
     
     def reset_all(self) -> None:
         """Reset all error stats."""
-        for stats in self._stats.values():
+        # Snapshot to avoid dict mutation during iteration
+        for stats in list(self._stats.values()):
             stats.reset()
     
     def _get_stats(self, category: ErrorCategory) -> ErrorStats:

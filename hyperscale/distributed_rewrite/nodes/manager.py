@@ -468,7 +468,8 @@ class ManagerServer(HealthAwareServer):
         )
         
         sync_tasks = []
-        for node_id, worker_reg in self._workers.items():
+        # Snapshot to avoid dict mutation during iteration
+        for node_id, worker_reg in list(self._workers.items()):
             worker_addr = (worker_reg.node.host, worker_reg.node.port)
             sync_tasks.append(
                 self._request_worker_state(worker_addr, request)
@@ -1551,8 +1552,9 @@ class ManagerServer(HealthAwareServer):
         healthy = []
         now = time.monotonic()
         grace_period = 30.0  # Consider workers healthy for 30s after registration
-        
-        for node_id, registration in self._workers.items():
+
+        # Snapshot to avoid dict mutation during iteration
+        for node_id, registration in list(self._workers.items()):
             worker_addr = (registration.node.host, registration.node.port)
             node_state = self._incarnation_tracker.get_node_state(worker_addr)
             
@@ -1572,9 +1574,10 @@ class ManagerServer(HealthAwareServer):
     
     def _get_total_cores(self) -> int:
         """Get total cores across all registered workers."""
+        # Snapshot to avoid dict mutation during iteration
         return sum(
             registration.total_cores
-            for registration in self._workers.values()
+            for registration in list(self._workers.values())
         )
     
     def _get_available_cores_for_healthy_workers(self) -> int:
@@ -2018,7 +2021,8 @@ class ManagerServer(HealthAwareServer):
     def _get_state_snapshot(self) -> ManagerStateSnapshot:
         """Get a complete state snapshot."""
         worker_snapshots = []
-        for node_id, reg in self._workers.items():
+        # Snapshot to avoid dict mutation during iteration
+        for node_id, reg in list(self._workers.items()):
             status = self._worker_status.get(node_id)
             if status:
                 worker_snapshots.append(WorkerStateSnapshot(
@@ -2032,7 +2036,8 @@ class ManagerServer(HealthAwareServer):
         
         # Serialize job contexts for state sync
         contexts_data = {}
-        for job_id, context in self._job_contexts.items():
+        # Snapshot to avoid dict mutation during iteration
+        for job_id, context in list(self._job_contexts.items()):
             contexts_data[job_id] = context.dict()
         
         return ManagerStateSnapshot(
@@ -2142,7 +2147,8 @@ class ManagerServer(HealthAwareServer):
         Skips workers with open circuit breakers.
         """
         eligible = []
-        for node_id, status in self._worker_status.items():
+        # Snapshot to avoid dict mutation during iteration
+        for node_id, status in list(self._worker_status.items()):
             # Check circuit breaker - skip workers with open circuits
             if self._is_worker_circuit_open(node_id):
                 continue

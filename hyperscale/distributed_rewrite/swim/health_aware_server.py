@@ -791,8 +791,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self_addr = self._get_self_udp_addr()
         base_timeout = self._context.read('current_timeout')
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
-        
-        for node in nodes:
+
+        # Snapshot nodes to avoid dict mutation during iteration
+        for node in list(nodes.keys()):
             if node != self_addr:
                 # Use task runner but schedule error-aware send
                 self._task_runner.run(
@@ -1300,8 +1301,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                import traceback
-                print(traceback.format_exc())
                 await self.handle_exception(e, "probe_cycle")
             await asyncio.sleep(protocol_period)
     
@@ -1322,43 +1321,36 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         
         # Use ErrorContext for consistent error handling throughout the probe
         async with ErrorContext(self._error_handler, f"probe_round_{target[0]}_{target[1]}") as ctx:
-            try:
-
-                node_state = self._incarnation_tracker.get_node_state(target)
-                incarnation = node_state.incarnation if node_state else 0
-                
-                base_timeout = self._context.read('current_timeout')
-                timeout = self.get_lhm_adjusted_timeout(base_timeout)
-                
-                target_addr = f'{target[0]}:{target[1]}'.encode()
-                probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
-                
-                response_received = await self._probe_with_timeout(target, probe_msg, timeout)
-                
-                if response_received:
+            node_state = self._incarnation_tracker.get_node_state(target)
+            incarnation = node_state.incarnation if node_state else 0
+            
+            base_timeout = self._context.read('current_timeout')
+            timeout = self.get_lhm_adjusted_timeout(base_timeout)
+            
+            target_addr = f'{target[0]}:{target[1]}'.encode()
+            probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
+            
+            response_received = await self._probe_with_timeout(target, probe_msg, timeout)
+            
+            if response_received:
+                await self.decrease_failure_detector('successful_probe')
+                ctx.record_success(ErrorCategory.NETWORK)  # Help circuit breaker recover
+                return
+            
+            await self.increase_failure_detector('probe_timeout')
+            indirect_sent = await self.initiate_indirect_probe(target, incarnation)
+            
+            if indirect_sent:
+                await asyncio.sleep(timeout)
+                probe = self._indirect_probe_manager.get_pending_probe(target)
+                if probe and probe.is_completed():
                     await self.decrease_failure_detector('successful_probe')
-                    ctx.record_success(ErrorCategory.NETWORK)  # Help circuit breaker recover
+                    ctx.record_success(ErrorCategory.NETWORK)
                     return
-                
-                await self.increase_failure_detector('probe_timeout')
-                indirect_sent = await self.initiate_indirect_probe(target, incarnation)
-                
-                if indirect_sent:
-                    await asyncio.sleep(timeout)
-                    probe = self._indirect_probe_manager.get_pending_probe(target)
-                    if probe and probe.is_completed():
-                        await self.decrease_failure_detector('successful_probe')
-                        ctx.record_success(ErrorCategory.NETWORK)
-                        return
-                
-                self_addr = self._get_self_udp_addr()
-                await self.start_suspicion(target, incarnation, self_addr)
-                await self.broadcast_suspicion(target, incarnation)
-
-            except Exception as err:
-                import traceback
-                print(traceback.format_exc())
-                raise err
+            
+            self_addr = self._get_self_udp_addr()
+            await self.start_suspicion(target, incarnation, self_addr)
+            await self.broadcast_suspicion(target, incarnation)
     
     async def _probe_with_timeout(
         self, 
@@ -2043,8 +2035,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
         
+        # Snapshot nodes.items() to avoid dict mutation during iteration
         candidates = [
-            node for node, queue in nodes.items()
+            node for node, queue in list(nodes.items())
             if node != target and node != self_addr
         ]
         
@@ -2174,14 +2167,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         successful = 0
         failed = 0
         
-        for node in nodes:
+        # Snapshot nodes to avoid dict mutation during iteration
+        for node in list(nodes.keys()):
             if node != self_addr:
                 success = await self._send_with_retry(node, msg, timeout)
                 if success:
                     successful += 1
                 else:
                     failed += 1
-        
+
         # Log if we had failures but don't fail the operation
         if failed > 0 and self._error_handler:
             await self.handle_error(
@@ -2260,15 +2254,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         
         successful = 0
         failed = 0
-        
-        for node in nodes:
+
+        # Snapshot nodes to avoid dict mutation during iteration
+        for node in list(nodes.keys()):
             if node != self_addr and node != target:
                 success = await self._send_broadcast_message(node, msg, timeout)
                 if success:
                     successful += 1
                 else:
                     failed += 1
-        
+
         if failed > 0 and self._error_handler:
             await self.handle_error(
                 NetworkError(

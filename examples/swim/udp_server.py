@@ -321,8 +321,6 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     )
                 )
             except Exception as e:
-                import traceback
-                print(traceback.format_exc())
                 # Don't let logging failure prevent degradation handling
                 # But still track the unexpected error
                 self._task_runner.run(
@@ -1008,43 +1006,36 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Use ErrorContext for consistent error handling throughout the probe
         async with ErrorContext(self._error_handler, f"probe_round_{target[0]}_{target[1]}") as ctx:
-            try:
-
-                node_state = self._incarnation_tracker.get_node_state(target)
-                incarnation = node_state.incarnation if node_state else 0
-                
-                base_timeout = self._context.read('current_timeout')
-                timeout = self.get_lhm_adjusted_timeout(base_timeout)
-                
-                target_addr = f'{target[0]}:{target[1]}'.encode()
-                probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
-                
-                response_received = await self._probe_with_timeout(target, probe_msg, timeout)
-                
-                if response_received:
+            node_state = self._incarnation_tracker.get_node_state(target)
+            incarnation = node_state.incarnation if node_state else 0
+            
+            base_timeout = self._context.read('current_timeout')
+            timeout = self.get_lhm_adjusted_timeout(base_timeout)
+            
+            target_addr = f'{target[0]}:{target[1]}'.encode()
+            probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
+            
+            response_received = await self._probe_with_timeout(target, probe_msg, timeout)
+            
+            if response_received:
+                await self.decrease_failure_detector('successful_probe')
+                ctx.record_success(ErrorCategory.NETWORK)  # Help circuit breaker recover
+                return
+            
+            await self.increase_failure_detector('probe_timeout')
+            indirect_sent = await self.initiate_indirect_probe(target, incarnation)
+            
+            if indirect_sent:
+                await asyncio.sleep(timeout)
+                probe = self._indirect_probe_manager.get_pending_probe(target)
+                if probe and probe.is_completed():
                     await self.decrease_failure_detector('successful_probe')
-                    ctx.record_success(ErrorCategory.NETWORK)  # Help circuit breaker recover
+                    ctx.record_success(ErrorCategory.NETWORK)
                     return
-                
-                await self.increase_failure_detector('probe_timeout')
-                indirect_sent = await self.initiate_indirect_probe(target, incarnation)
-                
-                if indirect_sent:
-                    await asyncio.sleep(timeout)
-                    probe = self._indirect_probe_manager.get_pending_probe(target)
-                    if probe and probe.is_completed():
-                        await self.decrease_failure_detector('successful_probe')
-                        ctx.record_success(ErrorCategory.NETWORK)
-                        return
-                
-                self_addr = self._get_self_udp_addr()
-                await self.start_suspicion(target, incarnation, self_addr)
-                await self.broadcast_suspicion(target, incarnation)
-
-            except Exception as err:
-                import traceback
-                print(traceback.format_exc())
-                raise err
+            
+            self_addr = self._get_self_udp_addr()
+            await self.start_suspicion(target, incarnation, self_addr)
+            await self.broadcast_suspicion(target, incarnation)
     
     async def _probe_with_timeout(
         self, 
