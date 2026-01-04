@@ -227,14 +227,51 @@ class TaskRunner:
                 timeout=timeout,
             )
 
-    async def wait_all(self, tokens: list[str]):
+    async def wait_all(
+        self,
+        tokens: list[str],
+        timeout: float | None = None,
+    ):
+        """
+        Wait for multiple task runs to complete.
+
+        Args:
+            tokens: List of task run tokens.
+            timeout: Maximum time to wait for ALL tasks in seconds. None means wait forever.
+
+        Returns:
+            List of completed task run results.
+
+        Raises:
+            asyncio.TimeoutError: If timeout is exceeded before all tasks complete.
+        """
         return await asyncio.gather(
-            *[self.wait(token) for token in tokens],
+            *[self.wait(token, timeout=timeout) for token in tokens],
         )
 
-    async def wait(self, token: str) -> ShellProcess | TaskRun:
+    async def wait(
+        self,
+        token: str,
+        timeout: float | None = None,
+    ) -> ShellProcess | TaskRun:
+        """
+        Wait for a task run to complete.
+
+        Args:
+            token: The task run token (format: "task_name:run_id")
+            timeout: Maximum time to wait in seconds. None means wait forever.
+
+        Returns:
+            The completed task run result.
+
+        Raises:
+            asyncio.TimeoutError: If timeout is exceeded before task completes.
+            KeyError: If task or run doesn't exist.
+        """
         task_name, run_id_str = token.split(":", maxsplit=1)
         run_id = int(run_id_str)
+
+        start_time = asyncio.get_event_loop().time()
 
         update = await self.tasks[task_name].get_run_update(run_id)
         while update.status not in [
@@ -242,6 +279,13 @@ class TaskRunner:
             RunStatus.FAILED,
             RunStatus.CANCELLED,
         ]:
+            if timeout is not None:
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed >= timeout:
+                    raise asyncio.TimeoutError(
+                        f"Timeout waiting for task {token} after {timeout}s"
+                    )
+
             await asyncio.sleep(self._cleanup_interval)
             update = await self.tasks[task_name].get_run_update(run_id)
 
