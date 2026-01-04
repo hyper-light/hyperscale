@@ -1242,7 +1242,7 @@ class WorkerServer(HealthAwareServer):
             progress.status = WorkflowStatus.CANCELLED.value
         except Exception as e:
             progress.status = WorkflowStatus.FAILED.value
-            error = str(error) if error else "Unknown error"
+            error = str(e) if e else "Unknown error"
         finally:
             self._free_cores(dispatch.workflow_id)
             self._increment_version()
