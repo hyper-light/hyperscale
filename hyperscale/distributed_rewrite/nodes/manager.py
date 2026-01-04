@@ -1647,7 +1647,7 @@ class ManagerServer(HealthAwareServer):
                             healthy_managers += 1
         
         ack = CrossClusterAck(
-            datacenter=self._dc_id,
+            datacenter=self._node_id.datacenter,
             node_id=self._node_id.full,
             incarnation=self._external_incarnation,
             is_leader=True,

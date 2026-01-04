@@ -5764,7 +5764,7 @@ This section documents how workflow results, context, and errors flow back throu
 │  │                                                                      │    │
 │  │      job_result = JobFinalResult(                                   │    │
 │  │          job_id=job_id,                                              │    │
-│  │          datacenter=self._dc_id,                                     │    │
+│  │          datacenter=self._node_id.datacenter,                        │    │
 │  │          status=status,                                              │    │
 │  │          workflow_results=workflow_results,                          │    │
 │  │          total_completed=total_completed,                            │    │

@@ -259,6 +259,8 @@ class LocalLeaderElection:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                import traceback
+                print(traceback.format_exc())
                 await self._handle_error(
                     UnexpectedError(e, "election_loop")
                 )

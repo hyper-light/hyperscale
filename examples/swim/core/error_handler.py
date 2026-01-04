@@ -488,7 +488,7 @@ class ErrorContext:
     Async context manager for consistent error handling.
     
     Example:
-        async with ErrorContext(handler, "probe_round") as ctx:
+        async with ErrorContext(handler, "") as ctx:
             await probe_node(target)
             ctx.record_success(ErrorCategory.NETWORK)
     """
@@ -508,6 +508,7 @@ class ErrorContext:
     
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
         if exc_val is not None:
+            print(exc_val, exc_tb)
             await self.handler.handle_exception(exc_val, self.operation)
             return not self.reraise  # Suppress exception unless reraise=True
         return False

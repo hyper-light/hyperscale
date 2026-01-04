@@ -23,6 +23,12 @@ from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
 from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
 from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.distributed_rewrite.models import ManagerState
+from hyperscale.logging.config.logging_config import LoggingConfig
+
+# Initialize logging directory (required for server pool)
+_logging_config = LoggingConfig()
+_logging_config.update(log_directory=os.getcwd())
+
 
 
 # ==========================================================================
@@ -40,10 +46,10 @@ MANAGER_CONFIGS = [
 
 # Worker configuration - 4 workers
 WORKER_CONFIGS = [
-    {"name": "Worker 1", "tcp": 9200, "udp": 9201, "cores": 4},
-    {"name": "Worker 2", "tcp": 9202, "udp": 9203, "cores": 8},
-    {"name": "Worker 3", "tcp": 9204, "udp": 9205, "cores": 4},
-    {"name": "Worker 4", "tcp": 9206, "udp": 9207, "cores": 16},
+    {"name": "Worker 1", "tcp": 9200, "udp": 9250, "cores": 4},
+    {"name": "Worker 2", "tcp": 9300, "udp": 9350, "cores": 4},
+    {"name": "Worker 3", "tcp": 9400, "udp": 9450, "cores": 4},
+    {"name": "Worker 4", "tcp": 9500, "udp": 9550, "cores": 4},
 ]
 
 STABILIZATION_TIME = 15  # seconds to wait for cluster stabilization

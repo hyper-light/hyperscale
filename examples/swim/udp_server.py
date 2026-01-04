@@ -321,6 +321,8 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                     )
                 )
             except Exception as e:
+                import traceback
+                print(traceback.format_exc())
                 # Don't let logging failure prevent degradation handling
                 # But still track the unexpected error
                 self._task_runner.run(
@@ -789,7 +791,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         target_host, target_port = node
         nodes: Nodes = self._context.read('nodes')
         return [
-            (host, port) for host, port in nodes 
+            (host, port) for host, port in list(nodes.keys()) 
             if target_host != host and target_port != port
         ]
     
@@ -1006,36 +1008,43 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Use ErrorContext for consistent error handling throughout the probe
         async with ErrorContext(self._error_handler, f"probe_round_{target[0]}_{target[1]}") as ctx:
-            node_state = self._incarnation_tracker.get_node_state(target)
-            incarnation = node_state.incarnation if node_state else 0
-            
-            base_timeout = self._context.read('current_timeout')
-            timeout = self.get_lhm_adjusted_timeout(base_timeout)
-            
-            target_addr = f'{target[0]}:{target[1]}'.encode()
-            probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
-            
-            response_received = await self._probe_with_timeout(target, probe_msg, timeout)
-            
-            if response_received:
-                await self.decrease_failure_detector('successful_probe')
-                ctx.record_success(ErrorCategory.NETWORK)  # Help circuit breaker recover
-                return
-            
-            await self.increase_failure_detector('probe_timeout')
-            indirect_sent = await self.initiate_indirect_probe(target, incarnation)
-            
-            if indirect_sent:
-                await asyncio.sleep(timeout)
-                probe = self._indirect_probe_manager.get_pending_probe(target)
-                if probe and probe.is_completed():
+            try:
+
+                node_state = self._incarnation_tracker.get_node_state(target)
+                incarnation = node_state.incarnation if node_state else 0
+                
+                base_timeout = self._context.read('current_timeout')
+                timeout = self.get_lhm_adjusted_timeout(base_timeout)
+                
+                target_addr = f'{target[0]}:{target[1]}'.encode()
+                probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
+                
+                response_received = await self._probe_with_timeout(target, probe_msg, timeout)
+                
+                if response_received:
                     await self.decrease_failure_detector('successful_probe')
-                    ctx.record_success(ErrorCategory.NETWORK)
+                    ctx.record_success(ErrorCategory.NETWORK)  # Help circuit breaker recover
                     return
-            
-            self_addr = self._get_self_udp_addr()
-            await self.start_suspicion(target, incarnation, self_addr)
-            await self.broadcast_suspicion(target, incarnation)
+                
+                await self.increase_failure_detector('probe_timeout')
+                indirect_sent = await self.initiate_indirect_probe(target, incarnation)
+                
+                if indirect_sent:
+                    await asyncio.sleep(timeout)
+                    probe = self._indirect_probe_manager.get_pending_probe(target)
+                    if probe and probe.is_completed():
+                        await self.decrease_failure_detector('successful_probe')
+                        ctx.record_success(ErrorCategory.NETWORK)
+                        return
+                
+                self_addr = self._get_self_udp_addr()
+                await self.start_suspicion(target, incarnation, self_addr)
+                await self.broadcast_suspicion(target, incarnation)
+
+            except Exception as err:
+                import traceback
+                print(traceback.format_exc())
+                raise err
     
     async def _probe_with_timeout(
         self, 
@@ -1104,7 +1113,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         """Update the probe scheduler with current membership."""
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
-        members = [node for node in nodes.keys() if node != self_addr]
+        members = [node for node in list(nodes.keys()) if node != self_addr]
         self._probe_scheduler.update_members(members)
     
     async def start_leader_election(self) -> None:
@@ -1157,7 +1166,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
                 timeout = self.get_lhm_adjusted_timeout(1.0)
                 
                 send_failures = 0
-                for node in nodes.keys():
+                for node in list(nodes.keys()):
                     if node != self_addr:
                         try:
                             await self.send(node, leave_msg, timeout=timeout)
@@ -2018,7 +2027,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
         
         # Get current node state before probe
         state_before = self._incarnation_tracker.get_node_state(target)
-        last_seen_before = state_before.last_seen if state_before else 0
+        last_seen_before = state_before.last_update_time if state_before else 0
         
         try:
             # Send probe with error handling
@@ -2031,7 +2040,7 @@ class UDPServer(MercurySyncBaseServer[Ctx]):
             state_after = self._incarnation_tracker.get_node_state(target)
             if state_after:
                 # Node was updated more recently than before our probe
-                if state_after.last_seen > last_seen_before:
+                if state_after.last_update_time > last_seen_before:
                     return state_after.status == b'OK'
                 # Node status is OK
                 if state_after.status == b'OK':

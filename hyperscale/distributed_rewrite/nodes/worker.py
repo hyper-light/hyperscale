@@ -322,6 +322,13 @@ class WorkerServer(HealthAwareServer):
         )
     
     async def start(self, timeout: float | None = None) -> None:
+
+        # Start the worker server (TCP/UDP listeners, task runner, etc.)
+        # Start the underlying server (TCP/UDP listeners, task runner, etc.)
+        # Uses SWIM settings from Env configuration
+        await self.start_server(init_context=self.env.get_swim_init_context())
+        
+        
         """Start the worker server and register with managers."""
         if timeout is None:
             timeout = self._worker_connect_timeout
@@ -365,8 +372,8 @@ class WorkerServer(HealthAwareServer):
                 timeout=timeout + 10.0,  # Extra buffer for poll_for_start
             )
         except asyncio.TimeoutError:
-            self._task_runner.run(
-                self._udp_logger.log,
+
+            await self._udp_logger.log(
                 ServerError(
                     message=f"Timeout waiting for {len(worker_ips)} worker processes to start. "
                             f"This may indicate process spawn failures.",
@@ -375,15 +382,11 @@ class WorkerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
+
             raise RuntimeError(
                 f"Worker process pool failed to start within {timeout + 10.0}s. "
                 f"Check logs for process spawn errors."
             )
-        
-        # Start the worker server (TCP/UDP listeners, task runner, etc.)
-        # Start the underlying server (TCP/UDP listeners, task runner, etc.)
-        # Uses SWIM settings from Env configuration
-        await self.start_server(init_context=self.env.get_swim_init_context())
         
         # Try seed managers in order until one succeeds
         # Registration response includes list of all healthy managers
@@ -395,8 +398,7 @@ class WorkerServer(HealthAwareServer):
                 break
         
         if not registered:
-            self._task_runner.run(
-                self._udp_logger.log,
+            await self._udp_logger.log(
                 ServerError(
                     message=f"Failed to register with any seed manager: {self._seed_managers}",
                     node_host=self._host,
@@ -414,8 +416,7 @@ class WorkerServer(HealthAwareServer):
         self._task_runner.run(self.start_probe_cycle)
         
         manager_count = len(self._known_managers)
-        self._task_runner.run(
-            self._udp_logger.log,
+        await self._udp_logger.log(
             ServerInfo(
                 message=f"Worker started with {self._total_cores} cores, registered with {manager_count} managers",
                 node_host=self._host,
