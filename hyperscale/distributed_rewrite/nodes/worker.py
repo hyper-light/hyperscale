@@ -235,6 +235,7 @@ class WorkerServer(HealthAwareServer):
         self._env = env
         self._cpu_monitor = CPUMonitor(env)
         self._memory_monitor = MemoryMonitor(env)
+        self._logging_config: LoggingConfig | None = None
     
 
     def _bin_and_check_socket_range(self):
@@ -324,11 +325,12 @@ class WorkerServer(HealthAwareServer):
     
     async def start(self, timeout: float | None = None) -> None:
 
-        logging_config = LoggingConfig()
-        logging_config.update(
-            log_directory=self._env.MERCURY_SYNC_LOGS_DIRECTORY,
-            log_level=self._env.MERCURY_SYNC_LOG_LEVEL,
-        )
+        if self._logging_config is None:
+            self._logging_config = LoggingConfig()
+            self._logging_config.update(
+                log_directory=self._env.MERCURY_SYNC_LOGS_DIRECTORY,
+                log_level=self._env.MERCURY_SYNC_LOG_LEVEL,
+            )
         # Start the worker server (TCP/UDP listeners, task runner, etc.)
         # Start the underlying server (TCP/UDP listeners, task runner, etc.)
         # Uses SWIM settings from Env configuration
@@ -414,7 +416,7 @@ class WorkerServer(HealthAwareServer):
             )
         
         # Join SWIM cluster with all known managers for healthchecks
-        for manager in self._known_managers.values():
+        for manager in list(self._known_managers.values()):
             udp_addr = (manager.udp_host, manager.udp_port)
             await self.join_cluster(udp_addr)
         
@@ -438,7 +440,7 @@ class WorkerServer(HealthAwareServer):
         Marks the manager as unhealthy in our tracking.
         """
         # Find which manager this address belongs to
-        for manager_id, manager in self._known_managers.items():
+        for manager_id, manager in list(self._known_managers.items()):
             if (manager.udp_host, manager.udp_port) == node_addr:
                 self._healthy_manager_ids.discard(manager_id)
                 self._task_runner.run(
@@ -450,7 +452,7 @@ class WorkerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
-                
+
                 # If this was our primary manager, select a new one
                 if manager_id == self._primary_manager_id:
                     self._task_runner.run(self._select_new_primary_manager)
@@ -463,7 +465,7 @@ class WorkerServer(HealthAwareServer):
         Marks the manager as healthy in our tracking.
         """
         # Find which manager this address belongs to
-        for manager_id, manager in self._known_managers.items():
+        for manager_id, manager in list(self._known_managers.items()):
             if (manager.udp_host, manager.udp_port) == node_addr:
                 self._healthy_manager_ids.add(manager_id)
                 break
@@ -600,7 +602,7 @@ class WorkerServer(HealthAwareServer):
         if not self._healthy_manager_ids:
             return
         
-        for workflow_id, progress in self._active_workflows.items():
+        for workflow_id, progress in list(self._active_workflows.items()):
             try:
                 await self._send_progress_to_all_managers(progress)
             except Exception:
@@ -658,10 +660,11 @@ class WorkerServer(HealthAwareServer):
 
         await self._server_pool.shutdown()
 
-        await self.graceful_shutdown(
+        await super().stop(
             drain_timeout=drain_timeout,
             broadcast_leave=broadcast_leave,
         )
+
 
     def abort(self):
 
@@ -679,18 +682,12 @@ class WorkerServer(HealthAwareServer):
 
         try:
             self._remote_manger.abort()
-        except Exception as e:
+        except (Exception, asyncio.CancelledError):
             pass
 
-        except asyncio.CancelledError:
-            pass
-        
         try:
             self._server_pool.abort()
-        except Exception as e:
-            pass
-
-        except asyncio.CancelledError:
+        except (Exception, asyncio.CancelledError):
             pass
 
         return super().abort()
@@ -1115,7 +1112,7 @@ class WorkerServer(HealthAwareServer):
             # Start execution task via TaskRunner
             # vus_for_workflow = VUs (virtual users, can be 50k+)
             # len(allocated_cores) = CPU cores (from priority, e.g., 4)
-            token = self._task_runner.run(
+            run = self._task_runner.run(
                 self._execute_workflow,
                 dispatch,
                 progress,
@@ -1124,7 +1121,8 @@ class WorkerServer(HealthAwareServer):
                 len(allocated_cores),  # CPU cores allocated
                 alias=f"workflow:{dispatch.workflow_id}",
             )
-            self._workflow_tokens[dispatch.workflow_id] = token
+            # Store the token string (not the Run object) for later cancellation
+            self._workflow_tokens[dispatch.workflow_id] = run.token
             
             # Return acknowledgment
             ack = WorkflowDispatchAck(
@@ -1218,10 +1216,9 @@ class WorkerServer(HealthAwareServer):
                 progress.status = WorkflowStatus.FAILED.value
                 workflow_error = str(e)
             finally:
-                # Construct token string from Run object
+                # Cancel progress monitor using its token
                 if progress_token:
-                    token_str = f"{progress_token.task_name}:{progress_token.run_id}"
-                    await self._task_runner.cancel(token_str)
+                    await self._task_runner.cancel(progress_token.token)
             
             # Final progress update
             progress.elapsed_seconds = time.monotonic() - start_time

@@ -197,7 +197,10 @@ class ErrorHandler:
     
     # Callbacks for fatal errors
     _fatal_callback: Callable[[SwimError], Awaitable[None]] | None = None
-    
+
+    # Shutdown flag - when True, suppress non-fatal errors
+    _shutting_down: bool = False
+
     def __post_init__(self):
         # Initialize stats for each category
         for category, settings in self.circuit_settings.items():
@@ -221,11 +224,15 @@ class ErrorHandler:
     ) -> None:
         """Set callback for fatal errors (e.g., graceful shutdown)."""
         self._fatal_callback = callback
-    
+
+    def start_shutdown(self) -> None:
+        """Signal that shutdown is in progress - suppress non-fatal errors."""
+        self._shutting_down = True
+
     async def handle(self, error: SwimError) -> None:
         """
         Handle an error with appropriate response.
-        
+
         Steps:
         1. Log with structured context
         2. Update error stats for circuit breaker
@@ -233,21 +240,25 @@ class ErrorHandler:
         4. Trigger recovery if circuit opens
         5. Escalate fatal errors
         """
+        # During shutdown, only handle fatal errors - suppress routine probe failures etc.
+        if self._shutting_down and error.severity != ErrorSeverity.FATAL:
+            return
+
         # 1. Log with structured context
         await self._log_error(error)
-        
+
         # 2. Update error stats
         stats = self._get_stats(error.category)
         stats.record_error()
-        
+
         # 3. Affect LHM based on error
         await self._update_lhm(error)
-        
+
         # 4. Check circuit breaker and trigger recovery
         if stats.is_circuit_open:
             await self._log_circuit_open(error.category, stats)
             await self._trigger_recovery(error.category)
-        
+
         # 5. Fatal errors need escalation
         if error.severity == ErrorSeverity.FATAL:
             await self._handle_fatal(error)

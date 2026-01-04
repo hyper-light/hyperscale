@@ -123,7 +123,8 @@ class Task(Generic[T]):
             await run.cancel()
 
     async def shutdown(self):
-        for run in self._runs.values():
+        # Snapshot to avoid dict mutation during iteration
+        for run in list(self._runs.values()):
             await run.cancel()
 
             if self._schedules.get(run.run_id):
@@ -136,7 +137,8 @@ class Task(Generic[T]):
                     pass
 
     def abort(self):
-        for run in self._runs.values():
+        # Snapshot to avoid dict mutation during iteration
+        for run in list(self._runs.values()):
             run.abort()
 
             if self._schedules.get(run.run_id):
@@ -257,7 +259,8 @@ class Task(Generic[T]):
         return run
 
     def stop_schedules(self):
-        for run_id in self._schedule_running_statuses:
+        # Snapshot keys to avoid dict mutation during iteration
+        for run_id in list(self._schedule_running_statuses.keys()):
             self._schedule_running_statuses[run_id] = False
 
     def run_schedule(

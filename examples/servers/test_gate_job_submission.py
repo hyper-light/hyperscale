@@ -496,7 +496,7 @@ async def run_test():
         # Stop managers
         for i, manager in enumerate(managers):
             try:
-                await manager.graceful_shutdown()
+                await manager.stop()
                 print(f"  ✓ {MANAGER_CONFIGS[i]['name']} stopped")
             except Exception as e:
                 print(f"  ✗ {MANAGER_CONFIGS[i]['name']} stop failed: {e}")
@@ -504,7 +504,7 @@ async def run_test():
         # Stop gates
         for i, gate in enumerate(gates):
             try:
-                await gate.graceful_shutdown()
+                await gate.stop()
                 print(f"  ✓ {GATE_CONFIGS[i]['name']} stopped")
             except Exception as e:
                 print(f"  ✗ {GATE_CONFIGS[i]['name']} stop failed: {e}")

@@ -72,7 +72,8 @@ class TaskRunner:
 
 
     def all_tasks(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             yield task
 
     def start_cleanup(self):
@@ -297,11 +298,13 @@ class TaskRunner:
             await task.cancel_schedule(int(run_id))
 
     async def stop(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             await task.shutdown()
 
     async def shutdown(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             await task.shutdown()
 
         self._run_cleanup = False
@@ -312,7 +315,7 @@ class TaskRunner:
 
         except Exception:
             pass
-        
+
         if self._executor:
             try:
                 self._executor.shutdown(cancel_futures=True)
@@ -321,7 +324,8 @@ class TaskRunner:
                 pass
 
     def abort(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             task.abort()
 
         self._run_cleanup = False
@@ -346,7 +350,8 @@ class TaskRunner:
 
     async def _cleanup_scheduled_tasks(self):
         try:
-            for task in self.tasks.values():
+            # Snapshot to avoid dict mutation during iteration
+            for task in list(self.tasks.values()):
                 await task.cleanup()
 
         except Exception:

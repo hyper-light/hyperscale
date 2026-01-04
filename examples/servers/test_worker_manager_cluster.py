@@ -336,7 +336,7 @@ async def run_test():
         # Then stop managers
         for i, manager in enumerate(managers):
             try:
-                await manager.graceful_shutdown(drain_timeout=0.5, broadcast_leave=False)
+                await manager.stop(drain_timeout=0.5, broadcast_leave=False)
                 print(f"  ✓ {MANAGER_CONFIGS[i]['name']} stopped")
             except Exception as e:
                 print(f"  ✗ {MANAGER_CONFIGS[i]['name']} stop failed: {e}")

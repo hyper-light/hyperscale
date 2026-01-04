@@ -284,11 +284,23 @@ class Run:
             except Exception:
                 pass
 
-        try:
-            self._task.set_result(None)
-
-        except Exception:
-            pass
+        # Actually cancel the asyncio task if it's running
+        if self._task and not self._task.done():
+            try:
+                self._task.cancel()
+                # Give the task a chance to handle cancellation
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+            except Exception:
+                pass
+        else:
+            # Task already done, try to set result
+            try:
+                self._task.set_result(None)
+            except Exception:
+                pass
 
         self.status = RunStatus.CANCELLED
 

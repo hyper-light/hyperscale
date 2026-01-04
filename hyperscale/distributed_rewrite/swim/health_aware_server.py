@@ -975,7 +975,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         nodes: Nodes = self._context.read('nodes')
         if node in nodes:
             self._safe_queue_put_sync(nodes[node], (int(time.monotonic()), b'DEAD'), node)
-        
+
+        # Update probe scheduler to stop probing this dead node
+        self.update_probe_scheduler_membership()
+
         # Invoke registered callbacks (composition pattern)
         for callback in self._on_node_dead_callbacks:
             try:
@@ -1306,12 +1309,16 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     async def _run_probe_round(self) -> None:
         """Execute a single probe round in the SWIM protocol."""
+        # Exit early if we're shutting down - don't attempt probes during shutdown
+        if not self._running or not self._probe_scheduler._running:
+            return
+
         # Check circuit breaker - if too many network errors, back off
         if self._error_handler and self._error_handler.is_circuit_open(ErrorCategory.NETWORK):
             # Network circuit is open - skip this round to let things recover
             await asyncio.sleep(1.0)  # Brief pause before next attempt
             return
-        
+
         target = self._probe_scheduler.get_next_target()
         if target is None:
             return
@@ -1331,23 +1338,40 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
             
             response_received = await self._probe_with_timeout(target, probe_msg, timeout)
-            
+
+            # Exit early if shutting down
+            if not self._running:
+                return
+
             if response_received:
                 await self.decrease_failure_detector('successful_probe')
                 ctx.record_success(ErrorCategory.NETWORK)  # Help circuit breaker recover
                 return
-            
+
             await self.increase_failure_detector('probe_timeout')
             indirect_sent = await self.initiate_indirect_probe(target, incarnation)
-            
+
+            # Exit early if shutting down
+            if not self._running:
+                return
+
             if indirect_sent:
                 await asyncio.sleep(timeout)
+
+                # Exit early if shutting down
+                if not self._running:
+                    return
+
                 probe = self._indirect_probe_manager.get_pending_probe(target)
                 if probe and probe.is_completed():
                     await self.decrease_failure_detector('successful_probe')
                     ctx.record_success(ErrorCategory.NETWORK)
                     return
-            
+
+            # Don't start suspicions during shutdown
+            if not self._running:
+                return
+
             self_addr = self._get_self_udp_addr()
             await self.start_suspicion(target, incarnation, self_addr)
             await self.broadcast_suspicion(target, incarnation)
@@ -1367,8 +1391,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._metrics.increment('probes_sent')
         attempt = 0
         max_attempts = PROBE_RETRY_POLICY.max_attempts + 1
-        
+
         while attempt < max_attempts:
+            # Exit early if shutting down
+            if not self._running:
+                return False
+
             try:
                 # Send probe
                 await self.send(target, message, timeout=timeout)
@@ -1416,10 +1444,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._probe_scheduler.stop()
     
     def update_probe_scheduler_membership(self) -> None:
-        """Update the probe scheduler with current membership."""
+        """Update the probe scheduler with current membership, excluding DEAD nodes."""
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
-        members = [node for node in list(nodes.keys()) if node != self_addr]
+        members = []
+        for node in list(nodes.keys()):
+            if node == self_addr:
+                continue
+            # Check if node is DEAD via incarnation tracker
+            node_state = self._incarnation_tracker.get_node_state(node)
+            if node_state and node_state.status == b'DEAD':
+                continue
+            members.append(node)
         self._probe_scheduler.update_members(members)
     
     async def start_leader_election(self) -> None:
@@ -1434,12 +1470,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Stop the leader election process."""
         await self._leader_election.stop()
 
-    async def shutdown(self):
-        await super().shutdown()
-
-        await self.stop()
     
-    async def graceful_shutdown(
+    async def _graceful_shutdown(
         self,
         drain_timeout: float = 5.0,
         broadcast_leave: bool = True,
@@ -1460,7 +1492,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         self._running = False
         self_addr = self._get_self_udp_addr()
-        
+
+        # Signal to error handler that we're shutting down - suppress non-fatal errors
+        if self._error_handler:
+            self._error_handler.start_shutdown()
+
         # 1. Step down from leadership if we're the leader
         if self._leader_election.state.is_leader():
             try:
@@ -1507,15 +1543,24 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # 3. Wait for drain period
         if drain_timeout > 0:
             await asyncio.sleep(drain_timeout)
+
+        
         
         # 4. Stop all background tasks in proper order
-        # Stop leader election first (stops sending heartbeats)
+        # Stop probe cycle first (stops probing other nodes)
+        try:
+            self.stop_probe_cycle()
+        except Exception as e:
+            if self._error_handler:
+                await self.handle_exception(e, "shutdown_stop_probe_cycle")
+
+        # Stop leader election (stops sending heartbeats)
         try:
             await self.stop_leader_election()
         except Exception as e:
             if self._error_handler:
                 await self.handle_exception(e, "shutdown_stop_election")
-        
+
         # Stop health monitor
         try:
             await self.stop_health_monitor()
@@ -1537,14 +1582,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             reason='graceful_shutdown',
         )
     
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        drain_timeout: float = 5,
+        broadcast_leave: bool = True
+    ) -> None:
         """
         Stop the server. Alias for graceful_shutdown with minimal drain time.
         
         For tests or quick shutdown, use this. For production, prefer
         graceful_shutdown() with appropriate drain_timeout.
         """
-        await self.graceful_shutdown(drain_timeout=0.1, broadcast_leave=False)
+        await self._graceful_shutdown(drain_timeout=drain_timeout, broadcast_leave=broadcast_leave)
+        await super().shutdown()
     
     def get_current_leader(self) -> tuple[str, int] | None:
         """Get the current leader, if known."""
@@ -2588,8 +2638,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         await self._safe_queue_put(nodes[target], (clock_time, b'DEAD'), target)
                         self._context.write('nodes', nodes)
 
+                        # Update incarnation tracker and probe scheduler
+                        self._incarnation_tracker.update_node(target, b'DEAD', 0, time.monotonic())
+                        self.update_probe_scheduler_membership()
+
                         return b'ack>' + self._udp_addr_slug
-                
+
                 case b'probe':
                     if not await self._validate_target(target, b'probe', addr):
                         return b'nack>' + self._udp_addr_slug

@@ -425,7 +425,7 @@ class GateServer(HealthAwareServer):
         for tcp_addr in self._active_gate_peers:
             # Find UDP addr for this peer
             udp_addr: tuple[str, int] | None = None
-            for udp, tcp in self._gate_udp_to_tcp.items():
+            for udp, tcp in list(self._gate_udp_to_tcp.items()):
                 if tcp == tcp_addr:
                     udp_addr = udp
                     break
@@ -873,7 +873,7 @@ class GateServer(HealthAwareServer):
         2. It has workers available (from TCP status updates)
         """
         healthy = []
-        for dc_id in self._datacenter_managers.keys():
+        for dc_id in list(self._datacenter_managers.keys()):
             status = self._classify_datacenter_health(dc_id)
             if status.health != DatacenterHealth.UNHEALTHY.value:
                 healthy.append(dc_id)
@@ -1260,7 +1260,7 @@ class GateServer(HealthAwareServer):
         """
         # Collect running jobs with callbacks
         jobs_with_callbacks = []
-        for job_id, job in self._jobs.items():
+        for job_id, job in list(self._jobs.items()):
             if job.status == JobStatus.RUNNING.value:
                 callback = self._job_callbacks.get(job_id)
                 if callback:
@@ -1681,7 +1681,7 @@ class GateServer(HealthAwareServer):
         )
         
         # Add known DC leaders to monitor (will be updated via TCP registrations)
-        for dc, manager_udp_addrs in self._datacenter_manager_udp.items():
+        for dc, manager_udp_addrs in list(self._datacenter_manager_udp.items()):
             if manager_udp_addrs:
                 # Start with first known manager - will update when leader is discovered
                 self._dc_health_monitor.add_datacenter(dc, manager_udp_addrs[0])
@@ -1707,16 +1707,19 @@ class GateServer(HealthAwareServer):
             )
         )
     
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        drain_timeout: float = 5,
+        broadcast_leave: bool = True
+    ) -> None:
         """Stop the gate server."""
         # Stop federated health monitor
         await self._dc_health_monitor.stop()
-        
-        # TaskRunner handles cleanup task cancellation
-        # Graceful shutdown broadcasts leave via UDP (SWIM)
-        await self.graceful_shutdown()
-        
-        await super().stop()
+    
+        await super().stop(
+            drain_timeout=drain_timeout,
+            broadcast_leave=broadcast_leave,
+        )
     
     async def _send_xprobe(self, target: tuple[str, int], data: bytes) -> bool:
         """
@@ -1844,7 +1847,7 @@ class GateServer(HealthAwareServer):
                 
                 now = time.monotonic()
                 expired = []
-                for key, lease in self._leases.items():
+                for key, lease in list(self._leases.items()):
                     if lease.expires_at < now:
                         expired.append(key)
                 
@@ -1875,8 +1878,8 @@ class GateServer(HealthAwareServer):
                 
                 now = time.monotonic()
                 jobs_to_remove = []
-                
-                for job_id, job in self._jobs.items():
+
+                for job_id, job in list(self._jobs.items()):
                     if job.status in terminal_states:
                         # Check age - use elapsed_seconds as relative timestamp
                         # or timestamp if available

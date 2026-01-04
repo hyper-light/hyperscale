@@ -1030,7 +1030,7 @@ class ManagerServer(HealthAwareServer):
         for tcp_addr in self._active_manager_peers:
             # Find UDP addr for this peer
             udp_addr: tuple[str, int] | None = None
-            for udp, tcp in self._manager_udp_to_tcp.items():
+            for udp, tcp in list(self._manager_udp_to_tcp.items()):
                 if tcp == tcp_addr:
                     udp_addr = udp
                     break
@@ -1176,7 +1176,7 @@ class ManagerServer(HealthAwareServer):
         )
         
         # Add known gate addresses to the federated health monitor
-        for gate_id, gate_info in self._known_gates.items():
+        for gate_id, gate_info in list(self._known_gates.items()):
             gate_udp_addr = (gate_info.udp_host, gate_info.udp_port)
             self._gate_health_monitor.add_datacenter(
                 datacenter="gate-cluster",  # Gates are a single cluster
@@ -1450,15 +1450,18 @@ class ManagerServer(HealthAwareServer):
         self._gate_circuit.record_error()
         return None
     
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        drain_timeout: float = 5,
+        broadcast_leave: bool = True
+    ) -> None:
         """Stop the manager server."""
         # Stop federated health monitor
-        await self._gate_health_monitor.stop()
-        
-        # Graceful shutdown broadcasts leave via UDP (SWIM)
-        await self.graceful_shutdown()
-        
-        await super().stop()
+        await self._gate_health_monitor.stop()        
+        await super().stop(
+            drain_timeout=drain_timeout,
+            broadcast_leave=broadcast_leave,
+        )
     
     async def _send_xprobe_to_gate(self, target: tuple[str, int], data: bytes) -> bool:
         """
@@ -2934,7 +2937,7 @@ class ManagerServer(HealthAwareServer):
         
         # Find leader's address
         leader_addr = None
-        for manager in self._known_managers.values():
+        for manager in list(self._known_managers.values()):
             if manager.node_id == leader_id:
                 leader_addr = (manager.host, manager.port)
                 break
@@ -3281,7 +3284,7 @@ class ManagerServer(HealthAwareServer):
         This extracts the name portion for context keying.
         """
         # Try to find in job progress
-        for job in self._jobs.values():
+        for job in list(self._jobs.values()):
             for wf in job.workflows:
                 if wf.workflow_id == workflow_id:
                     return wf.workflow_name
@@ -3342,7 +3345,7 @@ class ManagerServer(HealthAwareServer):
             return (peer_info.tcp_host, peer_info.tcp_port)
         
         # Check manager peers by matching node_id prefix
-        for tcp_addr, udp_addr in self._manager_tcp_to_udp.items():
+        for tcp_addr, udp_addr in list(self._manager_tcp_to_udp.items()):
             # This is less reliable - would need node_id mapping
             pass
         
@@ -3483,7 +3486,7 @@ class ManagerServer(HealthAwareServer):
     def _get_active_manager_peer_addrs(self) -> list[tuple[str, int]]:
         """Get TCP addresses of active peer managers."""
         addrs = []
-        for node_id, heartbeat in self._manager_peer_info.items():
+        for node_id, heartbeat in list(self._manager_peer_info.items()):
             if node_id == self._node_id.full:
                 continue  # Skip self
             # Only include active managers (not SYNCING)
@@ -3728,7 +3731,7 @@ class ManagerServer(HealthAwareServer):
         """
         # Collect running jobs with callbacks
         jobs_with_callbacks = []
-        for job_id, job in self._jobs.items():
+        for job_id, job in list(self._jobs.items()):
             if job.status == JobStatus.RUNNING.value:
                 callback = self._job_callbacks.get(job_id)
                 if callback:
@@ -4040,10 +4043,10 @@ class ManagerServer(HealthAwareServer):
         Also skips workers with open circuit breakers.
         """
         eligible = []
-        for node_id, status in self._worker_status.items():
+        for node_id, status in list(self._worker_status.items()):
             if node_id in exclude_workers:
                 continue
-            
+
             # Check circuit breaker - skip workers with open circuits
             if self._is_worker_circuit_open(node_id):
                 continue
@@ -4111,7 +4114,7 @@ class ManagerServer(HealthAwareServer):
         for workflow_id in workflows_to_retry:
             # Get the job for this workflow
             job_id = None
-            for jid, job in self._jobs.items():
+            for jid, job in list(self._jobs.items()):
                 for wf in job.workflows:
                     if wf.workflow_id == workflow_id:
                         job_id = jid
@@ -4195,8 +4198,8 @@ class ManagerServer(HealthAwareServer):
                 
                 now = time.monotonic()
                 jobs_to_remove = []
-                
-                for job_id, job in self._jobs.items():
+
+                for job_id, job in list(self._jobs.items()):
                     if job.status in terminal_states:
                         # Check age based on timestamp
                         age = now - job.timestamp

@@ -133,7 +133,8 @@ class HyperscaleClient(MercurySyncBaseServer):
         # Cancel any pending job waits
         for event in self._job_events.values():
             event.set()
-        await self.shutdown()
+            
+        await super().shutdown()
     
     def _get_callback_addr(self) -> tuple[str, int]:
         """Get this client's address for push notifications."""
