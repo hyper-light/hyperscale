@@ -792,7 +792,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         base_timeout = self._context.read('current_timeout')
         timeout = self.get_lhm_adjusted_timeout(base_timeout)
         
-        for node in nodes:
+        # Use list() to snapshot keys before iteration to prevent
+        # "dictionary changed size during iteration" errors
+        for node in list(nodes.keys()):
             if node != self_addr:
                 # Use task runner but schedule error-aware send
                 self._task_runner.run(
@@ -1101,8 +1103,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def get_other_nodes(self, node: tuple[str, int]):
         target_host, target_port = node
         nodes: Nodes = self._context.read('nodes')
+        # Use list() to snapshot keys before iteration to prevent
+        # "dictionary changed size during iteration" errors
         return [
-            (host, port) for host, port in nodes 
+            (host, port) for host, port in list(nodes.keys())
             if target_host != host and target_port != port
         ]
     
@@ -1288,9 +1292,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._probe_scheduler._running = True
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
-        members = [node for node in nodes.keys() if node != self_addr]
+        # Use list() to snapshot keys before iteration
+        members = [node for node in list(nodes.keys()) if node != self_addr]
         self._probe_scheduler.update_members(members)
-        
+
         protocol_period = self._context.read('udp_poll_interval', 1.0)
         self._probe_scheduler.protocol_period = protocol_period
         
@@ -1418,7 +1423,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """Update the probe scheduler with current membership."""
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
-        members = [node for node in nodes.keys() if node != self_addr]
+        # Use list() to snapshot keys before iteration
+        members = [node for node in list(nodes.keys()) if node != self_addr]
         self._probe_scheduler.update_members(members)
     
     async def start_leader_election(self) -> None:
@@ -1476,7 +1482,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 timeout = self.get_lhm_adjusted_timeout(1.0)
                 
                 send_failures = 0
-                for node in nodes.keys():
+                # Use list() to snapshot keys before iteration
+                for node in list(nodes.keys()):
                     if node != self_addr:
                         try:
                             await self.send(node, leave_msg, timeout=timeout)
@@ -2034,8 +2041,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
         
+        # Use list() to snapshot items before iteration
         candidates = [
-            node for node, queue in nodes.items()
+            node for node, queue in list(nodes.items())
             if node != target and node != self_addr
         ]
         
@@ -2164,8 +2172,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         
         successful = 0
         failed = 0
-        
-        for node in nodes:
+
+        # Use list() to snapshot keys before iteration
+        for node in list(nodes.keys()):
             if node != self_addr:
                 success = await self._send_with_retry(node, msg, timeout)
                 if success:
@@ -2251,8 +2260,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         
         successful = 0
         failed = 0
-        
-        for node in nodes:
+
+        # Use list() to snapshot keys before iteration
+        for node in list(nodes.keys()):
             if node != self_addr and node != target:
                 success = await self._send_broadcast_message(node, msg, timeout)
                 if success:

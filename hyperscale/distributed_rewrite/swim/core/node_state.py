@@ -10,16 +10,21 @@ from .types import Status
 class NodeState:
     """
     Tracks the state of a known node in the SWIM membership.
-    
+
     Includes status, incarnation number, and timing information
     for the suspicion subprotocol.
-    
+
     Uses __slots__ for memory efficiency since many instances are created.
     """
     status: Status = b'OK'
     incarnation: int = 0
     last_update_time: float = 0.0
-    
+
+    @property
+    def last_seen(self) -> float:
+        """Alias for last_update_time for backward compatibility."""
+        return self.last_update_time
+
     def update(self, new_status: Status, new_incarnation: int, timestamp: float) -> bool:
         """
         Update node state if the new information is fresher.

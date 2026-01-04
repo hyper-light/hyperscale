@@ -1647,7 +1647,7 @@ class ManagerServer(HealthAwareServer):
                             healthy_managers += 1
         
         ack = CrossClusterAck(
-            datacenter=self._dc_id,
+            datacenter=self._node_id.datacenter,
             node_id=self._node_id.full,
             incarnation=self._external_incarnation,
             is_leader=True,
@@ -3047,6 +3047,7 @@ class ManagerServer(HealthAwareServer):
             total_failed=total_failed,
             errors=errors,
             elapsed_seconds=max_elapsed,
+            fence_token=job.fence_token,  # Include fence token for stale rejection
         )
         
         self._task_runner.run(
@@ -4292,6 +4293,7 @@ class ManagerServer(HealthAwareServer):
                 status=JobStatus.SUBMITTED.value,
                 workflows=[],
                 timestamp=time.monotonic(),
+                fence_token=submission.fence_token,  # Preserve gate's fence token
             )
             self._jobs[submission.job_id] = job
             
