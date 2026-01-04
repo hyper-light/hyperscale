@@ -1330,9 +1330,11 @@ class GateServer(HealthAwareServer):
         """
         batch_interval = getattr(self, '_batch_stats_interval', 2.0)  # Default 2s
         
-        while True:
+        while self._running:
             try:
                 await asyncio.sleep(batch_interval)
+                if not self._running:
+                    break
                 await self._batch_stats_update()
             except asyncio.CancelledError:
                 break

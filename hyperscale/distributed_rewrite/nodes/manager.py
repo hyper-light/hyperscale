@@ -3797,15 +3797,17 @@ class ManagerServer(HealthAwareServer):
     async def _client_batch_push_loop(self) -> None:
         """
         Background loop for Tier 2 (Periodic) client push updates.
-        
+
         Only runs when manager operates without gates (direct client mode).
         Sends batched progress updates to clients every few seconds.
         """
         batch_interval = getattr(self, '_batch_push_interval', 2.0)
-        
-        while True:
+
+        while self._running:
             try:
                 await asyncio.sleep(batch_interval)
+                if not self._running:
+                    break
                 await self._push_batch_stats_to_clients()
             except asyncio.CancelledError:
                 break
