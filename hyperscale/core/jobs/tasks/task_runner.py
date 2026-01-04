@@ -15,7 +15,7 @@ T = TypeVar("T")
 class TaskRunner:
     def __init__(self, instance_id: int, config: Env) -> None:
         self.tasks: Dict[str, Task[Any]] = {}
-        self.results: Dict[str, Any]
+        self.results: Dict[str, Any] = {}
         self._runner = ThreadPoolExecutor(
             max_workers=config.MERCURY_SYNC_TASK_RUNNER_MAX_THREADS
         )
@@ -98,23 +98,30 @@ class TaskRunner:
             await task.cancel_schedule()
 
     async def shutdown(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             task.abort()
 
         self._run_cleanup = False
-        self._cleanup_task.set_result(None)
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
 
     def abort(self):
-        for task in self.tasks.values():
+        # Snapshot to avoid dict mutation during iteration
+        for task in list(self.tasks.values()):
             task.abort()
 
         self._run_cleanup = False
 
-        try:
-            self._cleanup_task.set_result(None)
-
-        except Exception:
-            pass
+        if self._cleanup_task and not self._cleanup_task.done():
+            try:
+                self._cleanup_task.cancel()
+            except Exception:
+                pass
 
     async def _cleanup(self):
         while self._run_cleanup:
@@ -123,7 +130,8 @@ class TaskRunner:
 
     async def _cleanup_scheduled_tasks(self):
         try:
-            for task in self.tasks.values():
+            # Snapshot to avoid dict mutation during iteration
+            for task in list(self.tasks.values()):
                 await task.cleanup()
 
         except Exception:

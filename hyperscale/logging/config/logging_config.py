@@ -8,11 +8,11 @@ from .stream_type import StreamType
 
 LogOutput = Literal['stdout', 'stderr']
 
-_global_log_level = contextvars.ContextVar("_global_log_level", default=LogLevel.INFO)
+_global_log_level = contextvars.ContextVar("_global_log_level", default=LogLevel.ERROR)
 _global_disabled_loggers = contextvars.ContextVar("_global_disabled_loggers", default=[])
 _global_level_map = contextvars.ContextVar("_global_level_map", default=LogLevelMap())
 _global_log_output_type = contextvars.ContextVar("_global_log_level_type", default=StreamType.STDOUT)
-_global_logging_directory = contextvars.ContextVar("_global_logging_directory")
+_global_logging_directory = contextvars.ContextVar("_global_logging_directory", default=None)
 
 
 class LoggingConfig:
@@ -32,16 +32,22 @@ class LoggingConfig:
         log_level: LogLevelName | None = None,
         log_output: LogOutput | None = None,
     ):
+    
         if log_directory:
             self._log_directory.set(log_directory)
+            _global_logging_directory.set(log_directory)
 
         if log_level:
             self._log_level.set(
                 LogLevel.to_level(log_level)
             )
+            _global_log_level.set(LogLevel.to_level(log_level))
 
         if log_output:
             self._log_output_type.set(
+                StreamType.STDOUT if log_output == 'stdout' else StreamType.STDERR
+            )
+            _global_log_output_type.set(
                 StreamType.STDOUT if log_output == 'stdout' else StreamType.STDERR
             )
 

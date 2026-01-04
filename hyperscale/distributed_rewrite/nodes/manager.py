@@ -1456,8 +1456,11 @@ class ManagerServer(HealthAwareServer):
         broadcast_leave: bool = True
     ) -> None:
         """Stop the manager server."""
+        # Set _running to False early to stop all background loops
+        self._running = False
+
         # Stop federated health monitor
-        await self._gate_health_monitor.stop()        
+        await self._gate_health_monitor.stop()
         await super().stop(
             drain_timeout=drain_timeout,
             broadcast_leave=broadcast_leave,

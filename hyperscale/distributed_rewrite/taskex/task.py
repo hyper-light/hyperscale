@@ -114,11 +114,12 @@ class Task(Generic[T]):
         if run := self._runs.get(run_id) and self._schedules.get(run_id):
             self._schedule_running_statuses[run_id] = False
 
-            try:
-                self._schedules[run_id].set_result(None)
-
-            except Exception:
-                pass
+            schedule = self._schedules.get(run_id)
+            if schedule and not schedule.done():
+                try:
+                    schedule.cancel()
+                except Exception:
+                    pass
 
             await run.cancel()
 
@@ -127,28 +128,30 @@ class Task(Generic[T]):
         for run in list(self._runs.values()):
             await run.cancel()
 
-            if self._schedules.get(run.run_id):
+            schedule = self._schedules.get(run.run_id)
+            if schedule:
                 self._schedule_running_statuses[run.run_id] = False
 
-                try:
-                    self._schedules[run.run_id].set_result(None)
-
-                except Exception:
-                    pass
+                if not schedule.done():
+                    try:
+                        schedule.cancel()
+                    except Exception:
+                        pass
 
     def abort(self):
         # Snapshot to avoid dict mutation during iteration
         for run in list(self._runs.values()):
             run.abort()
 
-            if self._schedules.get(run.run_id):
+            schedule = self._schedules.get(run.run_id)
+            if schedule:
                 self._schedule_running_statuses[run.run_id] = False
 
-                try:
-                    self._schedules[run.run_id].set_result(None)
-
-                except Exception:
-                    pass
+                if not schedule.done():
+                    try:
+                        schedule.cancel()
+                    except Exception:
+                        pass
 
     async def cleanup(self):
         match self.keep_policy:

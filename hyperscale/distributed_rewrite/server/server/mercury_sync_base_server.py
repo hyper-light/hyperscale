@@ -57,6 +57,7 @@ from hyperscale.distributed_rewrite.server.hooks.task import (
 from hyperscale.distributed_rewrite.taskex import TaskRunner
 from hyperscale.distributed_rewrite.taskex.run import Run
 from hyperscale.logging import Logger
+from hyperscale.logging.config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerWarning
 
 do_patch()
@@ -294,6 +295,9 @@ class MercurySyncBaseServer(Generic[T]):
         tcp_server_worker_server: asyncio.Server | None = None,
     ):
         
+        # Configure global log level from environment before creating loggers
+        LoggingConfig().update(log_level=self.env.MERCURY_SYNC_LOG_LEVEL)
+
         if self._tcp_logger is None:
             self._tcp_logger = Logger()
 

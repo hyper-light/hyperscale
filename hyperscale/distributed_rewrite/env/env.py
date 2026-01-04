@@ -72,6 +72,10 @@ class Env(BaseModel):
     CIRCUIT_BREAKER_WINDOW_SECONDS: StrictFloat = 30.0
     CIRCUIT_BREAKER_HALF_OPEN_AFTER: StrictFloat = 10.0
 
+    # Worker Progress Update Settings
+    WORKER_PROGRESS_UPDATE_INTERVAL: StrictFloat = 1.0  # How often to collect progress locally
+    WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 2.0  # How often to send buffered updates to manager
+
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
@@ -119,6 +123,9 @@ class Env(BaseModel):
             "FEDERATED_PROBE_TIMEOUT": float,
             "FEDERATED_SUSPICION_TIMEOUT": float,
             "FEDERATED_MAX_CONSECUTIVE_FAILURES": int,
+            # Worker progress update settings
+            "WORKER_PROGRESS_UPDATE_INTERVAL": float,
+            "WORKER_PROGRESS_FLUSH_INTERVAL": float,
         }
     
     def get_swim_init_context(self) -> dict:

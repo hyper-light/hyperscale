@@ -1715,9 +1715,12 @@ class GateServer(HealthAwareServer):
         broadcast_leave: bool = True
     ) -> None:
         """Stop the gate server."""
+        # Set _running to False early to stop all background loops
+        self._running = False
+
         # Stop federated health monitor
         await self._dc_health_monitor.stop()
-    
+
         await super().stop(
             drain_timeout=drain_timeout,
             broadcast_leave=broadcast_leave,

@@ -172,4 +172,4 @@ class StatusUpdate(Entry, kw_only=True):
     failed_count: int
     avg_cpu: float
     avg_mem_mb: float
-    level: LogLevel = LogLevel.DEBUG
+    level: LogLevel = LogLevel.TRACE  # TRACE level since this fires every 100ms

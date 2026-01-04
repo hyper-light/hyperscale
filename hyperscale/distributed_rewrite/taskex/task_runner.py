@@ -70,6 +70,8 @@ class TaskRunner:
         )
         self._loop = asyncio.get_event_loop()
 
+        # Skip list - tasks in this set will not be run or scheduled
+        self._skipped_tasks: set[str] = set()
 
     def all_tasks(self):
         # Snapshot to avoid dict mutation during iteration
@@ -82,7 +84,37 @@ class TaskRunner:
 
     def create_task_id(self):
         return self._snowflake_generator.generate()
-    
+
+    def skip_tasks(self, task_names: list[str]) -> None:
+        """
+        Add tasks to the skip list. Skipped tasks will not be run or scheduled.
+
+        Also stops any running schedules for these tasks.
+
+        Args:
+            task_names: List of task names (or aliases) to skip
+        """
+        for name in task_names:
+            self._skipped_tasks.add(name)
+            # Stop any running schedules for this task
+            task = self.tasks.get(name)
+            if task:
+                task.stop_schedules()
+
+    def unskip_tasks(self, task_names: list[str]) -> None:
+        """
+        Remove tasks from the skip list, allowing them to run again.
+
+        Args:
+            task_names: List of task names (or aliases) to unskip
+        """
+        for name in task_names:
+            self._skipped_tasks.discard(name)
+
+    def is_skipped(self, task_name: str) -> bool:
+        """Check if a task is in the skip list."""
+        return task_name in self._skipped_tasks
+
     def bundle(
         self,
         call: Callable[..., Awaitable[T]],
@@ -122,6 +154,10 @@ class TaskRunner:
 
         elif command_name is None:
             command_name = call.__name__
+
+        # Check if task is skipped - return None without running
+        if command_name in self._skipped_tasks:
+            return None
 
         task = self.tasks.get(command_name)
         if task is None and call:
@@ -180,6 +216,10 @@ class TaskRunner:
         command_name = alias
         if command_name is None:
             command_name = command
+
+        # Check if task is skipped - return None without running
+        if command_name in self._skipped_tasks:
+            return None
 
         if isinstance(timeout, str):
             timeout = TimeParser(timeout).time
@@ -371,12 +411,12 @@ class TaskRunner:
 
         self._run_cleanup = False
 
-        try:
-            self._cleanup_task.set_result(None)
+        if self._cleanup_task and not self._cleanup_task.done():
+            try:
+                self._cleanup_task.cancel()
+            except Exception:
+                pass
 
-        except Exception:
-            pass
-        
         if self._executor:
             try:
                 self._executor.shutdown(cancel_futures=True)

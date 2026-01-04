@@ -168,8 +168,14 @@ class WorkerServer(HealthAwareServer):
         # workflow_id -> set of completed core indices
         self._workflow_cores_completed: dict[str, set[int]] = {}
         
-        # Progress update configuration
-        self._progress_update_interval: float = 1.0  # Update every 1 second
+        # Progress update configuration (from Env with sane defaults)
+        self._progress_update_interval: float = env.WORKER_PROGRESS_UPDATE_INTERVAL
+
+        # Buffered progress updates - collect updates and send at controlled pace
+        self._progress_buffer: dict[str, WorkflowProgress] = {}  # workflow_id -> latest progress
+        self._progress_buffer_lock = asyncio.Lock()
+        self._progress_flush_interval: float = env.WORKER_PROGRESS_FLUSH_INTERVAL
+        self._progress_flush_task: asyncio.Task | None = None
         
         # State versioning (Lamport clock extension)
         self._state_version = 0
@@ -406,7 +412,10 @@ class WorkerServer(HealthAwareServer):
         
         # Start SWIM probe cycle (UDP healthchecks)
         self._task_runner.run(self.start_probe_cycle)
-        
+
+        # Start buffered progress flush loop
+        self._progress_flush_task = asyncio.create_task(self._progress_flush_loop())
+
         manager_count = len(self._known_managers)
         await self._udp_logger.log(
             ServerInfo(
@@ -616,10 +625,30 @@ class WorkerServer(HealthAwareServer):
         broadcast_leave: bool = True
     ) -> None:
         """Stop the worker server."""
+        # Set _running to False early to stop all background loops
+        # This ensures progress monitors and flush loop exit their while loops
+        self._running = False
+
+        # Skip all progress monitoring tasks to prevent new status updates
+        progress_task_names = [
+            name for name in self._task_runner.tasks.keys()
+            if name.startswith("progress:")
+        ]
+        if progress_task_names:
+            self._task_runner.skip_tasks(progress_task_names)
+
+        # Cancel progress flush loop
+        if self._progress_flush_task and not self._progress_flush_task.done():
+            self._progress_flush_task.cancel()
+            try:
+                await self._progress_flush_task
+            except asyncio.CancelledError:
+                pass
+
         # Cancel all active workflows via TaskRunner
         for workflow_id in list(self._workflow_tokens.keys()):
             await self._cancel_workflow(workflow_id, "server_shutdown")
-        
+
         # Graceful shutdown (broadcasts leave via SWIM)
 
         await self._cpu_monitor.stop_background_monitor(
@@ -651,6 +680,15 @@ class WorkerServer(HealthAwareServer):
 
 
     def abort(self):
+        # Set _running to False early to stop all background loops
+        self._running = False
+
+        # Cancel progress flush loop
+        if self._progress_flush_task and not self._progress_flush_task.done():
+            try:
+                self._progress_flush_task.cancel()
+            except Exception:
+                pass
 
         try:
             self._cpu_monitor.abort_all_background_monitors()
@@ -1217,11 +1255,11 @@ class WorkerServer(HealthAwareServer):
                 if progress_token:
                     await self._task_runner.cancel(progress_token.token)
             
-            # Final progress update
+            # Final progress update - send directly (not buffered) since it's critical
             progress.elapsed_seconds = time.monotonic() - start_time
             progress.timestamp = time.monotonic()
             if self._healthy_manager_ids:
-                await self._send_progress_update(progress)
+                await self._send_progress_update_direct(progress)
             
             # Send final result to manager
             final_result = WorkflowFinalResult(
@@ -1342,20 +1380,66 @@ class WorkerServer(HealthAwareServer):
     async def _send_progress_update(
         self,
         progress: WorkflowProgress,
+    ) -> None:
+        """
+        Buffer a progress update for batched sending to manager.
+
+        Instead of sending immediately, updates are collected in a buffer
+        and flushed periodically by _progress_flush_loop. This reduces
+        network traffic and noisy status updates.
+
+        Args:
+            progress: Workflow progress to buffer
+        """
+        async with self._progress_buffer_lock:
+            # Always keep the latest progress for each workflow
+            self._progress_buffer[progress.workflow_id] = progress
+
+    async def _progress_flush_loop(self) -> None:
+        """
+        Background loop that flushes buffered progress updates to manager.
+
+        Runs continuously while the worker is active, flushing all buffered
+        progress updates at a controlled interval.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._progress_flush_interval)
+
+                # Get and clear the buffer atomically
+                async with self._progress_buffer_lock:
+                    if not self._progress_buffer:
+                        continue
+                    updates_to_send = dict(self._progress_buffer)
+                    self._progress_buffer.clear()
+
+                # Send buffered updates
+                if self._healthy_manager_ids:
+                    for workflow_id, progress in updates_to_send.items():
+                        await self._send_progress_update_direct(progress)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _send_progress_update_direct(
+        self,
+        progress: WorkflowProgress,
         max_retries: int = 2,
         base_delay: float = 0.2,
     ) -> None:
         """
-        Send a progress update to the primary manager and process ack.
-        
+        Send a progress update directly to the primary manager and process ack.
+
         Uses limited retries with exponential backoff:
         - Progress updates happen frequently, so we keep retries short
         - Attempt 1: immediate
         - Attempt 2: 0.2s delay
         - Attempt 3: 0.4s delay
-        
+
         Circuit breaker prevents attempts when managers are unreachable.
-        
+
         Args:
             progress: Workflow progress to send
             max_retries: Maximum retry attempts (default 2)
@@ -1364,11 +1448,11 @@ class WorkerServer(HealthAwareServer):
         # Check circuit breaker first
         if self._is_manager_circuit_open():
             return  # Fail fast - don't attempt communication
-        
+
         manager_addr = self._get_primary_manager_tcp_addr()
         if not manager_addr:
             return
-        
+
         for attempt in range(max_retries + 1):
             try:
                 response, _ = await self.send_tcp(
@@ -1377,16 +1461,16 @@ class WorkerServer(HealthAwareServer):
                     progress.dump(),
                     timeout=1.0,
                 )
-                
+
                 # Process ack to update manager topology
                 if response and isinstance(response, bytes) and response != b'error':
                     self._process_workflow_progress_ack(response)
                     self._manager_circuit.record_success()
                     return  # Success
-                    
+
             except Exception:
                 pass
-            
+
             # Exponential backoff before retry (except after last attempt)
             if attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
