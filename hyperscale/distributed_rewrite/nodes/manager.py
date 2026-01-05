@@ -239,13 +239,9 @@ class ManagerServer(HealthAwareServer):
         # Tracks per-worker and per-job versions using Lamport timestamps
         self._versioned_clock = VersionedStateClock()
 
-        # Job and workflow state (legacy - being migrated to JobManager)
-        # NOTE: self._jobs removed - use self._job_manager exclusively
-        self._workflow_assignments: dict[str, dict[str, str]] = {}  # job_id -> {workflow_id -> worker_node_id}
+        # Quorum protocol state (temporary, scoped to quorum request execution)
         self._pending_provisions: dict[str, ProvisionRequest] = {}  # workflow_id -> request
         self._provision_confirmations: dict[str, set[str]] = {}  # workflow_id -> confirming nodes
-        self._workflow_final_results: dict[str, dict[str, WorkflowFinalResult]] = {}  # job_id -> {workflow_id -> result}
-        self._workflow_by_id: dict[str, Workflow] = {}  # workflow_id -> workflow instance (cleared on job completion)
 
         # Job leader tracking (Context Consistency Protocol)
         # Each job has one leader manager responsible for context consistency
@@ -289,18 +285,6 @@ class ManagerServer(HealthAwareServer):
         # Maps workflow_id -> asyncio.Event (set when workflow completes)
         self._workflow_completion_events: dict[str, asyncio.Event] = {}
 
-        # Multi-worker workflow dispatch tracking
-        # Maps parent workflow_id -> list of sub-workflow IDs dispatched to workers
-        self._sub_workflow_mapping: dict[str, list[str]] = {}
-        # Maps sub-workflow_id -> latest progress update from that worker
-        self._sub_workflow_progress: dict[str, WorkflowProgress] = {}
-        # Maps sub-workflow_id -> final result from that worker
-        self._sub_workflow_results: dict[str, WorkflowFinalResult] = {}
-
-        # Per-job locks for thread-safe access to job-related data structures
-        # Prevents race conditions when multiple workers report results concurrently
-        self._job_locks: dict[str, asyncio.Lock] = {}
-
         # Core availability event - signaled when cores become available
         # Waiting workflows can wait on this instead of polling
         self._cores_available_event: asyncio.Event = asyncio.Event()
@@ -308,14 +292,6 @@ class ManagerServer(HealthAwareServer):
         # Lock for atomic core selection and reservation
         # Prevents race conditions when multiple workflows dispatch concurrently
         self._core_allocation_lock: asyncio.Lock | None = None
-
-        # Unconfirmed workflow dispatch tracking
-        # When we dispatch a workflow, we optimistically decrement available_cores locally.
-        # The workflow is "unconfirmed" until we receive a progress update with
-        # worker_workflow_assigned_cores > 0, at which point we switch to using
-        # worker_available_cores from the progress update as the authoritative source.
-        # Maps sub_workflow_id -> (worker_id, cores_reserved)
-        self._unconfirmed_dispatches: dict[str, tuple[str, int]] = {}
 
         # Lock for dispatch synchronization (used by WorkflowDispatcher)
         self._eager_dispatch_lock: asyncio.Lock | None = None
@@ -3625,10 +3601,7 @@ class ManagerServer(HealthAwareServer):
             parent_workflow_id = self._get_parent_workflow_id(progress.workflow_id)
 
             if parent_workflow_id is not None:
-                # This is a sub-workflow - store in both legacy and new systems
-                self._sub_workflow_progress[progress.workflow_id] = progress
-
-                # Update SubWorkflowInfo.progress in the new JobManager system
+                # This is a sub-workflow - update SubWorkflowInfo.progress in JobManager
                 await self._job_manager.update_workflow_progress(progress.workflow_id, progress)
 
                 # Update worker available cores based on cores_completed
@@ -3647,10 +3620,6 @@ class ManagerServer(HealthAwareServer):
 
                 # Use aggregated progress for job updates
                 progress = aggregated_progress
-
-            # Store progress in sub_workflow_progress (for non-sub-workflows too)
-            old_progress = self._sub_workflow_progress.get(progress.workflow_id)
-            self._sub_workflow_progress[progress.workflow_id] = progress
 
             # Update job state via JobManager
             job = self._job_manager.get_job_by_id(progress.job_id)
@@ -3679,7 +3648,7 @@ class ManagerServer(HealthAwareServer):
 
                 # Update worker available cores based on cores_completed (for single-worker case)
                 if parent_workflow_id is None:
-                    await self._update_worker_cores_from_progress(progress, old_progress)
+                    await self._update_worker_cores_from_progress(progress, None)
 
                 self._increment_version()
 
@@ -3826,21 +3795,11 @@ class ManagerServer(HealthAwareServer):
                         if self._workflow_dispatcher:
                             self._workflow_dispatcher.signal_cores_available()
 
-                if parent_workflow_id is not None:
-                    # This is a sub-workflow - store and check if parent is complete
-                    self._sub_workflow_results[result.workflow_id] = result
+                # Store final result in JobManager first
+                await self._job_manager.record_sub_workflow_result(result.workflow_id, result)
 
-                    # Debug: log sub-workflow tracking state
-                    sub_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
-                    stored_results = [sid for sid in sub_ids if sid in self._sub_workflow_results]
-                    await self._udp_logger.log(
-                        ServerInfo(
-                            message=f"Sub-workflow tracking: parent={parent_workflow_id}, expected={sub_ids}, have_results={stored_results}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
+                if parent_workflow_id is not None:
+                    # This is a sub-workflow - check if parent is complete
 
                     # Handle context updates from sub-workflow
                     if result.context_updates and len(result.context_updates) > 0:
@@ -3853,33 +3812,6 @@ class ManagerServer(HealthAwareServer):
                     if not self._is_parent_workflow_complete(parent_workflow_id):
                         # More sub-workflows pending - just ack
                         return b'ok'
-
-                    sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
-
-                    if not sub_workflow_ids:
-                        return b'ok'  # No sub-workflows registered - just ack
-
-                    # Collect all sub-workflow results
-                    sub_results = [
-                        self._sub_workflow_results.get(sub_id)
-                        for sub_id in sub_workflow_ids
-                        if sub_id in self._sub_workflow_results
-                    ]
-
-                    if not sub_results or len(sub_results) != len(sub_workflow_ids):
-                        # Not all sub-workflows have completed
-                        return b'ok'  # Just ack - more results expected
-
-                    # Clean up sub-workflow tracking now that all results are in
-                    cleaned_sub_ids = self._sub_workflow_mapping.pop(parent_workflow_id, [])
-                    for sub_id in cleaned_sub_ids:
-                        self._sub_workflow_progress.pop(sub_id, None)
-                        self._sub_workflow_results.pop(sub_id, None)
-
-                # Store final result (either original or aggregated)
-                if result.job_id not in self._workflow_final_results:
-                    self._workflow_final_results[result.job_id] = {}
-                self._workflow_final_results[result.job_id][result.workflow_id] = result
 
                 # Handle context updates (for dependent workflows) - only for non-sub-workflows
                 # Sub-workflows already had context applied above
@@ -4045,35 +3977,16 @@ class ManagerServer(HealthAwareServer):
 
     def _is_job_complete(self, job_id: str) -> bool:
         """Check if all workflows in a job have completed."""
-        # =================================================================
-        # Check via JobManager (new system)
-        # =================================================================
         # Note: Use get_job_by_id(), not get_job() - the latter expects a full token string
         job_info = self._job_manager.get_job_by_id(job_id)
-        if job_info:
-            all_complete = all(
-                wf.status in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.AGGREGATED)
-                for wf in job_info.workflows.values()
-            )
-            if all_complete and job_info.workflows:
-                return True
-
-        # =================================================================
-        # Legacy check (fallback during migration)
-        # =================================================================
-        job = self._job_manager.get_job_by_id(job_id)
-        if not job or not job.workflows:
+        if not job_info or not job_info.workflows:
             return False
 
-        final_results = self._workflow_final_results.get(job_id, {})
-
-        # Job is complete when we have final results for ALL workflows in the job,
-        # not just the ones that have been dispatched so far.
-        # This is critical for eager dispatch where workflows are dispatched
-        # one at a time as their dependencies become satisfied.
-        total_workflows = len(job.workflows)
-
-        return len(final_results) >= total_workflows
+        return all(
+            wf.status in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
+                          WorkflowStatus.AGGREGATED, WorkflowStatus.AGGREGATION_FAILED)
+            for wf in job_info.workflows.values()
+        )
 
     def _get_parent_workflow_id(self, sub_workflow_id: str) -> str | None:
         """
@@ -4096,15 +4009,23 @@ class ManagerServer(HealthAwareServer):
 
         Returns True if all sub-workflows have final results stored.
         """
-        sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
-        if not sub_workflow_ids:
+        # Get job from workflow token
+        job = self._job_manager.get_job_for_workflow(parent_workflow_id)
+        if not job:
+            return True
+
+        # Find sub-workflows for this parent workflow
+        parent_sub_workflows = [
+            sub_wf for sub_wf in job.sub_workflows.values()
+            if str(sub_wf.parent_token) == parent_workflow_id
+        ]
+
+        if not parent_sub_workflows:
             # No sub-workflows tracked - might be single-worker dispatch
             return True
 
-        for sub_id in sub_workflow_ids:
-            if sub_id not in self._sub_workflow_results:
-                return False
-        return True
+        # Check if all have results
+        return all(sub_wf.result is not None for sub_wf in parent_sub_workflows)
 
     def _aggregate_sub_workflow_progress(self, parent_workflow_id: str) -> WorkflowProgress | None:
         """
@@ -4253,34 +4174,46 @@ class ManagerServer(HealthAwareServer):
         self,
         parent_workflow_id: str,
     ) -> WorkflowFinalResult | None:
+        """
+        Aggregate final results from all sub-workflows into a unified result.
+
+        Uses Results.merge_results() to combine WorkflowResults from all sub-workflows.
+        This follows the same pattern as RemoteGraphManager.
+
+        Args:
+            parent_workflow_id: 4-part workflow token (DC:manager:job_id:workflow_id)
+
+        Returns None if aggregation fails.
+        """
         try:
+            # Get job from workflow token
+            job = self._job_manager.get_job_for_workflow(parent_workflow_id)
+            if not job:
+                return None
 
-            """
-            Aggregate final results from all sub-workflows into a unified result.
+            # Get workflow info to access the workflow instance
+            wf_info = job.workflows.get(parent_workflow_id)
+            if not wf_info:
+                return None
 
-            Uses Results.merge_results() to combine WorkflowResults from all sub-workflows.
-            This follows the same pattern as RemoteGraphManager.
+            # Find sub-workflows for this parent workflow
+            parent_sub_workflows = [
+                sub_wf for sub_wf in job.sub_workflows.values()
+                if str(sub_wf.parent_token) == parent_workflow_id
+            ]
 
-            Returns None if aggregation fails.
-            """
-            sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
-        
-            if not sub_workflow_ids:
+            if not parent_sub_workflows:
                 return None
 
             # Collect all sub-workflow results
             sub_results = [
-                self._sub_workflow_results.get(sub_id)
-                for sub_id in sub_workflow_ids
-                if sub_id in self._sub_workflow_results
+                sub_wf.result for sub_wf in parent_sub_workflows
+                if sub_wf.result is not None
             ]
 
-            if not sub_results or len(sub_results) != len(sub_workflow_ids):
+            if not sub_results or len(sub_results) != len(parent_sub_workflows):
                 # Not all sub-workflows have completed
                 return None
-
-            # Extract job_id from parent workflow_id (format: job_id:workflow_idx)
-            job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
 
             # Determine overall status (any failure = failure)
             overall_status = WorkflowStatus.COMPLETED.value
@@ -4300,13 +4233,11 @@ class ManagerServer(HealthAwareServer):
                 try:
                     workflow_stats_list.extend(r.results.values())
                 except Exception:
-                    import traceback
-                    print(traceback.format_exc())
                     # Skip malformed results
                     pass
-                
-            workflow = self._workflow_by_id.get(parent_workflow_id)
-            print('GOT WORKFLOW', workflow.name)
+
+            # Get workflow instance for hooks
+            workflow = wf_info.workflow
             if workflow is None:
                 return None
 
@@ -4345,9 +4276,9 @@ class ManagerServer(HealthAwareServer):
                     except Exception:
                         pass
 
-            # Create aggregated final resultResults(
+            # Create aggregated final result
             return WorkflowFinalResult(
-                job_id=job_id,
+                job_id=job.job_id,
                 workflow_id=parent_workflow_id,
                 workflow_name=sub_results[0].workflow_name,
                 status=overall_status,
@@ -4355,10 +4286,11 @@ class ManagerServer(HealthAwareServer):
                 context_updates=cloudpickle.dumps(merged_context) if merged_context else b'',
                 error="; ".join(errors) if errors else None,
             )
-        
+
         except Exception:
             import traceback
             print(traceback.format_exc())
+            return None
 
     async def _handle_job_completion(self, job_id: str) -> None:
         """Handle job completion - build and send JobFinalResult."""
@@ -4366,39 +4298,36 @@ class ManagerServer(HealthAwareServer):
         if not job:
             return
 
-        # Determine overall status
-        final_results = self._workflow_final_results.get(job_id, {})
-        errors = []
+        # Collect results from sub_workflows
+        errors: list[str] = []
         has_failures = False
         max_elapsed = 0.0
+        workflow_results: list[WorkflowResult] = []
 
-        for wf_result in final_results.values():
-            if wf_result.status == WorkflowStatus.FAILED.value:
-                has_failures = True
-                if wf_result.error:
-                    errors.append(f"{wf_result.workflow_name}: {wf_result.error}")
+        for sub_wf in job.sub_workflows.values():
+            wf_result = sub_wf.result
+            if wf_result:
+                if wf_result.status == WorkflowStatus.FAILED.value:
+                    has_failures = True
+                    if wf_result.error:
+                        errors.append(f"{wf_result.workflow_name}: {wf_result.error}")
 
-        # Calculate max elapsed from progress stored in _sub_workflow_progress
-        for wf_info in job.workflows.values():
-            workflow_id = wf_info.token.workflow_id or ""
-            wf_progress = self._sub_workflow_progress.get(workflow_id)
-            if wf_progress and wf_progress.elapsed_seconds > max_elapsed:
-                max_elapsed = wf_progress.elapsed_seconds
+                workflow_results.append(WorkflowResult(
+                    workflow_id=str(sub_wf.token),
+                    workflow_name=wf_result.workflow_name,
+                    status=wf_result.status,
+                    results=wf_result.results,
+                    error=wf_result.error,
+                ))
 
-        # Build workflow results (without context for gates)
-        workflow_results = []
-        for wf_id, wf_result in final_results.items():
-            workflow_results.append(WorkflowResult(
-                workflow_id=wf_id,
-                workflow_name=wf_result.workflow_name,
-                status=wf_result.status,
-                results=wf_result.results,  # Already cloudpickled WorkflowStats
-                error=wf_result.error,
-            ))
+            # Calculate max elapsed from progress
+            if sub_wf.progress and sub_wf.progress.elapsed_seconds > max_elapsed:
+                max_elapsed = sub_wf.progress.elapsed_seconds
 
         # Determine final status
+        result_count = len(workflow_results)
         if has_failures:
-            job_status = JobStatus.FAILED.value if len(errors) == len(final_results) else "PARTIAL"
+            job_status = JobStatus.FAILED.value if len(errors) == result_count else "PARTIAL"
         else:
             job_status = JobStatus.COMPLETED.value
 
@@ -4406,17 +4335,14 @@ class ManagerServer(HealthAwareServer):
         job.elapsed_seconds = max_elapsed
         job.timestamp = time.monotonic()
 
-        # Extract completion counts from WorkflowStats if progress-based counts are zero.
-        # This handles test workflows that complete before progress updates are polled.
-        # Non-test workflows will have zero counts in both places (correct behavior).
-        # Note: JobInfo uses workflows_completed/workflows_failed, not total_completed/total_failed
+        # Extract completion counts from WorkflowStats if progress-based counts are zero
         total_completed = job.workflows_completed
         total_failed = job.workflows_failed
 
         if total_completed == 0 and total_failed == 0:
-            # Try to extract from WorkflowStats in final results
-            for wf_result in final_results.values():
-                if wf_result.results and len(wf_result.results) > 0:
+            for sub_wf in job.sub_workflows.values():
+                wf_result = sub_wf.result
+                if wf_result and wf_result.results and len(wf_result.results) > 0:
                     try:
                         workflow_stats = cloudpickle.loads(wf_result.results)
                         if isinstance(workflow_stats, dict):
@@ -4424,7 +4350,6 @@ class ManagerServer(HealthAwareServer):
                             total_completed += stats.get("succeeded", 0) or 0
                             total_failed += stats.get("failed", 0) or 0
                     except Exception:
-                        # If unpickling fails, keep the progress-based counts
                         pass
 
         # Build JobFinalResult
@@ -4457,17 +4382,6 @@ class ManagerServer(HealthAwareServer):
         callback = self._job_callbacks.get(job_id)
         if callback and not (self._known_gates or self._gate_addrs):
             await self._send_job_final_result_to_client(job_final, callback)
-
-        # Clean up workflow_by_id for this job
-        self._cleanup_workflow_by_id_for_job(job_id)
-
-    def _cleanup_workflow_by_id_for_job(self, job_id: str) -> None:
-        """Remove all workflow entries for a job from _workflow_by_id."""
-        # Find and remove all workflow IDs that start with this job_id
-        prefix = f"{job_id}:"
-        to_remove = [wf_id for wf_id in self._workflow_by_id if wf_id.startswith(prefix)]
-        for wf_id in to_remove:
-            self._workflow_by_id.pop(wf_id, None)
 
     async def _send_job_final_result_to_gates(self, job_final: JobFinalResult) -> None:
         """Send JobFinalResult to all known gates."""
@@ -5141,15 +5055,21 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         """
         Handle a workflow failure and potentially retry on another worker.
-        
+
         Called when a workflow reports FAILED status. Will attempt to
         reschedule on a different worker up to max_workflow_retries times.
         """
         workflow_id = progress.workflow_id
         job_id = progress.job_id
-        
-        # Get current assignment
-        current_worker = self._workflow_assignments.get(workflow_id)
+
+        # Get current assignment from JobManager
+        job = self._job_manager.get_job_for_sub_workflow(workflow_id)
+        if not job:
+            return
+        sub_wf = job.sub_workflows.get(workflow_id)
+        if not sub_wf:
+            return
+        current_worker = sub_wf.worker_id
         if not current_worker:
             return
         
@@ -5211,9 +5131,10 @@ class ManagerServer(HealthAwareServer):
         job = self._job_manager.get_job_by_id(job_id)
         if not job:
             return False
-        
-        # Find the workflow progress from _sub_workflow_progress
-        workflow_progress = self._sub_workflow_progress.get(workflow_id)
+
+        # Find the workflow progress from JobManager
+        sub_wf = job.sub_workflows.get(workflow_id)
+        workflow_progress = sub_wf.progress if sub_wf else None
         if not workflow_progress:
             return False
         
@@ -5272,12 +5193,7 @@ class ManagerServer(HealthAwareServer):
         
         # Update tracking - preserve original dispatch bytes
         self._workflow_retries[workflow_id] = (retry_count, original_dispatch_bytes, failed_workers)
-        # Extract job_id from workflow_id (format: "job_id:workflow_index")
-        job_id = workflow_id.rsplit(":", 1)[0] if ":" in workflow_id else workflow_id
-        if job_id not in self._workflow_assignments:
-            self._workflow_assignments[job_id] = {}
-        self._workflow_assignments[job_id][workflow_id] = new_worker
-        
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -5567,10 +5483,6 @@ class ManagerServer(HealthAwareServer):
             self._job_manager.complete_job,
             job_id,
         )
-
-        # Remove workflow assignments for this job
-        # _workflow_assignments is keyed by job_id, not workflow_id
-        self._workflow_assignments.pop(job_id, None)
 
         # Find and remove workflow retries and completion events for this job
         # These are keyed by workflow_id (format: "{job_id}:{idx}")
@@ -5895,16 +5807,12 @@ class ManagerServer(HealthAwareServer):
         """Handle provision commit from leader."""
         try:
             commit = ProvisionCommit.load(data)
-            
-            # Update our tracking - extract job_id from workflow_id
-            job_id = commit.workflow_id.rsplit(":", 1)[0] if ":" in commit.workflow_id else commit.workflow_id
-            if job_id not in self._workflow_assignments:
-                self._workflow_assignments[job_id] = {}
-            self._workflow_assignments[job_id][commit.workflow_id] = commit.target_worker
+
+            # Workflow assignments are tracked in JobManager via sub_workflows
             self._increment_version()
-            
+
             return b'ok'
-            
+
         except Exception as e:
             await self.handle_exception(e, "receive_provision_commit")
             return b'error'
@@ -5978,7 +5886,7 @@ class ManagerServer(HealthAwareServer):
         """Handle job cancellation (from gate or client)."""
         try:
             cancel = CancelJob.load(data)
-            
+
             job = self._job_manager.get_job_by_id(cancel.job_id)
             if not job:
                 ack = CancelAck(
@@ -5987,34 +5895,37 @@ class ManagerServer(HealthAwareServer):
                     error="Job not found",
                 )
                 return ack.dump()
-            
-            # Cancel all workflows on workers
+
+            # Cancel all workflows on workers via sub_workflows from JobManager
             cancelled_count = 0
-            for workflow_id, worker_id in list(self._workflow_assignments.items()):
-                if workflow_id.startswith(cancel.job_id + ":"):
-                    worker = self._workers.get(worker_id)
-                    if worker:
+            workers_notified: set[str] = set()
+            for sub_wf in job.sub_workflows.values():
+                worker_id = sub_wf.worker_id
+                if worker_id and worker_id not in workers_notified:
+                    worker = self._worker_pool.get_worker(worker_id)
+                    if worker and worker.registration:
                         try:
                             await self.send_tcp(
-                                (worker.node.host, worker.node.port),
+                                (worker.registration.node.host, worker.registration.node.port),
                                 "cancel_job",
                                 cancel.dump(),
                                 timeout=2.0,
                             )
                             cancelled_count += 1
+                            workers_notified.add(worker_id)
                         except Exception:
                             pass
-            
+
             job.status = JobStatus.CANCELLED.value
             self._increment_version()
-            
+
             ack = CancelAck(
                 job_id=cancel.job_id,
                 cancelled=True,
                 workflows_cancelled=cancelled_count,
             )
             return ack.dump()
-            
+
         except Exception as e:
             await self.handle_exception(e, "receive_cancel_job")
             ack = CancelAck(
