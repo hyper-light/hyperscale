@@ -13,8 +13,11 @@ Key responsibilities:
 """
 
 import asyncio
+import logging
 import time
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 from hyperscale.distributed_rewrite.models import (
     WorkerHeartbeat,

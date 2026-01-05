@@ -19,7 +19,10 @@ Design principles:
 """
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -119,12 +122,17 @@ class CoreAllocator:
             AllocationResult with success status and allocated core indices
         """
         if cores_needed <= 0:
+            logger.warning("Allocation request with invalid cores_needed=%d", cores_needed)
             return AllocationResult(
                 success=False,
                 error="cores_needed must be positive",
             )
 
         if cores_needed > self._total_cores:
+            logger.warning(
+                "Allocation request for %d cores exceeds total %d",
+                cores_needed, self._total_cores
+            )
             return AllocationResult(
                 success=False,
                 error=f"Requested {cores_needed} cores but only {self._total_cores} total available",

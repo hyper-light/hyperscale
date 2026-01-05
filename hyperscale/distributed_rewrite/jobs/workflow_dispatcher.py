@@ -14,8 +14,11 @@ Key responsibilities:
 """
 
 import asyncio
+import logging
 import time
 from typing import Any, Callable, Coroutine
+
+logger = logging.getLogger(__name__)
 
 import cloudpickle
 import networkx
@@ -160,8 +163,12 @@ class WorkflowDispatcher:
                     if dep_id:
                         graph.add_edge(dep_id, workflow_id)
 
-            except Exception:
+            except Exception as e:
                 # Registration failed - job should be marked failed by caller
+                logger.exception(
+                    "Failed to register workflow %s for job %s: %s",
+                    workflow_id, job_id, e
+                )
                 return False
 
         # Register pending workflows
@@ -477,7 +484,11 @@ class WorkflowDispatcher:
                     else:
                         await self._worker_pool.release_cores(worker_id, worker_cores)
                         failed_dispatches.append((worker_id, worker_cores))
-                except Exception:
+                except Exception as e:
+                    logger.warning(
+                        "Exception dispatching to worker %s for workflow %s: %s",
+                        worker_id, pending.workflow_id, e
+                    )
                     await self._worker_pool.release_cores(worker_id, worker_cores)
                     failed_dispatches.append((worker_id, worker_cores))
 
@@ -493,8 +504,12 @@ class WorkflowDispatcher:
                 # PARTIAL success - some dispatches succeeded, some failed
                 # This is still considered a success, but we log the partial failure
                 # The workflow will complete with reduced parallelism
-                # TODO: Consider implementing re-dispatch for failed workers
-                pass
+                logger.warning(
+                    "Partial dispatch for workflow %s: %d/%d workers succeeded",
+                    pending.workflow_id,
+                    len(successful_dispatches),
+                    len(successful_dispatches) + len(failed_dispatches),
+                )
 
             return True
 
@@ -559,16 +574,22 @@ class WorkflowDispatcher:
             for job_id, workflow_id, reason in evicted:
                 try:
                     await self._on_workflow_evicted(job_id, workflow_id, reason)
-                except Exception:
-                    pass  # Don't let callback failures propagate
+                except Exception as e:
+                    logger.exception(
+                        "Exception in eviction callback for workflow %s: %s",
+                        workflow_id, e
+                    )
 
         # Call dispatch failed callback outside the lock
         if self._on_dispatch_failed:
             for job_id, workflow_id, reason in failed:
                 try:
                     await self._on_dispatch_failed(job_id, workflow_id, reason)
-                except Exception:
-                    pass  # Don't let callback failures propagate
+                except Exception as e:
+                    logger.exception(
+                        "Exception in dispatch_failed callback for workflow %s: %s",
+                        workflow_id, e
+                    )
 
         return evicted + failed
 
