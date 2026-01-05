@@ -25,11 +25,16 @@ Protocols:
 import asyncio
 import secrets
 import time
+import inspect
 from typing import Any
 
 import cloudpickle
+from collections import defaultdict
 import networkx
 
+from hyperscale.core.hooks import Hook
+from hyperscale.core.jobs.models import WorkflowResults
+from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.state.context import Context
 from hyperscale.core.jobs.workers.stage_priority import StagePriority
@@ -53,6 +58,8 @@ from hyperscale.distributed_rewrite.models import (
     NodeInfo,
     NodeRole,
     ManagerInfo,
+    ManagerPeerRegistration,
+    ManagerPeerRegistrationResponse,
     ManagerState,
     RegistrationResponse,
     WorkflowProgressAck,
@@ -91,11 +98,42 @@ from hyperscale.distributed_rewrite.models import (
     ContextForward,
     ContextLayerSync,
     ContextLayerSyncAck,
+    JobLeadershipAnnouncement,
+    JobLeadershipAck,
+    ManagerToWorkerRegistration,
+    ManagerToWorkerRegistrationAck,
+    PingRequest,
+    WorkerStatus,
+    ManagerPingResponse,
+    WorkflowQueryRequest,
+    WorkflowStatusInfo,
+    WorkflowQueryResponse,
+    EagerWorkflowEntry,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 from hyperscale.reporting.results import Results
+
+# New modular classes for job/workflow management
+from hyperscale.distributed_rewrite.nodes.job_manager import (
+    JobManager,
+    TrackingToken,
+    WorkflowState,
+    JobInfo,
+    WorkflowInfo,
+    SubWorkflowInfo,
+)
+from hyperscale.distributed_rewrite.nodes.worker_pool import (
+    WorkerPool,
+    WorkerInfo,
+    WorkerHealth,
+)
+from hyperscale.distributed_rewrite.nodes.workflow_dispatcher import (
+    WorkflowDispatcher,
+    PendingWorkflow,
+    DispatchPriority,
+)
 
 
 class ManagerServer(HealthAwareServer):
@@ -131,8 +169,9 @@ class ManagerServer(HealthAwareServer):
         dc_id: str = "default",
         gate_addrs: list[tuple[str, int]] | None = None,
         gate_udp_addrs: list[tuple[str, int]] | None = None,  # For SWIM if gates exist
-        manager_peers: list[tuple[str, int]] | None = None,  # TCP addresses
-        manager_udp_peers: list[tuple[str, int]] | None = None,  # UDP for SWIM cluster
+        seed_managers: list[tuple[str, int]] | None = None,  # TCP seed addresses for peer discovery
+        manager_peers: list[tuple[str, int]] | None = None,  # DEPRECATED: use seed_managers
+        manager_udp_peers: list[tuple[str, int]] | None = None,  # UDP for initial SWIM cluster join
         quorum_timeout: float = 5.0,
         max_workflow_retries: int = 3,  # Max retry attempts per workflow
         workflow_timeout: float = 300.0,  # Workflow timeout in seconds
@@ -167,23 +206,34 @@ class ManagerServer(HealthAwareServer):
         self._gate_addrs = gate_addrs or []  # TCP
         self._current_gate: tuple[str, int] | None = None
         
-        # Manager peers for quorum (TCP) and SWIM cluster (UDP)
-        self._manager_peers = manager_peers or []  # TCP
-        self._manager_udp_peers = manager_udp_peers or []  # UDP for SWIM
-        
+        # Seed managers for peer discovery (like workers have seed_managers)
+        # Backwards compat: accept manager_peers as alias for seed_managers
+        self._seed_managers = seed_managers or manager_peers or []  # TCP
+        self._manager_udp_peers = manager_udp_peers or []  # UDP for initial SWIM join
+
+        # Known manager peers (discovered dynamically, like worker's _known_managers)
+        # Maps node_id -> ManagerInfo
+        self._known_manager_peers: dict[str, ManagerInfo] = {}
+
         # Track manager peer addresses for failure detection
         # Maps UDP addr -> TCP addr for peer managers
         self._manager_udp_to_tcp: dict[tuple[str, int], tuple[str, int]] = {}
-        for i, tcp_addr in enumerate(self._manager_peers):
+        for i, tcp_addr in enumerate(self._seed_managers):
             if i < len(self._manager_udp_peers):
                 self._manager_udp_to_tcp[self._manager_udp_peers[i]] = tcp_addr
-        
-        # Track active manager peers (removed when SWIM marks as dead)
-        self._active_manager_peers: set[tuple[str, int]] = set(self._manager_peers)
-        
+
+        # Track active manager peers by node_id (removed when SWIM marks as dead)
+        self._active_manager_peer_ids: set[str] = set()
+
+        # Legacy: Track active peers by TCP addr for backwards compat during transition
+        self._active_manager_peers: set[tuple[str, int]] = set(self._seed_managers)
+
         # Track manager peer info from ManagerHeartbeat (proper node_ids, leadership, etc)
         # Maps UDP addr -> ManagerHeartbeat for peers we've heard from via SWIM
         self._manager_peer_info: dict[tuple[str, int], ManagerHeartbeat] = {}
+
+        # Set of manager node_ids we've already registered with (avoid duplicate registrations)
+        self._registered_with_managers: set[str] = set()
         
         # Registered workers (indexed by node_id)
         self._workers: dict[str, WorkerRegistration] = {}  # node_id -> registration
@@ -205,10 +255,13 @@ class ManagerServer(HealthAwareServer):
         self._pending_provisions: dict[str, ProvisionRequest] = {}  # workflow_id -> request
         self._provision_confirmations: dict[str, set[str]] = {}  # workflow_id -> confirming nodes
         self._workflow_final_results: dict[str, dict[str, WorkflowFinalResult]] = {}  # job_id -> {workflow_id -> result}
-        
+        self._workflow_by_id: dict[str, Workflow] = {}  # workflow_id -> workflow instance (cleared on job completion)
+
         # Job leader tracking (Context Consistency Protocol)
         # Each job has one leader manager responsible for context consistency
         self._job_leaders: dict[str, str] = {}  # job_id -> leader_node_id
+        self._job_leader_addrs: dict[str, tuple[str, int]] = {}  # job_id -> (host, tcp_port)
+        self._job_fencing_tokens: dict[str, int] = {}  # job_id -> monotonic fencing token
         self._job_layer_version: dict[str, int] = {}  # job_id -> monotonic layer version
         self._job_contexts: dict[str, Context] = {}  # job_id -> Context for dependent workflows
         self._context_lamport_clock: int = 0  # For generating timestamps on context updates
@@ -217,6 +270,9 @@ class ManagerServer(HealthAwareServer):
         # job_id -> callback address for push notifications
         self._job_callbacks: dict[str, tuple[str, int]] = {}
         self._client_callbacks: dict[str, tuple[str, int]] = {}  # Alias for backwards compat
+
+        # Job submissions for eager dispatch (need access to submission params)
+        self._job_submissions: dict[str, JobSubmission] = {}  # job_id -> submission
         
         # Workflow retry tracking
         # Maps workflow_id -> (retry_count, original_dispatch, failed_workers)
@@ -251,9 +307,33 @@ class ManagerServer(HealthAwareServer):
         # Maps sub-workflow_id -> final result from that worker
         self._sub_workflow_results: dict[str, WorkflowFinalResult] = {}
 
+        # Per-job locks for thread-safe access to job-related data structures
+        # Prevents race conditions when multiple workers report results concurrently
+        self._job_locks: dict[str, asyncio.Lock] = {}
+
         # Core availability event - signaled when cores become available
         # Waiting workflows can wait on this instead of polling
         self._cores_available_event: asyncio.Event = asyncio.Event()
+
+        # Lock for atomic core selection and reservation
+        # Prevents race conditions when multiple workflows dispatch concurrently
+        self._core_allocation_lock: asyncio.Lock | None = None
+
+        # Unconfirmed workflow dispatch tracking
+        # When we dispatch a workflow, we optimistically decrement available_cores locally.
+        # The workflow is "unconfirmed" until we receive a progress update with
+        # worker_workflow_assigned_cores > 0, at which point we switch to using
+        # worker_available_cores from the progress update as the authoritative source.
+        # Maps sub_workflow_id -> (worker_id, cores_reserved)
+        self._unconfirmed_dispatches: dict[str, tuple[str, int]] = {}
+
+        # Eager dispatch tracking
+        # Pending workflows waiting for dependencies and/or cores
+        # Maps workflow_name -> EagerWorkflowEntry (contains all dispatch info)
+        self._eager_pending_workflows: dict[str, EagerWorkflowEntry] = {}
+        # Lock to prevent concurrent eager dispatch checks
+        self._eager_dispatch_lock: asyncio.Lock | None = None
+        self._workflow_results_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # Fencing tokens for at-most-once
         self._fence_token = 0
@@ -279,7 +359,32 @@ class ManagerServer(HealthAwareServer):
         # Job cleanup configuration
         self._job_max_age: float = 3600.0  # 1 hour max age for completed jobs
         self._job_cleanup_interval: float = 60.0  # Check every minute
-        
+
+        # =======================================================================
+        # New Modular Classes - Gradual Migration
+        # These classes will progressively replace the direct dict-based tracking
+        # above. During migration, both systems may coexist.
+        # =======================================================================
+
+        # JobManager for race-safe job/workflow state with TrackingToken support
+        # Uses per-job locks and globally unique tracking tokens
+        self._job_manager = JobManager(
+            datacenter=dc_id,
+            manager_id=self._node_id.short,  # Will be set after super().__init__
+        )
+
+        # WorkerPool for worker registration and resource tracking
+        # Integrates with SWIM for health monitoring
+        self._worker_pool = WorkerPool(
+            health_grace_period=30.0,
+            get_swim_status=self._get_swim_status_for_worker,
+        )
+
+        # WorkflowDispatcher for dependency-aware workflow dispatch
+        # Coordinates with JobManager and WorkerPool for allocation
+        # Initialized lazily after start() when we have full context
+        self._workflow_dispatcher: WorkflowDispatcher | None = None
+
         # Inject state embedder for Serf-style heartbeat embedding in SWIM messages
         self.set_state_embedder(ManagerStateEmbedder(
             get_node_id=lambda: self._node_id.full,
@@ -300,6 +405,10 @@ class ManagerServer(HealthAwareServer):
             on_manager_heartbeat=self._handle_manager_peer_heartbeat,
             on_gate_heartbeat=self._handle_gate_heartbeat,
             get_manager_state=lambda: self._manager_state.value,
+            get_tcp_host=lambda: self._host,
+            get_tcp_port=lambda: self._tcp_port,
+            get_udp_host=lambda: self._host,
+            get_udp_port=lambda: self._udp_port,
         ))
         
         # Register leadership callbacks (composition pattern - no override)
@@ -452,7 +561,81 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-    
+
+        # Check if the dead manager was leading any jobs
+        # If we're the cluster leader, take over those jobs
+        await self._handle_job_leader_failure(tcp_addr)
+
+    async def _handle_job_leader_failure(
+        self,
+        failed_manager_addr: tuple[str, int],
+    ) -> None:
+        """
+        Handle job leadership takeover when a job leader manager fails.
+
+        When a manager fails, the cluster leader takes over leadership
+        for any jobs that the failed manager was leading. This provides
+        automatic failover with the cluster leader acting as the
+        "leader of last resort" for orphaned jobs.
+
+        The cluster leader already has:
+        - Lease-based leadership (provides fencing)
+        - Term tracking (provides monotonic ordering)
+        - Quorum-based election (provides consistency)
+
+        By piggybacking on cluster leadership, we get these guarantees
+        for job leadership failover without a separate per-job election.
+        """
+        # Only cluster leader performs job takeover
+        if not self.is_leader():
+            return
+
+        # Find jobs led by the failed manager
+        orphaned_jobs: list[str] = []
+        for job_id, leader_addr in list(self._job_leader_addrs.items()):
+            if leader_addr == failed_manager_addr:
+                orphaned_jobs.append(job_id)
+
+        if not orphaned_jobs:
+            return
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Cluster leader taking over {len(orphaned_jobs)} jobs from failed manager at {failed_manager_addr}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # Take over leadership of each orphaned job
+        for job_id in orphaned_jobs:
+            # Update job leadership to self
+            old_leader = self._job_leaders.get(job_id)
+            old_token = self._job_fencing_tokens.get(job_id, 0)
+            new_token = old_token + 1  # Increment fencing token for new epoch
+
+            self._job_leaders[job_id] = self._node_id.full
+            self._job_leader_addrs[job_id] = (self._host, self._tcp_port)
+            self._job_fencing_tokens[job_id] = new_token
+
+            # Increment state version
+            self._increment_version()
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Took over job {job_id[:8]}... leadership (was: {old_leader[:8] if old_leader else 'unknown'}..., token: {old_token} -> {new_token})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Note: Job leadership will propagate via UDP heartbeats (Serf-style)
+            # The heartbeat includes job_leaderships with fencing tokens
+
     async def _sync_state_from_workers(self) -> None:
         """
         Request current state from all registered workers.
@@ -513,27 +696,28 @@ class ManagerServer(HealthAwareServer):
         Called when this manager becomes leader to get job-level metadata
         (retry counts, assignments, completion status) that workers don't have.
         """
-        if not self._manager_peers:
+        peer_addrs = self._get_active_peer_tcp_addrs()
+        if not peer_addrs:
             return
-        
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"New leader syncing job state from {len(self._manager_peers)} peer managers",
+                message=f"New leader syncing job state from {len(peer_addrs)} peer managers",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             )
         )
-        
+
         request = StateSyncRequest(
             requester_id=self._node_id.full,
             requester_role=NodeRole.MANAGER.value,
             since_version=0,  # Request full state
         )
-        
+
         sync_tasks = []
-        for peer_addr in self._manager_peers:
+        for peer_addr in peer_addrs:
             sync_tasks.append(
                 self._request_manager_peer_state(peer_addr, request)
             )
@@ -715,16 +899,42 @@ class ManagerServer(HealthAwareServer):
         manager_state: ManagerStateSnapshot,
     ) -> ManagerStateSnapshot | None:
         """
-        Process a manager state response and merge job state.
-        
-        Only merges jobs we don't know about or that have higher versions.
-        Does NOT override worker state - workers are source of truth for that.
+        Process a manager state response and merge state.
+
+        Merges:
+        - Workers: If peer has workers we don't know, register with them
+        - Jobs: Add jobs we don't have
+        - Job leaders, layer versions, contexts
         """
         # Check version for staleness
         peer_key = f"manager:{manager_state.node_id}"
         if self._versioned_clock.is_entity_stale(peer_key, manager_state.version):
             return None
-        
+
+        # Merge workers - if peer knows workers we don't, register with them
+        workers_discovered = 0
+        for worker_snapshot in manager_state.workers:
+            if worker_snapshot.node_id not in self._workers:
+                # Only process if we have full connection info
+                if worker_snapshot.host and worker_snapshot.tcp_port:
+                    workers_discovered += 1
+                    # Schedule registration with this worker
+                    self._task_runner.run(
+                        self._register_with_discovered_worker,
+                        worker_snapshot,
+                    )
+
+        if workers_discovered > 0:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Discovered {workers_discovered} workers from peer {manager_state.node_id}, registering...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
         # Merge job state - add jobs we don't have
         jobs_merged = 0
         for job_id, job_progress in manager_state.jobs.items():
@@ -732,18 +942,23 @@ class ManagerServer(HealthAwareServer):
                 # Create JobProgress for this job
                 self._jobs[job_id] = job_progress
                 jobs_merged += 1
-        
+
         # Merge job leader tracking (Context Consistency Protocol)
         for job_id, leader_id in manager_state.job_leaders.items():
             if job_id not in self._job_leaders:
                 self._job_leaders[job_id] = leader_id
-        
+
+        # Merge job leader addresses
+        for job_id, leader_addr in manager_state.job_leader_addrs.items():
+            if job_id not in self._job_leader_addrs:
+                self._job_leader_addrs[job_id] = leader_addr
+
         for job_id, layer_version in manager_state.job_layer_versions.items():
             # Accept higher layer versions
             current = self._job_layer_version.get(job_id, -1)
             if layer_version > current:
                 self._job_layer_version[job_id] = layer_version
-        
+
         # Deserialize and merge job contexts
         if manager_state.job_contexts:
             try:
@@ -758,7 +973,7 @@ class ManagerServer(HealthAwareServer):
                         )
             except Exception:
                 pass  # Ignore deserialization errors
-        
+
         if jobs_merged > 0:
             self._task_runner.run(
                 self._udp_logger.log,
@@ -769,8 +984,102 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-        
+
         return manager_state
+
+    async def _register_with_discovered_worker(
+        self,
+        worker_snapshot: WorkerStateSnapshot,
+    ) -> None:
+        """
+        Register with a worker discovered via state sync from another manager.
+
+        This ensures bidirectional consistency - if a follower has a worker
+        registration that the leader doesn't, the leader will register with
+        that worker to establish a direct connection.
+        """
+        worker_addr = (worker_snapshot.host, worker_snapshot.tcp_port)
+
+        # Don't re-register if we already know this worker
+        if worker_snapshot.node_id in self._workers:
+            return
+
+        try:
+            # Build manager info for registration
+            manager_info = ManagerInfo(
+                node_id=self._node_id.full,
+                host=self._host,
+                tcp_port=self._tcp_port,
+                udp_port=self._udp_port,
+                datacenter=self._node_id.datacenter,
+            )
+
+            registration = ManagerToWorkerRegistration(
+                manager=manager_info,
+                is_leader=self.is_leader(),
+                term=self._leader_election.state.current_term,
+                known_managers=self._get_known_peer_managers(),
+            )
+
+            response, _ = await self.send_tcp(
+                worker_addr,
+                action='manager_register',
+                data=registration.dump(),
+                timeout=2.0,
+            )
+
+            if response and isinstance(response, bytes) and response != b'error':
+                ack = ManagerToWorkerRegistrationAck.load(response)
+                if ack.accepted:
+
+                    # Use data from the worker's response, not the snapshot
+                    # This ensures we have accurate, up-to-date info from the worker
+                    worker_reg = WorkerRegistration(
+                        node=NodeInfo(
+                            node_id=ack.worker_id,
+                            host=worker_snapshot.host,
+                            port=worker_snapshot.tcp_port,
+                            udp_port=worker_snapshot.udp_port,
+                        ),
+                        total_cores=ack.total_cores,
+                        available_cores=ack.available_cores,
+                        memory_mb=0,  # Unknown from this flow
+                        available_memory_mb=0,
+                    )
+
+                    self._workers[ack.worker_id] = worker_reg
+                    self._worker_addr_to_id[worker_addr] = ack.worker_id
+                    self._worker_last_status[ack.worker_id] = time.monotonic()
+
+                    # Create initial status using response data
+                    self._worker_status[ack.worker_id] = WorkerHeartbeat(
+                        node_id=ack.worker_id,
+                        state=WorkerState.HEALTHY.value,
+                        available_cores=ack.available_cores,
+                        active_workflows={},
+                        version=0,
+                    )
+
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Registered with discovered worker {ack.worker_id[:8]}... at {worker_addr}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to register with discovered worker {worker_snapshot.node_id[:8]}...: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
     
     def _handle_embedded_worker_heartbeat(
         self,
@@ -805,23 +1114,115 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         """
         Handle ManagerHeartbeat received from peer managers via SWIM.
-        
+
         This enables:
         1. Proper node_id tracking for peers (instead of synthetic IDs)
         2. Leader tracking across the manager cluster
         3. Version-based stale update rejection
+        4. Dynamic peer discovery - register with newly discovered peers
+        5. Per-job leadership tracking via UDP (Serf-style)
+        6. Continuous refresh of _known_manager_peers from heartbeats
         """
+        # Don't process our own heartbeat
+        if heartbeat.node_id == self._node_id.full:
+            return
+
         # Check if update is stale using versioned clock
         if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
             return
-        
+
         # Store peer info keyed by UDP address
         self._manager_peer_info[source_addr] = heartbeat
-        
+
         # Update version tracking
         self._task_runner.run(
             self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
         )
+
+        # Use addresses from heartbeat if available, fallback to source_addr/convention
+        tcp_host = heartbeat.tcp_host if heartbeat.tcp_host else source_addr[0]
+        tcp_port = heartbeat.tcp_port if heartbeat.tcp_port else source_addr[1] - 1
+        tcp_addr = (tcp_host, tcp_port)
+
+        udp_host = heartbeat.udp_host if heartbeat.udp_host else source_addr[0]
+        udp_port = heartbeat.udp_port if heartbeat.udp_port else source_addr[1]
+        udp_addr = (udp_host, udp_port)
+
+        # Process job leadership claims from this peer (UDP-based consistency)
+        self._process_job_leadership_heartbeat(heartbeat, tcp_addr)
+
+        # Always update _known_manager_peers to keep it fresh from heartbeats
+        # This ensures leadership status and other info stays current
+        is_new_peer = heartbeat.node_id not in self._known_manager_peers
+
+        peer_info = ManagerInfo(
+            node_id=heartbeat.node_id,
+            tcp_host=tcp_host,
+            tcp_port=tcp_port,
+            udp_host=udp_host,
+            udp_port=udp_port,
+            datacenter=heartbeat.datacenter,
+            is_leader=heartbeat.is_leader,
+        )
+        self._known_manager_peers[heartbeat.node_id] = peer_info
+        self._active_manager_peer_ids.add(heartbeat.node_id)
+        self._manager_udp_to_tcp[source_addr] = tcp_addr
+        self._active_manager_peers.add(tcp_addr)
+
+        if is_new_peer:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Discovered new peer manager via SWIM: {heartbeat.node_id} (leader={heartbeat.is_leader})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Register with the newly discovered peer for consistency
+            # This ensures bidirectional relationship is established
+            if heartbeat.node_id not in self._registered_with_managers:
+                self._task_runner.run(
+                    self._register_with_peer_manager,
+                    tcp_addr,
+                )
+
+    def _process_job_leadership_heartbeat(
+        self,
+        heartbeat: ManagerHeartbeat,
+        peer_tcp_addr: tuple[str, int],
+    ) -> None:
+        """
+        Process job leadership claims from a peer's heartbeat.
+
+        Uses fencing tokens for consistency:
+        - Accept leadership claim only if fencing token is higher than what we have
+        - This prevents stale leaders from reasserting leadership after recovery
+
+        This is the UDP-based job leadership protocol (Serf-style piggybacking).
+        """
+        for job_id, (fencing_token, layer_version) in heartbeat.job_leaderships.items():
+            current_leader = self._job_leaders.get(job_id)
+            current_token = self._job_fencing_tokens.get(job_id, -1)
+
+            # Accept if:
+            # 1. We don't know about this job yet, OR
+            # 2. The fencing token is higher (newer leadership epoch)
+            if current_leader is None or fencing_token > current_token:
+                # Update job leadership
+                self._job_leaders[job_id] = heartbeat.node_id
+                self._job_leader_addrs[job_id] = peer_tcp_addr
+                self._job_fencing_tokens[job_id] = fencing_token
+
+                # Update layer version if higher
+                current_layer = self._job_layer_version.get(job_id, -1)
+                if layer_version > current_layer:
+                    self._job_layer_version[job_id] = layer_version
+
+                # Initialize context if needed
+                if job_id not in self._job_contexts:
+                    self._job_contexts[job_id] = Context()
     
     def _handle_gate_heartbeat(
         self,
@@ -982,11 +1383,19 @@ class ManagerServer(HealthAwareServer):
         """
         Calculate quorum size (majority of managers).
         
-        Quorum is based on *configured* cluster size, not active size.
+        Quorum is based on *known* cluster size, not just active size.
         This prevents split-brain where a partition thinks it has quorum
         because it only sees its own subset of members.
+
+        Uses the larger of: seed managers or discovered peers.
         """
-        total_managers = len(self._manager_peers) + 1  # Include self
+        # Use max of seeds and known peers for quorum calculation
+        # This handles both initial startup (only seeds known) and
+        # dynamic discovery (more peers discovered than seeds)
+        known_peer_count = len(self._known_manager_peers)
+        seed_count = len(self._seed_managers)
+        peer_count = max(known_peer_count, seed_count)
+        total_managers = peer_count + 1  # Include self
         return (total_managers // 2) + 1
     
     def _has_quorum_available(self) -> bool:
@@ -1094,7 +1503,184 @@ class ManagerServer(HealthAwareServer):
                 ))
         
         return managers
-    
+
+    def _get_self_manager_info(self) -> ManagerInfo:
+        """Get ManagerInfo for this manager."""
+        return ManagerInfo(
+            node_id=self._node_id.full,
+            tcp_host=self._host,
+            tcp_port=self._tcp_port,
+            udp_host=self._host,
+            udp_port=self._udp_port,
+            datacenter=self._node_id.datacenter,
+            is_leader=self.is_leader(),
+        )
+
+    def _get_known_peer_managers(self) -> list[ManagerInfo]:
+        """Get list of all known peer managers (excluding self)."""
+        return list(self._known_manager_peers.values())
+
+    def _get_active_peer_tcp_addrs(self) -> list[tuple[str, int]]:
+        """
+        Get TCP addresses of all active peer managers.
+
+        Prefers known peers (with proper node_ids) but falls back to
+        seed managers during initial startup before peers are discovered.
+        """
+        # If we have known peers, use them
+        if self._known_manager_peers:
+            return [
+                (peer.tcp_host, peer.tcp_port)
+                for peer in self._known_manager_peers.values()
+                if peer.node_id in self._active_manager_peer_ids
+            ]
+        # Fallback to active manager peers (set during init from seeds)
+        return list(self._active_manager_peers)
+
+    async def _register_with_peer_manager(
+        self,
+        peer_addr: tuple[str, int],
+        max_retries: int = 3,
+        base_delay: float = 0.5,
+    ) -> bool:
+        """
+        Register this manager with a peer manager.
+
+        Similar to worker registration - establishes bidirectional relationship
+        and discovers the full cluster topology.
+
+        Args:
+            peer_addr: (host, port) TCP tuple of peer manager
+            max_retries: Maximum number of retry attempts
+            base_delay: Base delay for exponential backoff
+
+        Returns:
+            True if registration succeeded, False otherwise
+        """
+        registration = ManagerPeerRegistration(
+            node=self._get_self_manager_info(),
+            term=self._leader_election.state.current_term,
+            is_leader=self.is_leader(),
+        )
+
+        for attempt in range(max_retries + 1):
+            try:
+                result, _ = await self.send_manager_peer_register(
+                    peer_addr,
+                    registration.dump(),
+                    timeout=5.0,
+                )
+
+                if isinstance(result, Exception):
+                    raise result
+
+                response = ManagerPeerRegistrationResponse.load(result)
+
+                if response.accepted:
+                    # Add to known peers
+                    self._registered_with_managers.add(response.manager_id)
+
+                    # Learn about other peers from response
+                    for peer_info in response.known_peers:
+                        if peer_info.node_id != self._node_id.full:
+                            self._known_manager_peers[peer_info.node_id] = peer_info
+                            self._active_manager_peer_ids.add(peer_info.node_id)
+
+                            # Update UDP -> TCP mapping
+                            udp_addr = (peer_info.udp_host, peer_info.udp_port)
+                            tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
+                            self._manager_udp_to_tcp[udp_addr] = tcp_addr
+                            self._active_manager_peers.add(tcp_addr)
+
+                            # Also populate _manager_peer_info for _get_active_manager_peer_addrs()
+                            # Create initial heartbeat that will be updated by SWIM
+                            if udp_addr not in self._manager_peer_info:
+                                initial_heartbeat = ManagerHeartbeat(
+                                    node_id=peer_info.node_id,
+                                    datacenter=peer_info.datacenter,
+                                    is_leader=(peer_info.node_id == response.manager_id and response.is_leader),
+                                    term=response.term,
+                                    version=0,
+                                    active_jobs=0,
+                                    active_workflows=0,
+                                    worker_count=0,
+                                    healthy_worker_count=0,
+                                    available_cores=0,
+                                    total_cores=0,
+                                    state=ManagerState.ACTIVE.value,
+                                    tcp_host=peer_info.tcp_host,
+                                    tcp_port=peer_info.tcp_port,
+                                    udp_host=peer_info.udp_host,
+                                    udp_port=peer_info.udp_port,
+                                )
+                                self._manager_peer_info[udp_addr] = initial_heartbeat
+
+                    if attempt > 0:
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerInfo(
+                                message=f"Registered with peer manager {peer_addr} after {attempt + 1} attempts",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                    return True
+
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Peer registration attempt {attempt + 1}/{max_retries + 1} failed for {peer_addr}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            # Exponential backoff before retry
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+
+        return False
+
+    async def _register_with_seed_managers(self) -> None:
+        """
+        Register with all seed managers on startup.
+
+        Like workers, managers register with all known seed managers
+        to establish the full cluster topology.
+        """
+        if not self._seed_managers:
+            return
+
+        successful = 0
+        for seed_addr in self._seed_managers:
+            success = await self._register_with_peer_manager(seed_addr)
+            if success:
+                successful += 1
+
+        if successful == 0:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Failed to register with any seed manager: {self._seed_managers}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        else:
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Registered with {successful}/{len(self._seed_managers)} seed managers, "
+                            f"discovered {len(self._known_manager_peers)} total peers",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
     async def _broadcast_worker_discovery(
         self,
         worker_id: str,
@@ -1104,13 +1690,14 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         """
         Broadcast a newly discovered worker to all peer managers.
-        
+
         Called when a worker registers with this manager. Ensures all managers
         learn about the worker even if they don't receive direct registration.
         """
-        if not self._manager_peers:
+        peer_addrs = self._get_active_peer_tcp_addrs()
+        if not peer_addrs:
             return
-        
+
         broadcast = WorkerDiscoveryBroadcast(
             worker_id=worker_id,
             worker_tcp_addr=worker_tcp_addr,
@@ -1119,9 +1706,9 @@ class ManagerServer(HealthAwareServer):
             available_cores=available_cores,
             source_manager_id=self._node_id.full,
         )
-        
+
         broadcast_count = 0
-        for peer_addr in self._manager_peers:
+        for peer_addr in peer_addrs:
             try:
                 await self.send_tcp(
                     peer_addr,
@@ -1161,7 +1748,23 @@ class ManagerServer(HealthAwareServer):
         # Start the underlying server (TCP/UDP listeners, task runner, etc.)
         # Uses SWIM settings from Env configuration
         await self.start_server(init_context=self.env.get_swim_init_context())
-        
+
+        if self._core_allocation_lock is None:
+            self._core_allocation_lock = asyncio.Lock()
+
+        if self._eager_dispatch_lock is None:
+            self._eager_dispatch_lock = asyncio.Lock()
+
+        # Initialize WorkflowDispatcher now that we have full context
+        if self._workflow_dispatcher is None:
+            self._workflow_dispatcher = WorkflowDispatcher(
+                job_manager=self._job_manager,
+                worker_pool=self._worker_pool,
+                send_dispatch=self._send_workflow_dispatch,
+                datacenter=self._node_id.datacenter,
+                manager_id=self._node_id.short,
+            )
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -1175,10 +1778,38 @@ class ManagerServer(HealthAwareServer):
         # Join SWIM cluster with other managers (UDP healthchecks)
         for peer_udp in self._manager_udp_peers:
             await self.join_cluster(peer_udp)
-        
+
         # Start SWIM probe cycle (UDP healthchecks for managers + workers)
         self._task_runner.run(self.start_probe_cycle)
-        
+
+        # Register with seed managers to discover cluster topology
+        # Like workers, managers register with all seeds to establish relationships
+        if self._seed_managers:
+            await self._register_with_seed_managers()
+
+        # Wait for cluster to stabilize before starting leader election
+        # This ensures all peers are visible before voting begins
+        await self._wait_for_cluster_stabilization()
+
+        # Add random jitter before starting leader election to prevent
+        # simultaneous elections when managers start concurrently.
+        # This is a standard Raft technique - each node waits a random
+        # amount of time before starting its first election.
+        jitter_max = self.env.LEADER_ELECTION_JITTER_MAX
+        if jitter_max > 0 and len(self._manager_udp_peers) > 0:
+            import random
+            jitter = random.uniform(0, jitter_max)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Waiting {jitter:.2f}s jitter before starting leader election",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            await asyncio.sleep(jitter)
+
         # Start leader election (uses SWIM membership info)
         await self.start_leader_election()
 
@@ -1247,13 +1878,83 @@ class ManagerServer(HealthAwareServer):
             )
         )
     
+    async def _wait_for_cluster_stabilization(self) -> None:
+        """
+        Wait for the SWIM cluster to stabilize before starting leader election.
+
+        This ensures all configured manager peers are visible in the cluster
+        before any node attempts to become leader. This prevents the race
+        condition where a manager becomes leader with only 1 vote (itself)
+        because it started election before other peers joined.
+
+        The method waits until:
+        - All expected peers are in the nodes dict, OR
+        - The stabilization timeout is reached
+
+        With sequential starts, this allows later-starting managers to join
+        before election begins. With concurrent starts, this ensures all
+        managers see each other.
+        """
+        expected_peers = len(self._manager_udp_peers)
+        if expected_peers == 0:
+            # Single manager, no cluster to stabilize
+            return
+
+        timeout = self.env.CLUSTER_STABILIZATION_TIMEOUT
+        poll_interval = self.env.CLUSTER_STABILIZATION_POLL_INTERVAL
+        start_time = time.monotonic()
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Waiting for cluster stabilization (expecting {expected_peers} peers, timeout={timeout}s)",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        while True:
+            # Check how many peers we can see
+            nodes = self._context.read('nodes')
+            self_addr = (self._host, self._udp_port)
+            visible_peers = len([n for n in nodes.keys() if n != self_addr])
+
+            if visible_peers >= expected_peers:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Cluster stabilized: {visible_peers}/{expected_peers} peers visible",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return
+
+            # Check timeout
+            elapsed = time.monotonic() - start_time
+            if elapsed >= timeout:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Cluster stabilization timeout: only {visible_peers}/{expected_peers} peers visible after {timeout}s",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return
+
+            await asyncio.sleep(poll_interval)
+
     async def _complete_startup_sync(self) -> None:
         """
         Complete the startup state sync and transition to ACTIVE.
-        
-        If this manager is the leader, it becomes ACTIVE immediately 
+
+        If this manager is the leader, it becomes ACTIVE immediately
         (leader sync happens in _on_manager_become_leader callback).
-        
+
         If not leader, requests state sync from the current leader,
         then transitions to ACTIVE.
         """
@@ -1471,8 +2172,6 @@ class ManagerServer(HealthAwareServer):
                     return result
                     
             except Exception as e:
-                import traceback
-                print(traceback.format_exc())
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerError(
@@ -1585,7 +2284,29 @@ class ManagerServer(HealthAwareServer):
             "healthy_gates": len(self._healthy_gate_ids),
             "primary_gate": self._primary_gate_id,
         }
-    
+
+    def _get_swim_status_for_worker(self, addr: tuple[str, int]) -> str | None:
+        """
+        Get SWIM health status for a worker by UDP address.
+
+        This callback is used by WorkerPool to integrate with SWIM health tracking.
+
+        Args:
+            addr: (host, udp_port) tuple for the worker
+
+        Returns:
+            'OK' if healthy, 'SUSPECT' if suspect, 'DEAD' if dead, None if unknown
+        """
+        node_state = self._incarnation_tracker.get_node_state(addr)
+        if not node_state:
+            return None
+
+        status = node_state.status
+        if isinstance(status, bytes):
+            status = status.decode('utf-8', errors='replace')
+
+        return status
+
     def _get_healthy_worker_ids(self) -> list[str]:
         """
         Get list of worker IDs that are healthy according to SWIM probes.
@@ -1603,7 +2324,9 @@ class ManagerServer(HealthAwareServer):
 
         # Snapshot to avoid dict mutation during iteration
         for node_id, registration in list(self._workers.items()):
-            worker_addr = (registration.node.host, registration.node.port)
+            # Use UDP port for SWIM lookup - incarnation tracker is keyed by UDP address
+            udp_port = registration.node.udp_port or registration.node.port
+            worker_addr = (registration.node.host, udp_port)
             node_state = self._incarnation_tracker.get_node_state(worker_addr)
             
             # Check if SWIM says healthy
@@ -1774,86 +2497,113 @@ class ManagerServer(HealthAwareServer):
                 return True
         return False
     
-    def _calculate_priority_based_cores(
+    def _calculate_layer_cores(
         self,
+        layer_workflows: list[str],
         workflow_by_name: dict[str, tuple[int, Any]],
         workflow_priorities: dict[str, StagePriority],
         workflow_is_test: dict[str, bool],
         total_pool: int,
-    ) -> dict[str, int]:
+    ) -> tuple[dict[str, int], list[str]]:
         """
-        Calculate cores for each workflow based on priority.
-        
-        This mirrors the logic in Provisioner.partion_by_priority:
-        - Priority determines what % of the pool a workflow can use
-        - LOW: 1 to 25% of pool
-        - NORMAL: 25% to 75% of pool
-        - HIGH: 75% to 100% of pool
-        - EXCLUSIVE: 100% of pool
-        - AUTO: 1 to 100% of pool
-        
-        Non-test workflows get 1 core (they don't parallelize).
+        Calculate cores for workflows in a single layer based on priority.
+
+        Priority allocation rules:
+        1. EXCLUSIVE workflows get 100% of pool and run sequentially (first-come first-serve)
+        2. Specific priority workflows (HIGH, NORMAL, LOW) get allocated first based on ranges
+        3. AUTO workflows split remaining cores evenly
+        4. If all workflows are AUTO, split cores evenly among them
+        5. Non-test workflows always get 1 core (they don't parallelize)
+
+        Args:
+            layer_workflows: Names of workflows in this layer
+            workflow_by_name: Map of name -> (index, workflow)
+            workflow_priorities: Map of name -> StagePriority
+            workflow_is_test: Map of name -> is_test_workflow
+            total_pool: Total available cores
+
+        Returns:
+            Tuple of:
+            - workflow_cores: Map of name -> cores allocated (for concurrent dispatch)
+            - exclusive_order: List of EXCLUSIVE workflow names to run sequentially
         """
-        import math
-        
         workflow_cores: dict[str, int] = {}
-        workflows_list = list(workflow_by_name.keys())
-        
-        if not workflows_list:
-            return workflow_cores
-        
-        # Separate test and non-test workflows
-        test_workflows = [name for name in workflows_list if workflow_is_test.get(name, False)]
-        non_test_workflows = [name for name in workflows_list if not workflow_is_test.get(name, False)]
-        
-        # Non-test workflows always get 1 core (they don't benefit from parallelization)
+        exclusive_order: list[str] = []
+
+        if not layer_workflows:
+            return workflow_cores, exclusive_order
+
+        # Categorize workflows
+        exclusive_workflows: list[str] = []
+        specific_priority_workflows: list[str] = []  # HIGH, NORMAL, LOW
+        auto_workflows: list[str] = []
+        non_test_workflows: list[str] = []
+
+        for name in layer_workflows:
+            if not workflow_is_test.get(name, False):
+                non_test_workflows.append(name)
+                continue
+
+            priority = workflow_priorities.get(name, StagePriority.AUTO)
+            if priority == StagePriority.EXCLUSIVE:
+                exclusive_workflows.append(name)
+            elif priority == StagePriority.AUTO:
+                auto_workflows.append(name)
+            else:
+                specific_priority_workflows.append(name)
+
+        # Non-test workflows always get 1 core
         for name in non_test_workflows:
             workflow_cores[name] = 1
-        
-        if not test_workflows:
-            return workflow_cores
-        
-        # For test workflows, calculate based on priority
-        if len(test_workflows) == 1:
-            # Single test workflow gets its priority's max allocation
-            name = test_workflows[0]
+
+        # EXCLUSIVE workflows run sequentially with full pool
+        # Return them in exclusive_order for sequential dispatch
+        if exclusive_workflows:
+            exclusive_order = exclusive_workflows
+            # Each EXCLUSIVE workflow gets full pool when it runs
+            for name in exclusive_workflows:
+                workflow_cores[name] = total_pool
+            # Other workflows in this layer must wait - don't allocate cores
+            # (They'll be dispatched after EXCLUSIVE workflows complete)
+            return workflow_cores, exclusive_order
+
+        # Calculate remaining pool after non-test allocations
+        remaining_pool = total_pool - len(non_test_workflows)
+        if remaining_pool <= 0:
+            remaining_pool = 1
+
+        # Allocate specific priority workflows first (HIGH > NORMAL > LOW)
+        # Sort by priority descending
+        specific_priority_workflows.sort(
+            key=lambda n: workflow_priorities.get(n, StagePriority.AUTO).value,
+            reverse=True
+        )
+
+        for name in specific_priority_workflows:
             priority = workflow_priorities.get(name, StagePriority.AUTO)
             min_cores, max_cores = StagePriority.get_worker_allocation_range(priority, total_pool)
-            workflow_cores[name] = max(max_cores, 1)
-        else:
-            # Multiple test workflows: distribute based on priority
-            # Higher priority workflows get more cores
-            
-            # Get min/max for each workflow
-            allocations: dict[str, tuple[int, int]] = {}
-            for name in test_workflows:
-                priority = workflow_priorities.get(name, StagePriority.AUTO)
-                min_cores, max_cores = StagePriority.get_worker_allocation_range(priority, total_pool)
-                allocations[name] = (min_cores, max_cores)
-            
-            # Sort by priority (highest first)
-            sorted_workflows = sorted(
-                test_workflows,
-                key=lambda n: workflow_priorities.get(n, StagePriority.AUTO).value,
-                reverse=True
-            )
-            
-            # Allocate cores, starting with highest priority
-            remaining_cores = total_pool
-            for name in sorted_workflows:
-                min_cores, max_cores = allocations[name]
-                # Allocate as much as possible up to max, but leave room for others
-                others_min = sum(
-                    allocations[n][0] 
-                    for n in sorted_workflows 
-                    if n != name and n not in workflow_cores
-                )
-                available = remaining_cores - others_min
-                cores = max(min(available, max_cores), min_cores, 1)
-                workflow_cores[name] = cores
-                remaining_cores -= cores
-        
-        return workflow_cores
+            # Allocate up to max, but leave at least 1 core for remaining workflows
+            others_remaining = len(specific_priority_workflows) + len(auto_workflows) - len(workflow_cores) - 1
+            reserved_for_others = max(others_remaining, 0)
+            available = remaining_pool - reserved_for_others
+            cores = max(min(available, max_cores), min_cores, 1)
+            workflow_cores[name] = cores
+            remaining_pool -= cores
+
+        # Divide remaining cores evenly among AUTO workflows
+        if auto_workflows:
+            if remaining_pool <= 0:
+                remaining_pool = len(auto_workflows)  # At least 1 core each
+
+            cores_per_auto = remaining_pool // len(auto_workflows)
+            extra_cores = remaining_pool % len(auto_workflows)
+
+            for i, name in enumerate(auto_workflows):
+                # Distribute extra cores to first few workflows
+                cores = cores_per_auto + (1 if i < extra_cores else 0)
+                workflow_cores[name] = max(cores, 1)
+
+        return workflow_cores, exclusive_order
     
     # =========================================================================
     # Job Leader Helpers (Context Consistency Protocol)
@@ -1866,7 +2616,71 @@ class ManagerServer(HealthAwareServer):
     def _get_job_leader(self, job_id: str) -> str | None:
         """Get the node_id of the job leader, or None if unknown."""
         return self._job_leaders.get(job_id)
-    
+
+    def _get_job_leader_addr(self, job_id: str) -> tuple[str, int] | None:
+        """Get the TCP address of the job leader, or None if unknown."""
+        return self._job_leader_addrs.get(job_id)
+
+    async def _broadcast_job_leadership(
+        self,
+        job_id: str,
+        workflow_count: int,
+        workflow_names: list[str] | None = None,
+    ) -> None:
+        """
+        Broadcast job leadership announcement to all peer managers.
+
+        This ensures all managers in the cluster know who is leading
+        a specific job, enabling proper routing of workflow results
+        and allowing non-leaders to respond to workflow queries.
+        """
+        announcement = JobLeadershipAnnouncement(
+            job_id=job_id,
+            leader_id=self._node_id.full,
+            leader_host=self._host,
+            leader_tcp_port=self._tcp_port,
+            term=self._leader_election.state.current_term,
+            workflow_count=workflow_count,
+            timestamp=time.monotonic(),
+            workflow_names=workflow_names or [],
+        )
+
+        # Get all peer manager addresses
+        peer_addrs = self._get_active_peer_tcp_addrs()
+
+        for peer_addr in peer_addrs:
+            try:
+                response, _ = await self.send_tcp(
+                    peer_addr,
+                    action='job_leadership_announcement',
+                    data=announcement.dump(),
+                    timeout=2.0,
+                )
+
+                if response and isinstance(response, bytes) and response != b'error':
+                    ack = JobLeadershipAck.load(response)
+                    if ack.accepted:
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerDebug(
+                                message=f"Job {job_id[:8]}... leadership accepted by {ack.responder_id[:8]}...",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Failed to announce job {job_id[:8]}... leadership to {peer_addr}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
     def _get_job_context(self, job_id: str) -> Context | None:
         """Get the context for a job, or None if job unknown."""
         return self._job_contexts.get(job_id)
@@ -1880,7 +2694,16 @@ class ManagerServer(HealthAwareServer):
         """Build a ManagerHeartbeat with current state."""
         healthy_worker_ids = self._get_healthy_worker_ids()
         healthy_ids_set = set(healthy_worker_ids)
-        
+
+        # Build job leadership info for jobs we lead
+        # Maps job_id -> (fencing_token, layer_version)
+        job_leaderships: dict[str, tuple[int, int]] = {}
+        for job_id, leader_id in self._job_leaders.items():
+            if leader_id == self._node_id.full:
+                fencing_token = self._job_fencing_tokens.get(job_id, 0)
+                layer_version = self._job_layer_version.get(job_id, 0)
+                job_leaderships[job_id] = (fencing_token, layer_version)
+
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -1902,6 +2725,7 @@ class ManagerServer(HealthAwareServer):
             state=self._manager_state.value,
             tcp_host=self._host,
             tcp_port=self._tcp_port,
+            job_leaderships=job_leaderships,
         )
     
     async def _gate_heartbeat_loop(self) -> None:
@@ -2081,6 +2905,10 @@ class ManagerServer(HealthAwareServer):
                     total_cores=reg.total_cores,
                     available_cores=status.available_cores,
                     version=status.version,
+                    # Include host/port for registration reconstruction
+                    host=reg.node.host,
+                    tcp_port=reg.node.port,
+                    udp_port=reg.node.udp_port,
                     active_workflows={},  # Could populate from tracking
                 ))
         
@@ -2099,6 +2927,7 @@ class ManagerServer(HealthAwareServer):
             workers=worker_snapshots,
             jobs=dict(self._jobs),
             job_leaders=dict(self._job_leaders),
+            job_leader_addrs=dict(self._job_leader_addrs),
             job_layer_versions=dict(self._job_layer_version),
             job_contexts=cloudpickle.dumps(contexts_data),
         )
@@ -2174,7 +3003,6 @@ class ManagerServer(HealthAwareServer):
         Returns cloudpickled dict of context values that this workflow
         may need from its dependencies.
         """
-        import cloudpickle
         
         job_context = self._job_contexts.get(job_id)
         if not job_context:
@@ -2254,6 +3082,9 @@ class ManagerServer(HealthAwareServer):
 
         # Build list of eligible workers with their available cores
         eligible_workers: list[tuple[str, int]] = []
+        now = time.monotonic()
+        grace_period = 30.0  # Consider workers healthy for 30s after registration
+
         for node_id, status in list(self._worker_status.items()):
             if node_id in excluded_workers:
                 continue
@@ -2268,15 +3099,35 @@ class ManagerServer(HealthAwareServer):
             if status.available_cores <= 0:
                 continue
 
-            # Check SWIM liveness
+            # Check SWIM liveness with grace period for newly registered workers
             worker_reg = self._workers.get(node_id)
             if worker_reg:
-                worker_addr = (worker_reg.node.host, worker_reg.node.port)
+                # Use UDP port for SWIM lookup - incarnation tracker is keyed by UDP address
+                udp_port = worker_reg.node.udp_port or worker_reg.node.port
+                worker_addr = (worker_reg.node.host, udp_port)
                 node_state = self._incarnation_tracker.get_node_state(worker_addr)
-                if node_state and node_state.status != b'OK':
+
+                # If SWIM says OK, worker is healthy
+                if node_state and node_state.status == b'OK':
+                    eligible_workers.append((node_id, status.available_cores))
                     continue
 
-            eligible_workers.append((node_id, status.available_cores))
+                # If SWIM says DEAD, worker is definitely unhealthy
+                if node_state and node_state.status == b'DEAD':
+                    continue
+
+                # SWIM hasn't probed yet (node_state is None or SUSPECTED)
+                # Check grace period - treat as healthy if recently registered
+                last_seen = self._worker_last_status.get(node_id, 0)
+                if (now - last_seen) < grace_period:
+                    eligible_workers.append((node_id, status.available_cores))
+                    continue
+
+                # Outside grace period and SWIM hasn't confirmed OK - skip
+                continue
+
+            # No registration found - shouldn't happen, but skip
+            continue
 
         # Sort by available cores descending (prefer workers with more capacity)
         eligible_workers.sort(key=lambda x: x[1], reverse=True)
@@ -2293,6 +3144,27 @@ class ManagerServer(HealthAwareServer):
 
         return allocations
 
+    async def _send_workflow_dispatch(
+        self,
+        worker_node_id: str,
+        dispatch: WorkflowDispatch,
+    ) -> bool:
+        """
+        Send a workflow dispatch to a worker and return success status.
+
+        This is a simple wrapper around _dispatch_workflow_to_worker that
+        returns True/False for use by the WorkflowDispatcher callback.
+
+        Args:
+            worker_node_id: Target worker node ID
+            dispatch: WorkflowDispatch message to send
+
+        Returns:
+            True if the worker accepted the dispatch, False otherwise
+        """
+        ack = await self._dispatch_workflow_to_worker(worker_node_id, dispatch)
+        return ack is not None and ack.accepted
+
     async def _dispatch_workflow_to_worker(
         self,
         worker_node_id: str,
@@ -2302,7 +3174,7 @@ class ManagerServer(HealthAwareServer):
     ) -> WorkflowDispatchAck | None:
         """
         Dispatch a workflow to a specific worker.
-        
+
         Uses retries with exponential backoff:
         - Attempt 1: immediate
         - Attempt 2: 0.3s delay
@@ -2472,10 +3344,11 @@ class ManagerServer(HealthAwareServer):
         
         self._pending_provisions[provision.workflow_id] = provision
         self._provision_confirmations[provision.workflow_id] = {self._node_id.full}  # Self-confirm
-        
+
         # Send to all peers
+        peer_addrs = self._get_active_peer_tcp_addrs()
         confirm_tasks = []
-        for peer in self._manager_peers:
+        for peer in peer_addrs:
             confirm_tasks.append(
                 self._request_confirmation_from_peer(peer, provision)
             )
@@ -2561,8 +3434,8 @@ class ManagerServer(HealthAwareServer):
             fence_token=provision.fence_token,
             committed_version=self._state_version,
         )
-        
-        for peer in self._manager_peers:
+
+        for peer in self._get_active_peer_tcp_addrs():
             try:
                 await self.send_tcp(
                     peer,
@@ -2570,7 +3443,7 @@ class ManagerServer(HealthAwareServer):
                     commit.dump(),
                     timeout=2.0,
                 )
-            except Exception as e:
+            except Exception:
                 # Commit is best-effort after quorum
                 pass
     
@@ -2617,7 +3490,27 @@ class ManagerServer(HealthAwareServer):
     ):
         """Handle raw worker discovery response."""
         return data
-    
+
+    @tcp.send('manager_peer_register')
+    async def send_manager_peer_register(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        timeout: int | float | None = None,
+    ):
+        """Send manager peer registration to another manager."""
+        return (addr, data, timeout)
+
+    @tcp.handle('manager_peer_register')
+    async def handle_manager_peer_register_response(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """Handle manager peer registration response."""
+        return data
+
     @tcp.receive()
     async def worker_register(
         self,
@@ -2700,7 +3593,94 @@ class ManagerServer(HealthAwareServer):
                 error=str(e),
             )
             return response.dump()
-    
+
+    @tcp.receive()
+    async def manager_peer_register(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle registration from a peer manager.
+
+        When another manager discovers us (via seed list or SWIM),
+        it sends a registration to establish bidirectional relationship.
+        """
+        try:
+            registration = ManagerPeerRegistration.load(data)
+            peer_info = registration.node
+
+            # Add to known peers if not already tracked
+            if peer_info.node_id not in self._known_manager_peers:
+                self._known_manager_peers[peer_info.node_id] = peer_info
+                self._active_manager_peer_ids.add(peer_info.node_id)
+
+                # Update mappings
+                udp_addr = (peer_info.udp_host, peer_info.udp_port)
+                tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
+                self._manager_udp_to_tcp[udp_addr] = tcp_addr
+                self._active_manager_peers.add(tcp_addr)
+
+                # Add to SWIM probing
+                self._probe_scheduler.add_member(udp_addr)
+
+                # Also populate _manager_peer_info so _get_active_manager_peer_addrs() works
+                # This creates an initial heartbeat entry that will be updated by SWIM
+                initial_heartbeat = ManagerHeartbeat(
+                    node_id=peer_info.node_id,
+                    datacenter=peer_info.datacenter,
+                    is_leader=registration.is_leader,
+                    term=registration.term,
+                    version=0,  # Will be updated by real heartbeats
+                    active_jobs=0,
+                    active_workflows=0,
+                    worker_count=0,
+                    healthy_worker_count=0,
+                    available_cores=0,
+                    total_cores=0,
+                    state=ManagerState.ACTIVE.value,  # Assume active since they're registering
+                    tcp_host=peer_info.tcp_host,
+                    tcp_port=peer_info.tcp_port,
+                    udp_host=peer_info.udp_host,
+                    udp_port=peer_info.udp_port,
+                )
+                self._manager_peer_info[udp_addr] = initial_heartbeat
+
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Peer manager registered: {peer_info.node_id} (leader={registration.is_leader})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            # Build response with all known peers (including self and the registrant)
+            all_peers = [self._get_self_manager_info()] + self._get_known_peer_managers()
+
+            response = ManagerPeerRegistrationResponse(
+                accepted=True,
+                manager_id=self._node_id.full,
+                is_leader=self.is_leader(),
+                term=self._leader_election.state.current_term,
+                known_peers=all_peers,
+            )
+            return response.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "manager_peer_register")
+            response = ManagerPeerRegistrationResponse(
+                accepted=False,
+                manager_id=self._node_id.full,
+                is_leader=self.is_leader(),
+                term=self._leader_election.state.current_term,
+                known_peers=[],
+                error=str(e),
+            )
+            return response.dump()
+
     @tcp.receive()
     async def worker_discovery(
         self,
@@ -2710,134 +3690,55 @@ class ManagerServer(HealthAwareServer):
     ):
         """
         Handle worker discovery broadcast from a peer manager.
-        
+
         When another manager receives a worker registration, it broadcasts
-        to all peers. This handler adds the worker to our tracking.
+        to all peers. This handler schedules direct registration with the
+        worker to get accurate, up-to-date info.
         """
         try:
             broadcast = WorkerDiscoveryBroadcast.load(data)
-            
+
             worker_id = broadcast.worker_id
             worker_tcp_addr = tuple(broadcast.worker_tcp_addr)
             worker_udp_addr = tuple(broadcast.worker_udp_addr)
-            
-            # Add worker if not already tracked
-            if worker_id not in self._workers:
-                # Create a minimal registration for tracking
-                node_info = NodeInfo(
-                    node_id=worker_id,
-                    host=worker_tcp_addr[0],
-                    port=worker_tcp_addr[1],
-                    role=NodeRole.WORKER.value,
-                    datacenter=broadcast.datacenter,
-                )
-                registration = WorkerRegistration(
-                    node=node_info,
-                    total_cores=broadcast.available_cores,
-                    available_cores=broadcast.available_cores,
-                    memory_mb=0,  # Unknown from broadcast
-                    available_memory_mb=0,  # Unknown from broadcast
-                )
-                self._workers[worker_id] = registration
-                self._worker_addr_to_id[worker_tcp_addr] = worker_id
-                self._worker_last_status[worker_id] = time.monotonic()
-                
-                # Create initial worker status with all cores available
-                # This prevents race condition where SWIM hasn't exchanged heartbeats yet
-                initial_status = WorkerHeartbeat(
-                    node_id=worker_id,
-                    state=WorkerState.HEALTHY.value,  # Assume healthy on discovery
-                    available_cores=broadcast.available_cores,  # All cores available
-                    queue_depth=0,
-                    cpu_percent=0.0,
-                    memory_percent=0.0,
-                    version=0,  # Initial version - SWIM updates will have higher versions
-                    active_workflows={},
-                )
-                self._worker_status[worker_id] = initial_status
 
-                # Signal that cores are available - wake up any waiting workflows
-                if broadcast.available_cores > 0:
-                    self._cores_available_event.set()
+            # Skip if already registered - direct registration takes precedence
+            if worker_id in self._workers:
+                return b'ok'
 
-                # Add to SWIM probing
-                self._probe_scheduler.add_member(worker_udp_addr)
+            # Schedule registration with the worker to get accurate info
+            # Don't blindly trust broadcast data - reach out to the worker directly
+            worker_snapshot = WorkerStateSnapshot(
+                node_id=worker_id,
+                host=worker_tcp_addr[0],
+                tcp_port=worker_tcp_addr[1],
+                udp_port=worker_udp_addr[1],
+                state=WorkerState.HEALTHY.value,
+                total_cores=broadcast.available_cores,
+                available_cores=broadcast.available_cores,
+                version=0,
+            )
 
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Discovered worker {worker_id} via manager {broadcast.source_manager_id}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
+            self._task_runner.run(
+                self._register_with_discovered_worker,
+                worker_snapshot,
+            )
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Scheduling registration with worker {worker_id[:8]}... (discovered via {broadcast.source_manager_id[:8]}...)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
                 )
-            
+            )
+
             return b'ok'
-            
+
         except Exception as e:
             await self.handle_exception(e, "worker_discovery")
             return b'error'
-    
-    async def _broadcast_worker_discovery(
-        self,
-        worker_id: str,
-        worker_tcp_addr: tuple[str, int],
-        worker_udp_addr: tuple[str, int],
-        available_cores: int,
-    ) -> None:
-        """
-        Broadcast a newly discovered worker to all peer managers.
-        
-        This enables cross-manager synchronization of worker discovery.
-        When a worker registers with one manager, it gets broadcast
-        to all other managers so they can also track it.
-        
-        Args:
-            worker_id: Worker's node_id
-            worker_tcp_addr: Worker's TCP address
-            worker_udp_addr: Worker's UDP address  
-            available_cores: Worker's available cores
-        """
-        if not self._manager_peers:
-            return
-        
-        broadcast = WorkerDiscoveryBroadcast(
-            worker_id=worker_id,
-            worker_tcp_addr=worker_tcp_addr,
-            worker_udp_addr=worker_udp_addr,
-            datacenter=self._node_id.datacenter,
-            available_cores=available_cores,
-            source_manager_id=self._node_id.full,
-        )
-        
-        for peer_addr in self._manager_peers:
-            try:
-                response, _ = await self.send_worker_discovery(
-                    peer_addr,
-                    broadcast.dump(),
-                    timeout=2.0,
-                )
-                if isinstance(response, Exception):
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerWarning(
-                            message=f"Failed to broadcast worker {worker_id} to {peer_addr}: {response}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-            except Exception as e:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerWarning(
-                        message=f"Error broadcasting worker {worker_id} to {peer_addr}: {e}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
     
     @tcp.receive()
     async def receive_worker_status_update(
@@ -2953,6 +3854,16 @@ class ManagerServer(HealthAwareServer):
                     if completion_event:
                         completion_event.set()
 
+                    # Eager dispatch: mark workflow complete and try to dispatch waiting workflows
+                    self._mark_workflow_completed_for_eager(progress.job_id, progress.workflow_name)
+                    submission = self._job_submissions.get(progress.job_id)
+                    if submission:
+                        self._task_runner.run(
+                            self._try_eager_dispatch,
+                            progress.job_id,
+                            submission,
+                        )
+
                 # Forward job progress to gates (if connected)
                 if self._known_gates or self._gate_addrs:
                     self._task_runner.run(self._send_job_progress_to_gate, job)
@@ -3009,9 +3920,47 @@ class ManagerServer(HealthAwareServer):
             # Check if this is a sub-workflow (dispatched to multiple workers)
             parent_workflow_id = self._get_parent_workflow_id(result.workflow_id)
 
+
+            await self._workflow_results_locks[parent_workflow_id].acquire()
+
+            # Update worker's available cores from the ORIGINAL result immediately
+            # This must happen before any sub-workflow aggregation or early returns
+            # because the worker has freed cores and we need to track that for dispatch
+            original_result = result  # Preserve for worker core update
+            if original_result.worker_id and original_result.worker_available_cores >= 0:
+                worker_status = self._worker_status.get(original_result.worker_id)
+                if worker_status:
+                    updated_status = WorkerHeartbeat(
+                        node_id=worker_status.node_id,
+                        state=worker_status.state,
+                        available_cores=original_result.worker_available_cores,
+                        queue_depth=worker_status.queue_depth,
+                        cpu_percent=worker_status.cpu_percent,
+                        memory_percent=worker_status.memory_percent,
+                        version=worker_status.version,
+                        active_workflows=worker_status.active_workflows,
+                    )
+                    self._worker_status[original_result.worker_id] = updated_status
+
+                    # Signal cores available for waiting workflows
+                    if original_result.worker_available_cores > 0:
+                        self._cores_available_event.set()
+
             if parent_workflow_id is not None:
                 # This is a sub-workflow - store and check if parent is complete
                 self._sub_workflow_results[result.workflow_id] = result
+
+                # Debug: log sub-workflow tracking state
+                sub_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
+                stored_results = [sid for sid in sub_ids if sid in self._sub_workflow_results]
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Sub-workflow tracking: parent={parent_workflow_id}, expected={sub_ids}, have_results={stored_results}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
                 # Handle context updates from sub-workflow
                 if result.context_updates and len(result.context_updates) > 0:
@@ -3020,26 +3969,83 @@ class ManagerServer(HealthAwareServer):
                     else:
                         await self._forward_context_from_result(result)
 
+                print(self._is_parent_workflow_complete(parent_workflow_id))
+
                 # Check if all sub-workflows have completed
                 if not self._is_parent_workflow_complete(parent_workflow_id):
                     # More sub-workflows pending - just ack
+                    self._workflow_results_locks[parent_workflow_id].release()
                     return b'ok'
+                
+                sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
+        
+                if not sub_workflow_ids:
+                    return None
 
-                # All sub-workflows complete - aggregate results
-                result = self._aggregate_sub_workflow_final_results(parent_workflow_id)
-                if result is None:
-                    # Aggregation failed - should not happen
+                # Collect all sub-workflow results
+                sub_results = [
+                    self._sub_workflow_results.get(sub_id)
+                    for sub_id in sub_workflow_ids
+                    if sub_id in self._sub_workflow_results
+                ]
+
+                if not sub_results or len(sub_results) != len(sub_workflow_ids):
+                    # Not all sub-workflows have completed
+                    return None
+
+                # Extract job_id from parent workflow_id (format: job_id:workflow_idx)
+                job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
+
+                # Determine overall status (any failure = failure)
+                overall_status = WorkflowStatus.COMPLETED.value
+                errors = []
+                for r in sub_results:
+                    if r.status == WorkflowStatus.FAILED.value:
+                        overall_status = WorkflowStatus.FAILED.value
+                        if r.error:
+                            errors.append(r.error)
+
+                matching_job = self._jobs.get(job_id)
+                if matching_job is None:
                     await self.handle_exception(
-                        Exception(f"Failed to aggregate results for {parent_workflow_id}"),
+                        Exception(f"Failed to find job for {parent_workflow_id}"),
                         "workflow_final_result"
                     )
+                    
                     return b'error'
 
+                matching_workflows = [
+                    workflow for workflow in matching_job.workflows if workflow.workflow_name in request.workflow_names
+                ]
+
+                if len(matching_workflows) < 1:
+                    await self.handle_exception(
+                        Exception(f"No workflows found for job {job_id}"),
+                        "workflow_final_result"
+                    )
+                    
+                    return b'error'
+
+
+
+                print(parent_workflow_id, list(self._sub_workflow_mapping.keys()), sub_ids)
+                # All sub-workflows complete - aggregate results
+                # result = self._aggregate_sub_workflow_final_results(parent_workflow_id)
+                # if result is None:
+                #     # Aggregation failed - should not happen
+                #     await self.handle_exception(
+                #         Exception(f"Failed to aggregate results for {parent_workflow_id}"),
+                #         "workflow_final_result"
+                #     )
+
+                #     self._workflow_results_locks[parent_workflow_id].release()
+                #     return b'error'
+
                 # Clean up sub-workflow tracking
-                sub_workflow_ids = self._sub_workflow_mapping.pop(parent_workflow_id, [])
-                for sub_id in sub_workflow_ids:
-                    self._sub_workflow_progress.pop(sub_id, None)
-                    self._sub_workflow_results.pop(sub_id, None)
+                # sub_workflow_ids = self._sub_workflow_mapping.pop(parent_workflow_id, [])
+                # for sub_id in sub_workflow_ids:
+                #     self._sub_workflow_progress.pop(sub_id, None)
+                #     self._sub_workflow_results.pop(sub_id, None)
 
             # Store final result (either original or aggregated)
             if result.job_id not in self._workflow_final_results:
@@ -3067,14 +4073,43 @@ class ManagerServer(HealthAwareServer):
             # Update job progress status
             job = self._jobs.get(result.job_id)
             if job:
+                matched = False
                 for i, wf in enumerate(job.workflows):
                     if wf.workflow_id == result.workflow_id:
                         wf.status = result.status
+                        matched = True
+                        await self._udp_logger.log(
+                            ServerInfo(
+                                message=f"Updated workflow status: {wf.workflow_id} -> {result.status}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
                         break
+
+                if not matched:
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=f"NO MATCH for workflow_id={result.workflow_id}, job has: {[w.workflow_id for w in job.workflows]}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
 
                 # Forward to gates (if connected)
                 if self._known_gates or self._gate_addrs:
                     self._task_runner.run(self._send_job_progress_to_gate, job)
+
+            # Eager dispatch: mark workflow complete and try to dispatch waiting workflows
+            # This is critical for dependency-based execution - when a workflow completes,
+            # dependent workflows may now be ready to run
+            if result.status == WorkflowStatus.COMPLETED.value:
+                self._mark_workflow_completed_for_eager(result.job_id, result.workflow_name)
+                submission = self._job_submissions.get(result.job_id)
+                if submission:
+                    await self._try_eager_dispatch(result.job_id, submission)
 
             # Check if job is complete
             if self._is_job_complete(result.job_id):
@@ -3082,9 +4117,14 @@ class ManagerServer(HealthAwareServer):
 
             self._increment_version()
 
+            self._workflow_results_locks[parent_workflow_id].release()
             return b'ok'
 
         except Exception as e:
+            import traceback
+            print(traceback.format_exc())
+
+            self._workflow_results_locks[parent_workflow_id].release()
             await self.handle_exception(e, "workflow_final_result")
             return b'error'
     
@@ -3116,36 +4156,32 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-    
+
     async def _forward_context_from_result(self, result: WorkflowFinalResult) -> None:
         """Forward context updates to the job leader."""
-        leader_info = self._get_job_leader(result.job_id)
-        if not leader_info:
-            return
-        
-        leader_id, leader_tcp_port = leader_info
-        
-        # Find leader's address
-        leader_addr = None
-        for manager in list(self._known_managers.values()):
-            if manager.node_id == leader_id:
-                leader_addr = (manager.host, manager.port)
-                break
-        
+        leader_addr = self._get_job_leader_addr(result.job_id)
         if not leader_addr:
-            # Check peers
-            for peer_addr in self._manager_peers:
-                leader_addr = peer_addr
-                break
-        
+            # Try to find leader by ID
+            leader_id = self._get_job_leader(result.job_id)
+            if leader_id:
+                for manager in list(self._known_manager_peers.values()):
+                    if manager.node_id == leader_id:
+                        leader_addr = (manager.tcp_host, manager.tcp_port)
+                        break
+
+        if not leader_addr:
+            # Check peers as fallback
+            peer_addrs = self._get_active_peer_tcp_addrs()
+            if peer_addrs:
+                leader_addr = peer_addrs[0]
+
         if leader_addr:
-            from hyperscale.distributed_rewrite.models import ContextForward
             forward = ContextForward(
                 job_id=result.job_id,
-                workflow_name=result.workflow_name,
-                context_values=result.context_updates,
-                lamport_clock=self._context_lamport_clock,
-                source_node_id=self._node_id.full,
+                workflow_id=result.workflow_id,
+                context_updates=result.context_updates,
+                context_timestamps=b'',  # Timestamps handled by leader on apply
+                source_manager=self._node_id.full,
             )
             try:
                 await self.send_tcp(
@@ -3156,21 +4192,22 @@ class ManagerServer(HealthAwareServer):
                 )
             except Exception:
                 pass
-    
+
     def _is_job_complete(self, job_id: str) -> bool:
         """Check if all workflows in a job have completed."""
         job = self._jobs.get(job_id)
-        if not job:
+        if not job or not job.workflows:
             return False
 
         final_results = self._workflow_final_results.get(job_id, {})
-        workflow_assignments = self._workflow_assignments.get(job_id, {})
 
-        # Job is complete when we have final results for all assigned workflows
-        if len(workflow_assignments) == 0:
-            return False
+        # Job is complete when we have final results for ALL workflows in the job,
+        # not just the ones that have been dispatched so far.
+        # This is critical for eager dispatch where workflows are dispatched
+        # one at a time as their dependencies become satisfied.
+        total_workflows = len(job.workflows)
 
-        return len(final_results) >= len(workflow_assignments)
+        return len(final_results) >= total_workflows
 
     def _get_parent_workflow_id(self, sub_workflow_id: str) -> str | None:
         """
@@ -3311,88 +4348,112 @@ class ManagerServer(HealthAwareServer):
         self,
         parent_workflow_id: str,
     ) -> WorkflowFinalResult | None:
-        """
-        Aggregate final results from all sub-workflows into a unified result.
+        try:
 
-        Uses Results.merge_results() to combine WorkflowStats from all sub-workflows.
-        This follows the same pattern as RemoteGraphManager.
+            """
+            Aggregate final results from all sub-workflows into a unified result.
 
-        Returns None if aggregation fails.
-        """
-        sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
-        if not sub_workflow_ids:
-            return None
+            Uses Results.merge_results() to combine WorkflowResults from all sub-workflows.
+            This follows the same pattern as RemoteGraphManager.
 
-        # Collect all sub-workflow results
-        sub_results = [
-            self._sub_workflow_results.get(sub_id)
-            for sub_id in sub_workflow_ids
-            if sub_id in self._sub_workflow_results
-        ]
+            Returns None if aggregation fails.
+            """
+            sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
+        
+            if not sub_workflow_ids:
+                return None
 
-        if not sub_results or len(sub_results) != len(sub_workflow_ids):
-            # Not all sub-workflows have completed
-            return None
+            # Collect all sub-workflow results
+            sub_results = [
+                self._sub_workflow_results.get(sub_id)
+                for sub_id in sub_workflow_ids
+                if sub_id in self._sub_workflow_results
+            ]
 
-        # Extract job_id from parent workflow_id (format: job_id:workflow_idx)
-        job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
+            if not sub_results or len(sub_results) != len(sub_workflow_ids):
+                # Not all sub-workflows have completed
+                return None
 
-        # Determine overall status (any failure = failure)
-        overall_status = WorkflowStatus.COMPLETED.value
-        errors = []
-        for r in sub_results:
-            if r.status == WorkflowStatus.FAILED.value:
-                overall_status = WorkflowStatus.FAILED.value
-                if r.error:
-                    errors.append(r.error)
+            # Extract job_id from parent workflow_id (format: job_id:workflow_idx)
+            job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
 
-        # Unpack and merge WorkflowStats from all sub-workflows
-        workflow_stats_list = []
-        for r in sub_results:
-            try:
-                stats = cloudpickle.loads(r.results)
-                workflow_stats_list.append(stats)
-            except Exception:
-                # Skip malformed results
-                pass
+            # Determine overall status (any failure = failure)
+            overall_status = WorkflowStatus.COMPLETED.value
+            errors = []
+            for r in sub_results:
+                if r.status == WorkflowStatus.FAILED.value:
+                    overall_status = WorkflowStatus.FAILED.value
+                    if r.error:
+                        errors.append(r.error)
 
-        # Merge results using Results helper (same pattern as RemoteGraphManager)
-        if len(workflow_stats_list) > 1:
-            results_helper = Results(hooks=[])
-            merged_stats = results_helper.merge_results(workflow_stats_list)
-        elif len(workflow_stats_list) == 1:
-            merged_stats = workflow_stats_list[0]
-        else:
-            # No valid stats - create empty result
-            merged_stats = {
-                "workflow": sub_results[0].workflow_name,
-                "stats": {},
-                "results": [],
-                "checks": [],
-                "metrics": [],
+            # Unpack and merge WorkflowResults from all sub-workflows
+            workflow_stats_list = []
+            for r in sub_results:
+                # Skip empty results (e.g., from failed workflows)
+                if not r.results or len(r.results) == 0:
+                    continue
+                try:
+                    workflow_stats_list.extend(r.results.values())
+                except Exception:
+                    import traceback
+                    print(traceback.format_exc())
+                    # Skip malformed results
+                    pass
+                
+            workflow = self._workflow_by_id.get(parent_workflow_id)
+            print('GOT WORKFLOW', workflow.name)
+            if workflow is None:
+                return None
+
+            hooks: dict[str, Hook] = {
+                name: hook
+                for name, hook in inspect.getmembers(
+                    workflow,
+                    predicate=lambda member: isinstance(member, Hook),
+                )
             }
 
-        # Merge context updates from all sub-workflows
-        merged_context = {}
-        for r in sub_results:
-            if r.context_updates and len(r.context_updates) > 0:
-                try:
-                    ctx = cloudpickle.loads(r.context_updates)
-                    if ctx:
-                        merged_context.update(ctx)
-                except Exception:
-                    pass
+            # Merge results using Results helper (same pattern as RemoteGraphManager)
+            if len(workflow_stats_list) > 1:
+                results_helper = Results(hooks)
+                merged_stats = results_helper.merge_results(workflow_stats_list)
+            elif len(workflow_stats_list) == 1:
+                merged_stats = workflow_stats_list[0]
+            else:
+                # No valid stats - create empty result
+                merged_stats = {
+                    "workflow": sub_results[0].workflow_name,
+                    "stats": {},
+                    "results": [],
+                    "checks": [],
+                    "metrics": [],
+                }
 
-        # Create aggregated final result
-        return WorkflowFinalResult(
-            job_id=job_id,
-            workflow_id=parent_workflow_id,
-            workflow_name=sub_results[0].workflow_name,
-            status=overall_status,
-            results=cloudpickle.dumps(merged_stats),
-            context_updates=cloudpickle.dumps(merged_context) if merged_context else b'',
-            error="; ".join(errors) if errors else None,
-        )
+            # Merge context updates from all sub-workflows
+            merged_context = {}
+            for r in sub_results:
+                if r.context_updates and len(r.context_updates) > 0:
+                    try:
+                        ctx = cloudpickle.loads(r.context_updates)
+                        if ctx:
+                            merged_context.update(ctx)
+                    except Exception:
+                        pass
+
+            # Create aggregated final resultResults(
+            return WorkflowFinalResult(
+                job_id=job_id,
+                workflow_id=parent_workflow_id,
+                workflow_name=sub_results[0].workflow_name,
+                status=overall_status,
+                results=cloudpickle.dumps(merged_stats),
+                context_updates=cloudpickle.dumps(merged_context) if merged_context else b'',
+                error="; ".join(errors) if errors else None,
+            )
+        
+        except Exception:
+            import traceback
+            print(traceback.format_exc())
 
     async def _handle_job_completion(self, job_id: str) -> None:
         """Handle job completion - build and send JobFinalResult."""
@@ -3488,7 +4549,18 @@ class ManagerServer(HealthAwareServer):
         callback = self._job_callbacks.get(job_id)
         if callback and not (self._known_gates or self._gate_addrs):
             await self._send_job_final_result_to_client(job_final, callback)
-    
+
+        # Clean up workflow_by_id for this job
+        self._cleanup_workflow_by_id_for_job(job_id)
+
+    def _cleanup_workflow_by_id_for_job(self, job_id: str) -> None:
+        """Remove all workflow entries for a job from _workflow_by_id."""
+        # Find and remove all workflow IDs that start with this job_id
+        prefix = f"{job_id}:"
+        to_remove = [wf_id for wf_id in self._workflow_by_id if wf_id.startswith(prefix)]
+        for wf_id in to_remove:
+            self._workflow_by_id.pop(wf_id, None)
+
     async def _send_job_final_result_to_gates(self, job_final: JobFinalResult) -> None:
         """Send JobFinalResult to all known gates."""
         for gate_addr in self._gate_addrs:
@@ -3620,74 +4692,6 @@ class ManagerServer(HealthAwareServer):
                 source_node=self._node_id.full,
             )
     
-    async def _forward_context_to_leader(
-        self,
-        job_id: str,
-        workflow_id: str,
-        context_updates: bytes,
-        context_timestamps: bytes,
-    ) -> bool:
-        """
-        Forward context updates to the job leader.
-        
-        Called by non-leader managers when they receive workflow completion
-        with context updates. Returns True if forwarding succeeded.
-        """
-        leader_id = self._get_job_leader(job_id)
-        if not leader_id:
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerWarning(
-                    message=f"Cannot forward context - no leader for job {job_id}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return False
-        
-        # Find leader's address from peer info
-        leader_addr = self._get_manager_tcp_addr(leader_id)
-        if not leader_addr:
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerWarning(
-                    message=f"Cannot forward context - unknown address for leader {leader_id}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return False
-        
-        forward = ContextForward(
-            job_id=job_id,
-            workflow_id=workflow_id,
-            context_updates=context_updates,
-            context_timestamps=context_timestamps,
-            source_manager=self._node_id.full,
-        )
-        
-        try:
-            response, _ = await self.send_tcp(
-                leader_addr,
-                action='context_forward',
-                data=forward.dump(),
-                timeout=5.0,
-            )
-            return response == b'ok'
-        except Exception as e:
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerWarning(
-                    message=f"Context forward to leader failed: {e}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return False
-    
     def _get_workflow_name_from_id(self, workflow_id: str) -> str:
         """
         Get the workflow name from a workflow ID.
@@ -3750,17 +4754,16 @@ class ManagerServer(HealthAwareServer):
     
     def _get_manager_tcp_addr(self, node_id: str) -> tuple[str, int] | None:
         """Get the TCP address for a manager by node_id."""
-        # Check peer info for TCP address
-        peer_info = self._manager_peer_info.get(node_id)
+        # Check _known_manager_peers first (keyed by node_id)
+        peer_info = self._known_manager_peers.get(node_id)
         if peer_info:
-            # ManagerHeartbeat has tcp_host and tcp_port
             return (peer_info.tcp_host, peer_info.tcp_port)
-        
-        # Check manager peers by matching node_id prefix
-        for tcp_addr, udp_addr in list(self._manager_tcp_to_udp.items()):
-            # This is less reliable - would need node_id mapping
-            pass
-        
+
+        # Fallback: search _manager_peer_info (keyed by UDP addr) for matching node_id
+        for udp_addr, heartbeat in list(self._manager_peer_info.items()):
+            if heartbeat.node_id == node_id:
+                return (heartbeat.tcp_host, heartbeat.tcp_port)
+
         return None
     
     async def _sync_context_and_advance(self, job_id: str) -> bool:
@@ -3898,11 +4901,11 @@ class ManagerServer(HealthAwareServer):
     def _get_active_manager_peer_addrs(self) -> list[tuple[str, int]]:
         """Get TCP addresses of active peer managers."""
         addrs = []
-        for node_id, heartbeat in list(self._manager_peer_info.items()):
-            if node_id == self._node_id.full:
+        for udp_addr, heartbeat in list(self._manager_peer_info.items()):
+            if heartbeat.node_id == self._node_id.full:
                 continue  # Skip self
             # Only include active managers (not SYNCING)
-            if heartbeat.manager_state == ManagerState.ACTIVE.value:
+            if heartbeat.state == ManagerState.ACTIVE.value:
                 addrs.append((heartbeat.tcp_host, heartbeat.tcp_port))
         return addrs
     
@@ -4017,61 +5020,101 @@ class ManagerServer(HealthAwareServer):
         old_progress: WorkflowProgress | None,
     ) -> None:
         """
-        Update worker available cores based on cores_completed from progress.
-        
-        When cores_completed increases, we can mark those cores as available
-        for new workflows. This allows for more aggressive provisioning.
-        
+        Update worker available cores based on workflow progress.
+
+        Two-phase confirmation model:
+        1. When workflow is dispatched, we optimistically decrement available_cores
+           and track it as "unconfirmed" in _unconfirmed_dispatches.
+        2. When we receive progress with worker_workflow_assigned_cores > 0,
+           the workflow is confirmed. We then use worker_available_cores from
+           the progress update as the authoritative source.
+
         Args:
             progress: New progress update
             old_progress: Previous progress (if any)
         """
+        workflow_id = progress.workflow_id
+
+        # Check if this workflow is unconfirmed (waiting for worker to assign cores)
+        if workflow_id in self._unconfirmed_dispatches:
+            worker_id, cores_reserved = self._unconfirmed_dispatches[workflow_id]
+
+            # Check if worker has confirmed core assignment
+            if progress.worker_workflow_assigned_cores > 0:
+                # Workflow is confirmed - remove from unconfirmed tracking
+                del self._unconfirmed_dispatches[workflow_id]
+
+                # Use worker_available_cores as authoritative source
+                worker_status = self._worker_status.get(worker_id)
+                if worker_status:
+                    updated_status = WorkerHeartbeat(
+                        node_id=worker_status.node_id,
+                        state=worker_status.state,
+                        available_cores=progress.worker_available_cores,
+                        queue_depth=worker_status.queue_depth,
+                        cpu_percent=worker_status.cpu_percent,
+                        memory_percent=worker_status.memory_percent,
+                        version=worker_status.version,
+                        active_workflows=worker_status.active_workflows,
+                    )
+                    self._worker_status[worker_id] = updated_status
+
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Workflow {workflow_id} confirmed on {worker_id} "
+                                    f"(assigned={progress.worker_workflow_assigned_cores}, "
+                                    f"worker_available={progress.worker_available_cores})",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+                    # Signal cores available in case availability increased
+                    if progress.worker_available_cores > 0:
+                        self._cores_available_event.set()
+            return
+
+        # For confirmed workflows, continue using worker_available_cores from progress
         # Find the worker for this workflow
-        worker_id = self._workflow_assignments.get(progress.workflow_id)
+        job_id = progress.job_id
+        job_assignments = self._workflow_assignments.get(job_id, {})
+        worker_id = job_assignments.get(workflow_id)
         if not worker_id:
             return
-        
+
         # Get worker status
         worker_status = self._worker_status.get(worker_id)
         if not worker_status:
             return
-        
-        # Calculate newly completed cores
-        old_cores_completed = old_progress.cores_completed if old_progress else 0
-        new_cores_completed = progress.cores_completed
-        
-        if new_cores_completed > old_cores_completed:
-            # Cores have been freed - update worker's available count
-            cores_freed = new_cores_completed - old_cores_completed
-            
-            # Create updated heartbeat with incremented available cores
-            # Note: This is an optimistic update that may be superseded by
-            # the next heartbeat from the worker. That's OK - if we overestimate
-            # available cores, workflow dispatch will fail and retry.
+
+        # Update available cores from worker's reported availability
+        if progress.worker_available_cores != worker_status.available_cores:
             updated_status = WorkerHeartbeat(
                 node_id=worker_status.node_id,
                 state=worker_status.state,
-                available_cores=worker_status.available_cores + cores_freed,
+                available_cores=progress.worker_available_cores,
                 queue_depth=worker_status.queue_depth,
                 cpu_percent=worker_status.cpu_percent,
                 memory_percent=worker_status.memory_percent,
-                version=worker_status.version,  # Keep same version - worker heartbeat will update
+                version=worker_status.version,
                 active_workflows=worker_status.active_workflows,
             )
             self._worker_status[worker_id] = updated_status
 
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Worker {worker_id} freed {cores_freed} cores (now {updated_status.available_cores} available)",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
+            # Signal if cores became available
+            if progress.worker_available_cores > worker_status.available_cores:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Worker {worker_id} availability updated: {worker_status.available_cores} -> {progress.worker_available_cores}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
                 )
-            )
-
-            # Signal that cores are available - wake up any waiting workflows
-            self._cores_available_event.set()
+                self._cores_available_event.set()
 
     # =========================================================================
     # Client Push Notifications (when gates not present)
@@ -4659,10 +5702,16 @@ class ManagerServer(HealthAwareServer):
         # Remove job and all related tracking dictionaries
         self._jobs.pop(job_id, None)
         self._job_leaders.pop(job_id, None)
+        self._job_leader_addrs.pop(job_id, None)
+        self._job_fencing_tokens.pop(job_id, None)
         self._job_layer_version.pop(job_id, None)
         self._job_contexts.pop(job_id, None)
         self._job_callbacks.pop(job_id, None)
-        
+        self._job_submissions.pop(job_id, None)
+
+        # Clean up eager dispatch tracking for this job
+        self._cleanup_eager_dispatch(job_id)
+
         # Remove workflow assignments for this job
         # _workflow_assignments is keyed by job_id, not workflow_id
         self._workflow_assignments.pop(job_id, None)
@@ -4714,45 +5763,111 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ):
-        """Handle job submission from gate or client."""
+        """
+        Handle job submission from gate or client.
+
+        Any active manager can accept a job and become the job leader.
+        Job leadership is per-job, not tied to datacenter leadership.
+        The accepting manager broadcasts leadership to peers so they
+        know where to route workflow results.
+        """
         try:
+            print('GOT JOB')
             submission = JobSubmission.load(data)
-            
-            # Only leader accepts new jobs
-            if not self.is_leader():
-                leader = self.get_current_leader()
+
+            # Unpickle workflows
+            workflows = restricted_loads(submission.workflows)
+
+            # Only active managers accept jobs (not SYNCING)
+            if self._manager_state != ManagerState.ACTIVE:
                 ack = JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error="Not leader" if leader else "No leader elected",
-                    leader_addr=leader,
+                    error=f"Manager is {self._manager_state.value}, not accepting jobs",
                 )
                 return ack.dump()
-            
-            # Create job progress tracker
+
+            # =================================================================
+            # Create job using JobManager (new system with TrackingToken)
+            # =================================================================
+            callback_addr = None
+            if submission.callback_addr:
+                callback_addr = tuple(submission.callback_addr) if isinstance(submission.callback_addr, list) else submission.callback_addr
+
+            job_info = await self._job_manager.create_job(
+                submission=submission,
+                callback_addr=callback_addr,
+            )
+
+            # Set job leadership info in JobInfo
+            job_info.leader_node_id = self._node_id.full
+            job_info.leader_addr = (self._host, self._tcp_port)
+            job_info.fencing_token = 1
+
+            # Log the tracking token
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Created job with tracking token: {job_info.token}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # =================================================================
+            # Legacy tracking (kept during migration)
+            # =================================================================
+
+            # Create initial workflow progress entries for query support
+            # These will be updated as workers report actual progress
+            initial_workflows = []
+            for wf in workflows:
+                # Debug: log what we're seeing
+                wf_name = wf.dependent_workflow.__name__ if isinstance(wf, DependentWorkflow) else wf.__name__
+
+                wf_id = getattr(wf, 'workflow_id', None) or f"{submission.job_id}:{wf_name}"
+                wf_progress = WorkflowProgress(
+                    job_id=submission.job_id,
+                    workflow_id=wf_id,
+                    workflow_name=wf_name,
+                    status=WorkflowStatus.PENDING.value,
+                    completed_count=0,
+                    failed_count=0,
+                    rate_per_second=0.0,
+                    elapsed_seconds=0.0,
+                    timestamp=time.monotonic(),
+                )
+                initial_workflows.append(wf_progress)
+
+            # Create job progress tracker (legacy)
             job = JobProgress(
                 job_id=submission.job_id,
                 datacenter=self._node_id.datacenter,
                 status=JobStatus.SUBMITTED.value,
-                workflows=[],
+                workflows=initial_workflows,
                 timestamp=time.monotonic(),
             )
+
             self._jobs[submission.job_id] = job
-            
+
+            # Store submission for eager dispatch
+            self._job_submissions[submission.job_id] = submission
+
             # Set this manager as job leader (first to accept = job leader)
             self._job_leaders[submission.job_id] = self._node_id.full
+            self._job_leader_addrs[submission.job_id] = (self._host, self._tcp_port)
+            self._job_fencing_tokens[submission.job_id] = 1  # Initial fencing token
             self._job_layer_version[submission.job_id] = 0  # Start at layer 0
             self._job_contexts[submission.job_id] = Context()  # Empty context
-            
+
             # Store callback for push notifications (if provided)
             if submission.callback_addr:
                 self._job_callbacks[submission.job_id] = submission.callback_addr
-            
+
             self._increment_version()
-            
-            # Unpickle workflows
-            workflows = restricted_loads(submission.workflows)
-            
+
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
@@ -4762,10 +5877,21 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            
+
+            # Broadcast job leadership to peer managers
+            # Include workflow names so non-leaders can respond to workflow queries
+            workflow_names = [wf.dependent_workflow.__name__ if isinstance(wf, DependentWorkflow) else wf.__name__ for wf in workflows]
+
+            await self._broadcast_job_leadership(
+                submission.job_id,
+                len(workflows),
+                workflow_names,
+            )
+
             # Dispatch workflows to workers via TaskRunner
-            self._task_runner.run(
-                self._dispatch_job_workflows, submission, workflows
+            await self._dispatch_job_workflows(
+                submission,
+                workflows,
             )
             
             ack = JobAck(
@@ -4776,6 +5902,8 @@ class ManagerServer(HealthAwareServer):
             return ack.dump()
             
         except Exception as e:
+            import traceback
+            print(traceback.format_exc())
             await self.handle_exception(e, "job_submission")
             ack = JobAck(
                 job_id="unknown",
@@ -4787,7 +5915,7 @@ class ManagerServer(HealthAwareServer):
     async def _dispatch_job_workflows(
         self,
         submission: JobSubmission,
-        workflows: list,
+        workflows: list[type[Workflow] | DependentWorkflow],
     ) -> None:
         """
         Dispatch workflows respecting dependencies and resource constraints.
@@ -4797,38 +5925,43 @@ class ManagerServer(HealthAwareServer):
         can run in parallel, but dependent workflows wait for their
         dependencies to complete before dispatching.
         """
-        import cloudpickle
-        
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=f"_dispatch_job_workflows called for job {submission.job_id} with {len(workflows)} workflows",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
+
+        try:
+            
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"_dispatch_job_workflows called for job {submission.job_id} with {len(workflows)} workflows",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
             )
-        )
-        
-        job = self._jobs.get(submission.job_id)
-        if not job:
-            return
-        
-        job.status = JobStatus.DISPATCHING.value
-        self._increment_version()
-        
-        # Build dependency graph
-        workflow_graph = networkx.DiGraph()
-        workflow_by_name: dict[str, tuple[int, Any]] = {}  # name -> (index, workflow)
-        workflow_vus: dict[str, int] = {}  # name -> vus (for passing to worker)
-        workflow_priorities: dict[str, StagePriority] = {}  # name -> priority
-        workflow_is_test: dict[str, bool] = {}  # name -> is_test_workflow
-        sources: list[str] = []  # Workflows with no dependencies
-        
-        for i, workflow in enumerate(workflows):
-            # Instantiate if it's a class (client sends classes, not instances)
-            if isinstance(workflow, type):
+            
+            job = self._jobs.get(submission.job_id)
+            if not job:
+                return
+            
+            job.status = JobStatus.DISPATCHING.value
+            self._increment_version()
+            
+            # Build dependency graph
+            workflow_graph = networkx.DiGraph()
+            workflow_by_name: dict[str, tuple[int, Any]] = {}  # name -> (index, workflow)
+            workflow_vus: dict[str, int] = {}  # name -> vus (for passing to worker)
+            workflow_priorities: dict[str, StagePriority] = {}  # name -> priority
+            workflow_is_test: dict[str, bool] = {}  # name -> is_test_workflow
+            sources: list[str] = []  # Workflows with no dependencies
+            
+            for i, workflow in enumerate(workflows):
                 try:
                     workflow = workflow()
+                    dependencies = []
+
+                    if isinstance(workflow, DependentWorkflow):
+                        dependencies = workflow.dependencies
+                        workflow = workflow.dependent_workflow
+
                 except Exception as e:
                     self._task_runner.run(
                         self._udp_logger.log,
@@ -4840,77 +5973,120 @@ class ManagerServer(HealthAwareServer):
                         )
                     )
                     job.status = JobStatus.FAILED.value
+                    # Clean up any workflows already added
+                    self._cleanup_workflow_by_id_for_job(submission.job_id)
                     return
+                
+
+                # At this point:
+                # - workflow is the inner workflow (DependentWorkflow was unwrapped above)
+                # - dependencies contains the list of dependency names (may be empty)
+                name = workflow.name
+
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Processing workflow {i}: {name}, deps={dependencies}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+                workflow_by_name[name] = (i, workflow)
+                workflow_vus[name] = getattr(workflow, 'vus', submission.vus)
+                workflow_priorities[name] = self._get_workflow_priority(workflow)
+                workflow_is_test[name] = self._is_test_workflow(workflow)
+                workflow_graph.add_node(name)
+
+                # Store workflow by ID for later lookup (e.g., aggregation)
+                workflow_id = f"{submission.job_id}:{name}"
+                self._workflow_by_id[workflow_id] = workflow
+
+                if dependencies:
+                    # Workflow has dependencies - add edges to the graph
+                    for dep in dependencies:
+                        workflow_graph.add_edge(dep, name)
+                else:
+                    # No dependencies - this is a source workflow
+                    sources.append(name)
+
             
+            # If no sources, all workflows have dependencies - find roots
+            if not sources:
+                # Find nodes with no incoming edges
+                for node in workflow_graph.nodes():
+                    if workflow_graph.in_degree(node) == 0:
+                        sources.append(node)
+            
+            # If still no sources, we have a cycle - fail the job
+            if not sources:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Job {submission.job_id} has circular workflow dependencies",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    ),
+                )
+                job.status = JobStatus.FAILED.value
+                self._cleanup_workflow_by_id_for_job(submission.job_id)
+                self._increment_version()
+                return
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
-                    message=f"Processing workflow {i}: {workflow.name}, vus={getattr(workflow, 'vus', 'N/A')}",
+                    message=f"Job {submission.job_id} graph built: {len(workflow_by_name)} workflows, {len(sources)} sources",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
             
-            if isinstance(workflow, DependentWorkflow) and len(workflow.dependencies) > 0:
-                # DependentWorkflow wraps the actual workflow
-                inner_wf = workflow.dependent_workflow
-                if isinstance(inner_wf, type):
-                    inner_wf = inner_wf()
-                name = inner_wf.name
-                workflow_by_name[name] = (i, inner_wf)
-                workflow_vus[name] = getattr(inner_wf, 'vus', submission.vus)
-                workflow_priorities[name] = self._get_workflow_priority(inner_wf)
-                workflow_is_test[name] = self._is_test_workflow(inner_wf)
-                workflow_graph.add_node(name)
-                for dep in workflow.dependencies:
-                    workflow_graph.add_edge(dep, name)
-            else:
-                # Regular workflow (no dependencies)
-                name = workflow.name
-                workflow_by_name[name] = (i, workflow)
-                workflow_vus[name] = getattr(workflow, 'vus', submission.vus)
-                workflow_priorities[name] = self._get_workflow_priority(workflow)
-                workflow_is_test[name] = self._is_test_workflow(workflow)
-                workflow_graph.add_node(name)
-                sources.append(name)
-        
-        # Calculate cores based on priority (NOT vus!)
-        # Total pool = sum of available cores across all healthy workers
-        total_pool = self._get_total_available_cores()
-        if total_pool == 0:
-            total_pool = 1  # Fallback to at least 1 core
-        
-        workflow_cores = self._calculate_priority_based_cores(
-            workflow_by_name,
-            workflow_priorities,
-            workflow_is_test,
-            total_pool,
-        )
-        
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=f"Core allocation for job {submission.job_id}: pool={total_pool}, allocations={workflow_cores}",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
+            # Create completion events for all workflows
+            for name in workflow_by_name:
+                idx, _ = workflow_by_name[name]
+                workflow_id = f"{submission.job_id}:{idx}"
+                self._workflow_completion_events[workflow_id] = asyncio.Event()
+
+            # Register all workflows for eager dispatch tracking
+            # This sets up dependency tracking so workflows dispatch as soon as ready
+            self._register_workflows_for_eager_dispatch(
+                submission.job_id,
+                workflow_graph,
+                workflow_by_name,
+                workflow_vus,
+                workflow_priorities,
+                workflow_is_test,
             )
-        )
-        
-        # If no sources, all workflows have dependencies - find roots
-        if not sources:
-            # Find nodes with no incoming edges
-            for node in workflow_graph.nodes():
-                if workflow_graph.in_degree(node) == 0:
-                    sources.append(node)
-        
-        # If still no sources, we have a cycle - fail the job
-        if not sources:
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Registered {len(workflow_by_name)} workflows for eager dispatch, "
+                            f"{len(sources)} sources ready immediately",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Dispatch initial workflows (sources with no dependencies)
+            # The eager dispatch system will handle dependent workflows as they become ready
+            await self._try_eager_dispatch(submission.job_id, submission)
+
+            job.status = JobStatus.RUNNING.value
+            self._increment_version()
+
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc())
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(
-                    message=f"Job {submission.job_id} has circular workflow dependencies",
+                    message=f"Initial dispatch failed: {e}",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
@@ -4918,136 +6094,222 @@ class ManagerServer(HealthAwareServer):
             )
             job.status = JobStatus.FAILED.value
             self._increment_version()
-            return
-        
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=f"Job {submission.job_id} graph built: {len(workflow_by_name)} workflows, {len(sources)} sources",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
+
+    # =========================================================================
+    # Eager Dispatch System
+    # =========================================================================
+
+    def _register_workflows_for_eager_dispatch(
+        self,
+        job_id: str,
+        workflow_graph: networkx.DiGraph,
+        workflow_by_name: dict[str, tuple[int, Any]],
+        workflow_vus: dict[str, int],
+        workflow_priorities: dict[str, StagePriority],
+        workflow_is_test: dict[str, bool],
+    ) -> None:
+        """
+        Register all workflows from a job for eager dispatch tracking.
+
+        This sets up the dependency tracking so workflows can be dispatched
+        as soon as their dependencies complete and cores are available.
+        """
+        for wf_name, (idx, wf) in workflow_by_name.items():
+            # Get dependencies (predecessors in the graph)
+            dependencies = set(workflow_graph.predecessors(wf_name))
+
+            entry = EagerWorkflowEntry(
+                job_id=job_id,
+                workflow_name=wf_name,
+                workflow_idx=idx,
+                workflow=wf,
+                vus=workflow_vus.get(wf_name, 1),
+                priority=workflow_priorities.get(wf_name, StagePriority.AUTO),
+                is_test=workflow_is_test.get(wf_name, False),
+                dependencies=dependencies,
+                completed_dependencies=set(),
+                dispatched=False,
             )
-        )
-        
-        # Create completion events for all workflows
-        for name in workflow_by_name:
-            idx, _ = workflow_by_name[name]
-            workflow_id = f"{submission.job_id}:{idx}"
-            self._workflow_completion_events[workflow_id] = asyncio.Event()
-        
+
+            # Key by job_id:workflow_name for uniqueness
+            key = f"{job_id}:{wf_name}"
+            self._eager_pending_workflows[key] = entry
+
+    def _mark_workflow_completed_for_eager(self, job_id: str, workflow_name: str) -> None:
+        """
+        Mark a workflow as completed and update dependent workflows.
+
+        Called when a workflow completes. Updates all pending workflows
+        that depend on this one.
+        """
+        for key, entry in list(self._eager_pending_workflows.items()):
+            if entry.job_id != job_id:
+                continue
+            if workflow_name in entry.dependencies:
+                entry.completed_dependencies.add(workflow_name)
+
+    def _get_ready_workflows(self, job_id: str) -> list[EagerWorkflowEntry]:
+        """
+        Get workflows that are ready for dispatch.
+
+        A workflow is ready if:
+        1. It hasn't been dispatched yet
+        2. All its dependencies have completed
+        """
+        ready = []
+        for key, entry in self._eager_pending_workflows.items():
+            if entry.job_id != job_id:
+                continue
+            if entry.dispatched:
+                continue
+            # Check if all dependencies are satisfied
+            if entry.dependencies <= entry.completed_dependencies:
+                ready.append(entry)
+        return ready
+
+    async def _try_eager_dispatch(self, job_id: str, submission: JobSubmission) -> None:
+        """
+        Attempt to eagerly dispatch any workflows that are now ready.
+
+        Called when:
+        1. A workflow completes (dependencies may now be satisfied)
+        2. Cores become available
+
+        Uses a lock to prevent concurrent dispatch attempts.
+        """
         try:
-            # Dispatch in dependency order using BFS layers
-            layer_idx = 0
-            for layer in networkx.bfs_layers(workflow_graph, sources):
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Processing layer {layer_idx} with {len(layer)} workflows: {list(layer)}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                layer_idx += 1
-                # Wait for dependencies of this layer to complete
-                for wf_name in layer:
-                    deps = list(workflow_graph.predecessors(wf_name))
-                    for dep in deps:
-                        dep_idx, _ = workflow_by_name.get(dep, (None, None))
-                        if dep_idx is not None:
-                            dep_workflow_id = f"{submission.job_id}:{dep_idx}"
-                            dep_event = self._workflow_completion_events.get(dep_workflow_id)
-                            if dep_event:
-                                # Wait for dependency to complete
-                                try:
-                                    await asyncio.wait_for(
-                                        dep_event.wait(),
-                                        timeout=submission.timeout_seconds,
-                                    )
-                                except asyncio.TimeoutError:
-                                    self._task_runner.run(
-                                        self._udp_logger.log,
-                                        ServerError(
-                                            message=f"Timeout waiting for dependency {dep} to complete",
-                                            node_host=self._host,
-                                            node_port=self._tcp_port,
-                                            node_id=self._node_id.short,
-                                        ),
-                                    )
-                                    job.status = JobStatus.TIMEOUT.value
-                                    self._increment_version()
-                                    return
-                
-                # Dispatch all workflows in this layer (can run in parallel)
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Dispatching {len(layer)} workflows in layer",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                
-                dispatch_tasks = []
-                for wf_name in layer:
-                    idx, wf = workflow_by_name[wf_name]
-                    cores_needed = workflow_cores[wf_name]
-                    vus_for_workflow = workflow_vus[wf_name]
-                    self._task_runner.run(
-                        self._udp_logger.log,
+
+            async with self._eager_dispatch_lock:
+                ready_workflows = self._get_ready_workflows(job_id)
+
+                if not ready_workflows:
+                    return
+
+                # Get current available cores
+                total_pool = self._get_total_available_cores()
+
+
+
+                if total_pool <= 0:
+                    # No cores available - workflows will be dispatched when cores free up
+                    return
+
+                # Separate EXCLUSIVE from others
+                exclusive = [e for e in ready_workflows if e.priority == StagePriority.EXCLUSIVE]
+                non_exclusive = [e for e in ready_workflows if e.priority != StagePriority.EXCLUSIVE]
+
+                # Handle EXCLUSIVE workflows - only one at a time with full pool
+                if exclusive:
+                    entry = exclusive[0]  # First-come first-serve
+                    entry.dispatched = True
+                    entry.cores_allocated = total_pool
+
+                    await self._udp_logger.log(
                         ServerInfo(
-                            message=f"Creating dispatch task for {wf_name} (idx={idx}, cores={cores_needed}, vus={vus_for_workflow})",
+                            message=f"Eager dispatch: EXCLUSIVE workflow {entry.workflow_name} (cores={total_pool})",
                             node_host=self._host,
                             node_port=self._tcp_port,
                             node_id=self._node_id.short,
                         )
+
                     )
-                    dispatch_tasks.append(
-                        self._dispatch_single_workflow(
-                            submission, idx, wf, cores_needed, vus_for_workflow, cloudpickle
-                        )
+
+                    # Dispatch and wait for completion before allowing more
+                    result = await self._dispatch_single_workflow(
+                        submission,
+                        entry.workflow_idx,
+                        entry.workflow,
+                        total_pool,
+                        entry.vus,
+                        entry.workflow_name,
                     )
-                
-                # Wait for all dispatches in this layer
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Waiting for {len(dispatch_tasks)} dispatch tasks to complete",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                results = await asyncio.gather(*dispatch_tasks, return_exceptions=True)
-                for result in results:
-                    if isinstance(result, Exception):
-                        self._task_runner.run(
-                            self._udp_logger.log,
+                    if result is False or isinstance(result, Exception):
+
+                        await self._udp_logger.log(
                             ServerError(
-                                message=f"Workflow dispatch failed: {result}",
+                                message=f"Eager dispatch failed for EXCLUSIVE {entry.workflow_name}: {result}",
                                 node_host=self._host,
                                 node_port=self._tcp_port,
                                 node_id=self._node_id.short,
-                            ),
+                            )
                         )
-                        job.status = JobStatus.FAILED.value
-                        self._increment_version()
-                        return
-                    elif result is False:
-                        # Dispatch failed
-                        job.status = JobStatus.FAILED.value
-                        self._increment_version()
-                        return
-            
-            job.status = JobStatus.RUNNING.value
-            self._increment_version()
-            
-        finally:
-            # Cleanup will happen when job completes
-            pass
-    
+
+                    return  # Don't dispatch others while EXCLUSIVE is pending
+
+                # For non-exclusive, calculate layer-style allocation
+                if not non_exclusive:
+                    return
+
+                # Build temporary structures for _calculate_layer_cores
+                layer_names = [e.workflow_name for e in non_exclusive]
+                temp_by_name = {e.workflow_name: (e.workflow_idx, e.workflow) for e in non_exclusive}
+                temp_priorities = {e.workflow_name: e.priority for e in non_exclusive}
+                temp_is_test = {e.workflow_name: e.is_test for e in non_exclusive}
+
+                try:
+                    layer_cores, _ = self._calculate_layer_cores(
+                        layer_names,
+                        temp_by_name,
+                        temp_priorities,
+                        temp_is_test,
+                        total_pool,
+                    )
+                except Exception as e:
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=f"_calculate_layer_cores FAILED: {e}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+
+                    )
+                    raise
+
+                # Dispatch all ready non-exclusive workflows concurrently
+                dispatch_tasks = []
+                for entry in non_exclusive:
+                    cores = layer_cores.get(entry.workflow_name, 1)
+                    entry.dispatched = True
+                    entry.cores_allocated = cores
+
+                    dispatch_tasks.append(
+                        self._dispatch_single_workflow(
+                            submission,
+                            entry.workflow_idx,
+                            entry.workflow,
+                            cores,
+                            entry.vus,
+                            entry.workflow_name,
+                        )
+                    )
+
+                if dispatch_tasks:
+                    results = await asyncio.gather(*dispatch_tasks, return_exceptions=True)
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception) or result is False:
+                            entry = non_exclusive[i]
+                            await self._udp_logger.log(
+                                ServerInfo(
+                                    message=f"Eager dispatch failed for {entry.workflow_name}: {result}",
+                                    node_host=self._host,
+                                    node_port=self._tcp_port,
+                                    node_id=self._node_id.short,
+                                )
+                            )
+
+        except Exception as err:
+            await self.handle_exception(err, "_try_eager_dispatch")
+
+    def _cleanup_eager_dispatch(self, job_id: str) -> None:
+        """Remove all eager dispatch entries for a completed job."""
+        keys_to_remove = [
+            key for key, entry in self._eager_pending_workflows.items()
+            if entry.job_id == job_id
+        ]
+        for key in keys_to_remove:
+            self._eager_pending_workflows.pop(key, None)
+
     async def _dispatch_single_workflow(
         self,
         submission: JobSubmission,
@@ -5055,250 +6317,330 @@ class ManagerServer(HealthAwareServer):
         workflow: Any,
         cores_needed: int,
         vus: int,
-        cloudpickle,
+        workflow_name: str,
     ) -> bool:
-        """
-        Dispatch a workflow across multiple workers to satisfy core requirements.
+        try:
 
-        Workers are treated as a unified pool. If a workflow needs 8 cores and
-        we have 2 workers with 4 cores each, the workflow is dispatched to BOTH
-        workers, each handling a portion of the VUs proportional to their cores.
+            """
+            Dispatch a workflow across multiple workers to satisfy core requirements.
 
-        Args:
-            submission: The job submission
-            idx: Workflow index within the job
-            workflow: The workflow instance
-            cores_needed: Total CPU cores to allocate across all workers
-            vus: Total virtual users (distributed proportionally across workers)
-            cloudpickle: The cloudpickle module for serialization
+            Workers are treated as a unified pool. If a workflow needs 8 cores and
+            we have 2 workers with 4 cores each, the workflow is dispatched to BOTH
+            workers, each handling a portion of the VUs proportional to their cores.
 
-        Returns True if at least one dispatch succeeded, False otherwise.
-        """
-        workflow_id = f"{submission.job_id}:{idx}"
+            Args:
+                submission: The job submission
+                idx: Workflow index within the job
+                workflow: The workflow instance
+                cores_needed: Total CPU cores to allocate across all workers
+                vus: Total virtual users (distributed proportionally across workers)
+                workflow_name: Name of the workflow for ID matching
 
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=f"_dispatch_single_workflow started for {workflow_id}, need {cores_needed} cores total",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
-        )
+            Returns True if at least one dispatch succeeded, False otherwise.
+            """
+            # Use workflow_name format to match WorkflowProgress.workflow_id
+            workflow_id = f"{submission.job_id}:{workflow_name}"
 
-        # Resource-aware waiting with event-driven notification
-        # When cores are freed, _cores_available_event is signaled
-        max_wait = submission.timeout_seconds
-        start_time = time.monotonic()
-        wait_timeout = self.env.MANAGER_DISPATCH_CORE_WAIT_TIMEOUT  # Max time per wait iteration
-        logged_waiting = False
-
-        worker_allocations: list[tuple[str, int]] = []
-        while True:
-            waited = time.monotonic() - start_time
-            if waited >= max_wait:
-                break
-
-            # Try to select workers from the pool to satisfy total core requirement
-            worker_allocations = self._select_workers_for_workflow_pool(cores_needed)
-            total_allocated = sum(cores for _, cores in worker_allocations)
-
-            if total_allocated >= cores_needed:
-                workers_str = ", ".join(f"{w}({c})" for w, c in worker_allocations)
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Selected workers for {workflow_id}: {workers_str} (total={total_allocated} cores)",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                break
-
-            # Log that we're waiting for resources (once)
-            if not logged_waiting:
-                logged_waiting = True
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Waiting for {cores_needed} cores for {workflow_id} (only {total_allocated} available)",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    ),
-                )
-
-            # Clear the event before waiting (so we catch new signals)
-            self._cores_available_event.clear()
-
-            # Wait for cores to become available (event-driven) or timeout
-            try:
-                remaining_time = max_wait - waited
-                actual_timeout = min(wait_timeout, remaining_time)
-                await asyncio.wait_for(
-                    self._cores_available_event.wait(),
-                    timeout=actual_timeout,
-                )
-            except asyncio.TimeoutError:
-                pass  # Timeout is expected - just re-check availability
-
-        waited = time.monotonic() - start_time
-
-        total_allocated = sum(cores for _, cores in worker_allocations)
-        if total_allocated == 0:
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerError(
-                    message=f"Timeout waiting for cores for {workflow_id} after {waited:.1f}s (0 available)",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                ),
-            )
-            return False
-
-        if waited > 0:
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Found {total_allocated} cores for {workflow_id} after {waited:.1f}s wait",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                ),
-            )
-
-        # Extract dependency context once (shared across all worker dispatches)
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=f"Extracting context for {workflow_id}",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
-            )
-        )
-        dependency_context = await self._extract_dependency_context(
-            submission.job_id, workflow
-        )
-        context_version = self._job_layer_version.get(submission.job_id, 0)
-
-        # Serialize workflow once (shared across all dispatches)
-        workflow_bytes = cloudpickle.dumps(workflow)
-        context_bytes = cloudpickle.dumps({})
-
-        # Initialize sub-workflow tracking for this parent workflow
-        self._sub_workflow_mapping[workflow_id] = []
-
-        # Dispatch to each worker with their portion of cores/vus
-        successful_dispatches = 0
-        for worker_idx, (worker_id, worker_cores) in enumerate(worker_allocations):
-            # Calculate VUs for this worker proportionally
-            # e.g., if worker gets 4 of 8 cores, it gets 50% of VUs
-            worker_vus = int(vus * (worker_cores / total_allocated))
-            # Ensure at least 1 VU if we're allocating cores
-            worker_vus = max(worker_vus, 1) if worker_cores > 0 else 0
-
-            # Create sub-workflow ID: job_id:workflow_idx:worker_idx
-            sub_workflow_id = f"{workflow_id}:{worker_idx}"
-
-            # Track this sub-workflow
-            self._sub_workflow_mapping[workflow_id].append(sub_workflow_id)
-
-            # Create provision request for quorum
-            provision = ProvisionRequest(
+            # =================================================================
+            # Register workflow with JobManager using TrackingToken
+            # =================================================================
+            # Use index-based workflow_id for unique identification
+            wf_id = f"wf-{idx:04d}"
+            await self._job_manager.register_workflow(
                 job_id=submission.job_id,
-                workflow_id=sub_workflow_id,
-                target_worker=worker_id,
-                cores_required=worker_cores,
-                fence_token=self._get_fence_token(),
-                version=self._state_version,
+                workflow_id=wf_id,
+                name=workflow_name,
+                workflow=workflow,
             )
 
-            # Request quorum (skip if only one manager)
-            if self._manager_peers:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Requesting quorum for {sub_workflow_id}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                try:
-                    await self._request_quorum_confirmation(provision)
-                    await self._send_provision_commit(provision)
-                except (QuorumCircuitOpenError, QuorumUnavailableError, QuorumTimeoutError) as e:
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerError(
-                            message=f"Quorum failed for {sub_workflow_id}: {e.message}",
+            # Resource-aware waiting with event-driven notification
+            # When cores are freed, _cores_available_event is signaled
+            max_wait = submission.timeout_seconds
+            start_time = time.monotonic()
+            wait_timeout = self.env.MANAGER_DISPATCH_CORE_WAIT_TIMEOUT  # Max time per wait iteration
+            logged_waiting = False
+
+            worker_allocations: list[tuple[str, int]] = []
+            while True:
+                waited = time.monotonic() - start_time
+                if waited >= max_wait:
+                    print('AA')
+                    break
+
+                # Try to select workers from the pool to satisfy total core requirement
+                # Use lock to ensure atomic selection + reservation (prevents race conditions)
+                print('A')
+                async with self._core_allocation_lock:
+                    worker_allocations = self._select_workers_for_workflow_pool(cores_needed)
+                    total_allocated = sum(cores for _, cores in worker_allocations)
+
+                    if total_allocated >= cores_needed:
+                        # Immediately reserve cores by decrementing available_cores
+                        # This prevents other concurrent dispatches from claiming the same cores
+                        # Worker heartbeats will provide authoritative counts going forward
+                        for worker_id, cores_to_reserve in worker_allocations:
+                            worker_status = self._worker_status.get(worker_id)
+                            if worker_status:
+                                updated_status = WorkerHeartbeat(
+                                    node_id=worker_status.node_id,
+                                    state=worker_status.state,
+                                    available_cores=max(0, worker_status.available_cores - cores_to_reserve),
+                                    queue_depth=worker_status.queue_depth,
+                                    cpu_percent=worker_status.cpu_percent,
+                                    memory_percent=worker_status.memory_percent,
+                                    version=worker_status.version,
+                                    active_workflows=worker_status.active_workflows,
+                                )
+                                self._worker_status[worker_id] = updated_status
+
+                    print('B')
+
+                # Log success outside the lock
+                if total_allocated >= cores_needed:
+                    print('C')
+                    workers_str = ", ".join(f"{w}({c})" for w, c in worker_allocations)
+
+                    await self._udp_logger.log(
+                        ServerInfo(
+                            message=f"Selected workers for {workflow_id}: {workers_str} (total={total_allocated} cores)",
                             node_host=self._host,
                             node_port=self._tcp_port,
                             node_id=self._node_id.short,
                         )
                     )
-                    continue  # Try next worker
-            else:
-                self._task_runner.run(
-                    self._udp_logger.log,
+                    break
+
+
+                print('D')
+                # Log that we're waiting for resources (once)
+                if not logged_waiting:
+                    logged_waiting = True
+
+                    await self._udp_logger.log(
+                        ServerInfo(
+                            message=f"Waiting for {cores_needed} cores for {workflow_id} (only {total_allocated} available)",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+                # Clear the event before waiting (so we catch new signals)
+                self._cores_available_event.clear()
+
+                print('E')
+
+                # Wait for cores to become available (event-driven) or timeout
+                try:
+                    remaining_time = max_wait - waited
+                    actual_timeout = min(wait_timeout, remaining_time)
+                    await asyncio.wait_for(
+                        self._cores_available_event.wait(),
+                        timeout=actual_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    pass  # Timeout is expected - just re-check availability
+
+
+                print('F')
+
+            waited = time.monotonic() - start_time
+
+            print('G')
+
+            total_allocated = sum(cores for _, cores in worker_allocations)
+            if total_allocated == 0:
+                print('H')
+                await self._udp_logger.log(
                     ServerInfo(
-                        message=f"Skipping quorum for {sub_workflow_id} (single manager mode)",
+                        message=f"Timeout waiting for cores for {workflow_id} after {waited:.1f}s (0 available)",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return False
+
+            if waited > 0:
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Found {total_allocated} cores for {workflow_id} after {waited:.1f}s wait",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
                     )
                 )
 
-            # Dispatch to this worker
-            dispatch = WorkflowDispatch(
-                job_id=submission.job_id,
-                workflow_id=sub_workflow_id,
-                workflow=workflow_bytes,
-                context=context_bytes,
-                vus=worker_vus,
-                cores=worker_cores,
-                timeout_seconds=submission.timeout_seconds,
-                fence_token=provision.fence_token,
-                context_version=context_version,
-                dependency_context=dependency_context,
-            )
+            print('I')
 
-            # Store dispatch bytes for potential retry
-            dispatch_bytes = dispatch.dump()
-            self._workflow_retries[sub_workflow_id] = (0, dispatch_bytes, set())
-
+            # Extract dependency context once (shared across all worker dispatches)
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
-                    message=f"Dispatching {sub_workflow_id} to worker {worker_id} (cores={worker_cores}, vus={worker_vus})",
+                    message=f"Extracting context for {workflow_id}",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
+            dependency_context = await self._extract_dependency_context(
+                submission.job_id, workflow
+            )
+            context_version = self._job_layer_version.get(submission.job_id, 0)
 
-            ack = await self._dispatch_workflow_to_worker(worker_id, dispatch)
-            if ack and ack.accepted:
-                successful_dispatches += 1
-                # Track assignment for this sub-workflow
-                if submission.job_id not in self._workflow_assignments:
-                    self._workflow_assignments[submission.job_id] = {}
-                self._workflow_assignments[submission.job_id][sub_workflow_id] = worker_id
-            else:
+            # Serialize workflow once (shared across all dispatches)
+            workflow_bytes = cloudpickle.dumps(workflow)
+            context_bytes = cloudpickle.dumps({})
+
+            # Initialize sub-workflow tracking for this parent workflow
+            self._sub_workflow_mapping[workflow_id] = []
+
+            print('J', worker_allocations)
+
+            # Dispatch to each worker with their portion of cores/vus
+            successful_dispatches = 0
+            for worker_idx, (worker_id, worker_cores) in enumerate(worker_allocations):
+
+
+                print('K')
+                # Calculate VUs for this worker proportionally
+                # e.g., if worker gets 4 of 8 cores, it gets 50% of VUs
+                worker_vus = int(vus * (worker_cores / total_allocated))
+                # Ensure at least 1 VU if we're allocating cores
+                worker_vus = max(worker_vus, 1) if worker_cores > 0 else 0
+
+                # Create sub-workflow ID: job_id:workflow_idx:worker_idx
+                sub_workflow_id = f"{workflow_id}:{worker_idx}"
+
+                # Track this sub-workflow
+                self._sub_workflow_mapping[workflow_id].append(sub_workflow_id)
+
+                # =============================================================
+                # Register sub-workflow with JobManager
+                # =============================================================
+                await self._job_manager.register_sub_workflow(
+                    job_id=submission.job_id,
+                    workflow_id=wf_id,  # Parent workflow ID (wf-XXXX)
+                    worker_id=worker_id,
+                    cores_allocated=worker_cores,
+                )
+
+                print('M', self._sub_workflow_mapping[workflow_id])
+
+                # Track as unconfirmed until worker reports assigned_cores > 0
+                # This allows us to know which dispatches are waiting for confirmation
+                self._unconfirmed_dispatches[sub_workflow_id] = (worker_id, worker_cores)
+
+                # Create provision request for quorum
+                provision = ProvisionRequest(
+                    job_id=submission.job_id,
+                    workflow_id=sub_workflow_id,
+                    target_worker=worker_id,
+                    cores_required=worker_cores,
+                    fence_token=self._get_fence_token(),
+                    version=self._state_version,
+                )
+
+                # Request quorum (skip if only one manager)
+                peer_addrs = self._get_active_peer_tcp_addrs()
+                if peer_addrs:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Requesting quorum for {sub_workflow_id}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    try:
+                        await self._request_quorum_confirmation(provision)
+                        await self._send_provision_commit(provision)
+                    except (QuorumCircuitOpenError, QuorumUnavailableError, QuorumTimeoutError) as e:
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerError(
+                                message=f"Quorum failed for {sub_workflow_id}: {e.message}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                        continue  # Try next worker
+                else:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Skipping quorum for {sub_workflow_id} (single manager mode)",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+                print(list(self._sub_workflow_mapping.keys()))
+
+                # Dispatch to this worker
+                dispatch = WorkflowDispatch(
+                    job_id=submission.job_id,
+                    workflow_id=sub_workflow_id,
+                    workflow=workflow_bytes,
+                    context=context_bytes,
+                    vus=worker_vus,
+                    cores=worker_cores,
+                    timeout_seconds=submission.timeout_seconds,
+                    fence_token=provision.fence_token,
+                    context_version=context_version,
+                    dependency_context=dependency_context,
+                )
+
+                # Store dispatch bytes for potential retry
+                dispatch_bytes = dispatch.dump()
+                self._workflow_retries[sub_workflow_id] = (0, dispatch_bytes, set())
+
                 self._task_runner.run(
                     self._udp_logger.log,
-                    ServerError(
-                        message=f"Dispatch rejected for {sub_workflow_id} by worker {worker_id}",
+                    ServerInfo(
+                        message=f"Dispatching {sub_workflow_id} to worker {worker_id} (cores={worker_cores}, vus={worker_vus})",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
                     )
                 )
 
-        return successful_dispatches > 0
+                ack = await self._dispatch_workflow_to_worker(worker_id, dispatch)
+                if ack and ack.accepted:
+                    successful_dispatches += 1
+                    # Track assignment for this sub-workflow
+                    if submission.job_id not in self._workflow_assignments:
+                        self._workflow_assignments[submission.job_id] = {}
+                    self._workflow_assignments[submission.job_id][sub_workflow_id] = worker_id
+
+                    # Update workflow status in job.workflows to RUNNING
+                    job = self._jobs.get(submission.job_id)
+                    if job:
+                        for wf_progress in job.workflows:
+                            # Match by workflow_id prefix (parent workflow)
+                            if wf_progress.workflow_id == workflow_id or wf_progress.workflow_id.startswith(f"{workflow_id}:"):
+                                wf_progress.status = WorkflowStatus.RUNNING.value
+                                break
+                        self._increment_version()
+                else:
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=f"Dispatch rejected for {sub_workflow_id} by worker {worker_id}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            return successful_dispatches > 0
+        
+        except Exception as err:
+           import traceback
+           print(traceback.format_exc())
+           await self.handle_exception(err, "_dispatch_single_workflow")
     
     # =========================================================================
     # TCP Handlers - Quorum
@@ -5504,3 +6846,304 @@ class ManagerServer(HealthAwareServer):
             )
             return ack.dump()
 
+    # =========================================================================
+    # TCP Handlers - Job Leadership
+    # =========================================================================
+
+    @tcp.receive()
+    async def job_leadership_announcement(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle job leadership announcement from another manager.
+
+        When another manager accepts a job, it broadcasts leadership.
+        We record this so we can properly route workflow results
+        and forward context updates to the job leader.
+        """
+        try:
+            announcement = JobLeadershipAnnouncement.load(data)
+        
+            # Don't accept if we're already the leader for this job
+            if self._is_job_leader(announcement.job_id):
+                ack = JobLeadershipAck(
+                    job_id=announcement.job_id,
+                    accepted=False,
+                    responder_id=self._node_id.full,
+                )
+                return ack.dump()
+
+            # Record job leadership
+            self._job_leaders[announcement.job_id] = announcement.leader_id
+            self._job_leader_addrs[announcement.job_id] = (
+                announcement.leader_host,
+                announcement.leader_tcp_port,
+            )
+
+            # Initialize empty context for this job if we don't have one
+            if announcement.job_id not in self._job_contexts:
+                self._job_contexts[announcement.job_id] = Context()
+
+            if announcement.job_id not in self._job_layer_version:
+                self._job_layer_version[announcement.job_id] = 0
+
+            # Create job progress tracker if we don't have one
+            # This allows non-leader managers to track and report on the job
+            if announcement.job_id not in self._jobs:
+                # Create workflow progress entries from announcement
+                # These are placeholder entries so we can respond to queries
+                workflows = []
+                for wf_name in announcement.workflow_names:
+                    wf_progress = WorkflowProgress(
+                        job_id=announcement.job_id,
+                        workflow_id=f"{announcement.job_id}:{wf_name}",  # Placeholder ID
+                        workflow_name=wf_name,
+                        status=WorkflowStatus.PENDING.value,
+                        completed_count=0,
+                        failed_count=0,
+                        rate_per_second=0.0,
+                        elapsed_seconds=0.0,
+                        timestamp=time.monotonic(),
+                    )
+                    workflows.append(wf_progress)
+
+                job = JobProgress(
+                    job_id=announcement.job_id,
+                    datacenter=self._node_id.datacenter,
+                    status=JobStatus.SUBMITTED.value,
+                    workflows=workflows,
+                    timestamp=time.monotonic(),
+                )
+
+                self._jobs[announcement.job_id] = job
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Accepted job {announcement.job_id[:8]}... leadership from {announcement.leader_id[:8]}...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            ack = JobLeadershipAck(
+                job_id=announcement.job_id,
+                accepted=True,
+                responder_id=self._node_id.full,
+            )
+            return ack.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "job_leadership_announcement")
+            return b'error'
+
+    # =========================================================================
+    # TCP Handlers - Ping/Health Check
+    # =========================================================================
+
+    @tcp.receive()
+    async def ping(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle ping request from client.
+
+        Returns comprehensive manager status including:
+        - Manager identity and leadership status
+        - Capacity (total/available cores)
+        - Worker health (per-worker breakdown)
+        - Active jobs
+        - Peer manager addresses
+        """
+        try:
+            request = PingRequest.load(data)
+
+            # Build per-worker status list
+            healthy_worker_ids = set(self._get_healthy_worker_ids())
+            workers: list[WorkerStatus] = []
+
+            for worker_id, registration in list(self._workers.items()):
+                # Get status from heartbeat if available
+                heartbeat = self._worker_status.get(worker_id)
+                if heartbeat:
+                    state = heartbeat.state
+                    available_cores = heartbeat.available_cores
+                    queue_depth = heartbeat.queue_depth
+                    cpu_percent = heartbeat.cpu_percent
+                    memory_percent = heartbeat.memory_percent
+                else:
+                    # Fallback to registration data
+                    state = WorkerState.HEALTHY.value if worker_id in healthy_worker_ids else WorkerState.OFFLINE.value
+                    available_cores = registration.available_cores
+                    queue_depth = 0
+                    cpu_percent = 0.0
+                    memory_percent = 0.0
+
+                workers.append(WorkerStatus(
+                    worker_id=worker_id,
+                    state=state,
+                    available_cores=available_cores,
+                    total_cores=registration.total_cores,
+                    queue_depth=queue_depth,
+                    cpu_percent=cpu_percent,
+                    memory_percent=memory_percent,
+                ))
+
+            # Get active job IDs
+            active_job_ids = list(self._jobs.keys())
+
+            # Get peer manager addresses
+            peer_managers = self._get_active_manager_peer_addrs()
+
+            response = ManagerPingResponse(
+                request_id=request.request_id,
+                manager_id=self._node_id.full,
+                datacenter=self._dc_id,
+                host=self._host,
+                port=self._tcp_port,
+                is_leader=self.is_leader(),
+                state=self._manager_state.value,
+                term=self._leader_election.state.current_term,
+                total_cores=self._get_total_cores(),
+                available_cores=self._get_available_cores_for_healthy_workers(),
+                worker_count=len(self._workers),
+                healthy_worker_count=len(healthy_worker_ids),
+                workers=workers,
+                active_job_ids=active_job_ids,
+                active_job_count=len(active_job_ids),
+                active_workflow_count=sum(
+                    len(job.workflows) for job in self._jobs.values()
+                ),
+                peer_managers=peer_managers,
+            )
+
+            return response.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "ping")
+            return b'error'
+
+    @tcp.receive()
+    async def workflow_query(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle workflow status query from client.
+
+        Returns status for requested workflows by name, including:
+        - Current status (pending, running, completed, etc.)
+        - Provisioned cores and VUs
+        - Progress stats (completed/failed counts, rate)
+        - Queue position if enqueued
+        - Assigned workers
+
+        Unknown workflow names are silently ignored.
+        """
+        try:
+            request = WorkflowQueryRequest.load(data)
+            workflow_names_set = set(request.workflow_names)
+
+            workflows: list[WorkflowStatusInfo] = []
+
+            matching_job = self._jobs.get(request.job_id)
+            if matching_job is None:
+                response = WorkflowQueryResponse(
+                    request_id=request.request_id,
+                    manager_id=self._node_id.full,
+                    datacenter=self._node_id.datacenter,
+                    workflows=workflows,
+                )
+
+                return response.dump()
+
+            matching_workflows = [
+                workflow for workflow in matching_job.workflows if workflow.workflow_name in request.workflow_names
+            ]
+
+            # Build global queue of all PENDING workflows ordered by timestamp
+            # Queue position is 1-indexed (1 = next to run, 0 = not queued)
+            pending_queue: list[tuple[float, str]] = []  # (timestamp, workflow_id)
+            for job in self._jobs.values():
+                for wf in job.workflows:
+                    if wf.status == WorkflowStatus.PENDING.value:
+                        pending_queue.append((wf.timestamp, wf.workflow_id))
+            # Sort by timestamp (earliest first = front of queue)
+            pending_queue.sort(key=lambda x: x[0])
+            # Map workflow_id -> queue position (1-indexed)
+            queue_positions = {wf_id: idx + 1 for idx, (_, wf_id) in enumerate(pending_queue)}
+
+            # Get workflow assignments for this job
+            job_assignments: dict[str, str] = self._workflow_assignments.get(request.job_id, {})
+
+            for workflow in matching_workflows:
+                # Determine if this workflow is enqueued (PENDING status)
+                is_enqueued = workflow.status == WorkflowStatus.PENDING.value
+                # Get assigned worker(s) for this workflow
+                assigned_workers: list[str] = []
+                provisioned_cores = 0
+                # Get assigned worker(s) for this workflow
+                assigned_workers: list[str] = []
+
+                # Check for sub-workflow assignments (multi-worker dispatch)
+                sub_workflow_ids = self._sub_workflow_mapping.get(workflow.workflow_id, [])
+
+                print(list(self._sub_workflow_mapping.keys()))
+                worker_id = job_assignments.get(workflow.workflow_id)
+
+                if sub_workflow_ids:
+                    assigned_workers.extend(set([
+                        job_assignments.get(sub_id)
+                        for sub_id in sub_workflow_ids
+                        if job_assignments.get(sub_id) is not None
+                    ]))
+                    
+                    provisioned_cores = sum([
+                        self._sub_workflow_progress[sub_id].assigned_cores
+                        for sub_id in sub_workflow_ids
+                        if self._sub_workflow_progress.get(sub_id)
+                    ])
+
+                else:
+                    assigned_workers = [worker_id] if worker_id else []
+                    provisioned_cores = len(workflow.assigned_cores)
+
+                # Build status info
+                status_info = WorkflowStatusInfo(
+                    workflow_name=workflow.workflow_name,
+                    workflow_id=workflow.workflow_id,
+                    job_id=request.job_id,
+                    status=workflow.status,
+                    provisioned_cores=provisioned_cores,
+                    vus=workflow.vus,  # VUs not tracked in progress, would need dispatch info
+                    completed_count=workflow.completed_count,
+                    failed_count=workflow.failed_count,
+                    rate_per_second=workflow.rate_per_second,
+                    elapsed_seconds=workflow.elapsed_seconds,
+                    is_enqueued=is_enqueued,
+                    queue_position=queue_positions.get(workflow.workflow_id, 0),
+                    assigned_workers=assigned_workers,
+                )
+                workflows.append(status_info)
+
+            response = WorkflowQueryResponse(
+                request_id=request.request_id,
+                manager_id=self._node_id.full,
+                datacenter=self._node_id.datacenter,
+                workflows=workflows,
+            )
+
+            return response.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "workflow_query")
+            return b'error'
