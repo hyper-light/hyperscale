@@ -14,7 +14,6 @@ Key responsibilities:
 import asyncio
 import time
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Callable, Coroutine
 
 import cloudpickle
@@ -35,15 +34,6 @@ from hyperscale.distributed_rewrite.nodes.job_manager import (
 from hyperscale.distributed_rewrite.nodes.worker_pool import WorkerPool
 
 
-class DispatchPriority(Enum):
-    """Priority levels for workflow dispatch."""
-    EXCLUSIVE = "exclusive"   # Requires all cores, blocks other workflows
-    HIGH = "high"
-    NORMAL = "normal"
-    LOW = "low"
-    AUTO = "auto"             # Determined by workflow type
-
-
 @dataclass
 class PendingWorkflow:
     """A workflow waiting to be dispatched."""
@@ -52,7 +42,7 @@ class PendingWorkflow:
     workflow_name: str
     workflow: Workflow
     vus: int
-    priority: DispatchPriority
+    priority: StagePriority
     is_test: bool
     dependencies: set[str]           # workflow_ids this depends on
     completed_dependencies: set[str] = field(default_factory=set)
@@ -201,16 +191,12 @@ class WorkflowDispatcher:
                 return wf_id
         return None
 
-    def _get_workflow_priority(self, workflow: Workflow) -> DispatchPriority:
+    def _get_workflow_priority(self, workflow: Workflow) -> StagePriority:
         """Determine dispatch priority for a workflow."""
         priority = getattr(workflow, 'priority', None)
-        if priority == StagePriority.EXCLUSIVE:
-            return DispatchPriority.EXCLUSIVE
-        if priority == StagePriority.HIGH:
-            return DispatchPriority.HIGH
-        if priority == StagePriority.LOW:
-            return DispatchPriority.LOW
-        return DispatchPriority.NORMAL
+        if isinstance(priority, StagePriority):
+            return priority
+        return StagePriority.NORMAL
 
     def _is_test_workflow(self, workflow: Workflow) -> bool:
         """Check if a workflow is a test workflow."""
@@ -271,7 +257,7 @@ class WorkflowDispatcher:
             dispatched = 0
 
             # Handle EXCLUSIVE workflows first
-            exclusive = [p for p in ready if p.priority == DispatchPriority.EXCLUSIVE]
+            exclusive = [p for p in ready if p.priority == StagePriority.EXCLUSIVE]
             if exclusive:
                 pending = exclusive[0]
                 success = await self._dispatch_workflow(
@@ -283,7 +269,7 @@ class WorkflowDispatcher:
                 return dispatched
 
             # Dispatch non-exclusive workflows
-            non_exclusive = [p for p in ready if p.priority != DispatchPriority.EXCLUSIVE]
+            non_exclusive = [p for p in ready if p.priority != StagePriority.EXCLUSIVE]
             if not non_exclusive:
                 return dispatched
 
@@ -324,16 +310,11 @@ class WorkflowDispatcher:
         if not workflows:
             return []
 
-        # Sort by priority (higher first) then by VUs (higher first)
-        priority_order = {
-            DispatchPriority.HIGH: 0,
-            DispatchPriority.NORMAL: 1,
-            DispatchPriority.AUTO: 2,
-            DispatchPriority.LOW: 3,
-        }
+        # Sort by priority (higher value = higher priority) then by VUs (higher first)
+        # StagePriority: EXCLUSIVE=4, HIGH=3, NORMAL=2, LOW=1, AUTO=0
         workflows = sorted(
             workflows,
-            key=lambda p: (priority_order.get(p.priority, 2), -p.vus),
+            key=lambda p: (-p.priority.value, -p.vus),
         )
 
         # Simple allocation: divide cores proportionally by VUs

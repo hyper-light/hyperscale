@@ -15,21 +15,17 @@ Key responsibilities:
 import asyncio
 import time
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Callable
 
 from hyperscale.distributed_rewrite.models import (
     WorkerHeartbeat,
     WorkerRegistration,
+    WorkerState,
 )
 
 
-class WorkerHealth(Enum):
-    """Health status of a worker."""
-    HEALTHY = "healthy"       # SWIM reports OK or within grace period
-    SUSPECT = "suspect"       # SWIM reports suspect (may be failing)
-    DEAD = "dead"             # SWIM reports dead
-    UNKNOWN = "unknown"       # No SWIM status yet
+# Re-export WorkerState for backwards compatibility (aliased as WorkerHealth)
+WorkerHealth = WorkerState
 
 
 @dataclass
@@ -38,7 +34,7 @@ class WorkerInfo:
     node_id: str
     registration: WorkerRegistration
     heartbeat: WorkerHeartbeat | None = None
-    health: WorkerHealth = WorkerHealth.UNKNOWN
+    health: WorkerState = WorkerState.HEALTHY
     last_seen: float = field(default_factory=time.monotonic)
 
     # Core tracking
