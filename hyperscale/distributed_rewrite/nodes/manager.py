@@ -2323,14 +2323,24 @@ class ManagerServer(HealthAwareServer):
     def _get_healthy_worker_ids(self) -> list[str]:
         """
         Get list of worker IDs that are healthy according to SWIM probes.
-        
+
         A worker is healthy if:
         1. SWIM reports it as 'OK' (alive), OR
         2. It was recently registered (within grace period) and hasn't been marked dead
-        
+
         The grace period handles the startup race where workers register but SWIM
         probing hasn't completed yet.
         """
+        # =================================================================
+        # Use WorkerPool for healthy worker list (new system)
+        # =================================================================
+        pool_healthy = self._worker_pool.get_healthy_worker_ids()
+        if pool_healthy:
+            return pool_healthy
+
+        # =================================================================
+        # Legacy fallback (kept during migration)
+        # =================================================================
         healthy = []
         now = time.monotonic()
         grace_period = 30.0  # Consider workers healthy for 30s after registration
@@ -2341,19 +2351,19 @@ class ManagerServer(HealthAwareServer):
             udp_port = registration.node.udp_port or registration.node.port
             worker_addr = (registration.node.host, udp_port)
             node_state = self._incarnation_tracker.get_node_state(worker_addr)
-            
+
             # Check if SWIM says healthy
             if node_state and node_state.status == b'OK':
                 healthy.append(node_id)
                 continue
-            
+
             # Check if recently registered (grace period)
             last_seen = self._worker_last_status.get(node_id, 0)
             if (now - last_seen) < grace_period:
                 # Not explicitly marked dead by SWIM - treat as healthy
                 if not node_state or node_state.status != b'DEAD':
                     healthy.append(node_id)
-        
+
         return healthy
     
     def _get_total_cores(self) -> int:
@@ -3216,12 +3226,26 @@ class ManagerServer(HealthAwareServer):
                 )
             )
             return None
-        
-        worker = self._workers.get(worker_node_id)
-        if not worker:
+
+        # =================================================================
+        # Get worker address from WorkerPool (new system) or legacy dict
+        # =================================================================
+        worker_addr = None
+        worker_pool_info = self._worker_pool.get_worker(worker_node_id)
+        if worker_pool_info:
+            worker_addr = (
+                worker_pool_info.registration.node.host,
+                worker_pool_info.registration.node.port,
+            )
+        else:
+            # Legacy fallback
+            worker = self._workers.get(worker_node_id)
+            if worker:
+                worker_addr = (worker.node.host, worker.node.port)
+
+        if not worker_addr:
             return None
-        
-        worker_addr = (worker.node.host, worker.node.port)
+
         circuit = self._get_worker_circuit(worker_node_id)
         
         self._task_runner.run(
@@ -3948,6 +3972,41 @@ class ManagerServer(HealthAwareServer):
                 )
             )
 
+            # =================================================================
+            # Record result in JobManager (new system)
+            # =================================================================
+            # Parse the workflow_id to extract job_id and workflow components
+            # Format: job_id:workflow_name:worker_idx or job_id:workflow_name
+            parts = result.workflow_id.split(":")
+            if len(parts) >= 2:
+                jm_job_id = parts[0]
+                # Try to find the workflow in JobManager by job_id
+                job_info = self._job_manager.get_job(jm_job_id)
+                if job_info:
+                    # Determine state based on result status
+                    new_state = WorkflowState.COMPLETED if result.status == WorkflowStatus.COMPLETED.value else WorkflowState.FAILED
+
+                    # Find matching workflow by name (parts[1] is workflow name)
+                    for wf_id, wf_info in job_info.workflows.items():
+                        if wf_info.name == parts[1] if len(parts) > 1 else True:
+                            await self._job_manager.update_workflow_state(
+                                jm_job_id, wf_id, new_state
+                            )
+                            self._task_runner.run(
+                                self._udp_logger.log,
+                                ServerDebug(
+                                    message=f"JobManager: Updated workflow {wf_id} to state {new_state.value}",
+                                    node_host=self._host,
+                                    node_port=self._tcp_port,
+                                    node_id=self._node_id.short,
+                                )
+                            )
+                            break
+
+            # =================================================================
+            # Legacy handling (kept during migration)
+            # =================================================================
+
             # Check if this is a sub-workflow (dispatched to multiple workers)
             parent_workflow_id = self._get_parent_workflow_id(result.workflow_id)
 
@@ -4226,6 +4285,21 @@ class ManagerServer(HealthAwareServer):
 
     def _is_job_complete(self, job_id: str) -> bool:
         """Check if all workflows in a job have completed."""
+        # =================================================================
+        # Check via JobManager (new system)
+        # =================================================================
+        job_info = self._job_manager.get_job(job_id)
+        if job_info:
+            all_complete = all(
+                wf.state in (WorkflowState.COMPLETED, WorkflowState.FAILED, WorkflowState.AGGREGATED)
+                for wf in job_info.workflows.values()
+            )
+            if all_complete and job_info.workflows:
+                return True
+
+        # =================================================================
+        # Legacy check (fallback during migration)
+        # =================================================================
         job = self._jobs.get(job_id)
         if not job or not job.workflows:
             return False
