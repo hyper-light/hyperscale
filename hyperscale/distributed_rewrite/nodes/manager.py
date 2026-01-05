@@ -887,8 +887,9 @@ class ManagerServer(HealthAwareServer):
 
         Merges:
         - Workers: If peer has workers we don't know, register with them
-        - Jobs: Add jobs we don't have
-        - Job leaders, layer versions, contexts
+        - Job leaders, layer versions, contexts (for routing)
+
+        Note: Job state is managed by JobManager, not merged from peers.
         """
         # Check version for staleness
         peer_key = f"manager:{manager_state.node_id}"
@@ -898,7 +899,8 @@ class ManagerServer(HealthAwareServer):
         # Merge workers - if peer knows workers we don't, register with them
         workers_discovered = 0
         for worker_snapshot in manager_state.workers:
-            if worker_snapshot.node_id not in self._workers:
+            # Check WorkerPool instead of legacy _workers
+            if self._worker_pool.get_worker(worker_snapshot.node_id) is None:
                 # Only process if we have full connection info
                 if worker_snapshot.host and worker_snapshot.tcp_port:
                     workers_discovered += 1
@@ -919,12 +921,8 @@ class ManagerServer(HealthAwareServer):
                 )
             )
 
-        # Note: Job state is managed by JobManager, not merged from peers.
-        # Jobs are only created locally via job_submission handler.
-        # State sync provides visibility but doesn't create local job tracking.
-        # The job_leaders/job_leader_addrs below are sufficient for routing.
-
         # Merge job leader tracking (Context Consistency Protocol)
+        # These are used for routing, not job state management
         for job_id, leader_id in manager_state.job_leaders.items():
             if job_id not in self._job_leaders:
                 self._job_leaders[job_id] = leader_id
@@ -954,17 +952,6 @@ class ManagerServer(HealthAwareServer):
                         )
             except Exception:
                 pass  # Ignore deserialization errors
-
-        if jobs_merged > 0:
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Merged {jobs_merged} jobs from peer {manager_state.node_id}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
 
         return manager_state
 
@@ -1067,22 +1054,12 @@ class ManagerServer(HealthAwareServer):
             # Stale update - discard
             return
 
-        # =================================================================
-        # Process heartbeat in WorkerPool (new system)
-        # =================================================================
+        # Process heartbeat in WorkerPool
         self._task_runner.run(
             self._worker_pool.process_heartbeat,
             heartbeat.node_id,
             heartbeat,
         )
-
-        # =================================================================
-        # Legacy tracking (kept during migration)
-        # =================================================================
-
-        # Accept update
-        self._worker_status[heartbeat.node_id] = heartbeat
-        self._worker_last_status[heartbeat.node_id] = time.monotonic()
 
         # Update version tracking (fire-and-forget, no await needed for sync operation)
         # We track the worker's version so future updates with same/lower version are rejected
