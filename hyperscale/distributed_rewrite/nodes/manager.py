@@ -70,6 +70,7 @@ from hyperscale.distributed_rewrite.models import (
     WorkerStateSnapshot,
     ManagerHeartbeat,
     ManagerStateSnapshot,
+    JobInfo,
     JobSubmission,
     JobAck,
     JobStatus,
@@ -3585,151 +3586,221 @@ class ManagerServer(HealthAwareServer):
         """
         Handle workflow progress update from worker.
 
-        Key feature: Uses cores_completed to enable faster provisioning.
-        When a worker reports that some cores have finished their portion
-        of a workflow, we can immediately consider those cores available
-        for new workflows, without waiting for the entire workflow to complete.
-
-        Multi-worker dispatch: When a workflow is split across multiple workers,
-        each worker sends progress with a sub-workflow ID (job_id:workflow_idx:worker_idx).
-        We aggregate these into unified parent workflow progress before forwarding.
+        Delegates to helper methods for clarity:
+        - Forward to job leader if not leader
+        - Process sub-workflow progress and aggregate
+        - Update job/workflow state
+        - Handle completion/failure states
         """
         try:
             progress = WorkflowProgress.load(data)
 
-            # =================================================================
             # Forward to job leader if we're not the leader
-            # =================================================================
-            # Progress updates should be processed by the job leader who has the state
-            if not self._is_job_leader(progress.job_id):
-                leader_addr = self._get_job_leader_addr(progress.job_id)
-                if leader_addr:
-                    try:
-                        response, _ = await self.send_tcp(
-                            leader_addr,
-                            "workflow_progress",
-                            progress,  # Forward
-                            timeout=2.0,
-                        )
-                        return response if response else b'ok'
-                    except Exception:
-                        pass  # Fall through to process locally as best effort
-                # Fall through - maybe we have the job locally anyway
+            forwarded = await self._try_forward_progress_to_leader(progress)
+            if forwarded:
+                return forwarded
 
-            # Check if this is a sub-workflow (dispatched to multiple workers)
-            parent_workflow_id = self._get_parent_workflow_id(progress.workflow_id)
+            # Process sub-workflow progress and get aggregated progress if applicable
+            progress, early_ack = await self._process_sub_workflow_progress(progress)
+            if early_ack:
+                return early_ack
 
-            if parent_workflow_id is not None:
-                # This is a sub-workflow - update SubWorkflowInfo.progress in JobManager
-                await self._job_manager.update_workflow_progress(progress.workflow_id, progress)
+            # Update job state and handle completion/failure
+            await self._update_job_from_progress(progress)
 
-                # Update worker available cores based on cores_completed
-                await self._update_worker_cores_from_progress(progress, None)
+            return self._create_progress_ack().dump()
 
-                # Aggregate progress from all sub-workflows
-                aggregated_progress = self._aggregate_sub_workflow_progress(parent_workflow_id)
-                if aggregated_progress is None:
-                    # No progress to aggregate yet
-                    ack = WorkflowProgressAck(
-                        manager_id=self._node_id.full,
-                        is_leader=self.is_leader(),
-                        healthy_managers=self._get_healthy_managers(),
-                    )
-                    return ack.dump()
-
-                # Use aggregated progress for job updates
-                progress = aggregated_progress
-
-            # Update job state via JobManager
-            job = self._job_manager.get_job_by_id(progress.job_id)
-            if job:
-                # Update WorkflowInfo state based on progress status
-                # Extract workflow_id from progress.workflow_id which may be a 5-part token
-                # Format: DC:manager:job_id:workflow_id:worker_id
-                parts = progress.workflow_id.split(":")
-                if len(parts) >= 5:
-                    workflow_id = parts[3]  # Extract just the workflow_id component (e.g., "wf-0001")
-                else:
-                    workflow_id = progress.workflow_id
-                wf_info = job.workflows.get(
-                    str(self._job_manager.create_workflow_token(progress.job_id, workflow_id))
-                )
-                if wf_info:
-                    # Convert progress status string to WorkflowStatus enum
-                    try:
-                        new_status = WorkflowStatus(progress.status)
-                    except ValueError:
-                        new_status = WorkflowStatus.RUNNING
-                    # Use state machine to advance status (prevents regression)
-                    wf_info.status = WorkflowStateMachine.advance_state(wf_info.status, new_status)
-
-                job.timestamp = time.monotonic()
-
-                # Update worker available cores based on cores_completed (for single-worker case)
-                if parent_workflow_id is None:
-                    await self._update_worker_cores_from_progress(progress, None)
-
-                self._increment_version()
-
-                # Handle workflow completion states
-                if progress.status == WorkflowStatus.FAILED.value:
-                    # Check if workflow should be retried
-                    await self._handle_workflow_failure(progress)
-                elif progress.status == WorkflowStatus.COMPLETED.value:
-                    # Clean up retry tracking on success
-                    self._workflow_retries.pop(progress.workflow_id, None)
-
-                    # Signal completion for dependency tracking
-                    completion_event = self._workflow_completion_events.get(progress.workflow_id)
-                    if completion_event:
-                        completion_event.set()
-
-                    # Notify WorkflowDispatcher of completion for dependency tracking
-                    if self._workflow_dispatcher:
-                        # Parse job_id from workflow_id (format: DC:manager:job_id:workflow_id:worker_id)
-                        parts = progress.workflow_id.split(":")
-                        if len(parts) >= 5:
-                            jm_job_id = parts[2]  # job_id is the 3rd component
-                            # Find matching workflow_id in JobManager
-                            # Note: Use get_job_by_id(), not get_job() - the latter expects a full token string
-                            job_info = self._job_manager.get_job_by_id(jm_job_id)
-                            if job_info:
-                                for wf_id, wf_info in job_info.workflows.items():
-                                    if wf_info.name == progress.workflow_name:
-                                        self._task_runner.run(
-                                            self._workflow_dispatcher.mark_workflow_completed,
-                                            jm_job_id,
-                                            wf_id,
-                                        )
-                                        # Try to dispatch newly ready workflows
-                                        submission = self._job_submissions.get(jm_job_id)
-                                        if submission:
-                                            self._task_runner.run(
-                                                self._workflow_dispatcher.try_dispatch,
-                                                jm_job_id,
-                                                submission,
-                                            )
-                                        break
-
-                # Forward job progress to gates (if connected)
-                if self._known_gates or self._gate_addrs:
-                    self._task_runner.run(self._send_job_progress_to_gate, job)
-
-                # Check for job completion and push to client (if no gates)
-                if not (self._known_gates or self._gate_addrs):
-                    self._check_job_completion(progress.job_id)
-            
-            # Return ack with current manager topology for worker to update
-            ack = WorkflowProgressAck(
-                manager_id=self._node_id.full,
-                is_leader=self.is_leader(),
-                healthy_managers=self._get_healthy_managers(),
-            )
-            return ack.dump()
-            
         except Exception as e:
             await self.handle_exception(e, "receive_workflow_progress")
             return b'error'
+
+    async def _try_forward_progress_to_leader(
+        self,
+        progress: WorkflowProgress,
+    ) -> bytes | None:
+        """
+        Forward progress to job leader if we're not the leader.
+
+        Returns the forwarded response bytes if forwarded, None otherwise.
+        """
+        if self._is_job_leader(progress.job_id):
+            return None
+
+        leader_addr = self._get_job_leader_addr(progress.job_id)
+        if not leader_addr:
+            return None
+
+        try:
+            response, _ = await self.send_tcp(
+                leader_addr,
+                "workflow_progress",
+                progress.dump(),
+                timeout=2.0,
+            )
+            return response if response else b'ok'
+        except Exception:
+            # Fall through to process locally as best effort
+            return None
+
+    async def _process_sub_workflow_progress(
+        self,
+        progress: WorkflowProgress,
+    ) -> tuple[WorkflowProgress, bytes | None]:
+        """
+        Process sub-workflow progress and aggregate if needed.
+
+        Returns:
+            (progress, early_ack): Updated progress and optional early ack response.
+            If early_ack is not None, caller should return it immediately.
+        """
+        parent_workflow_id = self._get_parent_workflow_id(progress.workflow_id)
+        if parent_workflow_id is None:
+            return progress, None
+
+        # Update SubWorkflowInfo.progress in JobManager
+        await self._job_manager.update_workflow_progress(progress.workflow_id, progress)
+
+        # Update worker available cores based on cores_completed
+        await self._update_worker_cores_from_progress(progress, None)
+
+        # Aggregate progress from all sub-workflows
+        aggregated_progress = self._aggregate_sub_workflow_progress(parent_workflow_id)
+        if aggregated_progress is None:
+            return progress, self._create_progress_ack().dump()
+
+        return aggregated_progress, None
+
+    async def _update_job_from_progress(self, progress: WorkflowProgress) -> None:
+        """
+        Update job state based on workflow progress.
+
+        Handles:
+        - Workflow status updates via state machine
+        - Core availability updates
+        - Completion/failure handling
+        - Gate forwarding and job completion checks
+        """
+        job = self._job_manager.get_job_by_id(progress.job_id)
+        if not job:
+            return
+
+        # Update workflow status
+        self._update_workflow_status_from_progress(job, progress)
+
+        job.timestamp = time.monotonic()
+
+        # Update cores for single-worker workflows
+        parent_workflow_id = self._get_parent_workflow_id(progress.workflow_id)
+        if parent_workflow_id is None:
+            await self._update_worker_cores_from_progress(progress, None)
+
+        self._increment_version()
+
+        # Handle terminal states
+        if progress.status == WorkflowStatus.FAILED.value:
+            await self._handle_workflow_failure(progress)
+        elif progress.status == WorkflowStatus.COMPLETED.value:
+            await self._handle_workflow_completion_from_progress(progress)
+
+        # Forward to gates or check job completion
+        self._forward_progress_to_gates_or_check_completion(job, progress.job_id)
+
+    def _update_workflow_status_from_progress(
+        self,
+        job: JobInfo,
+        progress: WorkflowProgress,
+    ) -> None:
+        """Update WorkflowInfo status based on progress, using state machine."""
+        workflow_id = self._extract_workflow_id_from_token(progress.workflow_id)
+        workflow_token_str = str(self._job_manager.create_workflow_token(progress.job_id, workflow_id))
+        wf_info = job.workflows.get(workflow_token_str)
+
+        if not wf_info:
+            return
+
+        try:
+            new_status = WorkflowStatus(progress.status)
+        except ValueError:
+            new_status = WorkflowStatus.RUNNING
+
+        wf_info.status = WorkflowStateMachine.advance_state(wf_info.status, new_status)
+
+    def _extract_workflow_id_from_token(self, workflow_id: str) -> str:
+        """
+        Extract the workflow_id component from a token string.
+
+        Token format: DC:manager:job_id:workflow_id:worker_id (5 parts)
+        Returns just the workflow_id component (e.g., "wf-0001").
+        """
+        parts = workflow_id.split(":")
+        if len(parts) >= 5:
+            return parts[3]
+        return workflow_id
+
+    async def _handle_workflow_completion_from_progress(
+        self,
+        progress: WorkflowProgress,
+    ) -> None:
+        """Handle workflow completion: cleanup, signal events, notify dispatcher."""
+        # Clean up retry tracking
+        self._workflow_retries.pop(progress.workflow_id, None)
+
+        # Signal completion event for dependency tracking
+        completion_event = self._workflow_completion_events.get(progress.workflow_id)
+        if completion_event:
+            completion_event.set()
+
+        # Notify WorkflowDispatcher for dependency-based dispatch
+        await self._notify_dispatcher_of_completion(progress)
+
+    async def _notify_dispatcher_of_completion(self, progress: WorkflowProgress) -> None:
+        """Notify WorkflowDispatcher that a workflow completed, triggering dependent dispatches."""
+        if not self._workflow_dispatcher:
+            return
+
+        parts = progress.workflow_id.split(":")
+        if len(parts) < 5:
+            return
+
+        job_id = parts[2]
+        job_info = self._job_manager.get_job_by_id(job_id)
+        if not job_info:
+            return
+
+        for wf_token_str, wf_info in job_info.workflows.items():
+            if wf_info.name == progress.workflow_name:
+                self._task_runner.run(
+                    self._workflow_dispatcher.mark_workflow_completed,
+                    job_id,
+                    wf_token_str,
+                )
+                submission = self._job_submissions.get(job_id)
+                if submission:
+                    self._task_runner.run(
+                        self._workflow_dispatcher.try_dispatch,
+                        job_id,
+                        submission,
+                    )
+                break
+
+    def _forward_progress_to_gates_or_check_completion(
+        self,
+        job: JobInfo,
+        job_id: str,
+    ) -> None:
+        """Forward job progress to gates if connected, otherwise check for job completion."""
+        if self._known_gates or self._gate_addrs:
+            self._task_runner.run(self._send_job_progress_to_gate, job)
+        else:
+            self._check_job_completion(job_id)
+
+    def _create_progress_ack(self) -> WorkflowProgressAck:
+        """Create a WorkflowProgressAck with current manager topology."""
+        return WorkflowProgressAck(
+            manager_id=self._node_id.full,
+            is_leader=self.is_leader(),
+            healthy_managers=self._get_healthy_managers(),
+        )
     
     @tcp.receive()
     async def workflow_final_result(
