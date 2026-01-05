@@ -70,6 +70,14 @@ from hyperscale.distributed_rewrite.models import (
     DatacenterHealth,
     DatacenterStatus,
     UpdateTier,
+    PingRequest,
+    DatacenterInfo,
+    GatePingResponse,
+    WorkflowQueryRequest,
+    WorkflowStatusInfo,
+    WorkflowQueryResponse,
+    DatacenterWorkflowStatus,
+    GateWorkflowQueryResponse,
 )
 from hyperscale.distributed_rewrite.swim.core import (
     QuorumError,
@@ -3050,7 +3058,158 @@ class GateServer(HealthAwareServer):
         # Update job status
         if job_id in self._jobs:
             self._jobs[job_id].status = overall_status
-        
+
         # Clean up
         self._job_dc_results.pop(job_id, None)
 
+    # =========================================================================
+    # TCP Handlers - Ping/Health Check
+    # =========================================================================
+
+    @tcp.receive()
+    async def ping(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle ping request from client.
+
+        Returns comprehensive gate status including:
+        - Gate identity and leadership status
+        - Per-datacenter health and leader info
+        - Active jobs
+        - Peer gate addresses
+        """
+        try:
+            request = PingRequest.load(data)
+
+            # Build per-datacenter info
+            datacenters: list[DatacenterInfo] = []
+
+            for dc_id in self._datacenter_managers.keys():
+                status = self._classify_datacenter_health(dc_id)
+
+                # Find the DC leader address
+                leader_addr: tuple[str, int] | None = None
+                manager_statuses = self._datacenter_manager_status.get(dc_id, {})
+                for manager_addr, heartbeat in manager_statuses.items():
+                    if heartbeat.is_leader:
+                        leader_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+                        break
+
+                datacenters.append(DatacenterInfo(
+                    dc_id=dc_id,
+                    health=status.health,
+                    leader_addr=leader_addr,
+                    available_cores=status.available_capacity,
+                    manager_count=status.manager_count,
+                    worker_count=status.worker_count,
+                ))
+
+            # Get active job IDs
+            active_job_ids = list(self._jobs.keys())
+
+            # Get peer gate addresses
+            peer_gates = list(self._active_gate_peers)
+
+            response = GatePingResponse(
+                request_id=request.request_id,
+                gate_id=self._node_id.full,
+                datacenter=self._node_id.datacenter,
+                host=self._host,
+                port=self._tcp_port,
+                is_leader=self.is_leader(),
+                state=self._gate_state.value,
+                term=self._leader_election.state.current_term,
+                datacenters=datacenters,
+                active_datacenter_count=self._count_active_datacenters(),
+                active_job_ids=active_job_ids,
+                active_job_count=len(active_job_ids),
+                peer_gates=peer_gates,
+            )
+
+            return response.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "ping")
+            return b'error'
+
+    @tcp.receive()
+    async def workflow_query(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle workflow status query from client.
+
+        Queries all datacenter managers and aggregates results by datacenter.
+        Returns status for requested workflows grouped by DC.
+
+        Unknown workflow names are silently ignored.
+        """
+        try:
+            request = WorkflowQueryRequest.load(data)
+
+            # Query all datacenter leaders concurrently
+            dc_results: dict[str, list[WorkflowStatusInfo]] = {}
+
+            async def query_dc(dc_id: str, leader_addr: tuple[str, int]) -> None:
+                """Query a single datacenter's leader manager."""
+                try:
+                    response_data, _ = await self.send_tcp(
+                        leader_addr,
+                        "workflow_query",
+                        request.dump(),
+                        timeout=5.0,
+                    )
+                    if isinstance(response_data, Exception) or response_data == b'error':
+                        return
+
+                    manager_response = WorkflowQueryResponse.load(response_data)
+                    dc_results[dc_id] = manager_response.workflows
+
+                except Exception:
+                    # DC query failed - skip this DC
+                    pass
+
+            # Find leader address for each datacenter
+            query_tasks = []
+            for dc_id in self._datacenter_managers.keys():
+                manager_statuses = self._datacenter_manager_status.get(dc_id, {})
+                leader_addr: tuple[str, int] | None = None
+
+                for manager_addr, heartbeat in manager_statuses.items():
+                    if heartbeat.is_leader:
+                        leader_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+                        break
+
+                if leader_addr:
+                    query_tasks.append(query_dc(dc_id, leader_addr))
+
+            # Run all DC queries concurrently
+            if query_tasks:
+                await asyncio.gather(*query_tasks, return_exceptions=True)
+
+            # Build response grouped by datacenter
+            datacenters: list[DatacenterWorkflowStatus] = []
+            for dc_id, workflows in dc_results.items():
+                datacenters.append(DatacenterWorkflowStatus(
+                    dc_id=dc_id,
+                    workflows=workflows,
+                ))
+
+            response = GateWorkflowQueryResponse(
+                request_id=request.request_id,
+                gate_id=self._node_id.full,
+                datacenters=datacenters,
+            )
+
+            return response.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "workflow_query")
+            return b'error'

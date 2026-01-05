@@ -13,11 +13,8 @@ Key responsibilities:
 """
 
 import asyncio
-import logging
 import time
 from typing import Callable
-
-logger = logging.getLogger(__name__)
 
 from hyperscale.distributed_rewrite.models import (
     WorkerHeartbeat,
@@ -25,6 +22,15 @@ from hyperscale.distributed_rewrite.models import (
     WorkerState,
     WorkerStatus,
 )
+from hyperscale.distributed_rewrite.jobs.logging_models import (
+    WorkerPoolTrace,
+    WorkerPoolDebug,
+    WorkerPoolInfo,
+    WorkerPoolWarning,
+    WorkerPoolError,
+    WorkerPoolCritical,
+)
+from hyperscale.logging import Logger
 
 
 # Re-export for backwards compatibility
@@ -45,6 +51,8 @@ class WorkerPool:
         self,
         health_grace_period: float = 30.0,
         get_swim_status: Callable[[tuple[str, int]], str | None] | None = None,
+        manager_id: str = "",
+        datacenter: str = "",
     ):
         """
         Initialize WorkerPool.
@@ -54,9 +62,14 @@ class WorkerPool:
                                  before SWIM status is available
             get_swim_status: Optional callback to get SWIM health status for a worker
                             Returns 'OK', 'SUSPECT', 'DEAD', or None
+            manager_id: Manager node ID for log context
+            datacenter: Datacenter identifier for log context
         """
         self._health_grace_period = health_grace_period
         self._get_swim_status = get_swim_status
+        self._manager_id = manager_id
+        self._datacenter = datacenter
+        self._logger = Logger()
 
         # Worker storage - node_id -> WorkerStatus
         self._workers: dict[str, WorkerStatus] = {}
@@ -448,3 +461,43 @@ class WorkerPool:
     def signal_cores_available(self) -> None:
         """Signal that cores have become available."""
         self._cores_available.set()
+
+    # =========================================================================
+    # Logging Helpers
+    # =========================================================================
+
+    def _get_log_context(self) -> dict:
+        """Get common context fields for logging."""
+        healthy_ids = self.get_healthy_worker_ids()
+        return {
+            "manager_id": self._manager_id,
+            "datacenter": self._datacenter,
+            "worker_count": len(self._workers),
+            "healthy_worker_count": len(healthy_ids),
+            "total_cores": sum(w.total_cores for w in self._workers.values()),
+            "available_cores": self.get_total_available_cores(),
+        }
+
+    async def _log_trace(self, message: str) -> None:
+        """Log a trace-level message."""
+        await self._logger.log(WorkerPoolTrace(message=message, **self._get_log_context()))
+
+    async def _log_debug(self, message: str) -> None:
+        """Log a debug-level message."""
+        await self._logger.log(WorkerPoolDebug(message=message, **self._get_log_context()))
+
+    async def _log_info(self, message: str) -> None:
+        """Log an info-level message."""
+        await self._logger.log(WorkerPoolInfo(message=message, **self._get_log_context()))
+
+    async def _log_warning(self, message: str) -> None:
+        """Log a warning-level message."""
+        await self._logger.log(WorkerPoolWarning(message=message, **self._get_log_context()))
+
+    async def _log_error(self, message: str) -> None:
+        """Log an error-level message."""
+        await self._logger.log(WorkerPoolError(message=message, **self._get_log_context()))
+
+    async def _log_critical(self, message: str) -> None:
+        """Log a critical-level message."""
+        await self._logger.log(WorkerPoolCritical(message=message, **self._get_log_context()))

@@ -78,13 +78,13 @@ class NullStateEmbedder:
 class WorkerStateEmbedder:
     """
     State embedder for Worker nodes.
-    
+
     Embeds WorkerHeartbeat data in SWIM messages so managers can
     passively learn worker capacity and status.
-    
+
     Also processes ManagerHeartbeat from managers to track leadership
     changes without requiring TCP acks.
-    
+
     Attributes:
         get_node_id: Callable returning the node's full ID.
         get_worker_state: Callable returning current WorkerState.
@@ -94,6 +94,8 @@ class WorkerStateEmbedder:
         get_memory_percent: Callable returning memory utilization.
         get_state_version: Callable returning state version.
         get_active_workflows: Callable returning workflow ID -> status dict.
+        get_tcp_host: Callable returning TCP host address.
+        get_tcp_port: Callable returning TCP port.
         on_manager_heartbeat: Optional callback for received ManagerHeartbeat.
     """
     get_node_id: Callable[[], str]
@@ -105,7 +107,9 @@ class WorkerStateEmbedder:
     get_state_version: Callable[[], int]
     get_active_workflows: Callable[[], dict[str, str]]
     on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
-    
+    get_tcp_host: Callable[[], str] | None = None
+    get_tcp_port: Callable[[], int] | None = None
+
     def get_state(self) -> bytes | None:
         """Get WorkerHeartbeat to embed in SWIM messages."""
         heartbeat = WorkerHeartbeat(
@@ -117,6 +121,8 @@ class WorkerStateEmbedder:
             memory_percent=self.get_memory_percent(),
             version=self.get_state_version(),
             active_workflows=self.get_active_workflows(),
+            tcp_host=self.get_tcp_host() if self.get_tcp_host else "",
+            tcp_port=self.get_tcp_port() if self.get_tcp_port else 0,
         )
         return heartbeat.dump()
     
@@ -128,10 +134,12 @@ class WorkerStateEmbedder:
         """Process ManagerHeartbeat from managers to track leadership."""
         if self.on_manager_heartbeat:
             try:
-                heartbeat = ManagerHeartbeat.load(state_data)
-                self.on_manager_heartbeat(heartbeat, source_addr)
+                obj = ManagerHeartbeat.load(state_data)  # Base unpickle
+                # Only process if actually a ManagerHeartbeat
+                if isinstance(obj, ManagerHeartbeat):
+                    self.on_manager_heartbeat(obj, source_addr)
             except Exception:
-                # Not a ManagerHeartbeat or invalid data - ignore
+                # Invalid data - ignore
                 pass
 
 
@@ -139,12 +147,12 @@ class WorkerStateEmbedder:
 class ManagerStateEmbedder:
     """
     State embedder for Manager nodes.
-    
+
     Embeds ManagerHeartbeat data and processes:
     - WorkerHeartbeat from workers
-    - ManagerHeartbeat from peer managers  
+    - ManagerHeartbeat from peer managers
     - GateHeartbeat from gates
-    
+
     Attributes:
         get_node_id: Callable returning the node's full ID.
         get_datacenter: Callable returning datacenter ID.
@@ -156,6 +164,10 @@ class ManagerStateEmbedder:
         get_worker_count: Callable returning registered worker count.
         get_available_cores: Callable returning total available cores.
         get_manager_state: Callable returning ManagerState value (syncing/active).
+        get_tcp_host: Callable returning TCP host address.
+        get_tcp_port: Callable returning TCP port.
+        get_udp_host: Callable returning UDP host address.
+        get_udp_port: Callable returning UDP port.
         on_worker_heartbeat: Callable to handle received WorkerHeartbeat.
         on_manager_heartbeat: Callable to handle received ManagerHeartbeat from peers.
         on_gate_heartbeat: Callable to handle received GateHeartbeat from gates.
@@ -175,7 +187,11 @@ class ManagerStateEmbedder:
     on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     get_manager_state: Callable[[], str] | None = None
-    
+    get_tcp_host: Callable[[], str] | None = None
+    get_tcp_port: Callable[[], int] | None = None
+    get_udp_host: Callable[[], str] | None = None
+    get_udp_port: Callable[[], int] | None = None
+
     def get_state(self) -> bytes | None:
         """Get ManagerHeartbeat to embed in SWIM messages."""
         heartbeat = ManagerHeartbeat(
@@ -191,6 +207,10 @@ class ManagerStateEmbedder:
             available_cores=self.get_available_cores(),
             total_cores=self.get_total_cores(),
             state=self.get_manager_state() if self.get_manager_state else "active",
+            tcp_host=self.get_tcp_host() if self.get_tcp_host else "",
+            tcp_port=self.get_tcp_port() if self.get_tcp_port else 0,
+            udp_host=self.get_udp_host() if self.get_udp_host else "",
+            udp_port=self.get_udp_port() if self.get_udp_port else 0,
         )
         return heartbeat.dump()
     
@@ -200,32 +220,23 @@ class ManagerStateEmbedder:
         source_addr: tuple[str, int],
     ) -> None:
         """Process embedded state from workers, peer managers, or gates."""
-        # Try parsing as WorkerHeartbeat first (most common)
+        # Unpickle once and dispatch based on actual type
+        # This is necessary because load() doesn't validate type - it returns
+        # whatever was pickled regardless of which class's load() was called
         try:
-            heartbeat = WorkerHeartbeat.load(state_data)
-            self.on_worker_heartbeat(heartbeat, source_addr)
-            return
+            obj = WorkerHeartbeat.load(state_data)  # Base unpickle
         except Exception:
-            pass
-        
-        # Try parsing as ManagerHeartbeat from peer managers
-        if self.on_manager_heartbeat:
-            try:
-                heartbeat = ManagerHeartbeat.load(state_data)
-                # Don't process our own heartbeat
-                if heartbeat.node_id != self.get_node_id():
-                    self.on_manager_heartbeat(heartbeat, source_addr)
-                    return
-            except Exception:
-                pass
-        
-        # Try parsing as GateHeartbeat from gates
-        if self.on_gate_heartbeat:
-            try:
-                heartbeat = GateHeartbeat.load(state_data)
-                self.on_gate_heartbeat(heartbeat, source_addr)
-            except Exception:
-                pass
+            return  # Invalid data
+
+        # Dispatch based on actual type
+        if isinstance(obj, WorkerHeartbeat):
+            self.on_worker_heartbeat(obj, source_addr)
+        elif isinstance(obj, ManagerHeartbeat) and self.on_manager_heartbeat:
+            # Don't process our own heartbeat
+            if obj.node_id != self.get_node_id():
+                self.on_manager_heartbeat(obj, source_addr)
+        elif isinstance(obj, GateHeartbeat) and self.on_gate_heartbeat:
+            self.on_gate_heartbeat(obj, source_addr)
 
 
 @dataclass(slots=True)
@@ -283,21 +294,17 @@ class GateStateEmbedder:
         source_addr: tuple[str, int],
     ) -> None:
         """Process embedded state from managers or peer gates."""
-        # Try parsing as ManagerHeartbeat first (most common)
+        # Unpickle once and dispatch based on actual type
         try:
-            heartbeat = ManagerHeartbeat.load(state_data)
-            self.on_manager_heartbeat(heartbeat, source_addr)
-            return
+            obj = ManagerHeartbeat.load(state_data)  # Base unpickle
         except Exception:
-            pass
-        
-        # Try parsing as GateHeartbeat from peer gates
-        if self.on_gate_heartbeat:
-            try:
-                heartbeat = GateHeartbeat.load(state_data)
-                # Don't process our own heartbeat
-                if heartbeat.node_id != self.get_node_id():
-                    self.on_gate_heartbeat(heartbeat, source_addr)
-            except Exception:
-                pass
+            return  # Invalid data
+
+        # Dispatch based on actual type
+        if isinstance(obj, ManagerHeartbeat):
+            self.on_manager_heartbeat(obj, source_addr)
+        elif isinstance(obj, GateHeartbeat) and self.on_gate_heartbeat:
+            # Don't process our own heartbeat
+            if obj.node_id != self.get_node_id():
+                self.on_gate_heartbeat(obj, source_addr)
 

@@ -43,6 +43,14 @@ from hyperscale.distributed_rewrite.models import (
     JobBatchPush,
     JobFinalResult,
     GlobalJobResult,
+    PingRequest,
+    ManagerPingResponse,
+    GatePingResponse,
+    WorkflowQueryRequest,
+    WorkflowStatusInfo,
+    WorkflowQueryResponse,
+    DatacenterWorkflowStatus,
+    GateWorkflowQueryResponse,
 )
 from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
@@ -116,6 +124,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._jobs: dict[str, JobResult] = {}
         self._job_events: dict[str, asyncio.Event] = {}
         self._job_callbacks: dict[str, Callable[[JobStatusPush], None]] = {}
+        self._job_targets: dict[str, tuple[str, int]] = {}  # job_id -> manager/gate that accepted
         
         # For selecting targets
         self._current_manager_idx = 0
@@ -156,6 +165,21 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._current_gate_idx = (self._current_gate_idx + 1) % len(self._gates)
         return addr
     
+    # Transient error messages that should trigger retry with backoff
+    _TRANSIENT_ERRORS = frozenset([
+        "syncing",
+        "not ready",
+        "initializing",
+        "starting up",
+        "election in progress",
+        "no quorum",
+    ])
+
+    def _is_transient_error(self, error: str) -> bool:
+        """Check if an error is transient and should be retried."""
+        error_lower = error.lower()
+        return any(te in error_lower for te in self._TRANSIENT_ERRORS)
+
     async def submit_job(
         self,
         workflows: list[type],
@@ -165,10 +189,12 @@ class HyperscaleClient(MercurySyncBaseServer):
         datacenters: list[str] | None = None,
         on_status_update: Callable[[JobStatusPush], None] | None = None,
         max_redirects: int = 3,
+        max_retries: int = 5,
+        retry_base_delay: float = 0.5,
     ) -> str:
         """
         Submit a job for execution.
-        
+
         Args:
             workflows: List of Workflow classes to execute
             vus: Virtual users (cores) per workflow
@@ -177,18 +203,20 @@ class HyperscaleClient(MercurySyncBaseServer):
             datacenters: Specific datacenters to target (optional)
             on_status_update: Callback for status updates (optional)
             max_redirects: Maximum leader redirects to follow
-            
+            max_retries: Maximum retries for transient errors (syncing, etc.)
+            retry_base_delay: Base delay for exponential backoff (seconds)
+
         Returns:
             job_id: Unique identifier for the submitted job
-            
+
         Raises:
             RuntimeError: If no managers/gates configured or submission fails
         """
         job_id = f"job-{secrets.token_hex(8)}"
-        
+
         # Serialize workflows
         workflows_bytes = cloudpickle.dumps(workflows)
-        
+
         submission = JobSubmission(
             job_id=job_id,
             workflows=workflows_bytes,
@@ -198,12 +226,7 @@ class HyperscaleClient(MercurySyncBaseServer):
             datacenters=datacenters or [],
             callback_addr=self._get_callback_addr(),
         )
-        
-        # Try gates first, then managers
-        target = self._get_next_gate() or self._get_next_manager()
-        if not target:
-            raise RuntimeError("No managers or gates configured")
-        
+
         # Initialize job tracking
         self._jobs[job_id] = JobResult(
             job_id=job_id,
@@ -212,42 +235,73 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._job_events[job_id] = asyncio.Event()
         if on_status_update:
             self._job_callbacks[job_id] = on_status_update
-        
-        # Submit with leader redirect handling
-        redirects = 0
-        while redirects <= max_redirects:
-            response, _ = await self.send_tcp(
-                target,
-                "job_submission",
-                submission.dump(),
-                timeout=10.0,
-            )
-            
-            if isinstance(response, Exception):
+
+        # Get all available targets for fallback
+        all_targets = []
+        if self._gates:
+            all_targets.extend(self._gates)
+        if self._managers:
+            all_targets.extend(self._managers)
+
+        if not all_targets:
+            raise RuntimeError("No managers or gates configured")
+
+        # Retry loop with exponential backoff for transient errors
+        last_error = None
+        for retry in range(max_retries + 1):
+            # Try each target in order, cycling through on retries
+            target_idx = retry % len(all_targets)
+            target = all_targets[target_idx]
+
+            # Submit with leader redirect handling
+            redirects = 0
+            while redirects <= max_redirects:
+                response, _ = await self.send_tcp(
+                    target,
+                    "job_submission",
+                    submission.dump(),
+                    timeout=10.0,
+                )
+
+                if isinstance(response, Exception):
+                    last_error = str(response)
+                    break  # Try next retry/target
+
+                ack = JobAck.load(response)
+
+                if ack.accepted:
+                    # Track which manager accepted this job for future queries
+                    self._job_targets[job_id] = target
+                    return job_id
+
+                # Check for leader redirect
+                if ack.leader_addr and redirects < max_redirects:
+                    target = tuple(ack.leader_addr)
+                    redirects += 1
+                    continue
+
+                # Check if this is a transient error that should be retried
+                if ack.error and self._is_transient_error(ack.error):
+                    last_error = ack.error
+                    break  # Exit redirect loop, continue to retry
+
+                # Permanent rejection - fail immediately
                 self._jobs[job_id].status = JobStatus.FAILED.value
-                self._jobs[job_id].error = str(response)
+                self._jobs[job_id].error = ack.error
                 self._job_events[job_id].set()
-                raise RuntimeError(f"Job submission failed: {response}")
-            
-            ack = JobAck.load(response)
-            
-            if ack.accepted:
-                return job_id
-            
-            # Check for leader redirect
-            if ack.leader_addr and redirects < max_redirects:
-                target = tuple(ack.leader_addr)
-                redirects += 1
-                continue
-            
-            # No redirect available or max redirects reached
-            self._jobs[job_id].status = JobStatus.FAILED.value
-            self._jobs[job_id].error = ack.error
-            self._job_events[job_id].set()
-            raise RuntimeError(f"Job rejected: {ack.error}")
-        
-        # Should not reach here, but handle gracefully
-        raise RuntimeError(f"Job submission failed after {max_redirects} redirects")
+                raise RuntimeError(f"Job rejected: {ack.error}")
+
+            # If we have retries remaining and the error was transient, wait and retry
+            if retry < max_retries and last_error:
+                # Exponential backoff: 0.5s, 1s, 2s, 4s, 8s
+                delay = retry_base_delay * (2 ** retry)
+                await asyncio.sleep(delay)
+
+        # All retries exhausted
+        self._jobs[job_id].status = JobStatus.FAILED.value
+        self._jobs[job_id].error = last_error
+        self._job_events[job_id].set()
+        raise RuntimeError(f"Job submission failed after {max_retries} retries: {last_error}")
     
     async def wait_for_job(
         self,
@@ -283,7 +337,329 @@ class HyperscaleClient(MercurySyncBaseServer):
     def get_job_status(self, job_id: str) -> JobResult | None:
         """Get current status of a job."""
         return self._jobs.get(job_id)
-    
+
+    # =========================================================================
+    # Ping Methods
+    # =========================================================================
+
+    async def ping_manager(
+        self,
+        addr: tuple[str, int] | None = None,
+        timeout: float = 5.0,
+    ) -> ManagerPingResponse:
+        """
+        Ping a manager to get its current status.
+
+        Args:
+            addr: Manager (host, port) to ping. If None, uses next manager in rotation.
+            timeout: Request timeout in seconds.
+
+        Returns:
+            ManagerPingResponse with manager status, worker health, and active jobs.
+
+        Raises:
+            RuntimeError: If no managers configured or ping fails.
+        """
+        target = addr or self._get_next_manager()
+        if not target:
+            raise RuntimeError("No managers configured")
+
+        request = PingRequest(request_id=secrets.token_hex(8))
+
+        response, _ = await self.send_tcp(
+            target,
+            "ping",
+            request.dump(),
+            timeout=timeout,
+        )
+
+        if isinstance(response, Exception):
+            raise RuntimeError(f"Ping failed: {response}")
+
+        if response == b'error':
+            raise RuntimeError("Ping failed: server returned error")
+
+        return ManagerPingResponse.load(response)
+
+    async def ping_gate(
+        self,
+        addr: tuple[str, int] | None = None,
+        timeout: float = 5.0,
+    ) -> GatePingResponse:
+        """
+        Ping a gate to get its current status.
+
+        Args:
+            addr: Gate (host, port) to ping. If None, uses next gate in rotation.
+            timeout: Request timeout in seconds.
+
+        Returns:
+            GatePingResponse with gate status, datacenter health, and active jobs.
+
+        Raises:
+            RuntimeError: If no gates configured or ping fails.
+        """
+        target = addr or self._get_next_gate()
+        if not target:
+            raise RuntimeError("No gates configured")
+
+        request = PingRequest(request_id=secrets.token_hex(8))
+
+        response, _ = await self.send_tcp(
+            target,
+            "ping",
+            request.dump(),
+            timeout=timeout,
+        )
+
+        if isinstance(response, Exception):
+            raise RuntimeError(f"Ping failed: {response}")
+
+        if response == b'error':
+            raise RuntimeError("Ping failed: server returned error")
+
+        return GatePingResponse.load(response)
+
+    async def ping_all_managers(
+        self,
+        timeout: float = 5.0,
+    ) -> dict[tuple[str, int], ManagerPingResponse | Exception]:
+        """
+        Ping all configured managers concurrently.
+
+        Args:
+            timeout: Request timeout in seconds per manager.
+
+        Returns:
+            Dict mapping manager address to response or exception.
+        """
+        if not self._managers:
+            return {}
+
+        async def ping_one(addr: tuple[str, int]) -> tuple[tuple[str, int], ManagerPingResponse | Exception]:
+            try:
+                response = await self.ping_manager(addr, timeout=timeout)
+                return (addr, response)
+            except Exception as e:
+                return (addr, e)
+
+        results = await asyncio.gather(
+            *[ping_one(addr) for addr in self._managers],
+            return_exceptions=False,
+        )
+
+        return dict(results)
+
+    async def ping_all_gates(
+        self,
+        timeout: float = 5.0,
+    ) -> dict[tuple[str, int], GatePingResponse | Exception]:
+        """
+        Ping all configured gates concurrently.
+
+        Args:
+            timeout: Request timeout in seconds per gate.
+
+        Returns:
+            Dict mapping gate address to response or exception.
+        """
+        if not self._gates:
+            return {}
+
+        async def ping_one(addr: tuple[str, int]) -> tuple[tuple[str, int], GatePingResponse | Exception]:
+            try:
+                response = await self.ping_gate(addr, timeout=timeout)
+                return (addr, response)
+            except Exception as e:
+                return (addr, e)
+
+        results = await asyncio.gather(
+            *[ping_one(addr) for addr in self._gates],
+            return_exceptions=False,
+        )
+
+        return dict(results)
+
+    # =========================================================================
+    # Workflow Query Methods
+    # =========================================================================
+
+    async def query_workflows(
+        self,
+        workflow_names: list[str],
+        job_id: str | None = None,
+        timeout: float = 5.0,
+    ) -> dict[str, list[WorkflowStatusInfo]]:
+        """
+        Query workflow status from managers.
+
+        If job_id is specified and we know which manager accepted that job,
+        queries that manager first. Otherwise queries all configured managers.
+
+        Args:
+            workflow_names: List of workflow class names to query.
+            job_id: Optional job ID to filter results.
+            timeout: Request timeout in seconds.
+
+        Returns:
+            Dict mapping datacenter ID to list of WorkflowStatusInfo.
+            If querying managers directly, uses the manager's datacenter.
+
+        Raises:
+            RuntimeError: If no managers configured.
+        """
+        if not self._managers:
+            raise RuntimeError("No managers configured")
+
+        request = WorkflowQueryRequest(
+            request_id=secrets.token_hex(8),
+            workflow_names=workflow_names,
+            job_id=job_id,
+        )
+
+        results: dict[str, list[WorkflowStatusInfo]] = {}
+
+        async def query_one(addr: tuple[str, int]) -> None:
+            try:
+                response_data, _ = await self.send_tcp(
+                    addr,
+                    "workflow_query",
+                    request.dump(),
+                    timeout=timeout,
+                )
+
+                if isinstance(response_data, Exception) or response_data == b'error':
+                    return
+
+                response = WorkflowQueryResponse.load(response_data)
+                dc_id = response.datacenter
+
+                if dc_id not in results:
+                    results[dc_id] = []
+                results[dc_id].extend(response.workflows)
+
+            except Exception:
+                pass  # Manager query failed - skip
+
+        # If we know which manager accepted this job, query it first
+        # This ensures we get results from the job leader
+        if job_id and job_id in self._job_targets:
+            target = self._job_targets[job_id]
+            await query_one(target)
+            # If we got results, return them (job leader has authoritative state)
+            if results:
+                return results
+
+        # Query all managers (either no job_id, or job target query failed)
+        await asyncio.gather(
+            *[query_one(addr) for addr in self._managers],
+            return_exceptions=False,
+        )
+
+        return results
+
+    async def query_workflows_via_gate(
+        self,
+        workflow_names: list[str],
+        job_id: str | None = None,
+        addr: tuple[str, int] | None = None,
+        timeout: float = 10.0,
+    ) -> dict[str, list[WorkflowStatusInfo]]:
+        """
+        Query workflow status via a gate.
+
+        Gates query all datacenter managers and return aggregated results
+        grouped by datacenter.
+
+        Args:
+            workflow_names: List of workflow class names to query.
+            job_id: Optional job ID to filter results.
+            addr: Gate (host, port) to query. If None, uses next gate in rotation.
+            timeout: Request timeout in seconds (higher for gate aggregation).
+
+        Returns:
+            Dict mapping datacenter ID to list of WorkflowStatusInfo.
+
+        Raises:
+            RuntimeError: If no gates configured or query fails.
+        """
+        target = addr or self._get_next_gate()
+        if not target:
+            raise RuntimeError("No gates configured")
+
+        request = WorkflowQueryRequest(
+            request_id=secrets.token_hex(8),
+            workflow_names=workflow_names,
+            job_id=job_id,
+        )
+
+        response_data, _ = await self.send_tcp(
+            target,
+            "workflow_query",
+            request.dump(),
+            timeout=timeout,
+        )
+
+        if isinstance(response_data, Exception):
+            raise RuntimeError(f"Workflow query failed: {response_data}")
+
+        if response_data == b'error':
+            raise RuntimeError("Workflow query failed: gate returned error")
+
+        response = GateWorkflowQueryResponse.load(response_data)
+
+        # Convert to dict format
+        results: dict[str, list[WorkflowStatusInfo]] = {}
+        for dc_status in response.datacenters:
+            results[dc_status.dc_id] = dc_status.workflows
+
+        return results
+
+    async def query_all_gates_workflows(
+        self,
+        workflow_names: list[str],
+        job_id: str | None = None,
+        timeout: float = 10.0,
+    ) -> dict[tuple[str, int], dict[str, list[WorkflowStatusInfo]] | Exception]:
+        """
+        Query workflow status from all configured gates concurrently.
+
+        Each gate returns results aggregated by datacenter.
+
+        Args:
+            workflow_names: List of workflow class names to query.
+            job_id: Optional job ID to filter results.
+            timeout: Request timeout in seconds per gate.
+
+        Returns:
+            Dict mapping gate address to either:
+            - Dict of datacenter -> workflow status list
+            - Exception if query failed
+        """
+        if not self._gates:
+            return {}
+
+        async def query_one(
+            addr: tuple[str, int],
+        ) -> tuple[tuple[str, int], dict[str, list[WorkflowStatusInfo]] | Exception]:
+            try:
+                result = await self.query_workflows_via_gate(
+                    workflow_names,
+                    job_id=job_id,
+                    addr=addr,
+                    timeout=timeout,
+                )
+                return (addr, result)
+            except Exception as e:
+                return (addr, e)
+
+        results = await asyncio.gather(
+            *[query_one(addr) for addr in self._gates],
+            return_exceptions=False,
+        )
+
+        return dict(results)
+
     # =========================================================================
     # TCP Handlers for Push Notifications
     # =========================================================================

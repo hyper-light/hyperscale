@@ -352,6 +352,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         run_id: int,
         workflow_name: str,
         timeout: int,
+        update_available_cores: Callable[[int, int], None],
     ):
         error: asyncio.TimeoutError | None = None
         async with self._logger.context(
@@ -367,6 +368,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     self._poll_for_completed(
                         run_id,
                         workflow_name,
+                        update_available_cores,
                     ),
                     timeout=timeout,
                 )
@@ -406,6 +408,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         self,
         run_id: int,
         workflow_name: str,
+        update_available_cores: Callable[[int, int], None],
     ):
         polling = True
 
@@ -421,6 +424,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             completions_count = len(self._completions[run_id][workflow_name])
             assigned_workers = self._run_workflow_expected_nodes[run_id][workflow_name]
+
+            update_available_cores(assigned_workers, completions_count)
 
             if completions_count >= assigned_workers:
                 await update_active_workflow_message(

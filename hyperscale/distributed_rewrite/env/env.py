@@ -59,6 +59,11 @@ class Env(BaseModel):
     LEADER_PRE_VOTE_TIMEOUT: StrictFloat = 2.0  # Timeout for pre-vote phase
     LEADER_LEASE_DURATION: StrictFloat = 5.0  # Leader lease duration in seconds
     LEADER_MAX_LHM: StrictInt = 4  # Max LHM score for leader eligibility (higher = more tolerant)
+
+    # Cluster Formation Settings
+    CLUSTER_STABILIZATION_TIMEOUT: StrictFloat = 10.0  # Max seconds to wait for cluster to form
+    CLUSTER_STABILIZATION_POLL_INTERVAL: StrictFloat = 0.5  # How often to check cluster membership
+    LEADER_ELECTION_JITTER_MAX: StrictFloat = 3.0  # Max random delay before starting first election
     
     # Federated Health Monitor Settings (Gate -> DC Leader probing)
     # These are tuned for high-latency, globally distributed links
@@ -125,6 +130,10 @@ class Env(BaseModel):
             "LEADER_PRE_VOTE_TIMEOUT": float,
             "LEADER_LEASE_DURATION": float,
             "LEADER_MAX_LHM": int,
+            # Cluster formation settings
+            "CLUSTER_STABILIZATION_TIMEOUT": float,
+            "CLUSTER_STABILIZATION_POLL_INTERVAL": float,
+            "LEADER_ELECTION_JITTER_MAX": float,
             # Federated health monitor settings
             "FEDERATED_PROBE_INTERVAL": float,
             "FEDERATED_PROBE_TIMEOUT": float,

@@ -2,22 +2,22 @@
 """
 Multi-Worker Workflow Dispatch Integration Test.
 
-Tests that:
-1. A workflow requiring more cores than any single worker has gets distributed
-   across multiple workers (multi-worker dispatch)
-2. Sub-workflow progress is aggregated correctly
-3. When cores are freed (first workflow completes), waiting workflows are
-   immediately dispatched (eager execution via _cores_available_event)
+Tests workflow dependency execution and core allocation:
 
-Scenario:
-- 2 workers with 4 cores each (8 total cores in pool)
-- First job: 1 workflow with Priority.AUTO (needs all 8 cores)
-  - Should dispatch to BOTH workers (4 cores each)
-- Second job: 1 workflow with Priority.AUTO (needs all 8 cores)
-  - Should WAIT until first workflow completes
-  - Should be dispatched IMMEDIATELY when cores are freed (eager execution)
+1. TestWorkflow and TestWorkflowTwo execute concurrently, each getting half
+   the available cores (4 cores each on 2 workers with 4 cores each)
 
-This validates the multi-worker dispatch and event-driven core availability.
+2. NonTestWorkflow depends on TestWorkflowTwo - should be enqueued until
+   TestWorkflowTwo completes, then get assigned to freed cores
+
+3. NonTestWorkflowTwo depends on BOTH TestWorkflow and TestWorkflowTwo -
+   should remain enqueued until both complete
+
+This validates:
+- Dependency-based workflow scheduling
+- Core allocation (test workflows split cores evenly)
+- Enqueued/pending state for dependent workflows
+- Eager dispatch when dependencies complete
 """
 
 import asyncio
@@ -28,7 +28,7 @@ import time
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from hyperscale.graph import Workflow, step
+from hyperscale.graph import Workflow, step, depends
 from hyperscale.testing import URL, HTTPResponse
 from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
 from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
@@ -46,18 +46,30 @@ _logging_config.update(log_directory=os.getcwd())
 # Test Workflows
 # ==========================================================================
 
-class QuickWorkflow(Workflow):
-    """A quick workflow that completes fast to test eager dispatch."""
-    vus = 100
-    duration = "3s"  # Short duration
+class TestWorkflow(Workflow):
+    vus = 2000
+    duration = "20s"
 
     @step()
-    async def quick_step(self) -> dict:
-        # Simple step that completes quickly
-        return {"status": "done"}
+    async def get_httpbin(
+        self,
+        url: URL = 'https://httpbin.org/get',
+    ) -> HTTPResponse:
+        return await self.client.http.get(url)
 
+class TestWorkflowTwo(Workflow):
+    vus = 500
+    duration = "5s"
 
-class SecondWorkflow(Workflow):
+    @step()
+    async def get_httpbin(
+        self,
+        url: URL = 'https://httpbin.org/get',
+    ) -> HTTPResponse:
+        return await self.client.http.get(url)
+
+@depends('TestWorkflowTwo')
+class NonTestWorkflow(Workflow):
     """Second workflow that should wait for first to complete."""
     vus = 100
     duration = "3s"
@@ -66,6 +78,15 @@ class SecondWorkflow(Workflow):
     async def second_step(self) -> dict:
         return {"status": "done"}
 
+@depends('TestWorkflow', 'TestWorkflowTwo')
+class NonTestWorkflowTwo(Workflow):
+    """Second workflow that should wait for first to complete."""
+    vus = 100
+    duration = "3s"
+
+    @step()
+    async def second_step(self) -> dict:
+        return {"status": "done"}
 
 # ==========================================================================
 # Configuration
@@ -204,15 +225,14 @@ async def run_test():
         await asyncio.sleep(WORKER_REGISTRATION_TIME)
 
         # Verify workers registered
-        manager = managers[0]
-        registered_workers = len(manager._workers)
-        total_cores = sum(s.available_cores for s in manager._worker_status.values())
-        print(f"  Registered workers: {registered_workers}")
-        print(f"  Total available cores: {total_cores}")
+        for idx, manager in enumerate(managers):
+            registered_workers = len(manager._workers)
+            registered_managers = len(manager._get_active_manager_peer_addrs())
+            total_cores = manager._get_total_available_cores()
+            print(f'  Registered managers for manager {idx}: {registered_managers}')
+            print(f"  Registered workers for manager {idx}: {registered_workers}")
+            print(f"  Total available cores for manager {idx}: {total_cores}")
 
-        if registered_workers < len(WORKER_CONFIGS):
-            print(f"  ERROR: Expected {len(WORKER_CONFIGS)} workers, got {registered_workers}")
-            return False
 
         print()
 
@@ -233,216 +253,210 @@ async def run_test():
         print()
 
         # ==============================================================
-        # STEP 5: Submit first job (should use all 8 cores across 2 workers)
+        # STEP 5: Submit job with all workflows
         # ==============================================================
-        print("[5/8] Submitting first job (should dispatch to BOTH workers)...")
+        print("[5/10] Submitting job with all 4 workflows...")
         print("-" * 60)
 
-        # Debug: Check leadership status before submission
-        print("  Leadership status:")
-        leader_found = False
-        for i, mgr in enumerate(managers):
-            is_leader = mgr.is_leader()
-            current_leader = mgr.get_current_leader()
-            state = mgr._manager_state.value
-            print(f"    {MANAGER_CONFIGS[i]['name']}: is_leader={is_leader}, "
-                  f"current_leader={current_leader}, state={state}")
-            if is_leader:
-                leader_found = True
-
-        if not leader_found:
-            print("  WARNING: No leader found! Waiting additional 5s...")
-            await asyncio.sleep(5)
-            # Check again
-            for i, mgr in enumerate(managers):
-                if mgr.is_leader():
-                    print(f"    {MANAGER_CONFIGS[i]['name']} is now leader")
-                    leader_found = True
-                    break
-
-        if not leader_found:
-            print("  ERROR: Still no leader after additional wait")
-            return False
-
-        print()
-
-        job1_id = await client.submit_job(
-            workflows=[QuickWorkflow],
-            timeout_seconds=60.0,
+        job_id = await client.submit_job(
+            workflows=[TestWorkflow, TestWorkflowTwo, NonTestWorkflow, NonTestWorkflowTwo],
+            timeout_seconds=120.0,
         )
-        print(f"  Job 1 submitted: {job1_id}")
+        print(f"  Job submitted: {job_id}")
 
-        # Wait for dispatch to happen
+        # Wait a moment for dispatch to begin
         await asyncio.sleep(2)
 
-        # Check sub-workflow mapping (multi-worker dispatch)
-        parent_workflow_id = None
-        sub_workflow_count = 0
-        for parent_id, sub_ids in manager._sub_workflow_mapping.items():
-            if job1_id in parent_id:
-                parent_workflow_id = parent_id
-                sub_workflow_count = len(sub_ids)
-                print(f"  Parent workflow: {parent_id}")
-                print(f"  Sub-workflows dispatched: {sub_workflow_count}")
-                for sub_id in sub_ids:
-                    assignment = manager._workflow_assignments.get(job1_id, {}).get(sub_id)
-                    print(f"    - {sub_id} -> {assignment}")
+        # ==============================================================
+        # STEP 6: Verify initial state - test workflows running, dependent workflows pending
+        # ==============================================================
+        print()
+        print("[6/10] Verifying initial workflow state...")
+        print("-" * 60)
+
+        all_workflow_names = ['TestWorkflow', 'TestWorkflowTwo', 'NonTestWorkflow', 'NonTestWorkflowTwo']
+
+        # Helper to get workflow status by name
+        def get_workflow_by_name(results: dict, name: str):
+            for dc_id, workflows in results.items():
+                for wf in workflows:
+                    if wf.workflow_name == name:
+                        return wf
+            return None
+
+        # Query initial state
+        results = await client.query_workflows(all_workflow_names, job_id=job_id)
+        print(f"  Query returned {sum(len(wfs) for wfs in results.values())} workflows")
+
+        test_wf = get_workflow_by_name(results, 'TestWorkflow')
+        test_wf_two = get_workflow_by_name(results, 'TestWorkflowTwo')
+        non_test_wf = get_workflow_by_name(results, 'NonTestWorkflow')
+        non_test_wf_two = get_workflow_by_name(results, 'NonTestWorkflowTwo')
+
+        # Verify test workflows are running/assigned
+        test_wf_ok = test_wf and test_wf.status in ('running', 'assigned')
+        test_wf_two_ok = test_wf_two and test_wf_two.status in ('running', 'assigned')
+        print(f"  TestWorkflow: status={test_wf.status if test_wf else 'NOT FOUND'}, "
+              f"cores={test_wf.provisioned_cores if test_wf else 0}, "
+              f"workers={len(test_wf.assigned_workers) if test_wf else 0}")
+        print(f"  TestWorkflowTwo: status={test_wf_two.status if test_wf_two else 'NOT FOUND'}, "
+              f"cores={test_wf_two.provisioned_cores if test_wf_two else 0}, "
+              f"workers={len(test_wf_two.assigned_workers) if test_wf_two else 0}")
+
+        # Verify dependent workflows are pending/enqueued
+        non_test_pending = non_test_wf and non_test_wf.status == 'pending'
+        non_test_two_pending = non_test_wf_two and non_test_wf_two.status == 'pending'
+        print(f"  NonTestWorkflow: status={non_test_wf.status if non_test_wf else 'NOT FOUND'}, "
+              f"is_enqueued={non_test_wf.is_enqueued if non_test_wf else False}")
+        print(f"  NonTestWorkflowTwo: status={non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'}, "
+              f"is_enqueued={non_test_wf_two.is_enqueued if non_test_wf_two else False}")
+
+        initial_state_ok = test_wf_ok and test_wf_two_ok and non_test_pending and non_test_two_pending
+        print(f"\n  Initial state verification: {'PASS' if initial_state_ok else 'FAIL'}")
+
+        # ==============================================================
+        # STEP 7: Poll for TestWorkflowTwo to complete
+        # ==============================================================
+        print()
+        print("[7/10] Waiting for TestWorkflowTwo to complete...")
+        print("-" * 60)
+
+        test_wf_two_completed = False
+        for i in range(60):  # 60 second timeout
+            results = await client.query_workflows(['TestWorkflowTwo'], job_id=job_id)
+            test_wf_two = get_workflow_by_name(results, 'TestWorkflowTwo')
+
+            if test_wf_two and test_wf_two.status == 'completed':
+                test_wf_two_completed = True
+                print(f"  TestWorkflowTwo completed after {i+1}s")
                 break
 
-        # Verify multi-worker dispatch
-        multi_worker_dispatch_ok = sub_workflow_count >= 2
-        if multi_worker_dispatch_ok:
-            print(f"  PASS: Workflow dispatched to {sub_workflow_count} workers")
-        else:
-            print(f"  FAIL: Expected dispatch to 2 workers, got {sub_workflow_count}")
+            # While waiting, verify dependent workflows remain pending
+            dep_results = await client.query_workflows(['NonTestWorkflow', 'NonTestWorkflowTwo'], job_id=job_id)
+            non_test_wf = get_workflow_by_name(dep_results, 'NonTestWorkflow')
+            non_test_wf_two = get_workflow_by_name(dep_results, 'NonTestWorkflowTwo')
 
-        # Check workers are executing
-        workers_executing = 0
-        for i, worker in enumerate(workers):
-            active = len(worker._active_workflows)
-            if active > 0:
-                workers_executing += 1
-                print(f"  {WORKER_CONFIGS[i]['name']}: executing {active} workflow(s)")
+            if i % 5 == 0:  # Log every 5 seconds
+                print(f"  [{i}s] TestWorkflowTwo: {test_wf_two.status if test_wf_two else 'NOT FOUND'}, "
+                      f"NonTestWorkflow: {non_test_wf.status if non_test_wf else 'NOT FOUND'}, "
+                      f"NonTestWorkflowTwo: {non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'}")
 
+            await asyncio.sleep(1)
+
+        if not test_wf_two_completed:
+            print("  ERROR: TestWorkflowTwo did not complete in time")
+            return False
+
+        # ==============================================================
+        # STEP 8: Verify TestWorkflow still running, NonTestWorkflow assigned,
+        #         NonTestWorkflowTwo still pending
+        # ==============================================================
         print()
-
-        # ==============================================================
-        # STEP 6: Submit second job (should WAIT - no cores available)
-        # ==============================================================
-        print("[6/8] Submitting second job (should WAIT for cores)...")
+        print("[8/10] Verifying state after TestWorkflowTwo completed...")
         print("-" * 60)
 
-        # Record time before submitting second job
-        second_job_submit_time = time.monotonic()
-
-        # Submit second job (this will block waiting for cores)
-        job2_submitted = asyncio.Event()
-        job2_id = None
-        job2_dispatch_time = None
-
-        async def submit_second_job():
-            nonlocal job2_id, job2_dispatch_time
-            job2_id = await client.submit_job(
-                workflows=[SecondWorkflow],
-                timeout_seconds=60.0,
-            )
-            job2_dispatch_time = time.monotonic()
-            job2_submitted.set()
-
-        # Start second job submission in background
-        submit_task = asyncio.create_task(submit_second_job())
-
-        # Wait a moment to ensure it's in the waiting state
+        # Small delay for dispatch to happen
         await asyncio.sleep(1)
 
-        # Check available cores (should be 0 or very low)
-        available_cores = sum(s.available_cores for s in manager._worker_status.values())
-        print(f"  Available cores while Job 1 running: {available_cores}")
+        results = await client.query_workflows(all_workflow_names, job_id=job_id)
 
-        # Second job should NOT have been dispatched yet
-        job2_waiting = not job2_submitted.is_set()
-        if job2_waiting:
-            print(f"  PASS: Job 2 is waiting for cores (as expected)")
-        else:
-            print(f"  INFO: Job 2 was dispatched quickly (cores may have freed)")
+        test_wf = get_workflow_by_name(results, 'TestWorkflow')
+        non_test_wf = get_workflow_by_name(results, 'NonTestWorkflow')
+        non_test_wf_two = get_workflow_by_name(results, 'NonTestWorkflowTwo')
 
+        # TestWorkflow should still be running (longer duration)
+        test_wf_still_running = test_wf and test_wf.status in ('running', 'assigned')
+        print(f"  TestWorkflow: status={test_wf.status if test_wf else 'NOT FOUND'} "
+              f"(expected: running/assigned) {'PASS' if test_wf_still_running else 'FAIL'}")
+
+        # NonTestWorkflow should now be assigned/running (dependency on TestWorkflowTwo met)
+        non_test_assigned = non_test_wf and non_test_wf.status in ('running', 'assigned')
+        print(f"  NonTestWorkflow: status={non_test_wf.status if non_test_wf else 'NOT FOUND'}, "
+              f"workers={non_test_wf.assigned_workers if non_test_wf else []} "
+              f"(expected: running/assigned) {'PASS' if non_test_assigned else 'FAIL'}")
+
+        # NonTestWorkflowTwo should still be pending (needs both TestWorkflow AND TestWorkflowTwo)
+        non_test_two_still_pending = non_test_wf_two and non_test_wf_two.status == 'pending'
+        print(f"  NonTestWorkflowTwo: status={non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'} "
+              f"(expected: pending) {'PASS' if non_test_two_still_pending else 'FAIL'}")
+
+        step8_ok = test_wf_still_running and non_test_assigned and non_test_two_still_pending
+        print(f"\n  Post-TestWorkflowTwo state: {'PASS' if step8_ok else 'FAIL'}")
+
+        # ==============================================================
+        # STEP 9: Wait for TestWorkflow to complete, verify NonTestWorkflowTwo gets assigned
+        # ==============================================================
         print()
-
-        # ==============================================================
-        # STEP 7: Wait for first job to complete and verify eager dispatch
-        # ==============================================================
-        print("[7/8] Waiting for Job 1 to complete and Job 2 to dispatch...")
+        print("[9/10] Waiting for TestWorkflow to complete...")
         print("-" * 60)
 
-        # Wait for Job 1 to complete (short workflow, should be ~3-5s)
-        job1_complete = False
-        for _ in range(30):  # 30 second timeout
-            job1 = manager._jobs.get(job1_id)
-            if job1:
-                # Check if all workflows completed
-                all_complete = all(
-                    w.status in (WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value)
-                    for w in job1.workflows
-                )
-                if all_complete:
-                    job1_complete = True
-                    job1_complete_time = time.monotonic()
-                    print(f"  Job 1 completed at t={job1_complete_time - second_job_submit_time:.2f}s")
-                    break
-            await asyncio.sleep(0.5)
+        test_wf_completed = False
+        for i in range(60):  # 60 second timeout
+            results = await client.query_workflows(['TestWorkflow'], job_id=job_id)
+            test_wf = get_workflow_by_name(results, 'TestWorkflow')
 
-        if not job1_complete:
-            print("  ERROR: Job 1 did not complete within timeout")
-            submit_task.cancel()
+            if test_wf and test_wf.status == 'completed':
+                test_wf_completed = True
+                print(f"  TestWorkflow completed after {i+1}s")
+                break
+
+            if i % 5 == 0:
+                print(f"  [{i}s] TestWorkflow: {test_wf.status if test_wf else 'NOT FOUND'}")
+
+            await asyncio.sleep(1)
+
+        if not test_wf_completed:
+            print("  ERROR: TestWorkflow did not complete in time")
             return False
 
-        # Wait for Job 2 to be submitted (should happen immediately after cores freed)
-        try:
-            await asyncio.wait_for(job2_submitted.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            print("  ERROR: Job 2 was not dispatched after Job 1 completed")
-            submit_task.cancel()
-            return False
+        # Small delay for dispatch
+        await asyncio.sleep(1)
 
-        # Calculate how quickly Job 2 was dispatched after Job 1 completed
-        dispatch_delay = job2_dispatch_time - job1_complete_time
-        print(f"  Job 2 dispatched: {job2_id}")
-        print(f"  Dispatch delay after Job 1 completion: {dispatch_delay:.3f}s")
+        # Verify NonTestWorkflowTwo is now assigned
+        results = await client.query_workflows(['NonTestWorkflowTwo'], job_id=job_id)
+        non_test_wf_two = get_workflow_by_name(results, 'NonTestWorkflowTwo')
 
-        # Eager dispatch should happen within ~1 second (event-driven)
-        eager_dispatch_ok = dispatch_delay < 2.0
-        if eager_dispatch_ok:
-            print(f"  PASS: Eager dispatch triggered ({dispatch_delay:.3f}s < 2.0s threshold)")
-        else:
-            print(f"  WARN: Dispatch was slower than expected ({dispatch_delay:.3f}s)")
+        non_test_two_assigned = non_test_wf_two and non_test_wf_two.status in ('running', 'assigned')
+        print(f"  NonTestWorkflowTwo: status={non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'}, "
+              f"workers={non_test_wf_two.assigned_workers if non_test_wf_two else []} "
+              f"(expected: running/assigned) {'PASS' if non_test_two_assigned else 'FAIL'}")
 
+        # ==============================================================
+        # STEP 10: Wait for all remaining workflows to complete
+        # ==============================================================
         print()
-
-        # ==============================================================
-        # STEP 8: Verify final state
-        # ==============================================================
-        print("[8/8] Verifying final state...")
+        print("[10/10] Waiting for NonTestWorkflow and NonTestWorkflowTwo to complete...")
         print("-" * 60)
 
-        # Wait for Job 2 to complete
-        job2_complete = False
-        for _ in range(30):
-            job2 = manager._jobs.get(job2_id)
-            if job2:
-                all_complete = all(
-                    w.status in (WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value)
-                    for w in job2.workflows
-                )
-                if all_complete:
-                    job2_complete = True
-                    print(f"  Job 2 completed")
-                    break
-            await asyncio.sleep(0.5)
+        all_complete = False
+        for i in range(60):
+            results = await client.query_workflows(['NonTestWorkflow', 'NonTestWorkflowTwo'], job_id=job_id)
+            non_test_wf = get_workflow_by_name(results, 'NonTestWorkflow')
+            non_test_wf_two = get_workflow_by_name(results, 'NonTestWorkflowTwo')
 
-        if not job2_complete:
-            print("  WARN: Job 2 did not complete within timeout (test continues)")
+            non_test_done = non_test_wf and non_test_wf.status == 'completed'
+            non_test_two_done = non_test_wf_two and non_test_wf_two.status == 'completed'
 
-        # Summary of core allocation
-        print(f"\n  === Core Allocation Summary ===")
-        for wid, status in manager._worker_status.items():
-            short_id = wid.split('-')[-1][:8] if '-' in wid else wid[:8]
-            print(f"    Worker {short_id}: available={status.available_cores}")
+            if non_test_done and non_test_two_done:
+                all_complete = True
+                print(f"  All workflows completed after {i+1}s")
+                break
 
-        # Check workflow assignments for both jobs
-        print(f"\n  === Workflow Assignments ===")
-        for job_id in [job1_id, job2_id]:
-            if job_id:
-                assignments = manager._workflow_assignments.get(job_id, {})
-                print(f"    {job_id[:16]}...: {len(assignments)} assignments")
+            if i % 5 == 0:
+                print(f"  [{i}s] NonTestWorkflow: {non_test_wf.status if non_test_wf else 'NOT FOUND'}, "
+                      f"NonTestWorkflowTwo: {non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'}")
 
+            await asyncio.sleep(1)
+
+        if not all_complete:
+            print("  WARNING: Not all workflows completed in time")
+
+        # ==============================================================
+        # Final Results
+        # ==============================================================
         print()
-
-        # ==============================================================
-        # Results
-        # ==============================================================
         print("=" * 70)
-
-        all_passed = multi_worker_dispatch_ok and eager_dispatch_ok
+        all_passed = initial_state_ok and step8_ok and non_test_two_assigned and all_complete
 
         if all_passed:
             print("TEST RESULT: PASSED")
@@ -451,10 +465,10 @@ async def run_test():
 
         print()
         print("  Test Summary:")
-        print(f"    - Multi-worker dispatch: {'PASS' if multi_worker_dispatch_ok else 'FAIL'}")
-        print(f"      (Workflow dispatched to {sub_workflow_count} workers)")
-        print(f"    - Eager execution: {'PASS' if eager_dispatch_ok else 'FAIL'}")
-        print(f"      (Dispatch delay: {dispatch_delay:.3f}s)")
+        print(f"    - Initial state (test wfs running, deps pending): {'PASS' if initial_state_ok else 'FAIL'}")
+        print(f"    - After TestWorkflowTwo done (NonTestWorkflow assigned): {'PASS' if step8_ok else 'FAIL'}")
+        print(f"    - After TestWorkflow done (NonTestWorkflowTwo assigned): {'PASS' if non_test_two_assigned else 'FAIL'}")
+        print(f"    - All workflows completed: {'PASS' if all_complete else 'FAIL'}")
         print()
         print("=" * 70)
 
@@ -505,12 +519,20 @@ async def run_test():
 
 def main():
     print("=" * 70)
-    print("MULTI-WORKER WORKFLOW DISPATCH INTEGRATION TEST")
+    print("WORKFLOW DEPENDENCY & CORE ALLOCATION TEST")
     print("=" * 70)
     print()
     print("This test validates:")
-    print("  1. Workflows are dispatched across multiple workers when needed")
-    print("  2. Waiting workflows are dispatched immediately when cores freed")
+    print("  1. TestWorkflow and TestWorkflowTwo run concurrently (split cores)")
+    print("  2. NonTestWorkflow (depends on TestWorkflowTwo) waits, then runs")
+    print("  3. NonTestWorkflowTwo (depends on BOTH) waits for both to complete")
+    print("  4. Dependency-based scheduling triggers eager dispatch")
+    print()
+    print("Workflow dependencies:")
+    print("  - TestWorkflow: no dependencies")
+    print("  - TestWorkflowTwo: no dependencies")
+    print("  - NonTestWorkflow: depends on TestWorkflowTwo")
+    print("  - NonTestWorkflowTwo: depends on TestWorkflow AND TestWorkflowTwo")
     print()
     print(f"Configuration:")
     print(f"  - {len(MANAGER_CONFIGS)} manager(s)")

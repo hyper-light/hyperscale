@@ -17,6 +17,7 @@ from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models import InstanceRoleType, WorkflowStatusUpdate
+from hyperscale.core.jobs.models import WorkflowResults
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.jobs.workers import Provisioner, StagePriority
@@ -98,6 +99,7 @@ class RemoteGraphManager:
         self._provisioner: Provisioner | None = None
         self._graph_updates: dict[int, dict[str, asyncio.Queue[WorkflowStatusUpdate]]] = defaultdict(lambda: defaultdict(asyncio.Queue))
         self._workflow_statuses: dict[int, dict[str, Deque[WorkflowStatusUpdate]]] = defaultdict(lambda: defaultdict(deque))
+        self._available_cores_updates: asyncio.Queue[tuple[int, int, int]] | None = None
 
         self._step_traversal_orders: Dict[
             str,
@@ -142,6 +144,9 @@ class RemoteGraphManager:
                     with_ssl=cert_path is not None and key_path is not None,
                 )
             )
+
+            if self._available_cores_updates is None:
+                self._available_cores_updates = asyncio.Queue()
 
             if self._controller is None:
                 self._controller = RemoteGraphController(
@@ -331,7 +336,7 @@ class RemoteGraphManager:
             run_id,
             workflow_context,
         )
-        
+
         default_config = {
             "workflow": workflow.name,
             "run_id": run_id,
@@ -368,7 +373,6 @@ class RemoteGraphManager:
         )
 
 
-        run_id = self._controller.id_generator.generate()
         async with self._logger.context(
             name=f"{workflow_slug}_logger",
             nested=True,
@@ -379,10 +383,10 @@ class RemoteGraphManager:
             )
 
             self._controller.create_run_contexts(run_id)
+        
             _, workflow_vus = self._provision({
                 workflow.name: workflow,
             }, threads=threads)
-
 
             await self._append_workflow_run_status(run_id, workflow.name, WorkflowStatus.RUNNING)
             
@@ -470,7 +474,7 @@ class RemoteGraphManager:
         threads: int,
         workflow_vus: List[int],
         skip_reporting: bool = False,
-    ) -> Tuple[str, WorkflowStats, Context, Exception | None]:
+    ) -> Tuple[str, WorkflowStats | dict[int, WorkflowResults], Context, Exception | None]:
         import sys
         workflow_slug = workflow.name.lower()
 
@@ -519,10 +523,9 @@ class RemoteGraphManager:
                 )
 
                 if is_test_workflow is False:
-                    threads = len(self._controller.nodes)
-
+                    threads = self._threads # We do this to ensure *every* local worker node gets the update
                     await ctx.log_prepared(
-                        message=f"Non-test Workflow {workflow.name} now using {self._threads} workers",
+                        message=f"Non-test Workflow {workflow.name} now using 1 workers",
                         name="trace",
                     )
 
@@ -556,7 +559,7 @@ class RemoteGraphManager:
                 context = self._controller.assign_context(
                     run_id,
                     workflow.name,
-                    threads if is_test_workflow else 1,
+                    threads,
                 )
 
                 loaded_context = await self._use_context(
@@ -585,11 +588,12 @@ class RemoteGraphManager:
 
                 self._workflow_timers[workflow.name] = time.monotonic()
 
+
                 await self._controller.submit_workflow_to_workers(
                     run_id,
                     workflow,
                     loaded_context,
-                    threads if is_test_workflow else 1,
+                    threads,
                     workflow_vus,
                     self._update,
                 )
@@ -613,6 +617,7 @@ class RemoteGraphManager:
                     run_id,
                     workflow.name,
                     workflow_timeout,
+                    self._update_available_cores,
                 )
 
                 results, run_context, timeout_error = worker_results
@@ -638,6 +643,30 @@ class RemoteGraphManager:
                 )
 
                 await update_workflow_executions_total_rate(workflow_slug, None, False)
+
+
+                if skip_reporting:
+
+                    updated_context = await self._provide_context(
+                        workflow.name,
+                        state_actions,
+                        run_context,
+                        execution_result,
+                    )
+
+                    await self._controller.update_context(
+                        run_id,
+                        updated_context,
+                    )
+
+                    self._provisioner.release(threads)
+
+                    return  (
+                        workflow.name,
+                        results,
+                        updated_context,
+                        timeout_error,
+                    )
 
                 await ctx.log_prepared(
                     message=f"Processing {len(results)} results sets for Workflow {workflow.name} run {run_id}",
@@ -699,14 +728,6 @@ class RemoteGraphManager:
                     message=f"Submitting results to reporters for Workflow {workflow.name} run {run_id}",
                     name="trace",
                 )
-
-                if skip_reporting:
-                    return  (
-                        workflow.name,
-                        execution_result,
-                        updated_context,
-                        timeout_error,
-                    )
 
                 reporting = workflow.reporting
 
@@ -824,6 +845,7 @@ class RemoteGraphManager:
             BrokenPipeError,
             asyncio.CancelledError,
         ) as err:
+            self._provisioner.release(threads)
             await update_active_workflow_message(workflow_slug, "Aborted")
 
             raise err
@@ -898,6 +920,24 @@ class RemoteGraphManager:
             self._status_lock.release()
 
         return workflow_status_update
+    
+    async def get_availability(self):
+        if self._available_cores_updates:
+            return await self._available_cores_updates.get()
+        
+        return 0
+    
+    def _update_available_cores(
+        self,
+        assigned: int,
+        completed: int,
+    ):
+        # Availablity is the total pool minus the difference between assigned and completd
+        self._available_cores_updates.put_nowait((
+            assigned,
+            completed,
+            self._threads - max(assigned - completed, 0),
+        ))
 
     async def _update(
         self,

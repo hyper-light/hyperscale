@@ -369,6 +369,8 @@ class ManagerServer(HealthAwareServer):
         self._worker_pool = WorkerPool(
             health_grace_period=30.0,
             get_swim_status=self._get_swim_status_for_worker,
+            manager_id=self._node_id.short,
+            datacenter=dc_id,
         )
 
         # WorkflowDispatcher for dependency-aware workflow dispatch

@@ -34,6 +34,9 @@ class Provisioner:
         self.loop = asyncio.get_event_loop()
         self.sem = BatchedSemaphore(self.max_workers)
 
+    def availalble(self):
+        return self.sem._value
+
     async def acquire(self, count: int):
         await self.sem.acquire(count)
 

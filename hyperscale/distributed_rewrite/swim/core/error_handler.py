@@ -15,6 +15,7 @@ from collections import deque
 from enum import Enum, auto
 import asyncio
 import time
+import traceback
 from hyperscale.logging.hyperscale_logging_models import ServerError
 
 from .errors import (
@@ -201,6 +202,9 @@ class ErrorHandler:
     # Shutdown flag - when True, suppress non-fatal errors
     _shutting_down: bool = False
 
+    # Track last error per category for debugging (includes traceback)
+    _last_errors: dict[ErrorCategory, tuple[SwimError, str]] = field(default_factory=dict)
+
     def __post_init__(self):
         # Initialize stats for each category
         for category, settings in self.circuit_settings.items():
@@ -244,6 +248,17 @@ class ErrorHandler:
         if self._shutting_down and error.severity != ErrorSeverity.FATAL:
             return
 
+        # Capture traceback for debugging - get the last line of the traceback
+        tb_line = ""
+        if error.cause:
+            tb_lines = traceback.format_exception(type(error.cause), error.cause, error.cause.__traceback__)
+            if tb_lines:
+                # Get the last non-empty line (usually the actual error)
+                tb_line = "".join(tb_lines[-3:]).strip() if len(tb_lines) >= 3 else "".join(tb_lines).strip()
+
+        # Store last error with traceback for circuit breaker logging
+        self._last_errors[error.category] = (error, tb_line)
+
         # 1. Log with structured context
         await self._log_error(error)
 
@@ -273,6 +288,7 @@ class ErrorHandler:
         
         Converts standard exceptions to SwimError types.
         """
+
         # Convert known exceptions to SwimError types
         if isinstance(exception, SwimError):
             await self.handle(exception)
@@ -416,11 +432,20 @@ class ErrorHandler:
                     pass  # Logging is best-effort
     
     async def _log_circuit_open(self, category: ErrorCategory, stats: ErrorStats) -> None:
-        """Log circuit breaker opening."""
+        """Log circuit breaker opening with last error details."""
         message = (
             f"[CircuitBreakerOpen] Circuit breaker OPEN for {category.name}: "
             f"{stats.error_count} errors, rate={stats.error_rate:.2f}/s"
         )
+
+        # Include last error details if available
+        last_error_info = self._last_errors.get(category)
+        if last_error_info:
+            error, tb_line = last_error_info
+            message += f" | Last error: {error}"
+            if tb_line:
+                message += f" | Traceback: {tb_line}"
+
         if self.logger:
             try:
                 from hyperscale.logging.hyperscale_logging_models import ServerError
@@ -518,13 +543,21 @@ class ErrorContext:
     
     async def __aenter__(self) -> 'ErrorContext':
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
         if exc_val is not None:
+            # CancelledError is not an error - it's a normal signal for task cancellation
+            # Log at debug level for visibility but don't treat as error or update metrics
+            if isinstance(exc_val, asyncio.CancelledError):
+                await self.handler._log_internal(
+                    f"Operation '{self.operation}' cancelled (normal during shutdown)"
+                )
+                return False  # Don't suppress, let it propagate
+
             await self.handler.handle_exception(exc_val, self.operation)
             return not self.reraise  # Suppress exception unless reraise=True
         return False
-    
+
     def record_success(self, category: ErrorCategory) -> None:
         """Record successful operation for circuit breaker."""
         self.handler.record_success(category)

@@ -19,10 +19,17 @@ Design principles:
 """
 
 import asyncio
-import logging
 from dataclasses import dataclass, field
 
-logger = logging.getLogger(__name__)
+from hyperscale.distributed_rewrite.jobs.logging_models import (
+    AllocatorTrace,
+    AllocatorDebug,
+    AllocatorInfo,
+    AllocatorWarning,
+    AllocatorError,
+    AllocatorCritical,
+)
+from hyperscale.logging import Logger
 
 
 @dataclass
@@ -59,14 +66,17 @@ class CoreAllocator:
         await allocator.free("workflow-1")
     """
 
-    def __init__(self, total_cores: int):
+    def __init__(self, total_cores: int, worker_id: str = ""):
         """
         Initialize CoreAllocator.
 
         Args:
             total_cores: Total number of CPU cores available
+            worker_id: Worker node ID for log context
         """
         self._total_cores = total_cores
+        self._worker_id = worker_id
+        self._logger = Logger()
 
         # Core assignment tracking
         # Maps core_index -> workflow_id (None if core is free)
@@ -122,16 +132,19 @@ class CoreAllocator:
             AllocationResult with success status and allocated core indices
         """
         if cores_needed <= 0:
-            logger.warning("Allocation request with invalid cores_needed=%d", cores_needed)
+            await self._log_warning(
+                f"Allocation request with invalid cores_needed={cores_needed}",
+                workflow_id=workflow_id,
+            )
             return AllocationResult(
                 success=False,
                 error="cores_needed must be positive",
             )
 
         if cores_needed > self._total_cores:
-            logger.warning(
-                "Allocation request for %d cores exceeds total %d",
-                cores_needed, self._total_cores
+            await self._log_warning(
+                f"Allocation request for {cores_needed} cores exceeds total {self._total_cores}",
+                workflow_id=workflow_id,
             )
             return AllocationResult(
                 success=False,
@@ -342,3 +355,41 @@ class CoreAllocator:
     def _count_free_cores(self) -> int:
         """Count free cores. Must be called with lock held."""
         return sum(1 for wf_id in self._core_assignments.values() if wf_id is None)
+
+    # =========================================================================
+    # Logging Helpers
+    # =========================================================================
+
+    def _get_log_context(self, workflow_id: str = "") -> dict:
+        """Get common context fields for logging."""
+        return {
+            "worker_id": self._worker_id,
+            "workflow_id": workflow_id,
+            "total_cores": self._total_cores,
+            "available_cores": self._available_cores,
+            "active_workflows": len(self._workflow_cores),
+        }
+
+    async def _log_trace(self, message: str, workflow_id: str = "") -> None:
+        """Log a trace-level message."""
+        await self._logger.log(AllocatorTrace(message=message, **self._get_log_context(workflow_id)))
+
+    async def _log_debug(self, message: str, workflow_id: str = "") -> None:
+        """Log a debug-level message."""
+        await self._logger.log(AllocatorDebug(message=message, **self._get_log_context(workflow_id)))
+
+    async def _log_info(self, message: str, workflow_id: str = "") -> None:
+        """Log an info-level message."""
+        await self._logger.log(AllocatorInfo(message=message, **self._get_log_context(workflow_id)))
+
+    async def _log_warning(self, message: str, workflow_id: str = "") -> None:
+        """Log a warning-level message."""
+        await self._logger.log(AllocatorWarning(message=message, **self._get_log_context(workflow_id)))
+
+    async def _log_error(self, message: str, workflow_id: str = "") -> None:
+        """Log an error-level message."""
+        await self._logger.log(AllocatorError(message=message, **self._get_log_context(workflow_id)))
+
+    async def _log_critical(self, message: str, workflow_id: str = "") -> None:
+        """Log a critical-level message."""
+        await self._logger.log(AllocatorCritical(message=message, **self._get_log_context(workflow_id)))

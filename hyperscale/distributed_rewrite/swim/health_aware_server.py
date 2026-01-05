@@ -62,7 +62,7 @@ from .health.health_monitor import EventLoopHealthMonitor
 from .health.graceful_degradation import GracefulDegradation, DegradationLevel
 
 # Failure detection
-from .detection.incarnation_tracker import IncarnationTracker
+from .detection.incarnation_tracker import IncarnationTracker, MessageFreshness
 from .detection.suspicion_state import SuspicionState
 from .detection.suspicion_manager import SuspicionManager
 from .detection.indirect_probe_manager import IndirectProbeManager
@@ -410,7 +410,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         policy = self._degradation.get_current_policy()
         
         # Log TaskOverloadError for severe/critical degradation
-        if new_level.value >= DegradationLevel.SEVERE.value and new_level.value > old_level.value:
+        if new_level.value >= DegradationLevel.CRITICAL.value and new_level.value > old_level.value:
             self._task_runner.run(
                 self.handle_error,
                 TaskOverloadError(
@@ -567,31 +567,46 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     def _build_ack_with_state(self) -> bytes:
         """
-        Build an ack response with embedded state.
-        
+        Build an ack response with embedded state (using self address).
+
         Format: ack>host:port#base64_state (if state available)
                 ack>host:port (if no state)
-        
+
+        Returns:
+            Ack message bytes with optional embedded state.
+        """
+        return self._build_ack_with_state_for_addr(self._udp_addr_slug)
+
+    def _build_ack_with_state_for_addr(self, addr_slug: bytes) -> bytes:
+        """
+        Build an ack response with embedded state for a specific address.
+
+        Format: ack>host:port#base64_state (if state available)
+                ack>host:port (if no state)
+
+        Args:
+            addr_slug: The address slug to include in the ack (e.g., b'127.0.0.1:9000')
+
         Returns:
             Ack message bytes with optional embedded state.
         """
         import base64
-        
-        base_ack = b'ack>' + self._udp_addr_slug
-        
+
+        base_ack = b'ack>' + addr_slug
+
         state = self._get_embedded_state()
         if state is None:
             return base_ack
-        
+
         # Encode state as base64 to avoid byte issues
         encoded_state = base64.b64encode(state)
-        
+
         # Check if adding state would exceed MTU
         full_message = base_ack + self._STATE_SEPARATOR + encoded_state
         if len(full_message) > MAX_UDP_PAYLOAD:
             # State too large, skip it
             return base_ack
-        
+
         return full_message
     
     def _extract_embedded_state(
@@ -1794,19 +1809,71 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         incarnation: int,
         status: Status,
     ) -> bool:
-        """Check if a message about a node should be processed."""
-        is_fresh = self._incarnation_tracker.is_message_fresh(node, incarnation, status)
-        if not is_fresh:
-            # Log stale message for monitoring (don't await since this is sync)
+        """
+        Check if a message about a node should be processed.
+
+        Uses check_message_freshness to get detailed rejection reason,
+        then handles each case appropriately:
+        - FRESH: Process the message
+        - DUPLICATE: Silent ignore (normal in gossip protocols)
+        - STALE: Log as error (may indicate network issues)
+        - INVALID: Log as error (bug or corruption)
+        - SUSPICIOUS: Log as error (possible attack)
+        """
+        freshness = self._incarnation_tracker.check_message_freshness(node, incarnation, status)
+
+        if freshness == MessageFreshness.FRESH:
+            return True
+
+        # Get current state for logging context
+        current_incarnation = self._incarnation_tracker.get_node_incarnation(node)
+        current_state = self._incarnation_tracker.get_node_state(node)
+        current_status = current_state.status.decode() if current_state else "unknown"
+
+        if freshness == MessageFreshness.DUPLICATE:
+            # Duplicates are completely normal in gossip - debug log only, no error handler
             self._task_runner.run(
-                self.handle_error,
-                StaleMessageError(
-                    node,
-                    incarnation,
-                    self._incarnation_tracker.get_node_incarnation(node),
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"[DUPLICATE] {node[0]}:{node[1]} incarnation={incarnation} status={status.decode()} "
+                            f"(current: incarnation={current_incarnation} status={current_status})",
+                    node_host=self._host,
+                    node_port=self._udp_port,
+                    node_id=self._node_id.short,
                 ),
             )
-        return is_fresh
+        elif freshness == MessageFreshness.STALE:
+            # Stale messages may indicate delayed network or state drift
+            self._task_runner.run(
+                self.handle_error,
+                StaleMessageError(node, incarnation, current_incarnation),
+            )
+        elif freshness == MessageFreshness.INVALID:
+            # Invalid incarnation - log as protocol error
+            self._task_runner.run(
+                self.handle_error,
+                ProtocolError(
+                    f"Invalid incarnation {incarnation} from {node[0]}:{node[1]}",
+                    severity=ErrorSeverity.DEGRADED,
+                    node=node,
+                    incarnation=incarnation,
+                ),
+            )
+        elif freshness == MessageFreshness.SUSPICIOUS:
+            # Suspicious jump - possible attack or serious bug
+            self._task_runner.run(
+                self.handle_error,
+                ProtocolError(
+                    f"Suspicious incarnation jump to {incarnation} from {node[0]}:{node[1]} "
+                    f"(current: {current_incarnation})",
+                    severity=ErrorSeverity.DEGRADED,
+                    node=node,
+                    incarnation=incarnation,
+                    current_incarnation=current_incarnation,
+                ),
+            )
+
+        return False
     
     def _make_network_error(
         self,
@@ -2544,8 +2611,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             match msg_type:
                 case b'ack' | b'nack':
                     # ack/nack may or may not have target
+                    # When we receive an ack, mark the SOURCE (addr) as alive
+                    # This is critical for probe responses - the source is the
+                    # node that responded to our probe
+                    nodes: Nodes = self._context.read('nodes')
+                    if addr in nodes:
+                        # Update incarnation tracker to mark the source as alive
+                        self._incarnation_tracker.update_node(addr, b'OK', 0, time.monotonic())
+                        await self.decrease_failure_detector('successful_probe')
                     if target:
-                        nodes: Nodes = self._context.read('nodes')
                         if target not in nodes:
                             await self.increase_failure_detector('missed_nack')
                             return b'nack>' + self._udp_addr_slug
@@ -2664,17 +2738,20 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         
                         if target not in nodes:
                             return b'nack>' + self._udp_addr_slug
-                        
+
                         base_timeout = self._context.read('current_timeout')
                         timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
+                        # Build ack with embedded state for the target
+                        # This enables Serf-style passive state dissemination
+                        ack_with_state = self._build_ack_with_state_for_addr(source_addr.encode())
                         self._task_runner.run(
                             self.send,
                             target,
-                            b'ack>' + source_addr.encode(),
+                            ack_with_state,
                             timeout=timeout,
                         )
-                        
+
                         others = self.get_other_nodes(target)
                         gather_timeout = timeout * 2
                         await self._gather_with_errors(
@@ -2682,8 +2759,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             operation="probe_propagation",
                             timeout=gather_timeout,
                         )
-                            
-                        return b'ack'
+
+                        # Return ack with embedded state to the original sender
+                        return self._build_ack_with_state()
                 
                 case b'xprobe':
                     # Cross-cluster health probe from a gate/manager

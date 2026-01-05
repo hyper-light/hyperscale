@@ -14,11 +14,8 @@ Key responsibilities:
 """
 
 import asyncio
-import logging
 import time
 from typing import Any, Callable, Coroutine
-
-logger = logging.getLogger(__name__)
 
 import cloudpickle
 import networkx
@@ -36,6 +33,15 @@ from hyperscale.distributed_rewrite.jobs.job_manager import (
     TrackingToken,
 )
 from hyperscale.distributed_rewrite.jobs.worker_pool import WorkerPool
+from hyperscale.distributed_rewrite.jobs.logging_models import (
+    DispatcherTrace,
+    DispatcherDebug,
+    DispatcherInfo,
+    DispatcherWarning,
+    DispatcherError,
+    DispatcherCritical,
+)
+from hyperscale.logging import Logger
 
 
 class WorkflowDispatcher:
@@ -89,6 +95,7 @@ class WorkflowDispatcher:
         self._max_dispatch_attempts = max_dispatch_attempts
         self._on_workflow_evicted = on_workflow_evicted
         self._on_dispatch_failed = on_dispatch_failed
+        self._logger = Logger()
 
         # Pending workflows waiting for dependencies/cores
         # Key: f"{job_id}:{workflow_id}"
@@ -165,9 +172,10 @@ class WorkflowDispatcher:
 
             except Exception as e:
                 # Registration failed - job should be marked failed by caller
-                logger.exception(
-                    "Failed to register workflow %s for job %s: %s",
-                    workflow_id, job_id, e
+                await self._log_error(
+                    f"Failed to register workflow {workflow_id} for job {job_id}: {e}",
+                    job_id=job_id,
+                    workflow_id=workflow_id,
                 )
                 return False
 
@@ -485,9 +493,10 @@ class WorkflowDispatcher:
                         await self._worker_pool.release_cores(worker_id, worker_cores)
                         failed_dispatches.append((worker_id, worker_cores))
                 except Exception as e:
-                    logger.warning(
-                        "Exception dispatching to worker %s for workflow %s: %s",
-                        worker_id, pending.workflow_id, e
+                    await self._log_warning(
+                        f"Exception dispatching to worker {worker_id} for workflow {pending.workflow_id}: {e}",
+                        job_id=pending.job_id,
+                        workflow_id=pending.workflow_id,
                     )
                     await self._worker_pool.release_cores(worker_id, worker_cores)
                     failed_dispatches.append((worker_id, worker_cores))
@@ -504,11 +513,11 @@ class WorkflowDispatcher:
                 # PARTIAL success - some dispatches succeeded, some failed
                 # This is still considered a success, but we log the partial failure
                 # The workflow will complete with reduced parallelism
-                logger.warning(
-                    "Partial dispatch for workflow %s: %d/%d workers succeeded",
-                    pending.workflow_id,
-                    len(successful_dispatches),
-                    len(successful_dispatches) + len(failed_dispatches),
+                await self._log_warning(
+                    f"Partial dispatch for workflow {pending.workflow_id}: "
+                    f"{len(successful_dispatches)}/{len(successful_dispatches) + len(failed_dispatches)} workers succeeded",
+                    job_id=pending.job_id,
+                    workflow_id=pending.workflow_id,
                 )
 
             return True
@@ -575,9 +584,10 @@ class WorkflowDispatcher:
                 try:
                     await self._on_workflow_evicted(job_id, workflow_id, reason)
                 except Exception as e:
-                    logger.exception(
-                        "Exception in eviction callback for workflow %s: %s",
-                        workflow_id, e
+                    await self._log_error(
+                        f"Exception in eviction callback for workflow {workflow_id}: {e}",
+                        job_id=job_id,
+                        workflow_id=workflow_id,
                     )
 
         # Call dispatch failed callback outside the lock
@@ -586,9 +596,10 @@ class WorkflowDispatcher:
                 try:
                     await self._on_dispatch_failed(job_id, workflow_id, reason)
                 except Exception as e:
-                    logger.exception(
-                        "Exception in dispatch_failed callback for workflow %s: %s",
-                        workflow_id, e
+                    await self._log_error(
+                        f"Exception in dispatch_failed callback for workflow {workflow_id}: {e}",
+                        job_id=job_id,
+                        workflow_id=workflow_id,
                     )
 
         return evicted + failed
@@ -618,3 +629,42 @@ class WorkflowDispatcher:
             ]
             for key in keys_to_remove:
                 self._pending.pop(key, None)
+
+    # =========================================================================
+    # Logging Helpers
+    # =========================================================================
+
+    def _get_log_context(self, job_id: str = "", workflow_id: str = "") -> dict:
+        """Get common context fields for logging."""
+        return {
+            "manager_id": self._manager_id,
+            "datacenter": self._datacenter,
+            "job_id": job_id,
+            "workflow_id": workflow_id,
+            "pending_count": len(self._pending),
+            "dispatched_count": sum(1 for p in self._pending.values() if p.dispatched),
+        }
+
+    async def _log_trace(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+        """Log a trace-level message."""
+        await self._logger.log(DispatcherTrace(message=message, **self._get_log_context(job_id, workflow_id)))
+
+    async def _log_debug(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+        """Log a debug-level message."""
+        await self._logger.log(DispatcherDebug(message=message, **self._get_log_context(job_id, workflow_id)))
+
+    async def _log_info(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+        """Log an info-level message."""
+        await self._logger.log(DispatcherInfo(message=message, **self._get_log_context(job_id, workflow_id)))
+
+    async def _log_warning(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+        """Log a warning-level message."""
+        await self._logger.log(DispatcherWarning(message=message, **self._get_log_context(job_id, workflow_id)))
+
+    async def _log_error(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+        """Log an error-level message."""
+        await self._logger.log(DispatcherError(message=message, **self._get_log_context(job_id, workflow_id)))
+
+    async def _log_critical(self, message: str, job_id: str = "", workflow_id: str = "") -> None:
+        """Log a critical-level message."""
+        await self._logger.log(DispatcherCritical(message=message, **self._get_log_context(job_id, workflow_id)))
