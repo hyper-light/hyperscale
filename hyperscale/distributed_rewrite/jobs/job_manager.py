@@ -387,7 +387,7 @@ class JobManager:
             self._sub_workflow_to_job[sub_workflow_token_str] = str(job.token)
 
             await self._logger.log(JobManagerError(
-                message=f"[register_sub_workflow] SUCCESS: registered sub_workflow_token={sub_workflow_token_str}, parent={workflow_token_str}",
+                message=f"[register_sub_workflow] SUCCESS: registered sub_workflow_token={sub_workflow_token_str}, parent={workflow_token_str}, JobManager id={id(self)}, _sub_workflow_to_job has {len(self._sub_workflow_to_job)} keys",
                 manager_id=self._manager_id,
                 datacenter=self._datacenter,
                 job_id=job_id,
@@ -461,7 +461,7 @@ class JobManager:
         job = self.get_job_for_sub_workflow(token_str)
         if not job:
             await self._logger.log(JobManagerError(
-                message=f"[record_sub_workflow_result] FAILED: job not found for token={token_str}, _sub_workflow_to_job keys={list(self._sub_workflow_to_job.keys())[:10]}...",
+                message=f"[record_sub_workflow_result] FAILED: job not found for token={token_str}, JobManager id={id(self)}, _sub_workflow_to_job keys={list(self._sub_workflow_to_job.keys())[:10]}...",
                 manager_id=self._manager_id,
                 datacenter=self._datacenter,
                 sub_workflow_token=token_str,
