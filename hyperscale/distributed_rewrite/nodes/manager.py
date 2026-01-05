@@ -98,6 +98,8 @@ from hyperscale.distributed_rewrite.models import (
     ContextLayerSyncAck,
     JobLeadershipAnnouncement,
     JobLeadershipAck,
+    JobStateSyncMessage,
+    JobStateSyncAck,
     ManagerToWorkerRegistration,
     ManagerToWorkerRegistrationAck,
     PingRequest,
@@ -1763,7 +1765,10 @@ class ManagerServer(HealthAwareServer):
         
         # Start background cleanup for completed jobs
         self._task_runner.run(self._job_cleanup_loop)
-        
+
+        # Start periodic job state sync to peer managers
+        self._task_runner.run(self._peer_job_state_sync_loop)
+
         # Register with gates (similar to Worker registering with Managers)
         if self._seed_gates:
             await self._register_with_gates()
@@ -5156,11 +5161,105 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
                 await asyncio.sleep(batch_interval)
-    
+
+    # =========================================================================
+    # Peer Job State Sync
+    # =========================================================================
+
+    async def _peer_job_state_sync_loop(self) -> None:
+        """
+        Background loop for periodic job state sync to peer managers.
+
+        Sends JobStateSyncMessage for each job we lead to all peer managers.
+        This enables faster failover recovery - peers have up-to-date state
+        without needing to request it after leader failure.
+        """
+        sync_interval = self._env.MANAGER_PEER_SYNC_INTERVAL
+
+        while self._running:
+            try:
+                await asyncio.sleep(sync_interval)
+                if not self._running:
+                    break
+                await self._sync_job_state_to_peers()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Peer job state sync loop error: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                await asyncio.sleep(sync_interval)
+
+    async def _sync_job_state_to_peers(self) -> None:
+        """
+        Send job state sync messages to all peer managers for jobs we lead.
+
+        Only syncs jobs where we are the leader to avoid duplicate syncs.
+        """
+        peer_addrs = self._get_active_peer_tcp_addrs()
+        if not peer_addrs:
+            return
+
+        # Get jobs where we are the leader
+        for job in self._job_manager.iter_jobs():
+            job_id = job.job_id
+            if not self._is_job_leader(job_id):
+                continue
+
+            # Build workflow status map
+            workflow_statuses = {
+                wf_info.name: wf_info.status.value
+                for wf_info in job.workflows.values()
+            }
+
+            sync_message = JobStateSyncMessage(
+                leader_id=self._node_id.full,
+                job_id=job_id,
+                status=job.status,
+                fencing_token=self._job_fencing_tokens.get(job_id, 0),
+                workflows_total=job.workflows_total,
+                workflows_completed=job.workflows_completed,
+                workflows_failed=job.workflows_failed,
+                workflow_statuses=workflow_statuses,
+                elapsed_seconds=job.elapsed_seconds(),
+                timestamp=time.monotonic(),
+            )
+
+            # Send to all peers (fire-and-forget, no need to wait for acks)
+            for peer_addr in peer_addrs:
+                self._task_runner.run(
+                    self._send_job_state_sync_to_peer,
+                    peer_addr,
+                    sync_message,
+                )
+
+    async def _send_job_state_sync_to_peer(
+        self,
+        peer_addr: tuple[str, int],
+        sync_message: JobStateSyncMessage,
+    ) -> None:
+        """Send job state sync to a single peer manager."""
+        try:
+            await self.send_tcp(
+                peer_addr,
+                "job_state_sync",
+                sync_message.dump(),
+                timeout=2.0,
+            )
+        except Exception:
+            # Fire-and-forget - don't log every failure
+            pass
+
     # =========================================================================
     # Workflow Failure Retry Logic
     # =========================================================================
-    
+
     async def _handle_workflow_failure(
         self,
         progress: WorkflowProgress,
@@ -6113,6 +6212,61 @@ class ManagerServer(HealthAwareServer):
 
         except Exception as e:
             await self.handle_exception(e, "job_leadership_announcement")
+            return b'error'
+
+    @tcp.receive()
+    async def job_state_sync(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle job state sync from job leader.
+
+        Periodic sync from job leaders to keep non-leaders informed about
+        job progress. This enables faster failover - non-leaders already
+        have recent state when they need to take over.
+        """
+        try:
+            sync_msg = JobStateSyncMessage.load(data)
+
+            # Only accept from actual job leader
+            current_leader = self._job_leaders.get(sync_msg.job_id)
+            if current_leader and current_leader != sync_msg.leader_id:
+                # Different leader than expected - might be stale
+                ack = JobStateSyncAck(
+                    job_id=sync_msg.job_id,
+                    responder_id=self._node_id.full,
+                    accepted=False,
+                )
+                return ack.dump()
+
+            # Update our tracking of this job's state
+            # This helps with faster failover if the leader dies
+            job = self._job_manager.get_job_by_id(sync_msg.job_id)
+            if job:
+                # Update job-level stats (don't overwrite local workflows)
+                job.status = sync_msg.status
+                job.workflows_total = sync_msg.workflows_total
+                job.workflows_completed = sync_msg.workflows_completed
+                job.workflows_failed = sync_msg.workflows_failed
+                job.timestamp = time.monotonic()
+
+            # Update fencing token if higher (ensures consistency)
+            current_token = self._job_fencing_tokens.get(sync_msg.job_id, 0)
+            if sync_msg.fencing_token > current_token:
+                self._job_fencing_tokens[sync_msg.job_id] = sync_msg.fencing_token
+
+            ack = JobStateSyncAck(
+                job_id=sync_msg.job_id,
+                responder_id=self._node_id.full,
+                accepted=True,
+            )
+            return ack.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "job_state_sync")
             return b'error'
 
     # =========================================================================

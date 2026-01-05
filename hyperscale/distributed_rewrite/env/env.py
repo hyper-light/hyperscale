@@ -88,6 +88,7 @@ class Env(BaseModel):
     MANAGER_STATE_SYNC_RETRIES: StrictInt = 3  # Number of retries for state sync
     MANAGER_DISPATCH_CORE_WAIT_TIMEOUT: StrictFloat = 5.0  # Max seconds to wait per iteration for cores
     MANAGER_HEARTBEAT_INTERVAL: StrictFloat = 5.0  # Seconds between manager heartbeats to gates
+    MANAGER_PEER_SYNC_INTERVAL: StrictFloat = 10.0  # Seconds between job state sync to peer managers
 
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
@@ -150,6 +151,7 @@ class Env(BaseModel):
             "MANAGER_STATE_SYNC_RETRIES": int,
             "MANAGER_DISPATCH_CORE_WAIT_TIMEOUT": float,
             "MANAGER_HEARTBEAT_INTERVAL": float,
+            "MANAGER_PEER_SYNC_INTERVAL": float,
         }
     
     def get_swim_init_context(self) -> dict:

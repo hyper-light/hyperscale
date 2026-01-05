@@ -737,6 +737,40 @@ class JobLeadershipAck(Message):
     responder_id: str            # Node ID of responder
 
 
+@dataclass(slots=True)
+class JobStateSyncMessage(Message):
+    """
+    Periodic job state sync from job leader to peer managers.
+
+    Sent every MANAGER_PEER_SYNC_INTERVAL seconds to ensure peer managers
+    have up-to-date job state for faster failover recovery. Contains summary
+    info that allows non-leaders to serve read queries and prepare for takeover.
+
+    This supplements SWIM heartbeat embedding (which has limited capacity)
+    with richer job metadata.
+    """
+    leader_id: str               # Node ID of the job leader
+    job_id: str                  # Job identifier
+    status: str                  # Current JobStatus value
+    fencing_token: int           # Current fencing token for consistency
+    workflows_total: int         # Total workflows in job
+    workflows_completed: int     # Completed workflow count
+    workflows_failed: int        # Failed workflow count
+    workflow_statuses: dict[str, str] = field(default_factory=dict)  # workflow_id -> status
+    elapsed_seconds: float = 0.0  # Time since job started
+    timestamp: float = 0.0       # When this sync was generated
+
+
+@dataclass(slots=True)
+class JobStateSyncAck(Message):
+    """
+    Acknowledgment of job state sync.
+    """
+    job_id: str                  # Job being acknowledged
+    responder_id: str            # Node ID of responder
+    accepted: bool = True        # Whether sync was applied
+
+
 # =============================================================================
 # Client Push Notifications
 # =============================================================================

@@ -60,6 +60,9 @@ from .distributed import (
     # Job leadership (per-job leader tracking)
     JobLeadershipAnnouncement as JobLeadershipAnnouncement,
     JobLeadershipAck as JobLeadershipAck,
+    # Job state sync (periodic leader -> peer sync)
+    JobStateSyncMessage as JobStateSyncMessage,
+    JobStateSyncAck as JobStateSyncAck,
     # Client push notifications
     JobStatusPush as JobStatusPush,
     DCStats as DCStats,
