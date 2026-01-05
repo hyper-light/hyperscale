@@ -5950,7 +5950,7 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         """
         Dispatch workflows respecting dependencies and resource constraints.
-        
+
         Builds a DAG from DependentWorkflow dependencies and dispatches
         in topological order (layer by layer). Workflows in the same layer
         can run in parallel, but dependent workflows wait for their
@@ -5958,7 +5958,7 @@ class ManagerServer(HealthAwareServer):
         """
 
         try:
-            
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
@@ -5968,11 +5968,46 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            
+
+            # =================================================================
+            # Register workflows with WorkflowDispatcher (new system)
+            # =================================================================
+            if self._workflow_dispatcher:
+                registered = await self._workflow_dispatcher.register_workflows(
+                    submission, workflows
+                )
+                if registered:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Registered {len(workflows)} workflows with WorkflowDispatcher for job {submission.job_id}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    # Try initial dispatch via WorkflowDispatcher
+                    dispatched = await self._workflow_dispatcher.try_dispatch(
+                        submission.job_id, submission
+                    )
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"WorkflowDispatcher initial dispatch: {dispatched} workflows dispatched",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            # =================================================================
+            # Legacy dispatch logic (kept during migration)
+            # =================================================================
+
             job = self._jobs.get(submission.job_id)
             if not job:
                 return
-            
+
             job.status = JobStatus.DISPATCHING.value
             self._increment_version()
             
