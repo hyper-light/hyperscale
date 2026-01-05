@@ -122,8 +122,8 @@ class WorkerPool:
                 registration=registration,
                 health=WorkerHealth.UNKNOWN,
                 last_seen=time.monotonic(),
-                total_cores=registration.node.cores or 0,
-                available_cores=registration.node.cores or 0,
+                total_cores=registration.total_cores or 0,
+                available_cores=registration.available_cores or 0,
             )
 
             self._workers[node_id] = worker
