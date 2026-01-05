@@ -981,8 +981,8 @@ class ManagerServer(HealthAwareServer):
         """
         worker_addr = (worker_snapshot.host, worker_snapshot.tcp_port)
 
-        # Don't re-register if we already know this worker
-        if worker_snapshot.node_id in self._workers:
+        # Don't re-register if we already know this worker (check WorkerPool)
+        if self._worker_pool.get_worker(worker_snapshot.node_id) is not None:
             return
 
         try:
@@ -1012,7 +1012,6 @@ class ManagerServer(HealthAwareServer):
             if response and isinstance(response, bytes) and response != b'error':
                 ack = ManagerToWorkerRegistrationAck.load(response)
                 if ack.accepted:
-
                     # Use data from the worker's response, not the snapshot
                     # This ensures we have accurate, up-to-date info from the worker
                     worker_reg = WorkerRegistration(
@@ -1028,18 +1027,8 @@ class ManagerServer(HealthAwareServer):
                         available_memory_mb=0,
                     )
 
-                    self._workers[ack.worker_id] = worker_reg
-                    self._worker_addr_to_id[worker_addr] = ack.worker_id
-                    self._worker_last_status[ack.worker_id] = time.monotonic()
-
-                    # Create initial status using response data
-                    self._worker_status[ack.worker_id] = WorkerHeartbeat(
-                        node_id=ack.worker_id,
-                        state=WorkerState.HEALTHY.value,
-                        available_cores=ack.available_cores,
-                        active_workflows={},
-                        version=0,
-                    )
+                    # Register with WorkerPool
+                    await self._worker_pool.register_worker(worker_reg)
 
                     self._task_runner.run(
                         self._udp_logger.log,
