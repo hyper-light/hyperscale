@@ -3597,9 +3597,37 @@ class ManagerServer(HealthAwareServer):
         try:
             progress = WorkflowProgress.load(data)
 
-            print(progress.workflow_name)
+            # =================================================================
+            # Forward to job leader if we're not the leader
+            # =================================================================
+            # Progress updates should be processed by the job leader who has the state
+            if not self._is_job_leader(progress.job_id):
+                leader_addr = self._get_job_leader_addr(progress.job_id)
+                if leader_addr:
+                    try:
+                        response, _ = await self.send_tcp(
+                            leader_addr,
+                            "workflow_progress",
+                            data,  # Forward the raw data
+                            timeout=2.0,
+                        )
+                        return response if response else b'ok'
+                    except Exception:
+                        pass  # Fall through to process locally as best effort
+                # Fall through - maybe we have the job locally anyway
+
             # Check if this is a sub-workflow (dispatched to multiple workers)
             parent_workflow_id = self._get_parent_workflow_id(progress.workflow_id)
+
+            # Log progress for debugging
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"[workflow_progress] Processing: workflow_id={progress.workflow_id} status={progress.status}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
             if parent_workflow_id is not None:
                 # This is a sub-workflow - update SubWorkflowInfo.progress in JobManager
@@ -3918,20 +3946,23 @@ class ManagerServer(HealthAwareServer):
                         if self._known_gates or self._gate_addrs:
                             self._task_runner.run(self._send_job_progress_to_gate, job)
 
-                        # Notify WorkflowDispatcher of completion for dependency tracking
-                        # This is critical for dependency-based execution - when a workflow completes OR FAILS,
-                        # dependent workflows may now be ready to run (or should be notified of failure)
-                        if self._workflow_dispatcher and result.status in (
-                            WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value
-                        ):
-                            await self._workflow_dispatcher.mark_workflow_completed(
-                                jm_job_id, jm_workflow_id
-                            )
-                            # Try to dispatch newly ready workflows
-                            submission = self._job_submissions.get(jm_job_id)
-                            if submission:
-                                await self._workflow_dispatcher.try_dispatch(
-                                    jm_job_id, submission
+                        # Notify WorkflowDispatcher of completion/failure for dependency tracking
+                        if self._workflow_dispatcher:
+                            if result.status == WorkflowStatus.COMPLETED.value:
+                                # Workflow completed successfully - notify dependents
+                                await self._workflow_dispatcher.mark_workflow_completed(
+                                    jm_job_id, jm_workflow_id
+                                )
+                                # Try to dispatch newly ready workflows
+                                submission = self._job_submissions.get(jm_job_id)
+                                if submission:
+                                    await self._workflow_dispatcher.try_dispatch(
+                                        jm_job_id, submission
+                                    )
+                            elif result.status == WorkflowStatus.FAILED.value:
+                                # Workflow failed - fail all dependents
+                                await self._workflow_dispatcher.mark_workflow_failed(
+                                    jm_job_id, jm_workflow_id
                                 )
 
                 # Check if job is complete

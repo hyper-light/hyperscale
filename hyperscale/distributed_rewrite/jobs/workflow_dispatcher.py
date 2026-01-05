@@ -258,7 +258,7 @@ class WorkflowDispatcher:
         workflow_id: str,
     ) -> None:
         """
-        Mark a workflow as completed and update dependents.
+        Mark a workflow as completed successfully and update dependents.
 
         Called when a workflow completes successfully. Updates
         all pending workflows that depend on this one and signals
@@ -277,6 +277,49 @@ class WorkflowDispatcher:
                     pending.completed_dependencies.add(workflow_id)
                     # Check if this workflow is now ready and signal if so
                     pending.check_and_signal_ready()
+
+    async def mark_workflow_failed(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> list[str]:
+        """
+        Mark a workflow as failed and fail all dependents.
+
+        When a workflow fails, all workflows that depend on it (directly or
+        transitively) cannot execute and should be marked as failed.
+
+        Returns list of workflow_ids that were failed as a result.
+        """
+        failed_workflows: list[str] = []
+
+        async with self._pending_lock:
+            # Find all workflows that depend on the failed one (directly or transitively)
+            to_fail: set[str] = set()
+            queue = [workflow_id]
+
+            while queue:
+                failed_wf_id = queue.pop(0)
+                for key, pending in self._pending.items():
+                    if pending.job_id != job_id:
+                        continue
+                    if failed_wf_id in pending.dependencies and pending.workflow_id not in to_fail:
+                        to_fail.add(pending.workflow_id)
+                        queue.append(pending.workflow_id)
+
+            # Mark all dependent workflows as failed by setting max_dispatch_attempts
+            # This prevents them from ever being dispatched
+            for key in list(self._pending.keys()):
+                pending = self._pending.get(key)
+                if not pending or pending.job_id != job_id:
+                    continue
+                if pending.workflow_id in to_fail:
+                    # Mark as exhausted so it won't dispatch
+                    pending.dispatch_attempts = pending.max_dispatch_attempts
+                    pending.clear_ready()
+                    failed_workflows.append(pending.workflow_id)
+
+        return failed_workflows
 
     # =========================================================================
     # Eager Dispatch
