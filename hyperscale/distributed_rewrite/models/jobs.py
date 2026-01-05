@@ -18,7 +18,7 @@ class PendingWorkflow:
 
     Used by WorkflowDispatcher to track workflows that are registered
     but not yet dispatched to workers. Tracks dependency completion,
-    dispatch state, and timeout for eviction.
+    dispatch state, timeout for eviction, and retry state.
     """
     job_id: str
     workflow_id: str
@@ -39,3 +39,9 @@ class PendingWorkflow:
 
     # Dispatch attempt tracking (for the dispatch flag race fix)
     dispatch_in_progress: bool = False   # True while async dispatch is in progress
+
+    # Retry tracking with exponential backoff
+    dispatch_attempts: int = 0           # Number of dispatch attempts
+    last_dispatch_attempt: float = 0.0   # time.monotonic() of last attempt
+    next_retry_delay: float = 1.0        # Seconds until next retry allowed
+    max_dispatch_attempts: int = 5       # Max retries before marking failed

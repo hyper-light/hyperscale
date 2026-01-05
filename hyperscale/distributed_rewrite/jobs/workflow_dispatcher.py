@@ -43,6 +43,11 @@ class WorkflowDispatcher:
     for resource allocation. Handles dependency-based eager dispatch.
     """
 
+    # Exponential backoff constants
+    INITIAL_RETRY_DELAY = 1.0  # seconds
+    MAX_RETRY_DELAY = 60.0     # seconds
+    BACKOFF_MULTIPLIER = 2.0   # double delay each retry
+
     def __init__(
         self,
         job_manager: JobManager,
@@ -51,7 +56,9 @@ class WorkflowDispatcher:
         datacenter: str,
         manager_id: str,
         default_timeout_seconds: float = 300.0,
+        max_dispatch_attempts: int = 5,
         on_workflow_evicted: Callable[[str, str, str], Coroutine[Any, Any, None]] | None = None,
+        on_dispatch_failed: Callable[[str, str, str], Coroutine[Any, Any, None]] | None = None,
     ):
         """
         Initialize WorkflowDispatcher.
@@ -64,7 +71,10 @@ class WorkflowDispatcher:
             datacenter: Datacenter identifier
             manager_id: This manager's node ID
             default_timeout_seconds: Default timeout for workflows (can be overridden per-job)
+            max_dispatch_attempts: Max dispatch retries before marking workflow failed
             on_workflow_evicted: Optional callback when a workflow is evicted due to timeout
+                               Takes (job_id, workflow_id, reason) and is awaited
+            on_dispatch_failed: Optional callback when dispatch permanently fails after retries
                                Takes (job_id, workflow_id, reason) and is awaited
         """
         self._job_manager = job_manager
@@ -73,7 +83,9 @@ class WorkflowDispatcher:
         self._datacenter = datacenter
         self._manager_id = manager_id
         self._default_timeout_seconds = default_timeout_seconds
+        self._max_dispatch_attempts = max_dispatch_attempts
         self._on_workflow_evicted = on_workflow_evicted
+        self._on_dispatch_failed = on_dispatch_failed
 
         # Pending workflows waiting for dependencies/cores
         # Key: f"{job_id}:{workflow_id}"
@@ -173,6 +185,8 @@ class WorkflowDispatcher:
                     dependencies=dependencies,
                     registered_at=now,
                     timeout_seconds=timeout,
+                    next_retry_delay=self.INITIAL_RETRY_DELAY,
+                    max_dispatch_attempts=self._max_dispatch_attempts,
                 )
 
         return True
@@ -283,6 +297,7 @@ class WorkflowDispatcher:
 
     def _get_ready_workflows(self, job_id: str) -> list[PendingWorkflow]:
         """Get workflows ready for dispatch (dependencies satisfied, not dispatched)."""
+        now = time.monotonic()
         ready = []
         for key, pending in self._pending.items():
             if pending.job_id != job_id:
@@ -291,6 +306,17 @@ class WorkflowDispatcher:
                 continue
             if pending.dispatch_in_progress:
                 continue  # Skip workflows with dispatch already in progress
+
+            # Check if we've exceeded max retries
+            if pending.dispatch_attempts >= pending.max_dispatch_attempts:
+                continue  # Will be cleaned up by check_timeouts or explicit failure handling
+
+            # Check retry backoff - if we failed before, wait for backoff period
+            if pending.dispatch_attempts > 0:
+                time_since_last_attempt = now - pending.last_dispatch_attempt
+                if time_since_last_attempt < pending.next_retry_delay:
+                    continue  # Still in backoff period
+
             # Check if all dependencies are satisfied
             if pending.dependencies <= pending.completed_dependencies:
                 ready.append(pending)
@@ -364,6 +390,9 @@ class WorkflowDispatcher:
         - Only set dispatched=True AFTER successful allocation
         - Clear flag on failure so workflow can be retried
 
+        On failure, increments dispatch_attempts and applies exponential backoff.
+        After max_dispatch_attempts, the workflow is marked as permanently failed.
+
         Returns True if dispatch succeeded.
         """
         # Mark dispatch in progress (atomic check-and-set would be better but
@@ -373,14 +402,19 @@ class WorkflowDispatcher:
         pending.dispatch_in_progress = True
 
         try:
+            # Track this dispatch attempt
+            pending.dispatch_attempts += 1
+            pending.last_dispatch_attempt = time.monotonic()
+
             # Allocate cores from worker pool
             allocations = await self._worker_pool.allocate_cores(
                 cores_needed,
-                timeout=submission.timeout_seconds,
+                timeout=min(submission.timeout_seconds, 30.0),  # Don't wait too long for allocation
             )
 
             if not allocations:
-                # No cores available - keep workflow eligible for future dispatch
+                # No cores available - apply backoff and allow retry
+                self._apply_backoff(pending)
                 return False
 
             # Allocation succeeded - NOW mark as dispatched
@@ -443,10 +477,11 @@ class WorkflowDispatcher:
                 except Exception:
                     await self._worker_pool.release_cores(worker_id, worker_cores)
 
-            # If ALL dispatches failed, revert dispatch status so it can be retried
+            # If ALL dispatches failed, revert dispatch status and apply backoff
             if successful == 0:
                 pending.dispatched = False
                 pending.dispatched_at = 0.0
+                self._apply_backoff(pending)
 
             return successful > 0
 
@@ -454,23 +489,32 @@ class WorkflowDispatcher:
             # Always clear the in-progress flag
             pending.dispatch_in_progress = False
 
+    def _apply_backoff(self, pending: PendingWorkflow) -> None:
+        """Apply exponential backoff after a failed dispatch attempt."""
+        # Double the delay for next retry, capped at MAX_RETRY_DELAY
+        pending.next_retry_delay = min(
+            pending.next_retry_delay * self.BACKOFF_MULTIPLIER,
+            self.MAX_RETRY_DELAY,
+        )
+
     # =========================================================================
     # Timeout and Eviction
     # =========================================================================
 
     async def check_timeouts(self) -> list[tuple[str, str, str]]:
         """
-        Check for timed-out workflows and evict them.
+        Check for timed-out workflows and workflows that exceeded max retries.
 
         Should be called periodically (e.g., every 30 seconds) by the manager.
 
-        Returns list of (job_id, workflow_id, reason) for evicted workflows.
+        Returns list of (job_id, workflow_id, reason) for evicted/failed workflows.
         """
         now = time.monotonic()
         evicted: list[tuple[str, str, str]] = []
+        failed: list[tuple[str, str, str]] = []
 
         async with self._pending_lock:
-            keys_to_evict = []
+            keys_to_remove = []
 
             for key, pending in self._pending.items():
                 # Check for timeout based on registration time
@@ -481,12 +525,21 @@ class WorkflowDispatcher:
                         reason = f"Dispatched workflow timed out after {age:.1f}s"
                     else:
                         reason = f"Pending workflow timed out after {age:.1f}s"
-                    keys_to_evict.append((key, pending.job_id, pending.workflow_id, reason))
+                    keys_to_remove.append((key, pending.job_id, pending.workflow_id, reason, "evicted"))
+                    continue
 
-            # Remove evicted workflows
-            for key, job_id, workflow_id, reason in keys_to_evict:
+                # Check for exceeded max retries
+                if pending.dispatch_attempts >= pending.max_dispatch_attempts and not pending.dispatched:
+                    reason = f"Dispatch failed after {pending.dispatch_attempts} attempts"
+                    keys_to_remove.append((key, pending.job_id, pending.workflow_id, reason, "failed"))
+
+            # Remove workflows
+            for key, job_id, workflow_id, reason, failure_type in keys_to_remove:
                 self._pending.pop(key, None)
-                evicted.append((job_id, workflow_id, reason))
+                if failure_type == "evicted":
+                    evicted.append((job_id, workflow_id, reason))
+                else:
+                    failed.append((job_id, workflow_id, reason))
 
         # Call eviction callback outside the lock
         if self._on_workflow_evicted:
@@ -496,7 +549,15 @@ class WorkflowDispatcher:
                 except Exception:
                     pass  # Don't let callback failures propagate
 
-        return evicted
+        # Call dispatch failed callback outside the lock
+        if self._on_dispatch_failed:
+            for job_id, workflow_id, reason in failed:
+                try:
+                    await self._on_dispatch_failed(job_id, workflow_id, reason)
+                except Exception:
+                    pass  # Don't let callback failures propagate
+
+        return evicted + failed
 
     def get_pending_count(self, job_id: str | None = None) -> int:
         """Get count of pending workflows (optionally filtered by job_id)."""
