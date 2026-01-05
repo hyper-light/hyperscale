@@ -1088,7 +1088,7 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         """
         Handle WorkerHeartbeat received via SWIM message embedding.
-        
+
         Uses versioned clock to reject stale updates - if the incoming
         heartbeat has a version <= our tracked version, it's discarded.
         """
@@ -1096,11 +1096,24 @@ class ManagerServer(HealthAwareServer):
         if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
             # Stale update - discard
             return
-        
+
+        # =================================================================
+        # Process heartbeat in WorkerPool (new system)
+        # =================================================================
+        self._task_runner.run(
+            self._worker_pool.process_heartbeat,
+            heartbeat.node_id,
+            heartbeat,
+        )
+
+        # =================================================================
+        # Legacy tracking (kept during migration)
+        # =================================================================
+
         # Accept update
         self._worker_status[heartbeat.node_id] = heartbeat
         self._worker_last_status[heartbeat.node_id] = time.monotonic()
-        
+
         # Update version tracking (fire-and-forget, no await needed for sync operation)
         # We track the worker's version so future updates with same/lower version are rejected
         self._task_runner.run(
@@ -3521,14 +3534,32 @@ class ManagerServer(HealthAwareServer):
         """Handle worker registration via TCP."""
         try:
             registration = WorkerRegistration.load(data)
-            
+
+            # =================================================================
+            # Register with WorkerPool (new system)
+            # =================================================================
+            worker_info = await self._worker_pool.register_worker(registration)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Worker registered in WorkerPool: {worker_info.node_id} ({worker_info.total_cores} cores)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # =================================================================
+            # Legacy tracking (kept during migration)
+            # =================================================================
+
             # Store registration
             self._workers[registration.node.node_id] = registration
             # Maintain reverse mapping for O(1) address -> node_id lookups
             worker_addr = (registration.node.host, registration.node.port)
             self._worker_addr_to_id[worker_addr] = registration.node.node_id
             self._worker_last_status[registration.node.node_id] = time.monotonic()
-            
+
             # Create initial worker status with all cores available
             # This prevents race condition where SWIM hasn't exchanged heartbeats yet
             # SWIM updates will overwrite this with real status as they arrive
