@@ -180,13 +180,6 @@ class JobManager:
 
             self._jobs[job_token_str] = job
 
-            await self._logger.log(JobManagerError(
-                message=f"[create_job] SUCCESS: created job_token={job_token_str}, job_id={submission.job_id}, JobManager id={id(self)}",
-                manager_id=self._manager_id,
-                datacenter=self._datacenter,
-                job_id=submission.job_id,
-            ))
-
             return job
 
     async def track_remote_job(
@@ -323,14 +316,6 @@ class JobManager:
             # Update job progress
             job.workflows_total = len(job.workflows)
 
-            await self._logger.log(JobManagerError(
-                message=f"[register_workflow] SUCCESS: registered workflow_token={workflow_token_str}, name={name}",
-                manager_id=self._manager_id,
-                datacenter=self._datacenter,
-                job_id=job_id,
-                workflow_id=workflow_id,
-            ))
-
             return info
 
     async def register_sub_workflow(
@@ -386,15 +371,6 @@ class JobManager:
             parent.sub_workflow_tokens.append(sub_workflow_token_str)
             self._sub_workflow_to_job[sub_workflow_token_str] = str(job.token)
 
-            await self._logger.log(JobManagerError(
-                message=f"[register_sub_workflow] SUCCESS: registered sub_workflow_token={sub_workflow_token_str}, parent={workflow_token_str}, JobManager id={id(self)}, _sub_workflow_to_job has {len(self._sub_workflow_to_job)} keys",
-                manager_id=self._manager_id,
-                datacenter=self._datacenter,
-                job_id=job_id,
-                workflow_id=workflow_id,
-                sub_workflow_token=sub_workflow_token_str,
-            ))
-
             # Mark parent as dispatched (assigned)
             if parent.status == WorkflowStatus.PENDING:
                 parent.status = WorkflowStatus.ASSIGNED
@@ -428,8 +404,6 @@ class JobManager:
                 return False
 
             sub_wf.progress = progress
-
-            print(progress.status, progress.workflow_name)
 
             # Update parent workflow state using state machine (prevents regression)
             parent_token_str = str(sub_wf.parent_token)
@@ -481,14 +455,6 @@ class JobManager:
                 return False, False
 
             sub_wf.result = result
-            await self._logger.log(JobManagerError(
-                message=f"[record_sub_workflow_result] SUCCESS: recorded result for token={token_str}",
-                manager_id=self._manager_id,
-                datacenter=self._datacenter,
-                job_id=job.job_id,
-                sub_workflow_token=token_str,
-            ))
-
             # Check if all sub-workflows for parent are complete
             parent_token_str = str(sub_wf.parent_token)
             parent = job.workflows.get(parent_token_str)

@@ -123,11 +123,10 @@ class WorkerServer(HealthAwareServer):
         udp_port: int,
         env: Env,
         dc_id: str = "default",
-        total_cores: int | None = None,
         seed_managers: list[tuple[str, int]] | None = None,
     ):
         # Core capacity (set before super().__init__ so state embedder can access it)
-        self._total_cores = total_cores or self._get_os_cpus() or 1
+        self._total_cores = env.WORKER_MAX_CORES or self._get_os_cpus() or 1
 
         # Core allocator for thread-safe core management
         # Uses composition to encapsulate all core allocation logic
@@ -357,18 +356,6 @@ class WorkerServer(HealthAwareServer):
             "healthy_managers": len(self._healthy_manager_ids),
             "primary_manager": self._primary_manager_id,
         }
-    
-    def _get_system_stats(self):
-        return (
-            self._cpu_monitor.get_moving_avg(
-                self._node_id.datacenter,
-                self._node_id.full,
-            ),
-            self._memory_monitor.get_moving_avg(
-                self._node_id.datacenter,
-                self._node_id.full,
-            ),
-        )
     
     async def start(self, timeout: float | None = None) -> None:
 
@@ -1234,7 +1221,7 @@ class WorkerServer(HealthAwareServer):
                 job_id=dispatch.job_id,
                 workflow_id=dispatch.workflow_id,
                 workflow_name="",
-                status=WorkflowStatus.ASSIGNED.value,
+                status=WorkflowStatus.RUNNING.value,
                 completed_count=0,
                 failed_count=0,
                 rate_per_second=0.0,
@@ -1337,7 +1324,7 @@ class WorkerServer(HealthAwareServer):
                 # Execute the workflow
  
                 (
-                    results_run_id,
+                    _,
                     workflow_results,
                     context,
                     error,
@@ -1460,6 +1447,7 @@ class WorkerServer(HealthAwareServer):
         """Monitor workflow progress and send updates to manager."""
         start_time = time.monotonic()
         workflow_name = progress.workflow_name
+
         
         while not cancel_event.is_set():
             try:
@@ -1474,8 +1462,14 @@ class WorkerServer(HealthAwareServer):
                 
                 # Get system stats
                 avg_cpu, avg_mem = (
-                    await self._cpu_monitor.get_moving_avg(),
-                    await self._memory_monitor.get_moving_avg(),
+                    self._cpu_monitor.get_moving_avg(
+                        run_id,
+                        progress.workflow_name,
+                    ),
+                    self._memory_monitor.get_moving_avg(
+                        run_id,
+                        progress.workflow_name,
+                    ),
                 )
                 
                 # Update progress
@@ -1546,8 +1540,15 @@ class WorkerServer(HealthAwareServer):
                 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as err:
+                await self._udp_logger.log(
+                    ServerError(
+                        node_host=self._host,
+                        node_port=self._udp_port,
+                        node_id=self._node_id.full,
+                        message=f'Encountered Update Error: {str(err)} for workflow: {progress.workflow_name} workflow id: {progress.workflow_id}'
+                    )
+                )
     
     async def _send_progress_update(
         self,
@@ -1754,8 +1755,6 @@ class WorkerServer(HealthAwareServer):
                         timeout=5.0,  # Longer timeout for final results
                     )
 
-                    print(response)
-
                     if response and isinstance(response, bytes) and response != b'error':
                         circuit.record_success()
                         self._task_runner.run(
@@ -1770,8 +1769,6 @@ class WorkerServer(HealthAwareServer):
                         return  # Success
 
                 except Exception as e:
-                    import traceback
-                    print(traceback.format_exc())
                     await self._udp_logger.log(
                         ServerError(
                             message=f"Failed to send final result for {final_result.workflow_id} attempt {attempt+1}: {e}",

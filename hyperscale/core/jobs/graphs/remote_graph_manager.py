@@ -524,6 +524,7 @@ class RemoteGraphManager:
 
                 if is_test_workflow is False:
                     threads = self._threads # We do this to ensure *every* local worker node gets the update
+                    workflow_vus = [workflow.vus for _ in range(threads)]
                     await ctx.log_prepared(
                         message=f"Non-test Workflow {workflow.name} now using 1 workers",
                         name="trace",
@@ -644,30 +645,6 @@ class RemoteGraphManager:
 
                 await update_workflow_executions_total_rate(workflow_slug, None, False)
 
-
-                if skip_reporting:
-
-                    updated_context = await self._provide_context(
-                        workflow.name,
-                        state_actions,
-                        run_context,
-                        execution_result,
-                    )
-
-                    await self._controller.update_context(
-                        run_id,
-                        updated_context,
-                    )
-
-                    self._provisioner.release(threads)
-
-                    return  (
-                        workflow.name,
-                        results,
-                        updated_context,
-                        timeout_error,
-                    )
-
                 await ctx.log_prepared(
                     message=f"Processing {len(results)} results sets for Workflow {workflow.name} run {run_id}",
                     name="debug",
@@ -690,7 +667,7 @@ class RemoteGraphManager:
                 elif is_test_workflow is False and len(results) > 1:
                     _, execution_result = list(
                         sorted(
-                            results,
+                            list(enumerate(results)),
                             key=lambda result: result[0],
                             reverse=True,
                         )
@@ -723,6 +700,16 @@ class RemoteGraphManager:
                     run_id,
                     updated_context,
                 )
+
+                if skip_reporting:
+                    self._provisioner.release(threads)
+
+                    return (
+                        workflow.name,
+                        results,
+                        updated_context,
+                        timeout_error,
+                    )
 
                 await ctx.log_prepared(
                     message=f"Submitting results to reporters for Workflow {workflow.name} run {run_id}",

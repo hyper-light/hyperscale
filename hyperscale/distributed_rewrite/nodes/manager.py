@@ -3608,7 +3608,7 @@ class ManagerServer(HealthAwareServer):
                         response, _ = await self.send_tcp(
                             leader_addr,
                             "workflow_progress",
-                            data,  # Forward the raw data
+                            progress,  # Forward
                             timeout=2.0,
                         )
                         return response if response else b'ok'
@@ -3618,16 +3618,6 @@ class ManagerServer(HealthAwareServer):
 
             # Check if this is a sub-workflow (dispatched to multiple workers)
             parent_workflow_id = self._get_parent_workflow_id(progress.workflow_id)
-
-            # Log progress for debugging
-            await self._udp_logger.log(
-                ServerError(
-                    message=f"[workflow_progress] Processing: workflow_id={progress.workflow_id} status={progress.status}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
 
             if parent_workflow_id is not None:
                 # This is a sub-workflow - update SubWorkflowInfo.progress in JobManager
@@ -3738,8 +3728,6 @@ class ManagerServer(HealthAwareServer):
             return ack.dump()
             
         except Exception as e:
-            import traceback
-            print(traceback.format_exc())
             await self.handle_exception(e, "receive_workflow_progress")
             return b'error'
     
@@ -3766,15 +3754,6 @@ class ManagerServer(HealthAwareServer):
         try:
             result = WorkflowFinalResult.load(data)
 
-            await self._udp_logger.log(
-                ServerError(
-                    message=f"[workflow_final_result] RECEIVED: workflow_id={result.workflow_id} status={result.status}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-
             # =================================================================
             # Forward to job leader if we're not the leader
             # =================================================================
@@ -3784,7 +3763,7 @@ class ManagerServer(HealthAwareServer):
                 leader_addr = self._get_job_leader_addr(result.job_id)
                 if leader_addr:
                     await self._udp_logger.log(
-                        ServerError(
+                        ServerInfo(
                             message=f"[workflow_final_result] Forwarding to job leader at {leader_addr} (we are not leader for job {result.job_id})",
                             node_host=self._host,
                             node_port=self._tcp_port,
@@ -3871,15 +3850,9 @@ class ManagerServer(HealthAwareServer):
                             self._workflow_dispatcher.signal_cores_available()
 
                 # Store final result in JobManager first
-                recorded, parent_complete = await self._job_manager.record_sub_workflow_result(result.workflow_id, result)
-                await self._udp_logger.log(
-                    ServerError(
-                        message=f"[workflow_final_result] record_sub_workflow_result returned: recorded={recorded}, parent_complete={parent_complete}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
+                recorded, _ = await self._job_manager.record_sub_workflow_result(result.workflow_id, result)
+                if not recorded:
+                    return b'error'
 
                 if parent_workflow_id is not None:
                     # This is a sub-workflow - check if parent is complete
@@ -3932,7 +3905,7 @@ class ManagerServer(HealthAwareServer):
                                 new_status = WorkflowStatus(result.status)
                                 wf_info.status = new_status
                                 await self._udp_logger.log(
-                                    ServerError(
+                                    ServerInfo(
                                         message=f"Updated workflow status: {jm_workflow_id} -> {result.status}",
                                         node_host=self._host,
                                         node_port=self._tcp_port,
@@ -4358,8 +4331,6 @@ class ManagerServer(HealthAwareServer):
             )
 
         except Exception:
-            import traceback
-            print(traceback.format_exc())
             return None
 
     async def _handle_job_completion(self, job_id: str) -> None:
@@ -5610,7 +5581,6 @@ class ManagerServer(HealthAwareServer):
         know where to route workflow results.
         """
         try:
-            print('GOT JOB')
             submission = JobSubmission.load(data)
 
             # Unpickle workflows
@@ -5704,8 +5674,6 @@ class ManagerServer(HealthAwareServer):
             return ack.dump()
             
         except Exception as e:
-            import traceback
-            print(traceback.format_exc())
             await self.handle_exception(e, "job_submission")
             ack = JobAck(
                 job_id="unknown",
@@ -5786,8 +5754,6 @@ class ManagerServer(HealthAwareServer):
                 self._increment_version()
 
         except Exception as e:
-            import traceback
-            print(traceback.format_exc())
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(

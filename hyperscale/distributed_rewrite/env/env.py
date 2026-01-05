@@ -80,6 +80,7 @@ class Env(BaseModel):
     # Worker Progress Update Settings
     WORKER_PROGRESS_UPDATE_INTERVAL: StrictFloat = 1.0  # How often to collect progress locally
     WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 2.0  # How often to send buffered updates to manager
+    WORKER_MAX_CORES: StrictInt | None = None
 
     # Manager Startup and Dispatch Settings
     MANAGER_STARTUP_SYNC_DELAY: StrictFloat = 2.0  # Seconds to wait for leader election before state sync
@@ -142,6 +143,7 @@ class Env(BaseModel):
             # Worker progress update settings
             "WORKER_PROGRESS_UPDATE_INTERVAL": float,
             "WORKER_PROGRESS_FLUSH_INTERVAL": float,
+            "WORKER_MAX_CORES": int,
             # Manager startup and dispatch settings
             "MANAGER_STARTUP_SYNC_DELAY": float,
             "MANAGER_STATE_SYNC_TIMEOUT": float,

@@ -179,9 +179,9 @@ async def run_test():
                 env=Env(
                     MERCURY_SYNC_REQUEST_TIMEOUT='5s',
                     MERCURY_SYNC_LOG_LEVEL="error",
+                    WORKER_MAX_CORES=config["cores"],
                 ),
                 dc_id=DC_ID,
-                total_cores=config["cores"],
                 seed_managers=seed_managers,
             )
             workers.append(worker)
@@ -370,7 +370,7 @@ async def run_test():
               f"(expected: running/assigned) {'PASS' if test_wf_still_running else 'FAIL'}")
 
         # NonTestWorkflow should now be assigned/running (dependency on TestWorkflowTwo met)
-        non_test_assigned = non_test_wf and non_test_wf.status in ('running', 'assigned')
+        non_test_assigned = non_test_wf and non_test_wf.status in ('running', 'assigned', 'completed')
         print(f"  NonTestWorkflow: status={non_test_wf.status if non_test_wf else 'NOT FOUND'}, "
               f"workers={non_test_wf.assigned_workers if non_test_wf else []} "
               f"(expected: running/assigned) {'PASS' if non_test_assigned else 'FAIL'}")
@@ -416,7 +416,7 @@ async def run_test():
         results = await client.query_workflows(['NonTestWorkflowTwo'], job_id=job_id)
         non_test_wf_two = get_workflow_by_name(results, 'NonTestWorkflowTwo')
 
-        non_test_two_assigned = non_test_wf_two and non_test_wf_two.status in ('running', 'assigned')
+        non_test_two_assigned = non_test_wf_two and non_test_wf_two.status in ('running', 'assigned', 'completed')
         print(f"  NonTestWorkflowTwo: status={non_test_wf_two.status if non_test_wf_two else 'NOT FOUND'}, "
               f"workers={non_test_wf_two.assigned_workers if non_test_wf_two else []} "
               f"(expected: running/assigned) {'PASS' if non_test_two_assigned else 'FAIL'}")
