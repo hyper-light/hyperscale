@@ -29,12 +29,12 @@ from hyperscale.distributed_rewrite.jobs import (
     JobInfo as JobInfo,
     WorkflowInfo as WorkflowInfo,
     SubWorkflowInfo as SubWorkflowInfo,
-    WorkflowState as WorkflowState,
     TrackingToken as TrackingToken,
     WorkerPool as WorkerPool,
     WorkerInfo as WorkerInfo,
     WorkerHealth as WorkerHealth,
     WorkflowDispatcher as WorkflowDispatcher,
+    WorkflowStateMachine as WorkflowStateMachine,
     CoreAllocator as CoreAllocator,
     AllocationResult as AllocationResult,
 )
