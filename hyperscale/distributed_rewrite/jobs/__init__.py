@@ -1,15 +1,21 @@
 """
-Jobs module - Manager-side job orchestration components.
+Jobs module - Job orchestration components.
 
-This module contains classes for managing job execution on the manager:
+This module contains classes for managing job execution:
+
+Manager-side:
 - JobManager: Thread-safe job/workflow state management
 - WorkerPool: Worker registration and resource allocation
 - WorkflowDispatcher: Workflow dispatch and dependency tracking
+
+Worker-side:
+- CoreAllocator: Thread-safe core allocation for workflow execution
 
 Supporting types:
 - TrackingToken: Globally unique workflow tracking IDs
 - JobInfo, WorkflowInfo, SubWorkflowInfo: Job state containers
 - WorkflowState: Internal workflow state enum
+- AllocationResult: Core allocation result container
 """
 
 from hyperscale.distributed_rewrite.jobs.job_manager import (
@@ -27,4 +33,8 @@ from hyperscale.distributed_rewrite.jobs.worker_pool import (
 )
 from hyperscale.distributed_rewrite.jobs.workflow_dispatcher import (
     WorkflowDispatcher as WorkflowDispatcher,
+)
+from hyperscale.distributed_rewrite.jobs.core_allocator import (
+    CoreAllocator as CoreAllocator,
+    AllocationResult as AllocationResult,
 )

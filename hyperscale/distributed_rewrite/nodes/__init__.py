@@ -35,6 +35,8 @@ from hyperscale.distributed_rewrite.jobs import (
     WorkerInfo as WorkerInfo,
     WorkerHealth as WorkerHealth,
     WorkflowDispatcher as WorkflowDispatcher,
+    CoreAllocator as CoreAllocator,
+    AllocationResult as AllocationResult,
 )
 
 # Re-export PendingWorkflow from models

@@ -55,6 +55,8 @@ from hyperscale.distributed_rewrite.models import (
     ManagerInfo,
     ManagerHeartbeat,
     RegistrationResponse,
+    ManagerToWorkerRegistration,
+    ManagerToWorkerRegistrationAck,
     WorkflowProgressAck,
     WorkerRegistration,
     WorkerHeartbeat,
@@ -73,6 +75,7 @@ from hyperscale.distributed_rewrite.models import (
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
+from hyperscale.distributed_rewrite.jobs import CoreAllocator
 from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError, ServerWarning, ServerDebug
 
@@ -125,15 +128,10 @@ class WorkerServer(HealthAwareServer):
     ):
         # Core capacity (set before super().__init__ so state embedder can access it)
         self._total_cores = total_cores or self._get_os_cpus() or 1
-        self._available_cores = self._total_cores
-        
-        # Per-core workflow assignment tracking
-        # Maps core_index -> workflow_id (None if core is free)
-        self._core_assignments: dict[int, str | None] = {
-            i: None for i in range(self._total_cores)
-        }
-        # Reverse mapping: workflow_id -> list of assigned core indices
-        self._workflow_cores: dict[str, list[int]] = {}
+
+        # Core allocator for thread-safe core management
+        # Uses composition to encapsulate all core allocation logic
+        self._core_allocator = CoreAllocator(self._total_cores)
         
         # Manager discovery
         # Seed managers from config (TCP addresses) - tried in order until one succeeds
@@ -144,15 +142,12 @@ class WorkerServer(HealthAwareServer):
         self._healthy_manager_ids: set[str] = set()
         # Primary manager for leader operations (set during registration)
         self._primary_manager_id: str | None = None
-        
-        # Circuit breaker for manager communication
-        # Tracks failures and implements fail-fast when managers are unreachable
-        cb_config = env.get_circuit_breaker_config()
-        self._manager_circuit = ErrorStats(
-            max_errors=cb_config['max_errors'],
-            window_seconds=cb_config['window_seconds'],
-            half_open_after=cb_config['half_open_after'],
-        )
+
+        # Per-manager circuit breakers for communication failures
+        # Each manager has its own circuit breaker so failures to one manager
+        # don't affect communication with other healthy managers
+        self._manager_circuits: dict[str, ErrorStats] = {}  # manager_id -> ErrorStats
+        self._manager_addr_circuits: dict[tuple[str, int], ErrorStats] = {}  # (host, port) -> ErrorStats for pre-registration
         
         # Workflow execution state
         self._active_workflows: dict[str, WorkflowProgress] = {}
@@ -187,7 +182,7 @@ class WorkerServer(HealthAwareServer):
         state_embedder = WorkerStateEmbedder(
             get_node_id=lambda: self._node_id.full,
             get_worker_state=lambda: self._get_worker_state().value,
-            get_available_cores=lambda: self._available_cores,
+            get_available_cores=lambda: self._core_allocator.available_cores,
             get_queue_depth=lambda: len(self._pending_workflows),
             get_cpu_percent=self._get_cpu_percent,
             get_memory_percent=self._get_memory_percent,
@@ -196,6 +191,8 @@ class WorkerServer(HealthAwareServer):
                 wf_id: wf.status for wf_id, wf in self._active_workflows.items()
             },
             on_manager_heartbeat=self._handle_manager_heartbeat,
+            get_tcp_host=lambda: self._host,
+            get_tcp_port=lambda: self._tcp_port,
         )
         
         # Initialize parent HealthAwareServer
@@ -271,6 +268,7 @@ class WorkerServer(HealthAwareServer):
             port=self._tcp_port,
             datacenter=self._node_id.datacenter,
             version=self._state_version,
+            udp_port=self._udp_port,
         )
     
     def _increment_version(self) -> int:
@@ -278,25 +276,84 @@ class WorkerServer(HealthAwareServer):
         self._state_version += 1
         return self._state_version
     
-    def _is_manager_circuit_open(self) -> bool:
-        """Check if manager circuit breaker is open (fail-fast mode)."""
-        return self._manager_circuit.circuit_state == CircuitState.OPEN
-    
-    def get_manager_circuit_status(self) -> dict:
+    def _get_manager_circuit(self, manager_id: str) -> ErrorStats:
         """
-        Get current manager circuit breaker status.
-        
-        Returns a dict with:
-        - circuit_state: Current state (CLOSED, OPEN, HALF_OPEN)
-        - error_count: Recent error count
-        - error_rate: Error rate over window
-        - healthy_managers: Count of healthy managers
-        - primary_manager: Current primary manager ID
+        Get or create a circuit breaker for a specific manager.
+
+        Each manager has its own circuit breaker so that failures to one
+        manager don't affect communication with other managers.
         """
+        if manager_id not in self._manager_circuits:
+            cb_config = self.env.get_circuit_breaker_config()
+            self._manager_circuits[manager_id] = ErrorStats(
+                max_errors=cb_config['max_errors'],
+                window_seconds=cb_config['window_seconds'],
+                half_open_after=cb_config['half_open_after'],
+            )
+        return self._manager_circuits[manager_id]
+
+    def _get_manager_circuit_by_addr(self, addr: tuple[str, int]) -> ErrorStats:
+        """
+        Get or create a circuit breaker for a manager by address.
+
+        Used during initial registration when we don't yet know the manager's ID.
+        """
+        if addr not in self._manager_addr_circuits:
+            cb_config = self.env.get_circuit_breaker_config()
+            self._manager_addr_circuits[addr] = ErrorStats(
+                max_errors=cb_config['max_errors'],
+                window_seconds=cb_config['window_seconds'],
+                half_open_after=cb_config['half_open_after'],
+            )
+        return self._manager_addr_circuits[addr]
+
+    def _is_manager_circuit_open(self, manager_id: str) -> bool:
+        """Check if a specific manager's circuit breaker is open."""
+        circuit = self._manager_circuits.get(manager_id)
+        if not circuit:
+            return False
+        return circuit.circuit_state == CircuitState.OPEN
+
+    def _is_manager_circuit_open_by_addr(self, addr: tuple[str, int]) -> bool:
+        """Check if a manager's circuit breaker is open by address."""
+        circuit = self._manager_addr_circuits.get(addr)
+        if not circuit:
+            return False
+        return circuit.circuit_state == CircuitState.OPEN
+
+    def get_manager_circuit_status(self, manager_id: str | None = None) -> dict:
+        """
+        Get circuit breaker status for a specific manager or summary of all.
+
+        Args:
+            manager_id: Specific manager to get status for, or None for summary
+
+        Returns a dict with circuit breaker state information.
+        """
+        if manager_id:
+            circuit = self._manager_circuits.get(manager_id)
+            if not circuit:
+                return {"error": f"No circuit breaker for manager {manager_id}"}
+            return {
+                "manager_id": manager_id,
+                "circuit_state": circuit.circuit_state.name,
+                "error_count": circuit.error_count,
+                "error_rate": circuit.error_rate,
+            }
+
+        # Summary of all managers
         return {
-            "circuit_state": self._manager_circuit.circuit_state.name,
-            "error_count": self._manager_circuit.error_count,
-            "error_rate": self._manager_circuit.error_rate,
+            "managers": {
+                mid: {
+                    "circuit_state": cb.circuit_state.name,
+                    "error_count": cb.error_count,
+                }
+                for mid, cb in self._manager_circuits.items()
+            },
+            "open_circuits": [
+                mid for mid, cb in self._manager_circuits.items()
+                if cb.circuit_state == CircuitState.OPEN
+            ],
             "healthy_managers": len(self._healthy_manager_ids),
             "primary_manager": self._primary_manager_id,
         }
@@ -386,19 +443,27 @@ class WorkerServer(HealthAwareServer):
                 f"Check logs for process spawn errors."
             )
         
-        # Try seed managers in order until one succeeds
-        # Registration response includes list of all healthy managers
-        registered = False
+        # Register with ALL seed managers for failover and consistency
+        # Each manager needs to know about this worker directly
+        successful_registrations = 0
         for seed_addr in self._seed_managers:
             success = await self._register_with_manager(seed_addr)
             if success:
-                registered = True
-                break
-        
-        if not registered:
+                successful_registrations += 1
+
+        if successful_registrations == 0:
             await self._udp_logger.log(
                 ServerError(
                     message=f"Failed to register with any seed manager: {self._seed_managers}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        elif successful_registrations < len(self._seed_managers):
+            await self._udp_logger.log(
+                ServerInfo(
+                    message=f"Registered with {successful_registrations}/{len(self._seed_managers)} seed managers",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
@@ -512,18 +577,21 @@ class WorkerServer(HealthAwareServer):
                     )
         else:
             # New manager discovered via SWIM - create entry
-            # We need TCP/UDP host:port from source_addr
-            self._known_managers[manager_id] = ManagerInfo(
+            # Use TCP address from heartbeat if available, fallback to convention
+            tcp_host = heartbeat.tcp_host if heartbeat.tcp_host else source_addr[0]
+            tcp_port = heartbeat.tcp_port if heartbeat.tcp_port else source_addr[1] - 1
+            new_manager = ManagerInfo(
                 node_id=manager_id,
-                tcp_host=source_addr[0],
-                tcp_port=source_addr[1] - 1,  # Convention: TCP = UDP - 1
+                tcp_host=tcp_host,
+                tcp_port=tcp_port,
                 udp_host=source_addr[0],
                 udp_port=source_addr[1],
                 datacenter=heartbeat.datacenter,
                 is_leader=heartbeat.is_leader,
             )
+            self._known_managers[manager_id] = new_manager
             self._healthy_manager_ids.add(manager_id)
-            
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
@@ -533,7 +601,14 @@ class WorkerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            
+
+            # Register with the newly discovered manager for consistency
+            # This ensures all managers know about this worker
+            self._task_runner.run(
+                self._register_with_manager,
+                (new_manager.tcp_host, new_manager.tcp_port),
+            )
+
             # If this is a leader and we don't have one, use it
             if heartbeat.is_leader and not self._primary_manager_id:
                 self._primary_manager_id = manager_id
@@ -579,16 +654,15 @@ class WorkerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-        
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerError(
-                message="No available managers for failover - worker is orphaned",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message="No available managers for failover - worker is orphaned",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
             )
-        )
     
     async def _report_active_workflows_to_managers(self) -> None:
         """Report all active workflows to all healthy managers."""
@@ -663,13 +737,21 @@ class WorkerServer(HealthAwareServer):
         await self._remote_manger.shutdown_workers()
         await self._remote_manger.close()
 
-
-        loop = asyncio.get_event_loop()
-        children = await loop.run_in_executor(None, active_children)
-
-        await asyncio.gather(
-            *[loop.run_in_executor(None, child.kill) for child in children]
-        )
+        # Kill any remaining child processes
+        try:
+            loop = asyncio.get_running_loop()
+            children = await loop.run_in_executor(None, active_children)
+            if children:
+                await asyncio.gather(
+                    *[loop.run_in_executor(None, child.kill) for child in children]
+                )
+        except RuntimeError:
+            # No running loop - kill children synchronously
+            for child in active_children():
+                try:
+                    child.kill()
+                except Exception:
+                    pass
 
         await self._server_pool.shutdown()
 
@@ -722,25 +804,29 @@ class WorkerServer(HealthAwareServer):
     ) -> bool:
         """
         Register this worker with a manager.
-        
+
         Uses exponential backoff for retries:
         - Attempt 1: immediate
         - Attempt 2: 0.5s delay
         - Attempt 3: 1.0s delay
         - Attempt 4: 2.0s delay
-        
-        Also respects the circuit breaker - if open, fails fast.
-        
+
+        Each manager has its own circuit breaker - failures to one manager
+        don't affect registration with other managers.
+
         Args:
             manager_addr: (host, port) tuple of manager
             max_retries: Maximum number of retry attempts (default 3)
             base_delay: Base delay in seconds for exponential backoff (default 0.5)
-            
+
         Returns:
             True if registration succeeded, False otherwise
         """
+        # Get per-manager circuit breaker (by address since we don't know ID yet)
+        circuit = self._get_manager_circuit_by_addr(manager_addr)
+
         # Check circuit breaker first
-        if self._is_manager_circuit_open():
+        if circuit.circuit_state == CircuitState.OPEN:
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(
@@ -751,7 +837,7 @@ class WorkerServer(HealthAwareServer):
                 )
             )
             return False
-        
+
         registration = WorkerRegistration(
             node=self.node_info,
             total_cores=self._total_cores,
@@ -759,7 +845,7 @@ class WorkerServer(HealthAwareServer):
             memory_mb=self._get_memory_mb(),
             available_memory_mb=self._get_available_memory_mb(),
         )
-        
+
         for attempt in range(max_retries + 1):
             try:
                 # Use decorated send method - handle() will capture manager's address
@@ -768,9 +854,9 @@ class WorkerServer(HealthAwareServer):
                     registration.dump(),
                     timeout=5.0,
                 )
-                
+
                 if not isinstance(result, Exception):
-                    self._manager_circuit.record_success()
+                    circuit.record_success()
                     if attempt > 0:
                         self._task_runner.run(
                             self._udp_logger.log,
@@ -782,7 +868,7 @@ class WorkerServer(HealthAwareServer):
                             )
                         )
                     return True
-                    
+
             except Exception as e:
                 self._task_runner.run(
                     self._udp_logger.log,
@@ -793,14 +879,14 @@ class WorkerServer(HealthAwareServer):
                         node_id=self._node_id.short,
                     )
                 )
-            
+
             # Exponential backoff before retry (except after last attempt)
             if attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
                 await asyncio.sleep(delay)
-        
-        # All retries exhausted
-        self._manager_circuit.record_error()
+
+        # All retries exhausted - record error on this manager's circuit breaker
+        circuit.record_error()
         self._task_runner.run(
             self._udp_logger.log,
             ServerError(
@@ -860,7 +946,7 @@ class WorkerServer(HealthAwareServer):
             node_id=self._node_id.full,
             state=self._get_worker_state().value,
             total_cores=self._total_cores,
-            available_cores=self._available_cores,
+            available_cores=self._core_allocator.available_cores,
             version=self._state_version,
             active_workflows=dict(self._active_workflows),
         )
@@ -868,7 +954,7 @@ class WorkerServer(HealthAwareServer):
     def _get_heartbeat(self) -> WorkerHeartbeat:
         """
         Build a WorkerHeartbeat with current state.
-        
+
         This is the same data that gets embedded in SWIM messages via
         WorkerStateEmbedder, but available for other uses like diagnostics
         or explicit TCP status updates if needed.
@@ -876,7 +962,7 @@ class WorkerServer(HealthAwareServer):
         return WorkerHeartbeat(
             node_id=self._node_id.full,
             state=self._get_worker_state().value,
-            available_cores=self._available_cores,
+            available_cores=self._core_allocator.available_cores,
             queue_depth=len(self._pending_workflows),
             cpu_percent=self._get_cpu_percent(),
             memory_percent=self._get_memory_percent(),
@@ -887,71 +973,30 @@ class WorkerServer(HealthAwareServer):
         )
     
     # =========================================================================
-    # Per-Core Assignment Tracking
+    # Core Allocation (delegates to CoreAllocator)
     # =========================================================================
-    
-    def _allocate_cores(self, workflow_id: str, num_cores: int) -> list[int]:
-        """Allocate a number of cores to a workflow."""
-        free_cores = [i for i, wf_id in self._core_assignments.items() if wf_id is None]
-        
-        if len(free_cores) < num_cores:
-            return []
-        
-        allocated = free_cores[:num_cores]
-        for core_idx in allocated:
-            self._core_assignments[core_idx] = workflow_id
-        
-        self._workflow_cores[workflow_id] = allocated
-        self._available_cores = len(
-            [i for i, wf_id in self._core_assignments.items() if wf_id is None]
-        )
-        
-        return allocated
-    
-    def _free_cores(self, workflow_id: str) -> list[int]:
-        """Free all cores allocated to a workflow."""
-        allocated = self._workflow_cores.pop(workflow_id, [])
-        
-        for core_idx in allocated:
-            if self._core_assignments.get(core_idx) == workflow_id:
-                self._core_assignments[core_idx] = None
-        
-        self._available_cores = len(
-            [i for i, wf_id in self._core_assignments.items() if wf_id is None]
-        )
-        
-        return allocated
-    
-    def _get_workflow_cores(self, workflow_id: str) -> list[int]:
-        """Get the core indices assigned to a workflow."""
-        return self._workflow_cores.get(workflow_id, [])
-    
-    def get_core_assignments(self) -> dict[int, str | None]:
+
+    async def get_core_assignments(self) -> dict[int, str | None]:
         """Get a copy of the current core assignments."""
-        return dict(self._core_assignments)
-    
-    def get_workflows_on_cores(self, core_indices: list[int]) -> set[str]:
+        return await self._core_allocator.get_core_assignments()
+
+    async def get_workflows_on_cores(self, core_indices: list[int]) -> set[str]:
         """Get workflows running on specific cores."""
-        workflows = set()
-        for core_idx in core_indices:
-            wf_id = self._core_assignments.get(core_idx)
-            if wf_id:
-                workflows.add(wf_id)
-        return workflows
-    
+        return await self._core_allocator.get_workflows_on_cores(core_indices)
+
     async def stop_workflows_on_cores(
         self,
         core_indices: list[int],
         reason: str = "core_stop",
     ) -> list[str]:
         """Stop all workflows running on specific cores (hierarchical stop)."""
-        workflows = self.get_workflows_on_cores(core_indices)
+        workflows = await self.get_workflows_on_cores(core_indices)
         stopped = []
-        
+
         for wf_id in workflows:
             if await self._cancel_workflow(wf_id, reason):
                 stopped.append(wf_id)
-        
+
         return stopped
     
     async def _cancel_workflow(self, workflow_id: str, reason: str) -> bool:
@@ -1049,7 +1094,77 @@ class WorkerServer(HealthAwareServer):
             self._known_managers[manager.node_id] = manager
             # Mark as healthy since we just received this info
             self._healthy_manager_ids.add(manager.node_id)
-    
+
+    @tcp.handle('manager_register')
+    async def handle_manager_register(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle registration request from a manager.
+
+        This enables bidirectional registration: managers can proactively
+        register with workers they discover via state sync from peer managers.
+        This speeds up cluster formation.
+        """
+        try:
+            registration = ManagerToWorkerRegistration.load(data)
+
+            # Add this manager to our known managers
+            self._known_managers[registration.manager.node_id] = registration.manager
+            self._healthy_manager_ids.add(registration.manager.node_id)
+
+            # Also add any other managers included in the registration
+            if registration.known_managers:
+                self._update_known_managers(registration.known_managers)
+
+            # Update primary manager if this one is the leader
+            if registration.is_leader:
+                self._primary_manager_id = registration.manager.node_id
+
+            # Add manager's UDP address to SWIM for probing
+            manager_udp_addr = (registration.manager.udp_host, registration.manager.udp_port)
+            if manager_udp_addr[0] and manager_udp_addr[1]:
+                self._probe_scheduler.add_member(manager_udp_addr)
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Manager {registration.manager.node_id[:8]}... registered with us (leader={registration.is_leader})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Return acknowledgment with our info
+            ack = ManagerToWorkerRegistrationAck(
+                accepted=True,
+                worker_id=self._node_id.full,
+                total_cores=self._total_cores,
+                available_cores=self._available_cores,
+            )
+            return ack.dump()
+
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Failed to process manager registration: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            ack = ManagerToWorkerRegistrationAck(
+                accepted=False,
+                worker_id=self._node_id.full,
+                error=str(e),
+            )
+            return ack.dump()
+
     # =========================================================================
     # TCP Handlers - Manager -> Worker
     # =========================================================================
@@ -1074,9 +1189,10 @@ class WorkerServer(HealthAwareServer):
         Receive a workflow dispatch from a manager.
 
         This is the main entry point for work arriving at the worker.
+        Uses atomic core allocation via CoreAllocator to prevent races.
         """
         dispatch: WorkflowDispatch | None = None
-        allocated_cores: list[int] = []
+        allocation_succeeded = False
 
         try:
             dispatch = WorkflowDispatch.load(data)
@@ -1085,16 +1201,7 @@ class WorkerServer(HealthAwareServer):
             vus_for_workflow = dispatch.vus
             cores_to_allocate = dispatch.cores
 
-            # Check if we can accept this workflow
-            if self._available_cores < cores_to_allocate:
-                ack = WorkflowDispatchAck(
-                    workflow_id=dispatch.workflow_id,
-                    accepted=False,
-                    error=f"Insufficient cores: need {cores_to_allocate}, have {self._available_cores}",
-                )
-                return ack.dump()
-
-            # Check backpressure
+            # Check backpressure first (fast path rejection)
             if self._get_worker_state() == WorkerState.DRAINING:
                 ack = WorkflowDispatchAck(
                     workflow_id=dispatch.workflow_id,
@@ -1103,16 +1210,23 @@ class WorkerServer(HealthAwareServer):
                 )
                 return ack.dump()
 
-            # Allocate cores to this workflow (cores, not VUs!)
-            allocated_cores = self._allocate_cores(dispatch.workflow_id, cores_to_allocate)
-            if not allocated_cores:
+            # Atomic core allocation - no TOCTOU race
+            # CoreAllocator checks availability and allocates in one atomic operation
+            allocation_result = await self._core_allocator.allocate(
+                dispatch.workflow_id,
+                cores_to_allocate,
+            )
+
+            if not allocation_result.success:
                 ack = WorkflowDispatchAck(
                     workflow_id=dispatch.workflow_id,
                     accepted=False,
-                    error=f"Failed to allocate {cores_to_allocate} cores",
+                    error=allocation_result.error or f"Failed to allocate {cores_to_allocate} cores",
                 )
                 return ack.dump()
 
+            allocation_succeeded = True
+            allocated_cores = allocation_result.allocated_cores
             self._increment_version()
 
             # Create progress tracker with assigned cores
@@ -1127,6 +1241,9 @@ class WorkerServer(HealthAwareServer):
                 elapsed_seconds=0.0,
                 timestamp=time.monotonic(),
                 assigned_cores=allocated_cores,
+                worker_available_cores=self._core_allocator.available_cores,
+                worker_workflow_completed_cores=0,
+                worker_workflow_assigned_cores=cores_to_allocate,
             )
             self._active_workflows[dispatch.workflow_id] = progress
 
@@ -1150,7 +1267,7 @@ class WorkerServer(HealthAwareServer):
             self._workflow_tokens[dispatch.workflow_id] = run.token
 
             # Task started successfully - cores are now managed by _execute_workflow's finally block
-            allocated_cores = []  # Clear so exception handler won't free them
+            allocation_succeeded = False  # Clear so exception handler won't free them
 
             # Return acknowledgment
             ack = WorkflowDispatchAck(
@@ -1162,8 +1279,8 @@ class WorkerServer(HealthAwareServer):
 
         except Exception as e:
             # Free any allocated cores if task didn't start successfully
-            if dispatch and allocated_cores:
-                self._free_cores(dispatch.workflow_id)
+            if dispatch and allocation_succeeded:
+                await self._core_allocator.free(dispatch.workflow_id)
                 self._workflow_cancel_events.pop(dispatch.workflow_id, None)
                 self._active_workflows.pop(dispatch.workflow_id, None)
 
@@ -1187,7 +1304,9 @@ class WorkerServer(HealthAwareServer):
         start_time = time.monotonic()
         run_id = hash(dispatch.workflow_id) % (2**31)
         error: Exception | None = None
-        
+        final_result_sent = False
+        workflow_error: str | None = None
+
         try:
             # Unpickle workflow and context
             workflow = dispatch.load_workflow()
@@ -1211,15 +1330,15 @@ class WorkerServer(HealthAwareServer):
             )
             
 
-            workflow_error: str | None = None
-            workflow_results: bytes = b''
+            workflow_results = {}
             context_updates: bytes = b''
             
             try:
                 # Execute the workflow
+ 
                 (
                     results_run_id,
-                    results,
+                    workflow_results,
                     context,
                     error,
                     status,
@@ -1240,7 +1359,6 @@ class WorkerServer(HealthAwareServer):
                     workflow_error = str(error) if error else "Unknown error"
 
                 # Serialize results and context for final result
-                workflow_results = cloudpickle.dumps(results) if results else b''
                 context_updates = cloudpickle.dumps(context.dict() if context else {})
 
             except asyncio.CancelledError:
@@ -1260,8 +1378,11 @@ class WorkerServer(HealthAwareServer):
             progress.timestamp = time.monotonic()
             if self._healthy_manager_ids:
                 await self._send_progress_update_direct(progress)
-            
-            # Send final result to manager
+
+            # Free cores BEFORE sending final result so we can report accurate availability
+            await self._core_allocator.free(dispatch.workflow_id)
+
+            # Send final result to manager with updated core availability
             final_result = WorkflowFinalResult(
                 job_id=dispatch.job_id,
                 workflow_id=dispatch.workflow_id,
@@ -1270,18 +1391,54 @@ class WorkerServer(HealthAwareServer):
                 results=workflow_results,
                 context_updates=context_updates,
                 error=workflow_error,
+                worker_id=self._node_id.full,
+                worker_available_cores=self._core_allocator.available_cores,
             )
             await self._send_final_result(final_result)
-                
+            final_result_sent = True
+
         except asyncio.CancelledError:
             progress.status = WorkflowStatus.CANCELLED.value
+            workflow_error = "Cancelled"
         except Exception as e:
             progress.status = WorkflowStatus.FAILED.value
-            error = str(e) if e else "Unknown error"
+            workflow_error = str(e) if e else "Unknown error"
+            error = e
         finally:
-            self._free_cores(dispatch.workflow_id)
+            # Free cores if not already freed (exception path)
+            if not final_result_sent:
+                await self._core_allocator.free(dispatch.workflow_id)
+
+            # ALWAYS send final result to manager, even if we failed
+            # This ensures the manager can update workflow status and potentially retry
+            if not final_result_sent:
+                try:
+                    final_result = WorkflowFinalResult(
+                        job_id=dispatch.job_id,
+                        workflow_id=dispatch.workflow_id,
+                        workflow_name=progress.workflow_name,
+                        status=progress.status,
+                        results=b'',  # No results on failure
+                        context_updates=b'',  # No context on failure
+                        error=workflow_error,
+                        worker_id=self._node_id.full,
+                        worker_available_cores=self._core_allocator.available_cores,
+                    )
+                    await self._send_final_result(final_result)
+                except Exception as send_err:
+                    # Log but don't propagate - we tried our best
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerError(
+                            message=f"Failed to send final result for {dispatch.workflow_id}: {send_err}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
             self._increment_version()
-            
+
             self._workflow_tokens.pop(dispatch.workflow_id, None)
             self._workflow_cancel_events.pop(dispatch.workflow_id, None)
             self._active_workflows.pop(dispatch.workflow_id, None)
@@ -1291,7 +1448,6 @@ class WorkerServer(HealthAwareServer):
         return (
             progress,
             error,
-
         )
     
     async def _monitor_workflow_progress(
@@ -1333,6 +1489,22 @@ class WorkerServer(HealthAwareServer):
                 progress.timestamp = time.monotonic()
                 progress.avg_cpu_percent = avg_cpu
                 progress.avg_memory_mb = avg_mem
+
+                availability = await self._remote_manger.get_availability()
+                (
+                    workflow_assigned_cores,
+                    workflow_completed_cores,
+                    worker_available_cores,  # Live count of free cores from RemoteGraphManager
+                ) = availability
+
+                if worker_available_cores > 0:
+                    await self._core_allocator.free_subset(progress.workflow_id, worker_available_cores)
+
+                progress.worker_workflow_assigned_cores = workflow_assigned_cores
+                progress.worker_workflow_completed_cores = workflow_completed_cores
+                # Live available cores from CoreAllocator - this is the real-time
+                # count of cores that have finished their work and are available
+                progress.worker_available_cores = self._core_allocator.available_cores
                 
                 # Convert step stats
                 progress.step_stats = [
@@ -1445,13 +1617,16 @@ class WorkerServer(HealthAwareServer):
             max_retries: Maximum retry attempts (default 2)
             base_delay: Base delay for exponential backoff (default 0.2s)
         """
-        # Check circuit breaker first
-        if self._is_manager_circuit_open():
-            return  # Fail fast - don't attempt communication
-
         manager_addr = self._get_primary_manager_tcp_addr()
         if not manager_addr:
             return
+
+        # Get per-manager circuit breaker
+        primary_id = self._primary_manager_id
+        if primary_id and self._is_manager_circuit_open(primary_id):
+            return  # Fail fast - don't attempt communication
+
+        circuit = self._get_manager_circuit_by_addr(manager_addr) if not primary_id else self._get_manager_circuit(primary_id)
 
         for attempt in range(max_retries + 1):
             try:
@@ -1465,7 +1640,7 @@ class WorkerServer(HealthAwareServer):
                 # Process ack to update manager topology
                 if response and isinstance(response, bytes) and response != b'error':
                     self._process_workflow_progress_ack(response)
-                    self._manager_circuit.record_success()
+                    circuit.record_success()
                     return  # Success
 
             except Exception:
@@ -1475,18 +1650,25 @@ class WorkerServer(HealthAwareServer):
             if attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
                 await asyncio.sleep(delay)
-        
+
         # All retries exhausted
-        self._manager_circuit.record_error()
+        circuit.record_error()
     
     async def _send_progress_to_all_managers(self, progress: WorkflowProgress) -> None:
         """Send a progress update to ALL healthy managers and process acks."""
-        # Check circuit breaker first
-        if self._is_manager_circuit_open():
-            return  # Fail fast
-        
-        success_count = 0
-        for manager_addr in self._get_healthy_manager_tcp_addrs():
+        for manager_id in list(self._healthy_manager_ids):
+            manager_info = self._known_managers.get(manager_id)
+            if not manager_info:
+                continue
+
+            manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+
+            # Check per-manager circuit breaker
+            if self._is_manager_circuit_open(manager_id):
+                continue  # Skip this manager, try others
+
+            circuit = self._get_manager_circuit(manager_id)
+
             try:
                 response, _ = await self.send_tcp(
                     manager_addr,
@@ -1494,20 +1676,16 @@ class WorkerServer(HealthAwareServer):
                     progress.dump(),
                     timeout=1.0,
                 )
-                
+
                 # Process ack to update manager topology
                 if response and isinstance(response, bytes) and response != b'error':
                     self._process_workflow_progress_ack(response)
-                    success_count += 1
-                    
+                    circuit.record_success()
+                else:
+                    circuit.record_error()
+
             except Exception:
-                pass
-        
-        # Record circuit breaker result based on overall success
-        if success_count > 0:
-            self._manager_circuit.record_success()
-        elif len(self._healthy_manager_ids) > 0:
-            self._manager_circuit.record_error()
+                circuit.record_error()
     
     async def _send_final_result(
         self,
@@ -1517,89 +1695,103 @@ class WorkerServer(HealthAwareServer):
     ) -> None:
         """
         Send workflow final result to the primary manager.
-        
+
         Final results are critical - they contain:
         - Workflow results/stats
         - Context updates for dependent workflows
         - Error information for failed workflows
-        
+
         Uses retries with exponential backoff since this is a critical path.
-        
+        If the primary manager's circuit breaker is open, tries other healthy managers.
+
         Args:
             final_result: The final result to send
             max_retries: Maximum retry attempts (default 3)
             base_delay: Base delay for exponential backoff (default 0.5s)
         """
-        # Check circuit breaker first
-        if self._is_manager_circuit_open():
+        # Try primary manager first, then fall back to other healthy managers
+        target_managers: list[str] = []
+
+        if self._primary_manager_id:
+            target_managers.append(self._primary_manager_id)
+
+        # Add other healthy managers as fallbacks
+        for manager_id in self._healthy_manager_ids:
+            if manager_id not in target_managers:
+                target_managers.append(manager_id)
+
+        if not target_managers:
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerWarning(
-                    message=f"Cannot send final result for {final_result.workflow_id}: manager circuit open",
+                    message=f"Cannot send final result for {final_result.workflow_id}: no healthy managers",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
             return
-        
-        manager_addr = self._get_primary_manager_tcp_addr()
-        if not manager_addr:
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerWarning(
-                    message=f"Cannot send final result for {final_result.workflow_id}: no primary manager",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            return
-        
-        for attempt in range(max_retries + 1):
-            try:
-                response, _ = await self.send_tcp(
-                    manager_addr,
-                    "workflow_final_result",
-                    final_result.dump(),
-                    timeout=5.0,  # Longer timeout for final results
-                )
-                
-                if response and isinstance(response, bytes) and response != b'error':
-                    self._manager_circuit.record_success()
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerDebug(
-                            message=f"Sent final result for {final_result.workflow_id} status={final_result.status}",
+
+        # Try each manager until one succeeds
+        for manager_id in target_managers:
+            # Check per-manager circuit breaker
+            if self._is_manager_circuit_open(manager_id):
+                continue  # Skip this manager, try next
+
+            manager_info = self._known_managers.get(manager_id)
+            if manager_info is None:
+                continue
+
+            manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+            circuit = self._get_manager_circuit(manager_id)
+
+            for attempt in range(max_retries + 1):
+                try:
+                    response, _ = await self.send_tcp(
+                        manager_addr,
+                        "workflow_final_result",
+                        final_result.dump(),
+                        timeout=5.0,  # Longer timeout for final results
+                    )
+
+                    print(response)
+
+                    if response and isinstance(response, bytes) and response != b'error':
+                        circuit.record_success()
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerDebug(
+                                message=f"Sent final result for {final_result.workflow_id} status={final_result.status}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                        return  # Success
+
+                except Exception as e:
+                    import traceback
+                    print(traceback.format_exc())
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=f"Failed to send final result for {final_result.workflow_id} attempt {attempt+1}: {e}",
                             node_host=self._host,
                             node_port=self._tcp_port,
                             node_id=self._node_id.short,
                         )
                     )
-                    return  # Success
-                    
-            except Exception as e:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerWarning(
-                        message=f"Failed to send final result for {final_result.workflow_id} attempt {attempt+1}: {e}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-            
-            # Exponential backoff before retry (except after last attempt)
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-        
-        # All retries exhausted
-        self._manager_circuit.record_error()
-        self._task_runner.run(
-            self._udp_logger.log,
+                # Exponential backoff before retry (except after last attempt)
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+
+            # All retries exhausted for this manager
+            circuit.record_error()
+
+        # All managers failed
+        await self._udp_logger.log(
             ServerError(
-                message=f"Failed to send final result for {final_result.workflow_id} after {max_retries + 1} attempts",
+                message=f"Failed to send final result for {final_result.workflow_id} to any manager after {max_retries + 1} attempts each",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
