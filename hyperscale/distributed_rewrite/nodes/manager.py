@@ -4017,225 +4017,220 @@ class ManagerServer(HealthAwareServer):
             # Check if this is a sub-workflow (dispatched to multiple workers)
             parent_workflow_id = self._get_parent_workflow_id(result.workflow_id)
 
-
+            # Use try/finally to ensure lock is always released
+            # This prevents lock leaks from early returns
             await self._workflow_results_locks[parent_workflow_id].acquire()
-
-            # Update worker's available cores from the ORIGINAL result immediately
-            # This must happen before any sub-workflow aggregation or early returns
-            # because the worker has freed cores and we need to track that for dispatch
-            original_result = result  # Preserve for worker core update
-            if original_result.worker_id and original_result.worker_available_cores >= 0:
-                worker_status = self._worker_status.get(original_result.worker_id)
-                if worker_status:
-                    updated_status = WorkerHeartbeat(
-                        node_id=worker_status.node_id,
-                        state=worker_status.state,
-                        available_cores=original_result.worker_available_cores,
-                        queue_depth=worker_status.queue_depth,
-                        cpu_percent=worker_status.cpu_percent,
-                        memory_percent=worker_status.memory_percent,
-                        version=worker_status.version,
-                        active_workflows=worker_status.active_workflows,
-                    )
-                    self._worker_status[original_result.worker_id] = updated_status
-
-                    # Signal cores available for waiting workflows
-                    if original_result.worker_available_cores > 0:
-                        self._cores_available_event.set()
-
-            if parent_workflow_id is not None:
-                # This is a sub-workflow - store and check if parent is complete
-                self._sub_workflow_results[result.workflow_id] = result
-
-                # Debug: log sub-workflow tracking state
-                sub_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
-                stored_results = [sid for sid in sub_ids if sid in self._sub_workflow_results]
-                await self._udp_logger.log(
-                    ServerInfo(
-                        message=f"Sub-workflow tracking: parent={parent_workflow_id}, expected={sub_ids}, have_results={stored_results}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-
-                # Handle context updates from sub-workflow
-                if result.context_updates and len(result.context_updates) > 0:
-                    if self._is_job_leader(result.job_id):
-                        await self._apply_context_updates_from_result(result)
-                    else:
-                        await self._forward_context_from_result(result)
-
-                print(self._is_parent_workflow_complete(parent_workflow_id))
-
-                # Check if all sub-workflows have completed
-                if not self._is_parent_workflow_complete(parent_workflow_id):
-                    # More sub-workflows pending - just ack
-                    self._workflow_results_locks[parent_workflow_id].release()
-                    return b'ok'
-                
-                sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
-        
-                if not sub_workflow_ids:
-                    return None
-
-                # Collect all sub-workflow results
-                sub_results = [
-                    self._sub_workflow_results.get(sub_id)
-                    for sub_id in sub_workflow_ids
-                    if sub_id in self._sub_workflow_results
-                ]
-
-                if not sub_results or len(sub_results) != len(sub_workflow_ids):
-                    # Not all sub-workflows have completed
-                    return None
-
-                # Extract job_id from parent workflow_id (format: job_id:workflow_idx)
-                job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
-
-                # Determine overall status (any failure = failure)
-                overall_status = WorkflowStatus.COMPLETED.value
-                errors = []
-                for r in sub_results:
-                    if r.status == WorkflowStatus.FAILED.value:
-                        overall_status = WorkflowStatus.FAILED.value
-                        if r.error:
-                            errors.append(r.error)
-
-                matching_job = self._jobs.get(job_id)
-                if matching_job is None:
-                    await self.handle_exception(
-                        Exception(f"Failed to find job for {parent_workflow_id}"),
-                        "workflow_final_result"
-                    )
-                    
-                    return b'error'
-
-                matching_workflows = [
-                    workflow for workflow in matching_job.workflows if workflow.workflow_name in request.workflow_names
-                ]
-
-                if len(matching_workflows) < 1:
-                    await self.handle_exception(
-                        Exception(f"No workflows found for job {job_id}"),
-                        "workflow_final_result"
-                    )
-                    
-                    return b'error'
-
-
-
-                print(parent_workflow_id, list(self._sub_workflow_mapping.keys()), sub_ids)
-                # All sub-workflows complete - aggregate results
-                # result = self._aggregate_sub_workflow_final_results(parent_workflow_id)
-                # if result is None:
-                #     # Aggregation failed - should not happen
-                #     await self.handle_exception(
-                #         Exception(f"Failed to aggregate results for {parent_workflow_id}"),
-                #         "workflow_final_result"
-                #     )
-
-                #     self._workflow_results_locks[parent_workflow_id].release()
-                #     return b'error'
-
-                # Clean up sub-workflow tracking
-                # sub_workflow_ids = self._sub_workflow_mapping.pop(parent_workflow_id, [])
-                # for sub_id in sub_workflow_ids:
-                #     self._sub_workflow_progress.pop(sub_id, None)
-                #     self._sub_workflow_results.pop(sub_id, None)
-
-            # Store final result (either original or aggregated)
-            if result.job_id not in self._workflow_final_results:
-                self._workflow_final_results[result.job_id] = {}
-            self._workflow_final_results[result.job_id][result.workflow_id] = result
-
-            # Handle context updates (for dependent workflows) - only for non-sub-workflows
-            # Sub-workflows already had context applied above
-            if parent_workflow_id is None and result.context_updates and len(result.context_updates) > 0:
-                if self._is_job_leader(result.job_id):
-                    # We are job leader - apply context directly
-                    await self._apply_context_updates_from_result(result)
-                else:
-                    # Forward context to job leader
-                    await self._forward_context_from_result(result)
-
-            # Clean up retry tracking on any final result
-            self._workflow_retries.pop(result.workflow_id, None)
-
-            # Signal completion for dependency tracking
-            completion_event = self._workflow_completion_events.get(result.workflow_id)
-            if completion_event:
-                completion_event.set()
-
-            # Update job progress status
-            job = self._jobs.get(result.job_id)
-            if job:
-                matched = False
-                for i, wf in enumerate(job.workflows):
-                    if wf.workflow_id == result.workflow_id:
-                        wf.status = result.status
-                        matched = True
-                        await self._udp_logger.log(
-                            ServerInfo(
-                                message=f"Updated workflow status: {wf.workflow_id} -> {result.status}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
+            try:
+                # Update worker's available cores from the ORIGINAL result immediately
+                # This must happen before any sub-workflow aggregation or early returns
+                # because the worker has freed cores and we need to track that for dispatch
+                original_result = result  # Preserve for worker core update
+                if original_result.worker_id and original_result.worker_available_cores >= 0:
+                    worker_status = self._worker_status.get(original_result.worker_id)
+                    if worker_status:
+                        updated_status = WorkerHeartbeat(
+                            node_id=worker_status.node_id,
+                            state=worker_status.state,
+                            available_cores=original_result.worker_available_cores,
+                            queue_depth=worker_status.queue_depth,
+                            cpu_percent=worker_status.cpu_percent,
+                            memory_percent=worker_status.memory_percent,
+                            version=worker_status.version,
+                            active_workflows=worker_status.active_workflows,
                         )
-                        break
+                        self._worker_status[original_result.worker_id] = updated_status
 
-                if not matched:
+                        # Signal cores available for waiting workflows
+                        if original_result.worker_available_cores > 0:
+                            self._cores_available_event.set()
+
+                if parent_workflow_id is not None:
+                    # This is a sub-workflow - store and check if parent is complete
+                    self._sub_workflow_results[result.workflow_id] = result
+
+                    # Debug: log sub-workflow tracking state
+                    sub_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
+                    stored_results = [sid for sid in sub_ids if sid in self._sub_workflow_results]
                     await self._udp_logger.log(
-                        ServerError(
-                            message=f"NO MATCH for workflow_id={result.workflow_id}, job has: {[w.workflow_id for w in job.workflows]}",
+                        ServerInfo(
+                            message=f"Sub-workflow tracking: parent={parent_workflow_id}, expected={sub_ids}, have_results={stored_results}",
                             node_host=self._host,
                             node_port=self._tcp_port,
                             node_id=self._node_id.short,
                         )
                     )
 
-                # Forward to gates (if connected)
-                if self._known_gates or self._gate_addrs:
-                    self._task_runner.run(self._send_job_progress_to_gate, job)
+                    # Handle context updates from sub-workflow
+                    if result.context_updates and len(result.context_updates) > 0:
+                        if self._is_job_leader(result.job_id):
+                            await self._apply_context_updates_from_result(result)
+                        else:
+                            await self._forward_context_from_result(result)
 
-            # Notify WorkflowDispatcher of completion for dependency tracking
-            # This is critical for dependency-based execution - when a workflow completes,
-            # dependent workflows may now be ready to run
-            if result.status == WorkflowStatus.COMPLETED.value and self._workflow_dispatcher:
-                # Parse job_id from workflow_id to find matching workflow
-                parts = result.workflow_id.split(":")
-                if len(parts) >= 2:
-                    jm_job_id = parts[0]
-                    job_info = self._job_manager.get_job(jm_job_id)
-                    if job_info:
-                        for wf_id, wf_info in job_info.workflows.items():
-                            if wf_info.name == result.workflow_name:
-                                await self._workflow_dispatcher.mark_workflow_completed(
-                                    jm_job_id, wf_id
+                    print(self._is_parent_workflow_complete(parent_workflow_id))
+
+                    # Check if all sub-workflows have completed
+                    if not self._is_parent_workflow_complete(parent_workflow_id):
+                        # More sub-workflows pending - just ack
+                        return b'ok'
+
+                    sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
+
+                    if not sub_workflow_ids:
+                        return b'ok'  # No sub-workflows registered - just ack
+
+                    # Collect all sub-workflow results
+                    sub_results = [
+                        self._sub_workflow_results.get(sub_id)
+                        for sub_id in sub_workflow_ids
+                        if sub_id in self._sub_workflow_results
+                    ]
+
+                    if not sub_results or len(sub_results) != len(sub_workflow_ids):
+                        # Not all sub-workflows have completed
+                        return b'ok'  # Just ack - more results expected
+
+                    # Extract job_id from parent workflow_id (format: job_id:workflow_idx)
+                    job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
+
+                    # Determine overall status (any failure = failure)
+                    overall_status = WorkflowStatus.COMPLETED.value
+                    errors = []
+                    for r in sub_results:
+                        if r.status == WorkflowStatus.FAILED.value:
+                            overall_status = WorkflowStatus.FAILED.value
+                            if r.error:
+                                errors.append(r.error)
+
+                    matching_job = self._jobs.get(job_id)
+                    if matching_job is None:
+                        await self.handle_exception(
+                            Exception(f"Failed to find job for {parent_workflow_id}"),
+                            "workflow_final_result"
+                        )
+                        return b'error'
+
+                    matching_workflows = [
+                        workflow for workflow in matching_job.workflows if workflow.workflow_name in request.workflow_names
+                    ]
+
+                    if len(matching_workflows) < 1:
+                        await self.handle_exception(
+                            Exception(f"No workflows found for job {job_id}"),
+                            "workflow_final_result"
+                        )
+                        return b'error'
+
+                    print(parent_workflow_id, list(self._sub_workflow_mapping.keys()), sub_ids)
+                    # All sub-workflows complete - aggregate results
+                    # result = self._aggregate_sub_workflow_final_results(parent_workflow_id)
+                    # if result is None:
+                    #     # Aggregation failed - should not happen
+                    #     await self.handle_exception(
+                    #         Exception(f"Failed to aggregate results for {parent_workflow_id}"),
+                    #         "workflow_final_result"
+                    #     )
+                    #     return b'error'
+
+                    # Clean up sub-workflow tracking
+                    # sub_workflow_ids = self._sub_workflow_mapping.pop(parent_workflow_id, [])
+                    # for sub_id in sub_workflow_ids:
+                    #     self._sub_workflow_progress.pop(sub_id, None)
+                    #     self._sub_workflow_results.pop(sub_id, None)
+
+                # Store final result (either original or aggregated)
+                if result.job_id not in self._workflow_final_results:
+                    self._workflow_final_results[result.job_id] = {}
+                self._workflow_final_results[result.job_id][result.workflow_id] = result
+
+                # Handle context updates (for dependent workflows) - only for non-sub-workflows
+                # Sub-workflows already had context applied above
+                if parent_workflow_id is None and result.context_updates and len(result.context_updates) > 0:
+                    if self._is_job_leader(result.job_id):
+                        # We are job leader - apply context directly
+                        await self._apply_context_updates_from_result(result)
+                    else:
+                        # Forward context to job leader
+                        await self._forward_context_from_result(result)
+
+                # Clean up retry tracking on any final result
+                self._workflow_retries.pop(result.workflow_id, None)
+
+                # Signal completion for dependency tracking
+                completion_event = self._workflow_completion_events.get(result.workflow_id)
+                if completion_event:
+                    completion_event.set()
+
+                # Update job progress status
+                job = self._jobs.get(result.job_id)
+                if job:
+                    matched = False
+                    for i, wf in enumerate(job.workflows):
+                        if wf.workflow_id == result.workflow_id:
+                            wf.status = result.status
+                            matched = True
+                            await self._udp_logger.log(
+                                ServerInfo(
+                                    message=f"Updated workflow status: {wf.workflow_id} -> {result.status}",
+                                    node_host=self._host,
+                                    node_port=self._tcp_port,
+                                    node_id=self._node_id.short,
                                 )
-                                # Try to dispatch newly ready workflows
-                                submission = self._job_submissions.get(jm_job_id)
-                                if submission:
-                                    await self._workflow_dispatcher.try_dispatch(
-                                        jm_job_id, submission
+                            )
+                            break
+
+                    if not matched:
+                        await self._udp_logger.log(
+                            ServerError(
+                                message=f"NO MATCH for workflow_id={result.workflow_id}, job has: {[w.workflow_id for w in job.workflows]}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+
+                    # Forward to gates (if connected)
+                    if self._known_gates or self._gate_addrs:
+                        self._task_runner.run(self._send_job_progress_to_gate, job)
+
+                # Notify WorkflowDispatcher of completion for dependency tracking
+                # This is critical for dependency-based execution - when a workflow completes,
+                # dependent workflows may now be ready to run
+                if result.status == WorkflowStatus.COMPLETED.value and self._workflow_dispatcher:
+                    # Parse job_id from workflow_id to find matching workflow
+                    parts = result.workflow_id.split(":")
+                    if len(parts) >= 2:
+                        jm_job_id = parts[0]
+                        job_info = self._job_manager.get_job(jm_job_id)
+                        if job_info:
+                            for wf_id, wf_info in job_info.workflows.items():
+                                if wf_info.name == result.workflow_name:
+                                    await self._workflow_dispatcher.mark_workflow_completed(
+                                        jm_job_id, wf_id
                                     )
-                                break
+                                    # Try to dispatch newly ready workflows
+                                    submission = self._job_submissions.get(jm_job_id)
+                                    if submission:
+                                        await self._workflow_dispatcher.try_dispatch(
+                                            jm_job_id, submission
+                                        )
+                                    break
 
-            # Check if job is complete
-            if self._is_job_complete(result.job_id):
-                await self._handle_job_completion(result.job_id)
+                # Check if job is complete
+                if self._is_job_complete(result.job_id):
+                    await self._handle_job_completion(result.job_id)
 
-            self._increment_version()
+                self._increment_version()
+                return b'ok'
 
-            self._workflow_results_locks[parent_workflow_id].release()
-            return b'ok'
+            finally:
+                # Always release the lock, even on early returns or exceptions
+                self._workflow_results_locks[parent_workflow_id].release()
 
         except Exception as e:
             import traceback
             print(traceback.format_exc())
 
-            self._workflow_results_locks[parent_workflow_id].release()
             await self.handle_exception(e, "workflow_final_result")
             return b'error'
     
