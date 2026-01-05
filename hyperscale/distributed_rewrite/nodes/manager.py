@@ -3597,6 +3597,7 @@ class ManagerServer(HealthAwareServer):
         try:
             progress = WorkflowProgress.load(data)
 
+            print(progress.workflow_name)
             # Check if this is a sub-workflow (dispatched to multiple workers)
             parent_workflow_id = self._get_parent_workflow_id(progress.workflow_id)
 
@@ -3709,6 +3710,8 @@ class ManagerServer(HealthAwareServer):
             return ack.dump()
             
         except Exception as e:
+            import traceback
+            print(traceback.format_exc())
             await self.handle_exception(e, "receive_workflow_progress")
             return b'error'
     
@@ -3735,10 +3738,9 @@ class ManagerServer(HealthAwareServer):
         try:
             result = WorkflowFinalResult.load(data)
 
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerDebug(
-                    message=f"Received final result for workflow {result.workflow_id} status={result.status}",
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"[workflow_final_result] RECEIVED: workflow_id={result.workflow_id} status={result.status}",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
@@ -3796,7 +3798,15 @@ class ManagerServer(HealthAwareServer):
                             self._workflow_dispatcher.signal_cores_available()
 
                 # Store final result in JobManager first
-                await self._job_manager.record_sub_workflow_result(result.workflow_id, result)
+                recorded, parent_complete = await self._job_manager.record_sub_workflow_result(result.workflow_id, result)
+                await self._udp_logger.log(
+                    ServerError(
+                        message=f"[workflow_final_result] record_sub_workflow_result returned: recorded={recorded}, parent_complete={parent_complete}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
 
                 if parent_workflow_id is not None:
                     # This is a sub-workflow - check if parent is complete
