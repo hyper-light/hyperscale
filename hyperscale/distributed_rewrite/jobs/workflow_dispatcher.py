@@ -12,8 +12,6 @@ Key responsibilities:
 """
 
 import asyncio
-import time
-from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
 
 import cloudpickle
@@ -24,30 +22,14 @@ from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.jobs.workers.stage_priority import StagePriority
 from hyperscale.distributed_rewrite.models import (
     JobSubmission,
+    PendingWorkflow,
     WorkflowDispatch,
 )
-from hyperscale.distributed_rewrite.nodes.job_manager import (
+from hyperscale.distributed_rewrite.jobs.job_manager import (
     JobManager,
     TrackingToken,
-    WorkflowState,
 )
-from hyperscale.distributed_rewrite.nodes.worker_pool import WorkerPool
-
-
-@dataclass
-class PendingWorkflow:
-    """A workflow waiting to be dispatched."""
-    job_id: str
-    workflow_id: str
-    workflow_name: str
-    workflow: Workflow
-    vus: int
-    priority: StagePriority
-    is_test: bool
-    dependencies: set[str]           # workflow_ids this depends on
-    completed_dependencies: set[str] = field(default_factory=set)
-    dispatched: bool = False
-    cores_allocated: int = 0
+from hyperscale.distributed_rewrite.jobs.worker_pool import WorkerPool
 
 
 class WorkflowDispatcher:
@@ -116,7 +98,7 @@ class WorkflowDispatcher:
         # Build dependency graph
         graph = networkx.DiGraph()
         workflow_by_id: dict[str, tuple[str, Workflow, int]] = {}  # workflow_id -> (name, workflow, vus)
-        priorities: dict[str, DispatchPriority] = {}
+        priorities: dict[str, StagePriority] = {}
         is_test: dict[str, bool] = {}
 
         for i, wf in enumerate(workflows):

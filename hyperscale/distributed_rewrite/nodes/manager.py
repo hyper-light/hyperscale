@@ -116,24 +116,19 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarni
 from hyperscale.reporting.results import Results
 
 # New modular classes for job/workflow management
-from hyperscale.distributed_rewrite.nodes.job_manager import (
+from hyperscale.distributed_rewrite.jobs import (
     JobManager,
     TrackingToken,
     WorkflowState,
     JobInfo,
     WorkflowInfo,
     SubWorkflowInfo,
-)
-from hyperscale.distributed_rewrite.nodes.worker_pool import (
     WorkerPool,
     WorkerInfo,
     WorkerHealth,
-)
-from hyperscale.distributed_rewrite.nodes.workflow_dispatcher import (
     WorkflowDispatcher,
-    PendingWorkflow,
-    DispatchPriority,
 )
+from hyperscale.distributed_rewrite.models import PendingWorkflow
 
 
 class ManagerServer(HealthAwareServer):
@@ -327,11 +322,7 @@ class ManagerServer(HealthAwareServer):
         # Maps sub_workflow_id -> (worker_id, cores_reserved)
         self._unconfirmed_dispatches: dict[str, tuple[str, int]] = {}
 
-        # Eager dispatch tracking
-        # Pending workflows waiting for dependencies and/or cores
-        # Maps workflow_name -> EagerWorkflowEntry (contains all dispatch info)
-        self._eager_pending_workflows: dict[str, EagerWorkflowEntry] = {}
-        # Lock to prevent concurrent eager dispatch checks
+        # Lock for dispatch synchronization (used by WorkflowDispatcher)
         self._eager_dispatch_lock: asyncio.Lock | None = None
         self._workflow_results_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -3909,15 +3900,31 @@ class ManagerServer(HealthAwareServer):
                     if completion_event:
                         completion_event.set()
 
-                    # Eager dispatch: mark workflow complete and try to dispatch waiting workflows
-                    self._mark_workflow_completed_for_eager(progress.job_id, progress.workflow_name)
-                    submission = self._job_submissions.get(progress.job_id)
-                    if submission:
-                        self._task_runner.run(
-                            self._try_eager_dispatch,
-                            progress.job_id,
-                            submission,
-                        )
+                    # Notify WorkflowDispatcher of completion for dependency tracking
+                    if self._workflow_dispatcher:
+                        # Parse job_id from workflow_id (format: job_id:workflow_name)
+                        parts = progress.workflow_id.split(":")
+                        if len(parts) >= 2:
+                            jm_job_id = parts[0]
+                            # Find matching workflow_id in JobManager
+                            job_info = self._job_manager.get_job(jm_job_id)
+                            if job_info:
+                                for wf_id, wf_info in job_info.workflows.items():
+                                    if wf_info.name == progress.workflow_name:
+                                        self._task_runner.run(
+                                            self._workflow_dispatcher.mark_workflow_completed,
+                                            jm_job_id,
+                                            wf_id,
+                                        )
+                                        # Try to dispatch newly ready workflows
+                                        submission = self._job_submissions.get(jm_job_id)
+                                        if submission:
+                                            self._task_runner.run(
+                                                self._workflow_dispatcher.try_dispatch,
+                                                jm_job_id,
+                                                submission,
+                                            )
+                                        break
 
                 # Forward job progress to gates (if connected)
                 if self._known_gates or self._gate_addrs:
@@ -4192,14 +4199,28 @@ class ManagerServer(HealthAwareServer):
                 if self._known_gates or self._gate_addrs:
                     self._task_runner.run(self._send_job_progress_to_gate, job)
 
-            # Eager dispatch: mark workflow complete and try to dispatch waiting workflows
+            # Notify WorkflowDispatcher of completion for dependency tracking
             # This is critical for dependency-based execution - when a workflow completes,
             # dependent workflows may now be ready to run
-            if result.status == WorkflowStatus.COMPLETED.value:
-                self._mark_workflow_completed_for_eager(result.job_id, result.workflow_name)
-                submission = self._job_submissions.get(result.job_id)
-                if submission:
-                    await self._try_eager_dispatch(result.job_id, submission)
+            if result.status == WorkflowStatus.COMPLETED.value and self._workflow_dispatcher:
+                # Parse job_id from workflow_id to find matching workflow
+                parts = result.workflow_id.split(":")
+                if len(parts) >= 2:
+                    jm_job_id = parts[0]
+                    job_info = self._job_manager.get_job(jm_job_id)
+                    if job_info:
+                        for wf_id, wf_info in job_info.workflows.items():
+                            if wf_info.name == result.workflow_name:
+                                await self._workflow_dispatcher.mark_workflow_completed(
+                                    jm_job_id, wf_id
+                                )
+                                # Try to dispatch newly ready workflows
+                                submission = self._job_submissions.get(jm_job_id)
+                                if submission:
+                                    await self._workflow_dispatcher.try_dispatch(
+                                        jm_job_id, submission
+                                    )
+                                break
 
             # Check if job is complete
             if self._is_job_complete(result.job_id):
@@ -5814,8 +5835,18 @@ class ManagerServer(HealthAwareServer):
         self._job_callbacks.pop(job_id, None)
         self._job_submissions.pop(job_id, None)
 
-        # Clean up eager dispatch tracking for this job
-        self._cleanup_eager_dispatch(job_id)
+        # Clean up WorkflowDispatcher tracking for this job
+        if self._workflow_dispatcher:
+            self._task_runner.run(
+                self._workflow_dispatcher.cleanup_job,
+                job_id,
+            )
+
+        # Clean up JobManager tracking for this job
+        self._task_runner.run(
+            self._job_manager.complete_job,
+            job_id,
+        )
 
         # Remove workflow assignments for this job
         # _workflow_assignments is keyed by job_id, not workflow_id
@@ -6074,151 +6105,11 @@ class ManagerServer(HealthAwareServer):
                         )
                     )
 
-            # =================================================================
-            # Legacy dispatch logic (kept during migration)
-            # =================================================================
-
+            # Update job status
             job = self._jobs.get(submission.job_id)
-            if not job:
-                return
-
-            job.status = JobStatus.DISPATCHING.value
-            self._increment_version()
-            
-            # Build dependency graph
-            workflow_graph = networkx.DiGraph()
-            workflow_by_name: dict[str, tuple[int, Any]] = {}  # name -> (index, workflow)
-            workflow_vus: dict[str, int] = {}  # name -> vus (for passing to worker)
-            workflow_priorities: dict[str, StagePriority] = {}  # name -> priority
-            workflow_is_test: dict[str, bool] = {}  # name -> is_test_workflow
-            sources: list[str] = []  # Workflows with no dependencies
-            
-            for i, workflow in enumerate(workflows):
-                try:
-                    workflow = workflow()
-                    dependencies = []
-
-                    if isinstance(workflow, DependentWorkflow):
-                        dependencies = workflow.dependencies
-                        workflow = workflow.dependent_workflow
-
-                except Exception as e:
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerError(
-                            message=f"Failed to instantiate workflow {i}: {type(workflow).__name__} - {e}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    job.status = JobStatus.FAILED.value
-                    # Clean up any workflows already added
-                    self._cleanup_workflow_by_id_for_job(submission.job_id)
-                    return
-                
-
-                # At this point:
-                # - workflow is the inner workflow (DependentWorkflow was unwrapped above)
-                # - dependencies contains the list of dependency names (may be empty)
-                name = workflow.name
-
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Processing workflow {i}: {name}, deps={dependencies}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-
-                workflow_by_name[name] = (i, workflow)
-                workflow_vus[name] = getattr(workflow, 'vus', submission.vus)
-                workflow_priorities[name] = self._get_workflow_priority(workflow)
-                workflow_is_test[name] = self._is_test_workflow(workflow)
-                workflow_graph.add_node(name)
-
-                # Store workflow by ID for later lookup (e.g., aggregation)
-                workflow_id = f"{submission.job_id}:{name}"
-                self._workflow_by_id[workflow_id] = workflow
-
-                if dependencies:
-                    # Workflow has dependencies - add edges to the graph
-                    for dep in dependencies:
-                        workflow_graph.add_edge(dep, name)
-                else:
-                    # No dependencies - this is a source workflow
-                    sources.append(name)
-
-            
-            # If no sources, all workflows have dependencies - find roots
-            if not sources:
-                # Find nodes with no incoming edges
-                for node in workflow_graph.nodes():
-                    if workflow_graph.in_degree(node) == 0:
-                        sources.append(node)
-            
-            # If still no sources, we have a cycle - fail the job
-            if not sources:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerError(
-                        message=f"Job {submission.job_id} has circular workflow dependencies",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    ),
-                )
-                job.status = JobStatus.FAILED.value
-                self._cleanup_workflow_by_id_for_job(submission.job_id)
+            if job:
+                job.status = JobStatus.RUNNING.value
                 self._increment_version()
-                return
-
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Job {submission.job_id} graph built: {len(workflow_by_name)} workflows, {len(sources)} sources",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            
-            # Create completion events for all workflows
-            for name in workflow_by_name:
-                idx, _ = workflow_by_name[name]
-                workflow_id = f"{submission.job_id}:{idx}"
-                self._workflow_completion_events[workflow_id] = asyncio.Event()
-
-            # Register all workflows for eager dispatch tracking
-            # This sets up dependency tracking so workflows dispatch as soon as ready
-            self._register_workflows_for_eager_dispatch(
-                submission.job_id,
-                workflow_graph,
-                workflow_by_name,
-                workflow_vus,
-                workflow_priorities,
-                workflow_is_test,
-            )
-
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Registered {len(workflow_by_name)} workflows for eager dispatch, "
-                            f"{len(sources)} sources ready immediately",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-
-            # Dispatch initial workflows (sources with no dependencies)
-            # The eager dispatch system will handle dependent workflows as they become ready
-            await self._try_eager_dispatch(submission.job_id, submission)
-
-            job.status = JobStatus.RUNNING.value
-            self._increment_version()
 
         except Exception as e:
             import traceback
@@ -6226,562 +6117,17 @@ class ManagerServer(HealthAwareServer):
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(
-                    message=f"Initial dispatch failed: {e}",
+                    message=f"Workflow dispatch failed: {e}",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 ),
             )
-            job.status = JobStatus.FAILED.value
+            job = self._jobs.get(submission.job_id)
+            if job:
+                job.status = JobStatus.FAILED.value
             self._increment_version()
 
-    # =========================================================================
-    # Eager Dispatch System
-    # =========================================================================
-
-    def _register_workflows_for_eager_dispatch(
-        self,
-        job_id: str,
-        workflow_graph: networkx.DiGraph,
-        workflow_by_name: dict[str, tuple[int, Any]],
-        workflow_vus: dict[str, int],
-        workflow_priorities: dict[str, StagePriority],
-        workflow_is_test: dict[str, bool],
-    ) -> None:
-        """
-        Register all workflows from a job for eager dispatch tracking.
-
-        This sets up the dependency tracking so workflows can be dispatched
-        as soon as their dependencies complete and cores are available.
-        """
-        for wf_name, (idx, wf) in workflow_by_name.items():
-            # Get dependencies (predecessors in the graph)
-            dependencies = set(workflow_graph.predecessors(wf_name))
-
-            entry = EagerWorkflowEntry(
-                job_id=job_id,
-                workflow_name=wf_name,
-                workflow_idx=idx,
-                workflow=wf,
-                vus=workflow_vus.get(wf_name, 1),
-                priority=workflow_priorities.get(wf_name, StagePriority.AUTO),
-                is_test=workflow_is_test.get(wf_name, False),
-                dependencies=dependencies,
-                completed_dependencies=set(),
-                dispatched=False,
-            )
-
-            # Key by job_id:workflow_name for uniqueness
-            key = f"{job_id}:{wf_name}"
-            self._eager_pending_workflows[key] = entry
-
-    def _mark_workflow_completed_for_eager(self, job_id: str, workflow_name: str) -> None:
-        """
-        Mark a workflow as completed and update dependent workflows.
-
-        Called when a workflow completes. Updates all pending workflows
-        that depend on this one.
-        """
-        for key, entry in list(self._eager_pending_workflows.items()):
-            if entry.job_id != job_id:
-                continue
-            if workflow_name in entry.dependencies:
-                entry.completed_dependencies.add(workflow_name)
-
-    def _get_ready_workflows(self, job_id: str) -> list[EagerWorkflowEntry]:
-        """
-        Get workflows that are ready for dispatch.
-
-        A workflow is ready if:
-        1. It hasn't been dispatched yet
-        2. All its dependencies have completed
-        """
-        ready = []
-        for key, entry in self._eager_pending_workflows.items():
-            if entry.job_id != job_id:
-                continue
-            if entry.dispatched:
-                continue
-            # Check if all dependencies are satisfied
-            if entry.dependencies <= entry.completed_dependencies:
-                ready.append(entry)
-        return ready
-
-    async def _try_eager_dispatch(self, job_id: str, submission: JobSubmission) -> None:
-        """
-        Attempt to eagerly dispatch any workflows that are now ready.
-
-        Called when:
-        1. A workflow completes (dependencies may now be satisfied)
-        2. Cores become available
-
-        Uses a lock to prevent concurrent dispatch attempts.
-        """
-        try:
-
-            async with self._eager_dispatch_lock:
-                ready_workflows = self._get_ready_workflows(job_id)
-
-                if not ready_workflows:
-                    return
-
-                # Get current available cores
-                total_pool = self._get_total_available_cores()
-
-
-
-                if total_pool <= 0:
-                    # No cores available - workflows will be dispatched when cores free up
-                    return
-
-                # Separate EXCLUSIVE from others
-                exclusive = [e for e in ready_workflows if e.priority == StagePriority.EXCLUSIVE]
-                non_exclusive = [e for e in ready_workflows if e.priority != StagePriority.EXCLUSIVE]
-
-                # Handle EXCLUSIVE workflows - only one at a time with full pool
-                if exclusive:
-                    entry = exclusive[0]  # First-come first-serve
-                    entry.dispatched = True
-                    entry.cores_allocated = total_pool
-
-                    await self._udp_logger.log(
-                        ServerInfo(
-                            message=f"Eager dispatch: EXCLUSIVE workflow {entry.workflow_name} (cores={total_pool})",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-
-                    )
-
-                    # Dispatch and wait for completion before allowing more
-                    result = await self._dispatch_single_workflow(
-                        submission,
-                        entry.workflow_idx,
-                        entry.workflow,
-                        total_pool,
-                        entry.vus,
-                        entry.workflow_name,
-                    )
-                    if result is False or isinstance(result, Exception):
-
-                        await self._udp_logger.log(
-                            ServerError(
-                                message=f"Eager dispatch failed for EXCLUSIVE {entry.workflow_name}: {result}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
-
-                    return  # Don't dispatch others while EXCLUSIVE is pending
-
-                # For non-exclusive, calculate layer-style allocation
-                if not non_exclusive:
-                    return
-
-                # Build temporary structures for _calculate_layer_cores
-                layer_names = [e.workflow_name for e in non_exclusive]
-                temp_by_name = {e.workflow_name: (e.workflow_idx, e.workflow) for e in non_exclusive}
-                temp_priorities = {e.workflow_name: e.priority for e in non_exclusive}
-                temp_is_test = {e.workflow_name: e.is_test for e in non_exclusive}
-
-                try:
-                    layer_cores, _ = self._calculate_layer_cores(
-                        layer_names,
-                        temp_by_name,
-                        temp_priorities,
-                        temp_is_test,
-                        total_pool,
-                    )
-                except Exception as e:
-                    await self._udp_logger.log(
-                        ServerError(
-                            message=f"_calculate_layer_cores FAILED: {e}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-
-                    )
-                    raise
-
-                # Dispatch all ready non-exclusive workflows concurrently
-                dispatch_tasks = []
-                for entry in non_exclusive:
-                    cores = layer_cores.get(entry.workflow_name, 1)
-                    entry.dispatched = True
-                    entry.cores_allocated = cores
-
-                    dispatch_tasks.append(
-                        self._dispatch_single_workflow(
-                            submission,
-                            entry.workflow_idx,
-                            entry.workflow,
-                            cores,
-                            entry.vus,
-                            entry.workflow_name,
-                        )
-                    )
-
-                if dispatch_tasks:
-                    results = await asyncio.gather(*dispatch_tasks, return_exceptions=True)
-                    for i, result in enumerate(results):
-                        if isinstance(result, Exception) or result is False:
-                            entry = non_exclusive[i]
-                            await self._udp_logger.log(
-                                ServerInfo(
-                                    message=f"Eager dispatch failed for {entry.workflow_name}: {result}",
-                                    node_host=self._host,
-                                    node_port=self._tcp_port,
-                                    node_id=self._node_id.short,
-                                )
-                            )
-
-        except Exception as err:
-            await self.handle_exception(err, "_try_eager_dispatch")
-
-    def _cleanup_eager_dispatch(self, job_id: str) -> None:
-        """Remove all eager dispatch entries for a completed job."""
-        keys_to_remove = [
-            key for key, entry in self._eager_pending_workflows.items()
-            if entry.job_id == job_id
-        ]
-        for key in keys_to_remove:
-            self._eager_pending_workflows.pop(key, None)
-
-    async def _dispatch_single_workflow(
-        self,
-        submission: JobSubmission,
-        idx: int,
-        workflow: Any,
-        cores_needed: int,
-        vus: int,
-        workflow_name: str,
-    ) -> bool:
-        try:
-
-            """
-            Dispatch a workflow across multiple workers to satisfy core requirements.
-
-            Workers are treated as a unified pool. If a workflow needs 8 cores and
-            we have 2 workers with 4 cores each, the workflow is dispatched to BOTH
-            workers, each handling a portion of the VUs proportional to their cores.
-
-            Args:
-                submission: The job submission
-                idx: Workflow index within the job
-                workflow: The workflow instance
-                cores_needed: Total CPU cores to allocate across all workers
-                vus: Total virtual users (distributed proportionally across workers)
-                workflow_name: Name of the workflow for ID matching
-
-            Returns True if at least one dispatch succeeded, False otherwise.
-            """
-            # Use workflow_name format to match WorkflowProgress.workflow_id
-            workflow_id = f"{submission.job_id}:{workflow_name}"
-
-            # =================================================================
-            # Register workflow with JobManager using TrackingToken
-            # =================================================================
-            # Use index-based workflow_id for unique identification
-            wf_id = f"wf-{idx:04d}"
-            await self._job_manager.register_workflow(
-                job_id=submission.job_id,
-                workflow_id=wf_id,
-                name=workflow_name,
-                workflow=workflow,
-            )
-
-            # Resource-aware waiting with event-driven notification
-            # When cores are freed, _cores_available_event is signaled
-            max_wait = submission.timeout_seconds
-            start_time = time.monotonic()
-            wait_timeout = self.env.MANAGER_DISPATCH_CORE_WAIT_TIMEOUT  # Max time per wait iteration
-            logged_waiting = False
-
-            worker_allocations: list[tuple[str, int]] = []
-            while True:
-                waited = time.monotonic() - start_time
-                if waited >= max_wait:
-                    print('AA')
-                    break
-
-                # Try to select workers from the pool to satisfy total core requirement
-                # Use lock to ensure atomic selection + reservation (prevents race conditions)
-                print('A')
-                async with self._core_allocation_lock:
-                    worker_allocations = self._select_workers_for_workflow_pool(cores_needed)
-                    total_allocated = sum(cores for _, cores in worker_allocations)
-
-                    if total_allocated >= cores_needed:
-                        # Immediately reserve cores by decrementing available_cores
-                        # This prevents other concurrent dispatches from claiming the same cores
-                        # Worker heartbeats will provide authoritative counts going forward
-                        for worker_id, cores_to_reserve in worker_allocations:
-                            worker_status = self._worker_status.get(worker_id)
-                            if worker_status:
-                                updated_status = WorkerHeartbeat(
-                                    node_id=worker_status.node_id,
-                                    state=worker_status.state,
-                                    available_cores=max(0, worker_status.available_cores - cores_to_reserve),
-                                    queue_depth=worker_status.queue_depth,
-                                    cpu_percent=worker_status.cpu_percent,
-                                    memory_percent=worker_status.memory_percent,
-                                    version=worker_status.version,
-                                    active_workflows=worker_status.active_workflows,
-                                )
-                                self._worker_status[worker_id] = updated_status
-
-                    print('B')
-
-                # Log success outside the lock
-                if total_allocated >= cores_needed:
-                    print('C')
-                    workers_str = ", ".join(f"{w}({c})" for w, c in worker_allocations)
-
-                    await self._udp_logger.log(
-                        ServerInfo(
-                            message=f"Selected workers for {workflow_id}: {workers_str} (total={total_allocated} cores)",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    break
-
-
-                print('D')
-                # Log that we're waiting for resources (once)
-                if not logged_waiting:
-                    logged_waiting = True
-
-                    await self._udp_logger.log(
-                        ServerInfo(
-                            message=f"Waiting for {cores_needed} cores for {workflow_id} (only {total_allocated} available)",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-
-                # Clear the event before waiting (so we catch new signals)
-                self._cores_available_event.clear()
-
-                print('E')
-
-                # Wait for cores to become available (event-driven) or timeout
-                try:
-                    remaining_time = max_wait - waited
-                    actual_timeout = min(wait_timeout, remaining_time)
-                    await asyncio.wait_for(
-                        self._cores_available_event.wait(),
-                        timeout=actual_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    pass  # Timeout is expected - just re-check availability
-
-
-                print('F')
-
-            waited = time.monotonic() - start_time
-
-            print('G')
-
-            total_allocated = sum(cores for _, cores in worker_allocations)
-            if total_allocated == 0:
-                print('H')
-                await self._udp_logger.log(
-                    ServerInfo(
-                        message=f"Timeout waiting for cores for {workflow_id} after {waited:.1f}s (0 available)",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                return False
-
-            if waited > 0:
-                await self._udp_logger.log(
-                    ServerInfo(
-                        message=f"Found {total_allocated} cores for {workflow_id} after {waited:.1f}s wait",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-
-            print('I')
-
-            # Extract dependency context once (shared across all worker dispatches)
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Extracting context for {workflow_id}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-            dependency_context = await self._extract_dependency_context(
-                submission.job_id, workflow
-            )
-            context_version = self._job_layer_version.get(submission.job_id, 0)
-
-            # Serialize workflow once (shared across all dispatches)
-            workflow_bytes = cloudpickle.dumps(workflow)
-            context_bytes = cloudpickle.dumps({})
-
-            # Initialize sub-workflow tracking for this parent workflow
-            self._sub_workflow_mapping[workflow_id] = []
-
-            print('J', worker_allocations)
-
-            # Dispatch to each worker with their portion of cores/vus
-            successful_dispatches = 0
-            for worker_idx, (worker_id, worker_cores) in enumerate(worker_allocations):
-
-
-                print('K')
-                # Calculate VUs for this worker proportionally
-                # e.g., if worker gets 4 of 8 cores, it gets 50% of VUs
-                worker_vus = int(vus * (worker_cores / total_allocated))
-                # Ensure at least 1 VU if we're allocating cores
-                worker_vus = max(worker_vus, 1) if worker_cores > 0 else 0
-
-                # Create sub-workflow ID: job_id:workflow_idx:worker_idx
-                sub_workflow_id = f"{workflow_id}:{worker_idx}"
-
-                # Track this sub-workflow
-                self._sub_workflow_mapping[workflow_id].append(sub_workflow_id)
-
-                # =============================================================
-                # Register sub-workflow with JobManager
-                # =============================================================
-                await self._job_manager.register_sub_workflow(
-                    job_id=submission.job_id,
-                    workflow_id=wf_id,  # Parent workflow ID (wf-XXXX)
-                    worker_id=worker_id,
-                    cores_allocated=worker_cores,
-                )
-
-                print('M', self._sub_workflow_mapping[workflow_id])
-
-                # Track as unconfirmed until worker reports assigned_cores > 0
-                # This allows us to know which dispatches are waiting for confirmation
-                self._unconfirmed_dispatches[sub_workflow_id] = (worker_id, worker_cores)
-
-                # Create provision request for quorum
-                provision = ProvisionRequest(
-                    job_id=submission.job_id,
-                    workflow_id=sub_workflow_id,
-                    target_worker=worker_id,
-                    cores_required=worker_cores,
-                    fence_token=self._get_fence_token(),
-                    version=self._state_version,
-                )
-
-                # Request quorum (skip if only one manager)
-                peer_addrs = self._get_active_peer_tcp_addrs()
-                if peer_addrs:
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerInfo(
-                            message=f"Requesting quorum for {sub_workflow_id}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    try:
-                        await self._request_quorum_confirmation(provision)
-                        await self._send_provision_commit(provision)
-                    except (QuorumCircuitOpenError, QuorumUnavailableError, QuorumTimeoutError) as e:
-                        self._task_runner.run(
-                            self._udp_logger.log,
-                            ServerError(
-                                message=f"Quorum failed for {sub_workflow_id}: {e.message}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
-                        continue  # Try next worker
-                else:
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerInfo(
-                            message=f"Skipping quorum for {sub_workflow_id} (single manager mode)",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-
-                print(list(self._sub_workflow_mapping.keys()))
-
-                # Dispatch to this worker
-                dispatch = WorkflowDispatch(
-                    job_id=submission.job_id,
-                    workflow_id=sub_workflow_id,
-                    workflow=workflow_bytes,
-                    context=context_bytes,
-                    vus=worker_vus,
-                    cores=worker_cores,
-                    timeout_seconds=submission.timeout_seconds,
-                    fence_token=provision.fence_token,
-                    context_version=context_version,
-                    dependency_context=dependency_context,
-                )
-
-                # Store dispatch bytes for potential retry
-                dispatch_bytes = dispatch.dump()
-                self._workflow_retries[sub_workflow_id] = (0, dispatch_bytes, set())
-
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Dispatching {sub_workflow_id} to worker {worker_id} (cores={worker_cores}, vus={worker_vus})",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-
-                ack = await self._dispatch_workflow_to_worker(worker_id, dispatch)
-                if ack and ack.accepted:
-                    successful_dispatches += 1
-                    # Track assignment for this sub-workflow
-                    if submission.job_id not in self._workflow_assignments:
-                        self._workflow_assignments[submission.job_id] = {}
-                    self._workflow_assignments[submission.job_id][sub_workflow_id] = worker_id
-
-                    # Update workflow status in job.workflows to RUNNING
-                    job = self._jobs.get(submission.job_id)
-                    if job:
-                        for wf_progress in job.workflows:
-                            # Match by workflow_id prefix (parent workflow)
-                            if wf_progress.workflow_id == workflow_id or wf_progress.workflow_id.startswith(f"{workflow_id}:"):
-                                wf_progress.status = WorkflowStatus.RUNNING.value
-                                break
-                        self._increment_version()
-                else:
-                    await self._udp_logger.log(
-                        ServerError(
-                            message=f"Dispatch rejected for {sub_workflow_id} by worker {worker_id}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-
-            return successful_dispatches > 0
-        
-        except Exception as err:
-           import traceback
-           print(traceback.format_exc())
-           await self.handle_exception(err, "_dispatch_single_workflow")
-    
     # =========================================================================
     # TCP Handlers - Quorum
     # =========================================================================

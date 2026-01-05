@@ -14,38 +14,19 @@ Key responsibilities:
 
 import asyncio
 import time
-from dataclasses import dataclass, field
 from typing import Callable
 
 from hyperscale.distributed_rewrite.models import (
     WorkerHeartbeat,
     WorkerRegistration,
     WorkerState,
+    WorkerStatus,
 )
 
 
-# Re-export WorkerState for backwards compatibility (aliased as WorkerHealth)
+# Re-export for backwards compatibility
+WorkerInfo = WorkerStatus
 WorkerHealth = WorkerState
-
-
-@dataclass
-class WorkerInfo:
-    """Information about a registered worker."""
-    node_id: str
-    registration: WorkerRegistration
-    heartbeat: WorkerHeartbeat | None = None
-    health: WorkerState = WorkerState.HEALTHY
-    last_seen: float = field(default_factory=time.monotonic)
-
-    # Core tracking
-    total_cores: int = 0
-    available_cores: int = 0
-    reserved_cores: int = 0  # Cores reserved but not yet confirmed by worker
-
-    @property
-    def short_id(self) -> str:
-        """Get short form of node ID for display."""
-        return self.node_id[:12] if len(self.node_id) > 12 else self.node_id
 
 
 class WorkerPool:
@@ -74,8 +55,8 @@ class WorkerPool:
         self._health_grace_period = health_grace_period
         self._get_swim_status = get_swim_status
 
-        # Worker storage - node_id -> WorkerInfo
-        self._workers: dict[str, WorkerInfo] = {}
+        # Worker storage - node_id -> WorkerStatus
+        self._workers: dict[str, WorkerStatus] = {}
 
         # Quick lookup by address
         self._addr_to_worker: dict[tuple[str, int], str] = {}  # (host, port) -> node_id
@@ -96,7 +77,7 @@ class WorkerPool:
     async def register_worker(
         self,
         registration: WorkerRegistration,
-    ) -> WorkerInfo:
+    ) -> WorkerStatus:
         """
         Register a new worker or update existing registration.
 
@@ -112,11 +93,11 @@ class WorkerPool:
                 worker.last_seen = time.monotonic()
                 return worker
 
-            # Create new worker info
-            worker = WorkerInfo(
-                node_id=node_id,
+            # Create new worker status
+            worker = WorkerStatus(
+                worker_id=node_id,
+                state=WorkerState.HEALTHY.value,
                 registration=registration,
-                health=WorkerHealth.UNKNOWN,
                 last_seen=time.monotonic(),
                 total_cores=registration.total_cores or 0,
                 available_cores=registration.available_cores or 0,
@@ -146,23 +127,24 @@ class WorkerPool:
                 return False
 
             # Remove address lookup
-            addr = (worker.registration.node.host, worker.registration.node.port)
-            self._addr_to_worker.pop(addr, None)
+            if worker.registration:
+                addr = (worker.registration.node.host, worker.registration.node.port)
+                self._addr_to_worker.pop(addr, None)
 
             return True
 
-    def get_worker(self, node_id: str) -> WorkerInfo | None:
+    def get_worker(self, node_id: str) -> WorkerStatus | None:
         """Get worker info by node ID."""
         return self._workers.get(node_id)
 
-    def get_worker_by_addr(self, addr: tuple[str, int]) -> WorkerInfo | None:
+    def get_worker_by_addr(self, addr: tuple[str, int]) -> WorkerStatus | None:
         """Get worker info by (host, port) address."""
         node_id = self._addr_to_worker.get(addr)
         if node_id:
             return self._workers.get(node_id)
         return None
 
-    def iter_workers(self) -> list[WorkerInfo]:
+    def iter_workers(self) -> list[WorkerStatus]:
         """Get a snapshot of all workers."""
         return list(self._workers.values())
 
@@ -170,7 +152,7 @@ class WorkerPool:
     # Health Tracking
     # =========================================================================
 
-    def update_health(self, node_id: str, health: WorkerHealth) -> bool:
+    def update_health(self, node_id: str, health: WorkerState) -> bool:
         """
         Update worker health status.
 
@@ -196,7 +178,7 @@ class WorkerPool:
             return False
 
         # Check SWIM status if callback provided
-        if self._get_swim_status:
+        if self._get_swim_status and worker.registration:
             addr = (worker.registration.node.host,
                     worker.registration.node.udp_port or worker.registration.node.port)
             swim_status = self._get_swim_status(addr)
@@ -206,9 +188,9 @@ class WorkerPool:
                 return False
 
         # Check explicit health status
-        if worker.health == WorkerHealth.HEALTHY:
+        if worker.health == WorkerState.HEALTHY:
             return True
-        if worker.health in (WorkerHealth.SUSPECT, WorkerHealth.DEAD):
+        if worker.health in (WorkerState.DRAINING, WorkerState.OFFLINE):
             return False
 
         # Grace period for newly registered workers

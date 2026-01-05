@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from hyperscale.core.graph import Workflow
 from hyperscale.core.state import Context
+from hyperscale.core.jobs.models import WorkflowResults
+from typing import Any
 from .message import Message
 
 
@@ -130,7 +132,7 @@ class UpdateTier(str, Enum):
 class NodeInfo(Message):
     """
     Identity information for any node in the cluster.
-    
+
     Used for registration, heartbeats, and state sync.
     """
     node_id: str                 # Unique node identifier
@@ -139,6 +141,7 @@ class NodeInfo(Message):
     port: int                    # TCP port
     datacenter: str              # Datacenter identifier
     version: int = 0             # State version (Lamport clock)
+    udp_port: int = 0            # UDP port for SWIM (defaults to 0, derived from port if not set)
 
 
 @dataclass(slots=True)
@@ -159,16 +162,73 @@ class ManagerInfo(Message):
 
 
 @dataclass(slots=True, kw_only=True)
+class ManagerPeerRegistration(Message):
+    """
+    Registration request from one manager to another peer manager.
+
+    When a manager discovers a new peer (via SWIM or seed list),
+    it sends this registration to establish the bidirectional relationship.
+    """
+    node: ManagerInfo            # Registering manager's info
+    term: int                    # Current leadership term
+    is_leader: bool              # Whether registering manager is leader
+
+
+@dataclass(slots=True, kw_only=True)
+class ManagerPeerRegistrationResponse(Message):
+    """
+    Registration acknowledgment from manager to peer manager.
+
+    Contains list of all known peer managers so the registering
+    manager can discover the full cluster topology.
+    """
+    accepted: bool                          # Whether registration was accepted
+    manager_id: str                         # Responding manager's node_id
+    is_leader: bool                         # Whether responding manager is leader
+    term: int                               # Responding manager's term
+    known_peers: list[ManagerInfo]          # All known peer managers (for discovery)
+    error: str | None = None                # Error message if not accepted
+
+
+@dataclass(slots=True, kw_only=True)
 class RegistrationResponse(Message):
     """
     Registration acknowledgment from manager to worker.
-    
+
     Contains list of all known healthy managers so worker can
     establish redundant communication channels.
     """
     accepted: bool                          # Whether registration was accepted
     manager_id: str                         # Responding manager's node_id
     healthy_managers: list[ManagerInfo]     # All known healthy managers (including self)
+    error: str | None = None                # Error message if not accepted
+
+
+@dataclass(slots=True, kw_only=True)
+class ManagerToWorkerRegistration(Message):
+    """
+    Registration request from manager to worker.
+
+    Enables bidirectional registration: workers register with managers,
+    AND managers can register with workers discovered via state sync.
+    This speeds up cluster formation by allowing managers to proactively
+    reach out to workers they learn about from peer managers.
+    """
+    manager: ManagerInfo                    # Registering manager's info
+    is_leader: bool                         # Whether this manager is the cluster leader
+    term: int                               # Current leadership term
+    known_managers: list[ManagerInfo] = field(default_factory=list)  # Other managers worker should know
+
+
+@dataclass(slots=True, kw_only=True)
+class ManagerToWorkerRegistrationAck(Message):
+    """
+    Acknowledgment from worker to manager registration.
+    """
+    accepted: bool                          # Whether registration was accepted
+    worker_id: str                          # Worker's node_id
+    total_cores: int = 0                    # Worker's total cores
+    available_cores: int = 0                # Worker's available cores
     error: str | None = None                # Error message if not accepted
 
 
@@ -309,7 +369,7 @@ class WorkerRegistration(Message):
 class WorkerHeartbeat(Message):
     """
     Periodic heartbeat from worker to manager.
-    
+
     Contains current state and resource utilization.
     """
     node_id: str                 # Worker identifier
@@ -321,6 +381,9 @@ class WorkerHeartbeat(Message):
     version: int                 # State version for sync
     # Active workflows and their status
     active_workflows: dict[str, str] = field(default_factory=dict)
+    # TCP address for routing (populated in UDP heartbeats)
+    tcp_host: str = ""
+    tcp_port: int = 0
 
 
 @dataclass(slots=True)
@@ -355,6 +418,11 @@ class ManagerHeartbeat(Message):
     state: str = "active"        # ManagerState value (syncing/active/draining)
     tcp_host: str = ""           # Manager's TCP host (for proper storage key)
     tcp_port: int = 0            # Manager's TCP port (for proper storage key)
+    udp_host: str = ""           # Manager's UDP host (for SWIM registration)
+    udp_port: int = 0            # Manager's UDP port (for SWIM registration)
+    # Per-job leadership - piggybacked on SWIM UDP for distributed consistency
+    # Maps job_id -> (fencing_token, layer_version) for jobs this manager leads
+    job_leaderships: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -466,13 +534,13 @@ class StepStats(Message):
 class WorkflowProgress(Message):
     """
     Progress update for a running workflow.
-    
+
     Sent from worker to manager during execution.
-    
+
     Key fields for rapid provisioning:
     - assigned_cores: Which CPU cores are executing this workflow
     - cores_completed: How many cores have finished their portion
-    
+
     When cores_completed > 0, the manager can immediately provision new
     workflows to the freed cores without waiting for the entire workflow
     to complete on all cores.
@@ -491,28 +559,35 @@ class WorkflowProgress(Message):
     cores_completed: int = 0     # Cores that have finished their portion
     avg_cpu_percent: float = 0.0   # Average CPU utilization
     avg_memory_mb: float = 0.0     # Average memory usage in MB
+    vus: int = 0                   # Virtual users (from workflow config)
+    worker_workflow_assigned_cores: int = 0
+    worker_workflow_completed_cores: int = 0
+    worker_available_cores: int = 0 # Available cores for worker.
 
 
 @dataclass(slots=True)
 class WorkflowFinalResult(Message):
     """
     Final result of a workflow execution.
-    
+
     Sent from worker to manager when a workflow completes (success or failure).
     This triggers:
     1. Context storage (for dependent workflows)
     2. Job completion check
     3. Final result aggregation
-    
+    4. Core availability update (manager uses worker_available_cores to track capacity)
+
     Note: WorkflowStats already contains run_id, elapsed, and step results.
     """
     job_id: str                  # Parent job
     workflow_id: str             # Workflow instance
     workflow_name: str           # Workflow class name
     status: str                  # COMPLETED | FAILED
-    results: bytes               # Cloudpickled WorkflowStats
+    results: dict[int, WorkflowResults]               # Cloudpickled dict[int, WorkflowResults]
     context_updates: bytes       # Cloudpickled context dict (for Provide hooks)
     error: str | None = None     # Error message if failed (no traceback)
+    worker_id: str = ""          # Worker that executed this workflow
+    worker_available_cores: int = 0  # Worker's available cores after completion
 
 
 @dataclass(slots=True)
@@ -612,7 +687,7 @@ class JobProgress(Message):
 class GlobalJobStatus(Message):
     """
     Global job status aggregated by gate across datacenters.
-    
+
     This is what gets returned to the client.
     """
     job_id: str                  # Job identifier
@@ -625,6 +700,39 @@ class GlobalJobStatus(Message):
     completed_datacenters: int = 0  # DCs finished
     failed_datacenters: int = 0  # DCs failed
     timestamp: float = 0.0       # Monotonic time when job was submitted
+
+
+@dataclass(slots=True)
+class JobLeadershipAnnouncement(Message):
+    """
+    Announcement of job leadership to peer managers.
+
+    When a manager accepts a job, it broadcasts this to all peer managers
+    so they know who the job leader is. This enables:
+    - Proper routing of workflow results to job leader
+    - Correct forwarding of context updates
+    - Job state consistency across the manager cluster
+    - Workflow query support (non-leaders can report job status)
+    """
+    job_id: str                  # Job being led
+    leader_id: str               # Node ID of the job leader
+    leader_host: str             # Host of the job leader
+    leader_tcp_port: int         # TCP port of the job leader
+    term: int                    # Cluster term when job was accepted
+    workflow_count: int = 0      # Number of workflows in job
+    timestamp: float = 0.0       # When job was accepted
+    # Workflow names for query support (non-leaders can track job contents)
+    workflow_names: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class JobLeadershipAck(Message):
+    """
+    Acknowledgment of job leadership announcement.
+    """
+    job_id: str                  # Job being acknowledged
+    accepted: bool               # Whether announcement was accepted
+    responder_id: str            # Node ID of responder
 
 
 # =============================================================================
@@ -700,7 +808,7 @@ class JobBatchPush(Message):
 class WorkerStateSnapshot(Message):
     """
     Complete state snapshot from a worker.
-    
+
     Used for state sync when a new manager becomes leader.
     """
     node_id: str                 # Worker identifier
@@ -708,6 +816,10 @@ class WorkerStateSnapshot(Message):
     total_cores: int             # Total cores
     available_cores: int         # Free cores
     version: int                 # State version
+    # Host/port for registration reconstruction during state sync
+    host: str = ""
+    tcp_port: int = 0
+    udp_port: int = 0
     active_workflows: dict[str, "WorkflowProgress"] = field(default_factory=dict)
 
 
@@ -727,6 +839,7 @@ class ManagerStateSnapshot(Message):
     jobs: dict[str, "JobProgress"] = field(default_factory=dict)
     # Context consistency protocol state
     job_leaders: dict[str, str] = field(default_factory=dict)  # job_id -> leader_node_id
+    job_leader_addrs: dict[str, tuple[str, int]] = field(default_factory=dict)  # job_id -> (host, tcp_port)
     job_layer_versions: dict[str, int] = field(default_factory=dict)  # job_id -> layer version
     job_contexts: bytes = b''  # Serialized contexts (cloudpickle)
 
@@ -950,10 +1063,10 @@ class LeaseTransfer(Message):
 class DatacenterStatus(Message):
     """
     Status of a datacenter for routing decisions.
-    
+
     Used by gates to classify datacenter health and make
     intelligent routing decisions with fallback support.
-    
+
     See AD-16 in docs/architecture.md for design rationale.
     """
     dc_id: str                       # Datacenter identifier
@@ -963,3 +1076,240 @@ class DatacenterStatus(Message):
     manager_count: int = 0           # Responding managers (via SWIM)
     worker_count: int = 0            # Available workers
     last_update: float = 0.0         # Timestamp of last status update
+
+
+# =============================================================================
+# Ping/Health Check Messages
+# =============================================================================
+
+@dataclass(slots=True)
+class PingRequest(Message):
+    """
+    Ping request from client to manager or gate.
+
+    Used for health checking and status retrieval without
+    submitting a job. Returns current node state.
+    """
+    request_id: str                  # Unique request identifier
+
+
+@dataclass(slots=True, kw_only=True)
+class WorkerStatus(Message):
+    """
+    Status of a single worker as seen by a manager.
+
+    Used for:
+    1. Wire protocol: ManagerPingResponse reports per-worker health
+    2. Internal tracking: Manager's WorkerPool tracks worker state
+
+    The registration/heartbeat/last_seen/reserved_cores fields are
+    optional and only used for internal manager tracking (not serialized
+    for wire protocol responses).
+
+    Properties provide compatibility aliases (node_id -> worker_id, health -> state).
+    """
+    worker_id: str                   # Worker's node_id
+    state: str                       # WorkerState value (as string for wire)
+    available_cores: int = 0         # Currently available cores
+    total_cores: int = 0             # Total cores on worker
+    queue_depth: int = 0             # Pending workflows
+    cpu_percent: float = 0.0         # CPU utilization
+    memory_percent: float = 0.0      # Memory utilization
+    # Manager-internal tracking fields (not used in wire protocol)
+    registration: "WorkerRegistration | None" = None  # Full registration info
+    heartbeat: "WorkerHeartbeat | None" = None        # Last heartbeat received
+    last_seen: float = 0.0                            # Monotonic time of last contact
+    reserved_cores: int = 0                           # Cores reserved but not confirmed
+
+    @property
+    def node_id(self) -> str:
+        """Alias for worker_id (internal use)."""
+        return self.worker_id
+
+    @property
+    def health(self) -> WorkerState:
+        """Get state as WorkerState enum (internal use)."""
+        try:
+            return WorkerState(self.state)
+        except ValueError:
+            return WorkerState.OFFLINE
+
+    @health.setter
+    def health(self, value: WorkerState) -> None:
+        """Set state from WorkerState enum (internal use)."""
+        object.__setattr__(self, 'state', value.value)
+
+    @property
+    def short_id(self) -> str:
+        """Get short form of node ID for display."""
+        return self.worker_id[:12] if len(self.worker_id) > 12 else self.worker_id
+
+
+@dataclass(slots=True, kw_only=True)
+class ManagerPingResponse(Message):
+    """
+    Ping response from a manager.
+
+    Contains manager status, worker health, and active job info.
+    """
+    request_id: str                  # Echoed from request
+    manager_id: str                  # Manager's node_id
+    datacenter: str                  # Datacenter identifier
+    host: str                        # Manager TCP host
+    port: int                        # Manager TCP port
+    is_leader: bool                  # Whether this manager is the DC leader
+    state: str                       # ManagerState value
+    term: int                        # Current leadership term
+    # Capacity
+    total_cores: int = 0             # Total cores across all workers
+    available_cores: int = 0         # Available cores (healthy workers only)
+    # Workers
+    worker_count: int = 0            # Total registered workers
+    healthy_worker_count: int = 0    # Workers responding to SWIM
+    workers: list[WorkerStatus] = field(default_factory=list)  # Per-worker status
+    # Jobs
+    active_job_ids: list[str] = field(default_factory=list)  # Currently active jobs
+    active_job_count: int = 0        # Number of active jobs
+    active_workflow_count: int = 0   # Number of active workflows
+    # Cluster info
+    peer_managers: list[tuple[str, int]] = field(default_factory=list)  # Known peer manager addrs
+
+
+@dataclass(slots=True, kw_only=True)
+class DatacenterInfo(Message):
+    """
+    Information about a datacenter as seen by a gate.
+
+    Used in GatePingResponse to report per-DC status.
+    """
+    dc_id: str                       # Datacenter identifier
+    health: str                      # DatacenterHealth value
+    leader_addr: tuple[str, int] | None = None  # DC leader's TCP address
+    available_cores: int = 0         # Available cores in DC
+    manager_count: int = 0           # Managers in DC
+    worker_count: int = 0            # Workers in DC
+
+
+@dataclass(slots=True, kw_only=True)
+class GatePingResponse(Message):
+    """
+    Ping response from a gate.
+
+    Contains gate status and datacenter health info.
+    """
+    request_id: str                  # Echoed from request
+    gate_id: str                     # Gate's node_id
+    datacenter: str                  # Gate's home datacenter
+    host: str                        # Gate TCP host
+    port: int                        # Gate TCP port
+    is_leader: bool                  # Whether this gate is the gate cluster leader
+    state: str                       # GateState value
+    term: int                        # Current leadership term
+    # Datacenters
+    datacenters: list[DatacenterInfo] = field(default_factory=list)  # Per-DC status
+    active_datacenter_count: int = 0 # Number of active datacenters
+    # Jobs
+    active_job_ids: list[str] = field(default_factory=list)  # Currently active jobs
+    active_job_count: int = 0        # Number of active jobs
+    # Cluster info
+    peer_gates: list[tuple[str, int]] = field(default_factory=list)  # Known peer gate addrs
+
+
+# =============================================================================
+# Workflow Query Messages
+# =============================================================================
+
+@dataclass(slots=True, kw_only=True)
+class WorkflowQueryRequest(Message):
+    """
+    Request to query workflow status by name.
+
+    Client sends this to managers or gates to get status of specific
+    workflows. Unknown workflow names are silently ignored.
+    """
+    request_id: str                      # Unique request identifier
+    workflow_names: list[str]            # Workflow class names to query
+    job_id: str | None = None            # Optional: filter to specific job
+
+
+@dataclass(slots=True, kw_only=True)
+class WorkflowStatusInfo(Message):
+    """
+    Status information for a single workflow.
+
+    Returned as part of WorkflowQueryResponse.
+    """
+    workflow_name: str                   # Workflow class name
+    workflow_id: str                     # Unique workflow instance ID
+    job_id: str                          # Parent job ID
+    status: str                          # WorkflowStatus value
+    # Provisioning info
+    provisioned_cores: int = 0           # Cores allocated to this workflow
+    vus: int = 0                         # Virtual users (from workflow config)
+    # Progress info
+    completed_count: int = 0             # Actions completed
+    failed_count: int = 0                # Actions failed
+    rate_per_second: float = 0.0         # Current execution rate
+    elapsed_seconds: float = 0.0         # Time since start
+    # Queue info
+    is_enqueued: bool = False            # True if waiting for cores
+    queue_position: int = 0              # Position in queue (0 if not queued)
+    # Worker assignment
+    assigned_workers: list[str] = field(default_factory=list)  # Worker IDs
+
+
+@dataclass(slots=True, kw_only=True)
+class WorkflowQueryResponse(Message):
+    """
+    Response to workflow query from a manager.
+
+    Contains status for all matching workflows.
+    """
+    request_id: str                      # Echoed from request
+    manager_id: str                       # Responding manager's node_id
+    datacenter: str                      # Manager's datacenter
+    workflows: list[WorkflowStatusInfo] = field(default_factory=list)
+
+
+@dataclass(slots=True, kw_only=True)
+class DatacenterWorkflowStatus(Message):
+    """
+    Workflow status for a single datacenter.
+
+    Used in GateWorkflowQueryResponse to group results by DC.
+    """
+    dc_id: str                           # Datacenter identifier
+    workflows: list[WorkflowStatusInfo] = field(default_factory=list)
+
+
+@dataclass(slots=True, kw_only=True)
+class GateWorkflowQueryResponse(Message):
+    """
+    Response to workflow query from a gate.
+
+    Contains status grouped by datacenter.
+    """
+    request_id: str                      # Echoed from request
+    gate_id: str                         # Responding gate's node_id
+    datacenters: list[DatacenterWorkflowStatus] = field(default_factory=list)
+
+
+@dataclass
+class EagerWorkflowEntry:
+    """
+    Tracking entry for a workflow pending eager dispatch.
+
+    Contains all information needed to dispatch the workflow once
+    its dependencies are met and cores are available.
+    """
+    job_id: str                          # Parent job ID
+    workflow_name: str                   # Workflow name (graph node)
+    workflow_idx: int                    # Index in job's workflow list
+    workflow: Any                        # The workflow instance
+    vus: int                             # Virtual users for this workflow
+    priority: "StagePriority"            # Workflow priority
+    is_test: bool                        # Whether this is a test workflow
+    dependencies: set[str]               # Set of workflow names this depends on
+    completed_dependencies: set[str] = field(default_factory=set)  # Dependencies that have completed
+    dispatched: bool = False             # Whether this workflow has been dispatched
+    cores_allocated: int = 0             # Cores allocated (set at dispatch time)

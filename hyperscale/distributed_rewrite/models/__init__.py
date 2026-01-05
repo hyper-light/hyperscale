@@ -26,7 +26,11 @@ from .distributed import (
     # Node identity (Worker <-> Manager)
     NodeInfo as NodeInfo,
     ManagerInfo as ManagerInfo,
+    ManagerPeerRegistration as ManagerPeerRegistration,
+    ManagerPeerRegistrationResponse as ManagerPeerRegistrationResponse,
     RegistrationResponse as RegistrationResponse,
+    ManagerToWorkerRegistration as ManagerToWorkerRegistration,
+    ManagerToWorkerRegistrationAck as ManagerToWorkerRegistrationAck,
     WorkflowProgressAck as WorkflowProgressAck,
     WorkerRegistration as WorkerRegistration,
     WorkerHeartbeat as WorkerHeartbeat,
@@ -53,6 +57,9 @@ from .distributed import (
     GlobalJobResult as GlobalJobResult,
     JobProgress as JobProgress,
     GlobalJobStatus as GlobalJobStatus,
+    # Job leadership (per-job leader tracking)
+    JobLeadershipAnnouncement as JobLeadershipAnnouncement,
+    JobLeadershipAck as JobLeadershipAck,
     # Client push notifications
     JobStatusPush as JobStatusPush,
     DCStats as DCStats,
@@ -79,6 +86,19 @@ from .distributed import (
     LeaseTransfer as LeaseTransfer,
     # Datacenter health
     DatacenterStatus as DatacenterStatus,
+    # Ping/health check
+    PingRequest as PingRequest,
+    WorkerStatus as WorkerStatus,
+    ManagerPingResponse as ManagerPingResponse,
+    DatacenterInfo as DatacenterInfo,
+    GatePingResponse as GatePingResponse,
+    # Workflow query
+    WorkflowQueryRequest as WorkflowQueryRequest,
+    WorkflowStatusInfo as WorkflowStatusInfo,
+    WorkflowQueryResponse as WorkflowQueryResponse,
+    DatacenterWorkflowStatus as DatacenterWorkflowStatus,
+    GateWorkflowQueryResponse as GateWorkflowQueryResponse,
+    EagerWorkflowEntry as EagerWorkflowEntry,
 )
 
 # CRDTs for cross-datacenter synchronization
@@ -87,4 +107,9 @@ from .crdt import (
     LWWRegister as LWWRegister,
     LWWMap as LWWMap,
     JobStatsCRDT as JobStatsCRDT,
+)
+
+# Internal job tracking models
+from .jobs import (
+    PendingWorkflow as PendingWorkflow,
 )
