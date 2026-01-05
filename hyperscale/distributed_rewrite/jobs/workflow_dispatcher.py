@@ -2,16 +2,19 @@
 Workflow Dispatcher - Manages workflow dispatch to workers.
 
 This class handles the logic for dispatching workflows to workers,
-including dependency tracking, eager dispatch, and resource allocation.
+including dependency tracking, eager dispatch, resource allocation,
+and workflow timeout/eviction.
 
 Key responsibilities:
 - Workflow dependency graph management
 - Eager dispatch (dispatch as soon as dependencies are satisfied)
 - Core allocation coordination with WorkerPool
 - Dispatch request building and sending
+- Workflow timeout tracking and eviction
 """
 
 import asyncio
+import time
 from typing import Any, Callable, Coroutine
 
 import cloudpickle
@@ -47,6 +50,8 @@ class WorkflowDispatcher:
         send_dispatch: Callable[[str, WorkflowDispatch], Coroutine[Any, Any, bool]],
         datacenter: str,
         manager_id: str,
+        default_timeout_seconds: float = 300.0,
+        on_workflow_evicted: Callable[[str, str, str], Coroutine[Any, Any, None]] | None = None,
     ):
         """
         Initialize WorkflowDispatcher.
@@ -58,12 +63,17 @@ class WorkflowDispatcher:
                           Takes (worker_node_id, dispatch) and returns success bool
             datacenter: Datacenter identifier
             manager_id: This manager's node ID
+            default_timeout_seconds: Default timeout for workflows (can be overridden per-job)
+            on_workflow_evicted: Optional callback when a workflow is evicted due to timeout
+                               Takes (job_id, workflow_id, reason) and is awaited
         """
         self._job_manager = job_manager
         self._worker_pool = worker_pool
         self._send_dispatch = send_dispatch
         self._datacenter = datacenter
         self._manager_id = manager_id
+        self._default_timeout_seconds = default_timeout_seconds
+        self._on_workflow_evicted = on_workflow_evicted
 
         # Pending workflows waiting for dependencies/cores
         # Key: f"{job_id}:{workflow_id}"
@@ -143,6 +153,9 @@ class WorkflowDispatcher:
                 return False
 
         # Register pending workflows
+        now = time.monotonic()
+        timeout = submission.timeout_seconds or self._default_timeout_seconds
+
         async with self._pending_lock:
             for workflow_id, (name, workflow, vus) in workflow_by_id.items():
                 # Get dependencies from graph
@@ -158,6 +171,8 @@ class WorkflowDispatcher:
                     priority=priorities[workflow_id],
                     is_test=is_test[workflow_id],
                     dependencies=dependencies,
+                    registered_at=now,
+                    timeout_seconds=timeout,
                 )
 
         return True
@@ -274,6 +289,8 @@ class WorkflowDispatcher:
                 continue
             if pending.dispatched:
                 continue
+            if pending.dispatch_in_progress:
+                continue  # Skip workflows with dispatch already in progress
             # Check if all dependencies are satisfied
             if pending.dependencies <= pending.completed_dependencies:
                 ready.append(pending)
@@ -342,79 +359,156 @@ class WorkflowDispatcher:
         Allocates cores from the worker pool and sends dispatch
         messages to the selected workers.
 
+        Uses dispatch_in_progress flag to prevent race conditions:
+        - Set flag BEFORE async allocation (prevents concurrent dispatch attempts)
+        - Only set dispatched=True AFTER successful allocation
+        - Clear flag on failure so workflow can be retried
+
         Returns True if dispatch succeeded.
         """
-        # Mark as dispatched (prevents duplicate dispatch)
-        pending.dispatched = True
-        pending.cores_allocated = cores_needed
+        # Mark dispatch in progress (atomic check-and-set would be better but
+        # this runs under dispatch_lock so we're safe)
+        if pending.dispatch_in_progress:
+            return False  # Another dispatch is already in progress
+        pending.dispatch_in_progress = True
 
-        # Allocate cores from worker pool
-        allocations = await self._worker_pool.allocate_cores(
-            cores_needed,
-            timeout=submission.timeout_seconds,
-        )
-
-        if not allocations:
-            # No cores available - revert dispatch status
-            pending.dispatched = False
-            return False
-
-        total_allocated = sum(cores for _, cores in allocations)
-
-        # Serialize workflow
-        workflow_bytes = cloudpickle.dumps(pending.workflow)
-        context_bytes = cloudpickle.dumps({})
-
-        # Create tracking token
-        workflow_token = TrackingToken.for_workflow(
-            self._datacenter,
-            self._manager_id,
-            pending.job_id,
-            pending.workflow_id,
-        )
-
-        # Dispatch to each worker
-        successful = 0
-        for worker_id, worker_cores in allocations:
-            # Calculate VUs for this worker
-            worker_vus = max(1, int(pending.vus * (worker_cores / total_allocated)))
-
-            # Create sub-workflow token
-            sub_token = workflow_token.to_sub_workflow_token(worker_id)
-
-            # Register sub-workflow with JobManager
-            await self._job_manager.register_sub_workflow(
-                job_id=pending.job_id,
-                workflow_id=pending.workflow_id,
-                worker_id=worker_id,
-                cores_allocated=worker_cores,
+        try:
+            # Allocate cores from worker pool
+            allocations = await self._worker_pool.allocate_cores(
+                cores_needed,
+                timeout=submission.timeout_seconds,
             )
 
-            # Create dispatch message
-            dispatch = WorkflowDispatch(
-                job_id=pending.job_id,
-                workflow_id=str(sub_token),  # Use full tracking token
-                workflow=workflow_bytes,
-                context=context_bytes,
-                vus=worker_vus,
-                cores=worker_cores,
-                timeout_seconds=submission.timeout_seconds,
-                fence_token=0,  # TODO: Get from quorum manager
-                context_version=0,
+            if not allocations:
+                # No cores available - keep workflow eligible for future dispatch
+                return False
+
+            # Allocation succeeded - NOW mark as dispatched
+            pending.dispatched = True
+            pending.dispatched_at = time.monotonic()
+            pending.cores_allocated = cores_needed
+
+            total_allocated = sum(cores for _, cores in allocations)
+
+            # Serialize workflow
+            workflow_bytes = cloudpickle.dumps(pending.workflow)
+            context_bytes = cloudpickle.dumps({})
+
+            # Create tracking token
+            workflow_token = TrackingToken.for_workflow(
+                self._datacenter,
+                self._manager_id,
+                pending.job_id,
+                pending.workflow_id,
             )
 
-            # Send dispatch
-            try:
-                success = await self._send_dispatch(worker_id, dispatch)
-                if success:
-                    await self._worker_pool.confirm_allocation(worker_id, worker_cores)
-                    successful += 1
-                else:
+            # Dispatch to each worker
+            successful = 0
+            for worker_id, worker_cores in allocations:
+                # Calculate VUs for this worker
+                worker_vus = max(1, int(pending.vus * (worker_cores / total_allocated)))
+
+                # Create sub-workflow token
+                sub_token = workflow_token.to_sub_workflow_token(worker_id)
+
+                # Register sub-workflow with JobManager
+                await self._job_manager.register_sub_workflow(
+                    job_id=pending.job_id,
+                    workflow_id=pending.workflow_id,
+                    worker_id=worker_id,
+                    cores_allocated=worker_cores,
+                )
+
+                # Create dispatch message
+                dispatch = WorkflowDispatch(
+                    job_id=pending.job_id,
+                    workflow_id=str(sub_token),  # Use full tracking token
+                    workflow=workflow_bytes,
+                    context=context_bytes,
+                    vus=worker_vus,
+                    cores=worker_cores,
+                    timeout_seconds=submission.timeout_seconds,
+                    fence_token=0,  # TODO: Get from quorum manager
+                    context_version=0,
+                )
+
+                # Send dispatch
+                try:
+                    success = await self._send_dispatch(worker_id, dispatch)
+                    if success:
+                        await self._worker_pool.confirm_allocation(worker_id, worker_cores)
+                        successful += 1
+                    else:
+                        await self._worker_pool.release_cores(worker_id, worker_cores)
+                except Exception:
                     await self._worker_pool.release_cores(worker_id, worker_cores)
-            except Exception:
-                await self._worker_pool.release_cores(worker_id, worker_cores)
 
-        return successful > 0
+            # If ALL dispatches failed, revert dispatch status so it can be retried
+            if successful == 0:
+                pending.dispatched = False
+                pending.dispatched_at = 0.0
+
+            return successful > 0
+
+        finally:
+            # Always clear the in-progress flag
+            pending.dispatch_in_progress = False
+
+    # =========================================================================
+    # Timeout and Eviction
+    # =========================================================================
+
+    async def check_timeouts(self) -> list[tuple[str, str, str]]:
+        """
+        Check for timed-out workflows and evict them.
+
+        Should be called periodically (e.g., every 30 seconds) by the manager.
+
+        Returns list of (job_id, workflow_id, reason) for evicted workflows.
+        """
+        now = time.monotonic()
+        evicted: list[tuple[str, str, str]] = []
+
+        async with self._pending_lock:
+            keys_to_evict = []
+
+            for key, pending in self._pending.items():
+                # Check for timeout based on registration time
+                # This catches workflows stuck waiting for dependencies or cores
+                age = now - pending.registered_at
+                if age > pending.timeout_seconds:
+                    if pending.dispatched:
+                        reason = f"Dispatched workflow timed out after {age:.1f}s"
+                    else:
+                        reason = f"Pending workflow timed out after {age:.1f}s"
+                    keys_to_evict.append((key, pending.job_id, pending.workflow_id, reason))
+
+            # Remove evicted workflows
+            for key, job_id, workflow_id, reason in keys_to_evict:
+                self._pending.pop(key, None)
+                evicted.append((job_id, workflow_id, reason))
+
+        # Call eviction callback outside the lock
+        if self._on_workflow_evicted:
+            for job_id, workflow_id, reason in evicted:
+                try:
+                    await self._on_workflow_evicted(job_id, workflow_id, reason)
+                except Exception:
+                    pass  # Don't let callback failures propagate
+
+        return evicted
+
+    def get_pending_count(self, job_id: str | None = None) -> int:
+        """Get count of pending workflows (optionally filtered by job_id)."""
+        if job_id is None:
+            return len(self._pending)
+        return sum(1 for p in self._pending.values() if p.job_id == job_id)
+
+    def get_dispatched_count(self, job_id: str | None = None) -> int:
+        """Get count of dispatched workflows (optionally filtered by job_id)."""
+        if job_id is None:
+            return sum(1 for p in self._pending.values() if p.dispatched)
+        return sum(1 for p in self._pending.values() if p.job_id == job_id and p.dispatched)
 
     # =========================================================================
     # Cleanup
