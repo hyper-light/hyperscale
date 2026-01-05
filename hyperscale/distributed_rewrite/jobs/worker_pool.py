@@ -285,6 +285,10 @@ class WorkerPool:
             if elapsed >= timeout:
                 return None
 
+            # Use a local event for this specific wait to avoid race conditions
+            # The pattern is: check inside lock, only wait if not satisfied
+            should_wait = False
+
             async with self._allocation_lock:
                 allocations = self._select_workers_for_allocation(cores_needed)
                 total_allocated = sum(cores for _, cores in allocations)
@@ -298,16 +302,21 @@ class WorkerPool:
 
                     return allocations
 
-            # Wait for cores to become available
-            self._cores_available.clear()
-            remaining = timeout - elapsed
-            try:
-                await asyncio.wait_for(
-                    self._cores_available.wait(),
-                    timeout=min(5.0, remaining),  # Check every 5s max
-                )
-            except asyncio.TimeoutError:
-                pass  # Re-check availability
+                # Not enough cores - prepare to wait
+                # Clear inside lock to avoid missing signals
+                self._cores_available.clear()
+                should_wait = True
+
+            # Wait for cores to become available (outside lock)
+            if should_wait:
+                remaining = timeout - elapsed
+                try:
+                    await asyncio.wait_for(
+                        self._cores_available.wait(),
+                        timeout=min(5.0, remaining),  # Check every 5s max
+                    )
+                except asyncio.TimeoutError:
+                    pass  # Re-check availability
 
     def _select_workers_for_allocation(
         self,
@@ -406,8 +415,24 @@ class WorkerPool:
         Wait for cores to become available.
 
         Returns True if cores became available, False on timeout.
+
+        Note: This method clears the event inside the allocation lock
+        to prevent race conditions where a signal could be missed.
         """
-        self._cores_available.clear()
+        async with self._allocation_lock:
+            # Check if any cores are already available
+            total_available = sum(
+                worker.available_cores - worker.reserved_cores
+                for worker in self._workers.values()
+                if self.is_worker_healthy(worker.node_id)
+            )
+            if total_available > 0:
+                return True
+
+            # Clear inside lock to avoid missing signals
+            self._cores_available.clear()
+
+        # Wait outside lock
         try:
             await asyncio.wait_for(
                 self._cores_available.wait(),
