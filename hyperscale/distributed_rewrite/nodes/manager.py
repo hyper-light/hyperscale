@@ -792,7 +792,7 @@ class ManagerServer(HealthAwareServer):
             worker_state.node_id,
             worker_state.version,
         ):
-            # Convert to heartbeat format for storage
+            # Convert to heartbeat format and update WorkerPool
             heartbeat = WorkerHeartbeat(
                 node_id=worker_state.node_id,
                 state=worker_state.state,
@@ -806,15 +806,8 @@ class ManagerServer(HealthAwareServer):
                     for wf_id, progress in worker_state.active_workflows.items()
                 },
             )
-            self._worker_status[worker_state.node_id] = heartbeat
-            
-            # Update workflow assignments from worker's state
-            for wf_id, progress in worker_state.active_workflows.items():
-                job_id = wf_id.rsplit(":", 1)[0] if ":" in wf_id else wf_id
-                if job_id not in self._workflow_assignments:
-                    self._workflow_assignments[job_id] = {}
-                self._workflow_assignments[job_id][wf_id] = worker_state.node_id
-            
+            await self._worker_pool.update_heartbeat(worker_state.node_id, heartbeat)
+
             return worker_state
         return None
     
