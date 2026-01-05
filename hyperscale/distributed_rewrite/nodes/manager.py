@@ -3748,6 +3748,51 @@ class ManagerServer(HealthAwareServer):
             )
 
             # =================================================================
+            # Forward to job leader if we're not the leader
+            # =================================================================
+            # The job state (workflows, sub-workflows) only exists on the job leader.
+            # If a worker sends a result to the wrong manager, forward it.
+            if not self._is_job_leader(result.job_id):
+                leader_addr = self._get_job_leader_addr(result.job_id)
+                if leader_addr:
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=f"[workflow_final_result] Forwarding to job leader at {leader_addr} (we are not leader for job {result.job_id})",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    try:
+                        response, _ = await self.send_tcp(
+                            leader_addr,
+                            "workflow_final_result",
+                            data,  # Forward the raw data
+                            timeout=5.0,
+                        )
+                        return response if response else b'ok'
+                    except Exception as forward_err:
+                        await self._udp_logger.log(
+                            ServerError(
+                                message=f"[workflow_final_result] Failed to forward to leader: {forward_err}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+                        return b'error'
+                else:
+                    await self._udp_logger.log(
+                        ServerError(
+                            message=f"[workflow_final_result] Not job leader and no leader addr known for job {result.job_id}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    # Fall through - maybe we have the job locally anyway
+
+            # =================================================================
             # Record result in JobManager (new system)
             # =================================================================
             # Parse the workflow_id to extract job_id and workflow components

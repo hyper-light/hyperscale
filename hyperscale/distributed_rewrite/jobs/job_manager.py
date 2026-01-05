@@ -181,7 +181,7 @@ class JobManager:
             self._jobs[job_token_str] = job
 
             await self._logger.log(JobManagerError(
-                message=f"[create_job] SUCCESS: created job_token={job_token_str}, job_id={submission.job_id}",
+                message=f"[create_job] SUCCESS: created job_token={job_token_str}, job_id={submission.job_id}, JobManager id={id(self)}",
                 manager_id=self._manager_id,
                 datacenter=self._datacenter,
                 job_id=submission.job_id,
