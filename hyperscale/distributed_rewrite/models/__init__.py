@@ -111,5 +111,9 @@ from .crdt import (
 
 # Internal job tracking models
 from .jobs import (
+    TrackingToken as TrackingToken,
+    WorkflowInfo as WorkflowInfo,
+    SubWorkflowInfo as SubWorkflowInfo,
+    JobInfo as JobInfo,
     PendingWorkflow as PendingWorkflow,
 )

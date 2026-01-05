@@ -28,10 +28,8 @@ from hyperscale.distributed_rewrite.models import (
     PendingWorkflow,
     WorkflowDispatch,
 )
-from hyperscale.distributed_rewrite.jobs.job_manager import (
-    JobManager,
-    TrackingToken,
-)
+from hyperscale.distributed_rewrite.jobs.job_manager import JobManager
+from hyperscale.distributed_rewrite.models import TrackingToken
 from hyperscale.distributed_rewrite.jobs.worker_pool import WorkerPool
 from hyperscale.distributed_rewrite.jobs.logging_models import (
     DispatcherTrace,

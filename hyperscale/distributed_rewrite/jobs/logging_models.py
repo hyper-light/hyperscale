@@ -215,3 +215,67 @@ class AllocatorCritical(Entry, kw_only=True):
     available_cores: int
     active_workflows: int
     level: LogLevel = LogLevel.CRITICAL
+
+
+# =============================================================================
+# JobManager Logging Models
+# =============================================================================
+
+class JobManagerTrace(Entry, kw_only=True):
+    """Trace-level logging for JobManager operations."""
+    manager_id: str
+    datacenter: str
+    job_id: str = ""
+    workflow_id: str = ""
+    sub_workflow_token: str = ""
+    level: LogLevel = LogLevel.TRACE
+
+
+class JobManagerDebug(Entry, kw_only=True):
+    """Debug-level logging for JobManager operations."""
+    manager_id: str
+    datacenter: str
+    job_id: str = ""
+    workflow_id: str = ""
+    sub_workflow_token: str = ""
+    level: LogLevel = LogLevel.DEBUG
+
+
+class JobManagerInfo(Entry, kw_only=True):
+    """Info-level logging for JobManager operations."""
+    manager_id: str
+    datacenter: str
+    job_id: str = ""
+    workflow_id: str = ""
+    sub_workflow_token: str = ""
+    level: LogLevel = LogLevel.INFO
+
+
+class JobManagerWarning(Entry, kw_only=True):
+    """Warning-level logging for JobManager operations."""
+    manager_id: str
+    datacenter: str
+    job_id: str = ""
+    workflow_id: str = ""
+    sub_workflow_token: str = ""
+    level: LogLevel = LogLevel.WARN
+
+
+class JobManagerError(Entry, kw_only=True):
+    """Error-level logging for JobManager operations."""
+    manager_id: str
+    datacenter: str
+    job_id: str = ""
+    workflow_id: str = ""
+    sub_workflow_token: str = ""
+    level: LogLevel = LogLevel.ERROR
+
+
+class JobManagerCritical(Entry, kw_only=True):
+    """Critical-level logging for JobManager operations."""
+    manager_id: str
+    datacenter: str
+    job_id: str = ""
+    workflow_id: str = ""
+    sub_workflow_token: str = ""
+    level: LogLevel = LogLevel.CRITICAL

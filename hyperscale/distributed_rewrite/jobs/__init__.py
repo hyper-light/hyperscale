@@ -23,8 +23,8 @@ Logging models:
 - AllocatorTrace/Debug/Info/Warning/Error/Critical
 """
 
-from hyperscale.distributed_rewrite.jobs.job_manager import (
-    JobManager as JobManager,
+from hyperscale.distributed_rewrite.jobs.job_manager import JobManager as JobManager
+from hyperscale.distributed_rewrite.models import (
     JobInfo as JobInfo,
     WorkflowInfo as WorkflowInfo,
     SubWorkflowInfo as SubWorkflowInfo,
