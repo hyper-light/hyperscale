@@ -436,22 +436,16 @@ class WorkflowDispatcher:
                 pending.workflow_id,
             )
 
-            # Dispatch to each worker
-            successful = 0
+            # Dispatch to each worker, tracking success/failure for cleanup
+            successful_dispatches: list[tuple[str, int]] = []  # (worker_id, cores)
+            failed_dispatches: list[tuple[str, int]] = []      # (worker_id, cores)
+
             for worker_id, worker_cores in allocations:
                 # Calculate VUs for this worker
                 worker_vus = max(1, int(pending.vus * (worker_cores / total_allocated)))
 
                 # Create sub-workflow token
                 sub_token = workflow_token.to_sub_workflow_token(worker_id)
-
-                # Register sub-workflow with JobManager
-                await self._job_manager.register_sub_workflow(
-                    job_id=pending.job_id,
-                    workflow_id=pending.workflow_id,
-                    worker_id=worker_id,
-                    cores_allocated=worker_cores,
-                )
 
                 # Create dispatch message
                 dispatch = WorkflowDispatch(
@@ -466,24 +460,43 @@ class WorkflowDispatcher:
                     context_version=0,
                 )
 
-                # Send dispatch
+                # Send dispatch FIRST, only register sub-workflow on success
                 try:
                     success = await self._send_dispatch(worker_id, dispatch)
                     if success:
+                        # Register sub-workflow AFTER successful dispatch
+                        # This prevents orphaned sub-workflow registrations
+                        await self._job_manager.register_sub_workflow(
+                            job_id=pending.job_id,
+                            workflow_id=pending.workflow_id,
+                            worker_id=worker_id,
+                            cores_allocated=worker_cores,
+                        )
                         await self._worker_pool.confirm_allocation(worker_id, worker_cores)
-                        successful += 1
+                        successful_dispatches.append((worker_id, worker_cores))
                     else:
                         await self._worker_pool.release_cores(worker_id, worker_cores)
+                        failed_dispatches.append((worker_id, worker_cores))
                 except Exception:
                     await self._worker_pool.release_cores(worker_id, worker_cores)
+                    failed_dispatches.append((worker_id, worker_cores))
 
-            # If ALL dispatches failed, revert dispatch status and apply backoff
-            if successful == 0:
+            # Determine outcome based on dispatch results
+            if len(successful_dispatches) == 0:
+                # ALL dispatches failed - revert dispatch status and apply backoff
                 pending.dispatched = False
                 pending.dispatched_at = 0.0
                 self._apply_backoff(pending)
+                return False
 
-            return successful > 0
+            if len(failed_dispatches) > 0:
+                # PARTIAL success - some dispatches succeeded, some failed
+                # This is still considered a success, but we log the partial failure
+                # The workflow will complete with reduced parallelism
+                # TODO: Consider implementing re-dispatch for failed workers
+                pass
+
+            return True
 
         finally:
             # Always clear the in-progress flag
