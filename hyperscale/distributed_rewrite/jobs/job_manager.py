@@ -108,6 +108,10 @@ class JobManager:
         self._workflow_to_job: dict[str, str] = {}  # workflow_token_str -> job_token_str
         self._sub_workflow_to_job: dict[str, str] = {}  # sub_workflow_token_str -> job_token_str
 
+        # Fence token tracking for at-most-once dispatch
+        # Monotonically increasing per job to ensure workers can reject stale dispatches
+        self._job_fence_tokens: dict[str, int] = {}  # job_id -> current fence token
+
         # Global lock for job creation/deletion (not per-job operations)
         self._global_lock = asyncio.Lock()
 
@@ -148,6 +152,29 @@ class JobManager:
         return TrackingToken.for_sub_workflow(
             self._datacenter, self._manager_id, job_id, workflow_id, worker_id
         )
+
+    # =========================================================================
+    # Fence Token Management
+    # =========================================================================
+
+    def get_next_fence_token(self, job_id: str) -> int:
+        """
+        Get the next fence token for a job and increment the counter.
+
+        Fence tokens are monotonically increasing per job. Workers use these
+        to reject stale/duplicate dispatch requests, ensuring at-most-once
+        delivery even when network issues cause retries.
+
+        Thread-safe: uses simple dict operations which are atomic in CPython.
+        """
+        current = self._job_fence_tokens.get(job_id, 0)
+        next_token = current + 1
+        self._job_fence_tokens[job_id] = next_token
+        return next_token
+
+    def get_current_fence_token(self, job_id: str) -> int:
+        """Get the current fence token for a job without incrementing."""
+        return self._job_fence_tokens.get(job_id, 0)
 
     # =========================================================================
     # Job Lifecycle
@@ -863,5 +890,8 @@ class JobManager:
                 self._workflow_to_job.pop(wf_token_str, None)
             for sub_wf_token_str in job.sub_workflows:
                 self._sub_workflow_to_job.pop(sub_wf_token_str, None)
+
+            # Clean up fence token tracking
+            self._job_fence_tokens.pop(job_id, None)
 
             return True

@@ -559,6 +559,9 @@ class WorkflowDispatcher:
                 # Create sub-workflow token
                 sub_token = workflow_token.to_sub_workflow_token(worker_id)
 
+                # Get fence token for at-most-once dispatch
+                fence_token = self._job_manager.get_next_fence_token(pending.job_id)
+
                 # Create dispatch message
                 dispatch = WorkflowDispatch(
                     job_id=pending.job_id,
@@ -568,7 +571,7 @@ class WorkflowDispatcher:
                     vus=worker_vus,
                     cores=worker_cores,
                     timeout_seconds=submission.timeout_seconds,
-                    fence_token=0,  # TODO: Get from quorum manager
+                    fence_token=fence_token,
                     context_version=0,
                 )
 
