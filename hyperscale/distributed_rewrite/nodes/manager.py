@@ -5224,12 +5224,8 @@ class ManagerServer(HealthAwareServer):
         """
         Update worker available cores based on workflow progress.
 
-        Two-phase confirmation model:
-        1. When workflow is dispatched, we optimistically decrement available_cores
-           and track it as "unconfirmed" in _unconfirmed_dispatches.
-        2. When we receive progress with worker_workflow_assigned_cores > 0,
-           the workflow is confirmed. We then use worker_available_cores from
-           the progress update as the authoritative source.
+        Uses JobManager to look up the sub-workflow and get the worker_id,
+        then updates WorkerPool with the worker's reported available cores.
 
         Args:
             progress: New progress update
@@ -5237,92 +5233,28 @@ class ManagerServer(HealthAwareServer):
         """
         workflow_id = progress.workflow_id
 
-        # Check if this workflow is unconfirmed (waiting for worker to assign cores)
-        if workflow_id in self._unconfirmed_dispatches:
-            worker_id, cores_reserved = self._unconfirmed_dispatches[workflow_id]
-
-            # Check if worker has confirmed core assignment
-            if progress.worker_workflow_assigned_cores > 0:
-                # Workflow is confirmed - remove from unconfirmed tracking
-                del self._unconfirmed_dispatches[workflow_id]
-
-                # Use worker_available_cores as authoritative source
-                worker_status = self._worker_status.get(worker_id)
-                if worker_status:
-                    updated_status = WorkerHeartbeat(
-                        node_id=worker_status.node_id,
-                        state=worker_status.state,
-                        available_cores=progress.worker_available_cores,
-                        queue_depth=worker_status.queue_depth,
-                        cpu_percent=worker_status.cpu_percent,
-                        memory_percent=worker_status.memory_percent,
-                        version=worker_status.version,
-                        active_workflows=worker_status.active_workflows,
-                    )
-                    self._worker_status[worker_id] = updated_status
-
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerInfo(
-                            message=f"Workflow {workflow_id} confirmed on {worker_id} "
-                                    f"(assigned={progress.worker_workflow_assigned_cores}, "
-                                    f"worker_available={progress.worker_available_cores})",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-
-                    # Signal cores available in case availability increased
-                    if progress.worker_available_cores > 0:
-                        self._cores_available_event.set()
-                        # Also notify WorkflowDispatcher for event-driven dispatch
-                        if self._workflow_dispatcher:
-                            self._workflow_dispatcher.signal_cores_available()
+        # Look up the sub-workflow in JobManager to get the worker_id
+        job = self._job_manager.get_job_for_sub_workflow(workflow_id)
+        if not job:
             return
 
-        # For confirmed workflows, continue using worker_available_cores from progress
-        # Find the worker for this workflow
-        job_id = progress.job_id
-        job_assignments = self._workflow_assignments.get(job_id, {})
-        worker_id = job_assignments.get(workflow_id)
-        if not worker_id:
+        sub_wf = job.sub_workflows.get(workflow_id)
+        if not sub_wf or not sub_wf.worker_id:
             return
 
-        # Get worker status
-        worker_status = self._worker_status.get(worker_id)
-        if not worker_status:
-            return
+        worker_id = sub_wf.worker_id
 
-        # Update available cores from worker's reported availability
-        if progress.worker_available_cores != worker_status.available_cores:
-            updated_status = WorkerHeartbeat(
-                node_id=worker_status.node_id,
-                state=worker_status.state,
-                available_cores=progress.worker_available_cores,
-                queue_depth=worker_status.queue_depth,
-                cpu_percent=worker_status.cpu_percent,
-                memory_percent=worker_status.memory_percent,
-                version=worker_status.version,
-                active_workflows=worker_status.active_workflows,
-            )
-            self._worker_status[worker_id] = updated_status
+        # Update WorkerPool with the worker's reported availability
+        updated = await self._worker_pool.update_worker_cores_from_progress(
+            worker_id,
+            progress.worker_available_cores,
+        )
 
-            # Signal if cores became available
-            if progress.worker_available_cores > worker_status.available_cores:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Worker {worker_id} availability updated: {worker_status.available_cores} -> {progress.worker_available_cores}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-                self._cores_available_event.set()
-                # Also notify WorkflowDispatcher for event-driven dispatch
-                if self._workflow_dispatcher:
-                    self._workflow_dispatcher.signal_cores_available()
+        if updated and progress.worker_available_cores > 0:
+            # Signal cores available for event-driven dispatch
+            self._cores_available_event.set()
+            if self._workflow_dispatcher:
+                self._workflow_dispatcher.signal_cores_available()
 
     # =========================================================================
     # Client Push Notifications (when gates not present)

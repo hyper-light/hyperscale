@@ -422,6 +422,39 @@ class WorkerPool:
 
             return True
 
+    async def update_worker_cores_from_progress(
+        self,
+        node_id: str,
+        worker_available_cores: int,
+    ) -> bool:
+        """
+        Update worker's available cores from workflow progress report.
+
+        Progress reports from workers include their current available_cores,
+        which is more recent than heartbeat data. This method updates the
+        worker's availability and signals if cores became available.
+
+        Thread-safe: uses allocation lock.
+
+        Returns True if worker was found and updated.
+        """
+        async with self._allocation_lock:
+            worker = self._workers.get(node_id)
+            if not worker:
+                return False
+
+            old_available = worker.available_cores
+            worker.available_cores = worker_available_cores
+
+            # Clear reservations since progress is authoritative
+            worker.reserved_cores = 0
+
+            # Signal if cores became available
+            if worker.available_cores > old_available:
+                self._cores_available.set()
+
+            return True
+
     # =========================================================================
     # Wait Helpers
     # =========================================================================
