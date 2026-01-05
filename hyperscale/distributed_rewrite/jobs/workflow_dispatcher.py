@@ -107,6 +107,20 @@ class WorkflowDispatcher:
         # Lock to prevent concurrent eager dispatch attempts
         self._dispatch_lock = asyncio.Lock()
 
+        # Event-driven dispatch: signaled when dispatch should be attempted
+        # Set when: workflow ready_event is set, cores become available, retry timer expires
+        self._dispatch_trigger: asyncio.Event = asyncio.Event()
+
+        # Active dispatch loops per job
+        # Key: job_id -> asyncio.Task running the dispatch loop
+        self._job_dispatch_tasks: dict[str, asyncio.Task] = {}
+
+        # Job submissions cache for dispatch loop access
+        self._job_submissions: dict[str, JobSubmission] = {}
+
+        # Shutdown flag
+        self._shutting_down: bool = False
+
     # =========================================================================
     # Workflow Registration
     # =========================================================================
@@ -189,7 +203,7 @@ class WorkflowDispatcher:
                 dependencies = set(graph.predecessors(workflow_id))
 
                 key = f"{job_id}:{workflow_id}"
-                self._pending[key] = PendingWorkflow(
+                pending = PendingWorkflow(
                     job_id=job_id,
                     workflow_id=workflow_id,
                     workflow_name=name,
@@ -203,6 +217,10 @@ class WorkflowDispatcher:
                     next_retry_delay=self.INITIAL_RETRY_DELAY,
                     max_dispatch_attempts=self._max_dispatch_attempts,
                 )
+                self._pending[key] = pending
+
+                # Signal workflows with no dependencies as ready immediately
+                pending.check_and_signal_ready()
 
         return True
 
@@ -245,7 +263,12 @@ class WorkflowDispatcher:
         Mark a workflow as completed and update dependents.
 
         Called when a workflow completes successfully. Updates
-        all pending workflows that depend on this one.
+        all pending workflows that depend on this one and signals
+        any that are now ready for dispatch.
+
+        This is event-driven: dependent workflows waiting on this
+        completion will have their ready_event set if all their
+        dependencies are now satisfied.
         """
         async with self._pending_lock:
             # Update all pending workflows that depend on this one
@@ -254,6 +277,8 @@ class WorkflowDispatcher:
                     continue
                 if workflow_id in pending.dependencies:
                     pending.completed_dependencies.add(workflow_id)
+                    # Check if this workflow is now ready and signal if so
+                    pending.check_and_signal_ready()
 
     # =========================================================================
     # Eager Dispatch
@@ -533,6 +558,179 @@ class WorkflowDispatcher:
             pending.next_retry_delay * self.BACKOFF_MULTIPLIER,
             self.MAX_RETRY_DELAY,
         )
+        # Clear ready state - will be re-signaled after backoff
+        pending.clear_ready()
+
+    # =========================================================================
+    # Event-Driven Dispatch Loop
+    # =========================================================================
+
+    async def start_job_dispatch(self, job_id: str, submission: JobSubmission) -> None:
+        """
+        Start the event-driven dispatch loop for a job.
+
+        This launches a background task that:
+        1. Waits for workflows to become ready (dependencies satisfied)
+        2. Waits for cores to become available
+        3. Dispatches ready workflows as resources allow
+
+        The loop continues until all workflows are dispatched or the job completes.
+        """
+        if job_id in self._job_dispatch_tasks:
+            return  # Already running
+
+        self._job_submissions[job_id] = submission
+        task = asyncio.create_task(self._job_dispatch_loop(job_id, submission))
+        self._job_dispatch_tasks[job_id] = task
+
+    async def stop_job_dispatch(self, job_id: str) -> None:
+        """
+        Stop the dispatch loop for a job.
+
+        Called when a job completes or is cancelled.
+        """
+        task = self._job_dispatch_tasks.pop(job_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        self._job_submissions.pop(job_id, None)
+
+    async def _job_dispatch_loop(self, job_id: str, submission: JobSubmission) -> None:
+        """
+        Event-driven dispatch loop for a single job.
+
+        Waits on:
+        1. Workflow ready events (dependencies satisfied)
+        2. Core availability events from WorkerPool
+        3. Dispatch trigger events (external signals)
+
+        Exits when:
+        - All workflows dispatched
+        - Job cancelled/completed
+        - Shutdown signaled
+        """
+        try:
+            while not self._shutting_down:
+                # Get all pending workflows for this job
+                async with self._pending_lock:
+                    job_pending = [
+                        p for p in self._pending.values()
+                        if p.job_id == job_id and not p.dispatched
+                    ]
+
+                if not job_pending:
+                    # No more pending workflows for this job
+                    break
+
+                # Build list of events to wait on
+                # We wait on ANY workflow becoming ready OR cores becoming available
+                ready_events = [p.ready_event.wait() for p in job_pending if not p.dispatched]
+                cores_event = self._worker_pool.wait_for_cores(timeout=5.0)
+                trigger_event = self._wait_dispatch_trigger()
+
+                if not ready_events:
+                    # All workflows either dispatched or failed
+                    break
+
+                # Wait for any event with a timeout for periodic checks
+                tasks = [asyncio.create_task(coro) for coro in [*ready_events, cores_event, trigger_event]]
+                try:
+                    done, pending = await asyncio.wait(
+                        tasks,
+                        timeout=5.0,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    # Cancel pending tasks and suppress CancelledError
+                    for task in pending:
+                        task.cancel()
+                    # Await cancelled tasks to ensure cleanup completes
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+
+                    # Retrieve results from done tasks to avoid warnings
+                    # (we don't need the results, just need to retrieve them)
+                    for task in done:
+                        try:
+                            task.result()
+                        except Exception:
+                            pass  # Ignore any exceptions from done tasks
+
+                except asyncio.CancelledError:
+                    # On cancellation, clean up all tasks
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    raise
+
+                # Attempt dispatch regardless of which event fired
+                # This handles the case where multiple events fire together
+                await self.try_dispatch(job_id, submission)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            await self._log_error(
+                f"Dispatch loop error for job {job_id}: {e}",
+                job_id=job_id,
+            )
+        finally:
+            # Clean up
+            self._job_dispatch_tasks.pop(job_id, None)
+
+    async def _wait_dispatch_trigger(self) -> None:
+        """Wait for the dispatch trigger event."""
+        await self._dispatch_trigger.wait()
+        self._dispatch_trigger.clear()
+
+    def signal_dispatch(self) -> None:
+        """
+        Signal that dispatch should be attempted.
+
+        Called when:
+        - Cores become available
+        - A workflow completes (dependencies satisfied)
+        - Retry timer expires
+        """
+        self._dispatch_trigger.set()
+
+    def signal_cores_available(self) -> None:
+        """
+        Signal that cores have become available.
+
+        This triggers dispatch attempts for workflows waiting on resources.
+        """
+        # Signal all pending workflows to re-check readiness
+        for pending in self._pending.values():
+            if not pending.dispatched:
+                pending.check_and_signal_ready()
+
+        # Also trigger the global dispatch event
+        self._dispatch_trigger.set()
+
+    async def shutdown(self) -> None:
+        """
+        Shutdown all dispatch loops gracefully.
+
+        Cancels all active dispatch tasks and waits for them to complete.
+        """
+        self._shutting_down = True
+        self._dispatch_trigger.set()  # Wake up any waiting loops
+
+        # Cancel all job dispatch tasks
+        tasks = list(self._job_dispatch_tasks.values())
+        for task in tasks:
+            task.cancel()
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._job_dispatch_tasks.clear()
+        self._job_submissions.clear()
 
     # =========================================================================
     # Timeout and Eviction
@@ -621,14 +819,28 @@ class WorkflowDispatcher:
     # =========================================================================
 
     async def cleanup_job(self, job_id: str) -> None:
-        """Remove all pending workflows for a job."""
+        """
+        Remove all pending workflows for a job and stop its dispatch loop.
+
+        Properly cleans up:
+        - Stops the dispatch loop task for this job
+        - Clears all pending workflow entries
+        - Clears ready_events to unblock any waiters
+        """
+        # Stop the dispatch loop first
+        await self.stop_job_dispatch(job_id)
+
+        # Clear pending workflows
         async with self._pending_lock:
             keys_to_remove = [
                 key for key in self._pending
                 if key.startswith(f"{job_id}:")
             ]
             for key in keys_to_remove:
-                self._pending.pop(key, None)
+                pending = self._pending.pop(key, None)
+                if pending:
+                    # Set the ready event to unblock any waiters, then clear
+                    pending.ready_event.set()
 
     # =========================================================================
     # Logging Helpers

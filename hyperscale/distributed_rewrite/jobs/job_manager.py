@@ -54,6 +54,7 @@ from hyperscale.distributed_rewrite.models import (
     JobSubmission,
     WorkflowProgress,
     WorkflowFinalResult,
+    WorkflowStatus,
 )
 
 
@@ -261,9 +262,16 @@ class SubWorkflowInfo:
 class JobInfo:
     """All state for a single job, protected by its own lock."""
     token: TrackingToken          # Job-level token (DC:manager:job)
-    submission: JobSubmission
-    progress: JobProgress
+    submission: JobSubmission | None  # None for remote jobs tracked by non-leaders
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    # Internal progress tracking (separate from wire protocol JobProgress)
+    status: str = JobStatus.QUEUED.value
+    workflows_total: int = 0
+    workflows_completed: int = 0
+    workflows_failed: int = 0
+    started_at: float = 0.0       # time.monotonic() when job started
+    timestamp: float = 0.0        # Last update time
 
     # Workflow tracking - keyed by token string for fast lookup
     workflows: dict[str, WorkflowInfo] = field(default_factory=dict)  # workflow_token_str -> info
@@ -281,6 +289,67 @@ class JobInfo:
     # Callbacks
     callback_addr: tuple[str, int] | None = None
 
+    @property
+    def job_id(self) -> str:
+        """Get job_id from token."""
+        return self.token.job_id
+
+    @property
+    def datacenter(self) -> str:
+        """Get datacenter from token."""
+        return self.token.datacenter
+
+    def elapsed_seconds(self) -> float:
+        """Calculate elapsed time since job started."""
+        if self.started_at == 0.0:
+            return 0.0
+        return time.monotonic() - self.started_at
+
+    def to_wire_progress(self) -> JobProgress:
+        """
+        Convert internal JobInfo to wire protocol JobProgress.
+
+        Used for state sync between managers and progress reporting to gates.
+        """
+        # Convert internal workflow state to wire protocol WorkflowProgress
+        workflow_progresses = []
+        for wf_token_str, wf_info in self.workflows.items():
+            # Map internal WorkflowState to wire WorkflowStatus
+            # Note: WorkflowState uses DISPATCHED, WorkflowStatus uses ASSIGNED
+            status_map = {
+                WorkflowState.PENDING: WorkflowStatus.PENDING.value,
+                WorkflowState.DISPATCHED: WorkflowStatus.ASSIGNED.value,
+                WorkflowState.RUNNING: WorkflowStatus.RUNNING.value,
+                WorkflowState.COMPLETED: WorkflowStatus.COMPLETED.value,
+                WorkflowState.FAILED: WorkflowStatus.FAILED.value,
+                WorkflowState.AGGREGATED: WorkflowStatus.COMPLETED.value,
+                WorkflowState.AGGREGATION_FAILED: WorkflowStatus.FAILED.value,
+            }
+            wf_progress = WorkflowProgress(
+                job_id=self.job_id,
+                workflow_id=wf_info.token.workflow_id or "",
+                workflow_name=wf_info.name,
+                status=status_map.get(wf_info.state, WorkflowStatus.PENDING.value),
+                completed_count=0,  # TODO: aggregate from sub-workflows
+                failed_count=0,
+                rate_per_second=0.0,
+                elapsed_seconds=self.elapsed_seconds(),
+                timestamp=self.timestamp,
+            )
+            workflow_progresses.append(wf_progress)
+
+        return JobProgress(
+            job_id=self.job_id,
+            datacenter=self.datacenter,
+            status=self.status,
+            workflows=workflow_progresses,
+            total_completed=self.workflows_completed,
+            total_failed=self.workflows_failed,
+            overall_rate=0.0,
+            elapsed_seconds=self.elapsed_seconds(),
+            timestamp=self.timestamp,
+        )
+
 
 class JobManager:
     """
@@ -292,18 +361,30 @@ class JobManager:
 
     All tracking uses TrackingToken format:
         <datacenter>:<manager_id>:<job_id>:<workflow_id>:<worker_id>
+
+    Event-driven notifications:
+        - on_workflow_completed callback is called when a workflow reaches terminal state
+        - This enables event-driven dependency resolution in WorkflowDispatcher
     """
 
-    def __init__(self, datacenter: str, manager_id: str):
+    def __init__(
+        self,
+        datacenter: str,
+        manager_id: str,
+        on_workflow_completed: Callable[[str, str], Coroutine[Any, Any, None]] | None = None,
+    ):
         """
         Initialize JobManager.
 
         Args:
             datacenter: Datacenter identifier (e.g., "DC-EAST")
             manager_id: This manager's node ID (short form)
+            on_workflow_completed: Optional async callback called when workflow completes
+                                  Takes (job_id, workflow_id) and is awaited
         """
         self._datacenter = datacenter
         self._manager_id = manager_id
+        self._on_workflow_completed = on_workflow_completed
 
         # Main job storage - job token string -> JobInfo
         self._jobs: dict[str, JobInfo] = {}
@@ -314,6 +395,22 @@ class JobManager:
 
         # Global lock for job creation/deletion (not per-job operations)
         self._global_lock = asyncio.Lock()
+
+    def set_on_workflow_completed(
+        self,
+        callback: Callable[[str, str], Coroutine[Any, Any, None]],
+    ) -> None:
+        """
+        Set the workflow completion callback.
+
+        This allows setting the callback after initialization, which is useful
+        when JobManager and WorkflowDispatcher need to reference each other.
+
+        Args:
+            callback: Async callback called when workflow completes
+                     Takes (job_id, workflow_id) and is awaited
+        """
+        self._on_workflow_completed = callback
 
     # =========================================================================
     # Token Generation
@@ -358,21 +455,49 @@ class JobManager:
             if job_token_str in self._jobs:
                 return self._jobs[job_token_str]
 
-            progress = JobProgress(
-                job_id=submission.job_id,
-                status=JobStatus.QUEUED.value,
-                workflows_total=0,
-                workflows_completed=0,
-                workflows_failed=0,
-                elapsed_seconds=0.0,
-                timestamp=time.monotonic(),
-            )
-
             job = JobInfo(
                 token=job_token,
                 submission=submission,
-                progress=progress,
+                status=JobStatus.QUEUED.value,
+                timestamp=time.monotonic(),
                 callback_addr=callback_addr,
+            )
+
+            self._jobs[job_token_str] = job
+            return job
+
+    async def track_remote_job(
+        self,
+        job_id: str,
+        leader_node_id: str,
+        leader_addr: tuple[str, int],
+    ) -> JobInfo:
+        """
+        Create a tracking entry for a job led by another manager.
+
+        Non-leader managers use this to track jobs they've been notified about.
+        This enables query routing and state awareness without full submission data.
+
+        Thread-safe: uses global lock for job creation.
+        """
+        job_token = self.create_job_token(job_id)
+        job_token_str = str(job_token)
+
+        async with self._global_lock:
+            if job_token_str in self._jobs:
+                # Update leader info if job already exists
+                job = self._jobs[job_token_str]
+                job.leader_node_id = leader_node_id
+                job.leader_addr = leader_addr
+                return job
+
+            job = JobInfo(
+                token=job_token,
+                submission=None,  # Non-leader doesn't have submission
+                status=JobStatus.QUEUED.value,
+                timestamp=time.monotonic(),
+                leader_node_id=leader_node_id,
+                leader_addr=leader_addr,
             )
 
             self._jobs[job_token_str] = job
@@ -466,7 +591,7 @@ class JobManager:
             self._workflow_to_job[workflow_token_str] = str(job.token)
 
             # Update job progress
-            job.progress.workflows_total = len(job.workflows)
+            job.workflows_total = len(job.workflows)
 
             return info
 
@@ -606,11 +731,15 @@ class JobManager:
         (all workers finished) but aggregation may still fail.
 
         Thread-safe: acquires job lock.
+        Notifies on_workflow_completed callback for event-driven dispatch.
         """
         token_str = str(workflow_token)
         job = self.get_job_for_workflow(token_str)
         if not job:
             return False
+
+        should_notify = False
+        workflow_id = ""
 
         async with job.lock:
             wf = job.workflows.get(token_str)
@@ -623,9 +752,18 @@ class JobManager:
                 wf.completion_event.set()
 
                 # Update job progress
-                job.progress.workflows_completed += 1
+                job.workflows_completed += 1
 
-            return True
+                # Mark for notification (do outside lock)
+                # Use workflow_id (e.g., "wf-0001") not name - dependencies are tracked by ID
+                should_notify = True
+                workflow_id = wf.token.workflow_id or ""
+
+        # Notify callback outside lock to avoid deadlocks
+        if should_notify and self._on_workflow_completed:
+            await self._on_workflow_completed(job.job_id, workflow_id)
+
+        return True
 
     async def mark_workflow_failed(
         self,
@@ -636,11 +774,15 @@ class JobManager:
         Mark a workflow as failed.
 
         Thread-safe: acquires job lock.
+        Notifies on_workflow_completed callback for event-driven dispatch.
         """
         token_str = str(workflow_token)
         job = self.get_job_for_workflow(token_str)
         if not job:
             return False
+
+        should_notify = False
+        workflow_id = ""
 
         async with job.lock:
             wf = job.workflows.get(token_str)
@@ -652,9 +794,19 @@ class JobManager:
             wf.completion_event.set()
 
             # Update job progress
-            job.progress.workflows_failed += 1
+            job.workflows_failed += 1
 
-            return True
+            # Mark for notification (do outside lock)
+            # Use workflow_id (e.g., "wf-0001") not name - dependencies are tracked by ID
+            should_notify = True
+            workflow_id = wf.token.workflow_id or ""
+
+        # Notify callback outside lock to avoid deadlocks
+        # Failed workflows still trigger dispatch - dependent workflows may need to fail
+        if should_notify and self._on_workflow_completed:
+            await self._on_workflow_completed(job.job_id, workflow_id)
+
+        return True
 
     async def mark_aggregation_failed(
         self,
@@ -683,6 +835,74 @@ class JobManager:
             wf.aggregation_error = error
 
             return True
+
+    async def update_workflow_state(
+        self,
+        job_id: str,
+        workflow_token: str | TrackingToken,
+        new_state: WorkflowState,
+        error: str | None = None,
+    ) -> bool:
+        """
+        Update workflow state directly.
+
+        This is a general-purpose state update method that handles the job
+        progress counters correctly based on state transitions.
+
+        Thread-safe: acquires job lock.
+        Notifies on_workflow_completed callback for event-driven dispatch.
+
+        Args:
+            job_id: The job ID
+            workflow_token: Workflow token (can be token string or TrackingToken)
+            new_state: New WorkflowState to set
+            error: Optional error message (for FAILED states)
+
+        Returns:
+            True if state was updated, False if workflow not found
+        """
+        job = self.get_job_by_id(job_id)
+        if not job:
+            return False
+
+        token_str = str(workflow_token)
+        should_notify = False
+        workflow_id = ""
+
+        async with job.lock:
+            wf = job.workflows.get(token_str)
+            if not wf:
+                return False
+
+            old_state = wf.state
+
+            # Update state
+            wf.state = new_state
+            if error:
+                wf.error = error
+
+            # Update job progress counters based on state transition
+            # Only count transitions TO terminal states, not from them
+            if old_state not in (WorkflowState.COMPLETED, WorkflowState.FAILED,
+                                 WorkflowState.AGGREGATED, WorkflowState.AGGREGATION_FAILED):
+                if new_state == WorkflowState.COMPLETED:
+                    job.workflows_completed += 1
+                    wf.completion_event.set()
+                    should_notify = True
+                    # Use workflow_id (e.g., "wf-0001") not name - dependencies are tracked by ID
+                    workflow_id = wf.token.workflow_id or ""
+                elif new_state == WorkflowState.FAILED:
+                    job.workflows_failed += 1
+                    wf.completion_event.set()
+                    should_notify = True
+                    # Use workflow_id (e.g., "wf-0001") not name - dependencies are tracked by ID
+                    workflow_id = wf.token.workflow_id or ""
+
+        # Notify callback outside lock to avoid deadlocks
+        if should_notify and self._on_workflow_completed:
+            await self._on_workflow_completed(job.job_id, workflow_id)
+
+        return True
 
     # =========================================================================
     # Sub-workflow Queries
@@ -775,7 +995,7 @@ class JobManager:
         if not job:
             return JobStatus.UNKNOWN.value
 
-        return job.progress.status
+        return job.status
 
     async def update_job_status(self, job_token: str | TrackingToken, status: str) -> bool:
         """
@@ -788,8 +1008,8 @@ class JobManager:
             return False
 
         async with job.lock:
-            job.progress.status = status
-            job.progress.timestamp = time.monotonic()
+            job.status = status
+            job.timestamp = time.monotonic()
             return True
 
     # =========================================================================
@@ -827,6 +1047,15 @@ class JobManager:
     # Iteration Helpers
     # =========================================================================
 
+    @property
+    def job_count(self) -> int:
+        """Get count of active jobs."""
+        return len(self._jobs)
+
+    def get_all_job_ids(self) -> list[str]:
+        """Get list of all active job IDs."""
+        return [job.job_id for job in self._jobs.values()]
+
     def iter_jobs(self) -> list[JobInfo]:
         """Get a snapshot of all jobs for iteration."""
         return list(self._jobs.values())
@@ -837,3 +1066,49 @@ class JobManager:
         if not job:
             return []
         return list(job.workflows.values())
+
+    def get_jobs_as_wire_progress(self) -> dict[str, JobProgress]:
+        """
+        Get all jobs converted to wire protocol JobProgress.
+
+        Used for state sync between managers.
+        """
+        return {
+            job.job_id: job.to_wire_progress()
+            for job in self._jobs.values()
+        }
+
+    # =========================================================================
+    # Job Cleanup
+    # =========================================================================
+
+    async def complete_job(self, job_id: str) -> bool:
+        """
+        Mark a job as complete and clean up its tracking state.
+
+        This removes the job from JobManager tracking. Called by the manager
+        during job cleanup to prevent memory leaks.
+
+        Thread-safe: uses global lock for job removal.
+
+        Args:
+            job_id: The job ID to complete/remove
+
+        Returns:
+            True if job was found and removed, False if not found
+        """
+        job_token = self.create_job_token(job_id)
+        job_token_str = str(job_token)
+
+        async with self._global_lock:
+            job = self._jobs.pop(job_token_str, None)
+            if not job:
+                return False
+
+            # Clean up lookup mappings to prevent memory leaks
+            for wf_token_str in job.workflows:
+                self._workflow_to_job.pop(wf_token_str, None)
+            for sub_wf_token_str in job.sub_workflows:
+                self._sub_workflow_to_job.pop(sub_wf_token_str, None)
+
+            return True

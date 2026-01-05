@@ -841,7 +841,7 @@ class WorkerServer(HealthAwareServer):
         registration = WorkerRegistration(
             node=self.node_info,
             total_cores=self._total_cores,
-            available_cores=self._available_cores,
+            available_cores=self._core_allocator.available_cores,
             memory_mb=self._get_memory_mb(),
             available_memory_mb=self._get_available_memory_mb(),
         )
@@ -1144,7 +1144,7 @@ class WorkerServer(HealthAwareServer):
                 accepted=True,
                 worker_id=self._node_id.full,
                 total_cores=self._total_cores,
-                available_cores=self._available_cores,
+                available_cores=self._core_allocator.available_cores,
             )
             return ack.dump()
 
