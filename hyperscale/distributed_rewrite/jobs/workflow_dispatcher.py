@@ -149,18 +149,18 @@ class WorkflowDispatcher:
 
         for i, wf in enumerate(workflows):
             try:
-                # Instantiate if it's a class
-                instance = wf() if isinstance(wf, type) else wf
+                # Handle DependentWorkflow specially to preserve name and get dependencies
                 dependencies: list[str] = []
-
-                # Unwrap DependentWorkflow
-                if isinstance(instance, DependentWorkflow):
-                    dependencies = instance.dependencies
-                    instance = instance.dependent_workflow
+                if isinstance(wf, DependentWorkflow):
+                    dependencies = wf.dependencies
+                    name = wf.dependent_workflow.__name__
+                    instance = wf.dependent_workflow()
+                else:
+                    name = wf.__name__
+                    instance = wf()
 
                 # Generate workflow ID
                 workflow_id = f"wf-{i:04d}"
-                name = getattr(instance, 'name', type(instance).__name__)
                 vus = getattr(instance, 'vus', submission.vus)
 
                 # Register with JobManager
@@ -240,7 +240,7 @@ class WorkflowDispatcher:
         priority = getattr(workflow, 'priority', None)
         if isinstance(priority, StagePriority):
             return priority
-        return StagePriority.NORMAL
+        return StagePriority.AUTO
 
     def _is_test_workflow(self, workflow: Workflow) -> bool:
         """Check if a workflow is a test workflow."""
@@ -370,42 +370,73 @@ class WorkflowDispatcher:
         """
         Calculate core allocations for workflows.
 
-        Distributes cores based on priority and VUs.
+        Allocation strategy:
+        1. Explicit priority workflows (non-AUTO) are allocated first, proportionally by VUs
+        2. AUTO priority workflows split remaining cores equally (minimum 1 core each)
+        3. If not enough cores for all workflows, only allocate what fits - rest stay pending
+
+        Returns only workflows that can actually be allocated within available cores.
+        Workflows that don't fit remain pending and will be dispatched when cores free up.
         """
         if not workflows:
             return []
 
-        # Sort by priority (higher value = higher priority) then by VUs (higher first)
-        # StagePriority: EXCLUSIVE=4, HIGH=3, NORMAL=2, LOW=1, AUTO=0
-        workflows = sorted(
-            workflows,
-            key=lambda p: (-p.priority.value, -p.vus),
-        )
-
-        # Simple allocation: divide cores proportionally by VUs
-        total_vus = sum(p.vus for p in workflows)
-        if total_vus == 0:
-            total_vus = len(workflows)  # Fallback: equal distribution
+        # Separate explicit priority from AUTO workflows
+        explicit = [p for p in workflows if p.priority != StagePriority.AUTO]
+        auto = [p for p in workflows if p.priority == StagePriority.AUTO]
 
         allocations = []
         remaining_cores = total_cores
 
-        for i, pending in enumerate(workflows):
-            if remaining_cores <= 0:
-                break
+        # Step 1: Allocate explicit priority workflows first (by priority then VUs)
+        if explicit:
+            # Sort by priority (higher value = higher priority) then by VUs (higher first)
+            # StagePriority: EXCLUSIVE=4, HIGH=3, NORMAL=2, LOW=1
+            explicit = sorted(
+                explicit,
+                key=lambda p: (-p.priority.value, -p.vus),
+            )
 
-            # Calculate this workflow's share
-            if i == len(workflows) - 1:
-                # Last workflow gets remaining cores
-                cores = remaining_cores
-            else:
-                # Proportional allocation
-                share = pending.vus / total_vus if total_vus > 0 else 1 / len(workflows)
-                cores = max(1, int(total_cores * share))
-                cores = min(cores, remaining_cores)
+            # Proportional allocation by VUs for explicit workflows
+            total_vus = sum(p.vus for p in explicit)
+            if total_vus == 0:
+                total_vus = len(explicit)
 
-            allocations.append((pending, cores))
-            remaining_cores -= cores
+            for i, pending in enumerate(explicit):
+                if remaining_cores <= 0:
+                    # No more cores - remaining explicit workflows stay pending
+                    break
+
+                if i == len(explicit) - 1 and not auto:
+                    # Last explicit workflow gets remaining if no AUTO workflows
+                    cores = remaining_cores
+                else:
+                    # Proportional allocation
+                    share = pending.vus / total_vus if total_vus > 0 else 1 / len(explicit)
+                    cores = max(1, int(total_cores * share))
+                    cores = min(cores, remaining_cores)
+
+                allocations.append((pending, cores))
+                remaining_cores -= cores
+
+        # Step 2: Split remaining cores equally among AUTO workflows (min 1 core each)
+        if auto and remaining_cores > 0:
+            # Each AUTO workflow needs minimum 1 core
+            # Only allocate as many workflows as we have cores for
+            num_auto_to_allocate = min(len(auto), remaining_cores)
+            cores_per_auto = remaining_cores // num_auto_to_allocate
+            leftover = remaining_cores - (cores_per_auto * num_auto_to_allocate)
+
+            for i, pending in enumerate(auto):
+                if i >= num_auto_to_allocate:
+                    # No more cores - remaining AUTO workflows stay pending
+                    break
+
+                # Give one extra core to first workflows if there's leftover
+                cores = cores_per_auto + (1 if i < leftover else 0)
+
+                allocations.append((pending, cores))
+                remaining_cores -= cores
 
         return allocations
 

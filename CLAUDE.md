@@ -38,6 +38,8 @@ This document contains critical information about working with this codebase. Fo
   - Read Architecture.md any time you need more context about what something does. This will save you LOTS of time.
   - Again, if there is a way to implement something that is more correct and robust, we do it.
   - Treat *everything* as if it must be compatible with asyncio
+  - You need to pay particular attentionto detail with providing correct attribues to classes and accessing them correctly.
+  - Use long variable names and avoid abbreviations (like i for index as opposed to idx) or "shortnames" for variables. Maximize readability.
   
 
 3. Testing Requirements
@@ -51,3 +53,6 @@ This document contains critical information about working with this codebase. Fo
     - Constants in UPPER_SNAKE_CASE
     - Document with docstrings
     - Use f-strings for formatting
+
+- After any fix or implementation of a todo, we generate a fresh commit. Do NOT run the tests. A user will run them and confirm.
+

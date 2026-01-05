@@ -41,7 +41,6 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Callable, Coroutine
 
 import cloudpickle
@@ -209,15 +208,9 @@ class TrackingToken:
         )
 
 
-class WorkflowState(Enum):
-    """State of a workflow in the job manager."""
-    PENDING = "pending"           # Registered but not yet dispatched
-    DISPATCHED = "dispatched"     # Dispatched to worker(s)
-    RUNNING = "running"           # At least one worker reports running
-    COMPLETED = "completed"       # Worker(s) reported success
-    FAILED = "failed"             # Worker(s) reported failure
-    AGGREGATED = "aggregated"     # Results successfully aggregated
-    AGGREGATION_FAILED = "aggregation_failed"  # Aggregation failed (manager error)
+from hyperscale.distributed_rewrite.jobs.workflow_state_machine import (
+    WorkflowStateMachine,
+)
 
 
 @dataclass
@@ -226,7 +219,7 @@ class WorkflowInfo:
     token: TrackingToken          # Full tracking token (DC:manager:job:workflow)
     name: str
     workflow: Workflow | None = None
-    state: WorkflowState = WorkflowState.PENDING
+    status: WorkflowStatus = WorkflowStatus.PENDING
     sub_workflow_tokens: list[str] = field(default_factory=list)  # Sub-workflow token strings
     completion_event: asyncio.Event = field(default_factory=asyncio.Event)
     error: str | None = None
@@ -314,22 +307,11 @@ class JobInfo:
         # Convert internal workflow state to wire protocol WorkflowProgress
         workflow_progresses = []
         for wf_token_str, wf_info in self.workflows.items():
-            # Map internal WorkflowState to wire WorkflowStatus
-            # Note: WorkflowState uses DISPATCHED, WorkflowStatus uses ASSIGNED
-            status_map = {
-                WorkflowState.PENDING: WorkflowStatus.PENDING.value,
-                WorkflowState.DISPATCHED: WorkflowStatus.ASSIGNED.value,
-                WorkflowState.RUNNING: WorkflowStatus.RUNNING.value,
-                WorkflowState.COMPLETED: WorkflowStatus.COMPLETED.value,
-                WorkflowState.FAILED: WorkflowStatus.FAILED.value,
-                WorkflowState.AGGREGATED: WorkflowStatus.COMPLETED.value,
-                WorkflowState.AGGREGATION_FAILED: WorkflowStatus.FAILED.value,
-            }
             wf_progress = WorkflowProgress(
                 job_id=self.job_id,
                 workflow_id=wf_info.token.workflow_id or "",
                 workflow_name=wf_info.name,
-                status=status_map.get(wf_info.state, WorkflowStatus.PENDING.value),
+                status=wf_info.status.value,
                 completed_count=0,  # TODO: aggregate from sub-workflows
                 failed_count=0,
                 rate_per_second=0.0,
@@ -585,7 +567,7 @@ class JobManager:
                 token=workflow_token,
                 name=name,
                 workflow=workflow,
-                state=WorkflowState.PENDING,
+                status=WorkflowStatus.PENDING,
             )
             job.workflows[workflow_token_str] = info
             self._workflow_to_job[workflow_token_str] = str(job.token)
@@ -634,9 +616,9 @@ class JobManager:
             parent.sub_workflow_tokens.append(sub_workflow_token_str)
             self._sub_workflow_to_job[sub_workflow_token_str] = str(job.token)
 
-            # Mark parent as dispatched
-            if parent.state == WorkflowState.PENDING:
-                parent.state = WorkflowState.DISPATCHED
+            # Mark parent as dispatched (assigned)
+            if parent.status == WorkflowStatus.PENDING:
+                parent.status = WorkflowStatus.ASSIGNED
 
             return info
 
@@ -653,6 +635,7 @@ class JobManager:
         Update progress for a sub-workflow.
 
         Thread-safe: acquires job lock.
+        Uses WorkflowStateMachine to ensure parent state only advances, never regresses.
         Returns True if update was applied, False if sub-workflow not found.
         """
         token_str = str(sub_workflow_token)
@@ -667,11 +650,14 @@ class JobManager:
 
             sub_wf.progress = progress
 
-            # Update parent workflow state if needed
+            # Update parent workflow state using state machine (prevents regression)
             parent_token_str = str(sub_wf.parent_token)
             parent = job.workflows.get(parent_token_str)
-            if parent and parent.state == WorkflowState.DISPATCHED:
-                parent.state = WorkflowState.RUNNING
+            if parent:
+                # Receiving progress means workflow is running
+                parent.status = WorkflowStateMachine.advance_state(
+                    parent.status, WorkflowStatus.RUNNING
+                )
 
             return True
 
@@ -746,9 +732,9 @@ class JobManager:
             if not wf:
                 return False
 
-            if wf.state not in (WorkflowState.COMPLETED, WorkflowState.FAILED,
-                                WorkflowState.AGGREGATED, WorkflowState.AGGREGATION_FAILED):
-                wf.state = WorkflowState.COMPLETED
+            if wf.status not in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
+                                WorkflowStatus.AGGREGATED, WorkflowStatus.AGGREGATION_FAILED):
+                wf.status = WorkflowStatus.COMPLETED
                 wf.completion_event.set()
 
                 # Update job progress
@@ -789,7 +775,7 @@ class JobManager:
             if not wf:
                 return False
 
-            wf.state = WorkflowState.FAILED
+            wf.status = WorkflowStatus.FAILED
             wf.error = error
             wf.completion_event.set()
 
@@ -831,23 +817,23 @@ class JobManager:
             if not wf:
                 return False
 
-            wf.state = WorkflowState.AGGREGATION_FAILED
+            wf.status = WorkflowStatus.AGGREGATION_FAILED
             wf.aggregation_error = error
 
             return True
 
-    async def update_workflow_state(
+    async def update_workflow_status(
         self,
         job_id: str,
         workflow_token: str | TrackingToken,
-        new_state: WorkflowState,
+        new_status: WorkflowStatus,
         error: str | None = None,
     ) -> bool:
         """
-        Update workflow state directly.
+        Update workflow status directly.
 
-        This is a general-purpose state update method that handles the job
-        progress counters correctly based on state transitions.
+        This is a general-purpose status update method that handles the job
+        progress counters correctly based on status transitions.
 
         Thread-safe: acquires job lock.
         Notifies on_workflow_completed callback for event-driven dispatch.
@@ -855,11 +841,11 @@ class JobManager:
         Args:
             job_id: The job ID
             workflow_token: Workflow token (can be token string or TrackingToken)
-            new_state: New WorkflowState to set
+            new_status: New WorkflowStatus to set
             error: Optional error message (for FAILED states)
 
         Returns:
-            True if state was updated, False if workflow not found
+            True if status was updated, False if workflow not found
         """
         job = self.get_job_by_id(job_id)
         if not job:
@@ -874,24 +860,24 @@ class JobManager:
             if not wf:
                 return False
 
-            old_state = wf.state
+            old_status = wf.status
 
-            # Update state
-            wf.state = new_state
+            # Update status
+            wf.status = new_status
             if error:
                 wf.error = error
 
-            # Update job progress counters based on state transition
+            # Update job progress counters based on status transition
             # Only count transitions TO terminal states, not from them
-            if old_state not in (WorkflowState.COMPLETED, WorkflowState.FAILED,
-                                 WorkflowState.AGGREGATED, WorkflowState.AGGREGATION_FAILED):
-                if new_state == WorkflowState.COMPLETED:
+            if old_status not in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
+                                 WorkflowStatus.AGGREGATED, WorkflowStatus.AGGREGATION_FAILED):
+                if new_status == WorkflowStatus.COMPLETED:
                     job.workflows_completed += 1
                     wf.completion_event.set()
                     should_notify = True
                     # Use workflow_id (e.g., "wf-0001") not name - dependencies are tracked by ID
                     workflow_id = wf.token.workflow_id or ""
-                elif new_state == WorkflowState.FAILED:
+                elif new_status == WorkflowStatus.FAILED:
                     job.workflows_failed += 1
                     wf.completion_event.set()
                     should_notify = True
@@ -984,8 +970,8 @@ class JobManager:
             return False
 
         return all(
-            wf.state in (WorkflowState.COMPLETED, WorkflowState.FAILED,
-                        WorkflowState.AGGREGATED, WorkflowState.AGGREGATION_FAILED)
+            wf.status in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
+                        WorkflowStatus.AGGREGATED, WorkflowStatus.AGGREGATION_FAILED)
             for wf in job.workflows.values()
         )
 

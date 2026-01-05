@@ -30,10 +30,8 @@ from typing import Any
 
 import cloudpickle
 from collections import defaultdict
-import networkx
 
 from hyperscale.core.hooks import Hook
-from hyperscale.core.jobs.models import WorkflowResults
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.state.context import Context
@@ -45,7 +43,6 @@ from hyperscale.distributed_rewrite.swim import HealthAwareServer, ManagerStateE
 from hyperscale.distributed_rewrite.swim.health import (
     FederatedHealthMonitor,
     CrossClusterAck,
-    DCLeaderAnnouncement,
 )
 from hyperscale.distributed_rewrite.swim.core import (
     ErrorStats,
@@ -119,7 +116,7 @@ from hyperscale.reporting.results import Results
 from hyperscale.distributed_rewrite.jobs import (
     JobManager,
     TrackingToken,
-    WorkflowState,
+    WorkflowStateMachine,
     JobInfo,
     WorkflowInfo,
     SubWorkflowInfo,
@@ -359,9 +356,10 @@ class ManagerServer(HealthAwareServer):
 
         # JobManager for race-safe job/workflow state with TrackingToken support
         # Uses per-job locks and globally unique tracking tokens
+        # NOTE: Use self._node_id.datacenter to ensure consistency with WorkflowDispatcher
         self._job_manager = JobManager(
-            datacenter=dc_id,
-            manager_id=self._node_id.short,  # Will be set after super().__init__
+            datacenter=self._node_id.datacenter,
+            manager_id=self._node_id.short,
         )
 
         # WorkerPool for worker registration and resource tracking
@@ -387,7 +385,7 @@ class ManagerServer(HealthAwareServer):
             get_state_version=lambda: self._state_version,
             get_active_jobs=lambda: self._job_manager.job_count,
             get_active_workflows=lambda: sum(
-                len([w for w in job.workflows.values() if w.state == WorkflowState.RUNNING])
+                len([w for w in job.workflows.values() if w.status == WorkflowStatus.RUNNING])
                 for job in self._job_manager.iter_jobs()
             ),
             get_worker_count=lambda: len(self._workers),
@@ -3813,6 +3811,8 @@ class ManagerServer(HealthAwareServer):
         """
         try:
             status = WorkerHeartbeat.load(data)
+
+            print(status)
             
             # Update status tracking
             self._worker_status[status.node_id] = status
@@ -3850,8 +3850,11 @@ class ManagerServer(HealthAwareServer):
             parent_workflow_id = self._get_parent_workflow_id(progress.workflow_id)
 
             if parent_workflow_id is not None:
-                # This is a sub-workflow - store and aggregate
+                # This is a sub-workflow - store in both legacy and new systems
                 self._sub_workflow_progress[progress.workflow_id] = progress
+
+                # Update SubWorkflowInfo.progress in the new JobManager system
+                await self._job_manager.update_workflow_progress(progress.workflow_id, progress)
 
                 # Update worker available cores based on cores_completed
                 await self._update_worker_cores_from_progress(progress, None)
@@ -3878,23 +3881,24 @@ class ManagerServer(HealthAwareServer):
             job = self._job_manager.get_job_by_id(progress.job_id)
             if job:
                 # Update WorkflowInfo state based on progress status
-                workflow_id = progress.workflow_id
+                # Extract workflow_id from progress.workflow_id which may be a 5-part token
+                # Format: DC:manager:job_id:workflow_id:worker_id
+                parts = progress.workflow_id.split(":")
+                if len(parts) >= 5:
+                    workflow_id = parts[3]  # Extract just the workflow_id component (e.g., "wf-0001")
+                else:
+                    workflow_id = progress.workflow_id
                 wf_info = job.workflows.get(
                     str(self._job_manager.create_workflow_token(progress.job_id, workflow_id))
                 )
                 if wf_info:
-                    # Map progress status to WorkflowState
-                    # Note: WorkflowStatus uses ASSIGNED, WorkflowState uses DISPATCHED
-                    status_to_state = {
-                        WorkflowStatus.PENDING.value: WorkflowState.PENDING,
-                        WorkflowStatus.ASSIGNED.value: WorkflowState.DISPATCHED,
-                        WorkflowStatus.RUNNING.value: WorkflowState.RUNNING,
-                        WorkflowStatus.COMPLETED.value: WorkflowState.COMPLETED,
-                        WorkflowStatus.FAILED.value: WorkflowState.FAILED,
-                    }
-                    new_state = status_to_state.get(progress.status, WorkflowState.RUNNING)
-                    if wf_info.state != new_state:
-                        wf_info.state = new_state
+                    # Convert progress status string to WorkflowStatus enum
+                    try:
+                        new_status = WorkflowStatus(progress.status)
+                    except ValueError:
+                        new_status = WorkflowStatus.RUNNING
+                    # Use state machine to advance status (prevents regression)
+                    wf_info.status = WorkflowStateMachine.advance_state(wf_info.status, new_status)
 
                 job.timestamp = time.monotonic()
 
@@ -3919,12 +3923,13 @@ class ManagerServer(HealthAwareServer):
 
                     # Notify WorkflowDispatcher of completion for dependency tracking
                     if self._workflow_dispatcher:
-                        # Parse job_id from workflow_id (format: job_id:workflow_name)
+                        # Parse job_id from workflow_id (format: DC:manager:job_id:workflow_id:worker_id)
                         parts = progress.workflow_id.split(":")
-                        if len(parts) >= 2:
-                            jm_job_id = parts[0]
+                        if len(parts) >= 5:
+                            jm_job_id = parts[2]  # job_id is the 3rd component
                             # Find matching workflow_id in JobManager
-                            job_info = self._job_manager.get_job(jm_job_id)
+                            # Note: Use get_job_by_id(), not get_job() - the latter expects a full token string
+                            job_info = self._job_manager.get_job_by_id(jm_job_id)
                             if job_info:
                                 for wf_id, wf_info in job_info.workflows.items():
                                     if wf_info.name == progress.workflow_name:
@@ -4000,32 +4005,34 @@ class ManagerServer(HealthAwareServer):
             # Record result in JobManager (new system)
             # =================================================================
             # Parse the workflow_id to extract job_id and workflow components
-            # Format: job_id:workflow_name:worker_idx or job_id:workflow_name
+            # Format: DC:manager:job_id:workflow_id:worker_id (5 parts)
             parts = result.workflow_id.split(":")
-            if len(parts) >= 2:
-                jm_job_id = parts[0]
+            if len(parts) >= 5:
+                jm_job_id = parts[2]  # job_id is the 3rd component
+                jm_workflow_id = parts[3]  # workflow_id is the 4th component (e.g., "wf-0001")
                 # Try to find the workflow in JobManager by job_id
-                job_info = self._job_manager.get_job(jm_job_id)
+                # Note: Use get_job_by_id(), not get_job() - the latter expects a full token string
+                job_info = self._job_manager.get_job_by_id(jm_job_id)
                 if job_info:
-                    # Determine state based on result status
-                    new_state = WorkflowState.COMPLETED if result.status == WorkflowStatus.COMPLETED.value else WorkflowState.FAILED
+                    # Determine status based on result status
+                    new_status = WorkflowStatus.COMPLETED if result.status == WorkflowStatus.COMPLETED.value else WorkflowStatus.FAILED
 
-                    # Find matching workflow by name (parts[1] is workflow name)
-                    for wf_id, wf_info in job_info.workflows.items():
-                        if wf_info.name == parts[1] if len(parts) > 1 else True:
-                            await self._job_manager.update_workflow_state(
-                                jm_job_id, wf_id, new_state
+                    # Find matching workflow by workflow_id (parts[3] is workflow_id like "wf-0001")
+                    workflow_token_str = str(self._job_manager.create_workflow_token(jm_job_id, jm_workflow_id))
+                    wf_info = job_info.workflows.get(workflow_token_str)
+                    if wf_info:
+                        await self._job_manager.update_workflow_status(
+                            jm_job_id, workflow_token_str, new_status
+                        )
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerDebug(
+                                message=f"JobManager: Updated workflow {workflow_token_str} to status {new_status.value}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
                             )
-                            self._task_runner.run(
-                                self._udp_logger.log,
-                                ServerDebug(
-                                    message=f"JobManager: Updated workflow {wf_id} to state {new_state.value}",
-                                    node_host=self._host,
-                                    node_port=self._tcp_port,
-                                    node_id=self._node_id.short,
-                                )
-                            )
-                            break
+                        )
 
             # =================================================================
             # Legacy handling (kept during migration)
@@ -4191,14 +4198,12 @@ class ManagerServer(HealthAwareServer):
                     matched = False
                     for wf_token_str, wf_info in job.workflows.items():
                         if wf_info.token.workflow_id == result.workflow_id:
-                            # Map result status to WorkflowState
-                            status_to_state = {
-                                WorkflowStatus.COMPLETED.value: WorkflowState.COMPLETED,
-                                WorkflowStatus.FAILED.value: WorkflowState.FAILED,
-                            }
-                            new_state = status_to_state.get(result.status)
-                            if new_state:
-                                wf_info.state = new_state
+                            # Convert result status to WorkflowStatus
+                            try:
+                                new_status = WorkflowStatus(result.status)
+                                wf_info.status = new_status
+                            except ValueError:
+                                pass  # Invalid status, keep current
                             matched = True
                             await self._udp_logger.log(
                                 ServerInfo(
@@ -4228,24 +4233,26 @@ class ManagerServer(HealthAwareServer):
                 # This is critical for dependency-based execution - when a workflow completes,
                 # dependent workflows may now be ready to run
                 if result.status == WorkflowStatus.COMPLETED.value and self._workflow_dispatcher:
-                    # Parse job_id from workflow_id to find matching workflow
+                    # Parse job_id from workflow_id (format: DC:manager:job_id:workflow_id:worker_id)
                     parts = result.workflow_id.split(":")
-                    if len(parts) >= 2:
-                        jm_job_id = parts[0]
-                        job_info = self._job_manager.get_job(jm_job_id)
+                    if len(parts) >= 5:
+                        jm_job_id = parts[2]  # job_id is the 3rd component
+                        jm_workflow_id = parts[3]  # workflow_id is the 4th component
+                        # Note: Use get_job_by_id(), not get_job() - the latter expects a full token string
+                        job_info = self._job_manager.get_job_by_id(jm_job_id)
                         if job_info:
-                            for wf_id, wf_info in job_info.workflows.items():
-                                if wf_info.name == result.workflow_name:
-                                    await self._workflow_dispatcher.mark_workflow_completed(
-                                        jm_job_id, wf_id
+                            workflow_token_str = str(self._job_manager.create_workflow_token(jm_job_id, jm_workflow_id))
+                            wf_info = job_info.workflows.get(workflow_token_str)
+                            if wf_info:
+                                await self._workflow_dispatcher.mark_workflow_completed(
+                                    jm_job_id, jm_workflow_id
+                                )
+                                # Try to dispatch newly ready workflows
+                                submission = self._job_submissions.get(jm_job_id)
+                                if submission:
+                                    await self._workflow_dispatcher.try_dispatch(
+                                        jm_job_id, submission
                                     )
-                                    # Try to dispatch newly ready workflows
-                                    submission = self._job_submissions.get(jm_job_id)
-                                    if submission:
-                                        await self._workflow_dispatcher.try_dispatch(
-                                            jm_job_id, submission
-                                        )
-                                    break
 
                 # Check if job is complete
                 if self._is_job_complete(result.job_id):
@@ -4335,10 +4342,11 @@ class ManagerServer(HealthAwareServer):
         # =================================================================
         # Check via JobManager (new system)
         # =================================================================
-        job_info = self._job_manager.get_job(job_id)
+        # Note: Use get_job_by_id(), not get_job() - the latter expects a full token string
+        job_info = self._job_manager.get_job_by_id(job_id)
         if job_info:
             all_complete = all(
-                wf.state in (WorkflowState.COMPLETED, WorkflowState.FAILED, WorkflowState.AGGREGATED)
+                wf.status in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED, WorkflowStatus.AGGREGATED)
                 for wf in job_info.workflows.values()
             )
             if all_complete and job_info.workflows:
@@ -4365,14 +4373,14 @@ class ManagerServer(HealthAwareServer):
         """
         Extract parent workflow ID from a sub-workflow ID.
 
-        Sub-workflow IDs have format: job_id:workflow_idx:worker_idx
-        Parent workflow IDs have format: job_id:workflow_idx
+        Sub-workflow IDs have format: DC:manager:job_id:workflow_id:worker_id (5 parts)
+        Parent workflow IDs have format: DC:manager:job_id:workflow_id (4 parts)
 
-        Returns None if this is not a sub-workflow (only has 2 parts).
+        Returns None if this is not a sub-workflow (fewer than 5 parts).
         """
         parts = sub_workflow_id.split(":")
-        if len(parts) >= 3:
-            # Has worker_idx suffix, return parent (without worker_idx)
+        if len(parts) >= 5:
+            # Has worker_id suffix (5 parts), return parent (4 parts, without worker_id)
             return ":".join(parts[:-1])
         return None
 
@@ -4406,22 +4414,37 @@ class ManagerServer(HealthAwareServer):
         - avg_memory_mb: sum across all
 
         Returns None if no progress available.
+
+        Uses the new JobManager system to get sub-workflow data.
         """
-        sub_workflow_ids = self._sub_workflow_mapping.get(parent_workflow_id, [])
-        if not sub_workflow_ids:
+        # Find job_id from parent workflow_id (format: job_id:workflow_idx)
+        job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
+
+        # Get job and workflow info from JobManager
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
             return None
 
+        # Find the parent workflow by workflow_id
+        workflow_token_str = str(self._job_manager.create_workflow_token(job_id, parent_workflow_id))
+        wf_info = job.workflows.get(workflow_token_str)
+        if not wf_info:
+            return None
+
+        # Get sub-workflow tokens from WorkflowInfo
+        sub_workflow_tokens = wf_info.sub_workflow_tokens
+        if not sub_workflow_tokens:
+            return None
+
+        # Collect progress from SubWorkflowInfo objects
         progress_updates = [
-            self._sub_workflow_progress.get(sub_id)
-            for sub_id in sub_workflow_ids
-            if sub_id in self._sub_workflow_progress
+            job.sub_workflows[token].progress
+            for token in sub_workflow_tokens
+            if token in job.sub_workflows and job.sub_workflows[token].progress is not None
         ]
 
         if not progress_updates:
             return None
-
-        # Find job_id from parent workflow_id (format: job_id:workflow_idx)
-        job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
 
         # Aggregate counts
         total_completed = sum(p.completed_count for p in progress_updates)
@@ -4500,7 +4523,9 @@ class ManagerServer(HealthAwareServer):
         """
         Compute the overall rate for a job by aggregating sub-workflow progress.
 
-        Sums up rate_per_second from all workflows belonging to this job.
+        Sums up rate_per_second from all sub-workflows belonging to this job.
+
+        Uses the new JobManager system to get sub-workflow data.
 
         Args:
             job_id: The job identifier
@@ -4508,10 +4533,14 @@ class ManagerServer(HealthAwareServer):
         Returns:
             Aggregate rate (requests/second) across all workflows
         """
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return 0.0
+
         total_rate = 0.0
-        for workflow_id, progress in self._sub_workflow_progress.items():
-            if progress.job_id == job_id:
-                total_rate += progress.rate_per_second
+        for sub_wf in job.sub_workflows.values():
+            if sub_wf.progress:
+                total_rate += sub_wf.progress.rate_per_second
         return total_rate
 
     def _aggregate_sub_workflow_final_results(
@@ -5410,19 +5439,19 @@ class ManagerServer(HealthAwareServer):
             return
         
         # Check if all workflows are complete (JobInfo.workflows is dict[str, WorkflowInfo])
-        # WorkflowInfo uses .state (WorkflowState enum), not .status
-        terminal_states = (WorkflowState.COMPLETED, WorkflowState.FAILED,
-                          WorkflowState.AGGREGATED, WorkflowState.AGGREGATION_FAILED)
+        # WorkflowInfo uses .status (WorkflowStatus enum)
+        terminal_statuses = (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
+                          WorkflowStatus.AGGREGATED, WorkflowStatus.AGGREGATION_FAILED)
         all_done = all(
-            wf_info.state in terminal_states
+            wf_info.status in terminal_statuses
             for wf_info in job.workflows.values()
         ) if job.workflows else False
 
         if all_done and job.status == JobStatus.RUNNING.value:
             # Determine final status
-            failed_states = (WorkflowState.FAILED, WorkflowState.AGGREGATION_FAILED)
+            failed_statuses = (WorkflowStatus.FAILED, WorkflowStatus.AGGREGATION_FAILED)
             any_failed = any(
-                wf_info.state in failed_states
+                wf_info.status in failed_statuses
                 for wf_info in job.workflows.values()
             )
             job.status = JobStatus.FAILED.value if any_failed else JobStatus.COMPLETED.value
@@ -6576,37 +6605,24 @@ class ManagerServer(HealthAwareServer):
             pending_queue: list[tuple[float, str]] = []  # (timestamp, workflow_id)
             for job in self._job_manager.iter_jobs():
                 for wf_info in job.workflows.values():
-                    if wf_info.state == WorkflowState.PENDING:
+                    if wf_info.status == WorkflowStatus.PENDING:
                         pending_queue.append((job.timestamp, wf_info.token.workflow_id or ""))
             # Sort by timestamp (earliest first = front of queue)
             pending_queue.sort(key=lambda x: x[0])
             # Map workflow_id -> queue position (1-indexed)
             queue_positions = {wf_id: idx + 1 for idx, (_, wf_id) in enumerate(pending_queue)}
 
-            # Get workflow assignments for this job
-            job_assignments: dict[str, str] = self._workflow_assignments.get(request.job_id, {})
-
             for wf_info in matching_workflows:
-                # wf_info is WorkflowInfo with: token, name, state, sub_workflow_tokens
+                # wf_info is WorkflowInfo with: token, name, status, sub_workflow_tokens
                 workflow_id = wf_info.token.workflow_id or ""
-
-                # Map WorkflowState to status string
-                # Note: WorkflowState uses DISPATCHED, WorkflowStatus uses ASSIGNED
-                state_to_status = {
-                    WorkflowState.PENDING: WorkflowStatus.PENDING.value,
-                    WorkflowState.DISPATCHED: WorkflowStatus.ASSIGNED.value,
-                    WorkflowState.RUNNING: WorkflowStatus.RUNNING.value,
-                    WorkflowState.COMPLETED: WorkflowStatus.COMPLETED.value,
-                    WorkflowState.FAILED: WorkflowStatus.FAILED.value,
-                    WorkflowState.AGGREGATED: WorkflowStatus.COMPLETED.value,
-                    WorkflowState.AGGREGATION_FAILED: WorkflowStatus.FAILED.value,
-                }
-                status = state_to_status.get(wf_info.state, WorkflowStatus.PENDING.value)
+                status = wf_info.status.value
 
                 # Determine if this workflow is enqueued (PENDING status)
-                is_enqueued = wf_info.state == WorkflowState.PENDING
+                is_enqueued = wf_info.status == WorkflowStatus.PENDING
 
-                # Get assigned worker(s) for this workflow
+                # Get assigned worker(s) and progress from sub-workflows (new JobManager system)
+                # WorkflowInfo.sub_workflow_tokens contains token strings for dispatched sub-workflows
+                # JobInfo.sub_workflows maps token string -> SubWorkflowInfo
                 assigned_workers: list[str] = []
                 provisioned_cores = 0
                 completed_count = 0
@@ -6614,36 +6630,26 @@ class ManagerServer(HealthAwareServer):
                 rate_per_second = 0.0
                 elapsed_seconds = 0.0
 
-                # Check for sub-workflow assignments (multi-worker dispatch)
-                sub_workflow_ids = self._sub_workflow_mapping.get(workflow_id, [])
-                worker_id = job_assignments.get(workflow_id)
+                # Iterate over sub-workflow tokens tracked in WorkflowInfo
+                for sub_token_str in wf_info.sub_workflow_tokens:
+                    sub_info = matching_job.sub_workflows.get(sub_token_str)
+                    if sub_info:
+                        # Get worker ID from SubWorkflowInfo (extracted from token)
+                        if sub_info.worker_id:
+                            assigned_workers.append(sub_info.worker_id)
 
-                if sub_workflow_ids:
-                    assigned_workers.extend(set([
-                        job_assignments.get(sub_id)
-                        for sub_id in sub_workflow_ids
-                        if job_assignments.get(sub_id) is not None
-                    ]))
+                        # Add cores allocated to this sub-workflow
+                        provisioned_cores += sub_info.cores_allocated
 
-                    # Aggregate progress from sub-workflows
-                    for sub_id in sub_workflow_ids:
-                        sub_progress = self._sub_workflow_progress.get(sub_id)
-                        if sub_progress:
-                            provisioned_cores += len(sub_progress.assigned_cores) if sub_progress.assigned_cores else 0
-                            completed_count += sub_progress.completed_count
-                            failed_count += sub_progress.failed_count
-                            rate_per_second += sub_progress.rate_per_second
-                            elapsed_seconds = max(elapsed_seconds, sub_progress.elapsed_seconds)
-                else:
-                    assigned_workers = [worker_id] if worker_id else []
-                    # Try to get progress from single-workflow tracking
-                    wf_progress = self._sub_workflow_progress.get(workflow_id)
-                    if wf_progress:
-                        provisioned_cores = len(wf_progress.assigned_cores) if wf_progress.assigned_cores else 0
-                        completed_count = wf_progress.completed_count
-                        failed_count = wf_progress.failed_count
-                        rate_per_second = wf_progress.rate_per_second
-                        elapsed_seconds = wf_progress.elapsed_seconds
+                        # Aggregate progress if available
+                        if sub_info.progress:
+                            completed_count += sub_info.progress.completed_count
+                            failed_count += sub_info.progress.failed_count
+                            rate_per_second += sub_info.progress.rate_per_second
+                            elapsed_seconds = max(elapsed_seconds, sub_info.progress.elapsed_seconds)
+
+                # Deduplicate workers (same worker may have multiple sub-workflows)
+                assigned_workers = list(set(assigned_workers))
 
                 # Build status info
                 status_info = WorkflowStatusInfo(

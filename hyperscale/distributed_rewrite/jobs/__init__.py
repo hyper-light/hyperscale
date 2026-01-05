@@ -14,7 +14,7 @@ Worker-side:
 Supporting types:
 - TrackingToken: Globally unique workflow tracking IDs
 - JobInfo, WorkflowInfo, SubWorkflowInfo: Job state containers
-- WorkflowState: Internal workflow state enum
+- WorkflowStateMachine: State machine for workflow transitions
 - AllocationResult: Core allocation result container
 
 Logging models:
@@ -28,8 +28,10 @@ from hyperscale.distributed_rewrite.jobs.job_manager import (
     JobInfo as JobInfo,
     WorkflowInfo as WorkflowInfo,
     SubWorkflowInfo as SubWorkflowInfo,
-    WorkflowState as WorkflowState,
     TrackingToken as TrackingToken,
+)
+from hyperscale.distributed_rewrite.jobs.workflow_state_machine import (
+    WorkflowStateMachine as WorkflowStateMachine,
 )
 from hyperscale.distributed_rewrite.jobs.worker_pool import (
     WorkerPool as WorkerPool,
