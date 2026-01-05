@@ -176,6 +176,14 @@ class JobManager:
             )
 
             self._jobs[job_token_str] = job
+
+            await self._logger.log(JobManagerError(
+                message=f"[create_job] SUCCESS: created job_token={job_token_str}, job_id={submission.job_id}",
+                manager_id=self._manager_id,
+                datacenter=self._datacenter,
+                job_id=submission.job_id,
+            ))
+
             return job
 
     async def track_remote_job(
@@ -284,6 +292,13 @@ class JobManager:
         """
         job = self.get_job_by_id(job_id)
         if not job:
+            await self._logger.log(JobManagerError(
+                message=f"[register_workflow] FAILED: job not found for job_id={job_id}",
+                manager_id=self._manager_id,
+                datacenter=self._datacenter,
+                job_id=job_id,
+                workflow_id=workflow_id,
+            ))
             return None
 
         workflow_token = self.create_workflow_token(job_id, workflow_id)
@@ -304,6 +319,14 @@ class JobManager:
 
             # Update job progress
             job.workflows_total = len(job.workflows)
+
+            await self._logger.log(JobManagerError(
+                message=f"[register_workflow] SUCCESS: registered workflow_token={workflow_token_str}, name={name}",
+                manager_id=self._manager_id,
+                datacenter=self._datacenter,
+                job_id=job_id,
+                workflow_id=workflow_id,
+            ))
 
             return info
 
@@ -360,7 +383,7 @@ class JobManager:
             parent.sub_workflow_tokens.append(sub_workflow_token_str)
             self._sub_workflow_to_job[sub_workflow_token_str] = str(job.token)
 
-            await self._logger.log(JobManagerInfo(
+            await self._logger.log(JobManagerError(
                 message=f"[register_sub_workflow] SUCCESS: registered sub_workflow_token={sub_workflow_token_str}, parent={workflow_token_str}",
                 manager_id=self._manager_id,
                 datacenter=self._datacenter,
@@ -455,7 +478,7 @@ class JobManager:
                 return False, False
 
             sub_wf.result = result
-            await self._logger.log(JobManagerInfo(
+            await self._logger.log(JobManagerError(
                 message=f"[record_sub_workflow_result] SUCCESS: recorded result for token={token_str}",
                 manager_id=self._manager_id,
                 datacenter=self._datacenter,
