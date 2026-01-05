@@ -230,8 +230,6 @@ class ManagerServer(HealthAwareServer):
         # Registered workers (indexed by node_id)
         self._workers: dict[str, WorkerRegistration] = {}  # node_id -> registration
         self._worker_addr_to_id: dict[tuple[str, int], str] = {}  # (host, port) -> node_id (reverse mapping)
-        self._worker_status: dict[str, WorkerHeartbeat] = {}  # node_id -> last status
-        self._worker_last_status: dict[str, float] = {}  # node_id -> timestamp
         
         # Per-worker circuit breakers for dispatch failures
         # Tracks failures per-worker to avoid dispatching to failing workers
@@ -5345,64 +5343,55 @@ class ManagerServer(HealthAwareServer):
     ) -> str | None:
         """
         Select a worker with sufficient capacity, excluding specified workers.
-        
+
         Used for retry logic to avoid workers that have already failed.
         Also skips workers with open circuit breakers.
         """
         eligible = []
-        for node_id, status in list(self._worker_status.items()):
+        for worker in self._worker_pool.iter_workers():
+            node_id = worker.node_id
+
             if node_id in exclude_workers:
                 continue
 
             # Check circuit breaker - skip workers with open circuits
             if self._is_worker_circuit_open(node_id):
                 continue
-            
-            if status.state != WorkerState.HEALTHY.value:
+
+            # Check capacity (available minus already reserved)
+            effective_available = worker.available_cores - worker.reserved_cores
+            if effective_available < vus_needed:
                 continue
-            if status.available_cores < vus_needed:
+
+            # Check health via WorkerPool
+            if not self._worker_pool.is_worker_healthy(node_id):
                 continue
-            
-            # Check worker registration exists
-            worker_reg = self._workers.get(node_id)
-            if not worker_reg:
-                continue
-            
-            # Check SWIM membership - only select workers that are ALIVE
-            node_state = self._incarnation_tracker.get_node_state((
-                worker_reg.node.host,
-                worker_reg.node.port,
-            ))
-            if node_state and node_state.status == b'OK':
-                eligible.append(node_id)
-        
+
+            eligible.append(node_id)
+
         if not eligible:
             return None
-        
+
         return secrets.choice(eligible)
     
     async def _handle_worker_failure(self, worker_node_id: str) -> None:
         """
         Handle a worker becoming unavailable (detected via SWIM).
-        
+
         Reschedules all workflows assigned to that worker on other workers.
         The workflows must have been dispatched via _dispatch_single_workflow
         which stores the dispatch bytes in _workflow_retries for exactly this
         scenario.
         """
-        # Clean up worker from registration mappings
-        worker_reg = self._workers.pop(worker_node_id, None)
-        if worker_reg:
-            worker_addr = (worker_reg.node.host, worker_reg.node.port)
-            self._worker_addr_to_id.pop(worker_addr, None)
-        self._worker_status.pop(worker_node_id, None)
-        self._worker_last_status.pop(worker_node_id, None)
-        
-        # Find all workflows assigned to this worker
-        workflows_to_retry = [
-            wf_id for wf_id, assigned_worker in self._workflow_assignments.items()
-            if assigned_worker == worker_node_id
-        ]
+        # Clean up worker from WorkerPool
+        await self._worker_pool.deregister_worker(worker_node_id)
+
+        # Find all workflows assigned to this worker via JobManager
+        workflows_to_retry: list[str] = []
+        for job in self._job_manager.iter_jobs():
+            for sub_wf in job.sub_workflows.values():
+                if sub_wf.worker_id == worker_node_id and sub_wf.result is None:
+                    workflows_to_retry.append(str(sub_wf.token))
         
         if not workflows_to_retry:
             return
@@ -5865,15 +5854,15 @@ class ManagerServer(HealthAwareServer):
         """Handle provision request from leader for quorum."""
         try:
             request = ProvisionRequest.load(data)
-            
+
             # Check if we can confirm (worker exists and has capacity)
-            worker_hb = self._worker_status.get(request.target_worker)
+            worker = self._worker_pool.get_worker(request.target_worker)
             can_confirm = (
-                worker_hb is not None and
-                worker_hb.available_cores >= request.cores_required and
-                worker_hb.state == WorkerState.HEALTHY.value
+                worker is not None and
+                self._worker_pool.is_worker_healthy(request.target_worker) and
+                (worker.available_cores - worker.reserved_cores) >= request.cores_required
             )
-            
+
             confirm = ProvisionConfirm(
                 job_id=request.job_id,
                 workflow_id=request.workflow_id,
@@ -6132,32 +6121,29 @@ class ManagerServer(HealthAwareServer):
         try:
             request = PingRequest.load(data)
 
-            # Build per-worker status list
-            healthy_worker_ids = set(self._get_healthy_worker_ids())
+            # Build per-worker status list from WorkerPool
+            all_workers = self._worker_pool.iter_workers()
+            healthy_worker_ids = set(self._worker_pool.get_healthy_worker_ids())
             workers: list[WorkerStatus] = []
 
-            for worker_id, registration in list(self._workers.items()):
-                # Get status from heartbeat if available
-                heartbeat = self._worker_status.get(worker_id)
-                if heartbeat:
-                    state = heartbeat.state
-                    available_cores = heartbeat.available_cores
-                    queue_depth = heartbeat.queue_depth
-                    cpu_percent = heartbeat.cpu_percent
-                    memory_percent = heartbeat.memory_percent
+            for worker in all_workers:
+                # Get state from heartbeat if available, otherwise infer from health
+                if worker.heartbeat:
+                    state = worker.heartbeat.state
+                    queue_depth = worker.heartbeat.queue_depth
+                    cpu_percent = worker.heartbeat.cpu_percent
+                    memory_percent = worker.heartbeat.memory_percent
                 else:
-                    # Fallback to registration data
-                    state = WorkerState.HEALTHY.value if worker_id in healthy_worker_ids else WorkerState.OFFLINE.value
-                    available_cores = registration.available_cores
+                    state = WorkerState.HEALTHY.value if worker.node_id in healthy_worker_ids else WorkerState.OFFLINE.value
                     queue_depth = 0
                     cpu_percent = 0.0
                     memory_percent = 0.0
 
                 workers.append(WorkerStatus(
-                    worker_id=worker_id,
+                    worker_id=worker.node_id,
                     state=state,
-                    available_cores=available_cores,
-                    total_cores=registration.total_cores,
+                    available_cores=worker.available_cores,
+                    total_cores=worker.total_cores,
                     queue_depth=queue_depth,
                     cpu_percent=cpu_percent,
                     memory_percent=memory_percent,
@@ -6180,7 +6166,7 @@ class ManagerServer(HealthAwareServer):
                 term=self._leader_election.state.current_term,
                 total_cores=self._get_total_cores(),
                 available_cores=self._get_available_cores_for_healthy_workers(),
-                worker_count=len(self._workers),
+                worker_count=len(all_workers),
                 healthy_worker_count=len(healthy_worker_ids),
                 workers=workers,
                 active_job_ids=active_job_ids,
