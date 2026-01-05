@@ -3887,68 +3887,52 @@ class ManagerServer(HealthAwareServer):
                     completion_event.set()
 
                 # Update job progress status via JobManager
-                job = self._job_manager.get_job_by_id(result.job_id)
-                if job:
-                    # JobInfo.workflows is dict[str, WorkflowInfo]
-                    # Find by workflow_id in token
-                    matched = False
-                    for wf_token_str, wf_info in job.workflows.items():
-                        if wf_info.token.workflow_id == result.workflow_id:
+                # Parse the workflow_id from the sub-workflow token
+                parts = result.workflow_id.split(":")
+                if len(parts) >= 5:
+                    jm_job_id = parts[2]  # job_id is the 3rd component
+                    jm_workflow_id = parts[3]  # workflow_id is the 4th component (e.g., "wf-0001")
+
+                    job = self._job_manager.get_job_by_id(jm_job_id)
+                    if job:
+                        # Find workflow by constructing the proper token
+                        workflow_token_str = str(self._job_manager.create_workflow_token(jm_job_id, jm_workflow_id))
+                        wf_info = job.workflows.get(workflow_token_str)
+                        if wf_info:
                             # Convert result status to WorkflowStatus
                             try:
                                 new_status = WorkflowStatus(result.status)
                                 wf_info.status = new_status
+                                await self._udp_logger.log(
+                                    ServerError(
+                                        message=f"Updated workflow status: {jm_workflow_id} -> {result.status}",
+                                        node_host=self._host,
+                                        node_port=self._tcp_port,
+                                        node_id=self._node_id.short,
+                                    )
+                                )
                             except ValueError:
                                 pass  # Invalid status, keep current
-                            matched = True
-                            await self._udp_logger.log(
-                                ServerInfo(
-                                    message=f"Updated workflow status: {result.workflow_id} -> {result.status}",
-                                    node_host=self._host,
-                                    node_port=self._tcp_port,
-                                    node_id=self._node_id.short,
-                                )
+
+                        # Forward to gates (if connected)
+                        if self._known_gates or self._gate_addrs:
+                            self._task_runner.run(self._send_job_progress_to_gate, job)
+
+                        # Notify WorkflowDispatcher of completion for dependency tracking
+                        # This is critical for dependency-based execution - when a workflow completes OR FAILS,
+                        # dependent workflows may now be ready to run (or should be notified of failure)
+                        if self._workflow_dispatcher and result.status in (
+                            WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value
+                        ):
+                            await self._workflow_dispatcher.mark_workflow_completed(
+                                jm_job_id, jm_workflow_id
                             )
-                            break
-
-                    if not matched:
-                        await self._udp_logger.log(
-                            ServerError(
-                                message=f"NO MATCH for workflow_id={result.workflow_id}, job has: {[wf.token.workflow_id for wf in job.workflows.values()]}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
-
-                    # Forward to gates (if connected)
-                    if self._known_gates or self._gate_addrs:
-                        self._task_runner.run(self._send_job_progress_to_gate, job)
-
-                # Notify WorkflowDispatcher of completion for dependency tracking
-                # This is critical for dependency-based execution - when a workflow completes,
-                # dependent workflows may now be ready to run
-                if result.status == WorkflowStatus.COMPLETED.value and self._workflow_dispatcher:
-                    # Parse job_id from workflow_id (format: DC:manager:job_id:workflow_id:worker_id)
-                    parts = result.workflow_id.split(":")
-                    if len(parts) >= 5:
-                        jm_job_id = parts[2]  # job_id is the 3rd component
-                        jm_workflow_id = parts[3]  # workflow_id is the 4th component
-                        # Note: Use get_job_by_id(), not get_job() - the latter expects a full token string
-                        job_info = self._job_manager.get_job_by_id(jm_job_id)
-                        if job_info:
-                            workflow_token_str = str(self._job_manager.create_workflow_token(jm_job_id, jm_workflow_id))
-                            wf_info = job_info.workflows.get(workflow_token_str)
-                            if wf_info:
-                                await self._workflow_dispatcher.mark_workflow_completed(
-                                    jm_job_id, jm_workflow_id
+                            # Try to dispatch newly ready workflows
+                            submission = self._job_submissions.get(jm_job_id)
+                            if submission:
+                                await self._workflow_dispatcher.try_dispatch(
+                                    jm_job_id, submission
                                 )
-                                # Try to dispatch newly ready workflows
-                                submission = self._job_submissions.get(jm_job_id)
-                                if submission:
-                                    await self._workflow_dispatcher.try_dispatch(
-                                        jm_job_id, submission
-                                    )
 
                 # Check if job is complete
                 if self._is_job_complete(result.job_id):
