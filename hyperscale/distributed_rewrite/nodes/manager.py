@@ -2279,7 +2279,7 @@ class ManagerServer(HealthAwareServer):
 
     def _get_healthy_worker_ids(self) -> list[str]:
         """
-        Get list of worker IDs that are healthy according to SWIM probes.
+        Get list of worker IDs that are healthy according to WorkerPool.
 
         A worker is healthy if:
         1. SWIM reports it as 'OK' (alive), OR
@@ -2288,63 +2288,21 @@ class ManagerServer(HealthAwareServer):
         The grace period handles the startup race where workers register but SWIM
         probing hasn't completed yet.
         """
-        # =================================================================
-        # Use WorkerPool for healthy worker list (new system)
-        # =================================================================
-        pool_healthy = self._worker_pool.get_healthy_worker_ids()
-        if pool_healthy:
-            return pool_healthy
-
-        # =================================================================
-        # Legacy fallback (kept during migration)
-        # =================================================================
-        healthy = []
-        now = time.monotonic()
-        grace_period = 30.0  # Consider workers healthy for 30s after registration
-
-        # Snapshot to avoid dict mutation during iteration
-        for node_id, registration in list(self._workers.items()):
-            # Use UDP port for SWIM lookup - incarnation tracker is keyed by UDP address
-            udp_port = registration.node.udp_port or registration.node.port
-            worker_addr = (registration.node.host, udp_port)
-            node_state = self._incarnation_tracker.get_node_state(worker_addr)
-
-            # Check if SWIM says healthy
-            if node_state and node_state.status == b'OK':
-                healthy.append(node_id)
-                continue
-
-            # Check if recently registered (grace period)
-            last_seen = self._worker_last_status.get(node_id, 0)
-            if (now - last_seen) < grace_period:
-                # Not explicitly marked dead by SWIM - treat as healthy
-                if not node_state or node_state.status != b'DEAD':
-                    healthy.append(node_id)
-
-        return healthy
+        return self._worker_pool.get_healthy_worker_ids()
     
     def _get_total_cores(self) -> int:
         """Get total cores across all registered workers."""
-        # Snapshot to avoid dict mutation during iteration
-        return sum(
-            registration.total_cores
-            for registration in list(self._workers.values())
-        )
+        return sum(worker.total_cores for worker in self._worker_pool.iter_workers())
     
     def _get_available_cores_for_healthy_workers(self) -> int:
         """
         Get available cores only from healthy workers.
-        
+
         This is the source of truth for datacenter "BUSY" state:
         - If this returns 0 but we have healthy workers → BUSY
         - If we have no healthy workers → DEGRADED/UNHEALTHY
         """
-        healthy_ids = set(self._get_healthy_worker_ids())
-        return sum(
-            status.available_cores
-            for node_id, status in self._worker_status.items()
-            if node_id in healthy_ids
-        )
+        return self._worker_pool.get_total_available_cores()
     
     def _get_total_available_cores(self) -> int:
         """Get total available cores across all healthy workers for priority calculation."""
@@ -2672,8 +2630,8 @@ class ManagerServer(HealthAwareServer):
     
     def _build_manager_heartbeat(self) -> ManagerHeartbeat:
         """Build a ManagerHeartbeat with current state."""
-        healthy_worker_ids = self._get_healthy_worker_ids()
-        healthy_ids_set = set(healthy_worker_ids)
+        healthy_worker_ids = self._worker_pool.get_healthy_worker_ids()
+        all_workers = self._worker_pool.iter_workers()
 
         # Build job leadership info for jobs we lead
         # Maps job_id -> (fencing_token, layer_version)
@@ -2694,14 +2652,10 @@ class ManagerServer(HealthAwareServer):
             active_workflows=sum(
                 len(job.workflows) for job in self._job_manager.iter_jobs()
             ),
-            worker_count=len(self._workers),
+            worker_count=len(all_workers),
             healthy_worker_count=len(healthy_worker_ids),
-            available_cores=sum(
-                status.available_cores
-                for node_id, status in self._worker_status.items()
-                if node_id in healthy_ids_set
-            ),
-            total_cores=self._get_total_cores(),
+            available_cores=self._worker_pool.get_total_available_cores(),
+            total_cores=sum(worker.total_cores for worker in all_workers),
             state=self._manager_state.value,
             tcp_host=self._host,
             tcp_port=self._tcp_port,
@@ -2875,20 +2829,19 @@ class ManagerServer(HealthAwareServer):
     def _get_state_snapshot(self) -> ManagerStateSnapshot:
         """Get a complete state snapshot."""
         worker_snapshots = []
-        # Snapshot to avoid dict mutation during iteration
-        for node_id, reg in list(self._workers.items()):
-            status = self._worker_status.get(node_id)
-            if status:
+        for worker in self._worker_pool.iter_workers():
+            if worker.registration:
+                heartbeat_version = worker.heartbeat.version if worker.heartbeat else 0
                 worker_snapshots.append(WorkerStateSnapshot(
-                    node_id=node_id,
-                    state=status.state,
-                    total_cores=reg.total_cores,
-                    available_cores=status.available_cores,
-                    version=status.version,
+                    node_id=worker.node_id,
+                    state=worker.state,
+                    total_cores=worker.total_cores,
+                    available_cores=worker.available_cores,
+                    version=heartbeat_version,
                     # Include host/port for registration reconstruction
-                    host=reg.node.host,
-                    tcp_port=reg.node.port,
-                    udp_port=reg.node.udp_port,
+                    host=worker.registration.node.host,
+                    tcp_port=worker.registration.node.port,
+                    udp_port=worker.registration.node.udp_port,
                     active_workflows={},  # Could populate from tracking
                 ))
         
@@ -2999,130 +2952,35 @@ class ManagerServer(HealthAwareServer):
     def _select_worker_for_workflow(self, vus_needed: int) -> str | None:
         """
         Select a worker with sufficient capacity for a workflow.
-        
+
         Uses cryptographically secure random selection among eligible workers.
         Also checks SWIM membership - only select workers that are ALIVE.
         Skips workers with open circuit breakers.
         """
         eligible = []
-        # Snapshot to avoid dict mutation during iteration
-        for node_id, status in list(self._worker_status.items()):
+        for worker in self._worker_pool.iter_workers():
+            node_id = worker.node_id
+
             # Check circuit breaker - skip workers with open circuits
             if self._is_worker_circuit_open(node_id):
                 continue
-            
-            # Check capacity from status update
-            if status.available_cores < vus_needed:
+
+            # Check capacity (available minus already reserved)
+            effective_available = worker.available_cores - worker.reserved_cores
+            if effective_available < vus_needed:
                 continue
-            if status.state != WorkerState.HEALTHY.value:
+
+            # Check health via WorkerPool
+            if not self._worker_pool.is_worker_healthy(node_id):
                 continue
-            
-            # Check SWIM liveness - worker must be alive in SWIM cluster
-            worker_reg = self._workers.get(node_id)
-            if worker_reg:
-                worker_addr = (worker_reg.node.host, worker_reg.node.port)
-                node_state = self._incarnation_tracker.get_node_state(worker_addr)
-                if node_state and node_state.status != b'OK':
-                    continue  # Worker is suspected or dead per SWIM
-            
+
             eligible.append(node_id)
-        
+
         if not eligible:
             return None
-        
+
         # Cryptographically secure selection
         return secrets.choice(eligible)
-
-    def _select_workers_for_workflow_pool(
-        self,
-        total_cores_needed: int,
-        excluded_workers: set[str] | None = None,
-    ) -> list[tuple[str, int]]:
-        """
-        Select multiple workers to satisfy total core requirement.
-
-        Distributes a workflow across multiple workers based on their available
-        capacity. Workers are treated as a unified pool - if we need 8 cores
-        and have 2 workers with 4 cores each, both workers are selected.
-
-        Args:
-            total_cores_needed: Total cores required across all workers
-            excluded_workers: Set of worker IDs to skip (e.g., already failed)
-
-        Returns:
-            List of (worker_id, cores_to_allocate) tuples. May be empty if
-            insufficient capacity, or may allocate fewer than requested if
-            that's all that's available.
-        """
-        if excluded_workers is None:
-            excluded_workers = set()
-
-        allocations: list[tuple[str, int]] = []
-        remaining_cores = total_cores_needed
-
-        # Build list of eligible workers with their available cores
-        eligible_workers: list[tuple[str, int]] = []
-        now = time.monotonic()
-        grace_period = 30.0  # Consider workers healthy for 30s after registration
-
-        for node_id, status in list(self._worker_status.items()):
-            if node_id in excluded_workers:
-                continue
-
-            # Check circuit breaker
-            if self._is_worker_circuit_open(node_id):
-                continue
-
-            if status.state != WorkerState.HEALTHY.value:
-                continue
-
-            if status.available_cores <= 0:
-                continue
-
-            # Check SWIM liveness with grace period for newly registered workers
-            worker_reg = self._workers.get(node_id)
-            if worker_reg:
-                # Use UDP port for SWIM lookup - incarnation tracker is keyed by UDP address
-                udp_port = worker_reg.node.udp_port or worker_reg.node.port
-                worker_addr = (worker_reg.node.host, udp_port)
-                node_state = self._incarnation_tracker.get_node_state(worker_addr)
-
-                # If SWIM says OK, worker is healthy
-                if node_state and node_state.status == b'OK':
-                    eligible_workers.append((node_id, status.available_cores))
-                    continue
-
-                # If SWIM says DEAD, worker is definitely unhealthy
-                if node_state and node_state.status == b'DEAD':
-                    continue
-
-                # SWIM hasn't probed yet (node_state is None or SUSPECTED)
-                # Check grace period - treat as healthy if recently registered
-                last_seen = self._worker_last_status.get(node_id, 0)
-                if (now - last_seen) < grace_period:
-                    eligible_workers.append((node_id, status.available_cores))
-                    continue
-
-                # Outside grace period and SWIM hasn't confirmed OK - skip
-                continue
-
-            # No registration found - shouldn't happen, but skip
-            continue
-
-        # Sort by available cores descending (prefer workers with more capacity)
-        eligible_workers.sort(key=lambda x: x[1], reverse=True)
-
-        # Allocate cores from workers until we have enough
-        for worker_id, available in eligible_workers:
-            if remaining_cores <= 0:
-                break
-
-            # Allocate as many cores as this worker can provide
-            cores_from_worker = min(available, remaining_cores)
-            allocations.append((worker_id, cores_from_worker))
-            remaining_cores -= cores_from_worker
-
-        return allocations
 
     async def _send_workflow_dispatch(
         self,
@@ -3516,45 +3374,8 @@ class ManagerServer(HealthAwareServer):
         try:
             registration = WorkerRegistration.load(data)
 
-            # =================================================================
-            # Register with WorkerPool (new system)
-            # =================================================================
+            # Register with WorkerPool
             worker_info = await self._worker_pool.register_worker(registration)
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Worker registered in WorkerPool: {worker_info.node_id} ({worker_info.total_cores} cores)",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-
-            # =================================================================
-            # Legacy tracking (kept during migration)
-            # =================================================================
-
-            # Store registration
-            self._workers[registration.node.node_id] = registration
-            # Maintain reverse mapping for O(1) address -> node_id lookups
-            worker_addr = (registration.node.host, registration.node.port)
-            self._worker_addr_to_id[worker_addr] = registration.node.node_id
-            self._worker_last_status[registration.node.node_id] = time.monotonic()
-
-            # Create initial worker status with all cores available
-            # This prevents race condition where SWIM hasn't exchanged heartbeats yet
-            # SWIM updates will overwrite this with real status as they arrive
-            initial_status = WorkerHeartbeat(
-                node_id=registration.node.node_id,
-                state=WorkerState.HEALTHY.value,  # Assume healthy on registration
-                available_cores=registration.available_cores,  # All cores available
-                queue_depth=0,
-                cpu_percent=0.0,
-                memory_percent=0.0,
-                version=0,  # Initial version - SWIM updates will have higher versions
-                active_workflows={},
-            )
-            self._worker_status[registration.node.node_id] = initial_status
 
             self._increment_version()
 
@@ -3566,28 +3387,28 @@ class ManagerServer(HealthAwareServer):
                     self._workflow_dispatcher.signal_cores_available()
 
             # Add worker to SWIM cluster for UDP healthchecks
-            # The worker's UDP address is derived from registration
             worker_udp_addr = (registration.node.host, registration.node.port)
             self._probe_scheduler.add_member(worker_udp_addr)
-            
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
-                    message=f"Worker registered: {registration.node.node_id} with {registration.total_cores} cores (SWIM probe added)",
+                    message=f"Worker registered: {worker_info.node_id} with {worker_info.total_cores} cores (SWIM probe added)",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
-            
+
             # Return response with list of all healthy managers
             response = RegistrationResponse(
                 accepted=True,
                 manager_id=self._node_id.full,
                 healthy_managers=self._get_healthy_managers(),
             )
-            
+
             # Broadcast this worker discovery to peer managers
+            worker_addr = (registration.node.host, registration.node.port)
             self._task_runner.run(
                 self._broadcast_worker_discovery,
                 registration.node.node_id,
@@ -3595,7 +3416,7 @@ class ManagerServer(HealthAwareServer):
                 worker_addr,  # UDP addr same as TCP for workers
                 registration.total_cores,
             )
-            
+
             return response.dump()
             
         except Exception as e:
@@ -3764,21 +3585,18 @@ class ManagerServer(HealthAwareServer):
     ):
         """
         Handle worker status update via TCP.
-        
+
         This is NOT a healthcheck - liveness is tracked via SWIM UDP probes.
         This contains capacity and workflow progress information.
         """
         try:
-            status = WorkerHeartbeat.load(data)
+            heartbeat = WorkerHeartbeat.load(data)
 
-            print(status)
-            
-            # Update status tracking
-            self._worker_status[status.node_id] = status
-            self._worker_last_status[status.node_id] = time.monotonic()
-            
+            # Process heartbeat via WorkerPool
+            await self._worker_pool.process_heartbeat(heartbeat.node_id, heartbeat)
+
             return b'ok'
-            
+
         except Exception as e:
             await self.handle_exception(e, "receive_worker_status_update")
             return b'error'
@@ -3993,10 +3811,6 @@ class ManagerServer(HealthAwareServer):
                             )
                         )
 
-            # =================================================================
-            # Legacy handling (kept during migration)
-            # =================================================================
-
             # Check if this is a sub-workflow (dispatched to multiple workers)
             parent_workflow_id = self._get_parent_workflow_id(result.workflow_id)
 
@@ -4004,31 +3818,15 @@ class ManagerServer(HealthAwareServer):
             # This prevents lock leaks from early returns
             await self._workflow_results_locks[parent_workflow_id].acquire()
             try:
-                # Update worker's available cores from the ORIGINAL result immediately
-                # This must happen before any sub-workflow aggregation or early returns
-                # because the worker has freed cores and we need to track that for dispatch
-                original_result = result  # Preserve for worker core update
-                if original_result.worker_id and original_result.worker_available_cores >= 0:
-                    worker_status = self._worker_status.get(original_result.worker_id)
-                    if worker_status:
-                        updated_status = WorkerHeartbeat(
-                            node_id=worker_status.node_id,
-                            state=worker_status.state,
-                            available_cores=original_result.worker_available_cores,
-                            queue_depth=worker_status.queue_depth,
-                            cpu_percent=worker_status.cpu_percent,
-                            memory_percent=worker_status.memory_percent,
-                            version=worker_status.version,
-                            active_workflows=worker_status.active_workflows,
-                        )
-                        self._worker_status[original_result.worker_id] = updated_status
-
-                        # Signal cores available for waiting workflows
-                        if original_result.worker_available_cores > 0:
-                            self._cores_available_event.set()
-                            # Also notify WorkflowDispatcher for event-driven dispatch
-                            if self._workflow_dispatcher:
-                                self._workflow_dispatcher.signal_cores_available()
+                # Update worker's available cores via WorkerPool
+                if result.worker_id and result.worker_available_cores >= 0:
+                    updated = await self._worker_pool.update_worker_cores_from_progress(
+                        result.worker_id, result.worker_available_cores
+                    )
+                    if updated and result.worker_available_cores > 0:
+                        self._cores_available_event.set()
+                        if self._workflow_dispatcher:
+                            self._workflow_dispatcher.signal_cores_available()
 
                 if parent_workflow_id is not None:
                     # This is a sub-workflow - store and check if parent is complete
@@ -4053,8 +3851,6 @@ class ManagerServer(HealthAwareServer):
                         else:
                             await self._forward_context_from_result(result)
 
-                    print(self._is_parent_workflow_complete(parent_workflow_id))
-
                     # Check if all sub-workflows have completed
                     if not self._is_parent_workflow_complete(parent_workflow_id):
                         # More sub-workflows pending - just ack
@@ -4076,55 +3872,11 @@ class ManagerServer(HealthAwareServer):
                         # Not all sub-workflows have completed
                         return b'ok'  # Just ack - more results expected
 
-                    # Extract job_id from parent workflow_id (format: job_id:workflow_idx)
-                    job_id = parent_workflow_id.rsplit(":", 1)[0] if ":" in parent_workflow_id else parent_workflow_id
-
-                    # Determine overall status (any failure = failure)
-                    overall_status = WorkflowStatus.COMPLETED.value
-                    errors = []
-                    for r in sub_results:
-                        if r.status == WorkflowStatus.FAILED.value:
-                            overall_status = WorkflowStatus.FAILED.value
-                            if r.error:
-                                errors.append(r.error)
-
-                    matching_job = self._job_manager.get_job_by_id(job_id)
-                    if matching_job is None:
-                        await self.handle_exception(
-                            Exception(f"Failed to find job for {parent_workflow_id}"),
-                            "workflow_final_result"
-                        )
-                        return b'error'
-
-                    # JobInfo.workflows is dict[str, WorkflowInfo], iterate over values
-                    matching_workflows = [
-                        wf_info for wf_info in matching_job.workflows.values()
-                        if wf_info.name in request.workflow_names
-                    ]
-
-                    if len(matching_workflows) < 1:
-                        await self.handle_exception(
-                            Exception(f"No workflows found for job {job_id}"),
-                            "workflow_final_result"
-                        )
-                        return b'error'
-
-                    print(parent_workflow_id, list(self._sub_workflow_mapping.keys()), sub_ids)
-                    # All sub-workflows complete - aggregate results
-                    # result = self._aggregate_sub_workflow_final_results(parent_workflow_id)
-                    # if result is None:
-                    #     # Aggregation failed - should not happen
-                    #     await self.handle_exception(
-                    #         Exception(f"Failed to aggregate results for {parent_workflow_id}"),
-                    #         "workflow_final_result"
-                    #     )
-                    #     return b'error'
-
-                    # Clean up sub-workflow tracking
-                    # sub_workflow_ids = self._sub_workflow_mapping.pop(parent_workflow_id, [])
-                    # for sub_id in sub_workflow_ids:
-                    #     self._sub_workflow_progress.pop(sub_id, None)
-                    #     self._sub_workflow_results.pop(sub_id, None)
+                    # Clean up sub-workflow tracking now that all results are in
+                    cleaned_sub_ids = self._sub_workflow_mapping.pop(parent_workflow_id, [])
+                    for sub_id in cleaned_sub_ids:
+                        self._sub_workflow_progress.pop(sub_id, None)
+                        self._sub_workflow_results.pop(sub_id, None)
 
                 # Store final result (either original or aggregated)
                 if result.job_id not in self._workflow_final_results:
@@ -4225,9 +3977,6 @@ class ManagerServer(HealthAwareServer):
                 self._workflow_results_locks[parent_workflow_id].release()
 
         except Exception as e:
-            import traceback
-            print(traceback.format_exc())
-
             await self.handle_exception(e, "workflow_final_result")
             return b'error'
     
