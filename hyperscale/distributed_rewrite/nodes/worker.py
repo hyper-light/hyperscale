@@ -153,6 +153,11 @@ class WorkerServer(HealthAwareServer):
         self._workflow_tokens: dict[str, str] = {}  # workflow_id -> TaskRunner token
         self._workflow_cancel_events: dict[str, asyncio.Event] = {}
         self._workflow_last_progress: dict[str, float] = {}  # workflow_id -> last update time
+
+        # Fence token tracking for at-most-once dispatch
+        # Tracks highest fence token seen per workflow_id to reject stale/duplicate dispatches
+        # Key: workflow_id, Value: highest fence_token seen
+        self._workflow_fence_tokens: dict[str, int] = {}
         
         # WorkflowRunner for actual workflow execution
         # Initialized lazily when first workflow is received
@@ -1197,6 +1202,29 @@ class WorkerServer(HealthAwareServer):
                 )
                 return ack.dump()
 
+            # Validate fence token for at-most-once dispatch
+            # Reject if we've seen this workflow_id with a higher or equal fence token
+            current_fence_token = self._workflow_fence_tokens.get(dispatch.workflow_id, -1)
+            if dispatch.fence_token <= current_fence_token:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Rejecting stale dispatch for {dispatch.workflow_id}: "
+                                f"fence_token={dispatch.fence_token} <= current={current_fence_token}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                ack = WorkflowDispatchAck(
+                    workflow_id=dispatch.workflow_id,
+                    accepted=False,
+                    error=f"Stale fence token: {dispatch.fence_token} <= {current_fence_token}",
+                )
+                return ack.dump()
+
+            # Update fence token tracking
+            self._workflow_fence_tokens[dispatch.workflow_id] = dispatch.fence_token
+
             # Atomic core allocation - no TOCTOU race
             # CoreAllocator checks availability and allocates in one atomic operation
             allocation_result = await self._core_allocator.allocate(
@@ -1270,6 +1298,7 @@ class WorkerServer(HealthAwareServer):
                 await self._core_allocator.free(dispatch.workflow_id)
                 self._workflow_cancel_events.pop(dispatch.workflow_id, None)
                 self._active_workflows.pop(dispatch.workflow_id, None)
+                self._workflow_fence_tokens.pop(dispatch.workflow_id, None)
 
             workflow_id = dispatch.workflow_id if dispatch else "unknown"
             ack = WorkflowDispatchAck(
@@ -1431,6 +1460,7 @@ class WorkerServer(HealthAwareServer):
             self._active_workflows.pop(dispatch.workflow_id, None)
             self._workflow_last_progress.pop(dispatch.workflow_id, None)
             self._workflow_cores_completed.pop(dispatch.workflow_id, None)
+            self._workflow_fence_tokens.pop(dispatch.workflow_id, None)
 
         return (
             progress,
