@@ -74,7 +74,8 @@ def do_patch():
     ssl = _ssl
     if hasattr(ssl, "PROTOCOL_DTLSv1"):
         return
-    _orig_wrap_socket = ssl.SSLContext().wrap_socket
+    # Note: _orig_wrap_socket was previously stored but never used
+    # We use our custom _wrap_socket function instead
     ssl.wrap_socket = _wrap_socket
     ssl.PROTOCOL_DTLS = PROTOCOL_DTLS
     ssl.PROTOCOL_DTLSv1 = PROTOCOL_DTLSv1
