@@ -40,4 +40,8 @@ from hyperscale.distributed_rewrite.reliability.rate_limiting import (
     # Retry-after helpers
     is_rate_limit_response as is_rate_limit_response,
     handle_rate_limit_response as handle_rate_limit_response,
+    # Retry-after with automatic retry
+    RateLimitRetryConfig as RateLimitRetryConfig,
+    RateLimitRetryResult as RateLimitRetryResult,
+    execute_with_rate_limit_retry as execute_with_rate_limit_retry,
 )

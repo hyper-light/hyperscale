@@ -516,3 +516,183 @@ async def handle_rate_limit_response(
         return await limiter.wait_if_needed(operation)
 
     return 0.0
+
+
+class RateLimitRetryConfig:
+    """Configuration for rate limit retry behavior."""
+
+    def __init__(
+        self,
+        max_retries: int = 3,
+        max_total_wait: float = 60.0,
+        backoff_multiplier: float = 1.5,
+    ):
+        """
+        Initialize retry configuration.
+
+        Args:
+            max_retries: Maximum number of retry attempts after rate limiting
+            max_total_wait: Maximum total time to spend waiting/retrying (seconds)
+            backoff_multiplier: Multiplier applied to retry_after on each retry
+        """
+        self.max_retries = max_retries
+        self.max_total_wait = max_total_wait
+        self.backoff_multiplier = backoff_multiplier
+
+
+class RateLimitRetryResult:
+    """Result of a rate-limit-aware operation."""
+
+    def __init__(
+        self,
+        success: bool,
+        response: bytes | None,
+        retries: int,
+        total_wait_time: float,
+        final_error: str | None = None,
+    ):
+        self.success = success
+        self.response = response
+        self.retries = retries
+        self.total_wait_time = total_wait_time
+        self.final_error = final_error
+
+
+async def execute_with_rate_limit_retry(
+    operation_func,
+    operation_name: str,
+    limiter: CooperativeRateLimiter,
+    config: RateLimitRetryConfig | None = None,
+    response_parser=None,
+) -> RateLimitRetryResult:
+    """
+    Execute an operation with automatic retry on rate limiting.
+
+    This function wraps any async operation and automatically handles
+    rate limit responses by waiting the specified retry_after time
+    and retrying up to max_retries times.
+
+    Args:
+        operation_func: Async function that performs the operation and returns bytes
+        operation_name: Name of the operation for rate limiting (e.g., "job_submit")
+        limiter: CooperativeRateLimiter to track rate limit state
+        config: Retry configuration (defaults to RateLimitRetryConfig())
+        response_parser: Optional function to parse response and check if it's
+                         a RateLimitResponse. If None, uses is_rate_limit_response.
+
+    Returns:
+        RateLimitRetryResult with success status, response, retry count, and wait time
+
+    Example:
+        async def submit_job():
+            return await send_tcp(gate_addr, "job_submit", submission.dump())
+
+        result = await execute_with_rate_limit_retry(
+            submit_job,
+            "job_submit",
+            my_limiter,
+        )
+
+        if result.success:
+            job_ack = JobAck.load(result.response)
+        else:
+            print(f"Failed after {result.retries} retries: {result.final_error}")
+    """
+    if config is None:
+        config = RateLimitRetryConfig()
+
+    if response_parser is None:
+        response_parser = is_rate_limit_response
+
+    total_wait_time = 0.0
+    retries = 0
+    start_time = time.monotonic()
+
+    # Check if we're already blocked for this operation
+    if limiter.is_blocked(operation_name):
+        initial_wait = await limiter.wait_if_needed(operation_name)
+        total_wait_time += initial_wait
+
+    while retries <= config.max_retries:
+        # Check if we've exceeded max total wait time
+        elapsed = time.monotonic() - start_time
+        if elapsed >= config.max_total_wait:
+            return RateLimitRetryResult(
+                success=False,
+                response=None,
+                retries=retries,
+                total_wait_time=total_wait_time,
+                final_error=f"Exceeded max total wait time ({config.max_total_wait}s)",
+            )
+
+        try:
+            # Execute the operation
+            response = await operation_func()
+
+            # Check if response is a rate limit response
+            if response and response_parser(response):
+                # Parse the rate limit response to get retry_after
+                # Import here to avoid circular dependency
+                from hyperscale.distributed_rewrite.models import RateLimitResponse
+
+                try:
+                    rate_limit = RateLimitResponse.load(response)
+                    retry_after = rate_limit.retry_after_seconds
+
+                    # Apply backoff multiplier for subsequent retries
+                    if retries > 0:
+                        retry_after *= config.backoff_multiplier ** retries
+
+                    # Check if waiting would exceed our limits
+                    if total_wait_time + retry_after > config.max_total_wait:
+                        return RateLimitRetryResult(
+                            success=False,
+                            response=response,
+                            retries=retries,
+                            total_wait_time=total_wait_time,
+                            final_error=f"Rate limited, retry_after ({retry_after}s) would exceed max wait",
+                        )
+
+                    # Wait and retry
+                    limiter.handle_rate_limit(operation_name, retry_after)
+                    await asyncio.sleep(retry_after)
+                    total_wait_time += retry_after
+                    retries += 1
+                    continue
+
+                except Exception:
+                    # Couldn't parse rate limit response, treat as failure
+                    return RateLimitRetryResult(
+                        success=False,
+                        response=response,
+                        retries=retries,
+                        total_wait_time=total_wait_time,
+                        final_error="Failed to parse rate limit response",
+                    )
+
+            # Success - not a rate limit response
+            return RateLimitRetryResult(
+                success=True,
+                response=response,
+                retries=retries,
+                total_wait_time=total_wait_time,
+            )
+
+        except Exception as e:
+            # Operation failed with exception
+            return RateLimitRetryResult(
+                success=False,
+                response=None,
+                retries=retries,
+                total_wait_time=total_wait_time,
+                final_error=str(e),
+            )
+
+    # Exhausted retries
+    return RateLimitRetryResult(
+        success=False,
+        response=None,
+        retries=retries,
+        total_wait_time=total_wait_time,
+        final_error=f"Exhausted max retries ({config.max_retries})",
+    )

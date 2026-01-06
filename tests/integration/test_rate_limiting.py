@@ -608,3 +608,214 @@ class TestRetryAfterHelpers:
         # Server should now allow the request again
         result4 = server_limiter.check_rate_limit("client-1", "test_op")
         assert result4.allowed is True
+
+
+class TestExecuteWithRateLimitRetry:
+    """Test automatic retry on rate limiting."""
+
+    @pytest.mark.asyncio
+    async def test_success_on_first_try(self) -> None:
+        """Test successful operation without rate limiting."""
+        from hyperscale.distributed_rewrite.reliability import (
+            CooperativeRateLimiter,
+            execute_with_rate_limit_retry,
+        )
+
+        limiter = CooperativeRateLimiter()
+        call_count = 0
+
+        async def operation():
+            nonlocal call_count
+            call_count += 1
+            return b"success_response"
+
+        result = await execute_with_rate_limit_retry(
+            operation,
+            "test_op",
+            limiter,
+        )
+
+        assert result.success is True
+        assert result.response == b"success_response"
+        assert result.retries == 0
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_after_rate_limit(self) -> None:
+        """Test automatic retry after rate limit response."""
+        from hyperscale.distributed_rewrite.reliability import (
+            CooperativeRateLimiter,
+            RateLimitRetryConfig,
+            execute_with_rate_limit_retry,
+        )
+        from hyperscale.distributed_rewrite.models import RateLimitResponse
+
+        limiter = CooperativeRateLimiter()
+        call_count = 0
+
+        async def operation():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call returns rate limit
+                return RateLimitResponse(
+                    operation="test_op",
+                    retry_after_seconds=0.05,
+                ).dump()
+            else:
+                # Second call succeeds
+                return b"success_response"
+
+        config = RateLimitRetryConfig(max_retries=3, max_total_wait=10.0)
+
+        start = time.monotonic()
+        result = await execute_with_rate_limit_retry(
+            operation,
+            "test_op",
+            limiter,
+            config=config,
+        )
+        elapsed = time.monotonic() - start
+
+        assert result.success is True
+        assert result.response == b"success_response"
+        assert result.retries == 1
+        assert call_count == 2
+        assert elapsed >= 0.04  # Waited for retry_after
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retries(self) -> None:
+        """Test failure after exhausting retries."""
+        from hyperscale.distributed_rewrite.reliability import (
+            CooperativeRateLimiter,
+            RateLimitRetryConfig,
+            execute_with_rate_limit_retry,
+        )
+        from hyperscale.distributed_rewrite.models import RateLimitResponse
+
+        limiter = CooperativeRateLimiter()
+        call_count = 0
+
+        async def operation():
+            nonlocal call_count
+            call_count += 1
+            # Always return rate limit
+            return RateLimitResponse(
+                operation="test_op",
+                retry_after_seconds=0.01,
+            ).dump()
+
+        config = RateLimitRetryConfig(max_retries=2, max_total_wait=10.0)
+
+        result = await execute_with_rate_limit_retry(
+            operation,
+            "test_op",
+            limiter,
+            config=config,
+        )
+
+        assert result.success is False
+        assert result.retries == 2
+        assert call_count == 3  # Initial + 2 retries
+        assert "Exhausted max retries" in result.final_error
+
+    @pytest.mark.asyncio
+    async def test_max_total_wait_exceeded(self) -> None:
+        """Test failure when max total wait time is exceeded."""
+        from hyperscale.distributed_rewrite.reliability import (
+            CooperativeRateLimiter,
+            RateLimitRetryConfig,
+            execute_with_rate_limit_retry,
+        )
+        from hyperscale.distributed_rewrite.models import RateLimitResponse
+
+        limiter = CooperativeRateLimiter()
+
+        async def operation():
+            # Return a rate limit with long retry_after
+            return RateLimitResponse(
+                operation="test_op",
+                retry_after_seconds=10.0,
+            ).dump()
+
+        # Max wait is shorter than retry_after
+        config = RateLimitRetryConfig(max_retries=5, max_total_wait=1.0)
+
+        result = await execute_with_rate_limit_retry(
+            operation,
+            "test_op",
+            limiter,
+            config=config,
+        )
+
+        assert result.success is False
+        assert "would exceed max wait" in result.final_error
+
+    @pytest.mark.asyncio
+    async def test_backoff_multiplier(self) -> None:
+        """Test that backoff multiplier increases wait time."""
+        from hyperscale.distributed_rewrite.reliability import (
+            CooperativeRateLimiter,
+            RateLimitRetryConfig,
+            execute_with_rate_limit_retry,
+        )
+        from hyperscale.distributed_rewrite.models import RateLimitResponse
+
+        limiter = CooperativeRateLimiter()
+        call_count = 0
+
+        async def operation():
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                return RateLimitResponse(
+                    operation="test_op",
+                    retry_after_seconds=0.02,
+                ).dump()
+            else:
+                return b"success"
+
+        # With backoff_multiplier=2.0:
+        # First retry: 0.02s
+        # Second retry: 0.02 * 2.0 = 0.04s
+        config = RateLimitRetryConfig(
+            max_retries=5,
+            max_total_wait=10.0,
+            backoff_multiplier=2.0,
+        )
+
+        start = time.monotonic()
+        result = await execute_with_rate_limit_retry(
+            operation,
+            "test_op",
+            limiter,
+            config=config,
+        )
+        elapsed = time.monotonic() - start
+
+        assert result.success is True
+        assert result.retries == 2
+        # Total wait should be at least 0.02 + 0.04 = 0.06
+        assert elapsed >= 0.05
+
+    @pytest.mark.asyncio
+    async def test_exception_handling(self) -> None:
+        """Test that exceptions are properly handled."""
+        from hyperscale.distributed_rewrite.reliability import (
+            CooperativeRateLimiter,
+            execute_with_rate_limit_retry,
+        )
+
+        limiter = CooperativeRateLimiter()
+
+        async def operation():
+            raise ConnectionError("Network failure")
+
+        result = await execute_with_rate_limit_retry(
+            operation,
+            "test_op",
+            limiter,
+        )
+
+        assert result.success is False
+        assert "Network failure" in result.final_error
