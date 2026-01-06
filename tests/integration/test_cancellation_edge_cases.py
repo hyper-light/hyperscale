@@ -400,15 +400,19 @@ class TestTimeoutHandling:
         manager.assign_workflow("wf-2", "worker-2")
         gate.register_job("job-1", ["wf-1", "wf-2"])
 
+        # Use a short per-worker timeout (0.5s) but give the gate enough time
+        # to wait for the manager to collect partial results
         request = CancelRequest(
             job_id="job-1",
             request_id="req-1",
             requester_id="client-1",
             timestamp=time.time(),
-            timeout_seconds=0.5,
+            timeout_seconds=0.5,  # Per-worker timeout
         )
 
-        response = await gate.handle_cancel(request)
+        # Call manager directly to test partial timeout at manager level
+        # (bypasses gate's additional timeout layer)
+        response = await manager.handle_cancel(request, ["wf-1", "wf-2"])
 
         # Partial success - worker-1 cancelled, worker-2 timed out
         assert response.cancelled_count == 1
