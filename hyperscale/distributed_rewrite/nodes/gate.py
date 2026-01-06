@@ -78,6 +78,8 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowQueryResponse,
     DatacenterWorkflowStatus,
     GateWorkflowQueryResponse,
+    RegisterCallback,
+    RegisterCallbackResponse,
 )
 from hyperscale.distributed_rewrite.swim.core import (
     QuorumError,
@@ -3322,6 +3324,69 @@ class GateServer(HealthAwareServer):
 
         except Exception as e:
             await self.handle_exception(e, "ping")
+            return b'error'
+
+    @tcp.receive()
+    async def register_callback(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle client callback registration for job reconnection.
+
+        Called when a client wants to re-subscribe to push notifications
+        for an existing job (e.g., after disconnect/reconnect).
+
+        Returns current job status so client can sync immediately.
+        If this gate doesn't own the job, returns success=False with
+        error="Job not found".
+        """
+        try:
+            request = RegisterCallback.load(data)
+            job_id = request.job_id
+
+            # Check if we own this job
+            job = self._jobs.get(job_id)
+            if not job:
+                # Job not found on this gate
+                response = RegisterCallbackResponse(
+                    job_id=job_id,
+                    success=False,
+                    error="Job not found",
+                )
+                return response.dump()
+
+            # Register the callback address
+            self._job_callbacks[job_id] = request.callback_addr
+
+            # Calculate elapsed time
+            elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Client reconnected for job {job_id}, registered callback {request.callback_addr}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            response = RegisterCallbackResponse(
+                job_id=job_id,
+                success=True,
+                status=job.status,
+                total_completed=job.total_completed,
+                total_failed=job.total_failed,
+                elapsed_seconds=elapsed,
+            )
+
+            return response.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "register_callback")
             return b'error'
 
     @tcp.receive()

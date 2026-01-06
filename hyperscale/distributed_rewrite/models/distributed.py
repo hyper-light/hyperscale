@@ -894,6 +894,41 @@ class JobBatchPush(Message):
     per_dc_stats: list["DCStats"] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class RegisterCallback(Message):
+    """
+    Client request to register for push notifications for a job.
+
+    Used for client reconnection after disconnect. Client sends this
+    to the job owner gate/manager to re-subscribe to status updates.
+
+    Part of Client Reconnection (Component 5):
+    1. Client disconnects from Gate-A
+    2. Client reconnects and sends RegisterCallback(job_id=X)
+    3. Gate/Manager adds callback_addr to job's notification list
+    4. Client receives remaining status updates
+    """
+    job_id: str                       # Job to register callback for
+    callback_addr: tuple[str, int]    # Client's TCP address for push notifications
+
+
+@dataclass(slots=True)
+class RegisterCallbackResponse(Message):
+    """
+    Response to RegisterCallback request.
+
+    Indicates whether callback registration succeeded and provides
+    current job status for immediate sync.
+    """
+    job_id: str                       # Job being registered
+    success: bool                     # Whether registration succeeded
+    status: str = ""                  # Current JobStatus value
+    total_completed: int = 0          # Current completion count
+    total_failed: int = 0             # Current failure count
+    elapsed_seconds: float = 0.0      # Time since job started
+    error: str | None = None          # Error message if failed
+
+
 # =============================================================================
 # State Synchronization
 # =============================================================================

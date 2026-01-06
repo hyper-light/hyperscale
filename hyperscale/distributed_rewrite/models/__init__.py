@@ -70,6 +70,9 @@ from .distributed import (
     JobStatusPush as JobStatusPush,
     DCStats as DCStats,
     JobBatchPush as JobBatchPush,
+    # Client reconnection
+    RegisterCallback as RegisterCallback,
+    RegisterCallbackResponse as RegisterCallbackResponse,
     # State sync
     WorkerStateSnapshot as WorkerStateSnapshot,
     ManagerStateSnapshot as ManagerStateSnapshot,

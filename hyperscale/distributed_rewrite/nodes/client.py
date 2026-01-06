@@ -51,6 +51,8 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowQueryResponse,
     DatacenterWorkflowStatus,
     GateWorkflowQueryResponse,
+    RegisterCallback,
+    RegisterCallbackResponse,
 )
 from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
@@ -337,6 +339,142 @@ class HyperscaleClient(MercurySyncBaseServer):
     def get_job_status(self, job_id: str) -> JobResult | None:
         """Get current status of a job."""
         return self._jobs.get(job_id)
+
+    # =========================================================================
+    # Client Reconnection
+    # =========================================================================
+
+    async def reconnect_to_job(
+        self,
+        job_id: str,
+        on_status_update: Callable[[JobStatusPush], None] | None = None,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.5,
+        timeout: float = 5.0,
+    ) -> JobResult:
+        """
+        Reconnect to an existing job after client disconnect.
+
+        This method re-registers the client's callback address with the
+        gate/manager that owns the job, enabling push notification delivery
+        to resume. It also returns the current job status for immediate sync.
+
+        Use this when:
+        - Client was disconnected and reconnected
+        - Client was restarted and needs to resume tracking a job
+        - Client wants to start receiving updates for a job submitted elsewhere
+
+        Args:
+            job_id: Job identifier to reconnect to
+            on_status_update: Optional callback for status updates
+            max_retries: Maximum retry attempts for transient errors
+            retry_base_delay: Base delay for exponential backoff (seconds)
+            timeout: Request timeout in seconds
+
+        Returns:
+            JobResult with current job status
+
+        Raises:
+            RuntimeError: If no gates/managers configured or reconnection fails
+            KeyError: If job not found on any configured gate/manager
+        """
+        # Build list of all potential targets
+        all_targets = []
+        if self._gates:
+            all_targets.extend(self._gates)
+        if self._managers:
+            all_targets.extend(self._managers)
+
+        if not all_targets:
+            raise RuntimeError("No managers or gates configured")
+
+        request = RegisterCallback(
+            job_id=job_id,
+            callback_addr=self._get_callback_addr(),
+        )
+
+        last_error: str | None = None
+        found_target: tuple[str, int] | None = None
+
+        # Try each target with retries
+        for retry in range(max_retries + 1):
+            for target in all_targets:
+                try:
+                    response_data, _ = await self.send_tcp(
+                        target,
+                        "register_callback",
+                        request.dump(),
+                        timeout=timeout,
+                    )
+
+                    if isinstance(response_data, Exception):
+                        last_error = str(response_data)
+                        continue
+
+                    response = RegisterCallbackResponse.load(response_data)
+
+                    if response.success:
+                        found_target = target
+                        # Initialize or update job tracking
+                        if job_id not in self._jobs:
+                            self._jobs[job_id] = JobResult(
+                                job_id=job_id,
+                                status=response.status,
+                                total_completed=response.total_completed,
+                                total_failed=response.total_failed,
+                                elapsed_seconds=response.elapsed_seconds,
+                            )
+                            self._job_events[job_id] = asyncio.Event()
+                        else:
+                            job = self._jobs[job_id]
+                            job.status = response.status
+                            job.total_completed = response.total_completed
+                            job.total_failed = response.total_failed
+                            job.elapsed_seconds = response.elapsed_seconds
+
+                        # Track the target for future queries
+                        self._job_targets[job_id] = target
+
+                        # Register callback if provided
+                        if on_status_update:
+                            self._job_callbacks[job_id] = on_status_update
+
+                        # Check if job already completed
+                        if response.status in (
+                            JobStatus.COMPLETED.value,
+                            JobStatus.FAILED.value,
+                            JobStatus.CANCELLED.value,
+                        ):
+                            self._job_events[job_id].set()
+
+                        return self._jobs[job_id]
+
+                    elif response.error:
+                        # Check if this is a "job not found" type error
+                        if "not found" in response.error.lower():
+                            continue  # Try next target
+                        elif self._is_transient_error(response.error):
+                            last_error = response.error
+                            continue  # Try next target
+                        else:
+                            # Permanent error
+                            raise RuntimeError(
+                                f"Failed to reconnect to job {job_id}: {response.error}"
+                            )
+
+                except Exception as exc:
+                    last_error = str(exc)
+                    continue
+
+            # If we haven't found the job, wait and retry
+            if retry < max_retries and not found_target:
+                delay = retry_base_delay * (2 ** retry)
+                await asyncio.sleep(delay)
+
+        # Job not found on any target
+        raise KeyError(
+            f"Job {job_id} not found on any configured gate/manager: {last_error}"
+        )
 
     # =========================================================================
     # Ping Methods
