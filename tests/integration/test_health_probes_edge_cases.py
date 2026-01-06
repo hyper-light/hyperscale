@@ -663,9 +663,12 @@ class TestPeriodicChecks:
     async def test_initial_delay(self):
         """initial_delay_seconds delays first check."""
         check_count = 0
+        first_check_time = None
 
         async def counting_check():
-            nonlocal check_count
+            nonlocal check_count, first_check_time
+            if first_check_time is None:
+                first_check_time = asyncio.get_event_loop().time()
             check_count += 1
             return True, "OK"
 
@@ -678,17 +681,19 @@ class TestPeriodicChecks:
             ),
         )
 
+        start_time = asyncio.get_event_loop().time()
+
+        # start_periodic awaits the initial delay before starting the task
         await probe.start_periodic()
 
-        # Before initial delay, no checks
-        await asyncio.sleep(0.05)
-        assert check_count == 0
-
-        # After initial delay, checks run
-        await asyncio.sleep(0.15)
-        assert check_count >= 1
+        # Wait for first check to happen
+        await asyncio.sleep(0.1)
 
         await probe.stop_periodic()
+
+        # Verify that the first check happened after the initial delay
+        assert first_check_time is not None
+        assert first_check_time >= start_time + 0.14  # Allow small tolerance
 
     @pytest.mark.asyncio
     async def test_start_periodic_idempotent(self):

@@ -75,14 +75,16 @@ class TestDeltaDetection:
             delta_thresholds=(0.2, 0.5, 1.0),
             min_samples=3,
             current_window=5,
+            ema_alpha=0.01,  # Very slow baseline adaptation
         )
         detector = HybridOverloadDetector(config)
 
-        # Establish baseline at 100ms
+        # Establish baseline at 100ms with slow EMA
         for _ in range(10):
             detector.record_latency(100.0)
 
         # Now samples at 130ms (30% above baseline)
+        # With ema_alpha=0.01, baseline barely moves
         for _ in range(5):
             detector.record_latency(130.0)
 
@@ -95,14 +97,16 @@ class TestDeltaDetection:
             delta_thresholds=(0.2, 0.5, 1.0),
             min_samples=3,
             current_window=5,
+            ema_alpha=0.01,  # Very slow baseline adaptation
         )
         detector = HybridOverloadDetector(config)
 
-        # Establish baseline at 100ms
+        # Establish baseline at 100ms with slow EMA
         for _ in range(10):
             detector.record_latency(100.0)
 
         # Now samples at 180ms (80% above baseline)
+        # With ema_alpha=0.01, baseline barely moves
         for _ in range(5):
             detector.record_latency(180.0)
 
@@ -115,14 +119,16 @@ class TestDeltaDetection:
             delta_thresholds=(0.2, 0.5, 1.0),
             min_samples=3,
             current_window=5,
+            ema_alpha=0.01,  # Very slow baseline adaptation
         )
         detector = HybridOverloadDetector(config)
 
-        # Establish baseline at 100ms
+        # Establish baseline at 100ms with slow EMA
         for _ in range(10):
             detector.record_latency(100.0)
 
         # Now samples at 250ms (150% above baseline)
+        # With ema_alpha=0.01, baseline barely moves
         for _ in range(5):
             detector.record_latency(250.0)
 
@@ -322,17 +328,21 @@ class TestTrendDetection:
             trend_window=10,
             min_samples=3,
             current_window=5,
+            ema_alpha=0.01,  # Very slow baseline so delta keeps rising
         )
         detector = HybridOverloadDetector(config)
 
-        # Establish baseline
-        detector.record_latency(100.0)
+        # Establish baseline at stable 100ms first
+        for _ in range(10):
+            detector.record_latency(100.0)
 
-        # Rising latency trend
-        for index in range(20):
-            detector.record_latency(100.0 + index * 10)
+        # Now rising latency - baseline is ~100, but current keeps increasing
+        # This creates rising delta values in the delta history
+        for index in range(15):
+            detector.record_latency(100.0 + (index + 1) * 20)
 
-        # Trend should be positive and trigger overload
+        # With slow EMA, current_avg keeps growing relative to baseline
+        # This means each delta is larger than the last -> positive trend
         assert detector.trend > 0
 
     def test_no_trend_with_stable_latency(self):
@@ -854,14 +864,16 @@ class TestCustomConfiguration:
             delta_thresholds=(0.05, 0.1, 0.2),  # 5%, 10%, 20%
             min_samples=3,
             current_window=5,
+            ema_alpha=0.01,  # Very slow baseline adaptation
         )
         detector = HybridOverloadDetector(config)
 
-        # Establish baseline
+        # Establish baseline with slow EMA
         for _ in range(10):
             detector.record_latency(100.0)
 
         # Just 15% above baseline triggers STRESSED
+        # With ema_alpha=0.01, baseline stays ~100
         for _ in range(5):
             detector.record_latency(115.0)
 

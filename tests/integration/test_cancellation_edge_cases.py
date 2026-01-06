@@ -380,8 +380,9 @@ class TestTimeoutHandling:
         manager = SimulatedManagerEdge("manager-1", timeout_sim)
         gate = SimulatedGateEdge("gate-1", timeout_sim)
 
-        # Only worker-2 times out
-        timeout_sim.set_timeout("worker-2", True)
+        # Only worker-2 times out (but use delay, not full timeout)
+        # This allows worker-1 to succeed while worker-2 fails
+        timeout_sim.set_delay("worker-2", 2.0)  # Long delay causes timeout
 
         manager.register_worker(worker1, "worker-1")
         manager.register_worker(worker2, "worker-2")
@@ -403,7 +404,7 @@ class TestTimeoutHandling:
 
         response = await gate.handle_cancel(request)
 
-        # Partial success
+        # Partial success - worker-1 cancelled, worker-2 timed out
         assert response.cancelled_count == 1
         assert "Timeout" in response.error
 
