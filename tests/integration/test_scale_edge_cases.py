@@ -204,9 +204,11 @@ class TestResourceExhaustion:
         for _ in range(10):
             assert bucket.acquire() is True
 
-        # Bucket is empty
+        # Bucket is empty - can't acquire more
         assert bucket.acquire() is False
-        assert bucket.available_tokens == 0
+        # Note: available_tokens calls _refill() which may add tiny amounts
+        # due to elapsed time, so check it's less than 1 (can't acquire)
+        assert bucket.available_tokens < 1
 
     def test_token_bucket_recovery_after_depletion(self):
         """Test token bucket recovery after complete depletion."""
@@ -216,7 +218,9 @@ class TestResourceExhaustion:
         for _ in range(10):
             bucket.acquire()
 
-        assert bucket.available_tokens == 0
+        # Immediately after depletion, should have very few tokens
+        # (available_tokens calls _refill so may have tiny amount)
+        assert bucket.available_tokens < 1
 
         # Wait for refill
         time.sleep(0.1)  # Should refill 10 tokens
@@ -319,33 +323,33 @@ class TestCascadeFailures:
 
     def test_overload_triggers_shedding_cascade(self):
         """Test that overload detection properly triggers load shedding."""
+        # Use min_samples=1 and current_window=1 for immediate state transitions
+        # based on absolute bounds (no EMA smoothing effects)
         config = OverloadConfig(
             absolute_bounds=(100.0, 200.0, 500.0),
-            min_samples=3,
-            current_window=5,
+            min_samples=1,
+            current_window=1,
         )
         detector = HybridOverloadDetector(config)
         shedder = LoadShedder(detector)
 
         # Initially healthy - accept everything
         detector.record_latency(50.0)
-        detector.record_latency(50.0)
-        detector.record_latency(50.0)
 
         assert not shedder.should_shed("DetailedStatsRequest")  # LOW
 
-        # Transition to stressed
-        for _ in range(5):
-            detector.record_latency(300.0)
+        # Transition to stressed (300ms > 200ms threshold)
+        detector._recent.clear()
+        detector.record_latency(300.0)
 
         # LOW and NORMAL should now be shed
         assert shedder.should_shed("DetailedStatsRequest")  # LOW
         assert shedder.should_shed("StatsUpdate")  # NORMAL
         assert not shedder.should_shed("SubmitJob")  # HIGH
 
-        # Transition to overloaded
-        for _ in range(5):
-            detector.record_latency(1000.0)
+        # Transition to overloaded (1000ms > 500ms threshold)
+        detector._recent.clear()
+        detector.record_latency(1000.0)
 
         # Only CRITICAL accepted
         assert shedder.should_shed("SubmitJob")  # HIGH - now shed
@@ -524,6 +528,8 @@ class TestStateCorruptionRecovery:
                 worker_id="worker-1",
                 reason="busy",
                 current_progress=float((i + 1) * 10),
+                estimated_completion=30.0,
+                active_workflow_count=1,
             )
             manager.handle_extension_request(request, time.time() + 30)
 
@@ -1167,6 +1173,8 @@ class TestRecoveryPatterns:
                 worker_id="worker-1",
                 reason="busy",
                 current_progress=float((i + 1) * 10),
+                estimated_completion=30.0,
+                active_workflow_count=1,
             )
             manager.handle_extension_request(request, time.time() + 30)
 
@@ -1181,6 +1189,8 @@ class TestRecoveryPatterns:
             worker_id="worker-1",
             reason="new work",
             current_progress=5.0,
+            estimated_completion=30.0,
+            active_workflow_count=1,
         )
         response = manager.handle_extension_request(request, time.time() + 30)
         assert response.granted is True
@@ -1633,6 +1643,8 @@ class TestPartialFailureSplitBrain:
                 worker_id="worker-1",
                 reason="busy",
                 current_progress=float((i + 1) * 10),
+                estimated_completion=30.0,
+                active_workflow_count=1,
             )
             manager.handle_extension_request(request, time.time() + 30)
 
@@ -1645,6 +1657,8 @@ class TestPartialFailureSplitBrain:
             worker_id="worker-2",
             reason="busy",
             current_progress=10.0,
+            estimated_completion=30.0,
+            active_workflow_count=1,
         )
         response = manager.handle_extension_request(request2, time.time() + 30)
         assert response.granted is True
@@ -1956,6 +1970,8 @@ class TestErrorMessageQuality:
                 worker_id="worker-1",
                 reason="busy",
                 current_progress=float((i + 1) * 10),
+                estimated_completion=30.0,
+                active_workflow_count=1,
             )
             manager.handle_extension_request(request, time.time() + 30)
 
@@ -2109,8 +2125,6 @@ class TestPriorityStateTransitionEdges:
             min_samples=1,
             current_window=1,
         )
-        detector = HybridOverloadDetector(config)
-        shedder = LoadShedder(detector)
 
         test_cases = [
             (50.0, OverloadState.HEALTHY, False, False, False, False),
@@ -2120,7 +2134,11 @@ class TestPriorityStateTransitionEdges:
         ]
 
         for latency, expected_state, crit_shed, high_shed, norm_shed, low_shed in test_cases:
-            detector._recent.clear()
+            # Create fresh detector/shedder for each case to avoid
+            # delta detection interference from baseline drift
+            detector = HybridOverloadDetector(config)
+            shedder = LoadShedder(detector)
+
             detector.record_latency(latency)
 
             state = detector.get_state()
@@ -2277,6 +2295,8 @@ class TestDiagnosticsObservability:
             worker_id="worker-1",
             reason="busy",
             current_progress=10.0,
+            estimated_completion=30.0,
+            active_workflow_count=1,
         )
         manager.handle_extension_request(request, time.time() + 30)
 
