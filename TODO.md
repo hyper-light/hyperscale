@@ -5,6 +5,11 @@ Items are ordered by implementation priority and dependency.
 
 ---
 
+# RULES
+
+Please mark each off in TODO once done. Then proceed linearly down each - do not skip, mark each TODO item as done.
+
+
 ## Completed
 
 ### Component 4: Direct DC-to-Job-Leader Routing
@@ -61,7 +66,7 @@ Foundation for all network operations.
 - [x] Implement `RetryExecutor` class
   - [x] `calculate_delay(attempt: int) -> float`
   - [x] `async execute(operation, operation_name) -> T`
-- [ ] Add integration tests for retry framework
+- [x] Add integration tests for retry framework
 
 ### 1.3 AD-18: Hybrid Overload Detection
 
@@ -77,7 +82,7 @@ Required by load shedding and health models.
   - [x] `_calculate_trend() -> float` (linear regression on delta history)
   - [x] `get_state(cpu_percent, memory_percent) -> str`
   - [x] State returns: "healthy" | "busy" | "stressed" | "overloaded"
-- [ ] Add integration tests for overload detection
+- [x] Add integration tests for overload detection
 
 ---
 
@@ -96,7 +101,7 @@ Three-signal health model for all node types.
 - [x] Implement `progress_state` property → "idle" | "normal" | "slow" | "degraded" | "stuck"
 - [x] Implement `get_routing_decision()` → "route" | "drain" | "investigate" | "evict"
 - [ ] Update manager's worker tracking to use `WorkerHealthState`
-- [ ] Add integration tests for worker health model
+- [x] Add integration tests for worker health model
 
 ### 2.2 AD-19: Manager Health (Gate monitors Managers)
 
