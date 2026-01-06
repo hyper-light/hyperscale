@@ -106,6 +106,69 @@ class Env(BaseModel):
     MANAGER_DEAD_PEER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead manager peers (15 minutes)
     MANAGER_DEAD_GATE_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead gates (15 minutes)
 
+    # ==========================================================================
+    # Overload Detection Settings (AD-18)
+    # ==========================================================================
+    OVERLOAD_EMA_ALPHA: StrictFloat = 0.1  # Smoothing factor for baseline (lower = more stable)
+    OVERLOAD_CURRENT_WINDOW: StrictInt = 10  # Samples for current average
+    OVERLOAD_TREND_WINDOW: StrictInt = 20  # Samples for trend calculation
+    OVERLOAD_MIN_SAMPLES: StrictInt = 3  # Minimum samples before delta detection
+    OVERLOAD_TREND_THRESHOLD: StrictFloat = 0.1  # Rising trend threshold
+    # Delta thresholds (% above baseline): busy / stressed / overloaded
+    OVERLOAD_DELTA_BUSY: StrictFloat = 0.2  # 20% above baseline
+    OVERLOAD_DELTA_STRESSED: StrictFloat = 0.5  # 50% above baseline
+    OVERLOAD_DELTA_OVERLOADED: StrictFloat = 1.0  # 100% above baseline
+    # Absolute bounds (milliseconds): busy / stressed / overloaded
+    OVERLOAD_ABSOLUTE_BUSY_MS: StrictFloat = 200.0
+    OVERLOAD_ABSOLUTE_STRESSED_MS: StrictFloat = 500.0
+    OVERLOAD_ABSOLUTE_OVERLOADED_MS: StrictFloat = 2000.0
+    # CPU thresholds (0.0 to 1.0): busy / stressed / overloaded
+    OVERLOAD_CPU_BUSY: StrictFloat = 0.7
+    OVERLOAD_CPU_STRESSED: StrictFloat = 0.85
+    OVERLOAD_CPU_OVERLOADED: StrictFloat = 0.95
+    # Memory thresholds (0.0 to 1.0): busy / stressed / overloaded
+    OVERLOAD_MEMORY_BUSY: StrictFloat = 0.7
+    OVERLOAD_MEMORY_STRESSED: StrictFloat = 0.85
+    OVERLOAD_MEMORY_OVERLOADED: StrictFloat = 0.95
+
+    # ==========================================================================
+    # Health Probe Settings (AD-19)
+    # ==========================================================================
+    # Liveness probe settings
+    LIVENESS_PROBE_TIMEOUT: StrictFloat = 1.0  # Seconds
+    LIVENESS_PROBE_PERIOD: StrictFloat = 10.0  # Seconds between checks
+    LIVENESS_PROBE_FAILURE_THRESHOLD: StrictInt = 3  # Failures before unhealthy
+    LIVENESS_PROBE_SUCCESS_THRESHOLD: StrictInt = 1  # Successes to recover
+    # Readiness probe settings
+    READINESS_PROBE_TIMEOUT: StrictFloat = 2.0  # Seconds
+    READINESS_PROBE_PERIOD: StrictFloat = 10.0  # Seconds between checks
+    READINESS_PROBE_FAILURE_THRESHOLD: StrictInt = 3  # Failures before unhealthy
+    READINESS_PROBE_SUCCESS_THRESHOLD: StrictInt = 1  # Successes to recover
+    # Startup probe settings
+    STARTUP_PROBE_TIMEOUT: StrictFloat = 5.0  # Seconds
+    STARTUP_PROBE_PERIOD: StrictFloat = 5.0  # Seconds between checks
+    STARTUP_PROBE_FAILURE_THRESHOLD: StrictInt = 30  # Allow slow startups (150s)
+    STARTUP_PROBE_SUCCESS_THRESHOLD: StrictInt = 1  # One success = started
+
+    # ==========================================================================
+    # Rate Limiting Settings (AD-24)
+    # ==========================================================================
+    RATE_LIMIT_DEFAULT_BUCKET_SIZE: StrictInt = 100  # Default token bucket size
+    RATE_LIMIT_DEFAULT_REFILL_RATE: StrictFloat = 10.0  # Tokens per second
+    RATE_LIMIT_CLIENT_IDLE_TIMEOUT: StrictFloat = 300.0  # Cleanup idle clients after 5min
+    RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = 60.0  # Run cleanup every minute
+    RATE_LIMIT_MAX_RETRIES: StrictInt = 3  # Max retry attempts when rate limited
+    RATE_LIMIT_MAX_TOTAL_WAIT: StrictFloat = 60.0  # Max total wait time for retries
+    RATE_LIMIT_BACKOFF_MULTIPLIER: StrictFloat = 1.5  # Backoff multiplier for retries
+
+    # ==========================================================================
+    # Healthcheck Extension Settings (AD-26)
+    # ==========================================================================
+    EXTENSION_BASE_DEADLINE: StrictFloat = 30.0  # Base deadline in seconds
+    EXTENSION_MIN_GRANT: StrictFloat = 1.0  # Minimum extension grant in seconds
+    EXTENSION_MAX_EXTENSIONS: StrictInt = 5  # Maximum extensions per cycle
+    EXTENSION_EVICTION_THRESHOLD: StrictInt = 3  # Failures before eviction
+
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
@@ -180,6 +243,50 @@ class Env(BaseModel):
             "MANAGER_DEAD_WORKER_REAP_INTERVAL": float,
             "MANAGER_DEAD_PEER_REAP_INTERVAL": float,
             "MANAGER_DEAD_GATE_REAP_INTERVAL": float,
+            # Overload detection settings (AD-18)
+            "OVERLOAD_EMA_ALPHA": float,
+            "OVERLOAD_CURRENT_WINDOW": int,
+            "OVERLOAD_TREND_WINDOW": int,
+            "OVERLOAD_MIN_SAMPLES": int,
+            "OVERLOAD_TREND_THRESHOLD": float,
+            "OVERLOAD_DELTA_BUSY": float,
+            "OVERLOAD_DELTA_STRESSED": float,
+            "OVERLOAD_DELTA_OVERLOADED": float,
+            "OVERLOAD_ABSOLUTE_BUSY_MS": float,
+            "OVERLOAD_ABSOLUTE_STRESSED_MS": float,
+            "OVERLOAD_ABSOLUTE_OVERLOADED_MS": float,
+            "OVERLOAD_CPU_BUSY": float,
+            "OVERLOAD_CPU_STRESSED": float,
+            "OVERLOAD_CPU_OVERLOADED": float,
+            "OVERLOAD_MEMORY_BUSY": float,
+            "OVERLOAD_MEMORY_STRESSED": float,
+            "OVERLOAD_MEMORY_OVERLOADED": float,
+            # Health probe settings (AD-19)
+            "LIVENESS_PROBE_TIMEOUT": float,
+            "LIVENESS_PROBE_PERIOD": float,
+            "LIVENESS_PROBE_FAILURE_THRESHOLD": int,
+            "LIVENESS_PROBE_SUCCESS_THRESHOLD": int,
+            "READINESS_PROBE_TIMEOUT": float,
+            "READINESS_PROBE_PERIOD": float,
+            "READINESS_PROBE_FAILURE_THRESHOLD": int,
+            "READINESS_PROBE_SUCCESS_THRESHOLD": int,
+            "STARTUP_PROBE_TIMEOUT": float,
+            "STARTUP_PROBE_PERIOD": float,
+            "STARTUP_PROBE_FAILURE_THRESHOLD": int,
+            "STARTUP_PROBE_SUCCESS_THRESHOLD": int,
+            # Rate limiting settings (AD-24)
+            "RATE_LIMIT_DEFAULT_BUCKET_SIZE": int,
+            "RATE_LIMIT_DEFAULT_REFILL_RATE": float,
+            "RATE_LIMIT_CLIENT_IDLE_TIMEOUT": float,
+            "RATE_LIMIT_CLEANUP_INTERVAL": float,
+            "RATE_LIMIT_MAX_RETRIES": int,
+            "RATE_LIMIT_MAX_TOTAL_WAIT": float,
+            "RATE_LIMIT_BACKOFF_MULTIPLIER": float,
+            # Healthcheck extension settings (AD-26)
+            "EXTENSION_BASE_DEADLINE": float,
+            "EXTENSION_MIN_GRANT": float,
+            "EXTENSION_MAX_EXTENSIONS": int,
+            "EXTENSION_EVICTION_THRESHOLD": int,
         }
     
     def get_swim_init_context(self) -> dict:
@@ -232,7 +339,7 @@ class Env(BaseModel):
     def get_federated_health_config(self) -> dict:
         """
         Get federated health monitor configuration from environment settings.
-        
+
         These settings are tuned for high-latency, globally distributed links
         between gates and datacenter managers:
         - Longer probe intervals (reduce cross-DC traffic)
@@ -245,3 +352,151 @@ class Env(BaseModel):
             'suspicion_timeout': self.FEDERATED_SUSPICION_TIMEOUT,
             'max_consecutive_failures': self.FEDERATED_MAX_CONSECUTIVE_FAILURES,
         }
+
+    def get_overload_config(self):
+        """
+        Get overload detection configuration (AD-18).
+
+        Creates an OverloadConfig instance from environment settings.
+        Uses hybrid detection combining delta-based, absolute bounds,
+        and resource-based (CPU/memory) signals.
+        """
+        from hyperscale.distributed_rewrite.reliability.overload import OverloadConfig
+
+        return OverloadConfig(
+            ema_alpha=self.OVERLOAD_EMA_ALPHA,
+            current_window=self.OVERLOAD_CURRENT_WINDOW,
+            trend_window=self.OVERLOAD_TREND_WINDOW,
+            min_samples=self.OVERLOAD_MIN_SAMPLES,
+            trend_threshold=self.OVERLOAD_TREND_THRESHOLD,
+            delta_thresholds=(
+                self.OVERLOAD_DELTA_BUSY,
+                self.OVERLOAD_DELTA_STRESSED,
+                self.OVERLOAD_DELTA_OVERLOADED,
+            ),
+            absolute_bounds=(
+                self.OVERLOAD_ABSOLUTE_BUSY_MS,
+                self.OVERLOAD_ABSOLUTE_STRESSED_MS,
+                self.OVERLOAD_ABSOLUTE_OVERLOADED_MS,
+            ),
+            cpu_thresholds=(
+                self.OVERLOAD_CPU_BUSY,
+                self.OVERLOAD_CPU_STRESSED,
+                self.OVERLOAD_CPU_OVERLOADED,
+            ),
+            memory_thresholds=(
+                self.OVERLOAD_MEMORY_BUSY,
+                self.OVERLOAD_MEMORY_STRESSED,
+                self.OVERLOAD_MEMORY_OVERLOADED,
+            ),
+        )
+
+    def get_liveness_probe_config(self):
+        """
+        Get liveness probe configuration (AD-19).
+
+        Liveness probes check if the process is running and responsive.
+        Failure triggers restart/replacement.
+        """
+        from hyperscale.distributed_rewrite.health.probes import ProbeConfig
+
+        return ProbeConfig(
+            timeout_seconds=self.LIVENESS_PROBE_TIMEOUT,
+            period_seconds=self.LIVENESS_PROBE_PERIOD,
+            failure_threshold=self.LIVENESS_PROBE_FAILURE_THRESHOLD,
+            success_threshold=self.LIVENESS_PROBE_SUCCESS_THRESHOLD,
+        )
+
+    def get_readiness_probe_config(self):
+        """
+        Get readiness probe configuration (AD-19).
+
+        Readiness probes check if the node can accept work.
+        Failure removes from load balancer/routing.
+        """
+        from hyperscale.distributed_rewrite.health.probes import ProbeConfig
+
+        return ProbeConfig(
+            timeout_seconds=self.READINESS_PROBE_TIMEOUT,
+            period_seconds=self.READINESS_PROBE_PERIOD,
+            failure_threshold=self.READINESS_PROBE_FAILURE_THRESHOLD,
+            success_threshold=self.READINESS_PROBE_SUCCESS_THRESHOLD,
+        )
+
+    def get_startup_probe_config(self):
+        """
+        Get startup probe configuration (AD-19).
+
+        Startup probes check if initialization is complete.
+        Delays liveness/readiness until startup complete.
+        """
+        from hyperscale.distributed_rewrite.health.probes import ProbeConfig
+
+        return ProbeConfig(
+            timeout_seconds=self.STARTUP_PROBE_TIMEOUT,
+            period_seconds=self.STARTUP_PROBE_PERIOD,
+            failure_threshold=self.STARTUP_PROBE_FAILURE_THRESHOLD,
+            success_threshold=self.STARTUP_PROBE_SUCCESS_THRESHOLD,
+        )
+
+    def get_rate_limit_config(self):
+        """
+        Get rate limiting configuration (AD-24).
+
+        Creates a RateLimitConfig with default bucket settings.
+        Per-operation limits can be customized after creation.
+        """
+        from hyperscale.distributed_rewrite.reliability.rate_limiting import RateLimitConfig
+
+        return RateLimitConfig(
+            default_bucket_size=self.RATE_LIMIT_DEFAULT_BUCKET_SIZE,
+            default_refill_rate=self.RATE_LIMIT_DEFAULT_REFILL_RATE,
+        )
+
+    def get_rate_limit_retry_config(self):
+        """
+        Get rate limit retry configuration (AD-24).
+
+        Controls how clients retry after being rate limited.
+        """
+        from hyperscale.distributed_rewrite.reliability.rate_limiting import RateLimitRetryConfig
+
+        return RateLimitRetryConfig(
+            max_retries=self.RATE_LIMIT_MAX_RETRIES,
+            max_total_wait=self.RATE_LIMIT_MAX_TOTAL_WAIT,
+            backoff_multiplier=self.RATE_LIMIT_BACKOFF_MULTIPLIER,
+        )
+
+    def get_worker_health_manager_config(self):
+        """
+        Get worker health manager configuration (AD-26).
+
+        Controls deadline extension tracking for workers.
+        Extensions use logarithmic decay to prevent indefinite extensions.
+        """
+        from hyperscale.distributed_rewrite.health.worker_health_manager import (
+            WorkerHealthManagerConfig,
+        )
+
+        return WorkerHealthManagerConfig(
+            base_deadline=self.EXTENSION_BASE_DEADLINE,
+            min_grant=self.EXTENSION_MIN_GRANT,
+            max_extensions=self.EXTENSION_MAX_EXTENSIONS,
+            eviction_threshold=self.EXTENSION_EVICTION_THRESHOLD,
+        )
+
+    def get_extension_tracker_config(self):
+        """
+        Get extension tracker configuration (AD-26).
+
+        Creates configuration for per-worker extension trackers.
+        """
+        from hyperscale.distributed_rewrite.health.extension_tracker import (
+            ExtensionTrackerConfig,
+        )
+
+        return ExtensionTrackerConfig(
+            base_deadline=self.EXTENSION_BASE_DEADLINE,
+            min_grant=self.EXTENSION_MIN_GRANT,
+            max_extensions=self.EXTENSION_MAX_EXTENSIONS,
+        )
