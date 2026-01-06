@@ -491,39 +491,17 @@ class RemoteGraphManager:
                         )
                         running_tasks[task] = pending.workflow_name
 
-                # If no tasks running, check if we can make progress
+                # If no tasks running, check if we're stuck or need to retry
                 if not running_tasks:
-                    # Check if any workflows are ready but waiting for cores
-                    workflows_waiting_for_cores = [
-                        pending for pending in pending_workflows.values()
-                        if pending.is_ready() and not pending.dispatched
-                    ]
-
-                    if workflows_waiting_for_cores:
-                        # This shouldn't happen - if no tasks running, all cores are free
-                        # Log error and try to recover by retrying allocation
-                        await ctx.log(
-                            GraphDebug(
-                                message=f"Graph {test_name} has {len(workflows_waiting_for_cores)} workflows waiting for cores but no tasks running (available_cores={available_cores}, cores_in_use={cores_in_use})",
-                                workflows=[p.workflow_name for p in workflows_waiting_for_cores],
-                                workers=total_cores,
-                                graph=test_name,
-                                level=LogLevel.DEBUG,
-                            )
-                        )
-                        # Reset cores_in_use since nothing is running
+                    has_waiting = self._has_workflows_waiting_for_cores(pending_workflows)
+                    if has_waiting:
                         cores_in_use = 0
                         continue
 
-                    # No tasks running and no ready workflows - we're stuck
-                    # (circular dependency or all remaining workflows have failed deps)
-                    for pending in pending_workflows.values():
-                        if not pending.dispatched and not pending.failed:
-                            pending.failed = True
-                            failed_deps = pending.dependencies - pending.completed_dependencies
-                            skip_reason = f"Dependencies not satisfied: {', '.join(sorted(failed_deps))}"
-                            skipped[pending.workflow_name] = skip_reason
-                            self._failed_workflows[run_id].add(pending.workflow_name)
+                    # Stuck - mark remaining as failed
+                    self._mark_stuck_workflows_failed(
+                        run_id, pending_workflows, skipped
+                    )
                     break
 
                 # Wait for any task to complete
@@ -681,6 +659,32 @@ class RemoteGraphManager:
             vus_list[index] += 1
 
         return vus_list
+
+    def _has_workflows_waiting_for_cores(
+        self,
+        pending_workflows: Dict[str, PendingWorkflowRun],
+    ) -> bool:
+        """Check if any workflows are ready but waiting for core allocation."""
+        return any(
+            pending.is_ready() and not pending.dispatched
+            for pending in pending_workflows.values()
+        )
+
+    def _mark_stuck_workflows_failed(
+        self,
+        run_id: int,
+        pending_workflows: Dict[str, PendingWorkflowRun],
+        skipped: Dict[str, str],
+    ) -> None:
+        """Mark undispatched workflows as failed due to unsatisfied dependencies."""
+        for pending in pending_workflows.values():
+            if pending.dispatched or pending.failed:
+                continue
+
+            pending.failed = True
+            failed_deps = pending.dependencies - pending.completed_dependencies
+            skipped[pending.workflow_name] = f"Dependencies not satisfied: {', '.join(sorted(failed_deps))}"
+            self._failed_workflows[run_id].add(pending.workflow_name)
 
     def _mark_workflow_completed(
         self,
