@@ -120,16 +120,16 @@ Three-signal health model for all node types.
 
 ### 2.3 AD-19: Gate Health (Gates monitor peer Gates)
 
-- [ ] Implement `GateHealthState` dataclass
-  - [ ] Liveness: `last_liveness_response`, `consecutive_liveness_failures`
-  - [ ] Readiness: `has_dc_connectivity`, `connected_dc_count`, `overload_state`
-  - [ ] Progress: `jobs_forwarded_last_interval`, `stats_aggregated_last_interval`, `expected_forward_rate`
-- [ ] Implement `liveness`, `readiness`, `progress_state` properties
-- [ ] Implement `get_routing_decision()` method
-- [ ] Implement `should_participate_in_election() -> bool`
-- [ ] Update gate's peer tracking to use `GateHealthState`
-- [ ] Integrate with leader election (unhealthy gates shouldn't lead)
-- [ ] Add integration tests for gate health model
+- [x] Implement `GateHealthState` dataclass
+  - [x] Liveness: `last_liveness_response`, `consecutive_liveness_failures`
+  - [x] Readiness: `has_dc_connectivity`, `connected_dc_count`, `overload_state`
+  - [x] Progress: `jobs_forwarded_last_interval`, `stats_aggregated_last_interval`, `expected_forward_rate`
+- [x] Implement `liveness`, `readiness`, `progress_state` properties
+- [x] Implement `get_routing_decision()` method
+- [x] Implement `should_participate_in_election() -> bool`
+- [x] Update gate's peer tracking to use `GateHealthState`
+- [x] Integrate with leader election (unhealthy gates shouldn't lead)
+- [x] Add integration tests for gate health model
 
 ### 2.4 AD-19: Generic Health Infrastructure
 

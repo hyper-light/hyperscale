@@ -23,3 +23,7 @@ from hyperscale.distributed_rewrite.health.manager_health import (
     ManagerHealthConfig as ManagerHealthConfig,
     ManagerHealthState as ManagerHealthState,
 )
+from hyperscale.distributed_rewrite.health.gate_health import (
+    GateHealthConfig as GateHealthConfig,
+    GateHealthState as GateHealthState,
+)

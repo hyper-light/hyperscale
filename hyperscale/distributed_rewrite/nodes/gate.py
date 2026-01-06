@@ -92,6 +92,8 @@ from hyperscale.distributed_rewrite.swim.core import (
 from hyperscale.distributed_rewrite.health import (
     ManagerHealthState,
     ManagerHealthConfig,
+    GateHealthState,
+    GateHealthConfig,
     RoutingDecision,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -181,7 +183,12 @@ class GateServer(HealthAwareServer):
         # Maps (dc, manager_addr) -> ManagerHealthState
         self._manager_health: dict[tuple[str, tuple[str, int]], ManagerHealthState] = {}
         self._manager_health_config = ManagerHealthConfig()
-        
+
+        # Three-signal health state for peer gates (AD-19)
+        # Maps gate_id -> GateHealthState
+        self._gate_peer_health: dict[str, GateHealthState] = {}
+        self._gate_health_config = GateHealthConfig()
+
         # Versioned state clock for rejecting stale updates
         # Tracks per-datacenter versions using Lamport timestamps
         self._versioned_clock = VersionedStateClock()
@@ -440,10 +447,28 @@ class GateServer(HealthAwareServer):
         # Check if update is stale using versioned clock
         if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
             return
-        
+
         # Store peer info keyed by UDP address
         self._gate_peer_info[source_addr] = heartbeat
-        
+
+        # Update three-signal health state for peer gate (AD-19)
+        gate_id = heartbeat.node_id
+        health_state = self._gate_peer_health.get(gate_id)
+        if not health_state:
+            health_state = GateHealthState(
+                gate_id=gate_id,
+                config=self._gate_health_config,
+            )
+            self._gate_peer_health[gate_id] = health_state
+
+        # Update signals from heartbeat
+        health_state.update_liveness(success=True)
+        health_state.update_readiness(
+            has_dc_connectivity=heartbeat.connected_dc_count > 0,
+            connected_dc_count=heartbeat.connected_dc_count,
+            overload_state=getattr(heartbeat, 'overload_state', 'healthy'),
+        )
+
         # Update version tracking
         self._task_runner.run(
             self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
@@ -1068,6 +1093,60 @@ class GateServer(HealthAwareServer):
     ) -> dict | None:
         """Get diagnostic information for a manager's health state."""
         health_state = self._get_manager_health_state(dc_id, manager_addr)
+        if health_state:
+            return health_state.get_diagnostics()
+        return None
+
+    # =========================================================================
+    # Three-Signal Gate Peer Health (AD-19)
+    # =========================================================================
+
+    def _get_gate_peer_health_state(self, gate_id: str) -> GateHealthState | None:
+        """Get the three-signal health state for a peer gate."""
+        return self._gate_peer_health.get(gate_id)
+
+    def _get_gate_peer_routing_decision(self, gate_id: str) -> RoutingDecision | None:
+        """Get routing decision for a peer gate based on three-signal health."""
+        health_state = self._get_gate_peer_health_state(gate_id)
+        if health_state:
+            return health_state.get_routing_decision()
+        return None
+
+    def _get_routable_peer_gates(self) -> list[str]:
+        """
+        Get list of peer gates that can receive forwarded jobs.
+
+        Returns gate IDs where routing decision is ROUTE.
+        """
+        return [
+            gate_id
+            for gate_id, health_state in self._gate_peer_health.items()
+            if health_state.get_routing_decision() == RoutingDecision.ROUTE
+        ]
+
+    def _get_gates_eligible_for_election(self) -> list[str]:
+        """
+        Get list of peer gates eligible for leader election.
+
+        Returns gate IDs where should_participate_in_election is True.
+        """
+        eligible: list[str] = []
+        for gate_id, health_state in self._gate_peer_health.items():
+            if health_state.should_participate_in_election():
+                eligible.append(gate_id)
+        return eligible
+
+    def _get_gates_to_evict(self) -> list[str]:
+        """Get list of peer gates that should be evicted based on health signals."""
+        return [
+            gate_id
+            for gate_id, health_state in self._gate_peer_health.items()
+            if health_state.get_routing_decision() == RoutingDecision.EVICT
+        ]
+
+    def _get_gate_peer_health_diagnostics(self, gate_id: str) -> dict | None:
+        """Get diagnostic information for a peer gate's health state."""
+        health_state = self._get_gate_peer_health_state(gate_id)
         if health_state:
             return health_state.get_diagnostics()
         return None
