@@ -491,10 +491,32 @@ class RemoteGraphManager:
                         )
                         running_tasks[task] = pending.workflow_name
 
-                # If no tasks running and no ready workflows, we're stuck
-                # (circular dependency or all remaining workflows have failed deps)
+                # If no tasks running, check if we can make progress
                 if not running_tasks:
-                    # Mark remaining undispatched workflows as skipped
+                    # Check if any workflows are ready but waiting for cores
+                    workflows_waiting_for_cores = [
+                        pending for pending in pending_workflows.values()
+                        if pending.is_ready() and not pending.dispatched
+                    ]
+
+                    if workflows_waiting_for_cores:
+                        # This shouldn't happen - if no tasks running, all cores are free
+                        # Log error and try to recover by retrying allocation
+                        await ctx.log(
+                            GraphDebug(
+                                message=f"Graph {test_name} has {len(workflows_waiting_for_cores)} workflows waiting for cores but no tasks running (available_cores={available_cores}, cores_in_use={cores_in_use})",
+                                workflows=[p.workflow_name for p in workflows_waiting_for_cores],
+                                workers=total_cores,
+                                graph=test_name,
+                                level=LogLevel.DEBUG,
+                            )
+                        )
+                        # Reset cores_in_use since nothing is running
+                        cores_in_use = 0
+                        continue
+
+                    # No tasks running and no ready workflows - we're stuck
+                    # (circular dependency or all remaining workflows have failed deps)
                     for pending in pending_workflows.values():
                         if not pending.dispatched and not pending.failed:
                             pending.failed = True
