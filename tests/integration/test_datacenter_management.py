@@ -509,8 +509,8 @@ class TestLeaseManager:
 
         assert transfer is not None
         assert transfer.job_id == "job-123"
-        assert transfer.from_holder == "gate-1"
-        assert transfer.to_holder == "gate-2"
+        assert transfer.from_gate == "gate-1"
+        assert transfer.to_gate == "gate-2"
 
     def test_accept_transfer(self) -> None:
         """Test accepting a lease transfer."""

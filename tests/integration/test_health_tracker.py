@@ -35,11 +35,15 @@ class TestNodeHealthTrackerWithWorkers:
 
         state = WorkerHealthState(worker_id="worker-1")
         state.update_liveness(success=True)
-        state.update_readiness(accepting_work=True, available_capacity=10)
+        state.update_readiness(accepting=True, capacity=10)
+        # expected_rate is the fraction of assigned work expected to complete
+        # With 5 assigned and 4 completed, actual_rate = 4/5 = 0.8
+        # For NORMAL status, actual_rate >= expected_rate * 0.8
+        # So expected_rate=1.0 means: 0.8 >= 1.0 * 0.8 = 0.8 → True (NORMAL)
         state.update_progress(
-            workflows_assigned=5,
-            completions=4,
-            expected_completion_rate=5.0,
+            assigned=5,
+            completed=4,
+            expected_rate=1.0,
         )
 
         tracker.update_state("worker-1", state)
@@ -56,11 +60,15 @@ class TestNodeHealthTrackerWithWorkers:
 
         state = WorkerHealthState(worker_id="worker-1")
         state.update_liveness(success=True)
-        state.update_readiness(accepting_work=True, available_capacity=10)
+        state.update_readiness(accepting=True, capacity=10)
+        # expected_rate is the fraction of assigned work expected to complete
+        # With 5 assigned and 4 completed, actual_rate = 4/5 = 0.8
+        # For NORMAL status, actual_rate >= expected_rate * 0.8
+        # So expected_rate=1.0 means: 0.8 >= 1.0 * 0.8 = 0.8 → True (NORMAL)
         state.update_progress(
-            workflows_assigned=5,
-            completions=4,
-            expected_completion_rate=5.0,
+            assigned=5,
+            completed=4,
+            expected_rate=1.0,
         )
 
         tracker.update_state("worker-1", state)
@@ -82,14 +90,15 @@ class TestNodeHealthTrackerWithWorkers:
         # Create healthy worker
         healthy = WorkerHealthState(worker_id="worker-healthy")
         healthy.update_liveness(success=True)
-        healthy.update_readiness(accepting_work=True, available_capacity=10)
-        healthy.update_progress(workflows_assigned=5, completions=4, expected_completion_rate=5.0)
+        healthy.update_readiness(accepting=True, capacity=10)
+        # Use expected_rate=1.0 (fraction) so that 4/5=0.8 >= 1.0*0.8 = NORMAL
+        healthy.update_progress(assigned=5, completed=4, expected_rate=1.0)
         tracker.update_state("worker-healthy", healthy)
 
         # Create unhealthy worker (not accepting work)
         unhealthy = WorkerHealthState(worker_id="worker-unhealthy")
         unhealthy.update_liveness(success=True)
-        unhealthy.update_readiness(accepting_work=False, available_capacity=0)
+        unhealthy.update_readiness(accepting=False, capacity=0)
         tracker.update_state("worker-unhealthy", unhealthy)
 
         healthy_nodes = tracker.get_healthy_nodes()
@@ -103,7 +112,7 @@ class TestNodeHealthTrackerWithWorkers:
         # Create healthy worker
         healthy = WorkerHealthState(worker_id="worker-healthy")
         healthy.update_liveness(success=True)
-        healthy.update_readiness(accepting_work=True, available_capacity=10)
+        healthy.update_readiness(accepting=True, capacity=10)
         tracker.update_state("worker-healthy", healthy)
 
         # Create dead worker (liveness timeout)
@@ -206,7 +215,7 @@ class TestEvictionWithCorrelation:
 
         healthy = WorkerHealthState(worker_id="worker-healthy")
         healthy.update_liveness(success=True)
-        healthy.update_readiness(accepting_work=True, available_capacity=10)
+        healthy.update_readiness(accepting=True, capacity=10)
         tracker.update_state("worker-healthy", healthy)
 
         decision = tracker.should_evict("worker-healthy")
@@ -420,7 +429,7 @@ class TestDiagnostics:
         # Add healthy worker
         healthy = WorkerHealthState(worker_id="worker-healthy")
         healthy.update_liveness(success=True)
-        healthy.update_readiness(accepting_work=True, available_capacity=10)
+        healthy.update_readiness(accepting=True, capacity=10)
         tracker.update_state("worker-healthy", healthy)
 
         # Add dead worker
@@ -450,7 +459,7 @@ class TestInvestigateAndDrain:
         # Create degraded worker (live and ready but degraded progress)
         degraded = WorkerHealthState(worker_id="worker-degraded")
         degraded.update_liveness(success=True)
-        degraded.update_readiness(accepting_work=True, available_capacity=10)
+        degraded.update_readiness(accepting=True, capacity=10)
         degraded.workflows_assigned = 10
         degraded.completions_last_interval = 1  # Very low completion
         degraded.expected_completion_rate = 10.0
@@ -469,7 +478,7 @@ class TestInvestigateAndDrain:
         # Create worker not accepting work (should drain)
         draining = WorkerHealthState(worker_id="worker-draining")
         draining.update_liveness(success=True)
-        draining.update_readiness(accepting_work=False, available_capacity=0)
+        draining.update_readiness(accepting=False, capacity=0)
         tracker.update_state("worker-draining", draining)
 
         drain = tracker.get_nodes_to_drain()

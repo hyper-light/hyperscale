@@ -60,7 +60,7 @@ class TestGateJobManager:
 
         manager.set_job("job-123", GlobalJobStatus(
             job_id="job-123",
-            status=JobStatus.PENDING.value,
+            status=JobStatus.SUBMITTED.value,
         ))
 
         assert manager.has_job("job-123") is True
@@ -160,7 +160,7 @@ class TestGateJobManager:
         manager = GateJobManager()
         manager.set_job("job-123", GlobalJobStatus(
             job_id="job-123",
-            status=JobStatus.PENDING.value,
+            status=JobStatus.SUBMITTED.value,
             total_completed=0,
         ))
 
@@ -357,13 +357,15 @@ class TestJobForwardingTracker:
 
     def test_cleanup_stale_peers(self) -> None:
         """Test cleaning up stale peers."""
+        import time as time_module
         tracker = JobForwardingTracker(local_gate_id="gate-1")
 
         # Register peer with old last_seen
         tracker.register_peer("gate-2", "10.0.0.2", 8080)
         peer = tracker.get_peer("gate-2")
         assert peer is not None
-        peer.last_seen = 0.0  # Very old
+        # Set last_seen to a time in the past (must be > 0 for cleanup check)
+        peer.last_seen = time_module.monotonic() - 100.0  # 100 seconds ago
 
         removed = tracker.cleanup_stale_peers(max_age_seconds=1.0)
 

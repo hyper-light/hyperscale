@@ -203,7 +203,10 @@ class LoadShedder:
         Returns:
             True if request should be shed, False if it should be processed
         """
-        state = self._detector.get_state(cpu_percent, memory_percent)
+        # Default None to 0.0 for detector
+        cpu = cpu_percent if cpu_percent is not None else 0.0
+        memory = memory_percent if memory_percent is not None else 0.0
+        state = self._detector.get_state(cpu, memory)
         threshold = self._config.shed_thresholds.get(state)
 
         # No threshold means accept all requests
@@ -234,7 +237,10 @@ class LoadShedder:
         Returns:
             Current OverloadState
         """
-        return self._detector.get_state(cpu_percent, memory_percent)
+        # Default None to 0.0 for detector
+        cpu = cpu_percent if cpu_percent is not None else 0.0
+        memory = memory_percent if memory_percent is not None else 0.0
+        return self._detector.get_state(cpu, memory)
 
     def register_message_priority(
         self,

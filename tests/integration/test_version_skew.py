@@ -252,10 +252,11 @@ class TestHandshakeMessageVersionFields:
         """WorkerRegistration should have version fields with defaults."""
         reg = WorkerRegistration(
             node=NodeInfo(
-                id="worker-1",
-                role=NodeRole.WORKER,
+                node_id="worker-1",
+                role=NodeRole.WORKER.value,
                 host="localhost",
                 port=8000,
+                datacenter="dc-1",
             ),
             total_cores=4,
             available_cores=4,
@@ -272,10 +273,11 @@ class TestHandshakeMessageVersionFields:
         """WorkerRegistration should accept version fields."""
         reg = WorkerRegistration(
             node=NodeInfo(
-                id="worker-1",
-                role=NodeRole.WORKER,
+                node_id="worker-1",
+                role=NodeRole.WORKER.value,
                 host="localhost",
                 port=8000,
+                datacenter="dc-1",
             ),
             total_cores=4,
             available_cores=4,
@@ -344,10 +346,11 @@ class TestBackwardsCompatibility:
         # Simulate old message by creating without version fields
         reg = WorkerRegistration(
             node=NodeInfo(
-                id="old-worker",
-                role=NodeRole.WORKER,
+                node_id="old-worker",
+                role=NodeRole.WORKER.value,
                 host="localhost",
                 port=8000,
+                datacenter="dc-1",
             ),
             total_cores=4,
             available_cores=4,
@@ -368,10 +371,11 @@ class TestBackwardsCompatibility:
         """Messages with version fields should preserve them."""
         reg = WorkerRegistration(
             node=NodeInfo(
-                id="new-worker",
-                role=NodeRole.WORKER,
+                node_id="new-worker",
+                role=NodeRole.WORKER.value,
                 host="localhost",
                 port=8000,
+                datacenter="dc-1",
             ),
             total_cores=4,
             available_cores=4,

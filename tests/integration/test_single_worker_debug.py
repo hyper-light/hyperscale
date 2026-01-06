@@ -23,12 +23,14 @@ async def test_worker_startup_phases():
     
     env = Env()
     
+    # Set WORKER_MAX_CORES via env
+    env.WORKER_MAX_CORES = 2
+
     worker = WorkerServer(
         host='127.0.0.1',
         tcp_port=9200,
         udp_port=9201,
         env=env,
-        total_cores=2,  # Use smaller number for debugging
         dc_id="DC-TEST",
         seed_managers=[],  # No managers
     )

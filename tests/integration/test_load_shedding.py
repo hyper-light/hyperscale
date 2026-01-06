@@ -246,34 +246,34 @@ class TestLoadShedderWithResourceSignals:
 
     def test_cpu_triggers_shedding(self) -> None:
         """Test that high CPU triggers shedding."""
+        # cpu_thresholds: (busy, stressed, overloaded) as 0-1 range
         config = OverloadConfig(
-            cpu_stress_threshold=80.0,
-            cpu_overload_threshold=95.0,
+            cpu_thresholds=(0.70, 0.80, 0.95),
         )
         detector = HybridOverloadDetector(config=config)
         shedder = LoadShedder(detector)
 
-        # High CPU should trigger stressed state
+        # High CPU (85%) should trigger stressed state (>80% threshold)
         assert shedder.should_shed("StatsUpdate", cpu_percent=85.0) is True
         assert shedder.should_shed("SubmitJob", cpu_percent=85.0) is False
 
-        # Very high CPU should trigger overloaded
+        # Very high CPU (98%) should trigger overloaded (>95% threshold)
         assert shedder.should_shed("SubmitJob", cpu_percent=98.0) is True
         assert shedder.should_shed("Heartbeat", cpu_percent=98.0) is False
 
     def test_memory_triggers_shedding(self) -> None:
         """Test that high memory triggers shedding."""
+        # memory_thresholds: (busy, stressed, overloaded) as 0-1 range
         config = OverloadConfig(
-            memory_stress_threshold=85.0,
-            memory_overload_threshold=95.0,
+            memory_thresholds=(0.70, 0.85, 0.95),
         )
         detector = HybridOverloadDetector(config=config)
         shedder = LoadShedder(detector)
 
-        # High memory should trigger stressed state
+        # High memory (90%) should trigger stressed state (>85% threshold)
         assert shedder.should_shed("StatsUpdate", memory_percent=90.0) is True
 
-        # Very high memory should trigger overloaded
+        # Very high memory (98%) should trigger overloaded (>95% threshold)
         assert shedder.should_shed("SubmitJob", memory_percent=98.0) is True
 
 

@@ -271,9 +271,9 @@ class LeaseManager:
         transfer = LeaseTransfer(
             job_id=job_id,
             datacenter=datacenter,
-            from_holder=self._node_id,
-            to_holder=new_holder,
-            fence_token=lease.fence_token,
+            from_gate=self._node_id,
+            to_gate=new_holder,
+            new_fence_token=lease.fence_token,
             version=lease.version,
         )
 
@@ -302,7 +302,7 @@ class LeaseManager:
             job_id=transfer.job_id,
             datacenter=transfer.datacenter,
             lease_holder=self._node_id,  # We're the new holder
-            fence_token=transfer.fence_token,
+            fence_token=transfer.new_fence_token,
             expires_at=time.monotonic() + self._lease_timeout,
             version=transfer.version,
         )
