@@ -271,10 +271,10 @@ Three-signal health model for all node types.
   - [x] Deny if no progress since last extension
   - [x] Deny if max_extensions exceeded
 - [x] Implement `reset()` for tracker cleanup
-- [ ] Add `HealthcheckExtensionRequest` message type
-  - [ ] `worker_id`, `reason`, `current_progress`, `estimated_completion`, `active_workflow_count`
-- [ ] Add `HealthcheckExtensionResponse` message type
-  - [ ] `granted`, `extension_seconds`, `new_deadline`, `remaining_extensions`, `denial_reason`
+- [x] Add `HealthcheckExtensionRequest` message type
+  - [x] `worker_id`, `reason`, `current_progress`, `estimated_completion`, `active_workflow_count`
+- [x] Add `HealthcheckExtensionResponse` message type
+  - [x] `granted`, `extension_seconds`, `new_deadline`, `remaining_extensions`, `denial_reason`
 - [ ] Implement `WorkerHealthManager` class
   - [ ] `handle_extension_request()` with tracker management
   - [ ] `on_worker_healthy()` to reset tracker

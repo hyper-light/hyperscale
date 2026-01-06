@@ -647,6 +647,56 @@ class WorkflowCancelResponse(Message):
 
 
 # =============================================================================
+# Adaptive Healthcheck Extensions (AD-26)
+# =============================================================================
+
+@dataclass(slots=True)
+class HealthcheckExtensionRequest(Message):
+    """
+    Request from worker for deadline extension (AD-26).
+
+    Workers can request deadline extensions when:
+    - Executing long-running workflows
+    - System is under heavy load but making progress
+    - Approaching timeout but not stuck
+
+    Extensions use logarithmic decay:
+    - First extension: base/2 (e.g., 15s with base=30s)
+    - Second extension: base/4 (e.g., 7.5s)
+    - Continues until min_grant is reached
+
+    Sent from: Worker -> Manager
+    """
+    worker_id: str               # Worker requesting extension
+    reason: str                  # Why extension is needed
+    current_progress: float      # Progress metric (must increase for approval)
+    estimated_completion: float  # Estimated seconds until completion
+    active_workflow_count: int   # Number of workflows currently executing
+
+
+@dataclass(slots=True)
+class HealthcheckExtensionResponse(Message):
+    """
+    Response to a healthcheck extension request (AD-26).
+
+    If granted, the worker's deadline is extended by extension_seconds.
+    If denied, the denial_reason explains why.
+
+    Extensions may be denied if:
+    - Maximum extensions already granted
+    - No progress since last extension
+    - Worker is being evicted
+
+    Sent from: Manager -> Worker
+    """
+    granted: bool                # Whether extension was granted
+    extension_seconds: float     # Seconds of extension granted (0 if denied)
+    new_deadline: float          # New deadline timestamp (if granted)
+    remaining_extensions: int    # Number of extensions remaining
+    denial_reason: str | None = None  # Why extension was denied
+
+
+# =============================================================================
 # Status Updates and Reporting
 # =============================================================================
 

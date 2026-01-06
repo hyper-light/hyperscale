@@ -52,6 +52,9 @@ from .distributed import (
     JobCancelResponse as JobCancelResponse,
     WorkflowCancelRequest as WorkflowCancelRequest,
     WorkflowCancelResponse as WorkflowCancelResponse,
+    # Adaptive healthcheck extensions (AD-26)
+    HealthcheckExtensionRequest as HealthcheckExtensionRequest,
+    HealthcheckExtensionResponse as HealthcheckExtensionResponse,
     # Status updates
     StepStats as StepStats,
     WorkflowProgress as WorkflowProgress,
