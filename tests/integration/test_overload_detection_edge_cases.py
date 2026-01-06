@@ -55,6 +55,7 @@ class TestDeltaDetection:
             min_samples=3,
             delta_thresholds=(0.1, 0.3, 0.5),
             current_window=3,
+            warmup_samples=0,  # Disable warmup to test delta detection
         )
         detector = HybridOverloadDetector(config)
 

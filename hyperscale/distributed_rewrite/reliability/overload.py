@@ -141,20 +141,14 @@ class HybridOverloadDetector:
         # Track recent samples first (used for current average)
         self._recent.append(latency_ms)
 
-        # Update baseline EMA
-        # During warmup, use a faster alpha to stabilize baseline quickly
+        # Update baseline EMA using configured alpha
+        # (warmup only affects delta detection, not EMA calculation)
         if not self._initialized:
             self._baseline_ema = latency_ms
             self._initialized = True
         else:
-            # Use faster adaptation during warmup for quicker baseline stabilization
-            if self._sample_count <= self._config.warmup_samples:
-                # Warmup alpha: faster adaptation (e.g., 0.3 instead of 0.1)
-                warmup_alpha = min(0.3, self._config.ema_alpha * 3)
-                self._baseline_ema = warmup_alpha * latency_ms + (1 - warmup_alpha) * self._baseline_ema
-            else:
-                alpha = self._config.ema_alpha
-                self._baseline_ema = alpha * latency_ms + (1 - alpha) * self._baseline_ema
+            alpha = self._config.ema_alpha
+            self._baseline_ema = alpha * latency_ms + (1 - alpha) * self._baseline_ema
 
         # Calculate and track delta (% above baseline)
         # Only track delta after we have enough samples for a meaningful average
