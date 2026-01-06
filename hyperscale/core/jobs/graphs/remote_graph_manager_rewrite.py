@@ -869,14 +869,6 @@ class RemoteGraphManager:
                     name="trace",
                 )
 
-                if is_test_workflow is False:
-                    threads = self._threads  # We do this to ensure *every* local worker node gets the update
-                    workflow_vus = [workflow.vus for _ in range(threads)]
-                    await ctx.log_prepared(
-                        message=f"Non-test Workflow {workflow.name} now using 1 workers",
-                        name="trace",
-                    )
-
                 state_actions = self._setup_state_actions(workflow)
 
                 if len(state_actions) > 0:
