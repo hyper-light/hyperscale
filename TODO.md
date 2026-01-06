@@ -5,6 +5,24 @@ Items are ordered by implementation priority and dependency.
 
 ---
 
+## Completed
+
+### Component 4: Direct DC-to-Job-Leader Routing
+- [x] `JobLeaderGateTransfer` message type
+- [x] `JobLeaderGateTransferAck` message type
+- [x] Gate forwarding logic for results not owned by this gate
+- [x] Integration tests for DC-to-Job-Leader routing
+
+### Component 5: Client Reconnection
+- [x] `RegisterCallback` message type
+- [x] `RegisterCallbackResponse` message type
+- [x] Client `reconnect_to_job()` method with retry logic
+- [x] Gate `register_callback` handler
+- [x] Manager `register_callback` handler
+- [x] Integration tests for client reconnection
+
+---
+
 ## Phase 0: Critical Bug Fixes
 
 Must be completed before reliability infrastructure.
