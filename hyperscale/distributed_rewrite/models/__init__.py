@@ -84,6 +84,8 @@ from .distributed import (
     # Cancellation
     CancelJob as CancelJob,
     CancelAck as CancelAck,
+    WorkflowCancellationQuery as WorkflowCancellationQuery,
+    WorkflowCancellationResponse as WorkflowCancellationResponse,
     # Lease
     DatacenterLease as DatacenterLease,
     LeaseTransfer as LeaseTransfer,

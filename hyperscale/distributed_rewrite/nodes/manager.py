@@ -92,6 +92,8 @@ from hyperscale.distributed_rewrite.models import (
     ProvisionCommit,
     CancelJob,
     CancelAck,
+    WorkflowCancellationQuery,
+    WorkflowCancellationResponse,
     WorkerDiscoveryBroadcast,
     ContextForward,
     ContextLayerSync,
@@ -6316,6 +6318,75 @@ class ManagerServer(HealthAwareServer):
                 error=str(e),
             )
             return ack.dump()
+
+    @tcp.receive()
+    async def workflow_cancellation_query(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle workflow cancellation query from a worker.
+
+        Workers poll the manager to check if their running workflows have been
+        cancelled. This provides a robust fallback when push notifications fail.
+        """
+        try:
+            query = WorkflowCancellationQuery.load(data)
+
+            job = self._job_manager.get_job_by_id(query.job_id)
+            if not job:
+                response = WorkflowCancellationResponse(
+                    job_id=query.job_id,
+                    workflow_id=query.workflow_id,
+                    workflow_name="",
+                    status="UNKNOWN",
+                    error="Job not found",
+                )
+                return response.dump()
+
+            # Check job-level cancellation
+            if job.status == JobStatus.CANCELLED.value:
+                response = WorkflowCancellationResponse(
+                    job_id=query.job_id,
+                    workflow_id=query.workflow_id,
+                    workflow_name="",
+                    status="CANCELLED",
+                )
+                return response.dump()
+
+            # Check specific workflow status in sub_workflows
+            for sub_wf in job.sub_workflows.values():
+                if str(sub_wf.token) == query.workflow_id:
+                    response = WorkflowCancellationResponse(
+                        job_id=query.job_id,
+                        workflow_id=query.workflow_id,
+                        workflow_name=sub_wf.workflow_name,
+                        status=sub_wf.status or WorkflowStatus.RUNNING.value,
+                    )
+                    return response.dump()
+
+            # Workflow not found - might have been cleaned up already
+            response = WorkflowCancellationResponse(
+                job_id=query.job_id,
+                workflow_id=query.workflow_id,
+                workflow_name="",
+                status="UNKNOWN",
+                error="Workflow not found",
+            )
+            return response.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "workflow_cancellation_query")
+            response = WorkflowCancellationResponse(
+                job_id="unknown",
+                workflow_id="unknown",
+                workflow_name="",
+                status="ERROR",
+                error=str(e),
+            )
+            return response.dump()
 
     # =========================================================================
     # TCP Handlers - Job Leadership

@@ -85,6 +85,9 @@ class Env(BaseModel):
     # Worker Dead Manager Cleanup Settings
     WORKER_DEAD_MANAGER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead managers (15 minutes)
 
+    # Worker Cancellation Polling Settings
+    WORKER_CANCELLATION_POLL_INTERVAL: StrictFloat = 5.0  # Seconds between cancellation poll requests
+
     # Manager Startup and Dispatch Settings
     MANAGER_STARTUP_SYNC_DELAY: StrictFloat = 2.0  # Seconds to wait for leader election before state sync
     MANAGER_STATE_SYNC_TIMEOUT: StrictFloat = 5.0  # Timeout for state sync request to leader
@@ -160,6 +163,8 @@ class Env(BaseModel):
             "WORKER_MAX_CORES": int,
             # Worker dead manager cleanup settings
             "WORKER_DEAD_MANAGER_REAP_INTERVAL": float,
+            # Worker cancellation polling settings
+            "WORKER_CANCELLATION_POLL_INTERVAL": float,
             # Manager startup and dispatch settings
             "MANAGER_STARTUP_SYNC_DELAY": float,
             "MANAGER_STATE_SYNC_TIMEOUT": float,

@@ -72,6 +72,8 @@ from hyperscale.distributed_rewrite.models import (
     StateSyncResponse,
     CancelJob,
     CancelAck,
+    WorkflowCancellationQuery,
+    WorkflowCancellationResponse,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -182,7 +184,11 @@ class WorkerServer(HealthAwareServer):
 
         # Dead manager reap loop task
         self._dead_manager_reap_task: asyncio.Task | None = None
-        
+
+        # Cancellation polling configuration and task
+        self._cancellation_poll_interval: float = env.WORKER_CANCELLATION_POLL_INTERVAL
+        self._cancellation_poll_task: asyncio.Task | None = None
+
         # State versioning (Lamport clock extension)
         self._state_version = 0
         
@@ -484,6 +490,9 @@ class WorkerServer(HealthAwareServer):
         # Start dead manager reap loop
         self._dead_manager_reap_task = asyncio.create_task(self._dead_manager_reap_loop())
 
+        # Start cancellation polling loop
+        self._cancellation_poll_task = asyncio.create_task(self._cancellation_poll_loop())
+
         manager_count = len(self._known_managers)
         await self._udp_logger.log(
             ServerInfo(
@@ -739,6 +748,14 @@ class WorkerServer(HealthAwareServer):
             except asyncio.CancelledError:
                 pass
 
+        # Cancel cancellation poll loop
+        if self._cancellation_poll_task and not self._cancellation_poll_task.done():
+            self._cancellation_poll_task.cancel()
+            try:
+                await self._cancellation_poll_task
+            except asyncio.CancelledError:
+                pass
+
         # Cancel all active workflows via TaskRunner
         for workflow_id in list(self._workflow_tokens.keys()):
             await self._cancel_workflow(workflow_id, "server_shutdown")
@@ -796,6 +813,13 @@ class WorkerServer(HealthAwareServer):
         if self._dead_manager_reap_task and not self._dead_manager_reap_task.done():
             try:
                 self._dead_manager_reap_task.cancel()
+            except Exception:
+                pass
+
+        # Cancel cancellation poll loop
+        if self._cancellation_poll_task and not self._cancellation_poll_task.done():
+            try:
+                self._cancellation_poll_task.cancel()
             except Exception:
                 pass
 
@@ -1726,6 +1750,78 @@ class WorkerServer(HealthAwareServer):
                             node_id=self._node_id.short,
                         )
                     )
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _cancellation_poll_loop(self) -> None:
+        """
+        Background loop that polls managers for cancellation status of running workflows.
+
+        This provides a robust fallback for cancellation when push notifications fail
+        (e.g., due to network issues or manager failover).
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._cancellation_poll_interval)
+
+                # Skip if no active workflows
+                if not self._active_workflows:
+                    continue
+
+                # Get primary manager address
+                manager_addr = self._get_primary_manager_tcp_addr()
+                if not manager_addr:
+                    continue
+
+                # Check circuit breaker
+                if self._primary_manager_id:
+                    circuit = self._manager_circuits.get(self._primary_manager_id)
+                    if circuit and circuit.state == CircuitState.OPEN:
+                        continue
+
+                # Poll for each active workflow
+                workflows_to_cancel: list[str] = []
+                for workflow_id, progress in list(self._active_workflows.items()):
+                    query = WorkflowCancellationQuery(
+                        job_id=progress.job_id,
+                        workflow_id=workflow_id,
+                    )
+
+                    try:
+                        response_data = await self.send_tcp(
+                            manager_addr,
+                            "workflow_cancellation_query",
+                            query.dump(),
+                            timeout=2.0,
+                        )
+
+                        if response_data:
+                            response = WorkflowCancellationResponse.load(response_data)
+                            if response.status == "CANCELLED":
+                                workflows_to_cancel.append(workflow_id)
+
+                    except Exception:
+                        # Network errors are expected sometimes - don't log each one
+                        pass
+
+                # Cancel any workflows that the manager says are cancelled
+                for workflow_id in workflows_to_cancel:
+                    cancel_event = self._workflow_cancel_events.get(workflow_id)
+                    if cancel_event and not cancel_event.is_set():
+                        cancel_event.set()
+
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerInfo(
+                                message=f"Cancelling workflow {workflow_id} via poll (manager confirmed cancellation)",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
 
             except asyncio.CancelledError:
                 break
