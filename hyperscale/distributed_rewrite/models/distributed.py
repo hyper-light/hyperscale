@@ -611,7 +611,7 @@ class WorkflowResult(Message):
 class JobFinalResult(Message):
     """
     Final result for a job from one datacenter.
-    
+
     Sent from Manager to Gate (or directly to Client if no gates).
     Contains per-workflow results and aggregated stats.
     """
@@ -623,6 +623,7 @@ class JobFinalResult(Message):
     total_failed: int = 0        # Total failed actions
     errors: list[str] = field(default_factory=list)  # All error messages
     elapsed_seconds: float = 0.0 # Max elapsed across workflows
+    fence_token: int = 0         # Fencing token for at-most-once semantics
 
 
 @dataclass(slots=True)
@@ -669,7 +670,7 @@ class GlobalJobResult(Message):
 class JobProgress(Message):
     """
     Aggregated job progress from manager to gate.
-    
+
     Contains summary of all workflows in the job.
     """
     job_id: str                  # Job identifier
@@ -683,6 +684,7 @@ class JobProgress(Message):
     timestamp: float = 0.0       # Monotonic timestamp
     # Aggregated step stats across all workflows in the job
     step_stats: list["StepStats"] = field(default_factory=list)
+    fence_token: int = 0         # Fencing token for at-most-once semantics
 
 
 @dataclass(slots=True)
@@ -779,14 +781,14 @@ class JobStateSyncAck(Message):
 class JobStatusPush(Message):
     """
     Push notification for job status changes.
-    
+
     Sent from Gate/Manager to Client when significant status changes occur.
     This is a Tier 1 (immediate) notification for:
     - Job started
     - Job completed
     - Job failed
     - Datacenter completion
-    
+
     Includes both aggregated totals AND per-DC breakdown for visibility.
     """
     job_id: str                  # Job identifier
@@ -799,6 +801,7 @@ class JobStatusPush(Message):
     is_final: bool = False       # True if job is complete (no more updates)
     # Per-datacenter breakdown (for clients that want granular visibility)
     per_dc_stats: list["DCStats"] = field(default_factory=list)
+    fence_token: int = 0         # Fencing token for at-most-once semantics
 
 
 @dataclass(slots=True)
@@ -1057,6 +1060,31 @@ class CancelAck(Message):
     cancelled: bool              # Whether successfully cancelled
     workflows_cancelled: int = 0 # Number of workflows stopped
     error: str | None = None     # Error if cancellation failed
+
+
+@dataclass(slots=True)
+class WorkflowCancellationQuery(Message):
+    """
+    Query for workflow cancellation status.
+
+    Sent from manager to worker to poll for cancellation progress.
+    """
+    job_id: str
+    workflow_id: str
+
+
+@dataclass(slots=True)
+class WorkflowCancellationResponse(Message):
+    """
+    Response to workflow cancellation query.
+
+    Contains the current cancellation status for a workflow.
+    """
+    job_id: str
+    workflow_id: str
+    workflow_name: str
+    status: str  # WorkflowCancellationStatus value
+    error: str | None = None
 
 
 # =============================================================================
