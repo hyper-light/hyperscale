@@ -162,6 +162,10 @@ class GateServer(HealthAwareServer):
         # Track gate peer info from GateHeartbeat (proper node_ids, leadership, etc)
         # Maps UDP addr -> GateHeartbeat for peers we've heard from via SWIM
         self._gate_peer_info: dict[tuple[str, int], GateHeartbeat] = {}
+
+        # Known gates discovered via piggybacking or direct announcement
+        # Maps gate_id -> GateInfo for cross-gate job forwarding and discovery
+        self._known_gates: dict[str, GateInfo] = {}
         
         # Known datacenters and their status (from TCP updates)
         # Stored per-datacenter, per-manager for proper aggregation
