@@ -131,7 +131,7 @@ class Provisioner:
         Allocate cores to workflows based on priority and VUs.
 
         Allocation strategy (matches WorkflowDispatcher._calculate_allocations):
-        1. Non-test workflows get 0 cores (bypass partition)
+        1. Non-test workflows get ALL cores (broadcast to all workers)
         2. EXCLUSIVE workflows get ALL cores, blocking others
         3. Explicit priority workflows (HIGH/NORMAL/LOW) allocated proportionally by VUs
         4. AUTO priority workflows split remaining cores equally (minimum 1 each)
@@ -155,7 +155,7 @@ class Provisioner:
             ]]
         allocations: List[Tuple[str, StagePriority, int]] = []
 
-        # Separate non-test workflows (they bypass partitioning with 0 cores)
+        # Separate non-test workflows (they get ALL cores to broadcast to all workers)
         non_test_workflows: List[Tuple[str, StagePriority, int]] = []
         test_workflows: List[Dict[str, Any]] = []
 
@@ -164,11 +164,11 @@ class Provisioner:
             priority = config.get("priority", StagePriority.AUTO)
 
             if not config.get("is_test", False):
-                non_test_workflows.append((workflow_name, priority, 0))
+                non_test_workflows.append((workflow_name, priority, total_cores))
             else:
                 test_workflows.append(config)
 
-        # Add non-test workflows to allocations (0 cores each)
+        # Add non-test workflows to allocations (all cores each)
         allocations.extend(non_test_workflows)
 
         if not test_workflows:
