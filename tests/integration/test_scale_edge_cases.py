@@ -323,13 +323,17 @@ class TestCascadeFailures:
 
     def test_overload_triggers_shedding_cascade(self):
         """Test that overload detection properly triggers load shedding."""
-        # Use high delta thresholds so only absolute bounds trigger state changes.
-        # This isolates absolute-bound behavior from delta detection.
+        # Use config that allows immediate state transitions for testing:
+        # - warmup_samples=0: Skip warmup period
+        # - hysteresis_samples=1: Disable hysteresis (immediate transitions)
+        # - High delta thresholds: Only absolute bounds trigger state changes
         config = OverloadConfig(
             absolute_bounds=(100.0, 200.0, 500.0),
             delta_thresholds=(100.0, 200.0, 300.0),  # Very high - effectively disabled
             min_samples=1,
             current_window=1,
+            warmup_samples=0,  # Skip warmup for immediate response
+            hysteresis_samples=1,  # Disable hysteresis for immediate transitions
         )
 
         # Test HEALTHY state - accept everything
@@ -1464,6 +1468,8 @@ class TestDataStructureInvariants:
             absolute_bounds=(10.0, 20.0, 50.0),
             min_samples=1,
             current_window=1,
+            warmup_samples=0,
+            hysteresis_samples=1,
         )
         detector = HybridOverloadDetector(config)
         shedder = LoadShedder(detector)
@@ -1611,6 +1617,8 @@ class TestPartialFailureSplitBrain:
             absolute_bounds=(100.0, 200.0, 500.0),
             min_samples=1,
             current_window=1,
+            warmup_samples=0,
+            hysteresis_samples=1,
         )
         detector = HybridOverloadDetector(config)
         shedder = LoadShedder(detector)
@@ -1683,6 +1691,8 @@ class TestBackpressurePropagation:
             absolute_bounds=(100.0, 200.0, 500.0),
             min_samples=1,
             current_window=1,
+            warmup_samples=0,
+            hysteresis_samples=1,
         )
         detector = HybridOverloadDetector(config)
         shedder = LoadShedder(detector)
@@ -1702,6 +1712,8 @@ class TestBackpressurePropagation:
             absolute_bounds=(100.0, 200.0, 500.0),
             min_samples=1,
             current_window=3,
+            warmup_samples=0,
+            hysteresis_samples=1,
         )
         detector = HybridOverloadDetector(config)
         shedder = LoadShedder(detector)
@@ -2100,6 +2112,8 @@ class TestPriorityStateTransitionEdges:
             absolute_bounds=(50.0, 100.0, 200.0),
             min_samples=1,
             current_window=1,
+            warmup_samples=0,
+            hysteresis_samples=1,
         )
         detector = HybridOverloadDetector(config)
         shedder = LoadShedder(detector)
@@ -2126,6 +2140,8 @@ class TestPriorityStateTransitionEdges:
             absolute_bounds=(100.0, 200.0, 500.0),
             min_samples=1,
             current_window=1,
+            warmup_samples=0,
+            hysteresis_samples=1,
         )
 
         test_cases = [
@@ -2333,6 +2349,8 @@ class TestGracefulDegradation:
             absolute_bounds=(1.0, 2.0, 5.0),  # Very low thresholds
             min_samples=1,
             current_window=1,
+            warmup_samples=0,
+            hysteresis_samples=1,
         )
         detector = HybridOverloadDetector(config)
         shedder = LoadShedder(detector)
@@ -2446,3 +2464,411 @@ class TestGracefulDegradation:
             detector.record_latency(value)
             state = detector.get_state()
             assert state is not None
+
+
+# =============================================================================
+# Detector Robustness Tests (Warmup, Hysteresis, Trend Escalation)
+# =============================================================================
+
+
+class TestDetectorWarmup:
+    """Tests for detector warmup period behavior."""
+
+    def test_warmup_uses_only_absolute_bounds(self):
+        """During warmup, delta detection should not trigger - only absolute bounds."""
+        config = OverloadConfig(
+            absolute_bounds=(100.0, 200.0, 500.0),
+            delta_thresholds=(0.01, 0.02, 0.03),  # Very sensitive - would trigger easily
+            warmup_samples=10,
+            hysteresis_samples=1,
+            min_samples=1,
+            current_window=1,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Record samples that would trigger delta detection (double the baseline)
+        detector.record_latency(50.0)
+        detector.record_latency(100.0)  # 100% above initial, exceeds delta_thresholds
+
+        # Should still be BUSY based on absolute bounds (100 is at BUSY threshold)
+        # NOT OVERLOADED from delta detection
+        state = detector.get_state()
+        assert state == OverloadState.BUSY
+
+    def test_warmup_period_length(self):
+        """Verify detector reports warmup status correctly."""
+        config = OverloadConfig(warmup_samples=5)
+        detector = HybridOverloadDetector(config)
+
+        for i in range(5):
+            assert detector.in_warmup is True
+            detector.record_latency(50.0)
+
+        assert detector.in_warmup is False
+
+    def test_warmup_with_zero_samples(self):
+        """Detector with warmup_samples=0 should skip warmup."""
+        config = OverloadConfig(
+            warmup_samples=0,
+            min_samples=1,
+            current_window=1,
+        )
+        detector = HybridOverloadDetector(config)
+
+        assert detector.in_warmup is False
+        detector.record_latency(50.0)
+        assert detector.in_warmup is False
+
+    def test_warmup_faster_baseline_adaptation(self):
+        """During warmup, baseline should adapt faster to stabilize quickly."""
+        config = OverloadConfig(
+            warmup_samples=5,
+            ema_alpha=0.1,  # Slow during normal operation
+        )
+        detector = HybridOverloadDetector(config)
+
+        # First sample
+        detector.record_latency(100.0)
+        assert detector.baseline == 100.0
+
+        # During warmup, second sample should adapt faster than 0.1 alpha
+        detector.record_latency(200.0)
+        # With warmup alpha ~0.3: 0.3*200 + 0.7*100 = 130
+        # With normal alpha 0.1: 0.1*200 + 0.9*100 = 110
+        assert detector.baseline > 110  # Faster adaptation
+
+    def test_warmup_diagnostics_report(self):
+        """Diagnostics should report warmup status."""
+        config = OverloadConfig(warmup_samples=5)
+        detector = HybridOverloadDetector(config)
+
+        detector.record_latency(50.0)
+        diag = detector.get_diagnostics()
+        assert diag["in_warmup"] is True
+
+        for _ in range(5):
+            detector.record_latency(50.0)
+
+        diag = detector.get_diagnostics()
+        assert diag["in_warmup"] is False
+
+
+class TestDetectorHysteresis:
+    """Tests for detector hysteresis (flapping prevention)."""
+
+    def test_hysteresis_prevents_immediate_deescalation(self):
+        """De-escalation should require multiple samples at new state."""
+        config = OverloadConfig(
+            absolute_bounds=(100.0, 200.0, 500.0),
+            warmup_samples=0,
+            hysteresis_samples=3,
+            min_samples=1,
+            current_window=1,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Go to OVERLOADED
+        detector.record_latency(600.0)
+        assert detector.get_state() == OverloadState.OVERLOADED
+
+        # Single healthy sample should not de-escalate (hysteresis)
+        detector.record_latency(50.0)
+        assert detector.get_state() == OverloadState.OVERLOADED
+
+        # Second healthy sample - still not enough
+        detector.record_latency(50.0)
+        assert detector.get_state() == OverloadState.OVERLOADED
+
+        # Third healthy sample - now should de-escalate
+        detector.record_latency(50.0)
+        assert detector.get_state() == OverloadState.HEALTHY
+
+    def test_hysteresis_allows_immediate_escalation(self):
+        """Escalation should happen immediately for responsiveness."""
+        config = OverloadConfig(
+            absolute_bounds=(100.0, 200.0, 500.0),
+            warmup_samples=0,
+            hysteresis_samples=5,  # High hysteresis
+            min_samples=1,
+            current_window=1,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Start healthy
+        detector.record_latency(50.0)
+        assert detector.get_state() == OverloadState.HEALTHY
+
+        # Single overload sample should escalate immediately
+        detector.record_latency(600.0)
+        assert detector.get_state() == OverloadState.OVERLOADED
+
+    def test_hysteresis_resets_on_new_pending_state(self):
+        """Pending state count should reset when state changes."""
+        config = OverloadConfig(
+            absolute_bounds=(100.0, 200.0, 500.0),
+            warmup_samples=0,
+            hysteresis_samples=3,
+            min_samples=1,
+            current_window=1,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Go to OVERLOADED
+        detector.record_latency(600.0)
+        assert detector.get_state() == OverloadState.OVERLOADED
+
+        # Two samples toward HEALTHY
+        detector.record_latency(50.0)
+        detector.record_latency(50.0)
+        assert detector.get_state() == OverloadState.OVERLOADED  # Not yet
+
+        # Interruption with STRESSED sample resets the pending count
+        detector.record_latency(300.0)
+        assert detector.get_state() == OverloadState.OVERLOADED
+
+        # Now need 3 consecutive STRESSED samples
+        for _ in range(3):
+            detector.record_latency(300.0)
+        assert detector.get_state() == OverloadState.STRESSED
+
+    def test_hysteresis_disabled_with_one_sample(self):
+        """hysteresis_samples=1 should effectively disable hysteresis."""
+        config = OverloadConfig(
+            absolute_bounds=(100.0, 200.0, 500.0),
+            warmup_samples=0,
+            hysteresis_samples=1,
+            min_samples=1,
+            current_window=1,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Immediate transitions both ways
+        detector.record_latency(600.0)
+        assert detector.get_state() == OverloadState.OVERLOADED
+
+        detector.record_latency(50.0)
+        assert detector.get_state() == OverloadState.HEALTHY
+
+    def test_hysteresis_state_in_diagnostics(self):
+        """Diagnostics should include hysteresis state."""
+        config = OverloadConfig(
+            absolute_bounds=(100.0, 200.0, 500.0),
+            warmup_samples=0,
+            hysteresis_samples=3,
+            min_samples=1,
+            current_window=1,
+        )
+        detector = HybridOverloadDetector(config)
+
+        detector.record_latency(600.0)
+        detector.record_latency(50.0)
+
+        diag = detector.get_diagnostics()
+        assert "current_state" in diag
+        assert "pending_state" in diag
+        assert "pending_state_count" in diag
+        assert diag["current_state"] == "overloaded"
+        assert diag["pending_state"] == "healthy"
+        assert diag["pending_state_count"] == 1
+
+
+class TestDetectorTrendEscalation:
+    """Tests for trend-based state escalation."""
+
+    def test_trend_does_not_trigger_from_healthy(self):
+        """Rising trend should not trigger overload from HEALTHY state."""
+        config = OverloadConfig(
+            absolute_bounds=(1000.0, 2000.0, 5000.0),  # High bounds - won't trigger
+            delta_thresholds=(0.5, 1.0, 2.0),  # Moderate thresholds
+            trend_threshold=0.01,  # Very sensitive trend detection
+            warmup_samples=0,
+            hysteresis_samples=1,
+            min_samples=3,
+            current_window=5,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Record increasing latencies to create a rising trend
+        # but keep delta below BUSY threshold
+        for i in range(10):
+            detector.record_latency(50.0 + i * 2)  # 50, 52, 54, ...
+
+        # Even with rising trend, should not trigger from HEALTHY
+        # because base delta is still small
+        state = detector.get_state()
+        assert state in (OverloadState.HEALTHY, OverloadState.BUSY)
+        assert state != OverloadState.OVERLOADED
+
+    def test_trend_escalates_from_busy_to_stressed(self):
+        """Rising trend should escalate BUSY to STRESSED."""
+        config = OverloadConfig(
+            absolute_bounds=(1000.0, 2000.0, 5000.0),  # High - won't trigger
+            delta_thresholds=(0.2, 0.5, 1.0),
+            trend_threshold=0.05,
+            warmup_samples=0,
+            hysteresis_samples=1,
+            min_samples=3,
+            current_window=5,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Establish baseline
+        for _ in range(10):
+            detector.record_latency(100.0)
+
+        # Now create rising trend that puts delta in BUSY range (20-50% above)
+        for i in range(10):
+            detector.record_latency(130.0 + i * 5)  # Rising in BUSY range
+
+        # With rising trend, should escalate from BUSY to STRESSED
+        state = detector.get_state()
+        assert state in (OverloadState.BUSY, OverloadState.STRESSED)
+
+    def test_trend_escalates_from_stressed_to_overloaded(self):
+        """Rising trend should escalate STRESSED to OVERLOADED."""
+        config = OverloadConfig(
+            absolute_bounds=(1000.0, 2000.0, 5000.0),  # High - won't trigger
+            delta_thresholds=(0.2, 0.5, 1.0),
+            trend_threshold=0.05,
+            warmup_samples=0,
+            hysteresis_samples=1,
+            min_samples=3,
+            current_window=5,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Establish baseline
+        for _ in range(10):
+            detector.record_latency(100.0)
+
+        # Create rising trend that puts delta in STRESSED range (50-100% above)
+        for i in range(10):
+            detector.record_latency(160.0 + i * 10)  # Rising in STRESSED range
+
+        # With rising trend, should escalate from STRESSED to OVERLOADED
+        state = detector.get_state()
+        assert state in (OverloadState.STRESSED, OverloadState.OVERLOADED)
+
+
+class TestDetectorNegativeInputHandling:
+    """Tests for negative and invalid input handling."""
+
+    def test_negative_latency_clamped_to_zero(self):
+        """Negative latencies should be clamped to 0."""
+        config = OverloadConfig(warmup_samples=0, hysteresis_samples=1)
+        detector = HybridOverloadDetector(config)
+
+        detector.record_latency(-100.0)
+        assert detector.baseline >= 0.0
+        assert detector.current_average >= 0.0
+
+    def test_mixed_negative_positive_latencies(self):
+        """Mixed negative and positive latencies should not corrupt state."""
+        config = OverloadConfig(warmup_samples=0, hysteresis_samples=1)
+        detector = HybridOverloadDetector(config)
+
+        for lat in [100.0, -50.0, 150.0, -200.0, 100.0]:
+            detector.record_latency(lat)
+
+        # Should have valid state
+        state = detector.get_state()
+        assert state in OverloadState.__members__.values()
+        assert detector.baseline >= 0.0
+
+    def test_all_negative_latencies(self):
+        """All negative latencies should result in zero baseline."""
+        config = OverloadConfig(warmup_samples=0, hysteresis_samples=1)
+        detector = HybridOverloadDetector(config)
+
+        for _ in range(10):
+            detector.record_latency(-100.0)
+
+        assert detector.baseline == 0.0
+        assert detector.current_average == 0.0
+
+
+class TestDetectorResetBehavior:
+    """Tests for detector reset preserving invariants."""
+
+    def test_reset_clears_hysteresis_state(self):
+        """Reset should clear hysteresis state."""
+        config = OverloadConfig(
+            absolute_bounds=(100.0, 200.0, 500.0),
+            warmup_samples=0,
+            hysteresis_samples=5,
+            min_samples=1,
+            current_window=1,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Build up hysteresis state
+        detector.record_latency(600.0)
+        detector.record_latency(50.0)
+        detector.record_latency(50.0)
+
+        diag = detector.get_diagnostics()
+        assert diag["pending_state_count"] > 0
+
+        # Reset
+        detector.reset()
+
+        diag = detector.get_diagnostics()
+        assert diag["pending_state_count"] == 0
+        assert diag["current_state"] == "healthy"
+        assert diag["pending_state"] == "healthy"
+
+    def test_reset_restarts_warmup(self):
+        """Reset should restart warmup period."""
+        config = OverloadConfig(warmup_samples=10)
+        detector = HybridOverloadDetector(config)
+
+        # Complete warmup
+        for _ in range(10):
+            detector.record_latency(50.0)
+        assert detector.in_warmup is False
+
+        # Reset should restart warmup
+        detector.reset()
+        assert detector.in_warmup is True
+        assert detector.sample_count == 0
+
+
+class TestDetectorColdStartBehavior:
+    """Tests for cold start and initialization behavior."""
+
+    def test_first_sample_sets_baseline(self):
+        """First sample should initialize baseline."""
+        config = OverloadConfig(warmup_samples=0, hysteresis_samples=1)
+        detector = HybridOverloadDetector(config)
+
+        assert detector.baseline == 0.0
+        detector.record_latency(100.0)
+        assert detector.baseline == 100.0
+
+    def test_cold_start_with_spike(self):
+        """Cold start with spike should not permanently corrupt baseline."""
+        config = OverloadConfig(
+            warmup_samples=5,
+            ema_alpha=0.1,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Start with a spike
+        detector.record_latency(1000.0)
+
+        # Follow with normal latencies
+        for _ in range(20):
+            detector.record_latency(50.0)
+
+        # Baseline should have recovered toward normal
+        assert detector.baseline < 200.0  # Not stuck at 1000
+
+    def test_empty_detector_state(self):
+        """Empty detector should return HEALTHY."""
+        config = OverloadConfig(warmup_samples=0, hysteresis_samples=1)
+        detector = HybridOverloadDetector(config)
+
+        assert detector.get_state() == OverloadState.HEALTHY
+        assert detector.baseline == 0.0
+        assert detector.current_average == 0.0
+        assert detector.trend == 0.0

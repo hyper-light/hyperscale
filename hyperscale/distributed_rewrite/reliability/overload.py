@@ -66,10 +66,19 @@ class OverloadConfig:
     memory_thresholds: tuple[float, float, float] = (0.7, 0.85, 0.95)
 
     # Trend threshold - positive slope indicates worsening
-    trend_threshold: float = 0.1  # Rising trend triggers overload
+    # Trend must be combined with elevated delta to trigger (not standalone)
+    trend_threshold: float = 0.1  # Rising trend amplifies delta state
 
     # Minimum samples before delta detection is active
     min_samples: int = 3
+
+    # Warmup samples before baseline is considered stable
+    # During warmup, only absolute bounds are used for state detection
+    warmup_samples: int = 10
+
+    # Hysteresis: number of consecutive samples at a state before transitioning
+    # Prevents flapping between states on single-sample variations
+    hysteresis_samples: int = 2
 
 
 class HybridOverloadDetector:
@@ -111,28 +120,45 @@ class HybridOverloadDetector:
         # Sample count
         self._sample_count: int = 0
 
+        # Hysteresis state tracking
+        self._current_state: OverloadState = OverloadState.HEALTHY
+        self._pending_state: OverloadState = OverloadState.HEALTHY
+        self._pending_state_count: int = 0
+
     def record_latency(self, latency_ms: float) -> None:
         """
         Record a latency sample and update internal state.
 
         Args:
-            latency_ms: Latency in milliseconds
+            latency_ms: Latency in milliseconds. Negative values are clamped to 0.
         """
+        # Validate input - negative latencies are invalid
+        if latency_ms < 0:
+            latency_ms = 0.0
+
         self._sample_count += 1
 
+        # Track recent samples first (used for current average)
+        self._recent.append(latency_ms)
+
         # Update baseline EMA
+        # During warmup, use a faster alpha to stabilize baseline quickly
         if not self._initialized:
             self._baseline_ema = latency_ms
             self._initialized = True
         else:
-            alpha = self._config.ema_alpha
-            self._baseline_ema = alpha * latency_ms + (1 - alpha) * self._baseline_ema
-
-        # Track recent samples
-        self._recent.append(latency_ms)
+            # Use faster adaptation during warmup for quicker baseline stabilization
+            if self._sample_count <= self._config.warmup_samples:
+                # Warmup alpha: faster adaptation (e.g., 0.3 instead of 0.1)
+                warmup_alpha = min(0.3, self._config.ema_alpha * 3)
+                self._baseline_ema = warmup_alpha * latency_ms + (1 - warmup_alpha) * self._baseline_ema
+            else:
+                alpha = self._config.ema_alpha
+                self._baseline_ema = alpha * latency_ms + (1 - alpha) * self._baseline_ema
 
         # Calculate and track delta (% above baseline)
-        if self._baseline_ema > 0:
+        # Only track delta after we have enough samples for a meaningful average
+        if self._baseline_ema > 0 and len(self._recent) >= self._config.min_samples:
             current_avg = sum(self._recent) / len(self._recent)
             delta = (current_avg - self._baseline_ema) / self._baseline_ema
             self._delta_history.append(delta)
@@ -162,7 +188,16 @@ class HybridOverloadDetector:
         return slope
 
     def _get_delta_state(self) -> OverloadState:
-        """Get state based on delta detection."""
+        """Get state based on delta detection.
+
+        Delta detection is only active after the warmup period to ensure
+        baseline stability. During warmup, returns HEALTHY to let absolute
+        bounds handle detection.
+        """
+        # During warmup, delta detection is not reliable - defer to absolute bounds
+        if self._sample_count < self._config.warmup_samples:
+            return OverloadState.HEALTHY
+
         if len(self._recent) < self._config.min_samples:
             return OverloadState.HEALTHY
 
@@ -175,15 +210,27 @@ class HybridOverloadDetector:
 
         thresholds = self._config.delta_thresholds
 
-        # Rising trend can trigger overload even at lower delta
-        if delta > thresholds[2] or trend > self._config.trend_threshold:
-            return OverloadState.OVERLOADED
+        # Determine base state from delta
+        if delta > thresholds[2]:
+            base_state = OverloadState.OVERLOADED
         elif delta > thresholds[1]:
-            return OverloadState.STRESSED
+            base_state = OverloadState.STRESSED
         elif delta > thresholds[0]:
-            return OverloadState.BUSY
+            base_state = OverloadState.BUSY
         else:
-            return OverloadState.HEALTHY
+            base_state = OverloadState.HEALTHY
+
+        # Rising trend can escalate state by one level (but not trigger from HEALTHY)
+        # This prevents trend-only overload triggering without actual elevated latency
+        if trend > self._config.trend_threshold and base_state != OverloadState.HEALTHY:
+            if base_state == OverloadState.BUSY:
+                return OverloadState.STRESSED
+            elif base_state == OverloadState.STRESSED:
+                return OverloadState.OVERLOADED
+            # Already OVERLOADED, can't escalate further
+            return OverloadState.OVERLOADED
+
+        return base_state
 
     def _get_absolute_state(self) -> OverloadState:
         """Get state based on absolute latency bounds."""
@@ -235,16 +282,35 @@ class HybridOverloadDetector:
 
         return max(states, key=lambda s: _STATE_ORDER[s])
 
+    def _get_raw_state(
+        self,
+        cpu_percent: float = 0.0,
+        memory_percent: float = 0.0,
+    ) -> OverloadState:
+        """Get raw state without hysteresis (for internal use)."""
+        states = [
+            self._get_delta_state(),
+            self._get_absolute_state(),
+            self._get_resource_state(cpu_percent, memory_percent),
+        ]
+        return max(states, key=lambda s: _STATE_ORDER[s])
+
     def get_state(
         self,
         cpu_percent: float = 0.0,
         memory_percent: float = 0.0,
     ) -> OverloadState:
         """
-        Get current overload state using hybrid detection.
+        Get current overload state using hybrid detection with hysteresis.
 
         Combines delta-based, absolute bounds, and resource signals,
-        returning the worst (most severe) state.
+        returning the worst (most severe) state. Uses hysteresis to
+        prevent flapping between states on single-sample variations.
+
+        State transitions require `hysteresis_samples` consecutive readings
+        at the new state before transitioning. Exception: transitions to
+        more severe states (escalation) happen immediately to ensure quick
+        response to deteriorating conditions.
 
         Args:
             cpu_percent: Current CPU utilization (0-100)
@@ -253,13 +319,34 @@ class HybridOverloadDetector:
         Returns:
             Current OverloadState
         """
-        states = [
-            self._get_delta_state(),
-            self._get_absolute_state(),
-            self._get_resource_state(cpu_percent, memory_percent),
-        ]
+        raw_state = self._get_raw_state(cpu_percent, memory_percent)
 
-        return max(states, key=lambda s: _STATE_ORDER[s])
+        # Fast path: if hysteresis is disabled, return raw state
+        if self._config.hysteresis_samples <= 1:
+            self._current_state = raw_state
+            return raw_state
+
+        # Escalation (getting worse) happens immediately for responsiveness
+        if _STATE_ORDER[raw_state] > _STATE_ORDER[self._current_state]:
+            self._current_state = raw_state
+            self._pending_state = raw_state
+            self._pending_state_count = 0
+            return raw_state
+
+        # De-escalation (getting better) requires hysteresis
+        if raw_state == self._pending_state:
+            self._pending_state_count += 1
+        else:
+            # New pending state
+            self._pending_state = raw_state
+            self._pending_state_count = 1
+
+        # Transition if we've seen enough consecutive samples at the new state
+        if self._pending_state_count >= self._config.hysteresis_samples:
+            self._current_state = self._pending_state
+            self._pending_state_count = 0
+
+        return self._current_state
 
     def get_state_str(
         self,
@@ -291,6 +378,11 @@ class HybridOverloadDetector:
         """Get total samples recorded."""
         return self._sample_count
 
+    @property
+    def in_warmup(self) -> bool:
+        """Check if detector is still in warmup period."""
+        return self._sample_count < self._config.warmup_samples
+
     def reset(self) -> None:
         """Reset all state."""
         self._baseline_ema = 0.0
@@ -298,6 +390,9 @@ class HybridOverloadDetector:
         self._recent.clear()
         self._delta_history.clear()
         self._sample_count = 0
+        self._current_state = OverloadState.HEALTHY
+        self._pending_state = OverloadState.HEALTHY
+        self._pending_state_count = 0
 
     def get_diagnostics(self) -> dict:
         """
@@ -309,7 +404,9 @@ class HybridOverloadDetector:
         - delta: Current % above baseline
         - trend: Trend slope
         - sample_count: Total samples
+        - in_warmup: Whether still in warmup period
         - states: Individual state components
+        - hysteresis: Current hysteresis state
         """
         current_avg = self.current_average
         delta = 0.0
@@ -322,6 +419,10 @@ class HybridOverloadDetector:
             "delta": delta,
             "trend": self._calculate_trend(),
             "sample_count": self._sample_count,
+            "in_warmup": self._sample_count < self._config.warmup_samples,
             "delta_state": self._get_delta_state().value,
             "absolute_state": self._get_absolute_state().value,
+            "current_state": self._current_state.value,
+            "pending_state": self._pending_state.value,
+            "pending_state_count": self._pending_state_count,
         }
