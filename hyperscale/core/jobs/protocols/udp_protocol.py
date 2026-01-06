@@ -599,7 +599,20 @@ class UDPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
 
-        await self._sendto_with_retry(compressed, address)
+        try:
+            await self._sendto_with_retry(compressed, address)
+        except BlockingIOError:
+            # Socket buffer full after all retries - return error response
+            return (
+                self.id_generator.generate(),
+                Message(
+                    self.node_id,
+                    target,
+                    service_host=self.host,
+                    service_port=self.port,
+                    error="Send failed: socket buffer full.",
+                ),
+            )
 
         for _ in range(self._retries):
             try:
