@@ -634,15 +634,16 @@ class HybridOverloadDetector:
 - More complex than simple thresholds
 - Baseline drift possible over long periods (mitigated by absolute bounds)
 
-### AD-19: Three-Signal Worker Health Model
+### AD-19: Three-Signal Health Model (All Node Types)
 
-**Decision**: Separate worker health into three independent signals: Liveness, Readiness, and Progress.
+**Decision**: Separate node health into three independent signals: Liveness, Readiness, and Progress. Apply this model uniformly to Workers, Managers, and Gates.
 
 **Rationale**:
-- Workers run CPU/memory-intensive workloads by design
+- All node types run demanding workloads in a distributed system
 - Conflating "can't accept work" with "dead" causes premature eviction
 - Resource metrics alone are meaningless for heavy workloads
-- Progress (workflow completion) is ground truth
+- Progress (throughput) is ground truth for all node types
+- Uniform model simplifies reasoning and implementation
 
 **Health Model**:
 ```
@@ -763,6 +764,277 @@ class WorkerHealthState:
 | Resource thresholds | Doesn't account for expected heavy usage |
 | Timeout-only | Can't distinguish slow from stuck |
 | Heartbeat-only | Process can heartbeat while frozen |
+
+#### Manager Health (Gate monitors Managers)
+
+Gates monitor manager health to make intelligent DC routing decisions.
+
+**Signal Definitions for Managers**:
+| Signal | Question | Measurement | Failure Threshold |
+|--------|----------|-------------|-------------------|
+| Liveness | Is manager responding? | SWIM probe response | 3 consecutive misses |
+| Readiness | Can accept jobs? | Has quorum + accepting jobs | `has_quorum=false` OR `accepting_jobs=false` |
+| Progress | Is work flowing? | Job throughput + dispatch rate | `dispatch_rate < expected * 0.3` |
+
+```python
+@dataclass
+class ManagerHealthState:
+    """Three-signal health state for managers (monitored by gates)."""
+    manager_id: str
+    datacenter_id: str
+
+    # Signal 1: Liveness
+    last_liveness_response: float
+    consecutive_liveness_failures: int
+
+    # Signal 2: Readiness
+    has_quorum: bool  # Can make authoritative decisions
+    accepting_jobs: bool  # Self-reported
+    active_worker_count: int  # Workers available for dispatch
+
+    # Signal 3: Progress
+    jobs_accepted_last_interval: int
+    workflows_dispatched_last_interval: int
+    expected_throughput: float  # Based on worker capacity
+
+    @property
+    def liveness(self) -> bool:
+        time_since_response = time.monotonic() - self.last_liveness_response
+        return (
+            time_since_response < 30.0
+            and self.consecutive_liveness_failures < 3
+        )
+
+    @property
+    def readiness(self) -> bool:
+        return (
+            self.has_quorum
+            and self.accepting_jobs
+            and self.active_worker_count > 0
+        )
+
+    @property
+    def progress_state(self) -> str:
+        if self.jobs_accepted_last_interval == 0:
+            return "idle"
+
+        actual_rate = self.workflows_dispatched_last_interval
+        if actual_rate >= self.expected_throughput * 0.8:
+            return "normal"
+        elif actual_rate >= self.expected_throughput * 0.3:
+            return "slow"
+        elif actual_rate > 0:
+            return "degraded"
+        else:
+            return "stuck"
+
+    def get_routing_decision(self) -> str:
+        """Determine whether gate should route jobs to this manager."""
+        if not self.liveness:
+            return "evict"  # Remove from DC's active managers
+
+        progress = self.progress_state
+
+        if progress == "stuck" and self.jobs_accepted_last_interval > 0:
+            return "evict"
+
+        if progress in ("slow", "degraded"):
+            return "investigate"
+
+        if not self.readiness:
+            return "drain"  # Don't send new jobs, let existing complete
+
+        return "route"
+```
+
+**Integration with DC Health Classification (AD-16)**:
+```
+DC Health = f(manager_health_states)
+
+If ALL managers NOT liveness → DC = UNHEALTHY
+If MAJORITY managers NOT readiness → DC = DEGRADED
+If ANY manager progress == "stuck" → DC = DEGRADED
+If ALL managers readiness but NO capacity → DC = BUSY
+Otherwise → DC = HEALTHY
+```
+
+#### Gate Health (Gates monitor peer Gates)
+
+Gates monitor peer gate health for leader election and job forwarding decisions.
+
+**Signal Definitions for Gates**:
+| Signal | Question | Measurement | Failure Threshold |
+|--------|----------|-------------|-------------------|
+| Liveness | Is gate responding? | SWIM probe response | 3 consecutive misses |
+| Readiness | Can handle jobs? | Has DC connectivity + not overloaded | `dc_connectivity=false` OR `overloaded=true` |
+| Progress | Is work flowing? | Job forwarding rate + stats aggregation | `forward_rate < expected * 0.3` |
+
+```python
+@dataclass
+class GateHealthState:
+    """Three-signal health state for gates (monitored by peer gates)."""
+    gate_id: str
+
+    # Signal 1: Liveness
+    last_liveness_response: float
+    consecutive_liveness_failures: int
+
+    # Signal 2: Readiness
+    has_dc_connectivity: bool  # Can reach at least one DC
+    connected_dc_count: int
+    overload_state: str  # From HybridOverloadDetector
+
+    # Signal 3: Progress
+    jobs_forwarded_last_interval: int
+    stats_aggregated_last_interval: int
+    expected_forward_rate: float
+
+    @property
+    def liveness(self) -> bool:
+        time_since_response = time.monotonic() - self.last_liveness_response
+        return (
+            time_since_response < 30.0
+            and self.consecutive_liveness_failures < 3
+        )
+
+    @property
+    def readiness(self) -> bool:
+        return (
+            self.has_dc_connectivity
+            and self.connected_dc_count > 0
+            and self.overload_state not in ("stressed", "overloaded")
+        )
+
+    @property
+    def progress_state(self) -> str:
+        if self.jobs_forwarded_last_interval == 0:
+            return "idle"
+
+        actual_rate = self.jobs_forwarded_last_interval
+        if actual_rate >= self.expected_forward_rate * 0.8:
+            return "normal"
+        elif actual_rate >= self.expected_forward_rate * 0.3:
+            return "slow"
+        elif actual_rate > 0:
+            return "degraded"
+        else:
+            return "stuck"
+
+    def get_routing_decision(self) -> str:
+        """Determine whether to forward jobs to this gate."""
+        if not self.liveness:
+            return "evict"  # Remove from peer list
+
+        progress = self.progress_state
+
+        if progress == "stuck" and self.jobs_forwarded_last_interval > 0:
+            return "evict"
+
+        if progress in ("slow", "degraded"):
+            return "investigate"
+
+        if not self.readiness:
+            return "drain"
+
+        return "route"
+
+    def should_participate_in_election(self) -> bool:
+        """Gates with poor health shouldn't become leaders."""
+        return (
+            self.liveness
+            and self.readiness
+            and self.progress_state in ("idle", "normal")
+        )
+```
+
+#### Generic Node Health Infrastructure
+
+```python
+from typing import Generic, TypeVar, Protocol
+
+class HealthSignals(Protocol):
+    """Protocol for health signal providers."""
+    @property
+    def liveness(self) -> bool: ...
+    @property
+    def readiness(self) -> bool: ...
+    @property
+    def progress_state(self) -> str: ...
+
+T = TypeVar("T", bound=HealthSignals)
+
+class NodeHealthTracker(Generic[T]):
+    """Generic health tracker for any node type."""
+
+    def __init__(self, node_type: str):
+        self._node_type = node_type
+        self._states: dict[str, T] = {}
+        self._history: dict[str, deque[str]] = {}  # node_id -> recent decisions
+
+    def update_state(self, node_id: str, state: T) -> None:
+        self._states[node_id] = state
+
+    def get_routing_decision(self, node_id: str) -> str:
+        if node_id not in self._states:
+            return "unknown"
+        return self._states[node_id].get_routing_decision()
+
+    def get_healthy_nodes(self) -> list[str]:
+        return [
+            node_id for node_id, state in self._states.items()
+            if state.liveness and state.readiness
+        ]
+
+    def should_evict(self, node_id: str) -> tuple[bool, str]:
+        """
+        Determine if node should be evicted with correlation check.
+        Returns (should_evict, reason).
+        """
+        if node_id not in self._states:
+            return False, "unknown node"
+
+        state = self._states[node_id]
+        decision = state.get_routing_decision()
+
+        if decision != "evict":
+            return False, "healthy"
+
+        # Correlation check: are many nodes failing?
+        total = len(self._states)
+        failing = sum(
+            1 for s in self._states.values()
+            if s.get_routing_decision() == "evict"
+        )
+
+        if failing > total * 0.5:
+            # More than half failing - likely systemic issue
+            return False, "systemic failure detected, holding eviction"
+
+        return True, "eviction criteria met"
+```
+
+#### SWIM Piggyback for Health State
+
+Health signals are piggybacked on SWIM protocol messages for protocol efficiency:
+
+```python
+@dataclass
+class HealthPiggyback:
+    """Health state embedded in SWIM messages."""
+    node_id: str
+    node_type: str  # "worker" | "manager" | "gate"
+
+    # Readiness signal
+    accepting_work: bool
+    capacity: int  # Available slots/cores
+
+    # Progress signal (last interval)
+    throughput: int  # Completions/dispatches/forwards
+    expected_throughput: int
+
+    # Overload signal (from AD-18)
+    overload_state: str  # "healthy" | "busy" | "stressed" | "overloaded"
+```
 
 ### AD-20: Cancellation Propagation
 
