@@ -217,14 +217,16 @@ class RemoteGraphManager:
                     f"Timed out waiting for {self._threads} workers to start"
                 )
 
-            await asyncio.gather(
+            connected = await asyncio.gather(
                 *[self._controller.connect_client(address) for address in workers]
             )
 
-            self._provisioner.setup(max_workers=len(self._controller.nodes))
+            print(f'[DEBUG] Connected: {len(connected)}')
+
+            self._provisioner.setup(max_workers=len(self._controller.acknowledged_start_node_ids))
 
             # Register all connected nodes with the provisioner for per-node tracking
-            self._provisioner.register_nodes(self._controller.nodes)
+            self._provisioner.register_nodes(self._controller.acknowledged_start_node_ids)
 
             await ctx.log(
                 Entry(
@@ -486,10 +488,14 @@ class RemoteGraphManager:
                             pending.workflow_name.lower()
                         ])
 
+                        # Generate unique run_id for this workflow dispatch
+                        # Each workflow needs its own run_id for independent completion tracking
+                        workflow_run_id = self._controller.id_generator.generate()
+
                         # Create task for workflow execution with explicit node targeting
                         task = asyncio.create_task(
                             self._run_workflow(
-                                run_id,
+                                workflow_run_id,
                                 pending.workflow,
                                 cores,
                                 pending.allocated_vus,
