@@ -285,7 +285,13 @@ Three-signal health model for all node types.
   - [x] Add request_extension TCP handler
   - [x] Add _on_worker_healthy and _on_worker_removed callbacks
   - [x] Track worker deadlines for extension management
-- [ ] Add integration tests for extension protocol
+- [x] Add integration tests for extension protocol
+  - [x] ExtensionTracker logarithmic decay tests
+  - [x] Progress requirement tests
+  - [x] Message serialization tests
+  - [x] WorkerHealthManager handling tests
+  - [x] Eviction recommendation tests
+  - [x] Realistic scenario tests
 
 ### 4.3 AD-25: Version Skew Handling
 
