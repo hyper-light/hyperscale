@@ -8258,11 +8258,11 @@ The architecture consists of five key components that work together:
 ├───────────────────────┬─────────────────────────────────────────────────────┤
 │  Component            │  Status         │  Description                      │
 ├───────────────────────┼─────────────────┼───────────────────────────────────┤
-│  1. Consistent Hashing│  UNIMPLEMENTED  │  Foundation for job distribution  │
-│  2. Lease-Based Owner │  UNIMPLEMENTED  │  Job ownership with TTL           │
-│  3. Direct DC Routing │  UNIMPLEMENTED  │  DC managers send to job leader   │
-│  4. Client Reconnect  │  UNIMPLEMENTED  │  Client computes job owner        │
-│  5. Fencing Tokens    │  UNIMPLEMENTED  │  Stale update protection          │
+│  1. Consistent Hashing│  IMPLEMENTED    │  Foundation for job distribution  │
+│  2. Lease-Based Owner │  IMPLEMENTED    │  Job ownership with TTL           │
+│  3. Direct DC Routing │  IMPLEMENTED    │  DC managers send to job leader   │
+│  4. Client Reconnect  │  IMPLEMENTED    │  Client computes job owner        │
+│  5. Fencing Tokens    │  IMPLEMENTED    │  Stale update protection          │
 └───────────────────────┴─────────────────┴───────────────────────────────────┘
 ```
 
@@ -8270,7 +8270,7 @@ The architecture consists of five key components that work together:
 
 ### Component 1: Consistent Hashing Ring
 
-**Status: UNIMPLEMENTED**
+**Status: IMPLEMENTED**
 
 **Decision**: Sophisticated approach - Use consistent hashing to deterministically map jobs to gates.
 
@@ -8370,7 +8370,7 @@ The architecture consists of five key components that work together:
 
 ### Component 2: Lease-Based Job Ownership
 
-**Status: UNIMPLEMENTED**
+**Status: IMPLEMENTED**
 
 **Decision**: Sophisticated approach - Jobs have leases with TTL that must be renewed.
 
@@ -8485,7 +8485,7 @@ The architecture consists of five key components that work together:
 
 ### Component 3: Direct DC-to-Job-Leader Result Routing
 
-**Status: UNIMPLEMENTED**
+**Status: IMPLEMENTED**
 
 **Decision**: Sophisticated approach - DC managers send results directly to job leader gate.
 
@@ -8573,7 +8573,7 @@ The architecture consists of five key components that work together:
 
 ### Component 4: Client Reconnection
 
-**Status: UNIMPLEMENTED**
+**Status: IMPLEMENTED**
 
 **Decision**: Sophisticated approach - Clients compute job owner deterministically.
 
@@ -8670,7 +8670,7 @@ The architecture consists of five key components that work together:
 
 ### Component 5: Fencing Tokens
 
-**Status: UNIMPLEMENTED**
+**Status: IMPLEMENTED**
 
 **Decision**: Simple approach - Monotonic fence tokens reject stale operations.
 
@@ -8815,269 +8815,6 @@ The architecture consists of five key components that work together:
 
 ---
 
-### Implementation Order
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    IMPLEMENTATION ROADMAP                                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Order  │ Component           │ Depends On       │ Status                   │
-│  ───────┼─────────────────────┼──────────────────┼────────────────────────  │
-│  1      │ Consistent Hashing  │ None             │ IMPLEMENTED ✓            │
-│  2      │ Lease-Based Owner   │ #1               │ UNIMPLEMENTED            │
-│  3      │ Fencing Tokens      │ #2               │ UNIMPLEMENTED            │
-│  4      │ Direct DC Routing   │ #1, #2, #3       │ UNIMPLEMENTED            │
-│  5      │ Client Reconnect    │ #1, #3           │ UNIMPLEMENTED            │
-│                                                                              │
-│  Each component will be:                                                     │
-│  1. Implemented                                                              │
-│  2. Tested with integration test                                             │
-│  3. Debugged and fixed                                                       │
-│  4. Committed                                                                │
-│  5. Marked as IMPLEMENTED in this document                                   │
-│  6. Committed again with documentation update                                │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Session Handoff: Implementation Continuation Guide
-
-This section provides all context needed for another AI session to resume implementation.
-
-### Current State (As of Last Session)
-
-#### What's Working ✓
-1. **Gate-to-Manager Federated Health Monitoring**: Implemented via `FederatedHealthMonitor`
-2. **Manager-to-Gate Symmetric Monitoring**: Managers also use federated health for gate monitoring
-3. **Cross-Cluster Probing Protocol**: `xprobe`/`xack` messages with namespaced incarnations
-4. **Gate Results Aggregation**: Working correctly - latency percentiles interpolated, per-DC stats preserved
-5. **TCP Length-Prefixed Framing**: Reliable message delivery implemented
-6. **Priority-Based Core Allocation**: Managers allocate cores based on `StagePriority`, not VUs
-7. **Context Consistency Protocol**: LWW with timestamps and source node tiebreakers
-8. **SWIM Configuration**: Externalized to `Env` class
-9. **Workflow Execution Pipeline**: Test workflows correctly report completion counts
-   - Fixed: `RemoteGraphManager.get_workflow_update()` now returns the update
-   - Fixed: Manager extracts counts from `WorkflowStats` for fast-completing workflows
-   - Note: Non-test workflows (no `CallResult` return type) correctly report zero counts
-
-#### What's Partially Working ⚠
-1. **Manager Cleanup on Shutdown**: `Manager stop failed` warnings during test cleanup
-
-#### What's Not Implemented ✗
-See "Remaining Components" below.
-
----
-
-### Remaining Components (In Implementation Order)
-
-#### Component 1: Consistent Hashing Ring ✓ IMPLEMENTED
-**Purpose**: Deterministic job-to-gate assignment for stable ownership
-
-**Location**: `hyperscale/distributed_rewrite/routing/consistent_hash.py`
-
-**Implementation**:
-```python
-class ConsistentHashRing:
-    def __init__(self, virtual_nodes: int = 150):
-        # 150 vnodes provides <10% CV distribution
-
-    def add_node(self, node_id: str) -> None:
-        # Idempotent, thread-safe
-
-    def remove_node(self, node_id: str) -> None:
-        # Idempotent, thread-safe
-
-    def get_node(self, key: str) -> str | None:
-        # O(log n) lookup via binary search
-
-    def get_backup(self, key: str) -> str | None:
-        # Returns different node from primary
-
-    def get_nodes_for_key(self, key: str, count: int) -> list[str]:
-        # For replication scenarios
-```
-
-**Key Properties**:
-- **Deterministic**: Same key always maps to same node
-- **Minimal redistribution**: ~23% keys move when adding 4th node
-- **Thread-safe**: RLock-protected operations
-- **Even distribution**: CV < 10% with 150 virtual nodes
-
-**Integration Points** (pending):
-- Gate uses hash ring in `job_submission` handler to determine initial owner
-- Client uses hash ring to find job owner for reconnection
-
-**Test File**: `examples/servers/test_consistent_hashing.py`
-- 9 test cases covering all functionality
-- Thread safety tested with 8000 concurrent ops
-
----
-
-#### Component 2: Lease-Based Job Ownership
-**Purpose**: Time-bounded ownership to prevent split-brain during failures
-
-**Implementation Plan**:
-```
-Location: hyperscale/distributed_rewrite/leases/job_lease.py
-
-@dataclass
-class JobLease:
-    job_id: str
-    owner_node: str
-    fence_token: int
-    expires_at: float  # monotonic time
-    lease_duration: float = 30.0
-    
-class LeaseManager:
-    def __init__(self, node_id: str):
-        self._leases: dict[str, JobLease] = {}
-        self._node_id = node_id
-        
-    def acquire(self, job_id: str) -> JobLease | None:
-        """Acquire lease if not held or expired"""
-        ...
-    
-    def renew(self, job_id: str) -> bool:
-        """Extend lease if still owner"""
-        ...
-    
-    def release(self, job_id: str) -> None:
-        """Explicitly release lease"""
-        ...
-    
-    def _cleanup_expired(self) -> None:
-        """Background task to clean expired leases"""
-        ...
-```
-
-**Integration Points**:
-- Gate acquires lease when becoming job owner (via hash ring or on job submission)
-- Lease renewal happens in background heartbeat loop
-- Backup gate monitors primary's lease via state sync
-
-**Test File**: `examples/servers/test_lease_ownership.py`
-```python
-# Test: lease acquisition succeeds for unclaimed job
-# Test: lease renewal extends expiry
-# Test: backup claims lease after primary expires
-# Test: fence token increments on each claim
-```
-
----
-
-#### Component 3: Fencing Tokens
-**Purpose**: Prevent stale updates from old owners
-
-**Implementation Plan**:
-```
-Location: Integrate into existing message models
-
-# Update JobFinalResult, JobStatusPush, etc.
-@dataclass  
-class JobFinalResult(Message):
-    ...
-    fence_token: int = 0  # Add to existing model
-    
-# Gate validation
-def validate_fence_token(self, job_id: str, received_token: int) -> bool:
-    current = self._job_fence_tokens.get(job_id, 0)
-    if received_token < current:
-        return False  # Stale update, reject
-    self._job_fence_tokens[job_id] = received_token
-    return True
-```
-
-**Integration Points**:
-- Gate includes fence_token in `JobDispatch` to managers
-- Managers include fence_token in `JobFinalResult` to gates
-- Gate validates fence_token before accepting results
-
-**Test File**: `examples/servers/test_fencing_tokens.py`
-```python
-# Test: stale result (old fence) rejected
-# Test: valid result (current fence) accepted
-# Test: new owner's results (higher fence) accepted
-```
-
----
-
-#### Component 4: Direct DC-to-Job-Leader Routing
-**Purpose**: Results go directly to job leader, not cluster leader
-
-**Implementation Plan**:
-```
-# In Manager.job_final_result handler:
-# Instead of sending to cluster leader, send to job leader
-
-def _send_job_final_result(self, job_id: str, result: JobFinalResult):
-    job_leader = self._job_leaders.get(job_id)
-    if job_leader == self._node_id.full:
-        # We are the job leader, aggregate locally
-        self._aggregate_and_forward_to_gate(result)
-    else:
-        # Forward to job leader
-        self.send_tcp(job_leader, "job_final_result", result.dump())
-
-# Similar pattern for gates forwarding to job-owning gate
-```
-
-**Integration Points**:
-- `JobDispatch` includes `job_leader_addr` field
-- DCs route results back to specified leader
-- If leader unreachable, use backup from hash ring
-
-**Test File**: `examples/servers/test_direct_routing.py`
-```python
-# Test: results route to job leader, not cluster leader
-# Test: failover to backup when leader unreachable
-```
-
----
-
-#### Component 5: Client Reconnection
-**Purpose**: Clients can reconnect after gate failure and resume job tracking
-
-**Implementation Plan**:
-```
-Location: hyperscale/distributed_rewrite/nodes/client.py
-
-class HyperscaleClient:
-    def __init__(self, gate_addrs: list[tuple[str, int]]):
-        self._hash_ring = ConsistentHashRing()
-        for addr in gate_addrs:
-            self._hash_ring.add_node(f"{addr[0]}:{addr[1]}")
-    
-    def reconnect(self, job_id: str) -> JobResult | None:
-        """Reconnect to job owner and get current status"""
-        owner = self._hash_ring.get_node(job_id)
-        backup = self._hash_ring.get_backup(job_id)
-        
-        # Try owner first, then backup
-        for gate_addr in [owner, backup]:
-            try:
-                return self._fetch_job_status(gate_addr, job_id)
-            except ConnectionError:
-                continue
-        raise AllGatesUnreachable()
-```
-
-**Integration Points**:
-- Client stores hash ring of known gates
-- On disconnect, client computes owner and reconnects
-- Gate's `job_status_request` handler returns current status
-
-**Test File**: `examples/servers/test_client_reconnection.py`
-```python
-# Test: client reconnects after gate failure
-# Test: client finds job on backup gate
-# Test: client receives missed status updates
-```
-
----
-
 ### Testing Approach
 
 All tests follow this pattern:
@@ -9122,7 +8859,7 @@ if __name__ == "__main__":
 ```
 
 **Debug Workflow**:
-1. Run test with `timeout 180 python examples/servers/test_<name>.py 2>&1 | tail -100`
+1. Let user test with `timeout 180 python examples/servers/test_<name>.py 2>&1 | tail -100`
 2. Watch for warnings/exceptions
 3. Kill test if error found
 4. Fix the issue
@@ -9151,20 +8888,6 @@ if __name__ == "__main__":
 ---
 
 ### Known Issues to Investigate
-
-1. ~~**Workflow Execution Not Completing**~~ **RESOLVED**
-   - ~~Jobs return `PARTIAL` with `total_completed=0`~~
-   - **Root cause 1**: `RemoteGraphManager.get_workflow_update()` missing return statement
-   - **Root cause 2**: Manager used progress-based counts only, missing fast workflows
-   - **Fix**: Added return statement; extract counts from `WorkflowStats["stats"]`
-
-2. **Manager Shutdown Failures**
-   - `Manager stop failed` during cleanup
-   - May be race condition with background tasks
-
-3. **Circuit Breaker False Positives**
-   - `[CircuitBreakerOpen] ELECTION` errors during single-node tests
-   - Single-node clusters shouldn't have election circuit breaker issues
 
 ---
 
