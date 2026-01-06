@@ -9,7 +9,7 @@ from .utils import (
     is_ssl,
 )
 from .abstract_connection import AbstractConnection
-from .receive_buffer import ReceiveBuffer
+from .receive_buffer import ReceiveBuffer, BufferOverflowError, FrameTooLargeError
 
 T = TypeVar("T", bound=AbstractConnection)
 
@@ -65,14 +65,27 @@ class MercurySyncTCPProtocol(asyncio.Protocol, Generic[T]):
 
     def data_received(self, data: bytes):
         # Buffer incoming data for length-prefixed framing
-        self._receive_buffer += data
-        
+        try:
+            self._receive_buffer += data
+        except BufferOverflowError:
+            # Buffer overflow attack - close connection immediately
+            self._receive_buffer.clear()
+            self.transport.close()
+            return
+
         # Process all complete messages in the buffer
         while True:
-            message = self._receive_buffer.maybe_extract_framed()
+            try:
+                message = self._receive_buffer.maybe_extract_framed()
+            except FrameTooLargeError:
+                # Frame too large - close connection (potential attack)
+                self._receive_buffer.clear()
+                self.transport.close()
+                return
+
             if message is None:
                 break
-            
+
             # Pass complete message to handler
             self.read(
                 message,

@@ -3,6 +3,10 @@ from .mercury_sync_udp_protocol import MercurySyncUDPProtocol as MercurySyncUDPP
 from .receive_buffer import (
     ReceiveBuffer as ReceiveBuffer,
     frame_message as frame_message,
+    BufferOverflowError as BufferOverflowError,
+    FrameTooLargeError as FrameTooLargeError,
+    MAX_FRAME_LENGTH,
+    MAX_BUFFER_SIZE,
 )
 from .security import (
     ReplayGuard as ReplayGuard,
@@ -15,4 +19,8 @@ from .security import (
     parse_address as parse_address,
     MAX_MESSAGE_SIZE,
     MAX_DECOMPRESSED_SIZE,
+)
+from .drop_counter import (
+    DropCounter as DropCounter,
+    DropCounterSnapshot as DropCounterSnapshot,
 )

@@ -48,6 +48,7 @@ from hyperscale.distributed_rewrite.server.protocol import (
     MAX_MESSAGE_SIZE,
     MAX_DECOMPRESSED_SIZE,
     frame_message,
+    DropCounter,
 )
 from hyperscale.distributed_rewrite.server.events import LamportClock
 from hyperscale.distributed_rewrite.server.hooks.task import (
@@ -58,7 +59,7 @@ from hyperscale.distributed_rewrite.taskex import TaskRunner
 from hyperscale.distributed_rewrite.taskex.run import Run
 from hyperscale.logging import Logger
 from hyperscale.logging.config import LoggingConfig
-from hyperscale.logging.hyperscale_logging_models import ServerWarning
+from hyperscale.logging.hyperscale_logging_models import ServerWarning, SilentDropStats
 
 do_patch()
 
@@ -159,6 +160,12 @@ class MercurySyncBaseServer(Generic[T]):
         self._replay_guard = ReplayGuard()
         self._rate_limiter = RateLimiter()
         self._secure_random = secrets.SystemRandom()  # Cryptographically secure RNG
+
+        # Drop counters for silent drop monitoring
+        self._tcp_drop_counter = DropCounter()
+        self._udp_drop_counter = DropCounter()
+        self._drop_stats_task: asyncio.Task | None = None
+        self._drop_stats_interval = 60.0  # Log drop stats every 60 seconds
         
         self._tcp_semaphore: asyncio.Semaphore | None= None
         self._udp_semaphore: asyncio.Semaphore | None= None
@@ -362,9 +369,12 @@ class MercurySyncBaseServer(Generic[T]):
 
         if self._tcp_server_cleanup_task is None:
             self._tcp_server_cleanup_task = self._loop.create_task(self._cleanup_tcp_server_tasks())
-                                                                   
+
         if self._udp_server_cleanup_task is None:
             self._udp_server_cleanup_task = self._loop.create_task(self._cleanup_udp_server_tasks())
+
+        if self._drop_stats_task is None:
+            self._drop_stats_task = self._loop.create_task(self._log_drop_stats_periodically())
 
         
         for task_name, task in self._tasks.items():
@@ -988,19 +998,26 @@ class MercurySyncBaseServer(Generic[T]):
             # Rate limiting (if sender address available)
             if sender_addr is not None:
                 if not self._rate_limiter.check(sender_addr):
-                    return  # Rate limited - silently drop
-            
+                    self._udp_drop_counter.increment_rate_limited()
+                    return
+
             # Message size validation (before decompression)
             if len(data) > MAX_MESSAGE_SIZE:
-                return  # Message too large - silently drop
+                self._udp_drop_counter.increment_message_too_large()
+                return
 
-            decrypted_data = self._encryptor.decrypt(data)
-            
+            try:
+                decrypted_data = self._encryptor.decrypt(data)
+            except Exception:
+                self._udp_drop_counter.increment_decryption_failed()
+                return
+
             decrypted = self._decompressor.decompress(decrypted_data)
-            
+
             # Validate decompressed size
             if len(decrypted) > MAX_DECOMPRESSED_SIZE:
-                return  # Decompressed message too large - silently drop
+                self._udp_drop_counter.increment_decompression_too_large()
+                return
 
             # Parse length-prefixed UDP message format:
             # type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
@@ -1041,18 +1058,30 @@ class MercurySyncBaseServer(Generic[T]):
                     )
 
         except Exception:
-            pass  # Sync callback - cannot log asynchronously
+            self._udp_drop_counter.increment_malformed_message()
 
     async def process_tcp_client_resopnse(
         self,
         data: bytes,
         transport: asyncio.Transport,
     ):
-        decrypted = self._decompressor.decompress(
-            self._encryptor.decrypt(
-                data,
+        try:
+            decrypted_data = self._encryptor.decrypt(data)
+            decrypted = self._decompressor.decompress(decrypted_data)
+
+            # Validate decompressed size (same as server request handling)
+            if len(decrypted) > MAX_DECOMPRESSED_SIZE:
+                await self._log_security_warning(
+                    "TCP client response decompressed message too large",
+                    protocol="tcp",
+                )
+                return
+        except Exception as decompression_error:
+            await self._log_security_warning(
+                f"TCP client response decompression failed: {type(decompression_error).__name__}",
+                protocol="tcp",
             )
-        )
+            return
 
         # Parse length-prefixed message format:
         # address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
@@ -1102,24 +1131,31 @@ class MercurySyncBaseServer(Generic[T]):
     ):
         # Get client address for rate limiting
         peername = transport.get_extra_info('peername')
-        
+
         try:
             # Rate limiting
             if peername is not None:
                 if not self._rate_limiter.check(peername):
-                    return  # Rate limited - silently drop
-            
+                    self._tcp_drop_counter.increment_rate_limited()
+                    return
+
             # Message size validation
             if len(data) > MAX_MESSAGE_SIZE:
-                return  # Message too large - silently drop
-            
-            decrypted_data = self._encryptor.decrypt(data)
+                self._tcp_drop_counter.increment_message_too_large()
+                return
+
+            try:
+                decrypted_data = self._encryptor.decrypt(data)
+            except Exception:
+                self._tcp_drop_counter.increment_decryption_failed()
+                return
 
             decrypted = self._decompressor.decompress(decrypted_data)
-            
+
             # Validate decompressed size
             if len(decrypted) > MAX_DECOMPRESSED_SIZE:
-                return  # Decompressed message too large - silently drop
+                self._tcp_drop_counter.increment_decompression_too_large()
+                return
 
             # Parse length-prefixed message format:
             # address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
@@ -1173,6 +1209,7 @@ class MercurySyncBaseServer(Generic[T]):
             transport.write(frame_message(response_payload))
 
         except Exception as e:
+            self._tcp_drop_counter.increment_malformed_message()
             # Log security event - could be decryption failure, malformed message, etc.
             await self._log_security_warning(
                 f"TCP server request failed: {type(e).__name__}",
@@ -1329,6 +1366,60 @@ class MercurySyncBaseServer(Generic[T]):
                         pass
                     self._pending_udp_server_responses.pop()
 
+    async def _log_drop_stats_periodically(self) -> None:
+        """Periodically log silent drop statistics for security monitoring."""
+        while self._running:
+            try:
+                await asyncio.sleep(self._drop_stats_interval)
+            except (asyncio.CancelledError, Exception):
+                break
+
+            # Get and reset TCP drop stats
+            tcp_snapshot = self._tcp_drop_counter.reset()
+            if tcp_snapshot.has_drops:
+                try:
+                    await self._tcp_logger.log(
+                        SilentDropStats(
+                            message="TCP silent drop statistics",
+                            node_id=0,
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            protocol="tcp",
+                            rate_limited_count=tcp_snapshot.rate_limited,
+                            message_too_large_count=tcp_snapshot.message_too_large,
+                            decompression_too_large_count=tcp_snapshot.decompression_too_large,
+                            decryption_failed_count=tcp_snapshot.decryption_failed,
+                            malformed_message_count=tcp_snapshot.malformed_message,
+                            total_dropped=tcp_snapshot.total,
+                            interval_seconds=tcp_snapshot.interval_seconds,
+                        )
+                    )
+                except Exception:
+                    pass  # Best effort logging
+
+            # Get and reset UDP drop stats
+            udp_snapshot = self._udp_drop_counter.reset()
+            if udp_snapshot.has_drops:
+                try:
+                    await self._udp_logger.log(
+                        SilentDropStats(
+                            message="UDP silent drop statistics",
+                            node_id=0,
+                            node_host=self._host,
+                            node_port=self._udp_port,
+                            protocol="udp",
+                            rate_limited_count=udp_snapshot.rate_limited,
+                            message_too_large_count=udp_snapshot.message_too_large,
+                            decompression_too_large_count=udp_snapshot.decompression_too_large,
+                            decryption_failed_count=udp_snapshot.decryption_failed,
+                            malformed_message_count=udp_snapshot.malformed_message,
+                            total_dropped=udp_snapshot.total,
+                            interval_seconds=udp_snapshot.interval_seconds,
+                        )
+                    )
+                except Exception:
+                    pass  # Best effort logging
+
     async def shutdown(self) -> None:
         self._running = False
 
@@ -1336,6 +1427,14 @@ class MercurySyncBaseServer(Generic[T]):
 
         for client in self._tcp_client_transports.values():
             client.abort()
+
+        # Cancel drop stats task
+        if self._drop_stats_task is not None:
+            self._drop_stats_task.cancel()
+            try:
+                await self._drop_stats_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         await asyncio.gather(*[
             self._cleanup_tcp_server_tasks(),
