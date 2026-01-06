@@ -194,21 +194,21 @@ Three-signal health model for all node types.
 
 ### 3.3 AD-24: Rate Limiting
 
-- [ ] Implement `TokenBucket` class
-  - [ ] `__init__(bucket_size: int, refill_rate: float)`
-  - [ ] `async acquire(tokens: int = 1) -> bool`
-  - [ ] `_refill()` based on elapsed time
-- [ ] Implement `RateLimitConfig` dataclass
-  - [ ] Per-operation limits
-- [ ] Implement `ServerRateLimiter` class
-  - [ ] Per-client token buckets: `dict[str, TokenBucket]`
-  - [ ] `check_rate_limit(client_id, operation) -> tuple[bool, float]`
-  - [ ] Returns `(allowed, retry_after_seconds)`
+- [x] Implement `TokenBucket` class
+  - [x] `__init__(bucket_size: int, refill_rate: float)`
+  - [x] `async acquire(tokens: int = 1) -> bool`
+  - [x] `_refill()` based on elapsed time
+- [x] Implement `RateLimitConfig` dataclass
+  - [x] Per-operation limits
+- [x] Implement `ServerRateLimiter` class
+  - [x] Per-client token buckets: `dict[str, TokenBucket]`
+  - [x] `check_rate_limit(client_id, operation) -> tuple[bool, float]`
+  - [x] Returns `(allowed, retry_after_seconds)`
 - [ ] Integrate rate limiter with gate handlers
 - [ ] Add 429 response handling with Retry-After
-- [ ] Add client-side cooperative rate limiting
-- [ ] Add bucket cleanup for inactive clients (prevent memory leak)
-- [ ] Add integration tests for rate limiting
+- [x] Add client-side cooperative rate limiting
+- [x] Add bucket cleanup for inactive clients (prevent memory leak)
+- [x] Add integration tests for rate limiting
 
 ---
 

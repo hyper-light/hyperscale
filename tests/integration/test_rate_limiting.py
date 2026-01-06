@@ -1,0 +1,486 @@
+"""
+Integration tests for Rate Limiting (AD-24).
+
+Tests:
+- TokenBucket acquire and refill behavior
+- ServerRateLimiter per-client limits
+- CooperativeRateLimiter client-side throttling
+- Client cleanup to prevent memory leaks
+"""
+
+import asyncio
+import time
+from unittest.mock import patch
+
+import pytest
+
+from hyperscale.distributed_rewrite.reliability import (
+    CooperativeRateLimiter,
+    RateLimitConfig,
+    RateLimitResult,
+    ServerRateLimiter,
+    TokenBucket,
+)
+
+
+class TestTokenBucket:
+    """Test TokenBucket basic operations."""
+
+    def test_initial_state(self) -> None:
+        """Test bucket starts full."""
+        bucket = TokenBucket(bucket_size=100, refill_rate=10.0)
+
+        assert bucket.available_tokens == 100.0
+
+    def test_acquire_success(self) -> None:
+        """Test successful token acquisition."""
+        bucket = TokenBucket(bucket_size=100, refill_rate=10.0)
+
+        result = bucket.acquire(10)
+
+        assert result is True
+        assert bucket.available_tokens == 90.0
+
+    def test_acquire_failure(self) -> None:
+        """Test failed token acquisition when bucket empty."""
+        bucket = TokenBucket(bucket_size=10, refill_rate=1.0)
+
+        # Drain the bucket
+        bucket.acquire(10)
+
+        # Try to acquire more
+        result = bucket.acquire(1)
+
+        assert result is False
+
+    def test_acquire_partial(self) -> None:
+        """Test that partial tokens don't work."""
+        bucket = TokenBucket(bucket_size=10, refill_rate=1.0)
+
+        # Use up most tokens
+        bucket.acquire(8)
+
+        # Try to acquire more than available
+        result = bucket.acquire(5)
+
+        assert result is False
+        assert bucket.available_tokens == 2.0
+
+    def test_try_acquire_with_wait_time(self) -> None:
+        """Test try_acquire returns wait time."""
+        bucket = TokenBucket(bucket_size=10, refill_rate=10.0)
+
+        # Drain bucket
+        bucket.acquire(10)
+
+        # Check wait time for 5 tokens
+        acquired, wait_time = bucket.try_acquire(5)
+
+        assert acquired is False
+        assert wait_time == pytest.approx(0.5, rel=0.1)  # 5 tokens / 10 per second
+
+    def test_refill_over_time(self) -> None:
+        """Test that tokens refill over time."""
+        bucket = TokenBucket(bucket_size=100, refill_rate=100.0)  # 100 per second
+
+        # Drain bucket
+        bucket.acquire(100)
+        assert bucket.available_tokens == 0.0
+
+        # Wait for refill (simulated)
+        with patch("time.monotonic") as mock_time:
+            mock_time.return_value = time.monotonic() + 0.5  # 0.5 seconds later
+            # Force refill by accessing tokens
+            tokens = bucket.available_tokens
+
+        assert tokens == pytest.approx(50.0, rel=0.1)  # ~50 tokens after 0.5s
+
+    def test_refill_caps_at_bucket_size(self) -> None:
+        """Test that refill doesn't exceed bucket size."""
+        bucket = TokenBucket(bucket_size=100, refill_rate=100.0)
+
+        # Use some tokens
+        bucket.acquire(50)
+
+        # Wait a long time (simulated)
+        with patch("time.monotonic") as mock_time:
+            mock_time.return_value = time.monotonic() + 10.0  # 10 seconds later
+            tokens = bucket.available_tokens
+
+        assert tokens == 100.0  # Capped at bucket size
+
+    def test_reset(self) -> None:
+        """Test bucket reset."""
+        bucket = TokenBucket(bucket_size=100, refill_rate=10.0)
+
+        bucket.acquire(100)
+        assert bucket.available_tokens == 0.0
+
+        bucket.reset()
+        assert bucket.available_tokens == 100.0
+
+    @pytest.mark.asyncio
+    async def test_acquire_async(self) -> None:
+        """Test async acquire with wait."""
+        bucket = TokenBucket(bucket_size=10, refill_rate=100.0)  # Fast refill
+
+        # Drain bucket
+        bucket.acquire(10)
+
+        # Async acquire should wait for tokens
+        start = time.monotonic()
+        result = await bucket.acquire_async(5, max_wait=1.0)
+        elapsed = time.monotonic() - start
+
+        assert result is True
+        assert elapsed >= 0.04  # At least 50ms to get 5 tokens
+
+    @pytest.mark.asyncio
+    async def test_acquire_async_timeout(self) -> None:
+        """Test async acquire times out."""
+        bucket = TokenBucket(bucket_size=10, refill_rate=1.0)  # Slow refill
+
+        # Drain bucket
+        bucket.acquire(10)
+
+        # Try to acquire with short timeout
+        result = await bucket.acquire_async(10, max_wait=0.01)
+
+        assert result is False
+
+
+class TestRateLimitConfig:
+    """Test RateLimitConfig."""
+
+    def test_default_limits(self) -> None:
+        """Test default limits for unknown operations."""
+        config = RateLimitConfig()
+
+        bucket_size, refill_rate = config.get_limits("unknown_operation")
+
+        assert bucket_size == 100
+        assert refill_rate == 10.0
+
+    def test_operation_limits(self) -> None:
+        """Test configured limits for known operations."""
+        config = RateLimitConfig()
+
+        stats_size, stats_rate = config.get_limits("stats_update")
+        assert stats_size == 500
+        assert stats_rate == 50.0
+
+        cancel_size, cancel_rate = config.get_limits("cancel")
+        assert cancel_size == 20
+        assert cancel_rate == 2.0
+
+    def test_custom_operation_limits(self) -> None:
+        """Test custom operation limits."""
+        config = RateLimitConfig(
+            operation_limits={
+                "custom_op": (50, 5.0),
+            }
+        )
+
+        size, rate = config.get_limits("custom_op")
+        assert size == 50
+        assert rate == 5.0
+
+
+class TestServerRateLimiter:
+    """Test ServerRateLimiter."""
+
+    def test_check_rate_limit_allowed(self) -> None:
+        """Test rate limit check when allowed."""
+        limiter = ServerRateLimiter()
+
+        result = limiter.check_rate_limit("client-1", "job_submit")
+
+        assert result.allowed is True
+        assert result.retry_after_seconds == 0.0
+        assert result.tokens_remaining > 0
+
+    def test_check_rate_limit_exhausted(self) -> None:
+        """Test rate limit check when exhausted."""
+        config = RateLimitConfig(
+            operation_limits={"test_op": (5, 1.0)}
+        )
+        limiter = ServerRateLimiter(config=config)
+
+        # Exhaust the bucket
+        for _ in range(5):
+            limiter.check_rate_limit("client-1", "test_op")
+
+        # Should be rate limited now
+        result = limiter.check_rate_limit("client-1", "test_op")
+
+        assert result.allowed is False
+        assert result.retry_after_seconds > 0
+
+    def test_per_client_isolation(self) -> None:
+        """Test that clients have separate buckets."""
+        config = RateLimitConfig(
+            operation_limits={"test_op": (3, 1.0)}
+        )
+        limiter = ServerRateLimiter(config=config)
+
+        # Exhaust client-1
+        for _ in range(3):
+            limiter.check_rate_limit("client-1", "test_op")
+
+        # client-2 should still have tokens
+        result = limiter.check_rate_limit("client-2", "test_op")
+
+        assert result.allowed is True
+
+    def test_per_operation_isolation(self) -> None:
+        """Test that operations have separate buckets."""
+        config = RateLimitConfig(
+            operation_limits={
+                "op1": (3, 1.0),
+                "op2": (3, 1.0),
+            }
+        )
+        limiter = ServerRateLimiter(config=config)
+
+        # Exhaust op1 for client-1
+        for _ in range(3):
+            limiter.check_rate_limit("client-1", "op1")
+
+        # op2 for same client should still work
+        result = limiter.check_rate_limit("client-1", "op2")
+
+        assert result.allowed is True
+
+    def test_cleanup_inactive_clients(self) -> None:
+        """Test cleanup of inactive clients."""
+        limiter = ServerRateLimiter(inactive_cleanup_seconds=0.1)
+
+        # Create some clients
+        limiter.check_rate_limit("client-1", "test")
+        limiter.check_rate_limit("client-2", "test")
+
+        # Wait for them to become inactive
+        time.sleep(0.15)
+
+        # Cleanup
+        cleaned = limiter.cleanup_inactive_clients()
+
+        assert cleaned == 2
+        metrics = limiter.get_metrics()
+        assert metrics["active_clients"] == 0
+
+    def test_cleanup_preserves_active_clients(self) -> None:
+        """Test that cleanup preserves recently active clients."""
+        limiter = ServerRateLimiter(inactive_cleanup_seconds=1.0)
+
+        # Create client and keep it active
+        limiter.check_rate_limit("client-1", "test")
+
+        # Cleanup immediately (client is still active)
+        cleaned = limiter.cleanup_inactive_clients()
+
+        assert cleaned == 0
+        metrics = limiter.get_metrics()
+        assert metrics["active_clients"] == 1
+
+    def test_reset_client(self) -> None:
+        """Test resetting a client's buckets."""
+        config = RateLimitConfig(
+            operation_limits={"test_op": (3, 1.0)}
+        )
+        limiter = ServerRateLimiter(config=config)
+
+        # Exhaust client
+        for _ in range(3):
+            limiter.check_rate_limit("client-1", "test_op")
+
+        # Rate limited
+        result = limiter.check_rate_limit("client-1", "test_op")
+        assert result.allowed is False
+
+        # Reset client
+        limiter.reset_client("client-1")
+
+        # Should work again
+        result = limiter.check_rate_limit("client-1", "test_op")
+        assert result.allowed is True
+
+    def test_get_client_stats(self) -> None:
+        """Test getting client's token stats."""
+        limiter = ServerRateLimiter()
+
+        # Use some tokens
+        limiter.check_rate_limit("client-1", "job_submit", tokens=10)
+        limiter.check_rate_limit("client-1", "job_status", tokens=5)
+
+        stats = limiter.get_client_stats("client-1")
+
+        assert "job_submit" in stats
+        assert "job_status" in stats
+        assert stats["job_submit"] < 50  # Started with 50
+
+    def test_metrics(self) -> None:
+        """Test metrics tracking."""
+        config = RateLimitConfig(
+            operation_limits={"test_op": (2, 1.0)}
+        )
+        limiter = ServerRateLimiter(config=config)
+
+        # Make some requests
+        limiter.check_rate_limit("client-1", "test_op")
+        limiter.check_rate_limit("client-1", "test_op")
+        limiter.check_rate_limit("client-1", "test_op")  # Rate limited
+
+        metrics = limiter.get_metrics()
+
+        assert metrics["total_requests"] == 3
+        assert metrics["rate_limited_requests"] == 1
+        assert metrics["active_clients"] == 1
+
+    @pytest.mark.asyncio
+    async def test_check_rate_limit_async(self) -> None:
+        """Test async rate limit check with wait."""
+        config = RateLimitConfig(
+            operation_limits={"test_op": (3, 100.0)}  # Fast refill
+        )
+        limiter = ServerRateLimiter(config=config)
+
+        # Exhaust bucket
+        for _ in range(3):
+            limiter.check_rate_limit("client-1", "test_op")
+
+        # Async check should wait for tokens
+        start = time.monotonic()
+        result = await limiter.check_rate_limit_async(
+            "client-1", "test_op", max_wait=1.0
+        )
+        elapsed = time.monotonic() - start
+
+        assert result.allowed is True
+        assert elapsed >= 0.005  # At least some wait time
+
+
+class TestCooperativeRateLimiter:
+    """Test CooperativeRateLimiter client-side throttling."""
+
+    def test_not_blocked_initially(self) -> None:
+        """Test that operations are not blocked initially."""
+        limiter = CooperativeRateLimiter()
+
+        assert limiter.is_blocked("test_op") is False
+        assert limiter.get_retry_after("test_op") == 0.0
+
+    def test_handle_rate_limit(self) -> None:
+        """Test handling rate limit response."""
+        limiter = CooperativeRateLimiter()
+
+        limiter.handle_rate_limit("test_op", retry_after=1.0)
+
+        assert limiter.is_blocked("test_op") is True
+        assert limiter.get_retry_after("test_op") > 0.9
+
+    def test_block_expires(self) -> None:
+        """Test that block expires after retry_after."""
+        limiter = CooperativeRateLimiter()
+
+        limiter.handle_rate_limit("test_op", retry_after=0.05)
+
+        assert limiter.is_blocked("test_op") is True
+
+        # Wait for block to expire
+        time.sleep(0.06)
+
+        assert limiter.is_blocked("test_op") is False
+
+    def test_default_backoff(self) -> None:
+        """Test default backoff when no retry_after specified."""
+        limiter = CooperativeRateLimiter(default_backoff=2.0)
+
+        limiter.handle_rate_limit("test_op")
+
+        assert limiter.is_blocked("test_op") is True
+        assert limiter.get_retry_after("test_op") >= 1.9
+
+    def test_clear_specific_operation(self) -> None:
+        """Test clearing block for specific operation."""
+        limiter = CooperativeRateLimiter()
+
+        limiter.handle_rate_limit("op1", retry_after=10.0)
+        limiter.handle_rate_limit("op2", retry_after=10.0)
+
+        limiter.clear("op1")
+
+        assert limiter.is_blocked("op1") is False
+        assert limiter.is_blocked("op2") is True
+
+    def test_clear_all(self) -> None:
+        """Test clearing all blocks."""
+        limiter = CooperativeRateLimiter()
+
+        limiter.handle_rate_limit("op1", retry_after=10.0)
+        limiter.handle_rate_limit("op2", retry_after=10.0)
+
+        limiter.clear()
+
+        assert limiter.is_blocked("op1") is False
+        assert limiter.is_blocked("op2") is False
+
+    @pytest.mark.asyncio
+    async def test_wait_if_needed_not_blocked(self) -> None:
+        """Test wait_if_needed when not blocked."""
+        limiter = CooperativeRateLimiter()
+
+        wait_time = await limiter.wait_if_needed("test_op")
+
+        assert wait_time == 0.0
+
+    @pytest.mark.asyncio
+    async def test_wait_if_needed_blocked(self) -> None:
+        """Test wait_if_needed when blocked."""
+        limiter = CooperativeRateLimiter()
+
+        limiter.handle_rate_limit("test_op", retry_after=0.1)
+
+        start = time.monotonic()
+        wait_time = await limiter.wait_if_needed("test_op")
+        elapsed = time.monotonic() - start
+
+        assert wait_time >= 0.09
+        assert elapsed >= 0.09
+
+    def test_metrics(self) -> None:
+        """Test cooperative rate limiter metrics."""
+        limiter = CooperativeRateLimiter()
+
+        # Initially no waits
+        metrics = limiter.get_metrics()
+        assert metrics["total_waits"] == 0
+        assert metrics["total_wait_time"] == 0.0
+
+
+class TestRateLimitResult:
+    """Test RateLimitResult dataclass."""
+
+    def test_allowed_result(self) -> None:
+        """Test allowed result."""
+        result = RateLimitResult(
+            allowed=True,
+            retry_after_seconds=0.0,
+            tokens_remaining=95.0,
+        )
+
+        assert result.allowed is True
+        assert result.retry_after_seconds == 0.0
+        assert result.tokens_remaining == 95.0
+
+    def test_rate_limited_result(self) -> None:
+        """Test rate limited result."""
+        result = RateLimitResult(
+            allowed=False,
+            retry_after_seconds=0.5,
+            tokens_remaining=0.0,
+        )
+
+        assert result.allowed is False
+        assert result.retry_after_seconds == 0.5
+        assert result.tokens_remaining == 0.0
