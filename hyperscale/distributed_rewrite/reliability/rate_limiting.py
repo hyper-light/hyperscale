@@ -90,6 +90,11 @@ class TokenBucket:
 
         # Calculate wait time for tokens to be available
         tokens_needed = tokens - self._tokens
+
+        # If no refill rate, tokens will never become available
+        if self.refill_rate <= 0:
+            return False, float('inf')
+
         wait_seconds = tokens_needed / self.refill_rate
         return False, wait_seconds
 
