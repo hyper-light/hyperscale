@@ -192,32 +192,38 @@ class SimulatedManagerEdge:
         cancelled = 0
         errors = []
 
-        for workflow_id in workflow_ids:
+        # Process workflows concurrently to allow partial success
+        async def cancel_workflow(workflow_id: str) -> tuple[bool, str | None]:
             worker_id = self._workflow_assignments.get(workflow_id)
             if not worker_id:
-                continue
+                return False, None
 
             worker = self._workers.get(worker_id)
             if not worker:
-                errors.append(f"Worker {worker_id} not found")
-                continue
+                return False, f"Worker {worker_id} not found"
 
             try:
-                # Apply per-workflow timeout
                 success, error = await asyncio.wait_for(
                     worker.handle_cancel(workflow_id, request.timeout_seconds),
                     timeout=request.timeout_seconds,
                 )
-                if success:
-                    cancelled += 1
-                elif error:
-                    errors.append(error)
+                return success, error
             except asyncio.TimeoutError:
-                errors.append(f"Timeout cancelling {workflow_id} on {worker_id}")
+                return False, f"Timeout cancelling {workflow_id} on {worker_id}"
             except ConnectionError as conn_err:
-                errors.append(str(conn_err))
+                return False, str(conn_err)
             except RuntimeError as runtime_err:
-                errors.append(str(runtime_err))
+                return False, str(runtime_err)
+
+        # Run all cancellations concurrently
+        tasks = [cancel_workflow(wf_id) for wf_id in workflow_ids]
+        results = await asyncio.gather(*tasks)
+
+        for success, error in results:
+            if success:
+                cancelled += 1
+            elif error:
+                errors.append(error)
 
         elapsed = time.monotonic() - start_time
         response = CancelResponse(
