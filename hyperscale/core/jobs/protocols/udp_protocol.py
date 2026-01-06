@@ -389,6 +389,19 @@ class UDPProtocol(Generic[T, K]):
                         socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
                     )
 
+                    # Increase socket buffer sizes to reduce EAGAIN errors under load
+                    # Default is typically 212992 bytes, we increase to 4MB
+                    try:
+                        self.udp_socket.setsockopt(
+                            socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024
+                        )
+                        self.udp_socket.setsockopt(
+                            socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024
+                        )
+                    except (OSError, socket.error):
+                        # Some systems may not allow large buffers, ignore
+                        pass
+
                     await self._loop.run_in_executor(
                         None, self.udp_socket.bind, (self.host, self.port)
                     )
@@ -526,6 +539,24 @@ class UDPProtocol(Generic[T, K]):
                     if len(self._pending_responses) > 0:
                         self._pending_responses.pop()
 
+    async def _sendto_with_retry(
+        self,
+        data: bytes,
+        address: Tuple[str, int],
+    ) -> None:
+        """Send data with retry on EAGAIN/EWOULDBLOCK (socket buffer full)."""
+        for send_attempt in range(self._retries + 1):
+            try:
+                self._transport.sendto(data, address)
+                return
+            except BlockingIOError:
+                # Socket buffer full, wait briefly with exponential backoff and retry
+                if send_attempt < self._retries:
+                    await asyncio.sleep(0.01 * (send_attempt + 1))
+                else:
+                    # All retries exhausted, let it propagate
+                    raise
+
     async def send(
         self,
         target: str,
@@ -547,6 +578,9 @@ class UDPProtocol(Generic[T, K]):
         if request_type is None:
             request_type = "request"
 
+        if target == "submit_workflow":
+            print(f"[DEBUG] Submitting to: node_id {node_id} at {address}")
+
         item = cloudpickle.dumps(
             (
                 request_type,
@@ -565,7 +599,7 @@ class UDPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
 
-        self._transport.sendto(compressed, address)
+        await self._sendto_with_retry(compressed, address)
 
         for _ in range(self._retries):
             try:
@@ -622,7 +656,7 @@ class UDPProtocol(Generic[T, K]):
         compressed = self._compressor.compress(encrypted_message)
 
         try:
-            self._transport.sendto(compressed, address)
+            await self._sendto_with_retry(compressed, address)
 
             for _ in range(self._retries):
                 try:
@@ -684,7 +718,7 @@ class UDPProtocol(Generic[T, K]):
         compressed = self._compressor.compress(encrypted_message)
 
         try:
-            self._transport.sendto(compressed, address)
+            await self._sendto_with_retry(compressed, address)
 
             waiter = self._loop.create_future()
             self._waiters[target].put_nowait(waiter)
@@ -953,7 +987,11 @@ class UDPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
 
-        self._transport.sendto(compressed, addr)
+        try:
+            await self._sendto_with_retry(compressed, addr)
+        except BlockingIOError:
+            # Error responses are best-effort, don't propagate failure
+            pass
 
     async def _reset_connection(self):
         try:
@@ -991,7 +1029,11 @@ class UDPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
 
-        self._transport.sendto(compressed, addr)
+        try:
+            await self._sendto_with_retry(compressed, addr)
+        except BlockingIOError:
+            # Connect responses are critical but best-effort, log and continue
+            pass
 
     async def _read(
         self,
@@ -1022,7 +1064,7 @@ class UDPProtocol(Generic[T, K]):
             encrypted_message = self._encryptor.encrypt(item)
             compressed = self._compressor.compress(encrypted_message)
 
-            self._transport.sendto(compressed, addr)
+            await self._sendto_with_retry(compressed, addr)
 
         except (Exception, socket.error):
             pass
@@ -1056,7 +1098,7 @@ class UDPProtocol(Generic[T, K]):
 
                 encrypted_message = self._encryptor.encrypt(item)
                 compressed = self._compressor.compress(encrypted_message)
-                self._transport.sendto(compressed, addr)
+                await self._sendto_with_retry(compressed, addr)
 
             except Exception:
                 pass
