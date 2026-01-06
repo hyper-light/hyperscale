@@ -96,6 +96,10 @@ from hyperscale.distributed_rewrite.health import (
     GateHealthConfig,
     RoutingDecision,
 )
+from hyperscale.distributed_rewrite.reliability import (
+    HybridOverloadDetector,
+    LoadShedder,
+)
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 
@@ -188,6 +192,11 @@ class GateServer(HealthAwareServer):
         # Maps gate_id -> GateHealthState
         self._gate_peer_health: dict[str, GateHealthState] = {}
         self._gate_health_config = GateHealthConfig()
+
+        # Load shedding infrastructure (AD-22)
+        # Tracks latency and sheds low-priority requests under load
+        self._overload_detector = HybridOverloadDetector()
+        self._load_shedder = LoadShedder(self._overload_detector)
 
         # Versioned state clock for rejecting stale updates
         # Tracks per-datacenter versions using Lamport timestamps
@@ -1150,6 +1159,44 @@ class GateServer(HealthAwareServer):
         if health_state:
             return health_state.get_diagnostics()
         return None
+
+    # =========================================================================
+    # Load Shedding (AD-22)
+    # =========================================================================
+
+    def _should_shed_request(self, message_type: str) -> bool:
+        """
+        Check if a request should be shed based on current load.
+
+        Uses the HybridOverloadDetector to determine current state and
+        LoadShedder to decide based on message priority.
+
+        Args:
+            message_type: The type of message being processed
+
+        Returns:
+            True if request should be shed, False to process normally
+        """
+        return self._load_shedder.should_shed(message_type)
+
+    def _record_request_latency(self, latency_ms: float) -> None:
+        """
+        Record request processing latency for overload detection.
+
+        Should be called after processing each request to update
+        the overload detector's latency model.
+
+        Args:
+            latency_ms: Request processing time in milliseconds
+        """
+        self._overload_detector.record_latency(latency_ms)
+
+    def _get_load_shedding_metrics(self) -> dict:
+        """Get load shedding metrics for monitoring."""
+        return {
+            "overload_state": self._load_shedder.get_current_state().value,
+            **self._load_shedder.get_metrics(),
+        }
 
     def _get_available_datacenters(self) -> list[str]:
         """
@@ -2827,14 +2874,22 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job status request from client."""
+        start_time = time.monotonic()
         try:
+            # Load shedding check (AD-22)
+            if self._should_shed_request("JobStatusRequest"):
+                return b''  # Shed request under load
+
             job_id = data.decode()
             status = await self._gather_job_status(job_id)
             return status.dump()
-            
+
         except Exception as e:
             await self.handle_exception(e, "receive_job_status_request")
             return b''
+        finally:
+            latency_ms = (time.monotonic() - start_time) * 1000
+            self._record_request_latency(latency_ms)
     
     # =========================================================================
     # TCP Handlers - Job Progress (from Manager)
@@ -2859,7 +2914,18 @@ class GateServer(HealthAwareServer):
         Forwarding: If we don't own this job (not in _jobs), forward to peer gates
         since we may have received this due to stale origin_gate_addr in manager.
         """
+        start_time = time.monotonic()
         try:
+            # Load shedding check (AD-22) - JobProgress is NORMAL priority
+            if self._should_shed_request("JobProgress"):
+                # Return minimal ack even when shedding to prevent retries
+                ack = JobProgressAck(
+                    gate_id=self._node_id.full,
+                    is_leader=self.is_leader(),
+                    healthy_gates=self._get_healthy_gates(),
+                )
+                return ack.dump()
+
             progress = JobProgress.load(data)
 
             # Check if we own this job - if not, forward to peers
@@ -2958,7 +3024,10 @@ class GateServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "receive_job_progress")
             return b'error'
-    
+        finally:
+            latency_ms = (time.monotonic() - start_time) * 1000
+            self._record_request_latency(latency_ms)
+
     # =========================================================================
     # TCP Handlers - Cancellation
     # =========================================================================

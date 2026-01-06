@@ -118,6 +118,10 @@ from hyperscale.distributed_rewrite.models import (
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
+from hyperscale.distributed_rewrite.reliability import (
+    HybridOverloadDetector,
+    LoadShedder,
+)
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 from hyperscale.reporting.results import Results
 
@@ -373,6 +377,11 @@ class ManagerServer(HealthAwareServer):
             manager_id=self._node_id.short,
             datacenter=dc_id,
         )
+
+        # Load shedding infrastructure (AD-22)
+        # Tracks latency and sheds low-priority requests under load
+        self._overload_detector = HybridOverloadDetector()
+        self._load_shedder = LoadShedder(self._overload_detector)
 
         # WorkflowDispatcher for dependency-aware workflow dispatch
         # Coordinates with JobManager and WorkerPool for allocation
@@ -2346,7 +2355,45 @@ class ManagerServer(HealthAwareServer):
     def _get_total_available_cores(self) -> int:
         """Get total available cores across all healthy workers for priority calculation."""
         return self._get_available_cores_for_healthy_workers()
-    
+
+    # =========================================================================
+    # Load Shedding (AD-22)
+    # =========================================================================
+
+    def _should_shed_request(self, message_type: str) -> bool:
+        """
+        Check if a request should be shed based on current load.
+
+        Uses the HybridOverloadDetector to determine current state and
+        LoadShedder to decide based on message priority.
+
+        Args:
+            message_type: The type of message being processed
+
+        Returns:
+            True if request should be shed, False to process normally
+        """
+        return self._load_shedder.should_shed(message_type)
+
+    def _record_request_latency(self, latency_ms: float) -> None:
+        """
+        Record request processing latency for overload detection.
+
+        Should be called after processing each request to update
+        the overload detector's latency model.
+
+        Args:
+            latency_ms: Request processing time in milliseconds
+        """
+        self._overload_detector.record_latency(latency_ms)
+
+    def _get_load_shedding_metrics(self) -> dict:
+        """Get load shedding metrics for monitoring."""
+        return {
+            "overload_state": self._load_shedder.get_current_state().value,
+            **self._load_shedder.get_metrics(),
+        }
+
     async def _build_xprobe_response(
         self,
         source_addr: tuple[str, int] | bytes,
@@ -3647,7 +3694,12 @@ class ManagerServer(HealthAwareServer):
         This is NOT a healthcheck - liveness is tracked via SWIM UDP probes.
         This contains capacity and workflow progress information.
         """
+        start_time = time.monotonic()
         try:
+            # Load shedding check (AD-22) - StatsUpdate is NORMAL priority
+            if self._should_shed_request("StatsUpdate"):
+                return b'ok'  # Return ok even when shedding to prevent retries
+
             heartbeat = WorkerHeartbeat.load(data)
 
             # Process heartbeat via WorkerPool
@@ -3658,6 +3710,9 @@ class ManagerServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "receive_worker_status_update")
             return b'error'
+        finally:
+            latency_ms = (time.monotonic() - start_time) * 1000
+            self._record_request_latency(latency_ms)
     
     @tcp.receive()
     async def workflow_progress(

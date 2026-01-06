@@ -19,3 +19,8 @@ from hyperscale.distributed_rewrite.reliability.overload import (
     OverloadConfig as OverloadConfig,
     HybridOverloadDetector as HybridOverloadDetector,
 )
+from hyperscale.distributed_rewrite.reliability.load_shedding import (
+    LoadShedder as LoadShedder,
+    LoadShedderConfig as LoadShedderConfig,
+    RequestPriority as RequestPriority,
+)

@@ -155,20 +155,20 @@ Three-signal health model for all node types.
 
 ### 3.1 AD-22: Load Shedding with Priority Queues
 
-- [ ] Implement `RequestPriority` enum
-  - [ ] CRITICAL = 0 (health checks, cancellation, final results, SWIM)
-  - [ ] HIGH = 1 (job submissions, workflow dispatch, state sync)
-  - [ ] NORMAL = 2 (progress updates, stats queries, reconnection)
-  - [ ] LOW = 3 (detailed stats, debug requests)
-- [ ] Implement `LoadShedder` class
-  - [ ] Constructor takes `HybridOverloadDetector`
-  - [ ] `should_shed(priority: RequestPriority) -> bool`
-  - [ ] `classify_request(message_type: str) -> RequestPriority`
-  - [ ] Shed thresholds: healthy=none, busy=LOW, stressed=NORMAL+LOW, overloaded=all except CRITICAL
-- [ ] Integrate load shedder with gate request handlers
-- [ ] Integrate load shedder with manager request handlers
-- [ ] Add metrics for shed request counts
-- [ ] Add integration tests for load shedding
+- [x] Implement `RequestPriority` enum
+  - [x] CRITICAL = 0 (health checks, cancellation, final results, SWIM)
+  - [x] HIGH = 1 (job submissions, workflow dispatch, state sync)
+  - [x] NORMAL = 2 (progress updates, stats queries, reconnection)
+  - [x] LOW = 3 (detailed stats, debug requests)
+- [x] Implement `LoadShedder` class
+  - [x] Constructor takes `HybridOverloadDetector`
+  - [x] `should_shed(priority: RequestPriority) -> bool`
+  - [x] `classify_request(message_type: str) -> RequestPriority`
+  - [x] Shed thresholds: healthy=none, busy=LOW, stressed=NORMAL+LOW, overloaded=all except CRITICAL
+- [x] Integrate load shedder with gate request handlers
+- [x] Integrate load shedder with manager request handlers
+- [x] Add metrics for shed request counts
+- [x] Add integration tests for load shedding
 
 ### 3.2 AD-23: Backpressure for Stats Updates
 
