@@ -13,7 +13,6 @@ from typing import (
 import networkx
 
 from hyperscale.core.engines.client.time_parser import TimeParser
-from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models import InstanceRoleType, WorkflowStatusUpdate
@@ -129,6 +128,13 @@ class RemoteGraphManager:
         self._logger = Logger()
         self._status_lock: asyncio.Lock | None = None
 
+        # Dependency tracking: workflow_name -> set of dependency workflow names
+        self._workflow_dependencies: Dict[str, set[str]] = {}
+        # Track completed workflows per run_id
+        self._completed_workflows: Dict[int, set[str]] = {}
+        # Track failed workflows per run_id
+        self._failed_workflows: Dict[int, set[str]] = {}
+
     async def start(
         self,
         host: str,
@@ -219,8 +225,24 @@ class RemoteGraphManager:
     async def execute_graph(
         self,
         test_name: str,
-        workflows: List[Workflow | DependentWorkflow],
+        workflows: List[
+            tuple[list[str], Workflow],
+        ],
     ) -> RunResults:
+        """
+        Execute a graph of workflows respecting dependencies.
+
+        Uses an iterative approach where we repeatedly find workflows whose
+        ALL dependencies have completed successfully, execute them in parallel,
+        and repeat until no more workflows can be executed.
+
+        A workflow only executes if ALL its dependencies have completed
+        successfully. If any dependency failed, the dependent workflow is
+        skipped (failure propagates transitively).
+
+        This mirrors worker execution semantics where dependent workflows
+        cannot execute until all dependencies have successfully completed.
+        """
         graph_slug = test_name.lower()
 
         self._logger.configure(
@@ -231,7 +253,7 @@ class RemoteGraphManager:
                 "debug": (
                     GraphDebug,
                     {
-                        "workflows": [workflow.name for workflow in workflows],
+                        "workflows": [workflow.name for _, workflow in workflows],
                         "workers": self._workers,
                         "graph": test_name,
                     },
@@ -241,6 +263,10 @@ class RemoteGraphManager:
 
         run_id = self._controller.id_generator.generate()
 
+        # Initialize tracking for this run
+        self._completed_workflows[run_id] = set()
+        self._failed_workflows[run_id] = set()
+
         async with self._logger.context(name=f"{graph_slug}_logger") as ctx:
             await ctx.log_prepared(
                 message=f"Graph {test_name} assigned run id {run_id}", name="debug"
@@ -248,14 +274,50 @@ class RemoteGraphManager:
 
             self._controller.create_run_contexts(run_id)
 
+            # Build the workflow graph - returns layers in dependency order
             workflow_traversal_order = self._create_workflow_graph(workflows)
 
             workflow_results: Dict[str, List[WorkflowResultsSet]] = defaultdict(list)
-
             timeouts: dict[str, Exception] = {}
+            skipped: dict[str, str] = {}  # workflow_name -> reason for skipping
 
+            # Execute workflows layer by layer (BFS order ensures dependencies run first)
             for workflow_set in workflow_traversal_order:
-                provisioned_batch, workflow_vus = self._provision(workflow_set)
+                # Filter out workflows whose dependencies failed
+                eligible_workflows: Dict[str, Workflow] = {}
+                for workflow_name, workflow in workflow_set.items():
+                    dependencies = self._workflow_dependencies.get(workflow_name, [])
+
+                    # Check if any dependencies failed
+                    failed_deps = [
+                        dep for dep in dependencies
+                        if dep in self._failed_workflows[run_id]
+                    ]
+                    if failed_deps:
+                        # Skip this workflow - one or more dependencies failed
+                        failed_dep_names = ", ".join(sorted(failed_deps))
+                        skip_reason = f"Dependencies failed: {failed_dep_names}"
+                        skipped[workflow_name] = skip_reason
+                        self._failed_workflows[run_id].add(workflow_name)
+
+                        await ctx.log(
+                            GraphDebug(
+                                message=f"Skipping workflow {workflow_name}: {skip_reason}",
+                                workflows=[workflow_name],
+                                workers=self._threads,
+                                graph=test_name,
+                                level=LogLevel.DEBUG,
+                            )
+                        )
+                        continue
+
+                    eligible_workflows[workflow_name] = workflow
+
+                if not eligible_workflows:
+                    # All workflows in this layer were skipped
+                    continue
+
+                provisioned_batch, workflow_vus = self._provision(eligible_workflows)
 
                 batch_workflows = [
                     workflow_name
@@ -287,7 +349,7 @@ class RemoteGraphManager:
                     *[
                         self._run_workflow(
                             run_id,
-                            workflow_set[workflow_name],
+                            eligible_workflows[workflow_name],
                             threads,
                             workflow_vus[workflow_name],
                         )
@@ -306,25 +368,30 @@ class RemoteGraphManager:
                     )
                 )
 
-                workflow_results.update(
-                    {
-                        workflow_name: results
-                        for workflow_name, results, _, timeout_error in results
-                        if timeout_error is None
-                    }
-                )
-
-                for workflow_name, _, _, timeout_error in results:
-                    timeouts[workflow_name] = timeout_error
+                # Process results and track completion/failure status
+                for workflow_name, workflow_result, _, timeout_error in results:
+                    if timeout_error is None:
+                        # Workflow completed successfully
+                        workflow_results[workflow_name] = workflow_result
+                        self._completed_workflows[run_id].add(workflow_name)
+                    else:
+                        # Workflow failed (timeout or error)
+                        timeouts[workflow_name] = timeout_error
+                        self._failed_workflows[run_id].add(workflow_name)
 
             await ctx.log_prepared(
                 message=f"Graph {test_name} completed execution", name="debug"
             )
 
+            # Cleanup tracking data for this run
+            self._completed_workflows.pop(run_id, None)
+            self._failed_workflows.pop(run_id, None)
+
             return {
                 "test": test_name,
                 "results": workflow_results,
                 "timeouts": timeouts,
+                "skipped": skipped,
             }
         
     async def execute_workflow(
@@ -427,10 +494,23 @@ class RemoteGraphManager:
             self._workflow_statuses[run_id][workflow].append(status)
             self._status_lock.release()
 
-    def _create_workflow_graph(self, workflows: List[Workflow | DependentWorkflow]):
-        workflow_graph = networkx.DiGraph()
+    def _create_workflow_graph(self, workflows: List[
+        tuple[list[str], Workflow]
+    ]):
+        """
+        Create workflow dependency graph and return traversal order.
 
-        workflow_dependencies: Dict[str, List[str]] = {}
+        Builds a directed acyclic graph (DAG) where edges represent dependencies.
+        Returns workflows grouped by BFS layer - all workflows in a layer can
+        execute in parallel once their dependencies are satisfied.
+
+        Also populates self._workflow_dependencies for runtime dependency checking.
+        """
+        # Clear previous run's workflows
+        self._workflows.clear()
+        self._workflow_dependencies.clear()
+
+        workflow_graph = networkx.DiGraph()
 
         sources = []
 
@@ -440,28 +520,25 @@ class RemoteGraphManager:
                 Workflow,
             ]
         ] = []
-
-        for workflow in workflows:
+        
+        for dependencies, workflow in workflows:
             if (
-                isinstance(workflow, DependentWorkflow)
-                and len(workflow.dependencies) > 0
+                len(dependencies) > 0
             ):
-                dependent_workflow = workflow.dependent_workflow
-                workflow_dependencies[dependent_workflow.name] = workflow.dependencies
-
-                self._workflows[dependent_workflow.name] = dependent_workflow
-
-                workflow_graph.add_node(dependent_workflow.name)
-
-            else:
                 self._workflows[workflow.name] = workflow
-                sources.append(workflow.name)
-
+                self._workflow_dependencies[workflow.name] = dependencies
                 workflow_graph.add_node(workflow.name)
 
-        for workflow_name, dependencies in workflow_dependencies.items():
-            for dependency in dependencies:
-                workflow_graph.add_edge(dependency, workflow_name)
+            else:
+                sources.append(workflow.name)
+                self._workflows[workflow.name] = workflow
+                workflow_graph.add_node(workflow.name)
+
+        for dependent, deps in self._workflow_dependencies.items():
+            for dependency in deps:
+                workflow_graph.add_edge(dependency, dependent)
+
+                
 
         for traversal_layer in networkx.bfs_layers(workflow_graph, sources):
             workflow_traversal_order.append(
