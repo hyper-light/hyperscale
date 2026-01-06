@@ -1,8 +1,9 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 from hyperscale.core.graph.workflow import Workflow
+from hyperscale.core.jobs.workers.stage_priority import StagePriority
 
 
 @dataclass(slots=True)
@@ -12,12 +13,16 @@ class PendingWorkflowRun:
     workflow: Workflow
     dependencies: set[str]
     completed_dependencies: set[str]
-    threads: int
-    workflow_vus: List[int]
+    vus: int
+    priority: StagePriority
+    is_test: bool
     ready_event: asyncio.Event
     dispatched: bool
     completed: bool
     failed: bool
+    # Allocated at dispatch time (not upfront)
+    allocated_cores: int = 0
+    allocated_vus: List[int] = field(default_factory=list)
 
     def is_ready(self) -> bool:
         """Check if all dependencies are satisfied and not yet dispatched."""

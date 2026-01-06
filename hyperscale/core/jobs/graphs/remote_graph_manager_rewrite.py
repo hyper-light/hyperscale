@@ -313,11 +313,11 @@ class RemoteGraphManager:
         workflows: List[tuple[list[str], Workflow]],
     ) -> Dict[str, PendingWorkflowRun]:
         """
-        Create PendingWorkflowRun for each workflow with provisioning.
+        Create PendingWorkflowRun for each workflow.
 
-        Builds the dependency graph, provisions all workflows upfront,
-        and creates tracking objects. Workflows with no dependencies
-        have their ready_event set immediately.
+        Builds the dependency graph and creates tracking objects.
+        Core allocation happens dynamically at dispatch time, not upfront.
+        Workflows with no dependencies have their ready_event set immediately.
         """
         # Clear previous run's state
         self._workflows.clear()
@@ -325,7 +325,6 @@ class RemoteGraphManager:
 
         # Build graph and collect workflow info
         workflow_graph = networkx.DiGraph()
-        sources: List[str] = []
 
         for dependencies, workflow in workflows:
             self._workflows[workflow.name] = workflow
@@ -333,38 +332,32 @@ class RemoteGraphManager:
 
             if len(dependencies) > 0:
                 self._workflow_dependencies[workflow.name] = set(dependencies)
-            else:
-                sources.append(workflow.name)
 
         # Add edges for dependencies
         for dependent, deps in self._workflow_dependencies.items():
             for dependency in deps:
                 workflow_graph.add_edge(dependency, dependent)
 
-        # Provision all workflows upfront
-        provisioned_batch, workflow_vus = self._provision(self._workflows)
+        # Determine which workflows are test workflows
+        workflow_is_test = self._determine_test_workflows(self._workflows)
 
-        # Build threads lookup from provisioned batch
-        workflow_threads: Dict[str, int] = {}
-        for group in provisioned_batch:
-            for workflow_name, _, threads in group:
-                workflow_threads[workflow_name] = threads
-
-        # Create PendingWorkflowRun for each workflow
+        # Create PendingWorkflowRun for each workflow (no core allocation yet)
         pending_workflows: Dict[str, PendingWorkflowRun] = {}
 
         for workflow_name, workflow in self._workflows.items():
             dependencies = self._workflow_dependencies.get(workflow_name, set())
-            threads = workflow_threads.get(workflow_name, self._threads)
-            vus = workflow_vus.get(workflow_name, [workflow.vus])
+            priority = getattr(workflow, 'priority', StagePriority.AUTO)
+            if not isinstance(priority, StagePriority):
+                priority = StagePriority.AUTO
 
             pending = PendingWorkflowRun(
                 workflow_name=workflow_name,
                 workflow=workflow,
                 dependencies=set(dependencies),
                 completed_dependencies=set(),
-                threads=threads,
-                workflow_vus=vus,
+                vus=workflow.vus,
+                priority=priority,
+                is_test=workflow_is_test[workflow_name],
                 ready_event=asyncio.Event(),
                 dispatched=False,
                 completed=False,
@@ -379,6 +372,29 @@ class RemoteGraphManager:
 
         return pending_workflows
 
+    def _determine_test_workflows(
+        self,
+        workflows: Dict[str, Workflow],
+    ) -> Dict[str, bool]:
+        """Determine which workflows are test workflows based on their hooks."""
+        workflow_hooks: Dict[str, Dict[str, Hook]] = {
+            workflow_name: {
+                name: hook
+                for name, hook in inspect.getmembers(
+                    workflow,
+                    predicate=lambda member: isinstance(member, Hook),
+                )
+            }
+            for workflow_name, workflow in workflows.items()
+        }
+
+        return {
+            workflow_name: (
+                len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST]) > 0
+            )
+            for workflow_name, hooks in workflow_hooks.items()
+        }
+
     async def _dispatch_loop(
         self,
         run_id: int,
@@ -389,6 +405,8 @@ class RemoteGraphManager:
         Event-driven dispatch loop for eager execution.
 
         Dispatches workflows as soon as their dependencies complete.
+        Core allocation happens dynamically at dispatch time using
+        partion_by_priority on the currently ready workflows.
         Uses asyncio.wait with FIRST_COMPLETED to react immediately
         to workflow completions.
         """
@@ -411,40 +429,55 @@ class RemoteGraphManager:
                 if all_done:
                     break
 
-                # Dispatch any ready workflows
+                # Get ready workflows (dependencies satisfied, not dispatched)
                 ready_workflows = [
                     pending for pending in pending_workflows.values()
                     if pending.is_ready()
                 ]
 
-                for pending in ready_workflows:
-                    pending.dispatched = True
-                    pending.ready_event.clear()
+                if ready_workflows:
+                    # Dynamically allocate cores for ready workflows
+                    allocations = self._allocate_cores_for_ready_workflows(ready_workflows)
 
-                    await ctx.log(
-                        GraphDebug(
-                            message=f"Graph {test_name} dispatching workflow {pending.workflow_name}",
-                            workflows=[pending.workflow_name],
-                            workers=pending.threads,
-                            graph=test_name,
-                            level=LogLevel.DEBUG,
+                    for pending, cores in allocations:
+                        if cores == 0:
+                            # No cores allocated - skip this workflow for now
+                            # It will be retried next iteration when cores free up
+                            continue
+
+                        pending.dispatched = True
+                        pending.ready_event.clear()
+                        pending.allocated_cores = cores
+
+                        # Calculate VUs per worker
+                        pending.allocated_vus = self._calculate_vus_per_worker(
+                            pending.vus, cores
                         )
-                    )
 
-                    self._updates.update_active_workflows([
-                        pending.workflow_name.lower()
-                    ])
-
-                    # Create task for workflow execution
-                    task = asyncio.create_task(
-                        self._run_workflow(
-                            run_id,
-                            pending.workflow,
-                            pending.threads,
-                            pending.workflow_vus,
+                        await ctx.log(
+                            GraphDebug(
+                                message=f"Graph {test_name} dispatching workflow {pending.workflow_name}",
+                                workflows=[pending.workflow_name],
+                                workers=cores,
+                                graph=test_name,
+                                level=LogLevel.DEBUG,
+                            )
                         )
-                    )
-                    running_tasks[task] = pending.workflow_name
+
+                        self._updates.update_active_workflows([
+                            pending.workflow_name.lower()
+                        ])
+
+                        # Create task for workflow execution
+                        task = asyncio.create_task(
+                            self._run_workflow(
+                                run_id,
+                                pending.workflow,
+                                cores,
+                                pending.allocated_vus,
+                            )
+                        )
+                        running_tasks[task] = pending.workflow_name
 
                 # If no tasks running and no ready workflows, we're stuck
                 # (circular dependency or all remaining workflows have failed deps)
@@ -484,7 +517,7 @@ class RemoteGraphManager:
                                 GraphDebug(
                                     message=f"Graph {test_name} workflow {workflow_name} completed successfully",
                                     workflows=[workflow_name],
-                                    workers=pending.threads,
+                                    workers=pending.allocated_cores,
                                     graph=test_name,
                                     level=LogLevel.DEBUG,
                                 )
@@ -506,7 +539,7 @@ class RemoteGraphManager:
                                 GraphDebug(
                                     message=f"Graph {test_name} workflow {workflow_name} timed out",
                                     workflows=[workflow_name],
-                                    workers=pending.threads,
+                                    workers=pending.allocated_cores,
                                     graph=test_name,
                                     level=LogLevel.DEBUG,
                                 )
@@ -532,7 +565,7 @@ class RemoteGraphManager:
                             GraphDebug(
                                 message=f"Graph {test_name} workflow {workflow_name} failed with error: {err}",
                                 workflows=[workflow_name],
-                                workers=pending.threads,
+                                workers=pending.allocated_cores,
                                 graph=test_name,
                                 level=LogLevel.DEBUG,
                             )
@@ -549,6 +582,61 @@ class RemoteGraphManager:
                             skipped[dep_name] = f"Dependency failed: {workflow_name}"
 
         return workflow_results, timeouts, skipped
+
+    def _allocate_cores_for_ready_workflows(
+        self,
+        ready_workflows: List[PendingWorkflowRun],
+    ) -> List[Tuple[PendingWorkflowRun, int]]:
+        """
+        Dynamically allocate cores for ready workflows.
+
+        Uses partion_by_priority to allocate cores based on priority and VUs.
+        Returns list of (pending_workflow, allocated_cores) tuples.
+        """
+        # Build configs for the provisioner
+        configs = [
+            {
+                "workflow_name": pending.workflow_name,
+                "priority": pending.priority,
+                "is_test": pending.is_test,
+                "vus": pending.vus,
+            }
+            for pending in ready_workflows
+        ]
+
+        # Get allocations from provisioner
+        batches = self._provisioner.partion_by_priority(configs)
+
+        # Build lookup from workflow_name -> cores
+        allocation_lookup: Dict[str, int] = {}
+        for batch in batches:
+            for workflow_name, _, cores in batch:
+                allocation_lookup[workflow_name] = cores
+
+        # Return allocations paired with pending workflows
+        return [
+            (pending, allocation_lookup.get(pending.workflow_name, 0))
+            for pending in ready_workflows
+        ]
+
+    def _calculate_vus_per_worker(
+        self,
+        total_vus: int,
+        cores: int,
+    ) -> List[int]:
+        """Calculate VUs distribution across workers."""
+        if cores <= 0:
+            return []
+
+        vus_per_core = total_vus // cores
+        remainder = total_vus % cores
+
+        # Distribute VUs evenly, with remainder going to first workers
+        vus_list = [vus_per_core for _ in range(cores)]
+        for index in range(remainder):
+            vus_list[index] += 1
+
+        return vus_list
 
     def _mark_workflow_completed(
         self,
