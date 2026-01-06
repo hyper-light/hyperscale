@@ -188,7 +188,11 @@ class GateServer(HealthAwareServer):
         # Lease management for at-most-once
         self._leases: dict[str, DatacenterLease] = {}  # job_id:dc -> lease
         self._fence_token = 0
-        
+
+        # Per-job fence token tracking for rejecting stale updates
+        # job_id -> highest fence_token seen for this job
+        self._job_fence_tokens: dict[str, int] = {}
+
         # State versioning (local gate state version)
         self._state_version = 0
         
@@ -1921,7 +1925,12 @@ class GateServer(HealthAwareServer):
                 
                 for job_id in jobs_to_remove:
                     self._jobs.pop(job_id, None)
-                    # Also clean up any leases for this job
+                    # Also clean up related tracking dicts
+                    self._job_fence_tokens.pop(job_id, None)
+                    self._job_dc_results.pop(job_id, None)
+                    self._job_target_dcs.pop(job_id, None)
+                    self._job_callbacks.pop(job_id, None)
+                    # Clean up any leases for this job
                     lease_keys_to_remove = [
                         key for key in self._leases
                         if key.startswith(f"{job_id}:")
@@ -2576,18 +2585,46 @@ class GateServer(HealthAwareServer):
     ):
         """
         Handle job progress update from manager.
-        
+
         Uses tiered update strategy (AD-15):
         - Tier 1 (Immediate): Critical state changes → push immediately
         - Tier 2 (Periodic): Regular progress → batched
+
+        Validates fence tokens to reject stale updates from old job owners.
         """
         try:
             progress = JobProgress.load(data)
-            
+
+            # Validate fence token - reject stale updates
+            current_fence = self._job_fence_tokens.get(progress.job_id, 0)
+            if progress.fence_token < current_fence:
+                # Stale update from old owner - reject silently
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"Rejecting stale job progress for {progress.job_id}: "
+                                f"fence_token {progress.fence_token} < {current_fence}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                # Still return ack to avoid retries
+                ack = JobProgressAck(
+                    gate_id=self._node_id.full,
+                    is_leader=self.is_leader(),
+                    healthy_gates=self._get_healthy_gates(),
+                )
+                return ack.dump()
+
+            # Update fence token if higher
+            if progress.fence_token > current_fence:
+                self._job_fence_tokens[progress.job_id] = progress.fence_token
+
             job = self._jobs.get(progress.job_id)
             if job:
                 old_status = job.status
-                
+
                 # Update DC progress
                 for i, dc_prog in enumerate(job.datacenters):
                     if dc_prog.datacenter == progress.datacenter:
@@ -2595,13 +2632,13 @@ class GateServer(HealthAwareServer):
                         break
                 else:
                     job.datacenters.append(progress)
-                
+
                 # Recalculate aggregates
                 job.total_completed = sum(p.total_completed for p in job.datacenters)
                 job.total_failed = sum(p.total_failed for p in job.datacenters)
                 job.overall_rate = sum(p.overall_rate for p in job.datacenters)
                 job.timestamp = time.monotonic()
-                
+
                 # Check if all DCs are done to update job status
                 completed_dcs = sum(
                     1 for p in job.datacenters
@@ -2618,7 +2655,7 @@ class GateServer(HealthAwareServer):
                         job.status = JobStatus.COMPLETED.value
                     job.completed_datacenters = len(job.datacenters) - failed_dcs
                     job.failed_datacenters = failed_dcs
-                
+
                 # Route through tiered update strategy
                 self._handle_update_by_tier(
                     progress.job_id,
@@ -2626,9 +2663,9 @@ class GateServer(HealthAwareServer):
                     job.status,
                     data,
                 )
-                
+
                 self._increment_version()
-            
+
             # Return ack with current gate topology for manager to update
             ack = JobProgressAck(
                 gate_id=self._node_id.full,
@@ -2636,7 +2673,7 @@ class GateServer(HealthAwareServer):
                 healthy_gates=self._get_healthy_gates(),
             )
             return ack.dump()
-            
+
         except Exception as e:
             await self.handle_exception(e, "receive_job_progress")
             return b'error'
@@ -2826,12 +2863,33 @@ class GateServer(HealthAwareServer):
     ):
         """
         Handle final result from a manager for a datacenter.
-        
+
         Aggregates results from all DCs and sends GlobalJobResult to client.
+        Validates fence tokens to reject stale results from old job owners.
         """
         try:
             result = JobFinalResult.load(data)
-            
+
+            # Validate fence token - reject stale results
+            current_fence = self._job_fence_tokens.get(result.job_id, 0)
+            if result.fence_token < current_fence:
+                # Stale result from old owner - reject silently
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"Rejecting stale job final result for {result.job_id}: "
+                                f"fence_token {result.fence_token} < {current_fence}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                return b'ok'  # Ack to avoid retries
+
+            # Update fence token if higher
+            if result.fence_token > current_fence:
+                self._job_fence_tokens[result.job_id] = result.fence_token
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerDebug(
@@ -2841,22 +2899,22 @@ class GateServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            
+
             # Store per-DC result
             if result.job_id not in self._job_dc_results:
                 self._job_dc_results[result.job_id] = {}
             self._job_dc_results[result.job_id][result.datacenter] = result
-            
+
             # Check if we have results from all target DCs
             target_dcs = self._job_target_dcs.get(result.job_id, set())
             received_dcs = set(self._job_dc_results.get(result.job_id, {}).keys())
-            
+
             if target_dcs and received_dcs >= target_dcs:
                 # All DCs reported - aggregate and send to client
                 await self._send_global_job_result(result.job_id)
-            
+
             return b'ok'
-            
+
         except Exception as e:
             await self.handle_exception(e, "job_final_result")
             return b'error'
