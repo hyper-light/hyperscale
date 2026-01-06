@@ -1170,9 +1170,9 @@ class TestHighDriftEscalation:
             absolute_bounds=(300.0, 500.0, 800.0),
             delta_thresholds=(0.25, 0.5, 1.0),
             drift_threshold=0.15,
-            high_drift_threshold=0.35,
-            ema_alpha=0.1,
-            slow_ema_alpha=0.005,  # Very slow baseline
+            high_drift_threshold=0.25,  # Lower threshold to catch gradual degradation
+            ema_alpha=0.15,  # Faster fast baseline to track rise
+            slow_ema_alpha=0.002,  # Even slower baseline to accumulate drift
             warmup_samples=10,
             hysteresis_samples=1,
             min_samples=3,
@@ -1187,10 +1187,10 @@ class TestHighDriftEscalation:
         initial_baseline = detector.baseline
         initial_slow_baseline = detector.slow_baseline
 
-        # Very slow degradation: 0.1ms per sample over 500 samples (80 -> 130)
-        # This is slow enough that delta detection won't trigger
-        for i in range(500):
-            latency = 80.0 + i * 0.1
+        # Gradual degradation: 0.15ms per sample over 400 samples (80 -> 140)
+        # This simulates slow memory leak or resource exhaustion
+        for i in range(400):
+            latency = 80.0 + i * 0.15
             detector.record_latency(latency)
 
         # Verify significant drift accumulated
@@ -1204,6 +1204,10 @@ class TestHighDriftEscalation:
         assert detector.slow_baseline < detector.baseline, \
             f"Slow baseline should be lower than fast baseline"
 
+        # Verify current_avg is above slow_baseline (required for high drift escalation)
+        assert detector.current_average > detector.slow_baseline, \
+            f"Current avg ({detector.current_average}) should be above slow baseline ({detector.slow_baseline})"
+
         # Check final state - should detect the degradation via high drift
         state = detector.get_state()
 
@@ -1211,3 +1215,151 @@ class TestHighDriftEscalation:
         from hyperscale.distributed_rewrite.reliability.overload import _STATE_ORDER
         assert _STATE_ORDER[state] >= _STATE_ORDER[OverloadState.BUSY], \
             f"Expected at least BUSY, got {state}, drift={final_drift}"
+
+    def test_oscillating_load_does_not_trigger_high_drift(self):
+        """Oscillating load should NOT trigger high drift escalation.
+
+        When load oscillates between low and high values, the baselines will have
+        "memory" of the high values, creating positive drift. But if current values
+        are actually healthy (below slow baseline), we should NOT escalate.
+
+        This prevents false positives in systems with bursty but healthy load patterns.
+        """
+        config = OverloadConfig(
+            absolute_bounds=(100.0, 200.0, 500.0),
+            delta_thresholds=(0.3, 0.6, 1.0),
+            drift_threshold=0.15,
+            high_drift_threshold=0.30,
+            ema_alpha=0.1,
+            slow_ema_alpha=0.02,
+            min_samples=1,
+            current_window=3,
+            warmup_samples=5,
+            hysteresis_samples=1,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Oscillate between healthy and overloaded values
+        for _ in range(10):
+            # Push to healthy
+            for _ in range(3):
+                detector.record_latency(50.0)
+
+            # Push to overloaded
+            for _ in range(3):
+                detector.record_latency(1000.0)
+
+        # Now check state when at healthy values
+        for _ in range(3):
+            detector.record_latency(50.0)
+
+        # Should have positive drift (fast > slow due to recent high values)
+        assert detector.baseline_drift > 0.30, \
+            f"Expected drift > 0.30 from oscillation, got {detector.baseline_drift}"
+
+        # But current_avg should be below slow_baseline
+        assert detector.current_average < detector.slow_baseline, \
+            f"Current avg ({detector.current_average}) should be below slow baseline ({detector.slow_baseline})"
+
+        # Therefore, should stay HEALTHY despite high drift
+        state = detector.get_state()
+        assert state == OverloadState.HEALTHY, \
+            f"Expected HEALTHY (oscillating load), got {state}, drift={detector.baseline_drift}"
+
+    def test_high_drift_requires_elevated_current_values(self):
+        """High drift escalation requires current_avg > slow_baseline.
+
+        This is the key condition that distinguishes:
+        - Boiled frog: gradual rise where current values ARE elevated
+        - Oscillation: bursty load where current values are healthy
+
+        The condition current_avg > slow_baseline ensures we only escalate
+        when the system is ACTUALLY operating at elevated levels relative to
+        its original baseline.
+        """
+        config = OverloadConfig(
+            absolute_bounds=(500.0, 1000.0, 2000.0),
+            delta_thresholds=(0.3, 0.6, 1.0),
+            drift_threshold=0.15,
+            high_drift_threshold=0.25,
+            ema_alpha=0.15,
+            slow_ema_alpha=0.01,
+            warmup_samples=10,
+            hysteresis_samples=1,
+            min_samples=3,
+            current_window=5,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Establish baseline at 100ms
+        for _ in range(20):
+            detector.record_latency(100.0)
+
+        # Gradual rise - this creates both drift AND elevated current values
+        for i in range(200):
+            detector.record_latency(100.0 + i * 0.6)
+
+        # Verify all conditions for high drift escalation are met:
+        # 1. Drift exceeds high_drift_threshold
+        assert detector.baseline_drift > config.high_drift_threshold, \
+            f"Drift ({detector.baseline_drift}) should exceed threshold ({config.high_drift_threshold})"
+
+        # 2. Current avg is above slow baseline (system is actually degraded)
+        assert detector.current_average > detector.slow_baseline, \
+            f"Current avg ({detector.current_average}) should be above slow baseline ({detector.slow_baseline})"
+
+        # 3. Delta detection returns HEALTHY (fast baseline tracked the rise)
+        diag = detector.get_diagnostics()
+        assert diag["delta_state"] == "healthy", \
+            f"Delta state should be healthy (fast baseline adapted), got {diag['delta_state']}"
+
+        # Result: Should escalate to BUSY via high drift
+        state = detector.get_state()
+        assert state == OverloadState.BUSY, \
+            f"Expected BUSY from high drift escalation, got {state}"
+
+    def test_recovery_from_high_drift_when_current_drops(self):
+        """System should recover when current values drop below slow baseline.
+
+        Even if drift is still positive (baselines haven't converged yet),
+        if current_avg drops below slow_baseline, we should return to HEALTHY.
+        """
+        config = OverloadConfig(
+            absolute_bounds=(500.0, 1000.0, 2000.0),
+            delta_thresholds=(0.3, 0.6, 1.0),
+            drift_threshold=0.15,
+            high_drift_threshold=0.25,
+            ema_alpha=0.15,
+            slow_ema_alpha=0.01,
+            warmup_samples=10,
+            hysteresis_samples=1,
+            min_samples=3,
+            current_window=5,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Establish baseline and create drift
+        for _ in range(20):
+            detector.record_latency(100.0)
+
+        for i in range(150):
+            detector.record_latency(100.0 + i * 0.6)
+
+        # Verify we're in BUSY due to high drift
+        state1 = detector.get_state()
+        assert state1 == OverloadState.BUSY, \
+            f"Should be BUSY from high drift, got {state1}"
+
+        # Now recover - drop current values below slow baseline
+        # Record many low values to push current_avg down
+        for _ in range(20):
+            detector.record_latency(80.0)
+
+        # Current avg should now be below slow baseline
+        assert detector.current_average < detector.slow_baseline, \
+            f"Current avg ({detector.current_average}) should be below slow baseline ({detector.slow_baseline})"
+
+        # Should recover to HEALTHY
+        state2 = detector.get_state()
+        assert state2 == OverloadState.HEALTHY, \
+            f"Should recover to HEALTHY when current drops, got {state2}"

@@ -256,7 +256,14 @@ class HybridOverloadDetector:
         # high_drift_threshold, escalate even from HEALTHY to BUSY. This catches
         # scenarios where latency rises so gradually that delta stays near zero
         # (fast baseline tracks the rise), but the system has significantly degraded.
-        if baseline_drift > self._config.high_drift_threshold and base_state == OverloadState.HEALTHY:
+        # Additional condition: current_avg must be above slow baseline to avoid
+        # false positives from oscillating loads where baselines have "memory" of
+        # past spikes but current values are actually healthy.
+        if (
+            baseline_drift > self._config.high_drift_threshold
+            and base_state == OverloadState.HEALTHY
+            and current_avg > self._slow_baseline_ema
+        ):
             return OverloadState.BUSY
 
         # Baseline drift escalation: if the fast baseline has drifted significantly
