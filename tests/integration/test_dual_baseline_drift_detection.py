@@ -220,12 +220,17 @@ class TestDriftCalculation:
 class TestDriftEscalation:
     """Tests for drift-based state escalation."""
 
-    def test_no_escalation_when_healthy(self):
-        """Drift should NOT escalate from HEALTHY state."""
+    def test_moderate_drift_no_escalation_when_healthy(self):
+        """Moderate drift (below high_drift_threshold) should NOT escalate from HEALTHY.
+
+        Note: With the high_drift_threshold feature, very high drift CAN escalate
+        from HEALTHY to BUSY. This test verifies that moderate drift does not.
+        """
         config = OverloadConfig(
             absolute_bounds=(1000.0, 2000.0, 5000.0),  # Won't trigger
             delta_thresholds=(0.5, 1.0, 2.0),  # Won't trigger with small deltas
-            drift_threshold=0.01,  # Very sensitive
+            drift_threshold=0.01,  # Very sensitive (but only applies to elevated states)
+            high_drift_threshold=0.50,  # Set high to prevent escalation in this test
             warmup_samples=0,
             hysteresis_samples=1,
             min_samples=3,
@@ -237,10 +242,13 @@ class TestDriftEscalation:
         for i in range(20):
             detector.record_latency(50.0 + i)  # 50, 51, 52, ...
 
+        # Verify drift is below high_drift_threshold
+        assert detector.baseline_drift < config.high_drift_threshold
+
         state = detector.get_state()
 
-        # Should not escalate to STRESSED or OVERLOADED from HEALTHY
-        assert state in (OverloadState.HEALTHY, OverloadState.BUSY)
+        # Should stay HEALTHY since drift is below high_drift_threshold
+        assert state == OverloadState.HEALTHY
 
     def test_busy_escalates_to_stressed_with_drift(self):
         """BUSY state escalates to STRESSED when drift exceeds threshold.
@@ -985,3 +993,221 @@ class TestDriftDiagnostics:
 
         diagnostics = detector.get_diagnostics()
         assert diagnostics["in_warmup"] is False
+
+
+# =============================================================================
+# Test High Drift Escalation (Boiled Frog Detection)
+# =============================================================================
+
+
+class TestHighDriftEscalation:
+    """Tests for high drift escalation from HEALTHY to BUSY.
+
+    The "boiled frog" scenario: latency rises so gradually that delta stays
+    near zero (because fast baseline tracks the rise), but the system has
+    significantly degraded from its original operating point.
+
+    The high_drift_threshold parameter allows escalation from HEALTHY to BUSY
+    when drift exceeds this threshold, even if delta-based detection shows HEALTHY.
+    """
+
+    def test_high_drift_escalates_healthy_to_busy(self):
+        """Very high drift should escalate HEALTHY to BUSY.
+
+        This tests the "boiled frog" detection where gradual rise keeps delta
+        low but drift accumulates significantly.
+        """
+        config = OverloadConfig(
+            # Absolute bounds won't trigger (values will stay below)
+            absolute_bounds=(500.0, 1000.0, 2000.0),
+            # Delta thresholds won't trigger (fast EMA tracks the rise)
+            delta_thresholds=(0.3, 0.6, 1.0),
+            drift_threshold=0.15,
+            high_drift_threshold=0.25,  # Escalate HEALTHY->BUSY at 25% drift
+            ema_alpha=0.15,
+            slow_ema_alpha=0.01,  # Very slow to accumulate drift
+            warmup_samples=10,
+            hysteresis_samples=1,
+            min_samples=3,
+            current_window=5,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Establish baseline at 100ms
+        for _ in range(20):
+            detector.record_latency(100.0)
+
+        # Gradual rise - slow enough that delta stays low but drift accumulates
+        # Rise from 100 to ~220 over 200 samples (0.6ms per sample)
+        for i in range(200):
+            detector.record_latency(100.0 + i * 0.6)
+
+        # Verify drift exceeds high_drift_threshold
+        assert detector.baseline_drift > config.high_drift_threshold, \
+            f"Expected drift > {config.high_drift_threshold}, got {detector.baseline_drift}"
+
+        # Should be BUSY due to high drift escalation, even though delta is low
+        # and absolute bounds haven't triggered
+        state = detector.get_state()
+        assert state == OverloadState.BUSY, \
+            f"Expected BUSY from high drift escalation, got {state}, drift={detector.baseline_drift}"
+
+    def test_drift_below_high_threshold_stays_healthy(self):
+        """Drift below high_drift_threshold should not escalate from HEALTHY."""
+        config = OverloadConfig(
+            absolute_bounds=(500.0, 1000.0, 2000.0),
+            delta_thresholds=(0.3, 0.6, 1.0),
+            drift_threshold=0.15,
+            high_drift_threshold=0.30,  # Higher threshold
+            ema_alpha=0.15,
+            slow_ema_alpha=0.02,
+            warmup_samples=10,
+            hysteresis_samples=1,
+            min_samples=3,
+            current_window=5,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Establish baseline
+        for _ in range(20):
+            detector.record_latency(100.0)
+
+        # Moderate rise that creates drift below high_drift_threshold
+        for i in range(50):
+            detector.record_latency(100.0 + i * 0.3)  # Slow rise
+
+        # Verify drift is below high_drift_threshold
+        assert detector.baseline_drift < config.high_drift_threshold, \
+            f"Expected drift < {config.high_drift_threshold}, got {detector.baseline_drift}"
+
+        # Should stay HEALTHY since drift is below high threshold
+        state = detector.get_state()
+        assert state == OverloadState.HEALTHY, \
+            f"Expected HEALTHY, got {state}, drift={detector.baseline_drift}"
+
+    def test_high_drift_threshold_disabled_with_high_value(self):
+        """Setting high_drift_threshold very high effectively disables it."""
+        config = OverloadConfig(
+            absolute_bounds=(500.0, 1000.0, 2000.0),
+            delta_thresholds=(0.3, 0.6, 1.0),
+            drift_threshold=0.15,
+            high_drift_threshold=100.0,  # Effectively disabled
+            ema_alpha=0.15,
+            slow_ema_alpha=0.01,
+            warmup_samples=10,
+            hysteresis_samples=1,
+            min_samples=3,
+            current_window=5,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Establish baseline
+        for _ in range(20):
+            detector.record_latency(100.0)
+
+        # Create significant drift
+        for i in range(200):
+            detector.record_latency(100.0 + i * 0.8)
+
+        # Even with high drift, should stay HEALTHY if high_drift_threshold is disabled
+        # (unless absolute bounds or delta trigger)
+        diagnostics = detector.get_diagnostics()
+        delta_state = diagnostics["delta_state"]
+        absolute_state = diagnostics["absolute_state"]
+
+        # If neither delta nor absolute triggered, should be HEALTHY
+        if delta_state == "healthy" and absolute_state == "healthy":
+            state = detector.get_state()
+            assert state == OverloadState.HEALTHY
+
+    def test_high_drift_only_applies_to_healthy_base_state(self):
+        """High drift escalation only applies when base state is HEALTHY.
+
+        If base state is already BUSY or higher, the regular drift escalation
+        applies, not the high_drift_threshold.
+        """
+        config = OverloadConfig(
+            absolute_bounds=(500.0, 1000.0, 2000.0),
+            # Delta thresholds set so we get BUSY at 30% delta
+            delta_thresholds=(0.25, 0.6, 1.0),
+            drift_threshold=0.15,
+            high_drift_threshold=0.30,
+            ema_alpha=0.15,
+            slow_ema_alpha=0.01,
+            warmup_samples=10,
+            hysteresis_samples=1,
+            min_samples=3,
+            current_window=5,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Establish baseline
+        for _ in range(20):
+            detector.record_latency(100.0)
+
+        # Create both high delta and high drift
+        for i in range(100):
+            detector.record_latency(100.0 + i * 2)  # Rise to 300
+
+        diagnostics = detector.get_diagnostics()
+
+        # If delta puts us at BUSY (not HEALTHY), drift escalation should
+        # potentially escalate to STRESSED, not just BUSY
+        if diagnostics["delta"] > config.delta_thresholds[0]:
+            state = detector.get_state()
+            # Should be at least BUSY, possibly STRESSED due to drift escalation
+            from hyperscale.distributed_rewrite.reliability.overload import _STATE_ORDER
+            assert _STATE_ORDER[state] >= _STATE_ORDER[OverloadState.BUSY]
+
+    def test_boiled_frog_real_world_scenario(self):
+        """Real-world boiled frog: gradual degradation over many samples.
+
+        Simulates a memory leak or resource exhaustion that slowly degrades
+        performance over time, where each individual measurement looks OK
+        relative to recent history.
+        """
+        config = OverloadConfig(
+            absolute_bounds=(300.0, 500.0, 800.0),
+            delta_thresholds=(0.25, 0.5, 1.0),
+            drift_threshold=0.15,
+            high_drift_threshold=0.35,
+            ema_alpha=0.1,
+            slow_ema_alpha=0.005,  # Very slow baseline
+            warmup_samples=10,
+            hysteresis_samples=1,
+            min_samples=3,
+            current_window=10,
+        )
+        detector = HybridOverloadDetector(config)
+
+        # Establish stable baseline at 80ms for a long time
+        for _ in range(100):
+            detector.record_latency(80.0)
+
+        initial_baseline = detector.baseline
+        initial_slow_baseline = detector.slow_baseline
+
+        # Very slow degradation: 0.1ms per sample over 500 samples (80 -> 130)
+        # This is slow enough that delta detection won't trigger
+        for i in range(500):
+            latency = 80.0 + i * 0.1
+            detector.record_latency(latency)
+
+        # Verify significant drift accumulated
+        final_drift = detector.baseline_drift
+
+        # The fast baseline should have moved significantly from initial
+        assert detector.baseline > initial_baseline + 30.0, \
+            f"Fast baseline should have risen significantly"
+
+        # Slow baseline should have moved less
+        assert detector.slow_baseline < detector.baseline, \
+            f"Slow baseline should be lower than fast baseline"
+
+        # Check final state - should detect the degradation via high drift
+        state = detector.get_state()
+
+        # Should be at least BUSY (via high drift) or higher (via absolute bounds)
+        from hyperscale.distributed_rewrite.reliability.overload import _STATE_ORDER
+        assert _STATE_ORDER[state] >= _STATE_ORDER[OverloadState.BUSY], \
+            f"Expected at least BUSY, got {state}, drift={final_drift}"

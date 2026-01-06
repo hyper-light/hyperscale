@@ -71,6 +71,13 @@ class OverloadConfig:
     # Drift = (fast_ema - slow_ema) / slow_ema
     drift_threshold: float = 0.15  # 15% drift triggers escalation
 
+    # High drift threshold - if drift exceeds this, escalate even from HEALTHY to BUSY
+    # This catches the "boiled frog" scenario where latency rises so gradually that
+    # delta stays near zero (because fast baseline tracks the rise), but the system
+    # has significantly degraded from its original operating point.
+    # Set to 2x drift_threshold by default. Set to a very high value to disable.
+    high_drift_threshold: float = 0.30  # 30% drift triggers HEALTHY -> BUSY
+
     # Minimum samples before delta detection is active
     min_samples: int = 3
 
@@ -244,6 +251,13 @@ class HybridOverloadDetector:
             base_state = OverloadState.BUSY
         else:
             base_state = OverloadState.HEALTHY
+
+        # High drift escalation ("boiled frog" detection): if drift exceeds
+        # high_drift_threshold, escalate even from HEALTHY to BUSY. This catches
+        # scenarios where latency rises so gradually that delta stays near zero
+        # (fast baseline tracks the rise), but the system has significantly degraded.
+        if baseline_drift > self._config.high_drift_threshold and base_state == OverloadState.HEALTHY:
+            return OverloadState.BUSY
 
         # Baseline drift escalation: if the fast baseline has drifted significantly
         # above the slow baseline, escalate the state. This catches gradual degradation
