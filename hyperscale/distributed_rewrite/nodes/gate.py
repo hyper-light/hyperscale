@@ -1232,13 +1232,29 @@ class GateServer(HealthAwareServer):
     # Rate Limiting (AD-24)
     # =========================================================================
 
-    def _check_rate_limit(
+    async def _check_rate_limit(self, addr: tuple[str, int]) -> bool:
+        """
+        Check if a sender is within rate limits.
+
+        Overrides base class to use ServerRateLimiter which provides
+        per-client per-operation rate limiting with configurable limits.
+
+        Args:
+            addr: Source address tuple (host, port)
+
+        Returns:
+            True if allowed, False if rate limited
+        """
+        # Use the .check() compatibility method on ServerRateLimiter
+        return self._rate_limiter.check(addr)
+
+    def _check_rate_limit_for_operation(
         self,
         client_id: str,
         operation: str,
     ) -> tuple[bool, float]:
         """
-        Check if a client request is within rate limits.
+        Check if a client request is within rate limits for a specific operation.
 
         Args:
             client_id: Client identifier (e.g., from address or auth)
@@ -2718,7 +2734,7 @@ class GateServer(HealthAwareServer):
         try:
             # Check rate limit first (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "job_submit")
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "job_submit")
             if not allowed:
                 return RateLimitResponse(
                     operation="job_submit",
@@ -2986,7 +3002,7 @@ class GateServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "job_status")
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "job_status")
             if not allowed:
                 return RateLimitResponse(
                     operation="job_status",
@@ -3165,7 +3181,7 @@ class GateServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "cancel")
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "cancel")
             if not allowed:
                 return RateLimitResponse(
                     operation="cancel",
@@ -3903,7 +3919,7 @@ class GateServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24) - using reconnect limits
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "reconnect")
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "reconnect")
             if not allowed:
                 return RateLimitResponse(
                     operation="reconnect",
@@ -3973,7 +3989,7 @@ class GateServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "workflow_query")
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "workflow_query")
             if not allowed:
                 return RateLimitResponse(
                     operation="workflow_query",

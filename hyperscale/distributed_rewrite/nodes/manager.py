@@ -2448,9 +2448,25 @@ class ManagerServer(HealthAwareServer):
     # Rate Limiting (AD-24)
     # =========================================================================
 
-    def _check_rate_limit(self, client_id: str, operation: str) -> tuple[bool, float]:
+    async def _check_rate_limit(self, addr: tuple[str, int]) -> bool:
         """
-        Check if a client request is within rate limits.
+        Check if a sender is within rate limits.
+
+        Overrides base class to use ServerRateLimiter which provides
+        per-client per-operation rate limiting with configurable limits.
+
+        Args:
+            addr: Source address tuple (host, port)
+
+        Returns:
+            True if allowed, False if rate limited
+        """
+        # Use the .check() compatibility method on ServerRateLimiter
+        return self._rate_limiter.check(addr)
+
+    def _check_rate_limit_for_operation(self, client_id: str, operation: str) -> tuple[bool, float]:
+        """
+        Check if a client request is within rate limits for a specific operation.
 
         Args:
             client_id: Identifier for the client (typically addr as string)
@@ -3679,6 +3695,15 @@ class ManagerServer(HealthAwareServer):
         When another manager discovers us (via seed list or SWIM),
         it sends a registration to establish bidirectional relationship.
         """
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerError(
+                message=f"Received peer registration request from {addr} ({len(data)} bytes)",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
         try:
             registration = ManagerPeerRegistration.load(data)
             peer_info = registration.node
@@ -6263,7 +6288,7 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "job_submit")
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "job_submit")
             if not allowed:
                 return RateLimitResponse(
                     operation="job_submit",
@@ -6622,7 +6647,7 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "cancel")
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "cancel")
             if not allowed:
                 return RateLimitResponse(
                     operation="cancel",
@@ -6890,7 +6915,7 @@ class ManagerServer(HealthAwareServer):
 
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "extension")
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "extension")
             if not allowed:
                 return HealthcheckExtensionResponse(
                     granted=False,
@@ -7289,7 +7314,7 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24) - using reconnect limits
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "reconnect")
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "reconnect")
             if not allowed:
                 return RateLimitResponse(
                     operation="reconnect",
@@ -7373,7 +7398,7 @@ class ManagerServer(HealthAwareServer):
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
-            allowed, retry_after = self._check_rate_limit(client_id, "workflow_query")
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "workflow_query")
             if not allowed:
                 return RateLimitResponse(
                     operation="workflow_query",
