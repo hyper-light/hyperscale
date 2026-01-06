@@ -13,13 +13,11 @@ from hyperscale.core.jobs.protocols.replay_guard import (
     DEFAULT_WINDOW_SIZE,
 )
 
+from hyperscale.distributed_rewrite.reliability import (
+    ServerRateLimiter as ServerRateLimiter,
+)
 from hyperscale.core.jobs.protocols.rate_limiter import (
-    RateLimiter as RateLimiter,
     RateLimitExceeded as RateLimitExceeded,
-    TokenBucket as TokenBucket,
-    DEFAULT_REQUESTS_PER_SECOND,
-    DEFAULT_BURST_SIZE,
-    DEFAULT_MAX_SOURCES,
 )
 
 

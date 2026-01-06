@@ -49,7 +49,8 @@ from .message_limits import (
     validate_decompressed_size,
     MessageSizeError,
 )
-from .rate_limiter import RateLimiter, RateLimitExceeded
+from hyperscale.distributed_rewrite.reliability import ServerRateLimiter
+from .rate_limiter import RateLimitExceeded
 from .replay_guard import ReplayGuard, ReplayError
 from .restricted_unpickler import restricted_loads, SecurityError
 from .udp_socket_protocol import UDPSocketProtocol
@@ -135,11 +136,7 @@ class UDPProtocol(Generic[T, K]):
         )
         
         # Rate limiting (per-source)
-        self._rate_limiter = RateLimiter(
-            requests_per_second=1000,
-            burst_size=100,
-            max_sources=10000,
-        )
+        self._rate_limiter = ServerRateLimiter()
 
     @property
     def nodes(self):

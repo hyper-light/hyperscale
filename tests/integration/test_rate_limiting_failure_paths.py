@@ -676,3 +676,200 @@ class TestRateLimitRecovery:
         # Wait on other operation should be instant
         waited = await limiter.wait_if_needed("other_op")
         assert waited == 0.0
+
+
+class TestServerRateLimiterCheckEdgeCases:
+    """Test edge cases for ServerRateLimiter.check() compatibility method."""
+
+    def test_check_with_port_zero(self) -> None:
+        """Test check() with port 0 (ephemeral port)."""
+        limiter = ServerRateLimiter()
+        addr = ("192.168.1.1", 0)
+
+        result = limiter.check(addr)
+        assert result is True
+        assert "192.168.1.1:0" in limiter._client_buckets
+
+    def test_check_with_high_port(self) -> None:
+        """Test check() with maximum port number."""
+        limiter = ServerRateLimiter()
+        addr = ("192.168.1.1", 65535)
+
+        result = limiter.check(addr)
+        assert result is True
+
+    def test_check_with_empty_host(self) -> None:
+        """Test check() with empty host string."""
+        limiter = ServerRateLimiter()
+        addr = ("", 8080)
+
+        # Should still work - empty string is a valid client_id
+        result = limiter.check(addr)
+        assert result is True
+        assert ":8080" in limiter._client_buckets
+
+    def test_check_rapid_fire_same_address(self) -> None:
+        """Test rapid-fire requests from same address."""
+        config = RateLimitConfig(
+            default_bucket_size=10,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("192.168.1.1", 8080)
+
+        # Fire 20 rapid requests
+        allowed_count = 0
+        for _ in range(20):
+            if limiter.check(addr):
+                allowed_count += 1
+
+        # Should allow first 10, deny rest
+        assert allowed_count == 10
+
+    def test_check_recovery_after_time(self) -> None:
+        """Test that check() allows requests again after time passes."""
+        config = RateLimitConfig(
+            default_bucket_size=2,
+            default_refill_rate=100.0,  # Fast refill for testing
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("192.168.1.1", 8080)
+
+        # Exhaust bucket
+        limiter.check(addr)
+        limiter.check(addr)
+        assert limiter.check(addr) is False
+
+        # Wait for refill
+        import time
+        time.sleep(0.05)
+
+        # Should be allowed again
+        assert limiter.check(addr) is True
+
+    def test_check_with_special_characters_in_host(self) -> None:
+        """Test check() with hostname containing dots and dashes."""
+        limiter = ServerRateLimiter()
+        addr = ("my-server.example-domain.com", 8080)
+
+        result = limiter.check(addr)
+        assert result is True
+        assert "my-server.example-domain.com:8080" in limiter._client_buckets
+
+    def test_check_does_not_interfere_with_other_operations(self) -> None:
+        """Test that check() using 'default' doesn't affect other operations."""
+        config = RateLimitConfig(
+            default_bucket_size=2,
+            default_refill_rate=1.0,
+            operation_limits={"custom_op": (10, 1.0)},
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("192.168.1.1", 8080)
+        client_id = "192.168.1.1:8080"
+
+        # Exhaust default bucket via check()
+        limiter.check(addr)
+        limiter.check(addr)
+        assert limiter.check(addr) is False
+
+        # custom_op should still be available
+        result = limiter.check_rate_limit(client_id, "custom_op")
+        assert result.allowed is True
+
+    def test_check_cleanup_affects_check_clients(self) -> None:
+        """Test that cleanup_inactive_clients() cleans up clients created via check()."""
+        limiter = ServerRateLimiter(inactive_cleanup_seconds=0.05)
+
+        # Create clients via check()
+        for i in range(5):
+            addr = (f"192.168.1.{i}", 8080)
+            limiter.check(addr)
+
+        assert limiter.get_metrics()["active_clients"] == 5
+
+        # Wait for inactivity timeout
+        import time
+        time.sleep(0.1)
+
+        # Cleanup
+        cleaned = limiter.cleanup_inactive_clients()
+        assert cleaned == 5
+        assert limiter.get_metrics()["active_clients"] == 0
+
+    def test_check_reset_client_affects_check_bucket(self) -> None:
+        """Test that reset_client() restores tokens for clients created via check()."""
+        config = RateLimitConfig(
+            default_bucket_size=3,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("192.168.1.1", 8080)
+        client_id = "192.168.1.1:8080"
+
+        # Exhaust via check()
+        limiter.check(addr)
+        limiter.check(addr)
+        limiter.check(addr)
+        assert limiter.check(addr) is False
+
+        # Reset client
+        limiter.reset_client(client_id)
+
+        # Should be able to check again
+        assert limiter.check(addr) is True
+
+    def test_check_exception_message_format(self) -> None:
+        """Test that RateLimitExceeded exception has correct message format."""
+        from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
+
+        config = RateLimitConfig(
+            default_bucket_size=1,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("10.20.30.40", 12345)
+
+        # Exhaust
+        limiter.check(addr)
+
+        # Get exception
+        try:
+            limiter.check(addr, raise_on_limit=True)
+            assert False, "Should have raised"
+        except RateLimitExceeded as exc:
+            # Verify message contains host:port format
+            assert "10.20.30.40" in str(exc)
+            assert "12345" in str(exc)
+
+    def test_check_multiple_concurrent_addresses(self) -> None:
+        """Test check() with many different addresses concurrently."""
+        config = RateLimitConfig(
+            default_bucket_size=5,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+
+        # Create many addresses
+        for i in range(100):
+            addr = (f"10.0.0.{i}", 8080 + i)
+            # Each should be allowed since they're separate buckets
+            assert limiter.check(addr) is True
+
+        # Verify all clients tracked
+        assert limiter.get_metrics()["active_clients"] == 100
+
+    def test_check_returns_false_not_none(self) -> None:
+        """Test that check() returns False (not None) when rate limited."""
+        config = RateLimitConfig(
+            default_bucket_size=1,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("192.168.1.1", 8080)
+
+        limiter.check(addr)
+        result = limiter.check(addr)
+
+        # Must be exactly False, not falsy
+        assert result is False
+        assert result is not None

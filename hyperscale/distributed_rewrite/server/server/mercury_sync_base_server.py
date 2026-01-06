@@ -41,7 +41,6 @@ from hyperscale.distributed_rewrite.server.protocol import (
     MercurySyncTCPProtocol,
     MercurySyncUDPProtocol,
     ReplayGuard,
-    RateLimiter,
     validate_message_size,
     parse_address,
     AddressValidationError,
@@ -50,6 +49,7 @@ from hyperscale.distributed_rewrite.server.protocol import (
     frame_message,
     DropCounter,
 )
+from hyperscale.distributed_rewrite.reliability import ServerRateLimiter
 from hyperscale.distributed_rewrite.server.events import LamportClock
 from hyperscale.distributed_rewrite.server.hooks.task import (
     TaskCall,
@@ -158,7 +158,7 @@ class MercurySyncBaseServer(Generic[T]):
         
         # Security utilities
         self._replay_guard = ReplayGuard()
-        self._rate_limiter = RateLimiter()
+        self._rate_limiter = ServerRateLimiter()
         self._secure_random = secrets.SystemRandom()  # Cryptographically secure RNG
 
         # Drop counters for silent drop monitoring
@@ -966,7 +966,7 @@ class MercurySyncBaseServer(Generic[T]):
         # print(f"DEBUG read_client_tcp: received {len(data)} bytes")
         self._pending_tcp_server_responses.append(
             asyncio.ensure_future(
-                self.process_tcp_client_resopnse(
+                self.process_tcp_client_response(
                     data,
                     transport,
                 ),
@@ -1060,7 +1060,7 @@ class MercurySyncBaseServer(Generic[T]):
         except Exception:
             self._udp_drop_counter.increment_malformed_message()
 
-    async def process_tcp_client_resopnse(
+    async def process_tcp_client_response(
         self,
         data: bytes,
         transport: asyncio.Transport,
@@ -1131,6 +1131,7 @@ class MercurySyncBaseServer(Generic[T]):
     ):
         # Get client address for rate limiting
         peername = transport.get_extra_info('peername')
+        handler_name = b''
 
         try:
             # Rate limiting
@@ -1196,6 +1197,9 @@ class MercurySyncBaseServer(Generic[T]):
             if isinstance(response, Message):
                 response = response.dump()
 
+            if handler_name == b'':
+                handler_name = b'error'
+
             # Build response with clock before length-prefixed data
             # Format: address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
             response_len = len(response).to_bytes(4, 'big')
@@ -1209,6 +1213,8 @@ class MercurySyncBaseServer(Generic[T]):
             transport.write(frame_message(response_payload))
 
         except Exception as e:
+            import traceback
+            print(traceback.format_exc())
             self._tcp_drop_counter.increment_malformed_message()
             # Log security event - could be decryption failure, malformed message, etc.
             await self._log_security_warning(
@@ -1228,6 +1234,8 @@ class MercurySyncBaseServer(Generic[T]):
                 # Frame with length prefix for proper TCP stream handling
                 transport.write(frame_message(error_response))
             except Exception:
+                import traceback
+                print(traceback.format_exc())
                 pass  # Best effort error response
 
     async def process_udp_server_request(
@@ -1240,7 +1248,8 @@ class MercurySyncBaseServer(Generic[T]):
     ):
         
         next_time = await self._udp_clock.update(clock_time)
-        
+        handler_name = b''
+
         try:
             parsed_addr = parse_address(addr)
         except AddressValidationError as e:
@@ -1281,6 +1290,10 @@ class MercurySyncBaseServer(Generic[T]):
                 f"UDP server request failed: {type(e).__name__}",
                 protocol="udp",
             )
+
+            if handler_name == b'':
+                handler_name = b'error'
+
             # Sanitized error response
             error_msg = b'Request processing failed'
             error_len = len(error_msg).to_bytes(4, 'big')

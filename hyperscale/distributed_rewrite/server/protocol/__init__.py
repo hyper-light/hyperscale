@@ -11,7 +11,7 @@ from .receive_buffer import (
 from .security import (
     ReplayGuard as ReplayGuard,
     ReplayError as ReplayError,
-    RateLimiter as RateLimiter,
+    ServerRateLimiter as ServerRateLimiter,
     RateLimitExceeded as RateLimitExceeded,
     MessageSizeError as MessageSizeError,
     AddressValidationError as AddressValidationError,

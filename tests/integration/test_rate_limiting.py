@@ -827,3 +827,165 @@ class TestExecuteWithRateLimitRetry:
 
         assert result.success is False
         assert "Network failure" in result.final_error
+
+
+class TestServerRateLimiterCheckCompatibility:
+    """Test ServerRateLimiter.check() compatibility method for simple RateLimiter API."""
+
+    def test_check_allowed(self) -> None:
+        """Test check() returns True when allowed."""
+        limiter = ServerRateLimiter()
+        addr = ("192.168.1.1", 8080)
+
+        result = limiter.check(addr)
+
+        assert result is True
+
+    def test_check_rate_limited(self) -> None:
+        """Test check() returns False when rate limited."""
+        config = RateLimitConfig(
+            default_bucket_size=3,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("192.168.1.1", 8080)
+
+        # Exhaust the bucket using check() API
+        for _ in range(3):
+            limiter.check(addr)
+
+        # Should be rate limited now
+        result = limiter.check(addr)
+
+        assert result is False
+
+    def test_check_raises_on_limit(self) -> None:
+        """Test check() raises RateLimitExceeded when raise_on_limit=True."""
+        from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
+
+        config = RateLimitConfig(
+            default_bucket_size=2,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("10.0.0.1", 9000)
+
+        # Exhaust the bucket
+        limiter.check(addr)
+        limiter.check(addr)
+
+        # Should raise
+        with pytest.raises(RateLimitExceeded) as exc_info:
+            limiter.check(addr, raise_on_limit=True)
+
+        assert "10.0.0.1:9000" in str(exc_info.value)
+
+    def test_check_does_not_raise_when_allowed(self) -> None:
+        """Test check() does not raise when allowed even with raise_on_limit=True."""
+        limiter = ServerRateLimiter()
+        addr = ("192.168.1.1", 8080)
+
+        # Should not raise
+        result = limiter.check(addr, raise_on_limit=True)
+        assert result is True
+
+    def test_check_different_addresses_isolated(self) -> None:
+        """Test that different addresses have separate buckets via check()."""
+        config = RateLimitConfig(
+            default_bucket_size=2,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+
+        addr1 = ("192.168.1.1", 8080)
+        addr2 = ("192.168.1.2", 8080)
+
+        # Exhaust addr1
+        limiter.check(addr1)
+        limiter.check(addr1)
+        assert limiter.check(addr1) is False
+
+        # addr2 should still be allowed
+        assert limiter.check(addr2) is True
+
+    def test_check_converts_address_to_client_id(self) -> None:
+        """Test that check() properly converts address tuple to client_id string."""
+        limiter = ServerRateLimiter()
+        addr = ("myhost.example.com", 12345)
+
+        # Make a request
+        limiter.check(addr)
+
+        # Verify internal client was created with correct ID format
+        expected_client_id = "myhost.example.com:12345"
+        assert expected_client_id in limiter._client_buckets
+
+    def test_check_uses_default_operation(self) -> None:
+        """Test that check() uses 'default' operation bucket."""
+        limiter = ServerRateLimiter()
+        addr = ("192.168.1.1", 8080)
+
+        # Make a request via check()
+        limiter.check(addr)
+
+        # Verify 'default' operation was used
+        client_id = "192.168.1.1:8080"
+        stats = limiter.get_client_stats(client_id)
+        assert "default" in stats
+
+    def test_check_interoperates_with_check_rate_limit(self) -> None:
+        """Test that check() and check_rate_limit() share state correctly."""
+        config = RateLimitConfig(
+            default_bucket_size=5,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("192.168.1.1", 8080)
+        client_id = "192.168.1.1:8080"
+
+        # Use 2 tokens via check()
+        limiter.check(addr)
+        limiter.check(addr)
+
+        # Use 2 more via check_rate_limit()
+        limiter.check_rate_limit(client_id, "default")
+        limiter.check_rate_limit(client_id, "default")
+
+        # Should have 1 token left
+        stats = limiter.get_client_stats(client_id)
+        assert stats["default"] == pytest.approx(1.0, abs=0.1)
+
+        # One more check should work
+        assert limiter.check(addr) is True
+
+        # Now should be exhausted
+        assert limiter.check(addr) is False
+
+    def test_check_with_ipv6_address(self) -> None:
+        """Test check() works with IPv6 addresses."""
+        limiter = ServerRateLimiter()
+        addr = ("::1", 8080)
+
+        result = limiter.check(addr)
+
+        assert result is True
+        # Verify client was created
+        assert "::1:8080" in limiter._client_buckets
+
+    def test_check_metrics_updated(self) -> None:
+        """Test that check() updates metrics correctly."""
+        config = RateLimitConfig(
+            default_bucket_size=2,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("192.168.1.1", 8080)
+
+        # Make requests - 2 allowed, 1 rate limited
+        limiter.check(addr)
+        limiter.check(addr)
+        limiter.check(addr)
+
+        metrics = limiter.get_metrics()
+        assert metrics["total_requests"] == 3
+        assert metrics["rate_limited_requests"] == 1
