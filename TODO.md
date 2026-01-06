@@ -100,7 +100,7 @@ Three-signal health model for all node types.
 - [x] Implement `readiness` property
 - [x] Implement `progress_state` property → "idle" | "normal" | "slow" | "degraded" | "stuck"
 - [x] Implement `get_routing_decision()` → "route" | "drain" | "investigate" | "evict"
-- [ ] Update manager's worker tracking to use `WorkerHealthState`
+- [x] Update manager's worker tracking to use `WorkerHealthState`
 - [x] Add integration tests for worker health model
 
 ### 2.2 AD-19: Manager Health (Gate monitors Managers)

@@ -7,7 +7,7 @@ and core allocation.
 
 Key responsibilities:
 - Worker registration and deregistration
-- Health tracking (integrates with SWIM)
+- Health tracking (integrates with SWIM and three-signal model AD-19)
 - Core availability tracking and allocation
 - Worker selection for workflow dispatch
 """
@@ -21,6 +21,11 @@ from hyperscale.distributed_rewrite.models import (
     WorkerRegistration,
     WorkerState,
     WorkerStatus,
+)
+from hyperscale.distributed_rewrite.health import (
+    WorkerHealthState,
+    WorkerHealthConfig,
+    RoutingDecision,
 )
 from hyperscale.distributed_rewrite.jobs.logging_models import (
     WorkerPoolTrace,
@@ -74,6 +79,10 @@ class WorkerPool:
         # Worker storage - node_id -> WorkerStatus
         self._workers: dict[str, WorkerStatus] = {}
 
+        # Three-signal health state tracking (AD-19)
+        self._worker_health: dict[str, WorkerHealthState] = {}
+        self._health_config = WorkerHealthConfig()
+
         # Quick lookup by address
         self._addr_to_worker: dict[tuple[str, int], str] = {}  # (host, port) -> node_id
 
@@ -121,6 +130,18 @@ class WorkerPool:
 
             self._workers[node_id] = worker
 
+            # Initialize three-signal health state (AD-19)
+            health_state = WorkerHealthState(
+                worker_id=node_id,
+                config=self._health_config,
+            )
+            health_state.update_liveness(success=True)
+            health_state.update_readiness(
+                accepting=True,
+                capacity=registration.available_cores or 0,
+            )
+            self._worker_health[node_id] = health_state
+
             # Add address lookup
             addr = (registration.node.host, registration.node.port)
             self._addr_to_worker[addr] = node_id
@@ -141,6 +162,9 @@ class WorkerPool:
             worker = self._workers.pop(node_id, None)
             if not worker:
                 return False
+
+            # Remove health state tracking
+            self._worker_health.pop(node_id, None)
 
             # Remove address lookup
             if worker.registration:
@@ -179,6 +203,13 @@ class WorkerPool:
             return False
 
         worker.health = health
+
+        # Update three-signal liveness based on health (AD-19)
+        health_state = self._worker_health.get(node_id)
+        if health_state:
+            is_healthy = health == WorkerState.HEALTHY
+            health_state.update_liveness(success=is_healthy)
+
         return True
 
     def is_worker_healthy(self, node_id: str) -> bool:
@@ -224,6 +255,117 @@ class WorkerPool:
         ]
 
     # =========================================================================
+    # Three-Signal Health Model (AD-19)
+    # =========================================================================
+
+    def get_worker_health_state(self, node_id: str) -> WorkerHealthState | None:
+        """Get the three-signal health state for a worker."""
+        return self._worker_health.get(node_id)
+
+    def get_worker_routing_decision(self, node_id: str) -> RoutingDecision | None:
+        """
+        Get routing decision for a worker based on three-signal health.
+
+        Returns:
+            RoutingDecision.ROUTE - healthy, send work
+            RoutingDecision.DRAIN - not ready, stop new work
+            RoutingDecision.INVESTIGATE - degraded, check worker
+            RoutingDecision.EVICT - dead or stuck, remove
+            None - worker not found
+        """
+        health_state = self._worker_health.get(node_id)
+        if health_state:
+            return health_state.get_routing_decision()
+        return None
+
+    def update_worker_progress(
+        self,
+        node_id: str,
+        assigned: int,
+        completed: int,
+        expected_rate: float | None = None,
+    ) -> bool:
+        """
+        Update worker progress signal from completion metrics.
+
+        Called periodically to track workflow completion rates.
+
+        Args:
+            node_id: Worker node ID
+            assigned: Number of workflows assigned to worker
+            completed: Number of completions in the last interval
+            expected_rate: Expected completion rate per interval
+
+        Returns:
+            True if worker was found and updated
+        """
+        health_state = self._worker_health.get(node_id)
+        if not health_state:
+            return False
+
+        health_state.update_progress(
+            assigned=assigned,
+            completed=completed,
+            expected_rate=expected_rate,
+        )
+        return True
+
+    def get_workers_to_evict(self) -> list[str]:
+        """
+        Get list of workers that should be evicted based on health signals.
+
+        Returns node IDs where routing decision is EVICT.
+        """
+        return [
+            node_id
+            for node_id, health_state in self._worker_health.items()
+            if health_state.get_routing_decision() == RoutingDecision.EVICT
+        ]
+
+    def get_workers_to_investigate(self) -> list[str]:
+        """
+        Get list of workers that need investigation based on health signals.
+
+        Returns node IDs where routing decision is INVESTIGATE.
+        """
+        return [
+            node_id
+            for node_id, health_state in self._worker_health.items()
+            if health_state.get_routing_decision() == RoutingDecision.INVESTIGATE
+        ]
+
+    def get_workers_to_drain(self) -> list[str]:
+        """
+        Get list of workers that should be drained based on health signals.
+
+        Returns node IDs where routing decision is DRAIN.
+        """
+        return [
+            node_id
+            for node_id, health_state in self._worker_health.items()
+            if health_state.get_routing_decision() == RoutingDecision.DRAIN
+        ]
+
+    def get_routable_worker_ids(self) -> list[str]:
+        """
+        Get list of workers that can receive new work based on health signals.
+
+        Returns node IDs where routing decision is ROUTE.
+        """
+        return [
+            node_id
+            for node_id, health_state in self._worker_health.items()
+            if health_state.get_routing_decision() == RoutingDecision.ROUTE
+        ]
+
+    def get_worker_health_diagnostics(self, node_id: str) -> dict | None:
+        """Get diagnostic information for a worker's health state."""
+        health_state = self._worker_health.get(node_id)
+        if health_state:
+            return health_state.get_diagnostics()
+        return None
+
+    # =========================================================================
     # Heartbeat Processing
     # =========================================================================
 
@@ -259,6 +401,18 @@ class WorkerPool:
             # Signal if cores became available
             if worker.available_cores > old_available:
                 self._cores_available.set()
+
+            # Update three-signal health state (AD-19)
+            health_state = self._worker_health.get(node_id)
+            if health_state:
+                # Heartbeat received = liveness success
+                health_state.update_liveness(success=True)
+
+                # Update readiness from heartbeat data
+                health_state.update_readiness(
+                    accepting=worker.available_cores > 0,
+                    capacity=worker.available_cores,
+                )
 
         return True
 
