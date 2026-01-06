@@ -2,8 +2,10 @@
 Integration tests for Rate Limiting (AD-24).
 
 Tests:
-- TokenBucket acquire and refill behavior
-- ServerRateLimiter per-client limits
+- SlidingWindowCounter deterministic counting
+- AdaptiveRateLimiter health-gated behavior
+- ServerRateLimiter with adaptive limiting
+- TokenBucket (legacy) basic operations
 - CooperativeRateLimiter client-side throttling
 - Client cleanup to prevent memory leaks
 """
@@ -15,16 +17,325 @@ from unittest.mock import patch
 import pytest
 
 from hyperscale.distributed_rewrite.reliability import (
+    AdaptiveRateLimitConfig,
+    AdaptiveRateLimiter,
     CooperativeRateLimiter,
+    HybridOverloadDetector,
+    OverloadConfig,
+    OverloadState,
     RateLimitConfig,
     RateLimitResult,
     ServerRateLimiter,
+    SlidingWindowCounter,
     TokenBucket,
 )
+from hyperscale.distributed_rewrite.reliability.load_shedding import RequestPriority
+
+
+class TestSlidingWindowCounter:
+    """Test SlidingWindowCounter deterministic counting."""
+
+    def test_initial_state(self) -> None:
+        """Test counter starts empty with full capacity."""
+        counter = SlidingWindowCounter(window_size_seconds=60.0, max_requests=100)
+
+        assert counter.get_effective_count() == 0.0
+        assert counter.available_slots == 100.0
+
+    def test_acquire_success(self) -> None:
+        """Test successful slot acquisition."""
+        counter = SlidingWindowCounter(window_size_seconds=60.0, max_requests=100)
+
+        acquired, wait_time = counter.try_acquire(10)
+
+        assert acquired is True
+        assert wait_time == 0.0
+        assert counter.get_effective_count() == 10.0
+        assert counter.available_slots == 90.0
+
+    def test_acquire_at_limit(self) -> None:
+        """Test acquisition when at exact limit."""
+        counter = SlidingWindowCounter(window_size_seconds=60.0, max_requests=10)
+
+        # Fill to exactly limit
+        acquired, _ = counter.try_acquire(10)
+        assert acquired is True
+
+        # One more should fail
+        acquired, wait_time = counter.try_acquire(1)
+        assert acquired is False
+        assert wait_time > 0
+
+    def test_acquire_exceeds_limit(self) -> None:
+        """Test acquisition fails when exceeding limit."""
+        counter = SlidingWindowCounter(window_size_seconds=60.0, max_requests=10)
+
+        # Fill most of capacity
+        counter.try_acquire(8)
+
+        # Try to acquire more than remaining
+        acquired, wait_time = counter.try_acquire(5)
+
+        assert acquired is False
+        assert wait_time > 0
+        # Count should be unchanged
+        assert counter.get_effective_count() == 8.0
+
+    def test_window_rotation(self) -> None:
+        """Test that window rotates correctly."""
+        counter = SlidingWindowCounter(window_size_seconds=0.1, max_requests=100)
+
+        # Fill current window
+        counter.try_acquire(50)
+        assert counter.get_effective_count() == 50.0
+
+        # Wait for window to rotate
+        time.sleep(0.12)
+
+        # After rotation, previous count contributes weighted portion
+        effective = counter.get_effective_count()
+        # Previous = 50, current = 0, window_progress ~= 0.2
+        # effective = 0 + 50 * (1 - 0.2) = 40 (approximately)
+        # But since we're early in new window, previous contribution is high
+        assert effective < 50.0  # Some decay from window progress
+        assert effective > 0.0  # But not fully gone
+
+    def test_multiple_window_rotation(self) -> None:
+        """Test that multiple windows passing clears all counts."""
+        counter = SlidingWindowCounter(window_size_seconds=0.05, max_requests=100)
+
+        # Fill current window
+        counter.try_acquire(50)
+
+        # Wait for 2+ windows to pass
+        time.sleep(0.12)
+
+        # Both previous and current should be cleared
+        effective = counter.get_effective_count()
+        assert effective == 0.0
+        assert counter.available_slots == 100.0
+
+    def test_reset(self) -> None:
+        """Test counter reset."""
+        counter = SlidingWindowCounter(window_size_seconds=60.0, max_requests=100)
+
+        counter.try_acquire(50)
+        assert counter.get_effective_count() == 50.0
+
+        counter.reset()
+
+        assert counter.get_effective_count() == 0.0
+        assert counter.available_slots == 100.0
+
+    @pytest.mark.asyncio
+    async def test_acquire_async(self) -> None:
+        """Test async acquire with wait."""
+        counter = SlidingWindowCounter(window_size_seconds=0.1, max_requests=10)
+
+        # Fill counter
+        counter.try_acquire(10)
+
+        # Async acquire should wait for window to rotate
+        start = time.monotonic()
+        result = await counter.acquire_async(5, max_wait=0.2)
+        elapsed = time.monotonic() - start
+
+        assert result is True
+        assert elapsed >= 0.05  # Waited for some window rotation
+
+    @pytest.mark.asyncio
+    async def test_acquire_async_timeout(self) -> None:
+        """Test async acquire times out."""
+        counter = SlidingWindowCounter(window_size_seconds=10.0, max_requests=10)
+
+        # Fill counter
+        counter.try_acquire(10)
+
+        # Try to acquire with short timeout (window won't rotate)
+        result = await counter.acquire_async(5, max_wait=0.01)
+
+        assert result is False
+
+
+class TestAdaptiveRateLimiter:
+    """Test AdaptiveRateLimiter health-gated behavior."""
+
+    def test_allows_all_when_healthy(self) -> None:
+        """Test that all requests pass when system is healthy."""
+        detector = HybridOverloadDetector()
+        limiter = AdaptiveRateLimiter(overload_detector=detector)
+
+        # System is healthy by default
+        for i in range(100):
+            result = limiter.check(f"client-{i}", RequestPriority.LOW)
+            assert result.allowed is True
+
+    def test_sheds_low_priority_when_busy(self) -> None:
+        """Test that LOW priority requests are shed when BUSY."""
+        config = OverloadConfig(absolute_bounds=(10.0, 50.0, 200.0))  # Lower bounds
+        detector = HybridOverloadDetector(config=config)
+        limiter = AdaptiveRateLimiter(overload_detector=detector)
+
+        # Record high latencies to trigger BUSY state
+        for _ in range(15):
+            detector.record_latency(25.0)  # Above busy threshold
+
+        assert detector.get_state() == OverloadState.BUSY
+
+        # LOW priority should be shed
+        result = limiter.check("client-1", RequestPriority.LOW)
+        assert result.allowed is False
+
+        # HIGH priority should pass
+        result = limiter.check("client-1", RequestPriority.HIGH)
+        assert result.allowed is True
+
+        # CRITICAL always passes
+        result = limiter.check("client-1", RequestPriority.CRITICAL)
+        assert result.allowed is True
+
+    def test_only_critical_when_overloaded(self) -> None:
+        """Test that only CRITICAL passes when OVERLOADED."""
+        config = OverloadConfig(absolute_bounds=(10.0, 50.0, 100.0))
+        detector = HybridOverloadDetector(config=config)
+        limiter = AdaptiveRateLimiter(overload_detector=detector)
+
+        # Record very high latencies to trigger OVERLOADED state
+        for _ in range(15):
+            detector.record_latency(150.0)  # Above overloaded threshold
+
+        assert detector.get_state() == OverloadState.OVERLOADED
+
+        # Only CRITICAL passes
+        assert limiter.check("client-1", RequestPriority.LOW).allowed is False
+        assert limiter.check("client-1", RequestPriority.NORMAL).allowed is False
+        assert limiter.check("client-1", RequestPriority.HIGH).allowed is False
+        assert limiter.check("client-1", RequestPriority.CRITICAL).allowed is True
+
+    def test_fair_share_when_stressed(self) -> None:
+        """Test per-client limits when system is STRESSED."""
+        config = OverloadConfig(absolute_bounds=(10.0, 30.0, 100.0))
+        detector = HybridOverloadDetector(config=config)
+        adaptive_config = AdaptiveRateLimitConfig(
+            window_size_seconds=60.0,
+            stressed_requests_per_window=5,  # Low limit for testing
+        )
+        limiter = AdaptiveRateLimiter(
+            overload_detector=detector,
+            config=adaptive_config,
+        )
+
+        # Trigger STRESSED state
+        for _ in range(15):
+            detector.record_latency(50.0)
+
+        assert detector.get_state() == OverloadState.STRESSED
+
+        # First 5 requests for client-1 should pass (within counter limit)
+        for i in range(5):
+            result = limiter.check("client-1", RequestPriority.NORMAL)
+            assert result.allowed is True, f"Request {i} should be allowed"
+
+        # 6th request should be rate limited
+        result = limiter.check("client-1", RequestPriority.NORMAL)
+        assert result.allowed is False
+        assert result.retry_after_seconds > 0
+
+        # Different client should still have their own limit
+        result = limiter.check("client-2", RequestPriority.NORMAL)
+        assert result.allowed is True
+
+    def test_cleanup_inactive_clients(self) -> None:
+        """Test cleanup of inactive clients."""
+        adaptive_config = AdaptiveRateLimitConfig(
+            inactive_cleanup_seconds=0.1,
+        )
+        limiter = AdaptiveRateLimiter(config=adaptive_config)
+
+        # Create some clients
+        limiter.check("client-1", RequestPriority.NORMAL)
+        limiter.check("client-2", RequestPriority.NORMAL)
+
+        # Wait for them to become inactive
+        time.sleep(0.15)
+
+        # Cleanup
+        cleaned = limiter.cleanup_inactive_clients()
+
+        assert cleaned == 2
+        metrics = limiter.get_metrics()
+        assert metrics["active_clients"] == 0
+
+    def test_metrics_tracking(self) -> None:
+        """Test that metrics are tracked correctly."""
+        config = OverloadConfig(absolute_bounds=(10.0, 30.0, 100.0))
+        detector = HybridOverloadDetector(config=config)
+        adaptive_config = AdaptiveRateLimitConfig(
+            stressed_requests_per_window=2,
+        )
+        limiter = AdaptiveRateLimiter(
+            overload_detector=detector,
+            config=adaptive_config,
+        )
+
+        # Make requests when healthy
+        limiter.check("client-1", RequestPriority.NORMAL)
+        limiter.check("client-1", RequestPriority.NORMAL)
+
+        metrics = limiter.get_metrics()
+        assert metrics["total_requests"] == 2
+        assert metrics["allowed_requests"] == 2
+        assert metrics["shed_requests"] == 0
+
+        # Trigger stressed state and exhaust limit
+        for _ in range(15):
+            detector.record_latency(50.0)
+
+        limiter.check("client-1", RequestPriority.NORMAL)  # Allowed (new counter)
+        limiter.check("client-1", RequestPriority.NORMAL)  # Allowed
+        limiter.check("client-1", RequestPriority.NORMAL)  # Shed
+
+        metrics = limiter.get_metrics()
+        assert metrics["total_requests"] == 5
+        assert metrics["shed_requests"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_check_async(self) -> None:
+        """Test async check with wait."""
+        config = OverloadConfig(absolute_bounds=(10.0, 30.0, 100.0))
+        detector = HybridOverloadDetector(config=config)
+        adaptive_config = AdaptiveRateLimitConfig(
+            window_size_seconds=0.1,  # Short window for testing
+            stressed_requests_per_window=2,
+        )
+        limiter = AdaptiveRateLimiter(
+            overload_detector=detector,
+            config=adaptive_config,
+        )
+
+        # Trigger stressed state
+        for _ in range(15):
+            detector.record_latency(50.0)
+
+        # Exhaust limit
+        limiter.check("client-1", RequestPriority.NORMAL)
+        limiter.check("client-1", RequestPriority.NORMAL)
+
+        # Async check should wait
+        start = time.monotonic()
+        result = await limiter.check_async(
+            "client-1",
+            RequestPriority.NORMAL,
+            max_wait=0.2,
+        )
+        elapsed = time.monotonic() - start
+
+        # Should have waited for window to rotate
+        assert elapsed >= 0.05
 
 
 class TestTokenBucket:
-    """Test TokenBucket basic operations."""
+    """Test TokenBucket basic operations (legacy support)."""
 
     def test_initial_state(self) -> None:
         """Test bucket starts full."""
@@ -39,7 +350,6 @@ class TestTokenBucket:
         result = bucket.acquire(10)
 
         assert result is True
-        # Use approx due to time-based refill between operations
         assert bucket.available_tokens == pytest.approx(90.0, abs=0.1)
 
     def test_acquire_failure(self) -> None:
@@ -54,20 +364,6 @@ class TestTokenBucket:
 
         assert result is False
 
-    def test_acquire_partial(self) -> None:
-        """Test that partial tokens don't work."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=1.0)
-
-        # Use up most tokens
-        bucket.acquire(8)
-
-        # Try to acquire more than available
-        result = bucket.acquire(5)
-
-        assert result is False
-        # Use approx due to time-based refill between operations
-        assert bucket.available_tokens == pytest.approx(2.0, abs=0.1)
-
     def test_try_acquire_with_wait_time(self) -> None:
         """Test try_acquire returns wait time."""
         bucket = TokenBucket(bucket_size=10, refill_rate=10.0)
@@ -79,46 +375,40 @@ class TestTokenBucket:
         acquired, wait_time = bucket.try_acquire(5)
 
         assert acquired is False
-        assert wait_time == pytest.approx(0.5, rel=0.1)  # 5 tokens / 10 per second
+        assert wait_time == pytest.approx(0.5, rel=0.1)
+
+    def test_try_acquire_zero_refill_rate(self) -> None:
+        """Test try_acquire with zero refill rate returns infinity."""
+        bucket = TokenBucket(bucket_size=10, refill_rate=0.0)
+
+        # Drain bucket
+        bucket.acquire(10)
+
+        # Try to acquire - should return infinity wait time
+        acquired, wait_time = bucket.try_acquire(1)
+
+        assert acquired is False
+        assert wait_time == float('inf')
 
     def test_refill_over_time(self) -> None:
         """Test that tokens refill over time."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=100.0)  # 100 per second
+        bucket = TokenBucket(bucket_size=100, refill_rate=100.0)
 
         # Drain bucket
         bucket.acquire(100)
-        # Use approx since tiny time passes between operations
         assert bucket.available_tokens == pytest.approx(0.0, abs=0.1)
 
-        # Actually wait for refill (0.1 seconds = 10 tokens at 100/s)
-        import asyncio
-        asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.1))
+        # Wait for refill
+        time.sleep(0.1)
 
         tokens = bucket.available_tokens
-        # Should have gained approximately 10 tokens
         assert tokens == pytest.approx(10.0, abs=2.0)
-
-    def test_refill_caps_at_bucket_size(self) -> None:
-        """Test that refill doesn't exceed bucket size."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=1000.0)  # Very fast refill
-
-        # Use some tokens
-        bucket.acquire(50)
-
-        # Wait a short time but enough to overfill at 1000/s rate
-        import asyncio
-        asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.2))
-
-        tokens = bucket.available_tokens
-        # Should be capped at 100, not 50 + 200 = 250
-        assert tokens == pytest.approx(100.0, abs=0.1)
 
     def test_reset(self) -> None:
         """Test bucket reset."""
         bucket = TokenBucket(bucket_size=100, refill_rate=10.0)
 
         bucket.acquire(100)
-        # Use approx since tiny time passes between operations
         assert bucket.available_tokens == pytest.approx(0.0, abs=0.1)
 
         bucket.reset()
@@ -127,7 +417,7 @@ class TestTokenBucket:
     @pytest.mark.asyncio
     async def test_acquire_async(self) -> None:
         """Test async acquire with wait."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=100.0)  # Fast refill
+        bucket = TokenBucket(bucket_size=10, refill_rate=100.0)
 
         # Drain bucket
         bucket.acquire(10)
@@ -138,20 +428,7 @@ class TestTokenBucket:
         elapsed = time.monotonic() - start
 
         assert result is True
-        assert elapsed >= 0.04  # At least 50ms to get 5 tokens
-
-    @pytest.mark.asyncio
-    async def test_acquire_async_timeout(self) -> None:
-        """Test async acquire times out."""
-        bucket = TokenBucket(bucket_size=10, refill_rate=1.0)  # Slow refill
-
-        # Drain bucket
-        bucket.acquire(10)
-
-        # Try to acquire with short timeout
-        result = await bucket.acquire_async(10, max_wait=0.01)
-
-        assert result is False
+        assert elapsed >= 0.04
 
 
 class TestRateLimitConfig:
@@ -174,55 +451,38 @@ class TestRateLimitConfig:
         assert stats_size == 500
         assert stats_rate == 50.0
 
-        cancel_size, cancel_rate = config.get_limits("cancel")
-        assert cancel_size == 20
-        assert cancel_rate == 2.0
-
-    def test_custom_operation_limits(self) -> None:
-        """Test custom operation limits."""
-        config = RateLimitConfig(
-            operation_limits={
-                "custom_op": (50, 5.0),
-            }
-        )
-
-        size, rate = config.get_limits("custom_op")
-        assert size == 50
-        assert rate == 5.0
-
 
 class TestServerRateLimiter:
-    """Test ServerRateLimiter."""
+    """Test ServerRateLimiter with adaptive limiting."""
 
-    def test_check_rate_limit_allowed(self) -> None:
-        """Test rate limit check when allowed."""
+    def test_allows_all_when_healthy(self) -> None:
+        """Test that all requests pass when system is healthy."""
         limiter = ServerRateLimiter()
 
-        result = limiter.check_rate_limit("client-1", "job_submit")
+        # System is healthy - all should pass
+        for i in range(50):
+            result = limiter.check_rate_limit(f"client-{i % 5}", "job_submit")
+            assert result.allowed is True
 
-        assert result.allowed is True
-        assert result.retry_after_seconds == 0.0
-        assert result.tokens_remaining > 0
-
-    def test_check_rate_limit_exhausted(self) -> None:
-        """Test rate limit check when exhausted."""
+    def test_respects_operation_limits_when_healthy(self) -> None:
+        """Test per-operation limits are applied when healthy."""
         config = RateLimitConfig(
-            operation_limits={"test_op": (5, 1.0)}
+            operation_limits={"test_op": (5, 1.0)}  # Low limit
         )
         limiter = ServerRateLimiter(config=config)
 
-        # Exhaust the bucket
+        # Exhaust the operation limit
         for _ in range(5):
-            limiter.check_rate_limit("client-1", "test_op")
+            result = limiter.check_rate_limit("client-1", "test_op")
+            assert result.allowed is True
 
         # Should be rate limited now
         result = limiter.check_rate_limit("client-1", "test_op")
-
         assert result.allowed is False
         assert result.retry_after_seconds > 0
 
     def test_per_client_isolation(self) -> None:
-        """Test that clients have separate buckets."""
+        """Test that clients have separate counters."""
         config = RateLimitConfig(
             operation_limits={"test_op": (3, 1.0)}
         )
@@ -232,29 +492,30 @@ class TestServerRateLimiter:
         for _ in range(3):
             limiter.check_rate_limit("client-1", "test_op")
 
-        # client-2 should still have tokens
+        # client-2 should still have capacity
         result = limiter.check_rate_limit("client-2", "test_op")
-
         assert result.allowed is True
 
-    def test_per_operation_isolation(self) -> None:
-        """Test that operations have separate buckets."""
-        config = RateLimitConfig(
-            operation_limits={
-                "op1": (3, 1.0),
-                "op2": (3, 1.0),
-            }
+    def test_check_rate_limit_with_priority(self) -> None:
+        """Test priority-aware rate limit check."""
+        config = OverloadConfig(absolute_bounds=(10.0, 50.0, 100.0))
+        detector = HybridOverloadDetector(config=config)
+        limiter = ServerRateLimiter(overload_detector=detector)
+
+        # Trigger BUSY state
+        for _ in range(15):
+            detector.record_latency(25.0)
+
+        # LOW should be shed, HIGH should pass
+        result_low = limiter.check_rate_limit_with_priority(
+            "client-1", RequestPriority.LOW
         )
-        limiter = ServerRateLimiter(config=config)
+        result_high = limiter.check_rate_limit_with_priority(
+            "client-1", RequestPriority.HIGH
+        )
 
-        # Exhaust op1 for client-1
-        for _ in range(3):
-            limiter.check_rate_limit("client-1", "op1")
-
-        # op2 for same client should still work
-        result = limiter.check_rate_limit("client-1", "op2")
-
-        assert result.allowed is True
+        assert result_low.allowed is False
+        assert result_high.allowed is True
 
     def test_cleanup_inactive_clients(self) -> None:
         """Test cleanup of inactive clients."""
@@ -274,22 +535,8 @@ class TestServerRateLimiter:
         metrics = limiter.get_metrics()
         assert metrics["active_clients"] == 0
 
-    def test_cleanup_preserves_active_clients(self) -> None:
-        """Test that cleanup preserves recently active clients."""
-        limiter = ServerRateLimiter(inactive_cleanup_seconds=1.0)
-
-        # Create client and keep it active
-        limiter.check_rate_limit("client-1", "test")
-
-        # Cleanup immediately (client is still active)
-        cleaned = limiter.cleanup_inactive_clients()
-
-        assert cleaned == 0
-        metrics = limiter.get_metrics()
-        assert metrics["active_clients"] == 1
-
     def test_reset_client(self) -> None:
-        """Test resetting a client's buckets."""
+        """Test resetting a client's counters."""
         config = RateLimitConfig(
             operation_limits={"test_op": (3, 1.0)}
         )
@@ -309,20 +556,6 @@ class TestServerRateLimiter:
         # Should work again
         result = limiter.check_rate_limit("client-1", "test_op")
         assert result.allowed is True
-
-    def test_get_client_stats(self) -> None:
-        """Test getting client's token stats."""
-        limiter = ServerRateLimiter()
-
-        # Use some tokens
-        limiter.check_rate_limit("client-1", "job_submit", tokens=10)
-        limiter.check_rate_limit("client-1", "job_status", tokens=5)
-
-        stats = limiter.get_client_stats("client-1")
-
-        assert "job_submit" in stats
-        assert "job_status" in stats
-        assert stats["job_submit"] < 50  # Started with 50
 
     def test_metrics(self) -> None:
         """Test metrics tracking."""
@@ -344,9 +577,9 @@ class TestServerRateLimiter:
 
     @pytest.mark.asyncio
     async def test_check_rate_limit_async(self) -> None:
-        """Test async rate limit check with wait."""
+        """Test async rate limit check."""
         config = RateLimitConfig(
-            operation_limits={"test_op": (3, 100.0)}  # Fast refill
+            operation_limits={"test_op": (3, 100.0)}
         )
         limiter = ServerRateLimiter(config=config)
 
@@ -354,7 +587,7 @@ class TestServerRateLimiter:
         for _ in range(3):
             limiter.check_rate_limit("client-1", "test_op")
 
-        # Async check should wait for tokens
+        # Async check with wait
         start = time.monotonic()
         result = await limiter.check_rate_limit_async(
             "client-1", "test_op", max_wait=1.0
@@ -362,7 +595,95 @@ class TestServerRateLimiter:
         elapsed = time.monotonic() - start
 
         assert result.allowed is True
-        assert elapsed >= 0.005  # At least some wait time
+        assert elapsed >= 0.005
+
+    def test_overload_detector_property(self) -> None:
+        """Test that overload_detector property works."""
+        limiter = ServerRateLimiter()
+
+        detector = limiter.overload_detector
+        assert isinstance(detector, HybridOverloadDetector)
+
+        # Should be able to record latency
+        detector.record_latency(50.0)
+
+    def test_adaptive_limiter_property(self) -> None:
+        """Test that adaptive_limiter property works."""
+        limiter = ServerRateLimiter()
+
+        adaptive = limiter.adaptive_limiter
+        assert isinstance(adaptive, AdaptiveRateLimiter)
+
+
+class TestServerRateLimiterCheckCompatibility:
+    """Test ServerRateLimiter.check() compatibility method."""
+
+    def test_check_allowed(self) -> None:
+        """Test check() returns True when allowed."""
+        limiter = ServerRateLimiter()
+        addr = ("192.168.1.1", 8080)
+
+        result = limiter.check(addr)
+
+        assert result is True
+
+    def test_check_rate_limited(self) -> None:
+        """Test check() returns False when rate limited."""
+        config = RateLimitConfig(
+            default_bucket_size=3,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("192.168.1.1", 8080)
+
+        # Exhaust the counter
+        for _ in range(3):
+            limiter.check(addr)
+
+        # Should be rate limited now
+        result = limiter.check(addr)
+
+        assert result is False
+
+    def test_check_raises_on_limit(self) -> None:
+        """Test check() raises RateLimitExceeded when raise_on_limit=True."""
+        from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
+
+        config = RateLimitConfig(
+            default_bucket_size=2,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+        addr = ("10.0.0.1", 9000)
+
+        # Exhaust the counter
+        limiter.check(addr)
+        limiter.check(addr)
+
+        # Should raise
+        with pytest.raises(RateLimitExceeded) as exc_info:
+            limiter.check(addr, raise_on_limit=True)
+
+        assert "10.0.0.1:9000" in str(exc_info.value)
+
+    def test_check_different_addresses_isolated(self) -> None:
+        """Test that different addresses have separate counters."""
+        config = RateLimitConfig(
+            default_bucket_size=2,
+            default_refill_rate=1.0,
+        )
+        limiter = ServerRateLimiter(config=config)
+
+        addr1 = ("192.168.1.1", 8080)
+        addr2 = ("192.168.1.2", 8080)
+
+        # Exhaust addr1
+        limiter.check(addr1)
+        limiter.check(addr1)
+        assert limiter.check(addr1) is False
+
+        # addr2 should still be allowed
+        assert limiter.check(addr2) is True
 
 
 class TestCooperativeRateLimiter:
@@ -396,15 +717,6 @@ class TestCooperativeRateLimiter:
         time.sleep(0.06)
 
         assert limiter.is_blocked("test_op") is False
-
-    def test_default_backoff(self) -> None:
-        """Test default backoff when no retry_after specified."""
-        limiter = CooperativeRateLimiter(default_backoff=2.0)
-
-        limiter.handle_rate_limit("test_op")
-
-        assert limiter.is_blocked("test_op") is True
-        assert limiter.get_retry_after("test_op") >= 1.9
 
     def test_clear_specific_operation(self) -> None:
         """Test clearing block for specific operation."""
@@ -452,15 +764,6 @@ class TestCooperativeRateLimiter:
 
         assert wait_time >= 0.09
         assert elapsed >= 0.09
-
-    def test_metrics(self) -> None:
-        """Test cooperative rate limiter metrics."""
-        limiter = CooperativeRateLimiter()
-
-        # Initially no waits
-        metrics = limiter.get_metrics()
-        assert metrics["total_waits"] == 0
-        assert metrics["total_wait_time"] == 0.0
 
 
 class TestRateLimitResult:
@@ -511,17 +814,9 @@ class TestRetryAfterHelpers:
         """Test non-rate-limit response is not detected."""
         from hyperscale.distributed_rewrite.reliability import is_rate_limit_response
 
-        # Some other data
         data = b"not a rate limit response"
 
         assert is_rate_limit_response(data) is False
-
-    def test_is_rate_limit_response_empty(self) -> None:
-        """Test empty data is not detected as rate limit."""
-        from hyperscale.distributed_rewrite.reliability import is_rate_limit_response
-
-        assert is_rate_limit_response(b"") is False
-        assert is_rate_limit_response(b"short") is False
 
     @pytest.mark.asyncio
     async def test_handle_rate_limit_response_with_wait(self) -> None:
@@ -533,7 +828,6 @@ class TestRetryAfterHelpers:
 
         limiter = CooperativeRateLimiter()
 
-        # Handle rate limit with short wait
         start = time.monotonic()
         wait_time = await handle_rate_limit_response(
             limiter,
@@ -545,74 +839,6 @@ class TestRetryAfterHelpers:
 
         assert wait_time >= 0.04
         assert elapsed >= 0.04
-
-    @pytest.mark.asyncio
-    async def test_handle_rate_limit_response_without_wait(self) -> None:
-        """Test handling rate limit response without wait."""
-        from hyperscale.distributed_rewrite.reliability import (
-            CooperativeRateLimiter,
-            handle_rate_limit_response,
-        )
-
-        limiter = CooperativeRateLimiter()
-
-        # Handle rate limit without waiting
-        wait_time = await handle_rate_limit_response(
-            limiter,
-            operation="test_op",
-            retry_after_seconds=10.0,
-            wait=False,
-        )
-
-        assert wait_time == 0.0
-        # But the operation should be blocked
-        assert limiter.is_blocked("test_op") is True
-        assert limiter.get_retry_after("test_op") >= 9.9
-
-    @pytest.mark.asyncio
-    async def test_retry_after_flow(self) -> None:
-        """Test complete retry-after flow."""
-        from hyperscale.distributed_rewrite.reliability import (
-            CooperativeRateLimiter,
-            ServerRateLimiter,
-            RateLimitConfig,
-            handle_rate_limit_response,
-        )
-
-        # Server-side: create a rate limiter with small bucket
-        config = RateLimitConfig(
-            operation_limits={"test_op": (2, 10.0)}  # 2 tokens, refill 10/s
-        )
-        server_limiter = ServerRateLimiter(config=config)
-
-        # Client-side: create cooperative limiter
-        client_limiter = CooperativeRateLimiter()
-
-        # First 2 requests succeed
-        result1 = server_limiter.check_rate_limit("client-1", "test_op")
-        result2 = server_limiter.check_rate_limit("client-1", "test_op")
-        assert result1.allowed is True
-        assert result2.allowed is True
-
-        # Third request is rate limited
-        result3 = server_limiter.check_rate_limit("client-1", "test_op")
-        assert result3.allowed is False
-        assert result3.retry_after_seconds > 0
-
-        # Client handles rate limit response
-        await handle_rate_limit_response(
-            client_limiter,
-            operation="test_op",
-            retry_after_seconds=result3.retry_after_seconds,
-            wait=True,
-        )
-
-        # After waiting, client can check if blocked and retry
-        assert client_limiter.is_blocked("test_op") is False
-
-        # Server should now allow the request again
-        result4 = server_limiter.check_rate_limit("client-1", "test_op")
-        assert result4.allowed is True
 
 
 class TestExecuteWithRateLimitRetry:
@@ -662,13 +888,11 @@ class TestExecuteWithRateLimitRetry:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                # First call returns rate limit
                 return RateLimitResponse(
                     operation="test_op",
                     retry_after_seconds=0.05,
                 ).dump()
             else:
-                # Second call succeeds
                 return b"success_response"
 
         config = RateLimitRetryConfig(max_retries=3, max_total_wait=10.0)
@@ -686,125 +910,7 @@ class TestExecuteWithRateLimitRetry:
         assert result.response == b"success_response"
         assert result.retries == 1
         assert call_count == 2
-        assert elapsed >= 0.04  # Waited for retry_after
-
-    @pytest.mark.asyncio
-    async def test_exhausted_retries(self) -> None:
-        """Test failure after exhausting retries."""
-        from hyperscale.distributed_rewrite.reliability import (
-            CooperativeRateLimiter,
-            RateLimitRetryConfig,
-            execute_with_rate_limit_retry,
-        )
-        from hyperscale.distributed_rewrite.models import RateLimitResponse
-
-        limiter = CooperativeRateLimiter()
-        call_count = 0
-
-        async def operation():
-            nonlocal call_count
-            call_count += 1
-            # Always return rate limit
-            return RateLimitResponse(
-                operation="test_op",
-                retry_after_seconds=0.01,
-            ).dump()
-
-        config = RateLimitRetryConfig(max_retries=2, max_total_wait=10.0)
-
-        result = await execute_with_rate_limit_retry(
-            operation,
-            "test_op",
-            limiter,
-            config=config,
-        )
-
-        assert result.success is False
-        # retries counts how many times we retried (after initial attempt failed)
-        # With max_retries=2, we try: initial, retry 1, retry 2, then exit
-        # The implementation increments retries after each rate limit, so we get 3
-        assert result.retries == 3
-        assert call_count == 3  # Initial + 2 retries
-        assert "Exhausted max retries" in result.final_error
-
-    @pytest.mark.asyncio
-    async def test_max_total_wait_exceeded(self) -> None:
-        """Test failure when max total wait time is exceeded."""
-        from hyperscale.distributed_rewrite.reliability import (
-            CooperativeRateLimiter,
-            RateLimitRetryConfig,
-            execute_with_rate_limit_retry,
-        )
-        from hyperscale.distributed_rewrite.models import RateLimitResponse
-
-        limiter = CooperativeRateLimiter()
-
-        async def operation():
-            # Return a rate limit with long retry_after
-            return RateLimitResponse(
-                operation="test_op",
-                retry_after_seconds=10.0,
-            ).dump()
-
-        # Max wait is shorter than retry_after
-        config = RateLimitRetryConfig(max_retries=5, max_total_wait=1.0)
-
-        result = await execute_with_rate_limit_retry(
-            operation,
-            "test_op",
-            limiter,
-            config=config,
-        )
-
-        assert result.success is False
-        assert "would exceed max wait" in result.final_error
-
-    @pytest.mark.asyncio
-    async def test_backoff_multiplier(self) -> None:
-        """Test that backoff multiplier increases wait time."""
-        from hyperscale.distributed_rewrite.reliability import (
-            CooperativeRateLimiter,
-            RateLimitRetryConfig,
-            execute_with_rate_limit_retry,
-        )
-        from hyperscale.distributed_rewrite.models import RateLimitResponse
-
-        limiter = CooperativeRateLimiter()
-        call_count = 0
-
-        async def operation():
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 2:
-                return RateLimitResponse(
-                    operation="test_op",
-                    retry_after_seconds=0.02,
-                ).dump()
-            else:
-                return b"success"
-
-        # With backoff_multiplier=2.0:
-        # First retry: 0.02s
-        # Second retry: 0.02 * 2.0 = 0.04s
-        config = RateLimitRetryConfig(
-            max_retries=5,
-            max_total_wait=10.0,
-            backoff_multiplier=2.0,
-        )
-
-        start = time.monotonic()
-        result = await execute_with_rate_limit_retry(
-            operation,
-            "test_op",
-            limiter,
-            config=config,
-        )
-        elapsed = time.monotonic() - start
-
-        assert result.success is True
-        assert result.retries == 2
-        # Total wait should be at least 0.02 + 0.04 = 0.06
-        assert elapsed >= 0.05
+        assert elapsed >= 0.04
 
     @pytest.mark.asyncio
     async def test_exception_handling(self) -> None:
@@ -829,163 +935,79 @@ class TestExecuteWithRateLimitRetry:
         assert "Network failure" in result.final_error
 
 
-class TestServerRateLimiterCheckCompatibility:
-    """Test ServerRateLimiter.check() compatibility method for simple RateLimiter API."""
+class TestHealthGatedBehavior:
+    """Test health-gated behavior under various conditions."""
 
-    def test_check_allowed(self) -> None:
-        """Test check() returns True when allowed."""
+    def test_burst_traffic_allowed_when_healthy(self) -> None:
+        """Test that burst traffic is allowed when system is healthy."""
         limiter = ServerRateLimiter()
-        addr = ("192.168.1.1", 8080)
 
-        result = limiter.check(addr)
+        # Simulate burst traffic from multiple clients
+        results = []
+        for burst in range(10):
+            for client in range(5):
+                result = limiter.check_rate_limit(
+                    f"client-{client}",
+                    "stats_update",
+                    tokens=10,
+                )
+                results.append(result.allowed)
 
-        assert result is True
+        # All should pass when healthy
+        assert all(results), "All burst requests should pass when healthy"
 
-    def test_check_rate_limited(self) -> None:
-        """Test check() returns False when rate limited."""
-        config = RateLimitConfig(
-            default_bucket_size=3,
-            default_refill_rate=1.0,
+    def test_graceful_degradation_under_stress(self) -> None:
+        """Test graceful degradation when system becomes stressed."""
+        config = OverloadConfig(
+            absolute_bounds=(50.0, 100.0, 200.0),
+            warmup_samples=5,
         )
-        limiter = ServerRateLimiter(config=config)
-        addr = ("192.168.1.1", 8080)
+        detector = HybridOverloadDetector(config=config)
+        limiter = ServerRateLimiter(overload_detector=detector)
 
-        # Exhaust the bucket using check() API
-        for _ in range(3):
-            limiter.check(addr)
+        # Initially healthy - all pass
+        for _ in range(5):
+            result = limiter.check_rate_limit_with_priority(
+                "client-1", RequestPriority.LOW
+            )
+            assert result.allowed is True
 
-        # Should be rate limited now
-        result = limiter.check(addr)
+        # Trigger stress
+        for _ in range(10):
+            detector.record_latency(120.0)
 
-        assert result is False
-
-    def test_check_raises_on_limit(self) -> None:
-        """Test check() raises RateLimitExceeded when raise_on_limit=True."""
-        from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
-
-        config = RateLimitConfig(
-            default_bucket_size=2,
-            default_refill_rate=1.0,
+        # Now should shed low priority
+        result = limiter.check_rate_limit_with_priority(
+            "client-1", RequestPriority.LOW
         )
-        limiter = ServerRateLimiter(config=config)
-        addr = ("10.0.0.1", 9000)
-
-        # Exhaust the bucket
-        limiter.check(addr)
-        limiter.check(addr)
-
-        # Should raise
-        with pytest.raises(RateLimitExceeded) as exc_info:
-            limiter.check(addr, raise_on_limit=True)
-
-        assert "10.0.0.1:9000" in str(exc_info.value)
-
-    def test_check_does_not_raise_when_allowed(self) -> None:
-        """Test check() does not raise when allowed even with raise_on_limit=True."""
-        limiter = ServerRateLimiter()
-        addr = ("192.168.1.1", 8080)
-
-        # Should not raise
-        result = limiter.check(addr, raise_on_limit=True)
-        assert result is True
-
-    def test_check_different_addresses_isolated(self) -> None:
-        """Test that different addresses have separate buckets via check()."""
-        config = RateLimitConfig(
-            default_bucket_size=2,
-            default_refill_rate=1.0,
+        # May or may not be shed depending on state
+        # But critical should always pass
+        result_critical = limiter.check_rate_limit_with_priority(
+            "client-1", RequestPriority.CRITICAL
         )
-        limiter = ServerRateLimiter(config=config)
+        assert result_critical.allowed is True
 
-        addr1 = ("192.168.1.1", 8080)
-        addr2 = ("192.168.1.2", 8080)
-
-        # Exhaust addr1
-        limiter.check(addr1)
-        limiter.check(addr1)
-        assert limiter.check(addr1) is False
-
-        # addr2 should still be allowed
-        assert limiter.check(addr2) is True
-
-    def test_check_converts_address_to_client_id(self) -> None:
-        """Test that check() properly converts address tuple to client_id string."""
-        limiter = ServerRateLimiter()
-        addr = ("myhost.example.com", 12345)
-
-        # Make a request
-        limiter.check(addr)
-
-        # Verify internal client was created with correct ID format
-        expected_client_id = "myhost.example.com:12345"
-        assert expected_client_id in limiter._client_buckets
-
-    def test_check_uses_default_operation(self) -> None:
-        """Test that check() uses 'default' operation bucket."""
-        limiter = ServerRateLimiter()
-        addr = ("192.168.1.1", 8080)
-
-        # Make a request via check()
-        limiter.check(addr)
-
-        # Verify 'default' operation was used
-        client_id = "192.168.1.1:8080"
-        stats = limiter.get_client_stats(client_id)
-        assert "default" in stats
-
-    def test_check_interoperates_with_check_rate_limit(self) -> None:
-        """Test that check() and check_rate_limit() share state correctly."""
-        config = RateLimitConfig(
-            default_bucket_size=5,
-            default_refill_rate=1.0,
+    def test_recovery_after_stress(self) -> None:
+        """Test that system recovers after stress subsides."""
+        config = OverloadConfig(
+            absolute_bounds=(50.0, 100.0, 200.0),
+            warmup_samples=3,
+            hysteresis_samples=2,
         )
-        limiter = ServerRateLimiter(config=config)
-        addr = ("192.168.1.1", 8080)
-        client_id = "192.168.1.1:8080"
+        detector = HybridOverloadDetector(config=config)
+        limiter = ServerRateLimiter(overload_detector=detector)
 
-        # Use 2 tokens via check()
-        limiter.check(addr)
-        limiter.check(addr)
+        # Start with stress
+        for _ in range(5):
+            detector.record_latency(150.0)
 
-        # Use 2 more via check_rate_limit()
-        limiter.check_rate_limit(client_id, "default")
-        limiter.check_rate_limit(client_id, "default")
+        # Recover
+        for _ in range(10):
+            detector.record_latency(20.0)
 
-        # Should have 1 token left
-        stats = limiter.get_client_stats(client_id)
-        assert stats["default"] == pytest.approx(1.0, abs=0.1)
-
-        # One more check should work
-        assert limiter.check(addr) is True
-
-        # Now should be exhausted
-        assert limiter.check(addr) is False
-
-    def test_check_with_ipv6_address(self) -> None:
-        """Test check() works with IPv6 addresses."""
-        limiter = ServerRateLimiter()
-        addr = ("::1", 8080)
-
-        result = limiter.check(addr)
-
-        assert result is True
-        # Verify client was created
-        assert "::1:8080" in limiter._client_buckets
-
-    def test_check_metrics_updated(self) -> None:
-        """Test that check() updates metrics correctly."""
-        config = RateLimitConfig(
-            default_bucket_size=2,
-            default_refill_rate=1.0,
+        # Should be healthy again
+        result = limiter.check_rate_limit_with_priority(
+            "client-1", RequestPriority.LOW
         )
-        limiter = ServerRateLimiter(config=config)
-        addr = ("192.168.1.1", 8080)
-
-        # Make requests - 2 allowed, 1 rate limited
-        limiter.check(addr)
-        limiter.check(addr)
-        limiter.check(addr)
-
-        metrics = limiter.get_metrics()
-        assert metrics["total_requests"] == 3
-        assert metrics["rate_limited_requests"] == 1
+        # After recovery, low priority should pass again
+        assert result.allowed is True

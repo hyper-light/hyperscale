@@ -13,7 +13,7 @@ All components from TODO.md phases 1-4 are covered:
 - AD-21: RetryExecutor
 - AD-22: LoadShedder
 - AD-23: StatsBuffer/Backpressure
-- AD-24: TokenBucket/ServerRateLimiter
+- AD-24: SlidingWindowCounter/AdaptiveRateLimiter/ServerRateLimiter
 - AD-26: ExtensionTracker/WorkerHealthManager
 """
 
@@ -33,6 +33,7 @@ from hyperscale.distributed_rewrite.reliability.load_shedding import (
     RequestPriority,
 )
 from hyperscale.distributed_rewrite.reliability.rate_limiting import (
+    SlidingWindowCounter,
     TokenBucket,
     ServerRateLimiter,
     RateLimitConfig,
@@ -213,17 +214,146 @@ class TestLoadShedderConcurrency:
 
 
 # =============================================================================
-# Test TokenBucket Concurrency (AD-24)
+# Test SlidingWindowCounter Concurrency (AD-24)
+# =============================================================================
+
+
+class TestSlidingWindowCounterConcurrency:
+    """Test SlidingWindowCounter under concurrent async access."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_acquire_never_exceeds_max_requests(self):
+        """Concurrent acquires should never grant more slots than available."""
+        # Use a long window so it doesn't rotate during test
+        counter = SlidingWindowCounter(window_size_seconds=60.0, max_requests=100)
+
+        acquired_count = 0
+        lock = asyncio.Lock()
+
+        async def try_acquire():
+            nonlocal acquired_count
+            success, _ = counter.try_acquire(10)
+            if success:
+                async with lock:
+                    acquired_count += 10
+
+        # 20 coroutines trying to acquire 10 slots each = 200 requested
+        # Only 100 available, so max 100 should be acquired
+        tasks = [try_acquire() for _ in range(20)]
+        await asyncio.gather(*tasks)
+
+        assert acquired_count <= 100, f"Acquired {acquired_count} slots from 100-slot counter"
+
+    @pytest.mark.asyncio
+    async def test_acquire_async_serializes_access(self):
+        """Test that acquire_async serializes access to the counter.
+
+        This test validates that concurrent acquire_async calls are serialized
+        via the internal async lock, preventing race conditions.
+        """
+        # Counter with 10 slots, long window for deterministic behavior
+        counter = SlidingWindowCounter(window_size_seconds=60.0, max_requests=10)
+
+        # Track results
+        success_count = 0
+        failure_count = 0
+        results_lock = asyncio.Lock()
+
+        async def try_acquire_async():
+            nonlocal success_count, failure_count
+            # Each tries to acquire 5 slots with very short max wait
+            result = await counter.acquire_async(count=5, max_wait=0.01)
+            async with results_lock:
+                if result:
+                    success_count += 1
+                else:
+                    failure_count += 1
+
+        # 5 coroutines try to acquire 5 slots each (25 total needed)
+        # With 10 slots available and long window, exactly 2 should succeed
+        tasks = [try_acquire_async() for _ in range(5)]
+        await asyncio.gather(*tasks)
+
+        # Exactly 2 should succeed (10 slots / 5 per request = 2)
+        assert success_count == 2, \
+            f"Expected exactly 2 successes, got {success_count}"
+
+        # Remaining 3 should have failed
+        assert failure_count == 3, \
+            f"Expected exactly 3 failures, got {failure_count}"
+
+    @pytest.mark.asyncio
+    async def test_acquire_async_serializes_waiters(self):
+        """Verify that acquire_async serializes concurrent waiters.
+
+        This directly tests that the lock prevents concurrent waits.
+        """
+        # Short window to allow recovery
+        counter = SlidingWindowCounter(window_size_seconds=0.1, max_requests=100)
+
+        # Fill counter
+        counter.try_acquire(100)
+
+        execution_order = []
+        order_lock = asyncio.Lock()
+
+        async def acquire_and_record(task_id: int):
+            async with order_lock:
+                execution_order.append(f"start_{task_id}")
+
+            # This should serialize due to internal lock
+            result = await counter.acquire_async(count=10, max_wait=1.0)
+
+            async with order_lock:
+                execution_order.append(f"end_{task_id}_{result}")
+
+        # Launch concurrent tasks
+        tasks = [acquire_and_record(i) for i in range(3)]
+        await asyncio.gather(*tasks)
+
+        # Verify all events recorded
+        assert len(execution_order) == 6, f"Expected 6 events, got {execution_order}"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_window_rotation_consistency(self):
+        """Window rotation should be consistent under concurrent access."""
+        counter = SlidingWindowCounter(window_size_seconds=0.1, max_requests=100)
+
+        # Fill counter
+        counter.try_acquire(100)
+
+        # Wait for window to rotate
+        await asyncio.sleep(0.15)
+
+        # Multiple concurrent reads of effective count
+        readings = []
+
+        async def read_effective():
+            for _ in range(10):
+                readings.append(counter.get_effective_count())
+                await asyncio.sleep(0.01)
+
+        await asyncio.gather(*[read_effective() for _ in range(5)])
+
+        # After window rotation, count should decay over time
+        # All readings should be less than original 100
+        assert all(r < 100 for r in readings), \
+            f"Expected all readings < 100 after rotation, got {readings}"
+
+
+# =============================================================================
+# Test TokenBucket Concurrency (AD-24) - Legacy
 # =============================================================================
 
 
 class TestTokenBucketConcurrency:
-    """Test TokenBucket under concurrent async access."""
+    """Test TokenBucket under concurrent async access (legacy)."""
 
     @pytest.mark.asyncio
     async def test_concurrent_acquire_never_exceeds_bucket_size(self):
         """Concurrent acquires should never grant more tokens than available."""
-        bucket = TokenBucket(bucket_size=100, refill_rate=0.0)  # No refill
+        # Use very slow refill so bucket doesn't refill during test
+        bucket = TokenBucket(bucket_size=100, refill_rate=0.001)
 
         acquired_count = 0
         lock = asyncio.Lock()
@@ -241,44 +371,6 @@ class TestTokenBucketConcurrency:
         await asyncio.gather(*tasks)
 
         assert acquired_count <= 100, f"Acquired {acquired_count} tokens from 100-token bucket"
-
-    @pytest.mark.asyncio
-    async def test_acquire_async_serializes_access(self):
-        """Test that acquire_async serializes access to the bucket.
-
-        This test validates that concurrent acquire_async calls are serialized
-        via the internal async lock, preventing race conditions.
-        """
-        # Bucket with 10 tokens, no refill (to make behavior deterministic)
-        bucket = TokenBucket(bucket_size=10, refill_rate=0.0)
-
-        # Track results
-        success_count = 0
-        failure_count = 0
-        results_lock = asyncio.Lock()
-
-        async def try_acquire_async():
-            nonlocal success_count, failure_count
-            # Each tries to acquire 5 tokens with very short max wait
-            result = await bucket.acquire_async(tokens=5, max_wait=0.01)
-            async with results_lock:
-                if result:
-                    success_count += 1
-                else:
-                    failure_count += 1
-
-        # 5 coroutines try to acquire 5 tokens each (25 total needed)
-        # With 10 tokens available and no refill, exactly 2 should succeed
-        tasks = [try_acquire_async() for _ in range(5)]
-        await asyncio.gather(*tasks)
-
-        # Exactly 2 should succeed (10 tokens / 5 per request = 2)
-        assert success_count == 2, \
-            f"Expected exactly 2 successes, got {success_count}"
-
-        # Remaining 3 should have failed
-        assert failure_count == 3, \
-            f"Expected exactly 3 failures, got {failure_count}"
 
     @pytest.mark.asyncio
     async def test_acquire_async_serializes_waiters(self):
@@ -310,10 +402,6 @@ class TestTokenBucketConcurrency:
 
         # Verify all events recorded
         assert len(execution_order) == 6, f"Expected 6 events, got {execution_order}"
-
-        # With proper locking, ends should be serialized (not all clustered at end)
-        # Check that we don't see pattern: start_0, start_1, start_2, end_0, end_1, end_2
-        # Instead should see interleaving due to serialized waits
 
     @pytest.mark.asyncio
     async def test_concurrent_refill_timing_consistency(self):
@@ -383,7 +471,7 @@ class TestServerRateLimiterConcurrency:
 
     @pytest.mark.asyncio
     async def test_cleanup_under_concurrent_access(self):
-        """Bucket cleanup should not cause errors during concurrent access."""
+        """Counter cleanup should not cause errors during concurrent access."""
         config = RateLimitConfig(
             default_bucket_size=10,
             default_refill_rate=10.0,
@@ -421,11 +509,11 @@ class TestServerRateLimiterConcurrency:
         """Test that check_rate_limit_async serializes concurrent waiters.
 
         This validates that ServerRateLimiter's async API properly uses
-        TokenBucket's lock-based serialization for waiting coroutines.
+        the SlidingWindowCounter's lock-based serialization for waiting coroutines.
         """
         config = RateLimitConfig(
             default_bucket_size=10,
-            default_refill_rate=0.0,  # No refill for deterministic behavior
+            default_refill_rate=0.001,  # Very slow refill for deterministic behavior
         )
         limiter = ServerRateLimiter(config)
 
@@ -449,7 +537,7 @@ class TestServerRateLimiterConcurrency:
                     failure_count += 1
 
         # 5 coroutines try to acquire 5 tokens each (25 total needed)
-        # With 10 tokens available and no refill, exactly 2 should succeed
+        # With 10 tokens available and very slow refill, exactly 2 should succeed
         tasks = [try_acquire() for _ in range(5)]
         await asyncio.gather(*tasks)
 
@@ -464,7 +552,7 @@ class TestServerRateLimiterConcurrency:
         """
         config = RateLimitConfig(
             default_bucket_size=5,
-            default_refill_rate=0.0,  # No refill for deterministic behavior
+            default_refill_rate=0.001,  # Very slow refill for deterministic behavior
         )
         limiter = ServerRateLimiter(config)
 

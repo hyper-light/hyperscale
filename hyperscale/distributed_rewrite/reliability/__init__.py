@@ -32,11 +32,16 @@ from hyperscale.distributed_rewrite.reliability.backpressure import (
     StatsEntry as StatsEntry,
 )
 from hyperscale.distributed_rewrite.reliability.rate_limiting import (
-    CooperativeRateLimiter as CooperativeRateLimiter,
+    # Core rate limiting
+    SlidingWindowCounter as SlidingWindowCounter,
+    AdaptiveRateLimitConfig as AdaptiveRateLimitConfig,
+    AdaptiveRateLimiter as AdaptiveRateLimiter,
+    ServerRateLimiter as ServerRateLimiter,
     RateLimitConfig as RateLimitConfig,
     RateLimitResult as RateLimitResult,
-    ServerRateLimiter as ServerRateLimiter,
+    # Legacy (kept for backward compatibility)
     TokenBucket as TokenBucket,
+    CooperativeRateLimiter as CooperativeRateLimiter,
     # Retry-after helpers
     is_rate_limit_response as is_rate_limit_response,
     handle_rate_limit_response as handle_rate_limit_response,
