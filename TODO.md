@@ -1,137 +1,345 @@
 # Hyperscale Implementation TODO
 
-## Previously Identified (Some Completed)
-
-- Add fence_token field to JobFinalResult, JobProgress, JobStatusPush
-- Implement fence token validation in Gate handlers
-- Write integration test for fencing tokens
-- ~~Implement Component 4: Direct DC-to-Job-Leader Routing~~ (DONE)
-- ~~Implement Component 5: Client Reconnection~~ (DONE)
+This document tracks implementation progress for architectural decisions AD-18 through AD-27.
+Items are ordered by implementation priority and dependency.
 
 ---
 
-## Priority 0: Critical Bug Fixes
+## Phase 0: Critical Bug Fixes
+
+Must be completed before reliability infrastructure.
 
 - [ ] Fix `_known_gates` not initialized in gate.py (used but never created)
 - [ ] Add per-job locking to gate's job state (race condition with concurrent handlers)
 
 ---
 
-## Priority 1: Reliability Infrastructure (AD-18 to AD-27)
+## Phase 1: Core Infrastructure
 
-### AD-18: Hybrid Overload Detection
+These provide the foundation for all other reliability features.
+
+### 1.1 Module Structure Setup
+
 - [ ] Create `hyperscale/distributed_rewrite/reliability/` module
+- [ ] Create `hyperscale/distributed_rewrite/health/` module
+- [ ] Create `hyperscale/distributed_rewrite/jobs/gates/` module
+- [ ] Create `hyperscale/distributed_rewrite/datacenters/` module
+- [ ] Add `__init__.py` files with proper exports
+
+### 1.2 AD-21: Unified Retry Framework with Jitter
+
+Foundation for all network operations.
+
+- [ ] Implement `JitterStrategy` enum (FULL, EQUAL, DECORRELATED)
+  - [ ] FULL: `random(0, min(cap, base * 2^attempt))`
+  - [ ] EQUAL: `temp/2 + random(0, temp/2)`
+  - [ ] DECORRELATED: `random(base, previous_delay * 3)`
+- [ ] Implement `RetryConfig` dataclass
+  - [ ] `max_attempts: int = 3`
+  - [ ] `base_delay: float = 0.5`
+  - [ ] `max_delay: float = 30.0`
+  - [ ] `jitter: JitterStrategy = JitterStrategy.FULL`
+  - [ ] `retryable_exceptions: tuple[type[Exception], ...]`
+- [ ] Implement `RetryExecutor` class
+  - [ ] `calculate_delay(attempt: int) -> float`
+  - [ ] `async execute(operation, operation_name) -> T`
+- [ ] Add integration tests for retry framework
+
+### 1.3 AD-18: Hybrid Overload Detection
+
+Required by load shedding and health models.
+
 - [ ] Implement `OverloadConfig` dataclass
-- [ ] Implement `HybridOverloadDetector` class with:
-  - [ ] Delta-based detection (EMA baseline, trend calculation)
-  - [ ] Absolute safety bounds
-  - [ ] Resource signal integration (CPU, memory)
+  - [ ] Delta detection params: `ema_alpha`, `current_window`, `trend_window`
+  - [ ] Delta thresholds: `(0.2, 0.5, 1.0)` for busy/stressed/overloaded
+  - [ ] Absolute bounds: `(200.0, 500.0, 2000.0)` ms
+  - [ ] Resource thresholds for CPU and memory
+- [ ] Implement `HybridOverloadDetector` class
+  - [ ] `record_latency(latency_ms: float) -> None`
+  - [ ] `_calculate_trend() -> float` (linear regression on delta history)
+  - [ ] `get_state(cpu_percent, memory_percent) -> str`
+  - [ ] State returns: "healthy" | "busy" | "stressed" | "overloaded"
 - [ ] Add integration tests for overload detection
 
-### AD-19: Three-Signal Worker Health Model
-- [ ] Create `hyperscale/distributed_rewrite/health/` module
-- [ ] Implement `WorkerHealthState` dataclass with:
-  - [ ] Liveness signal (ping/pong tracking)
-  - [ ] Readiness signal (self-reported + capacity)
-  - [ ] Progress signal (completion rate tracking)
+---
+
+## Phase 2: Health Model Infrastructure
+
+Three-signal health model for all node types.
+
+### 2.1 AD-19: Worker Health (Manager monitors Workers)
+
+- [ ] Implement `WorkerHealthState` dataclass
+  - [ ] Liveness: `last_liveness_response`, `consecutive_liveness_failures`
+  - [ ] Readiness: `accepting_work`, `available_capacity`
+  - [ ] Progress: `workflows_assigned`, `completions_last_interval`, `expected_completion_rate`
+- [ ] Implement `liveness` property (30s timeout, 3 consecutive failures)
+- [ ] Implement `readiness` property
+- [ ] Implement `progress_state` property → "idle" | "normal" | "slow" | "degraded" | "stuck"
+- [ ] Implement `get_routing_decision()` → "route" | "drain" | "investigate" | "evict"
+- [ ] Update manager's worker tracking to use `WorkerHealthState`
+- [ ] Add integration tests for worker health model
+
+### 2.2 AD-19: Manager Health (Gate monitors Managers)
+
+- [ ] Implement `ManagerHealthState` dataclass
+  - [ ] Liveness: `last_liveness_response`, `consecutive_liveness_failures`
+  - [ ] Readiness: `has_quorum`, `accepting_jobs`, `active_worker_count`
+  - [ ] Progress: `jobs_accepted_last_interval`, `workflows_dispatched_last_interval`, `expected_throughput`
+- [ ] Implement `liveness`, `readiness`, `progress_state` properties
 - [ ] Implement `get_routing_decision()` method
-- [ ] Update manager's worker tracking to use three-signal model
-- [ ] Add integration tests for health model
+- [ ] Update gate's manager tracking to use `ManagerHealthState`
+- [ ] Integrate with DC Health Classification (AD-16)
+  - [ ] ALL managers NOT liveness → DC = UNHEALTHY
+  - [ ] MAJORITY managers NOT readiness → DC = DEGRADED
+  - [ ] ANY manager progress == "stuck" → DC = DEGRADED
+- [ ] Add integration tests for manager health model
 
-### AD-20: Cancellation Propagation
-- [ ] Add `JobCancelRequest` and `JobCancelResponse` message types
-- [ ] Implement client `cancel_job()` method
-- [ ] Implement gate `_handle_cancel_job()` handler
-- [ ] Implement manager `_handle_cancel_job()` handler
-- [ ] Implement worker cancellation of running workflows
-- [ ] Add idempotency handling for repeated cancellation requests
-- [ ] Add integration tests for cancellation flow
+### 2.3 AD-19: Gate Health (Gates monitor peer Gates)
 
-### AD-21: Unified Retry Framework with Jitter
-- [ ] Implement `JitterStrategy` enum (FULL, EQUAL, DECORRELATED)
-- [ ] Implement `RetryConfig` dataclass
-- [ ] Implement `RetryExecutor` class
-- [ ] Add `calculate_delay()` with all jitter strategies
-- [ ] Refactor existing retry code to use RetryExecutor:
-  - [ ] State sync retries
-  - [ ] Health check retries
-  - [ ] Workflow dispatch retries
-  - [ ] Reconnection retries
-- [ ] Add jitter to heartbeat timing
-- [ ] Add jitter to leader election timeouts
+- [ ] Implement `GateHealthState` dataclass
+  - [ ] Liveness: `last_liveness_response`, `consecutive_liveness_failures`
+  - [ ] Readiness: `has_dc_connectivity`, `connected_dc_count`, `overload_state`
+  - [ ] Progress: `jobs_forwarded_last_interval`, `stats_aggregated_last_interval`, `expected_forward_rate`
+- [ ] Implement `liveness`, `readiness`, `progress_state` properties
+- [ ] Implement `get_routing_decision()` method
+- [ ] Implement `should_participate_in_election() -> bool`
+- [ ] Update gate's peer tracking to use `GateHealthState`
+- [ ] Integrate with leader election (unhealthy gates shouldn't lead)
+- [ ] Add integration tests for gate health model
 
-### AD-22: Load Shedding with Priority Queues
+### 2.4 AD-19: Generic Health Infrastructure
+
+- [ ] Implement `HealthSignals` Protocol
+  - [ ] `liveness: bool`
+  - [ ] `readiness: bool`
+  - [ ] `progress_state: str`
+- [ ] Implement `NodeHealthTracker[T]` generic class
+  - [ ] `update_state(node_id, state)`
+  - [ ] `get_routing_decision(node_id) -> str`
+  - [ ] `get_healthy_nodes() -> list[str]`
+  - [ ] `should_evict(node_id) -> tuple[bool, str]` with correlation check
+- [ ] Implement `HealthPiggyback` for SWIM integration
+  - [ ] `node_id`, `node_type`
+  - [ ] `accepting_work`, `capacity`
+  - [ ] `throughput`, `expected_throughput`
+  - [ ] `overload_state`
+- [ ] Add health piggyback to SWIM protocol messages
+
+---
+
+## Phase 3: Load Management
+
+### 3.1 AD-22: Load Shedding with Priority Queues
+
 - [ ] Implement `RequestPriority` enum
+  - [ ] CRITICAL = 0 (health checks, cancellation, final results, SWIM)
+  - [ ] HIGH = 1 (job submissions, workflow dispatch, state sync)
+  - [ ] NORMAL = 2 (progress updates, stats queries, reconnection)
+  - [ ] LOW = 3 (detailed stats, debug requests)
 - [ ] Implement `LoadShedder` class
-- [ ] Add `classify_request()` for message type → priority mapping
+  - [ ] Constructor takes `HybridOverloadDetector`
+  - [ ] `should_shed(priority: RequestPriority) -> bool`
+  - [ ] `classify_request(message_type: str) -> RequestPriority`
+  - [ ] Shed thresholds: healthy=none, busy=LOW, stressed=NORMAL+LOW, overloaded=all except CRITICAL
 - [ ] Integrate load shedder with gate request handlers
 - [ ] Integrate load shedder with manager request handlers
 - [ ] Add metrics for shed request counts
 - [ ] Add integration tests for load shedding
 
-### AD-23: Backpressure for Stats Updates
+### 3.2 AD-23: Backpressure for Stats Updates
+
 - [ ] Implement `BackpressureLevel` enum
-- [ ] Implement `StatsBuffer` with tiered retention (HOT/WARM/COLD)
-- [ ] Add automatic tier promotion (HOT → WARM → COLD)
+  - [ ] NONE = 0 (accept all)
+  - [ ] THROTTLE = 1 (reduce frequency)
+  - [ ] BATCH = 2 (batched only)
+  - [ ] REJECT = 3 (reject non-critical)
+- [ ] Implement `StatsBuffer` with tiered retention
+  - [ ] HOT: 0-60s, full resolution, ring buffer (max 1000 entries)
+  - [ ] WARM: 1-60min, 10s aggregates (max 360 entries)
+  - [ ] COLD: 1-24h, 1min aggregates (max 1440 entries)
+  - [ ] ARCHIVE: final summary only
+- [ ] Implement automatic tier promotion (HOT → WARM → COLD)
 - [ ] Implement `get_backpressure_level()` based on buffer fill
+  - [ ] < 70% → NONE
+  - [ ] 70-85% → THROTTLE
+  - [ ] 85-95% → BATCH
+  - [ ] > 95% → REJECT
 - [ ] Add backpressure signaling in stats update responses
 - [ ] Update stats senders to respect backpressure signals
 - [ ] Add integration tests for backpressure
 
-### AD-24: Rate Limiting
+### 3.3 AD-24: Rate Limiting
+
 - [ ] Implement `TokenBucket` class
-- [ ] Implement `ServerRateLimiter` with per-client buckets
-- [ ] Add rate limit configuration per operation type
+  - [ ] `__init__(bucket_size: int, refill_rate: float)`
+  - [ ] `async acquire(tokens: int = 1) -> bool`
+  - [ ] `_refill()` based on elapsed time
+- [ ] Implement `RateLimitConfig` dataclass
+  - [ ] Per-operation limits
+- [ ] Implement `ServerRateLimiter` class
+  - [ ] Per-client token buckets: `dict[str, TokenBucket]`
+  - [ ] `check_rate_limit(client_id, operation) -> tuple[bool, float]`
+  - [ ] Returns `(allowed, retry_after_seconds)`
 - [ ] Integrate rate limiter with gate handlers
-- [ ] Add 429 response handling with Retry-After header
+- [ ] Add 429 response handling with Retry-After
 - [ ] Add client-side cooperative rate limiting
-- [ ] Add bucket cleanup for inactive clients
+- [ ] Add bucket cleanup for inactive clients (prevent memory leak)
 - [ ] Add integration tests for rate limiting
 
-### AD-25: Version Skew Handling
+---
+
+## Phase 4: Protocol Extensions
+
+### 4.1 AD-20: Cancellation Propagation
+
+- [ ] Add `JobCancelRequest` message type
+  - [ ] `job_id: str`
+  - [ ] `requester_id: str`
+  - [ ] `timestamp: float`
+  - [ ] `fence_token: int`
+- [ ] Add `JobCancelResponse` message type
+  - [ ] `job_id: str`
+  - [ ] `success: bool`
+  - [ ] `cancelled_workflow_count: int`
+  - [ ] `error: str | None`
+- [ ] Implement client `cancel_job(job_id) -> JobCancelResponse`
+- [ ] Implement gate `_handle_cancel_job()` handler
+  - [ ] Forward to appropriate manager(s)
+  - [ ] Aggregate responses from all DCs
+- [ ] Implement manager `_handle_cancel_job()` handler
+  - [ ] Cancel dispatched workflows on workers
+  - [ ] Update job state to CANCELLED
+- [ ] Implement worker workflow cancellation
+  - [ ] Cancel running workflow tasks
+  - [ ] Report cancellation to manager
+- [ ] Add idempotency handling (repeated cancel returns success)
+- [ ] Add integration tests for cancellation flow
+
+### 4.2 AD-26: Adaptive Healthcheck Extensions
+
+- [ ] Implement `ExtensionTracker` dataclass
+  - [ ] `worker_id: str`
+  - [ ] `base_deadline: float = 30.0`
+  - [ ] `min_grant: float = 1.0`
+  - [ ] `max_extensions: int = 5`
+  - [ ] `extension_count: int = 0`
+  - [ ] `last_progress: float = 0.0`
+  - [ ] `total_extended: float = 0.0`
+- [ ] Implement `request_extension(reason, current_progress) -> tuple[bool, float]`
+  - [ ] Logarithmic grant: `max(min_grant, base / 2^extension_count)`
+  - [ ] Deny if no progress since last extension
+  - [ ] Deny if max_extensions exceeded
+- [ ] Implement `reset()` for tracker cleanup
+- [ ] Add `HealthcheckExtensionRequest` message type
+  - [ ] `worker_id`, `reason`, `current_progress`, `estimated_completion`, `active_workflow_count`
+- [ ] Add `HealthcheckExtensionResponse` message type
+  - [ ] `granted`, `extension_seconds`, `new_deadline`, `remaining_extensions`, `denial_reason`
+- [ ] Implement `WorkerHealthManager` class
+  - [ ] `handle_extension_request()` with tracker management
+  - [ ] `on_worker_healthy()` to reset tracker
+- [ ] Integrate with manager's worker health tracking
+- [ ] Add integration tests for extension protocol
+
+### 4.3 AD-25: Version Skew Handling
+
 - [ ] Implement `ProtocolVersion` dataclass
+  - [ ] `major: int`, `minor: int`
+  - [ ] `is_compatible_with(other) -> bool` (same major)
+  - [ ] `supports_feature(other, feature) -> bool`
+- [ ] Define feature version map
+  - [ ] `"cancellation": (1, 0)`
+  - [ ] `"batched_stats": (1, 1)`
+  - [ ] `"client_reconnection": (1, 2)`
+  - [ ] `"fence_tokens": (1, 2)`
 - [ ] Implement `NodeCapabilities` dataclass
+  - [ ] `protocol_version: ProtocolVersion`
+  - [ ] `capabilities: set[str]`
+  - [ ] `node_version: str`
+  - [ ] `negotiate(other) -> set[str]`
 - [ ] Add version/capability fields to handshake messages
-- [ ] Implement `is_compatible_with()` check
-- [ ] Implement `negotiate()` for capability intersection
 - [ ] Update message serialization to ignore unknown fields
 - [ ] Add protocol version validation on connection
 - [ ] Add integration tests for version compatibility
 
-### AD-26: Adaptive Healthcheck Extensions
-- [ ] Implement `ExtensionTracker` dataclass
-- [ ] Add `HealthcheckExtensionRequest` message type
-- [ ] Add `HealthcheckExtensionResponse` message type
-- [ ] Implement logarithmic grant reduction
-- [ ] Add progress validation before granting extensions
-- [ ] Integrate with manager's worker health tracking
-- [ ] Add integration tests for extension protocol
+---
 
-### AD-27: Gate Module Reorganization
-- [ ] Create `hyperscale/distributed_rewrite/jobs/gates/` module
+## Phase 5: Module Reorganization (AD-27)
+
+Extract classes from monolithic files into focused modules.
+
+### 5.1 Gate Job Management
+
 - [ ] Extract `GateJobManager` class from gate.py
+  - [ ] Per-job state with locking
+  - [ ] Job lifecycle management
 - [ ] Extract `JobForwardingTracker` class from gate.py
-- [ ] Extract `ConsistentHashRing` class from gate.py
-- [ ] Create `hyperscale/distributed_rewrite/datacenters/` module
+  - [ ] Cross-gate job forwarding logic
+- [ ] Extract `ConsistentHashRing` class
+  - [ ] Per-job gate ownership calculation
+- [ ] Update gate.py imports
+
+### 5.2 Datacenter Management
+
 - [ ] Extract `DatacenterHealthManager` class
+  - [ ] DC health classification logic
+  - [ ] Manager health aggregation
 - [ ] Extract `ManagerDispatcher` class
-- [ ] Update gate.py imports to use new modules
-- [ ] Add tests for each extracted class
+  - [ ] Manager selection and routing
+- [ ] Extract `LeaseManager` class (if applicable)
+- [ ] Update gate.py imports
+
+### 5.3 Reliability Module
+
+- [ ] Move `RetryExecutor` to `reliability/retry.py`
+- [ ] Move `HybridOverloadDetector` to `reliability/overload.py`
+- [ ] Move `LoadShedder` to `reliability/load_shedding.py`
+- [ ] Move `StatsBuffer` to `reliability/backpressure.py`
+- [ ] Move `TokenBucket`, `ServerRateLimiter` to `reliability/rate_limiting.py`
+- [ ] Create `reliability/jitter.py` for jitter utilities
+- [ ] Add unified exports in `reliability/__init__.py`
+
+### 5.4 Health Module
+
+- [ ] Move `WorkerHealthState` to `health/worker_health.py`
+- [ ] Move `ManagerHealthState` to `health/manager_health.py`
+- [ ] Move `GateHealthState` to `health/gate_health.py`
+- [ ] Move `NodeHealthTracker` to `health/tracker.py`
+- [ ] Move `ExtensionTracker` to `health/extension_tracker.py`
+- [ ] Add `health/probes.py` for liveness/readiness probe implementations
+- [ ] Add unified exports in `health/__init__.py`
 
 ---
 
-## Priority 2: Extended SWIM Integration
+## Phase 6: SWIM Protocol Extensions
 
-- [ ] Extend SWIM protocol for overload signaling (piggyback overload state)
-- [ ] Add work-aware health signal to SWIM heartbeats
-- [ ] Implement adaptive timeout scaling based on reported load
-- [ ] Add out-of-band health channel for high-priority probes
+### 6.1 Health State Piggyback
+
+- [ ] Add `HealthPiggyback` to SWIM message embedding
+- [ ] Update `StateEmbedder` to include health signals
+- [ ] Parse health piggyback in SWIM message handlers
+
+### 6.2 Overload Signaling
+
+- [ ] Piggyback overload state on SWIM messages
+- [ ] React to peer overload state (reduce traffic)
+
+### 6.3 Adaptive Timeouts
+
+- [ ] Scale SWIM probe timeouts based on reported load
+- [ ] Implement out-of-band health channel for high-priority probes
 
 ---
 
-## Priority 3: Remaining Gate Per-Job Leadership Components
+## Phase 7: Remaining Items
 
-Reference: See "Gate Per-Job Leadership Architecture" in docs/architecture.md
+### Previously Identified
+
+- [ ] Add `fence_token` field to `JobFinalResult`, `JobProgress`, `JobStatusPush`
+- [ ] Implement fence token validation in Gate handlers
+- [ ] Write integration test for fencing tokens
+
+### Gate Per-Job Leadership
 
 - [ ] Verify and enhance failover logic for gate leadership transfer
 - [ ] Implement cross-DC correlation for eviction decisions
@@ -141,6 +349,23 @@ Reference: See "Gate Per-Job Leadership Architecture" in docs/architecture.md
 
 ## Testing Requirements
 
-- Integration tests should follow patterns in `tests/integration/`
-- DO NOT run integration tests directly - user will run and confirm
+- Integration tests follow patterns in `tests/integration/`
+- **DO NOT run integration tests directly** - user will run and confirm
 - Each new class should have corresponding test file
+- Test files named `test_<module_name>.py`
+
+---
+
+## Reference
+
+All architectural decisions documented in `docs/architecture.md`:
+- AD-18: Hybrid Overload Detection (Delta + Absolute)
+- AD-19: Three-Signal Health Model (All Node Types)
+- AD-20: Cancellation Propagation
+- AD-21: Unified Retry Framework with Jitter
+- AD-22: Load Shedding with Priority Queues
+- AD-23: Backpressure for Stats Updates
+- AD-24: Rate Limiting (Client and Server)
+- AD-25: Version Skew Handling
+- AD-26: Adaptive Healthcheck Extensions
+- AD-27: Gate Module Reorganization
