@@ -2635,9 +2635,26 @@ class GateServer(HealthAwareServer):
         - Tier 2 (Periodic): Regular progress → batched
 
         Validates fence tokens to reject stale updates from old job owners.
+
+        Forwarding: If we don't own this job (not in _jobs), forward to peer gates
+        since we may have received this due to stale origin_gate_addr in manager.
         """
         try:
             progress = JobProgress.load(data)
+
+            # Check if we own this job - if not, forward to peers
+            if progress.job_id not in self._jobs:
+                # We don't own this job - forward to peer gates
+                forwarded = await self._forward_job_progress_to_peers(progress)
+                if forwarded:
+                    # Still return ack with topology info
+                    ack = JobProgressAck(
+                        gate_id=self._node_id.full,
+                        is_leader=self.is_leader(),
+                        healthy_gates=self._get_healthy_gates(),
+                    )
+                    return ack.dump()
+                # No peers to forward to - continue processing locally
 
             # Validate fence token - reject stale updates
             current_fence = self._job_fence_tokens.get(progress.job_id, 0)
@@ -2910,9 +2927,30 @@ class GateServer(HealthAwareServer):
 
         Aggregates results from all DCs and sends GlobalJobResult to client.
         Validates fence tokens to reject stale results from old job owners.
+
+        Forwarding: If we don't own this job (not in _jobs), forward to peer gates
+        since we may have received this due to stale origin_gate_addr in manager.
         """
         try:
             result = JobFinalResult.load(data)
+
+            # Check if we own this job - if not, forward to peers
+            if result.job_id not in self._jobs:
+                # We don't own this job - forward to peer gates
+                forwarded = await self._forward_job_result_to_peers(result)
+                if forwarded:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=f"Forwarded job final result for {result.job_id} to peer gates",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return b'ok'
+                # No peers to forward to, or we're the leader - process locally
+                # This can happen during startup or single-gate deployments
 
             # Validate fence token - reject stale results
             current_fence = self._job_fence_tokens.get(result.job_id, 0)
@@ -2962,6 +3000,54 @@ class GateServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "job_final_result")
             return b'error'
+
+    async def _forward_job_result_to_peers(self, result: JobFinalResult) -> bool:
+        """
+        Forward a job final result to peer gates that may own the job.
+
+        Returns True if forwarded to at least one peer.
+        """
+        forwarded = False
+        for gate_id, gate_info in list(self._known_gates.items()):
+            if gate_id == self._node_id.full:
+                continue  # Don't forward to self
+            try:
+                gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
+                await self.send_tcp(
+                    gate_addr,
+                    "job_final_result",
+                    result.dump(),
+                    timeout=3.0,
+                )
+                forwarded = True
+                break  # Only forward to one peer, they'll handle routing
+            except Exception:
+                continue  # Try next peer
+        return forwarded
+
+    async def _forward_job_progress_to_peers(self, progress: JobProgress) -> bool:
+        """
+        Forward job progress to peer gates that may own the job.
+
+        Returns True if forwarded to at least one peer.
+        """
+        forwarded = False
+        for gate_id, gate_info in list(self._known_gates.items()):
+            if gate_id == self._node_id.full:
+                continue  # Don't forward to self
+            try:
+                gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
+                await self.send_tcp(
+                    gate_addr,
+                    "job_progress",
+                    progress.dump(),
+                    timeout=2.0,
+                )
+                forwarded = True
+                break  # Only forward to one peer, they'll handle routing
+            except Exception:
+                continue  # Try next peer
+        return forwarded
     
     async def _send_global_job_result(self, job_id: str) -> None:
         """
