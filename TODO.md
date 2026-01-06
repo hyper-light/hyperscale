@@ -348,13 +348,17 @@ Extract classes from monolithic files into focused modules.
 
 ### 5.2 Datacenter Management
 
-- [ ] Extract `DatacenterHealthManager` class
-  - [ ] DC health classification logic
-  - [ ] Manager health aggregation
-- [ ] Extract `ManagerDispatcher` class
-  - [ ] Manager selection and routing
-- [ ] Extract `LeaseManager` class (if applicable)
-- [ ] Update gate.py imports
+- [x] Extract `DatacenterHealthManager` class
+  - [x] DC health classification logic
+  - [x] Manager health aggregation
+- [x] Extract `ManagerDispatcher` class
+  - [x] Manager selection and routing
+- [x] Extract `LeaseManager` class
+  - [x] At-most-once delivery via leases
+  - [x] Fence token validation
+  - [x] Lease transfer between gates
+- [x] Add integration tests for datacenter management
+- [ ] Update gate.py imports (deferred - requires larger refactor)
 
 ### 5.3 Reliability Module
 
