@@ -418,9 +418,6 @@ class RemoteGraphManager:
                 ]
 
                 for pending in ready_workflows:
-                    # Acquire cores before dispatching
-                    await self._provisioner.acquire(pending.threads)
-
                     pending.dispatched = True
                     pending.ready_event.clear()
 
@@ -945,8 +942,6 @@ class RemoteGraphManager:
                 )
 
                 if skip_reporting:
-                    self._provisioner.release(threads)
-
                     return (
                         workflow.name,
                         results,
@@ -1062,11 +1057,9 @@ class RemoteGraphManager:
                 await asyncio.sleep(1)
 
                 await ctx.log_prepared(
-                    message=f"Workflow {workflow.name} run {run_id} complete - releasing workers from pool",
+                    message=f"Workflow {workflow.name} run {run_id} complete",
                     name="debug",
                 )
-
-                self._provisioner.release(threads)
 
                 return (workflow.name, execution_result, updated_context, timeout_error)
 
@@ -1077,7 +1070,6 @@ class RemoteGraphManager:
         ) as err:
             import traceback
             print(traceback.format_exc())
-            self._provisioner.release(threads)
             await update_active_workflow_message(workflow_slug, "Aborted")
 
             raise err
