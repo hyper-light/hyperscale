@@ -19,3 +19,7 @@ from hyperscale.distributed_rewrite.health.worker_health import (
     WorkerHealthConfig as WorkerHealthConfig,
     WorkerHealthState as WorkerHealthState,
 )
+from hyperscale.distributed_rewrite.health.manager_health import (
+    ManagerHealthConfig as ManagerHealthConfig,
+    ManagerHealthState as ManagerHealthState,
+)

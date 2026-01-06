@@ -89,6 +89,11 @@ from hyperscale.distributed_rewrite.swim.core import (
     ErrorStats,
     CircuitState,
 )
+from hyperscale.distributed_rewrite.health import (
+    ManagerHealthState,
+    ManagerHealthConfig,
+    RoutingDecision,
+)
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 
@@ -171,6 +176,11 @@ class GateServer(HealthAwareServer):
         # Stored per-datacenter, per-manager for proper aggregation
         self._datacenter_manager_status: dict[str, dict[tuple[str, int], ManagerHeartbeat]] = {}  # dc -> {manager_addr -> heartbeat}
         self._manager_last_status: dict[tuple[str, int], float] = {}  # manager_addr -> timestamp
+
+        # Three-signal health state for managers (AD-19)
+        # Maps (dc, manager_addr) -> ManagerHealthState
+        self._manager_health: dict[tuple[str, tuple[str, int]], ManagerHealthState] = {}
+        self._manager_health_config = ManagerHealthConfig()
         
         # Versioned state clock for rejecting stale updates
         # Tracks per-datacenter versions using Lamport timestamps
@@ -383,12 +393,32 @@ class GateServer(HealthAwareServer):
         # Store per-datacenter, per-manager using heartbeat's self-reported address
         dc = heartbeat.datacenter
         manager_addr = (heartbeat.tcp_host, heartbeat.tcp_port) if heartbeat.tcp_host else source_addr
-        
+
         if dc not in self._datacenter_manager_status:
             self._datacenter_manager_status[dc] = {}
         self._datacenter_manager_status[dc][manager_addr] = heartbeat
         self._manager_last_status[manager_addr] = time.monotonic()
-        
+
+        # Update three-signal health state (AD-19)
+        manager_key = (dc, manager_addr)
+        health_state = self._manager_health.get(manager_key)
+        if not health_state:
+            health_state = ManagerHealthState(
+                manager_id=heartbeat.node_id,
+                datacenter_id=dc,
+                config=self._manager_health_config,
+            )
+            self._manager_health[manager_key] = health_state
+
+        # Update signals from heartbeat
+        health_state.update_liveness(success=True)
+        health_state.update_readiness(
+            has_quorum=heartbeat.has_quorum,
+            accepting=heartbeat.accepting_jobs,
+            worker_count=heartbeat.healthy_worker_count,
+        )
+        # Progress is updated from throughput metrics if available
+
         # Update version tracking via TaskRunner
         self._task_runner.run(
             self._versioned_clock.update_entity, dc_key, heartbeat.version
@@ -936,7 +966,112 @@ class GateServer(HealthAwareServer):
             dc_id: self._classify_datacenter_health(dc_id)
             for dc_id in self._datacenter_managers.keys()
         }
-    
+
+    # =========================================================================
+    # Three-Signal Manager Health (AD-19)
+    # =========================================================================
+
+    def _get_manager_health_state(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+    ) -> ManagerHealthState | None:
+        """Get the three-signal health state for a manager."""
+        manager_key = (dc_id, manager_addr)
+        return self._manager_health.get(manager_key)
+
+    def _get_manager_routing_decision(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+    ) -> RoutingDecision | None:
+        """Get routing decision for a manager based on three-signal health."""
+        health_state = self._get_manager_health_state(dc_id, manager_addr)
+        if health_state:
+            return health_state.get_routing_decision()
+        return None
+
+    def _get_routable_managers_in_dc(self, dc_id: str) -> list[tuple[str, int]]:
+        """
+        Get list of managers in a DC that can receive new jobs.
+
+        Returns managers where routing decision is ROUTE.
+        """
+        routable: list[tuple[str, int]] = []
+        for manager_addr in self._datacenter_managers.get(dc_id, []):
+            decision = self._get_manager_routing_decision(dc_id, manager_addr)
+            # If no health state yet, consider routable (optimistic)
+            if decision is None or decision == RoutingDecision.ROUTE:
+                routable.append(manager_addr)
+        return routable
+
+    def _get_dc_health_from_managers(self, dc_id: str) -> DatacenterHealth:
+        """
+        Classify DC health based on manager health signals (AD-19).
+
+        Rules:
+        - ALL managers NOT liveness → DC = UNHEALTHY
+        - MAJORITY managers NOT readiness → DC = DEGRADED
+        - ANY manager progress == "stuck" → DC = DEGRADED
+        - Otherwise → HEALTHY
+        """
+        manager_addrs = self._datacenter_managers.get(dc_id, [])
+        if not manager_addrs:
+            return DatacenterHealth.UNHEALTHY
+
+        live_count = 0
+        ready_count = 0
+        has_stuck = False
+        total = len(manager_addrs)
+
+        for manager_addr in manager_addrs:
+            health_state = self._get_manager_health_state(dc_id, manager_addr)
+            if health_state:
+                if health_state.liveness:
+                    live_count += 1
+                if health_state.readiness:
+                    ready_count += 1
+                if health_state.progress_state.value == "stuck":
+                    has_stuck = True
+            else:
+                # No health state yet - assume live for new managers
+                live_count += 1
+
+        # ALL managers NOT liveness → UNHEALTHY
+        if live_count == 0:
+            return DatacenterHealth.UNHEALTHY
+
+        # MAJORITY managers NOT readiness → DEGRADED
+        quorum = total // 2 + 1
+        if ready_count < quorum:
+            return DatacenterHealth.DEGRADED
+
+        # ANY manager stuck → DEGRADED
+        if has_stuck:
+            return DatacenterHealth.DEGRADED
+
+        return DatacenterHealth.HEALTHY
+
+    def _get_managers_to_evict(self, dc_id: str) -> list[tuple[str, int]]:
+        """Get list of managers that should be evicted based on health signals."""
+        evict: list[tuple[str, int]] = []
+        for manager_addr in self._datacenter_managers.get(dc_id, []):
+            decision = self._get_manager_routing_decision(dc_id, manager_addr)
+            if decision == RoutingDecision.EVICT:
+                evict.append(manager_addr)
+        return evict
+
+    def _get_manager_health_diagnostics(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+    ) -> dict | None:
+        """Get diagnostic information for a manager's health state."""
+        health_state = self._get_manager_health_state(dc_id, manager_addr)
+        if health_state:
+            return health_state.get_diagnostics()
+        return None
+
     def _get_available_datacenters(self) -> list[str]:
         """
         Get list of healthy datacenters (for backwards compatibility).

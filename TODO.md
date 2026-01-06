@@ -105,12 +105,12 @@ Three-signal health model for all node types.
 
 ### 2.2 AD-19: Manager Health (Gate monitors Managers)
 
-- [ ] Implement `ManagerHealthState` dataclass
-  - [ ] Liveness: `last_liveness_response`, `consecutive_liveness_failures`
-  - [ ] Readiness: `has_quorum`, `accepting_jobs`, `active_worker_count`
-  - [ ] Progress: `jobs_accepted_last_interval`, `workflows_dispatched_last_interval`, `expected_throughput`
-- [ ] Implement `liveness`, `readiness`, `progress_state` properties
-- [ ] Implement `get_routing_decision()` method
+- [x] Implement `ManagerHealthState` dataclass
+  - [x] Liveness: `last_liveness_response`, `consecutive_liveness_failures`
+  - [x] Readiness: `has_quorum`, `accepting_jobs`, `active_worker_count`
+  - [x] Progress: `jobs_accepted_last_interval`, `workflows_dispatched_last_interval`, `expected_throughput`
+- [x] Implement `liveness`, `readiness`, `progress_state` properties
+- [x] Implement `get_routing_decision()` method
 - [ ] Update gate's manager tracking to use `ManagerHealthState`
 - [ ] Integrate with DC Health Classification (AD-16)
   - [ ] ALL managers NOT liveness → DC = UNHEALTHY
