@@ -492,6 +492,908 @@ async def _dispatch_job_to_datacenters(
     await self._dispatch_job_with_fallback(submission, primary_dcs, fallback_dcs)
 ```
 
+### AD-18: Hybrid Overload Detection (Delta + Absolute)
+
+**Decision**: Use delta-based detection with absolute safety bounds for overload detection.
+
+**Rationale**:
+- Fixed thresholds cause flapping and require per-workload tuning
+- Delta-based detection (rate of change) is self-calibrating
+- Pure delta misses absolute capacity limits and suffers baseline drift
+- Hybrid approach combines benefits of both
+
+**Detection Model**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Hybrid Overload Detection                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Primary: Delta-based (% above EMA baseline + trend slope)     │
+│  ├─ Tracks latency/queue depth relative to baseline            │
+│  ├─ Uses Exponential Moving Average for baseline               │
+│  ├─ Calculates trend via linear regression on delta history    │
+│  └─ Self-calibrates to workload characteristics                │
+│                                                                 │
+│  Secondary: Absolute safety bounds (hard limits)               │
+│  ├─ Prevents baseline drift masking real problems              │
+│  ├─ Catches "stable but maxed out" scenarios                   │
+│  └─ Example: latency > 5000ms = overloaded regardless          │
+│                                                                 │
+│  Tertiary: Resource signals (CPU, memory, queue depth)         │
+│  ├─ Provides capacity awareness                                │
+│  └─ Catches "about to fail" before latency spikes              │
+│                                                                 │
+│  Final State = max(delta_state, absolute_state, resource_state)│
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**State Levels**:
+| State | Delta Threshold | Absolute Bound | Action |
+|-------|-----------------|----------------|--------|
+| healthy | < 20% above baseline | < 200ms | Normal operation |
+| busy | 20-50% above baseline | 200-500ms | Reduce new work |
+| stressed | 50-100% above baseline | 500-2000ms | Shed low-priority |
+| overloaded | > 100% above baseline OR rising trend | > 2000ms | Emergency shed |
+
+**Implementation**:
+```python
+@dataclass
+class OverloadConfig:
+    """Configuration for hybrid overload detection."""
+    # Delta detection
+    ema_alpha: float = 0.1  # Smoothing factor for baseline
+    current_window: int = 10  # Samples for current average
+    trend_window: int = 20  # Samples for trend calculation
+    delta_thresholds: tuple[float, float, float] = (0.2, 0.5, 1.0)  # busy/stressed/overloaded
+
+    # Absolute bounds (safety rails)
+    absolute_bounds: tuple[float, float, float] = (200.0, 500.0, 2000.0)
+
+    # Resource signals
+    cpu_thresholds: tuple[float, float, float] = (0.7, 0.85, 0.95)
+    memory_thresholds: tuple[float, float, float] = (0.7, 0.85, 0.95)
+
+class HybridOverloadDetector:
+    """Combines delta-based and absolute detection."""
+
+    def __init__(self, config: OverloadConfig | None = None):
+        self._config = config or OverloadConfig()
+        self._baseline_ema: float = 0.0
+        self._recent: deque[float] = deque(maxlen=self._config.current_window)
+        self._delta_history: deque[float] = deque(maxlen=self._config.trend_window)
+
+    def record_latency(self, latency_ms: float) -> None:
+        """Record a latency sample and update state."""
+        # Update baseline EMA
+        if self._baseline_ema == 0.0:
+            self._baseline_ema = latency_ms
+        else:
+            alpha = self._config.ema_alpha
+            self._baseline_ema = alpha * latency_ms + (1 - alpha) * self._baseline_ema
+
+        self._recent.append(latency_ms)
+
+        # Calculate delta (% above baseline)
+        if self._baseline_ema > 0:
+            current_avg = sum(self._recent) / len(self._recent)
+            delta = (current_avg - self._baseline_ema) / self._baseline_ema
+            self._delta_history.append(delta)
+
+    def get_state(self, cpu_percent: float = 0.0, memory_percent: float = 0.0) -> str:
+        """Get current overload state using hybrid detection."""
+        states = []
+
+        # Delta-based state
+        if len(self._recent) >= 3:
+            current_avg = sum(self._recent) / len(self._recent)
+            delta = (current_avg - self._baseline_ema) / max(self._baseline_ema, 1.0)
+            trend = self._calculate_trend()
+
+            if delta > self._config.delta_thresholds[2] or trend > 0.1:
+                states.append("overloaded")
+            elif delta > self._config.delta_thresholds[1]:
+                states.append("stressed")
+            elif delta > self._config.delta_thresholds[0]:
+                states.append("busy")
+            else:
+                states.append("healthy")
+
+        # Absolute bound state
+        if self._recent:
+            current_avg = sum(self._recent) / len(self._recent)
+            if current_avg > self._config.absolute_bounds[2]:
+                states.append("overloaded")
+            elif current_avg > self._config.absolute_bounds[1]:
+                states.append("stressed")
+            elif current_avg > self._config.absolute_bounds[0]:
+                states.append("busy")
+
+        # Resource state
+        cpu = cpu_percent / 100.0
+        if cpu > self._config.cpu_thresholds[2]:
+            states.append("overloaded")
+        elif cpu > self._config.cpu_thresholds[1]:
+            states.append("stressed")
+        elif cpu > self._config.cpu_thresholds[0]:
+            states.append("busy")
+
+        # Return worst state
+        state_order = {"healthy": 0, "busy": 1, "stressed": 2, "overloaded": 3}
+        return max(states, key=lambda s: state_order.get(s, 0)) if states else "healthy"
+```
+
+**Advantages**:
+- Self-calibrating: adapts to workload characteristics
+- Less configuration: works across different deployments
+- Catches both gradual degradation AND absolute limits
+- Trend detection provides early warning
+
+**Disadvantages**:
+- Warm-up period required (mitigated by absolute bounds)
+- More complex than simple thresholds
+- Baseline drift possible over long periods (mitigated by absolute bounds)
+
+### AD-19: Three-Signal Worker Health Model
+
+**Decision**: Separate worker health into three independent signals: Liveness, Readiness, and Progress.
+
+**Rationale**:
+- Workers run CPU/memory-intensive workloads by design
+- Conflating "can't accept work" with "dead" causes premature eviction
+- Resource metrics alone are meaningless for heavy workloads
+- Progress (workflow completion) is ground truth
+
+**Health Model**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 Three-Signal Worker Health Model                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │  LIVENESS   │  │  READINESS  │  │  PROGRESS   │             │
+│  │             │  │             │  │             │             │
+│  │ Can respond │  │ Can accept  │  │ Completing  │             │
+│  │ to probes?  │  │ new work?   │  │ workflows?  │             │
+│  │             │  │             │  │             │             │
+│  │ Binary:     │  │ Binary:     │  │ Rate-based: │             │
+│  │ yes/no      │  │ yes/no      │  │ completions │             │
+│  │             │  │             │  │ per interval│             │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+│         │                │                │                     │
+│         ▼                ▼                ▼                     │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                   Decision Matrix                        │   │
+│  ├─────────────────────────────────────────────────────────┤   │
+│  │ Liveness  Readiness  Progress   →  Action               │   │
+│  │ ────────  ─────────  ────────      ──────────────────── │   │
+│  │ YES       YES        NORMAL     →  HEALTHY (route work) │   │
+│  │ YES       NO         NORMAL     →  BUSY (drain only)    │   │
+│  │ YES       YES        LOW        →  SLOW (investigate)   │   │
+│  │ YES       NO         LOW        →  DEGRADED (drain)     │   │
+│  │ YES       *          ZERO       →  STUCK (drain+timer)  │   │
+│  │ NO        *          *          →  SUSPECT (begin evict)│   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Signal Definitions**:
+
+| Signal | Question | Measurement | Failure Threshold |
+|--------|----------|-------------|-------------------|
+| Liveness | Is process alive? | Ping/pong response | 3 consecutive misses, 30s timeout |
+| Readiness | Can accept work? | Self-reported + capacity | `accepting_work=false` OR `capacity=0` |
+| Progress | Is work completing? | Completions per interval | `actual_rate < expected_rate * 0.3` |
+
+**Implementation**:
+```python
+@dataclass
+class WorkerHealthState:
+    """Unified health state combining all three signals."""
+    worker_id: str
+
+    # Signal 1: Liveness
+    last_liveness_response: float  # timestamp
+    consecutive_liveness_failures: int
+
+    # Signal 2: Readiness
+    accepting_work: bool  # reported by worker
+    available_capacity: int
+
+    # Signal 3: Progress
+    workflows_assigned: int
+    completions_last_interval: int
+    expected_completion_rate: float
+
+    @property
+    def liveness(self) -> bool:
+        """Is the worker process alive and responsive?"""
+        time_since_response = time.monotonic() - self.last_liveness_response
+        return (
+            time_since_response < 30.0
+            and self.consecutive_liveness_failures < 3
+        )
+
+    @property
+    def readiness(self) -> bool:
+        """Can the worker accept new work?"""
+        return self.accepting_work and self.available_capacity > 0
+
+    @property
+    def progress_state(self) -> str:
+        """Is work completing at expected rate?"""
+        if self.workflows_assigned == 0:
+            return "idle"
+
+        actual_rate = self.completions_last_interval / max(self.workflows_assigned, 1)
+
+        if actual_rate >= self.expected_completion_rate * 0.8:
+            return "normal"
+        elif actual_rate >= self.expected_completion_rate * 0.3:
+            return "slow"
+        elif actual_rate > 0:
+            return "degraded"
+        else:
+            return "stuck"
+
+    def get_routing_decision(self) -> str:
+        """Determine action: route, drain, investigate, or evict."""
+        if not self.liveness:
+            return "evict"
+
+        progress = self.progress_state
+
+        if progress == "stuck" and self.workflows_assigned > 0:
+            return "evict"
+
+        if progress in ("slow", "degraded"):
+            return "investigate"
+
+        if not self.readiness:
+            return "drain"
+
+        return "route"
+```
+
+**Why This Model Is Correct**:
+| Alternative | Problem |
+|-------------|---------|
+| Single health score | Conflates independent failure modes |
+| Resource thresholds | Doesn't account for expected heavy usage |
+| Timeout-only | Can't distinguish slow from stuck |
+| Heartbeat-only | Process can heartbeat while frozen |
+
+### AD-20: Cancellation Propagation
+
+**Decision**: Implement four-phase cancellation: Client → Gate → Manager → Worker.
+
+**Rationale**:
+- Users need ability to stop long-running jobs
+- Resources should be freed promptly
+- Cancellation must be idempotent and handle partial failures
+- Each layer confirms cancellation before propagating
+
+**Cancellation Flow**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Cancellation Propagation                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Client                Gate                Manager      Worker  │
+│    │                    │                    │            │     │
+│    │─ CancelJob(id) ───►│                    │            │     │
+│    │                    │─ CancelJob(id) ───►│            │     │
+│    │                    │                    │─ Cancel ──►│     │
+│    │                    │                    │◄── Ack ────│     │
+│    │                    │◄─── Ack ───────────│            │     │
+│    │◄─── Ack ───────────│                    │            │     │
+│    │                    │                    │            │     │
+│  Phase 1: Request    Phase 2: Forward     Phase 3: Execute     │
+│                      Phase 4: Confirm (reverse direction)       │
+│                                                                 │
+│  Timeout behavior:                                              │
+│  - If Worker doesn't ACK: Manager retries, then marks failed   │
+│  - If Manager doesn't ACK: Gate retries, then best-effort      │
+│  - Client receives "cancellation requested" immediately        │
+│  - Final status pushed when all DCs confirm                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Message Types**:
+```python
+@dataclass
+class JobCancelRequest:
+    job_id: str
+    requester_id: str  # For audit trail
+    timestamp: float
+    fence_token: int  # Must match current job epoch
+
+@dataclass
+class JobCancelResponse:
+    job_id: str
+    success: bool
+    cancelled_workflow_count: int
+    error: str | None = None
+```
+
+**Idempotency**: Cancellation requests are idempotent - repeated requests return success if job is already cancelled or cancelling.
+
+### AD-21: Unified Retry Framework with Jitter
+
+**Decision**: Implement a unified retry framework with exponential backoff and jitter for all network operations.
+
+**Rationale**:
+- Scattered retry implementations lead to inconsistency
+- Without jitter, retries cause thundering herd
+- Different jitter strategies suit different scenarios
+- Framework enables consistent timeout and backoff across codebase
+
+**Jitter Strategies**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       Jitter Strategies                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Full Jitter (default for most operations):                    │
+│  ├─ delay = random(0, min(cap, base * 2^attempt))              │
+│  ├─ Best for independent clients                               │
+│  └─ Maximum spread, minimum correlation                        │
+│                                                                 │
+│  Equal Jitter (for operations needing minimum delay):          │
+│  ├─ temp = min(cap, base * 2^attempt)                          │
+│  ├─ delay = temp/2 + random(0, temp/2)                         │
+│  └─ Guarantees minimum delay while spreading                   │
+│                                                                 │
+│  Decorrelated Jitter (for AWS-style retries):                  │
+│  ├─ delay = random(base, previous_delay * 3)                   │
+│  ├─ Each retry depends on previous                             │
+│  └─ Good spread with bounded growth                            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+```python
+class JitterStrategy(Enum):
+    FULL = "full"
+    EQUAL = "equal"
+    DECORRELATED = "decorrelated"
+
+@dataclass
+class RetryConfig:
+    """Configuration for retry behavior."""
+    max_attempts: int = 3
+    base_delay: float = 0.5  # seconds
+    max_delay: float = 30.0  # cap
+    jitter: JitterStrategy = JitterStrategy.FULL
+    retryable_exceptions: tuple[type[Exception], ...] = (
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    )
+
+class RetryExecutor:
+    """Unified retry execution with jitter."""
+
+    def __init__(self, config: RetryConfig | None = None):
+        self._config = config or RetryConfig()
+        self._previous_delay: float = self._config.base_delay
+
+    def calculate_delay(self, attempt: int) -> float:
+        """Calculate delay with jitter for given attempt."""
+        base = self._config.base_delay
+        cap = self._config.max_delay
+
+        if self._config.jitter == JitterStrategy.FULL:
+            temp = min(cap, base * (2 ** attempt))
+            return random.uniform(0, temp)
+
+        elif self._config.jitter == JitterStrategy.EQUAL:
+            temp = min(cap, base * (2 ** attempt))
+            return temp / 2 + random.uniform(0, temp / 2)
+
+        elif self._config.jitter == JitterStrategy.DECORRELATED:
+            delay = random.uniform(base, self._previous_delay * 3)
+            delay = min(cap, delay)
+            self._previous_delay = delay
+            return delay
+
+        return base * (2 ** attempt)  # fallback: no jitter
+
+    async def execute(
+        self,
+        operation: Callable[[], Awaitable[T]],
+        operation_name: str = "operation",
+    ) -> T:
+        """Execute operation with retry and jitter."""
+        last_exception: Exception | None = None
+
+        for attempt in range(self._config.max_attempts):
+            try:
+                return await operation()
+            except self._config.retryable_exceptions as exc:
+                last_exception = exc
+                if attempt < self._config.max_attempts - 1:
+                    delay = self.calculate_delay(attempt)
+                    await asyncio.sleep(delay)
+
+        raise last_exception or RuntimeError(f"{operation_name} failed")
+```
+
+**Where Jitter Is Applied**:
+- Health check intervals
+- Retry delays
+- Heartbeat timing
+- State sync intervals
+- Leader election timeouts
+- Reconnection attempts
+
+### AD-22: Load Shedding with Priority Queues
+
+**Decision**: Implement load shedding using priority-based request classification.
+
+**Rationale**:
+- Under overload, processing all requests degrades all users
+- Shedding low-priority work protects critical operations
+- Priority should be explicit, not implicit
+- Graceful degradation is better than complete failure
+
+**Priority Levels**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Load Shedding Priority                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Priority 0 (CRITICAL) - Never shed:                           │
+│  ├─ Health checks / liveness probes                            │
+│  ├─ Cancellation requests                                      │
+│  ├─ Final result delivery                                      │
+│  └─ Cluster membership (SWIM)                                  │
+│                                                                 │
+│  Priority 1 (HIGH) - Shed under severe overload:               │
+│  ├─ Job submissions                                            │
+│  ├─ Workflow dispatch                                          │
+│  └─ State sync requests                                        │
+│                                                                 │
+│  Priority 2 (NORMAL) - Shed under moderate overload:           │
+│  ├─ Progress updates                                           │
+│  ├─ Stats queries                                              │
+│  └─ Reconnection requests                                      │
+│                                                                 │
+│  Priority 3 (LOW) - Shed first:                                │
+│  ├─ Detailed stats                                             │
+│  ├─ Debug/diagnostic requests                                  │
+│  └─ Non-essential sync                                         │
+│                                                                 │
+│  Shedding Thresholds (based on overload state):                │
+│  ├─ healthy: shed nothing                                      │
+│  ├─ busy: shed Priority 3                                      │
+│  ├─ stressed: shed Priority 2-3                                │
+│  └─ overloaded: shed Priority 1-3 (only CRITICAL processed)   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+```python
+class RequestPriority(Enum):
+    CRITICAL = 0
+    HIGH = 1
+    NORMAL = 2
+    LOW = 3
+
+class LoadShedder:
+    """Determines whether to shed requests based on priority and load."""
+
+    def __init__(self, overload_detector: HybridOverloadDetector):
+        self._detector = overload_detector
+
+        # Map overload state to minimum priority processed
+        self._shed_thresholds: dict[str, int] = {
+            "healthy": 4,    # Process all (nothing shed)
+            "busy": 3,       # Shed LOW
+            "stressed": 2,   # Shed NORMAL and LOW
+            "overloaded": 1, # Only CRITICAL (shed HIGH, NORMAL, LOW)
+        }
+
+    def should_shed(self, priority: RequestPriority) -> bool:
+        """Return True if request should be shed."""
+        state = self._detector.get_state()
+        min_priority = self._shed_thresholds.get(state, 4)
+        return priority.value >= min_priority
+
+    def classify_request(self, message_type: str) -> RequestPriority:
+        """Classify request by message type."""
+        critical_types = {"ping", "cancel_job", "final_result", "swim_*"}
+        high_types = {"job_submit", "workflow_dispatch", "state_sync"}
+        normal_types = {"progress_update", "stats_query", "register_callback"}
+
+        if message_type in critical_types:
+            return RequestPriority.CRITICAL
+        elif message_type in high_types:
+            return RequestPriority.HIGH
+        elif message_type in normal_types:
+            return RequestPriority.NORMAL
+        else:
+            return RequestPriority.LOW
+```
+
+### AD-23: Backpressure for Stats Updates
+
+**Decision**: Implement tiered stats retention with backpressure signaling.
+
+**Rationale**:
+- Unbounded stats history causes memory exhaustion
+- Different retention needs for different data freshness
+- Upstream should slow down when downstream is overwhelmed
+- Explicit backpressure prevents silent data loss
+
+**Tiered Retention**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Tiered Stats Retention                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  HOT (0-60 seconds):                                           │
+│  ├─ Full resolution (every update)                             │
+│  ├─ In-memory ring buffer                                      │
+│  └─ Used for real-time dashboards                              │
+│                                                                 │
+│  WARM (1-60 minutes):                                          │
+│  ├─ 10-second aggregates                                       │
+│  ├─ Compressed in-memory                                       │
+│  └─ Used for recent history                                    │
+│                                                                 │
+│  COLD (1-24 hours):                                            │
+│  ├─ 1-minute aggregates                                        │
+│  ├─ Spill to disk if needed                                    │
+│  └─ Used for job post-mortems                                  │
+│                                                                 │
+│  ARCHIVE (> 24 hours):                                         │
+│  ├─ Final summary only                                         │
+│  └─ Persisted with job completion                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Backpressure Levels**:
+```python
+class BackpressureLevel(Enum):
+    NONE = 0       # Accept all updates
+    THROTTLE = 1   # Reduce update frequency
+    BATCH = 2      # Only accept batched updates
+    REJECT = 3     # Reject non-critical updates
+
+@dataclass
+class StatsBuffer:
+    """Bounded stats buffer with backpressure."""
+    max_hot_entries: int = 1000
+    max_warm_entries: int = 360  # 1 hour at 10s intervals
+    max_cold_entries: int = 1440  # 24 hours at 1m intervals
+
+    hot: deque[StatsEntry]
+    warm: deque[AggregatedStats]
+    cold: deque[AggregatedStats]
+
+    def get_backpressure_level(self) -> BackpressureLevel:
+        """Determine backpressure based on buffer fill."""
+        hot_fill = len(self.hot) / self.max_hot_entries
+
+        if hot_fill < 0.7:
+            return BackpressureLevel.NONE
+        elif hot_fill < 0.85:
+            return BackpressureLevel.THROTTLE
+        elif hot_fill < 0.95:
+            return BackpressureLevel.BATCH
+        else:
+            return BackpressureLevel.REJECT
+```
+
+### AD-24: Rate Limiting (Client and Server)
+
+**Decision**: Implement token bucket rate limiting at both client and server sides.
+
+**Rationale**:
+- Prevents any single client from overwhelming the system
+- Server-side is authoritative; client-side is cooperative
+- Token bucket allows bursts while enforcing average rate
+- Per-client tracking enables fair sharing
+
+**Implementation**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Rate Limiting Architecture                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Client-Side (cooperative):                                     │
+│  ├─ Pre-flight check before sending                            │
+│  ├─ Respects server's rate limit headers                       │
+│  └─ Delays requests when approaching limit                     │
+│                                                                 │
+│  Server-Side (authoritative):                                   │
+│  ├─ Per-client token buckets                                   │
+│  ├─ Returns 429 with Retry-After when exceeded                 │
+│  └─ Different limits for different operation types             │
+│                                                                 │
+│  Token Bucket Parameters:                                       │
+│  ├─ bucket_size: Maximum burst capacity                        │
+│  ├─ refill_rate: Tokens added per second                       │
+│  └─ current_tokens: Available tokens                           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```python
+class TokenBucket:
+    """Token bucket rate limiter."""
+
+    def __init__(self, bucket_size: int, refill_rate: float):
+        self._bucket_size = bucket_size
+        self._refill_rate = refill_rate
+        self._tokens = float(bucket_size)
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, tokens: int = 1) -> bool:
+        """Try to acquire tokens. Returns False if rate limited."""
+        async with self._lock:
+            self._refill()
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return True
+            return False
+
+    def _refill(self) -> None:
+        """Refill tokens based on elapsed time."""
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(
+            self._bucket_size,
+            self._tokens + elapsed * self._refill_rate
+        )
+        self._last_refill = now
+
+class ServerRateLimiter:
+    """Server-side rate limiter with per-client buckets."""
+
+    def __init__(self, default_config: RateLimitConfig):
+        self._config = default_config
+        self._buckets: dict[str, TokenBucket] = {}
+
+    def check_rate_limit(self, client_id: str, operation: str) -> tuple[bool, float]:
+        """Check if request is allowed. Returns (allowed, retry_after)."""
+        bucket = self._get_or_create_bucket(client_id, operation)
+        if bucket.acquire(1):
+            return True, 0.0
+        else:
+            retry_after = 1.0 / bucket._refill_rate
+            return False, retry_after
+```
+
+### AD-25: Version Skew Handling
+
+**Decision**: Support rolling upgrades via protocol versioning and capability negotiation.
+
+**Rationale**:
+- Zero-downtime upgrades require version compatibility
+- Nodes must handle messages from older/newer versions
+- Unknown fields should be ignored, not rejected
+- Capability advertisement enables gradual feature rollout
+
+**Protocol Versioning**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Version Skew Handling                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Version Format: MAJOR.MINOR                                    │
+│  ├─ MAJOR: Breaking changes (must match)                       │
+│  └─ MINOR: Additive changes (newer can talk to older)          │
+│                                                                 │
+│  Handshake includes:                                            │
+│  ├─ protocol_version: "1.2"                                    │
+│  ├─ capabilities: ["cancellation", "batched_stats", ...]       │
+│  └─ node_version: "hyperscale-0.5.0" (informational)           │
+│                                                                 │
+│  Compatibility Rules:                                           │
+│  ├─ Same MAJOR: compatible                                     │
+│  ├─ Different MAJOR: reject connection                         │
+│  ├─ Newer MINOR → older: use older's feature set               │
+│  └─ Older MINOR → newer: newer ignores unknown capabilities    │
+│                                                                 │
+│  Message Handling:                                              │
+│  ├─ Unknown fields: ignore (forward compatibility)             │
+│  ├─ Missing optional fields: use defaults                      │
+│  └─ Missing required fields: reject with clear error           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+```python
+@dataclass
+class ProtocolVersion:
+    major: int
+    minor: int
+
+    def is_compatible_with(self, other: "ProtocolVersion") -> bool:
+        return self.major == other.major
+
+    def supports_feature(self, other: "ProtocolVersion", feature: str) -> bool:
+        """Check if feature is supported by both versions."""
+        # Feature was added in version X.Y
+        feature_versions = {
+            "cancellation": (1, 0),
+            "batched_stats": (1, 1),
+            "client_reconnection": (1, 2),
+            "fence_tokens": (1, 2),
+        }
+        required = feature_versions.get(feature, (999, 999))
+        return (
+            (self.major, self.minor) >= required
+            and (other.major, other.minor) >= required
+        )
+
+@dataclass
+class NodeCapabilities:
+    protocol_version: ProtocolVersion
+    capabilities: set[str]
+    node_version: str  # Informational
+
+    def negotiate(self, other: "NodeCapabilities") -> set[str]:
+        """Return capabilities supported by both nodes."""
+        return self.capabilities & other.capabilities
+```
+
+### AD-26: Adaptive Healthcheck Extensions
+
+**Decision**: Allow healthcheck deadline extensions with logarithmic grant reduction.
+
+**Rationale**:
+- Long-running operations may legitimately need more time
+- Unlimited extensions enable abuse
+- Logarithmic reduction discourages repeated requests
+- Extensions require active negotiation (not automatic)
+
+**Extension Protocol**:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Adaptive Healthcheck Extensions                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Base deadline: 30 seconds                                      │
+│                                                                 │
+│  Extension grants (logarithmic reduction):                      │
+│  ├─ 1st extension: +30s (100% of base)                         │
+│  ├─ 2nd extension: +15s (50% of base)                          │
+│  ├─ 3rd extension: +7.5s (25% of base)                         │
+│  ├─ 4th extension: +3.75s (12.5% of base)                      │
+│  └─ ...converges to minimum (1s)                               │
+│                                                                 │
+│  Formula: grant = max(min_grant, base / (2^extension_count))   │
+│                                                                 │
+│  Extension request must include:                                │
+│  ├─ reason: "long_workflow" | "gc_pause" | "resource_contention"│
+│  ├─ estimated_completion: timestamp                            │
+│  └─ current_progress: 0.0-1.0                                  │
+│                                                                 │
+│  Extension denied if:                                           │
+│  ├─ No progress since last extension                           │
+│  ├─ Total extensions exceed max (e.g., 5)                      │
+│  └─ Node is already marked suspect                             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation**:
+```python
+@dataclass
+class ExtensionTracker:
+    """Tracks healthcheck extensions for a worker."""
+    worker_id: str
+    base_deadline: float = 30.0
+    min_grant: float = 1.0
+    max_extensions: int = 5
+
+    extension_count: int = 0
+    last_progress: float = 0.0
+    total_extended: float = 0.0
+
+    def request_extension(
+        self,
+        reason: str,
+        current_progress: float,
+    ) -> tuple[bool, float]:
+        """
+        Request deadline extension.
+        Returns (granted, extension_seconds).
+        """
+        # Deny if too many extensions
+        if self.extension_count >= self.max_extensions:
+            return False, 0.0
+
+        # Deny if no progress
+        if current_progress <= self.last_progress and self.extension_count > 0:
+            return False, 0.0
+
+        # Calculate grant with logarithmic reduction
+        grant = max(
+            self.min_grant,
+            self.base_deadline / (2 ** self.extension_count)
+        )
+
+        self.extension_count += 1
+        self.last_progress = current_progress
+        self.total_extended += grant
+
+        return True, grant
+```
+
+### AD-27: Gate Module Reorganization
+
+**Decision**: Reorganize gate-related code into focused modules following manager patterns.
+
+**Rationale**:
+- Current gate.py is monolithic and hard to maintain
+- Similar to manager refactoring already completed
+- One class per file improves testability
+- Clear module boundaries reduce coupling
+
+**Proposed Structure**:
+```
+hyperscale/distributed_rewrite/
+├── jobs/
+│   ├── gates/                    # Gate-side job management
+│   │   ├── __init__.py
+│   │   ├── gate_job_manager.py   # Per-job state and locking
+│   │   ├── job_forwarding.py     # Cross-gate job forwarding
+│   │   └── consistent_hash.py    # Per-job gate ownership
+│   │
+│   ├── managers/                 # Manager-side (existing)
+│   │   ├── __init__.py
+│   │   ├── job_manager.py
+│   │   ├── worker_pool.py
+│   │   └── workflow_dispatcher.py
+│   │
+│   └── __init__.py
+│
+├── datacenters/                  # DC-level coordination
+│   ├── __init__.py
+│   ├── datacenter_health.py      # DatacenterHealthManager
+│   ├── manager_dispatcher.py     # ManagerDispatcher
+│   └── lease_manager.py          # DC lease management
+│
+├── reliability/                  # Cross-cutting reliability
+│   ├── __init__.py
+│   ├── retry.py                  # RetryExecutor
+│   ├── circuit_breaker.py        # CircuitBreaker
+│   ├── load_shedding.py          # LoadShedder
+│   ├── backpressure.py           # BackpressureController
+│   ├── rate_limiting.py          # TokenBucket, RateLimiter
+│   ├── overload.py               # HybridOverloadDetector
+│   └── jitter.py                 # Jitter utilities
+│
+├── health/                       # Health checking
+│   ├── __init__.py
+│   ├── worker_health.py          # WorkerHealthState, three-signal model
+│   ├── extension_tracker.py      # Adaptive extensions
+│   └── probes.py                 # Liveness/Readiness probe implementations
+│
+└── swim/
+    └── gates/                    # Gate SWIM extensions
+        ├── __init__.py
+        └── peer_topology.py      # GatePeerTopology
+```
+
+**Migration Plan**:
+1. Create new module directories
+2. Extract classes one at a time (preserve behavior)
+3. Update imports in gate.py incrementally
+4. Add tests for each extracted class
+5. Final cleanup of gate.py
+
 ---
 
 ## Architecture
