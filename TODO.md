@@ -336,14 +336,15 @@ Extract classes from monolithic files into focused modules.
 
 ### 5.1 Gate Job Management
 
-- [ ] Extract `GateJobManager` class from gate.py
-  - [ ] Per-job state with locking
-  - [ ] Job lifecycle management
-- [ ] Extract `JobForwardingTracker` class from gate.py
-  - [ ] Cross-gate job forwarding logic
-- [ ] Extract `ConsistentHashRing` class
-  - [ ] Per-job gate ownership calculation
-- [ ] Update gate.py imports
+- [x] Extract `GateJobManager` class from gate.py
+  - [x] Per-job state with locking
+  - [x] Job lifecycle management
+- [x] Extract `JobForwardingTracker` class from gate.py
+  - [x] Cross-gate job forwarding logic
+- [x] Extract `ConsistentHashRing` class
+  - [x] Per-job gate ownership calculation
+- [x] Add integration tests for gate job management
+- [ ] Update gate.py imports (deferred - requires larger refactor)
 
 ### 5.2 Datacenter Management
 
