@@ -125,6 +125,7 @@ class Provisioner:
                 str | int | StagePriority,
             ]
         ],
+        available_cores: int | None = None,
     ) -> List[List[Tuple[str, StagePriority, int]]]:
         """
         Allocate cores to workflows based on priority and VUs.
@@ -135,12 +136,23 @@ class Provisioner:
         3. Explicit priority workflows (HIGH/NORMAL/LOW) allocated proportionally by VUs
         4. AUTO priority workflows split remaining cores equally (minimum 1 each)
 
+        Args:
+            configs: List of workflow configs with name, priority, is_test, vus
+            available_cores: Number of cores currently available. If None, uses max_workers.
+
         Returns list containing a single batch with all allocations.
         """
         if not configs:
             return []
 
-        total_cores = self.max_workers
+        total_cores = available_cores if available_cores is not None else self.max_workers
+
+        # If no cores available, all workflows get 0
+        if total_cores <= 0:
+            return [[
+                (config.get("workflow_name"), config.get("priority", StagePriority.AUTO), 0)
+                for config in configs
+            ]]
         allocations: List[Tuple[str, StagePriority, int]] = []
 
         # Separate non-test workflows (they bypass partitioning with 0 cores)

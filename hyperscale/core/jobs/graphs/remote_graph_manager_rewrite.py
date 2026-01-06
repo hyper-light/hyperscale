@@ -417,6 +417,10 @@ class RemoteGraphManager:
         # Track running tasks: task -> workflow_name
         running_tasks: Dict[asyncio.Task, str] = {}
 
+        # Track cores currently in use by running workflows
+        cores_in_use = 0
+        total_cores = self._provisioner.max_workers
+
         graph_slug = test_name.lower()
 
         async with self._logger.context(name=f"{graph_slug}_logger") as ctx:
@@ -436,8 +440,13 @@ class RemoteGraphManager:
                 ]
 
                 if ready_workflows:
+                    # Calculate available cores
+                    available_cores = total_cores - cores_in_use
+
                     # Dynamically allocate cores for ready workflows
-                    allocations = self._allocate_cores_for_ready_workflows(ready_workflows)
+                    allocations = self._allocate_cores_for_ready_workflows(
+                        ready_workflows, available_cores
+                    )
 
                     for pending, cores in allocations:
                         if cores == 0:
@@ -448,6 +457,9 @@ class RemoteGraphManager:
                         pending.dispatched = True
                         pending.ready_event.clear()
                         pending.allocated_cores = cores
+
+                        # Track cores in use
+                        cores_in_use += cores
 
                         # Calculate VUs per worker
                         pending.allocated_vus = self._calculate_vus_per_worker(
@@ -502,6 +514,9 @@ class RemoteGraphManager:
                 for task in done:
                     workflow_name = running_tasks.pop(task)
                     pending = pending_workflows[workflow_name]
+
+                    # Release cores used by this workflow
+                    cores_in_use -= pending.allocated_cores
 
                     try:
                         result = task.result()
@@ -586,11 +601,18 @@ class RemoteGraphManager:
     def _allocate_cores_for_ready_workflows(
         self,
         ready_workflows: List[PendingWorkflowRun],
+        available_cores: int,
     ) -> List[Tuple[PendingWorkflowRun, int]]:
         """
         Dynamically allocate cores for ready workflows.
 
-        Uses partion_by_priority to allocate cores based on priority and VUs.
+        Uses partion_by_priority to allocate cores based on priority and VUs,
+        constrained by the number of cores currently available.
+
+        Args:
+            ready_workflows: List of workflows ready for dispatch
+            available_cores: Number of cores not currently in use
+
         Returns list of (pending_workflow, allocated_cores) tuples.
         """
         # Build configs for the provisioner
@@ -604,8 +626,8 @@ class RemoteGraphManager:
             for pending in ready_workflows
         ]
 
-        # Get allocations from provisioner
-        batches = self._provisioner.partion_by_priority(configs)
+        # Get allocations from provisioner, constrained by available cores
+        batches = self._provisioner.partion_by_priority(configs, available_cores)
 
         # Build lookup from workflow_name -> cores
         allocation_lookup: Dict[str, int] = {}
@@ -979,6 +1001,8 @@ class RemoteGraphManager:
                 )
 
                 results = [result_set for _, result_set in results.values() if result_set is not None]
+
+                print(len(results), threads)
 
                 if is_test_workflow and len(results) > 1:
                     await ctx.log_prepared(
