@@ -24,3 +24,10 @@ from hyperscale.distributed_rewrite.reliability.load_shedding import (
     LoadShedderConfig as LoadShedderConfig,
     RequestPriority as RequestPriority,
 )
+from hyperscale.distributed_rewrite.reliability.backpressure import (
+    BackpressureLevel as BackpressureLevel,
+    BackpressureSignal as BackpressureSignal,
+    StatsBuffer as StatsBuffer,
+    StatsBufferConfig as StatsBufferConfig,
+    StatsEntry as StatsEntry,
+)

@@ -172,25 +172,25 @@ Three-signal health model for all node types.
 
 ### 3.2 AD-23: Backpressure for Stats Updates
 
-- [ ] Implement `BackpressureLevel` enum
-  - [ ] NONE = 0 (accept all)
-  - [ ] THROTTLE = 1 (reduce frequency)
-  - [ ] BATCH = 2 (batched only)
-  - [ ] REJECT = 3 (reject non-critical)
-- [ ] Implement `StatsBuffer` with tiered retention
-  - [ ] HOT: 0-60s, full resolution, ring buffer (max 1000 entries)
-  - [ ] WARM: 1-60min, 10s aggregates (max 360 entries)
-  - [ ] COLD: 1-24h, 1min aggregates (max 1440 entries)
-  - [ ] ARCHIVE: final summary only
-- [ ] Implement automatic tier promotion (HOT → WARM → COLD)
-- [ ] Implement `get_backpressure_level()` based on buffer fill
-  - [ ] < 70% → NONE
-  - [ ] 70-85% → THROTTLE
-  - [ ] 85-95% → BATCH
-  - [ ] > 95% → REJECT
-- [ ] Add backpressure signaling in stats update responses
+- [x] Implement `BackpressureLevel` enum
+  - [x] NONE = 0 (accept all)
+  - [x] THROTTLE = 1 (reduce frequency)
+  - [x] BATCH = 2 (batched only)
+  - [x] REJECT = 3 (reject non-critical)
+- [x] Implement `StatsBuffer` with tiered retention
+  - [x] HOT: 0-60s, full resolution, ring buffer (max 1000 entries)
+  - [x] WARM: 1-60min, 10s aggregates (max 360 entries)
+  - [x] COLD: 1-24h, 1min aggregates (max 1440 entries)
+  - [x] ARCHIVE: final summary only
+- [x] Implement automatic tier promotion (HOT → WARM → COLD)
+- [x] Implement `get_backpressure_level()` based on buffer fill
+  - [x] < 70% → NONE
+  - [x] 70-85% → THROTTLE
+  - [x] 85-95% → BATCH
+  - [x] > 95% → REJECT
+- [x] Add backpressure signaling in stats update responses
 - [ ] Update stats senders to respect backpressure signals
-- [ ] Add integration tests for backpressure
+- [x] Add integration tests for backpressure
 
 ### 3.3 AD-24: Rate Limiting
 
