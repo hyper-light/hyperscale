@@ -550,9 +550,9 @@ class UDPProtocol(Generic[T, K]):
                 self._transport.sendto(data, address)
                 return
             except BlockingIOError:
-                # Socket buffer full, wait briefly with exponential backoff and retry
+                # Socket buffer full, use exponential backoff: 10ms, 20ms, 40ms, 80ms...
                 if send_attempt < self._retries:
-                    await asyncio.sleep(0.01 * (send_attempt + 1))
+                    await asyncio.sleep(0.01 * (2 ** send_attempt))
                 else:
                     # All retries exhausted, let it propagate
                     raise
