@@ -317,9 +317,16 @@ Three-signal health model for all node types.
   - [x] ManagerPeerRegistration: protocol_version_major/minor, capabilities
   - [x] ManagerPeerRegistrationResponse: protocol_version_major/minor, capabilities
   - [x] RegistrationResponse: protocol_version_major/minor, capabilities
-- [ ] Update message serialization to ignore unknown fields
-- [ ] Add protocol version validation on connection
-- [ ] Add integration tests for version compatibility
+- [x] Update message serialization to ignore unknown fields
+  - [x] Already handled by cloudpickle/pickle - new fields with defaults are backwards compatible
+- [ ] Add protocol version validation on connection (deferred - requires node changes)
+- [x] Add integration tests for version compatibility
+  - [x] ProtocolVersion compatibility tests
+  - [x] Feature version map tests
+  - [x] NodeCapabilities negotiation tests
+  - [x] Handshake message version field tests
+  - [x] Backwards compatibility tests
+  - [x] Rolling upgrade scenario tests
 
 ---
 
