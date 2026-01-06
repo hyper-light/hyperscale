@@ -226,6 +226,39 @@ class ServerRateLimiter:
         self._rate_limited_requests: int = 0
         self._clients_cleaned: int = 0
 
+    def check(
+        self,
+        addr: tuple[str, int],
+        raise_on_limit: bool = False,
+    ) -> bool:
+        """
+        Compatibility method matching the simple RateLimiter.check() API.
+
+        This allows ServerRateLimiter to be used as a drop-in replacement
+        for the simple RateLimiter in base server code.
+
+        Args:
+            addr: Source address tuple (host, port)
+            raise_on_limit: If True, raise RateLimitExceeded instead of returning False
+
+        Returns:
+            True if request is allowed, False if rate limited
+
+        Raises:
+            RateLimitExceeded: If raise_on_limit is True and rate is exceeded
+        """
+        # Convert address tuple to client_id string
+        client_id = f"{addr[0]}:{addr[1]}"
+
+        # Use "default" operation for simple rate limiting
+        result = self.check_rate_limit(client_id, "default")
+
+        if not result.allowed and raise_on_limit:
+            from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
+            raise RateLimitExceeded(f"Rate limit exceeded for {addr[0]}:{addr[1]}")
+
+        return result.allowed
+
     def check_rate_limit(
         self,
         client_id: str,
