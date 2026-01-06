@@ -362,23 +362,24 @@ Extract classes from monolithic files into focused modules.
 
 ### 5.3 Reliability Module
 
-- [ ] Move `RetryExecutor` to `reliability/retry.py`
-- [ ] Move `HybridOverloadDetector` to `reliability/overload.py`
-- [ ] Move `LoadShedder` to `reliability/load_shedding.py`
-- [ ] Move `StatsBuffer` to `reliability/backpressure.py`
-- [ ] Move `TokenBucket`, `ServerRateLimiter` to `reliability/rate_limiting.py`
-- [ ] Create `reliability/jitter.py` for jitter utilities
-- [ ] Add unified exports in `reliability/__init__.py`
+- [x] Move `RetryExecutor` to `reliability/retry.py`
+- [x] Move `HybridOverloadDetector` to `reliability/overload.py`
+- [x] Move `LoadShedder` to `reliability/load_shedding.py`
+- [x] Move `StatsBuffer` to `reliability/backpressure.py`
+- [x] Move `TokenBucket`, `ServerRateLimiter` to `reliability/rate_limiting.py`
+- [x] JitterStrategy is in `reliability/retry.py` (no separate jitter.py needed)
+- [x] Add unified exports in `reliability/__init__.py`
 
 ### 5.4 Health Module
 
-- [ ] Move `WorkerHealthState` to `health/worker_health.py`
-- [ ] Move `ManagerHealthState` to `health/manager_health.py`
-- [ ] Move `GateHealthState` to `health/gate_health.py`
-- [ ] Move `NodeHealthTracker` to `health/tracker.py`
-- [ ] Move `ExtensionTracker` to `health/extension_tracker.py`
-- [ ] Add `health/probes.py` for liveness/readiness probe implementations
-- [ ] Add unified exports in `health/__init__.py`
+- [x] Move `WorkerHealthState` to `health/worker_health.py`
+- [x] Move `ManagerHealthState` to `health/manager_health.py`
+- [x] Move `GateHealthState` to `health/gate_health.py`
+- [x] Move `NodeHealthTracker` to `health/tracker.py`
+- [x] Move `ExtensionTracker` to `health/extension_tracker.py`
+- [x] Move `WorkerHealthManager` to `health/worker_health_manager.py`
+- [ ] Add `health/probes.py` for liveness/readiness probe implementations (deferred)
+- [x] Add unified exports in `health/__init__.py`
 
 ---
 
