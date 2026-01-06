@@ -11,6 +11,7 @@ except Exception:
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -19,6 +20,8 @@ from pydantic import (
 
 
 class DragAndDropCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     source: StrictStr
     target: StrictStr
     source_position: Optional[Position] = None
@@ -28,6 +31,3 @@ class DragAndDropCommand(BaseModel):
     no_wait_after: Optional[StrictBool] = None
     strict: Optional[StrictBool] = None
     trial: Optional[StrictBool] = None
-
-    class Config:
-        arbitrary_types_allowed = True

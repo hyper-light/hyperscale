@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Dict, List, Optional, Union
 from urllib.parse import urlparse
 
-from pydantic import AnyHttpUrl
+from pydantic import AnyHttpUrl, ConfigDict
 
 from hyperscale.distributed.models.base.message import Message
 
@@ -16,14 +16,13 @@ class HTTPRequestMethod(Enum):
 
 
 class HTTPRequest(Message):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     url: AnyHttpUrl
     method: HTTPRequestMethod
     params: Optional[Dict[str, str]]
     headers: Dict[str, str] = {}
     data: Optional[Union[str, Message]]
-
-    class Config:
-        arbitrary_types_allowed = True
 
     def prepare_request(self):
         parsed = urlparse(self.url)

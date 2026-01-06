@@ -13,6 +13,7 @@ except Exception:
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -21,10 +22,9 @@ from pydantic import (
 
 
 class RouteCommand(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     url: StrictStr | Pattern[str] | Callable[[StrictStr], StrictBool]
     handler: Callable[[Route], Any] | Callable[[Route, Request], Any]
     times: Optional[StrictInt]
     timeout: StrictInt | StrictFloat
-
-    class Config:
-        arbitrary_types_allowed = True

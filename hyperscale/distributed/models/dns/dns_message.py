@@ -3,7 +3,7 @@ import io
 import struct
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
-from pydantic import StrictBool, StrictInt
+from pydantic import ConfigDict, StrictBool, StrictInt
 
 from hyperscale.distributed.discovery.dns.core.exceptions import DNSError
 from hyperscale.distributed.discovery.dns.core.record import (
@@ -16,6 +16,8 @@ from hyperscale.distributed.models.http import HTTPRequest, HTTPRequestMethod
 
 
 class DNSMessage(Message):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     query_type: QueryType = QueryType.REQUEST
     query_id: StrictInt = 0
     query_opcode: StrictInt = 0
@@ -30,9 +32,6 @@ class DNSMessage(Message):
     query_namservers: List[Record] = []
     query_additional_records: List[Record] = []
     query_has_result: StrictBool = False
-
-    class Config:
-        arbitrary_types_allowed = True
 
     def __iter__(self):
         return iter(self.query_answers)
