@@ -102,6 +102,8 @@ from hyperscale.distributed_rewrite.models import (
     JobLeadershipAck,
     JobStateSyncMessage,
     JobStateSyncAck,
+    JobLeaderGateTransfer,
+    JobLeaderGateTransferAck,
     ManagerToWorkerRegistration,
     ManagerToWorkerRegistrationAck,
     PingRequest,
@@ -275,6 +277,11 @@ class ManagerServer(HealthAwareServer):
         # job_id -> callback address for push notifications
         self._job_callbacks: dict[str, tuple[str, int]] = {}
         self._client_callbacks: dict[str, tuple[str, int]] = {}  # Alias for backwards compat
+
+        # Origin gate addresses for direct DC-to-Job-Leader routing
+        # job_id -> origin gate TCP address
+        # Set when job is submitted, used to route results directly to job leader gate
+        self._job_origin_gates: dict[str, tuple[str, int]] = {}
 
         # Job submissions for eager dispatch (need access to submission params)
         self._job_submissions: dict[str, JobSubmission] = {}  # job_id -> submission
@@ -2672,6 +2679,17 @@ class ManagerServer(HealthAwareServer):
                 layer_version = self._job_layer_version.get(job_id, 0)
                 job_leaderships[job_id] = (fencing_token, layer_version)
 
+        # Build known gates info for piggybacking (gate discovery)
+        # Maps gate_id -> (tcp_host, tcp_port, udp_host, udp_port)
+        known_gates_piggyback: dict[str, tuple[str, int, str, int]] = {}
+        for gate_id, gate_info in list(self._known_gates.items()):
+            known_gates_piggyback[gate_id] = (
+                gate_info.tcp_host,
+                gate_info.tcp_port,
+                gate_info.udp_host,
+                gate_info.udp_port,
+            )
+
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -2690,6 +2708,7 @@ class ManagerServer(HealthAwareServer):
             tcp_host=self._host,
             tcp_port=self._tcp_port,
             job_leaderships=job_leaderships,
+            known_gates=known_gates_piggyback,
         )
     
     async def _gate_heartbeat_loop(self) -> None:
@@ -2778,17 +2797,21 @@ class ManagerServer(HealthAwareServer):
         base_delay: float = 0.2,
     ) -> None:
         """
-        Send job progress to the primary gate and process ack.
-        
+        Send job progress to the job leader gate (direct routing).
+
+        Uses Direct DC-to-Job-Leader Routing:
+        1. Try origin_gate_addr first (the gate that submitted the job)
+        2. If origin gate unreachable, fall back to primary/seed gates
+
         Uses limited retries with exponential backoff:
         - Progress updates can be frequent, so we keep retries short
         - Attempt 1: immediate
         - Attempt 2: 0.2s delay
         - Attempt 3: 0.4s delay
-        
+
         The gate responds with JobProgressAck containing updated
         gate topology which we use to maintain redundant channels.
-        
+
         Args:
             job: Job progress to send
             max_retries: Maximum retry attempts (default 2)
@@ -2797,15 +2820,18 @@ class ManagerServer(HealthAwareServer):
         # Check circuit breaker first
         if self._is_gate_circuit_open():
             return  # Fail fast
-        
-        gate_addr = self._get_primary_gate_tcp_addr()
+
+        # Direct routing: prefer origin gate for this job
+        origin_gate = self._job_origin_gates.get(job.job_id)
+        gate_addr = origin_gate or self._get_primary_gate_tcp_addr()
+
         if not gate_addr:
             # Fallback to first seed gate
             if self._gate_addrs:
                 gate_addr = self._gate_addrs[0]
             else:
                 return
-        
+
         for attempt in range(max_retries + 1):
             try:
                 response, _ = await self.send_tcp(
@@ -2814,21 +2840,21 @@ class ManagerServer(HealthAwareServer):
                     job.dump(),
                     timeout=2.0,
                 )
-                
+
                 # Process ack to update gate topology
                 if response and isinstance(response, bytes) and response != b'error':
                     self._process_job_progress_ack(response)
                     self._gate_circuit.record_success()
                     return  # Success
-                    
+
             except Exception:
                 pass
-            
+
             # Exponential backoff before retry (except after last attempt)
             if attempt < max_retries:
                 delay = base_delay * (2 ** attempt)
                 await asyncio.sleep(delay)
-        
+
         # All retries exhausted
         self._gate_circuit.record_error()
     
@@ -4551,7 +4577,40 @@ class ManagerServer(HealthAwareServer):
             await self._send_job_final_result_to_client(job_final, callback)
 
     async def _send_job_final_result_to_gates(self, job_final: JobFinalResult) -> None:
-        """Send JobFinalResult to all known gates."""
+        """
+        Send JobFinalResult to the job leader gate (direct routing).
+
+        Uses Direct DC-to-Job-Leader Routing:
+        1. Try origin_gate_addr first (the gate that submitted the job)
+        2. If origin gate unreachable, fall back to all known gates
+        3. The receiving gate will forward if it's not the owner anymore
+        """
+        origin_gate = self._job_origin_gates.get(job_final.job_id)
+
+        # Try direct routing to origin gate first
+        if origin_gate:
+            try:
+                await self.send_tcp(
+                    origin_gate,
+                    "job_final_result",
+                    job_final.dump(),
+                    timeout=5.0,
+                )
+                # Direct routing succeeded
+                return
+            except Exception as e:
+                # Origin gate unreachable - fall back to broadcast
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Origin gate {origin_gate} unreachable for job {job_final.job_id}, falling back to broadcast: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        # Fall back to broadcast to all known gates
         for gate_addr in self._gate_addrs:
             try:
                 await self.send_tcp(
@@ -5279,6 +5338,8 @@ class ManagerServer(HealthAwareServer):
                 workflow_statuses=workflow_statuses,
                 elapsed_seconds=job.elapsed_seconds(),
                 timestamp=time.monotonic(),
+                # Include origin gate for direct routing on failover
+                origin_gate_addr=self._job_origin_gates.get(job_id),
             )
 
             # Send to all peers (fire-and-forget, no need to wait for acks)
@@ -5750,6 +5811,7 @@ class ManagerServer(HealthAwareServer):
         self._job_contexts.pop(job_id, None)
         self._job_callbacks.pop(job_id, None)
         self._job_submissions.pop(job_id, None)
+        self._job_origin_gates.pop(job_id, None)
 
         # Clean up WorkflowDispatcher tracking for this job
         if self._workflow_dispatcher:
@@ -5984,6 +6046,11 @@ class ManagerServer(HealthAwareServer):
             # Store callback for push notifications (if provided)
             if submission.callback_addr:
                 self._job_callbacks[submission.job_id] = submission.callback_addr
+
+            # Store origin gate for direct DC-to-Job-Leader routing
+            # This gate is the job leader gate and receives all results directly
+            if submission.origin_gate_addr:
+                self._job_origin_gates[submission.job_id] = submission.origin_gate_addr
 
             self._increment_version()
 
@@ -6505,6 +6572,11 @@ class ManagerServer(HealthAwareServer):
             if sync_msg.fencing_token > current_token:
                 self._job_fencing_tokens[sync_msg.job_id] = sync_msg.fencing_token
 
+            # Update origin gate address for direct routing on failover
+            # This ensures we can route results to the correct gate if we take over
+            if sync_msg.origin_gate_addr:
+                self._job_origin_gates[sync_msg.job_id] = sync_msg.origin_gate_addr
+
             ack = JobStateSyncAck(
                 job_id=sync_msg.job_id,
                 responder_id=self._node_id.full,
@@ -6514,6 +6586,65 @@ class ManagerServer(HealthAwareServer):
 
         except Exception as e:
             await self.handle_exception(e, "job_state_sync")
+            return b'error'
+
+    @tcp.receive()
+    async def job_leader_gate_transfer(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle job leader gate transfer notification from a gate.
+
+        When a gate fails and another gate takes over job leadership,
+        the new gate notifies managers to update their origin_gate_addr
+        for direct DC-to-Job-Leader routing.
+
+        Uses fence tokens for consistency - only accept transfers with
+        higher fence tokens to prevent stale updates.
+        """
+        try:
+            transfer = JobLeaderGateTransfer.load(data)
+
+            # Use fence token for consistency
+            current_fence = self._job_fencing_tokens.get(transfer.job_id, 0)
+            if transfer.fence_token < current_fence:
+                # Stale transfer - reject
+                ack = JobLeaderGateTransferAck(
+                    job_id=transfer.job_id,
+                    manager_id=self._node_id.full,
+                    accepted=False,
+                )
+                return ack.dump()
+
+            # Update origin gate address
+            self._job_origin_gates[transfer.job_id] = transfer.new_gate_addr
+
+            # Update fence token if higher
+            if transfer.fence_token > current_fence:
+                self._job_fencing_tokens[transfer.job_id] = transfer.fence_token
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Job {transfer.job_id} leader gate transferred: {transfer.old_gate_id} -> {transfer.new_gate_id} at {transfer.new_gate_addr}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            ack = JobLeaderGateTransferAck(
+                job_id=transfer.job_id,
+                manager_id=self._node_id.full,
+                accepted=True,
+            )
+            return ack.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "job_leader_gate_transfer")
             return b'error'
 
     # =========================================================================

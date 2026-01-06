@@ -63,6 +63,9 @@ from .distributed import (
     # Job state sync (periodic leader -> peer sync)
     JobStateSyncMessage as JobStateSyncMessage,
     JobStateSyncAck as JobStateSyncAck,
+    # Job leader gate transfer (direct DC-to-Job-Leader routing)
+    JobLeaderGateTransfer as JobLeaderGateTransfer,
+    JobLeaderGateTransferAck as JobLeaderGateTransferAck,
     # Client push notifications
     JobStatusPush as JobStatusPush,
     DCStats as DCStats,

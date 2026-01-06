@@ -272,9 +272,13 @@ class GateInfo(Message):
 class GateHeartbeat(Message):
     """
     Periodic heartbeat from gate embedded in SWIM messages.
-    
+
     Contains gate-level status for cross-DC coordination.
     Gates are the top-level coordinators managing global job state.
+
+    Piggybacking (like manager/worker discovery):
+    - known_managers: Managers this gate knows about, for manager discovery
+    - known_gates: Other gates this gate knows about (for gate cluster membership)
     """
     node_id: str                 # Gate identifier
     datacenter: str              # Gate's home datacenter
@@ -285,6 +289,11 @@ class GateHeartbeat(Message):
     active_jobs: int             # Number of active global jobs
     active_datacenters: int      # Number of datacenters with active work
     manager_count: int           # Number of registered managers
+    # Piggybacked discovery info - managers learn about other managers/gates
+    # Maps node_id -> (tcp_host, tcp_port, udp_host, udp_port, datacenter)
+    known_managers: dict[str, tuple[str, int, str, int, str]] = field(default_factory=dict)
+    # Maps node_id -> (tcp_host, tcp_port, udp_host, udp_port)
+    known_gates: dict[str, tuple[str, int, str, int]] = field(default_factory=dict)
 
 
 @dataclass(slots=True, kw_only=True)
@@ -392,9 +401,9 @@ class WorkerHeartbeat(Message):
 class ManagerHeartbeat(Message):
     """
     Periodic heartbeat from manager to gates (if gates present).
-    
+
     Contains datacenter-level job status summary.
-    
+
     Datacenter Health Classification (evaluated in order):
     1. DEGRADED: majority of workers unhealthy (healthy_worker_count < worker_count // 2 + 1)
        OR majority of managers unhealthy (alive_managers < total_managers // 2 + 1)
@@ -405,6 +414,10 @@ class ManagerHeartbeat(Message):
        (normal operation - capacity available for new jobs)
     4. UNHEALTHY: no managers responding OR no workers registered
        (severe - cannot process jobs)
+
+    Piggybacking:
+    - job_leaderships: Jobs this manager leads (for distributed consistency)
+    - known_gates: Gates this manager knows about (for gate discovery)
     """
     node_id: str                 # Manager identifier
     datacenter: str              # Datacenter identifier
@@ -425,6 +438,9 @@ class ManagerHeartbeat(Message):
     # Per-job leadership - piggybacked on SWIM UDP for distributed consistency
     # Maps job_id -> (fencing_token, layer_version) for jobs this manager leads
     job_leaderships: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Piggybacked gate discovery - gates learn about other gates from managers
+    # Maps gate_id -> (tcp_host, tcp_port, udp_host, udp_port)
+    known_gates: dict[str, tuple[str, int, str, int]] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -450,6 +466,10 @@ class JobSubmission(Message):
     # Optional callback address for push notifications
     # If set, server pushes status updates to this address
     callback_addr: tuple[str, int] | None = None
+    # Origin gate address for direct DC-to-Job-Leader routing
+    # Set by the job leader gate when dispatching to managers
+    # Managers send results directly to this gate instead of all gates
+    origin_gate_addr: tuple[str, int] | None = None
 
 
 @dataclass(slots=True)
@@ -761,6 +781,9 @@ class JobStateSyncMessage(Message):
     workflow_statuses: dict[str, str] = field(default_factory=dict)  # workflow_id -> status
     elapsed_seconds: float = 0.0  # Time since job started
     timestamp: float = 0.0       # When this sync was generated
+    # Origin gate for direct DC-to-Job-Leader routing
+    # Peer managers need this to route results if they take over job leadership
+    origin_gate_addr: tuple[str, int] | None = None
 
 
 @dataclass(slots=True)
@@ -771,6 +794,38 @@ class JobStateSyncAck(Message):
     job_id: str                  # Job being acknowledged
     responder_id: str            # Node ID of responder
     accepted: bool = True        # Whether sync was applied
+
+
+@dataclass(slots=True)
+class JobLeaderGateTransfer(Message):
+    """
+    Notification that job leadership has transferred to a new gate.
+
+    Sent from the new job leader gate to all managers in relevant DCs
+    when gate failure triggers job ownership transfer. Managers update
+    their origin_gate_addr to route results to the new leader.
+
+    This is part of Direct DC-to-Job-Leader Routing:
+    - Gate-A fails while owning job-123
+    - Gate-B takes over via consistent hashing
+    - Gate-B sends JobLeaderGateTransfer to managers
+    - Managers update _job_origin_gates[job-123] = Gate-B address
+    """
+    job_id: str                  # Job being transferred
+    new_gate_id: str             # Node ID of new job leader gate
+    new_gate_addr: tuple[str, int]  # TCP address of new leader gate
+    fence_token: int             # Incremented fence token for consistency
+    old_gate_id: str | None = None  # Node ID of old leader gate (if known)
+
+
+@dataclass(slots=True)
+class JobLeaderGateTransferAck(Message):
+    """
+    Acknowledgment of job leader gate transfer.
+    """
+    job_id: str                  # Job being acknowledged
+    manager_id: str              # Node ID of responding manager
+    accepted: bool = True        # Whether transfer was applied
 
 
 # =============================================================================

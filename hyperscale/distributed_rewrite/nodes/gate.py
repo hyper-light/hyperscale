@@ -231,6 +231,9 @@ class GateServer(HealthAwareServer):
             ),
             on_manager_heartbeat=self._handle_embedded_manager_heartbeat,
             on_gate_heartbeat=self._handle_gate_peer_heartbeat,
+            # Piggybacking for discovery
+            get_known_managers=self._get_known_managers_for_piggyback,
+            get_known_gates=self._get_known_gates_for_piggyback,
         ))
         
         # Register node death and join callbacks for failure/recovery handling
@@ -744,7 +747,7 @@ class GateServer(HealthAwareServer):
     def _count_active_datacenters(self) -> int:
         """
         Count datacenters with at least one fresh manager heartbeat.
-        
+
         A datacenter is active if any manager has sent a heartbeat in the last 60s.
         """
         now = time.monotonic()
@@ -755,6 +758,39 @@ class GateServer(HealthAwareServer):
                     active_count += 1
                     break  # Only count DC once
         return active_count
+
+    def _get_known_managers_for_piggyback(self) -> dict[str, tuple[str, int, str, int, str]]:
+        """
+        Get known managers for piggybacking in SWIM heartbeats.
+
+        Returns: dict mapping manager_id -> (tcp_host, tcp_port, udp_host, udp_port, datacenter)
+        """
+        result: dict[str, tuple[str, int, str, int, str]] = {}
+        for dc_id, manager_status in self._datacenter_manager_status.items():
+            for manager_addr, heartbeat in manager_status.items():
+                if heartbeat.node_id:
+                    tcp_host = heartbeat.tcp_host or manager_addr[0]
+                    tcp_port = heartbeat.tcp_port or manager_addr[1]
+                    udp_host = heartbeat.udp_host or manager_addr[0]
+                    udp_port = heartbeat.udp_port or manager_addr[1]
+                    result[heartbeat.node_id] = (tcp_host, tcp_port, udp_host, udp_port, dc_id)
+        return result
+
+    def _get_known_gates_for_piggyback(self) -> dict[str, tuple[str, int, str, int]]:
+        """
+        Get known gates for piggybacking in SWIM heartbeats.
+
+        Returns: dict mapping gate_id -> (tcp_host, tcp_port, udp_host, udp_port)
+        """
+        result: dict[str, tuple[str, int, str, int]] = {}
+        for gate_id, gate_info in self._known_gates.items():
+            result[gate_id] = (
+                gate_info.tcp_host,
+                gate_info.tcp_port,
+                gate_info.udp_host,
+                gate_info.udp_port,
+            )
+        return result
     
     def _get_best_manager_heartbeat(self, dc_id: str) -> tuple[ManagerHeartbeat | None, int, int]:
         """
@@ -2425,20 +2461,28 @@ class GateServer(HealthAwareServer):
     ) -> None:
         """
         Dispatch job to all target datacenters with fallback support.
-        
+
         Uses _select_datacenters_with_fallback to get primary and fallback DCs,
         then uses _dispatch_job_with_fallback for resilient dispatch.
-        
+
         Routing Rules:
         - UNHEALTHY: Fallback to non-UNHEALTHY DC, else fail job with error
         - DEGRADED: Fallback to non-DEGRADED DC, else queue with warning
-        - BUSY: Fallback to HEALTHY DC, else queue  
+        - BUSY: Fallback to HEALTHY DC, else queue
         - HEALTHY: Enqueue (preferred)
+
+        Direct DC-to-Job-Leader Routing:
+        - Sets origin_gate_addr so managers send results directly to this gate
+        - This gate is the job leader for this job
         """
         job = self._jobs.get(submission.job_id)
         if not job:
             return
-        
+
+        # Set origin gate address for direct DC-to-Job-Leader routing
+        # Managers will send JobFinalResult/JobProgress directly to this gate
+        submission.origin_gate_addr = (self._host, self._tcp_port)
+
         job.status = JobStatus.DISPATCHING.value
         self._increment_version()
         

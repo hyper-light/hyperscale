@@ -243,11 +243,11 @@ class ManagerStateEmbedder:
 class GateStateEmbedder:
     """
     State embedder for Gate nodes.
-    
+
     Embeds GateHeartbeat data and processes:
     - ManagerHeartbeat from datacenter managers
     - GateHeartbeat from peer gates
-    
+
     Attributes:
         get_node_id: Callable returning the node's full ID.
         get_datacenter: Callable returning datacenter ID.
@@ -260,6 +260,8 @@ class GateStateEmbedder:
         get_manager_count: Callable returning registered manager count.
         on_manager_heartbeat: Callable to handle received ManagerHeartbeat.
         on_gate_heartbeat: Callable to handle received GateHeartbeat from peers.
+        get_known_managers: Callable returning piggybacked manager info.
+        get_known_gates: Callable returning piggybacked gate info.
     """
     get_node_id: Callable[[], str]
     get_datacenter: Callable[[], str]
@@ -272,9 +274,21 @@ class GateStateEmbedder:
     get_manager_count: Callable[[], int]
     on_manager_heartbeat: Callable[[Any, tuple[str, int]], None]
     on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
-    
+    # Piggybacking callbacks for discovery
+    get_known_managers: Callable[[], dict[str, tuple[str, int, str, int, str]]] | None = None
+    get_known_gates: Callable[[], dict[str, tuple[str, int, str, int]]] | None = None
+
     def get_state(self) -> bytes | None:
         """Get GateHeartbeat to embed in SWIM messages."""
+        # Build piggybacked discovery info
+        known_managers: dict[str, tuple[str, int, str, int, str]] = {}
+        if self.get_known_managers:
+            known_managers = self.get_known_managers()
+
+        known_gates: dict[str, tuple[str, int, str, int]] = {}
+        if self.get_known_gates:
+            known_gates = self.get_known_gates()
+
         heartbeat = GateHeartbeat(
             node_id=self.get_node_id(),
             datacenter=self.get_datacenter(),
@@ -285,6 +299,8 @@ class GateStateEmbedder:
             active_jobs=self.get_active_jobs(),
             active_datacenters=self.get_active_datacenters(),
             manager_count=self.get_manager_count(),
+            known_managers=known_managers,
+            known_gates=known_gates,
         )
         return heartbeat.dump()
     
