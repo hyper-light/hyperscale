@@ -206,6 +206,8 @@ class SimulatedManager:
                 response = await worker.handle_cancel_request(wf_request)
                 if response.success and not response.already_completed:
                     cancelled_count += 1
+                elif not response.success and response.error:
+                    errors.append(response.error)
             except ConnectionError as connection_error:
                 errors.append(str(connection_error))
 

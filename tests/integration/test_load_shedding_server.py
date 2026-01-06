@@ -190,7 +190,8 @@ class TestLoadSheddingStateTransitions:
     async def test_transition_healthy_to_busy(self) -> None:
         """Test transition from healthy to busy state."""
         config = OverloadConfig(
-            delta_thresholds=(0.1, 0.3, 0.5),
+            # Use high delta thresholds so absolute bounds dominate
+            delta_thresholds=(5.0, 10.0, 20.0),  # Very high so delta rarely triggers
             absolute_bounds=(50.0, 100.0, 200.0),
             min_samples=3,
             current_window=5,  # Small window for faster state transitions
@@ -203,8 +204,8 @@ class TestLoadSheddingStateTransitions:
 
         assert server.get_current_state() == OverloadState.HEALTHY
 
-        # Increase latency to trigger busy state (above 50ms absolute bound)
-        # Fill the window with high latency values
+        # Increase latency to trigger busy state (above 50ms but below 100ms)
+        # Fill the window with busy-level latency values
         for _ in range(5):
             await server.process_request("SubmitJob", simulated_latency_ms=60.0)
 
@@ -218,7 +219,8 @@ class TestLoadSheddingStateTransitions:
     async def test_transition_busy_to_stressed(self) -> None:
         """Test transition from busy to stressed state."""
         config = OverloadConfig(
-            delta_thresholds=(0.1, 0.3, 0.5),
+            # Use high delta thresholds so absolute bounds dominate
+            delta_thresholds=(5.0, 10.0, 20.0),  # Very high so delta rarely triggers
             absolute_bounds=(50.0, 100.0, 200.0),
             min_samples=3,
             current_window=5,  # Small window for faster state transitions
@@ -231,7 +233,7 @@ class TestLoadSheddingStateTransitions:
 
         assert server.get_current_state() == OverloadState.BUSY
 
-        # Increase latency to trigger stressed state (above 100ms)
+        # Increase latency to trigger stressed state (above 100ms but below 200ms)
         # Fill the window with stressed-level latencies
         for _ in range(5):
             await server.process_request("SubmitJob", simulated_latency_ms=120.0)
@@ -249,7 +251,8 @@ class TestLoadSheddingStateTransitions:
     async def test_transition_stressed_to_overloaded(self) -> None:
         """Test transition from stressed to overloaded state."""
         config = OverloadConfig(
-            delta_thresholds=(0.1, 0.3, 0.5),
+            # Use high delta thresholds so absolute bounds dominate
+            delta_thresholds=(5.0, 10.0, 20.0),  # Very high so delta rarely triggers
             absolute_bounds=(50.0, 100.0, 200.0),
             min_samples=3,
             current_window=5,  # Small window for faster state transitions

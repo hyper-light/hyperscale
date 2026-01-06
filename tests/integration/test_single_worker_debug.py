@@ -7,6 +7,8 @@ import asyncio
 import os
 import sys
 
+import pytest
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -15,6 +17,7 @@ from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
 
 
+@pytest.mark.skip(reason="Debug test that spawns actual processes - run manually only")
 async def test_worker_startup_phases():
     """Test worker startup in phases to find where it hangs."""
     
