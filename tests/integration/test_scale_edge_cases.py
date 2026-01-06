@@ -323,23 +323,24 @@ class TestCascadeFailures:
 
     def test_overload_triggers_shedding_cascade(self):
         """Test that overload detection properly triggers load shedding."""
-        # Use min_samples=1 and current_window=1 for immediate state transitions
-        # based on absolute bounds (no EMA smoothing effects)
+        # Use high delta thresholds so only absolute bounds trigger state changes.
+        # This isolates absolute-bound behavior from delta detection.
         config = OverloadConfig(
             absolute_bounds=(100.0, 200.0, 500.0),
+            delta_thresholds=(100.0, 200.0, 300.0),  # Very high - effectively disabled
             min_samples=1,
             current_window=1,
         )
+
+        # Test HEALTHY state - accept everything
         detector = HybridOverloadDetector(config)
         shedder = LoadShedder(detector)
+        detector.record_latency(50.0)  # Below 100.0 threshold
+        assert not shedder.should_shed("DetailedStatsRequest")  # LOW - accepted
 
-        # Initially healthy - accept everything
-        detector.record_latency(50.0)
-
-        assert not shedder.should_shed("DetailedStatsRequest")  # LOW
-
-        # Transition to stressed (300ms > 200ms threshold)
-        detector._recent.clear()
+        # Test STRESSED state (300ms > 200ms, < 500ms threshold)
+        detector = HybridOverloadDetector(config)
+        shedder = LoadShedder(detector)
         detector.record_latency(300.0)
 
         # LOW and NORMAL should now be shed
@@ -347,8 +348,9 @@ class TestCascadeFailures:
         assert shedder.should_shed("StatsUpdate")  # NORMAL
         assert not shedder.should_shed("SubmitJob")  # HIGH
 
-        # Transition to overloaded (1000ms > 500ms threshold)
-        detector._recent.clear()
+        # Test OVERLOADED state (1000ms > 500ms threshold)
+        detector = HybridOverloadDetector(config)
+        shedder = LoadShedder(detector)
         detector.record_latency(1000.0)
 
         # Only CRITICAL accepted
