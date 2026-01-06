@@ -30,7 +30,7 @@ from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.engines.client.udp.protocols.dtls import do_patch
 from hyperscale.core.jobs.data_structures import LockedSet
 from hyperscale.core.jobs.hooks.hook_type import HookType
-from hyperscale.core.jobs.models import Env, Message
+from hyperscale.core.jobs.models import Env, JobContext, Message
 from hyperscale.core.jobs.tasks import TaskRunner
 from hyperscale.core.snowflake import Snowflake
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
@@ -227,11 +227,10 @@ class UDPProtocol(Generic[T, K]):
                     timeout=self._connect_timeout,
                 )
 
-                shard_id, _ = result
+                shard_id, response = result
 
-                snowflake = Snowflake.parse(shard_id)
-
-                instance_id = snowflake.instance
+                # Use full 64-bit node_id from message instead of 10-bit snowflake instance
+                instance_id = response.node_id
 
                 self._node_host_map[instance_id] = address
                 self._nodes.put_no_wait(instance_id)
@@ -337,10 +336,10 @@ class UDPProtocol(Generic[T, K]):
             self.id_generator = SnowflakeGenerator(self._node_id_base)
 
         if self.node_id is None:
-            snowflake_id = self.id_generator.generate()
-            snowflake = Snowflake.parse(snowflake_id)
+            # Use full 64-bit UUID to avoid collisions (10-bit snowflake instance is too small)
+            self.node_id = self._node_id_base
 
-            self.node_id = snowflake.instance
+            print('[DEBUG] NODE ID', self.node_id)
 
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._max_concurrency)
@@ -952,6 +951,11 @@ class UDPProtocol(Generic[T, K]):
             )
 
         elif message_type == "request":
+            # Inject sender's node_id into JobContext if present
+            data = message.data
+            if isinstance(data, JobContext):
+                data.node_id = message.node_id
+
             self._pending_responses.append(
                 asyncio.create_task(
                     self._read(
@@ -959,7 +963,7 @@ class UDPProtocol(Generic[T, K]):
                         message,
                         self._events.get(message.name)(
                             shard_id,
-                            message.data,
+                            data,
                         ),
                         addr,
                     )
@@ -967,12 +971,17 @@ class UDPProtocol(Generic[T, K]):
             )
 
         elif message_type == "stream":
+            # Inject sender's node_id into JobContext if present
+            stream_data = message.data
+            if isinstance(stream_data, JobContext):
+                stream_data.node_id = message.node_id
+
             self._pending_responses.append(
                 asyncio.create_task(
                     self._read_iterator(
                         message.name,
                         message,
-                        self._events.get(message.name)(shard_id, message.data),
+                        self._events.get(message.name)(shard_id, stream_data),
                         addr,
                     )
                 )
@@ -1152,11 +1161,11 @@ class UDPProtocol(Generic[T, K]):
                 pass
 
     async def _add_node_from_shard_id(self, shard_id: int, message: Message[T | None]):
-        snowflake = Snowflake.parse(shard_id)
-        instance = snowflake.instance
-        if (await self._nodes.exists(instance)) is False:
-            self._nodes.put_no_wait(instance)
-            self._node_host_map[instance] = (
+        # Use full 64-bit node_id from message instead of 10-bit snowflake instance
+        node_id = message.node_id
+        if (await self._nodes.exists(node_id)) is False:
+            self._nodes.put_no_wait(node_id)
+            self._node_host_map[node_id] = (
                 message.service_host,
                 message.service_port,
             )

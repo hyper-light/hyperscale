@@ -87,6 +87,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         )
 
         self.acknowledged_starts: set[str] = set()
+        self.acknowledged_start_node_ids: set[str] = set()
         self._worker_id = worker_idx
 
         self._logfile = f"hyperscale.worker.{self._worker_id}.log.json"
@@ -410,36 +411,21 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             # If explicit node_ids provided, target specific nodes
             # Otherwise fall back to round-robin (for backward compatibility)
-            if node_ids is not None and len(node_ids) == threads:
-                return await asyncio.gather(
-                    *[
-                        self.submit(
-                            run_id,
-                            workflow,
-                            workflow_vus[idx],
-                            node_ids[idx],
-                            context,
-                        )
-                        for idx in range(threads)
-                    ]
-                )
-            else:
-                # Fallback: use all available nodes via round-robin (legacy behavior)
-                # This should rarely happen with the new per-node tracking
-                print(f"[DEBUG] {workflow.name} run {run_id}: WARNING - using round-robin submission (node_ids={node_ids}, threads={threads})")
-                all_nodes = self._nodes.items()
-                return await asyncio.gather(
-                    *[
-                        self.submit(
-                            run_id,
-                            workflow,
-                            workflow_vus[idx],
-                            all_nodes[idx % len(all_nodes)] if all_nodes else None,
-                            context,
-                        )
-                        for idx in range(threads)
-                    ]
-                )
+            print(f"[DEBUG] {workflow.name} run {run_id}: about to submit to {len(node_ids)} specific nodes")
+            results = await asyncio.gather(
+                *[
+                    self.submit(
+                        run_id,
+                        workflow,
+                        workflow_vus[idx],
+                        node_id,
+                        context,
+                    )
+                    for idx, node_id in enumerate(node_ids)
+                ]
+            )
+            print(f"[DEBUG] {workflow.name} run {run_id}: submit completed, got {len(results)} responses")
+            return results
 
     async def submit_workflow_cancellation(
         self,
@@ -593,6 +579,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 "initializing",
                 f"Starting - {workers}/{workers} - threads",
             )
+
             return True
 
     @send()
@@ -633,6 +620,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 name="debug",
             )
 
+            print(f"[DEBUG] submit: {workflow.name} run {run_id} -> node {target_node_id} (vus={vus})")
+
             response: Response[JobContext[WorkflowStatusUpdate]] = await self.send(
                 "start_workflow",
                 JobContext(
@@ -646,6 +635,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 node_id=target_node_id,
             )
 
+            print(f"[DEBUG] submit: {workflow.name} run {run_id} -> node {target_node_id} got response")
+
             (shard_id, workflow_status) = response
 
             if workflow_status.data:
@@ -653,8 +644,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 workflow_name = workflow_status.data.workflow
                 run_id = workflow_status.run_id
 
-                snowflake = Snowflake.parse(shard_id)
-                node_id = snowflake.instance
+                # Use full 64-bit node_id from message instead of 10-bit snowflake instance
+                node_id = workflow_status.node_id
 
                 self._statuses[run_id][workflow_name][node_id] = (
                     WorkflowStatus.map_value_to_status(status)
@@ -685,7 +676,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
     @send()
     async def push_results(
         self,
-        node_id: str,
+        node_id: int,
         results: WorkflowResults,
         run_id: int,
     ) -> Response[JobContext[ReceivedReceipt]]:
@@ -696,6 +687,9 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 message=f"Workflow {results.workflow} run {run_id} pushing results to Node {node_id}",
                 name="debug",
             )
+
+            address = self._node_host_map.get(node_id)
+            print(f"[DEBUG] push_results: {results.workflow} run {run_id} -> node {node_id}, address={address}, host_map_keys={list(self._node_host_map.keys())[:5]}")
 
             return await self.send(
                 "process_results",
@@ -745,8 +739,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             name=f"graph_server_{self._node_id_base}"
         ) as ctx:
             async with self._leader_lock:
-                snowflake = Snowflake.parse(shard_id)
-                node_id = snowflake.instance
+                # Use full 64-bit node_id from message instead of 10-bit snowflake instance
+                node_id = acknowledgement.node_id
 
                 host, port = acknowledgement.data
 
@@ -757,6 +751,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 )
 
                 self.acknowledged_starts.add(node_addr)
+                self.acknowledged_start_node_ids.add(node_id)
 
                 # Signal the event if all expected workers have acknowledged
                 if (
@@ -774,8 +769,9 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         async with self._logger.context(
             name=f"workflow_run_{workflow_results.run_id}",
         ) as ctx:
+            # Use full 64-bit node_id from JobContext instead of 10-bit snowflake instance
+            node_id = workflow_results.node_id
             snowflake = Snowflake.parse(shard_id)
-            node_id = snowflake.instance
             timestamp = snowflake.timestamp
 
             run_id = workflow_results.run_id
@@ -800,7 +796,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                         value,
                         timestamp=timestamp,
                     )
-                    for _ in self.nodes
+                    for _ in self.acknowledged_start_node_ids
                     for key, value in workflow_context.items()
                 ]
             )
@@ -876,10 +872,12 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
     ) -> JobContext[WorkflowStatusUpdate]:
         task_id = self.tasks.create_task_id()
 
-        snowflake = Snowflake.parse(shard_id)
-        node_id = snowflake.instance
+        # Use full 64-bit node_id from JobContext instead of 10-bit snowflake instance
+        node_id = context.node_id
 
         workflow_name = context.data.workflow.name
+
+        print(f"[DEBUG] start_workflow: node {self._node_id_base} received {workflow_name} run {context.run_id} from node {node_id}, host_map_has_sender={node_id in self._node_host_map}, host_map_keys={list(self._node_host_map.keys())[:3]}")
 
         default_config = {
             "node_id": self._node_id_base,
@@ -961,8 +959,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         cancelation: JobContext[WorkflowCancellation]
     ) -> JobContext[WorkflowCancellationUpdate]:
 
-        snowflake = Snowflake.parse(shard_id)
-        node_id = snowflake.instance
+        # Use full 64-bit node_id from JobContext instead of 10-bit snowflake instance
+        node_id = cancelation.node_id
 
         run_id = cancelation.run_id
         workflow_name = cancelation.data.workflow_name
@@ -1002,8 +1000,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
     ) -> JobContext[WorkflowCancellationUpdate]:
         try:
 
-            snowflake = Snowflake.parse(shard_id)
-            node_id = snowflake.instance
+            # Use full 64-bit node_id from JobContext instead of 10-bit snowflake instance
+            node_id = cancellation.node_id
 
             run_id = cancellation.run_id
             workflow_name = cancellation.data.workflow_name
@@ -1037,8 +1035,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         shard_id: int,
         update: JobContext[WorkflowStatusUpdate],
     ) -> JobContext[ReceivedReceipt]:
-        snowflake = Snowflake.parse(shard_id)
-        node_id = snowflake.instance
+        # Use full 64-bit node_id from JobContext instead of 10-bit snowflake instance
+        node_id = update.node_id
 
         run_id = update.run_id
         workflow = update.data.workflow
@@ -1130,6 +1128,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     job.vus,
                 )
 
+                print(f"[DEBUG] run_workflow: {job.workflow.name} completed - results={results is not None}, run_id={run_id}, status={status}, error={error}")
+
                 if context is None:
                     context = job.context
 
@@ -1145,11 +1145,19 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     run_id,
                 )
             except Exception as err:
+                await ctx.log_prepared(
+                    message=f"Workflow {job.workflow.name} run {run_id} failed with error: {err}",
+                    name="error",
+                )
+
+                print(f"[DEBUG] run_workflow: {job.workflow.name} run {run_id} EXCEPTION: {err}")
+
                 await self.push_results(
                     node_id,
                     WorkflowResults(
                         job.workflow.name, None, job.context, err, WorkflowStatus.FAILED
                     ),
+                    run_id,
                 )
 
     @task(
