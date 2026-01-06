@@ -420,6 +420,12 @@ class ManagerServer(HealthAwareServer):
             get_tcp_port=lambda: self._tcp_port,
             get_udp_host=lambda: self._host,
             get_udp_port=lambda: self._udp_port,
+            # Health piggyback fields (AD-19)
+            get_health_accepting_jobs=lambda: self._manager_state == ManagerState.ACTIVE,
+            get_health_has_quorum=self._has_quorum_available,
+            get_health_throughput=lambda: 0.0,  # Actual throughput tracking deferred
+            get_health_expected_throughput=lambda: 0.0,  # Expected throughput calculation deferred
+            get_health_overload_state=lambda: self._overload_detector.get_state(0.0, 0.0),
         ))
         
         # Register leadership callbacks (composition pattern - no override)

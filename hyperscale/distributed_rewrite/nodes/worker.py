@@ -219,6 +219,11 @@ class WorkerServer(HealthAwareServer):
             on_manager_heartbeat=self._handle_manager_heartbeat,
             get_tcp_host=lambda: self._host,
             get_tcp_port=lambda: self._tcp_port,
+            # Health piggyback fields (AD-19)
+            get_health_accepting_work=lambda: self._get_worker_state() in (WorkerState.HEALTHY, WorkerState.DEGRADED),
+            get_health_throughput=lambda: 0.0,  # Actual throughput tracking deferred
+            get_health_expected_throughput=lambda: 0.0,  # Expected throughput calculation deferred
+            get_health_overload_state=lambda: "healthy",  # Workers don't have overload detector yet
         )
         
         # Initialize parent HealthAwareServer

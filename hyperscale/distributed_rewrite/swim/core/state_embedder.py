@@ -97,6 +97,10 @@ class WorkerStateEmbedder:
         get_tcp_host: Callable returning TCP host address.
         get_tcp_port: Callable returning TCP port.
         on_manager_heartbeat: Optional callback for received ManagerHeartbeat.
+        get_health_accepting_work: Callable returning whether worker accepts work.
+        get_health_throughput: Callable returning current throughput.
+        get_health_expected_throughput: Callable returning expected throughput.
+        get_health_overload_state: Callable returning overload state.
     """
     get_node_id: Callable[[], str]
     get_worker_state: Callable[[], str]
@@ -109,6 +113,11 @@ class WorkerStateEmbedder:
     on_manager_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     get_tcp_host: Callable[[], str] | None = None
     get_tcp_port: Callable[[], int] | None = None
+    # Health piggyback fields (AD-19)
+    get_health_accepting_work: Callable[[], bool] | None = None
+    get_health_throughput: Callable[[], float] | None = None
+    get_health_expected_throughput: Callable[[], float] | None = None
+    get_health_overload_state: Callable[[], str] | None = None
 
     def get_state(self) -> bytes | None:
         """Get WorkerHeartbeat to embed in SWIM messages."""
@@ -123,6 +132,11 @@ class WorkerStateEmbedder:
             active_workflows=self.get_active_workflows(),
             tcp_host=self.get_tcp_host() if self.get_tcp_host else "",
             tcp_port=self.get_tcp_port() if self.get_tcp_port else 0,
+            # Health piggyback fields
+            health_accepting_work=self.get_health_accepting_work() if self.get_health_accepting_work else True,
+            health_throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
+            health_expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
+            health_overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
         )
         return heartbeat.dump()
     
@@ -171,6 +185,11 @@ class ManagerStateEmbedder:
         on_worker_heartbeat: Callable to handle received WorkerHeartbeat.
         on_manager_heartbeat: Callable to handle received ManagerHeartbeat from peers.
         on_gate_heartbeat: Callable to handle received GateHeartbeat from gates.
+        get_health_accepting_jobs: Callable returning whether manager accepts jobs.
+        get_health_has_quorum: Callable returning whether manager has quorum.
+        get_health_throughput: Callable returning current throughput.
+        get_health_expected_throughput: Callable returning expected throughput.
+        get_health_overload_state: Callable returning overload state.
     """
     get_node_id: Callable[[], str]
     get_datacenter: Callable[[], str]
@@ -191,6 +210,12 @@ class ManagerStateEmbedder:
     get_tcp_port: Callable[[], int] | None = None
     get_udp_host: Callable[[], str] | None = None
     get_udp_port: Callable[[], int] | None = None
+    # Health piggyback fields (AD-19)
+    get_health_accepting_jobs: Callable[[], bool] | None = None
+    get_health_has_quorum: Callable[[], bool] | None = None
+    get_health_throughput: Callable[[], float] | None = None
+    get_health_expected_throughput: Callable[[], float] | None = None
+    get_health_overload_state: Callable[[], str] | None = None
 
     def get_state(self) -> bytes | None:
         """Get ManagerHeartbeat to embed in SWIM messages."""
@@ -211,6 +236,12 @@ class ManagerStateEmbedder:
             tcp_port=self.get_tcp_port() if self.get_tcp_port else 0,
             udp_host=self.get_udp_host() if self.get_udp_host else "",
             udp_port=self.get_udp_port() if self.get_udp_port else 0,
+            # Health piggyback fields
+            health_accepting_jobs=self.get_health_accepting_jobs() if self.get_health_accepting_jobs else True,
+            health_has_quorum=self.get_health_has_quorum() if self.get_health_has_quorum else True,
+            health_throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
+            health_expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
+            health_overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
         )
         return heartbeat.dump()
     
@@ -262,6 +293,11 @@ class GateStateEmbedder:
         on_gate_heartbeat: Callable to handle received GateHeartbeat from peers.
         get_known_managers: Callable returning piggybacked manager info.
         get_known_gates: Callable returning piggybacked gate info.
+        get_health_has_dc_connectivity: Callable returning DC connectivity status.
+        get_health_connected_dc_count: Callable returning connected DC count.
+        get_health_throughput: Callable returning current throughput.
+        get_health_expected_throughput: Callable returning expected throughput.
+        get_health_overload_state: Callable returning overload state.
     """
     get_node_id: Callable[[], str]
     get_datacenter: Callable[[], str]
@@ -277,6 +313,12 @@ class GateStateEmbedder:
     # Piggybacking callbacks for discovery
     get_known_managers: Callable[[], dict[str, tuple[str, int, str, int, str]]] | None = None
     get_known_gates: Callable[[], dict[str, tuple[str, int, str, int]]] | None = None
+    # Health piggyback fields (AD-19)
+    get_health_has_dc_connectivity: Callable[[], bool] | None = None
+    get_health_connected_dc_count: Callable[[], int] | None = None
+    get_health_throughput: Callable[[], float] | None = None
+    get_health_expected_throughput: Callable[[], float] | None = None
+    get_health_overload_state: Callable[[], str] | None = None
 
     def get_state(self) -> bytes | None:
         """Get GateHeartbeat to embed in SWIM messages."""
@@ -301,6 +343,12 @@ class GateStateEmbedder:
             manager_count=self.get_manager_count(),
             known_managers=known_managers,
             known_gates=known_gates,
+            # Health piggyback fields
+            health_has_dc_connectivity=self.get_health_has_dc_connectivity() if self.get_health_has_dc_connectivity else True,
+            health_connected_dc_count=self.get_health_connected_dc_count() if self.get_health_connected_dc_count else 0,
+            health_throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
+            health_expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
+            health_overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
         )
         return heartbeat.dump()
     

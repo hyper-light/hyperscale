@@ -275,6 +275,12 @@ class GateServer(HealthAwareServer):
             # Piggybacking for discovery
             get_known_managers=self._get_known_managers_for_piggyback,
             get_known_gates=self._get_known_gates_for_piggyback,
+            # Health piggyback fields (AD-19)
+            get_health_has_dc_connectivity=lambda: len(self._datacenter_managers) > 0,
+            get_health_connected_dc_count=self._count_active_datacenters,
+            get_health_throughput=lambda: 0.0,  # Actual throughput tracking deferred
+            get_health_expected_throughput=lambda: 0.0,  # Expected throughput calculation deferred
+            get_health_overload_state=lambda: self._overload_detector.get_state(0.0, 0.0),
         ))
         
         # Register node death and join callbacks for failure/recovery handling

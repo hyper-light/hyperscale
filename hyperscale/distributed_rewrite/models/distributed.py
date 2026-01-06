@@ -279,6 +279,13 @@ class GateHeartbeat(Message):
     Piggybacking (like manager/worker discovery):
     - known_managers: Managers this gate knows about, for manager discovery
     - known_gates: Other gates this gate knows about (for gate cluster membership)
+
+    Health piggyback fields (AD-19):
+    - health_has_dc_connectivity: Whether gate has DC connectivity
+    - health_connected_dc_count: Number of connected datacenters
+    - health_throughput: Current job forwarding throughput
+    - health_expected_throughput: Expected throughput
+    - health_overload_state: Overload state from HybridOverloadDetector
     """
     node_id: str                 # Gate identifier
     datacenter: str              # Gate's home datacenter
@@ -294,6 +301,12 @@ class GateHeartbeat(Message):
     known_managers: dict[str, tuple[str, int, str, int, str]] = field(default_factory=dict)
     # Maps node_id -> (tcp_host, tcp_port, udp_host, udp_port)
     known_gates: dict[str, tuple[str, int, str, int]] = field(default_factory=dict)
+    # Health piggyback fields (AD-19)
+    health_has_dc_connectivity: bool = True
+    health_connected_dc_count: int = 0
+    health_throughput: float = 0.0
+    health_expected_throughput: float = 0.0
+    health_overload_state: str = "healthy"
 
 
 @dataclass(slots=True, kw_only=True)
@@ -382,6 +395,12 @@ class WorkerHeartbeat(Message):
     Periodic heartbeat from worker to manager.
 
     Contains current state and resource utilization.
+
+    Health piggyback fields (AD-19):
+    - health_accepting_work: Whether worker is accepting new work
+    - health_throughput: Current workflow completions per interval
+    - health_expected_throughput: Expected throughput based on capacity
+    - health_overload_state: Overload state from HybridOverloadDetector
     """
     node_id: str                 # Worker identifier
     state: str                   # WorkerState value
@@ -395,6 +414,11 @@ class WorkerHeartbeat(Message):
     # TCP address for routing (populated in UDP heartbeats)
     tcp_host: str = ""
     tcp_port: int = 0
+    # Health piggyback fields (AD-19)
+    health_accepting_work: bool = True
+    health_throughput: float = 0.0
+    health_expected_throughput: float = 0.0
+    health_overload_state: str = "healthy"
 
 
 @dataclass(slots=True)
@@ -418,6 +442,13 @@ class ManagerHeartbeat(Message):
     Piggybacking:
     - job_leaderships: Jobs this manager leads (for distributed consistency)
     - known_gates: Gates this manager knows about (for gate discovery)
+
+    Health piggyback fields (AD-19):
+    - health_accepting_jobs: Whether manager is accepting new jobs
+    - health_has_quorum: Whether manager has worker quorum
+    - health_throughput: Current job/workflow throughput
+    - health_expected_throughput: Expected throughput based on capacity
+    - health_overload_state: Overload state from HybridOverloadDetector
     """
     node_id: str                 # Manager identifier
     datacenter: str              # Datacenter identifier
@@ -441,6 +472,12 @@ class ManagerHeartbeat(Message):
     # Piggybacked gate discovery - gates learn about other gates from managers
     # Maps gate_id -> (tcp_host, tcp_port, udp_host, udp_port)
     known_gates: dict[str, tuple[str, int, str, int]] = field(default_factory=dict)
+    # Health piggyback fields (AD-19)
+    health_accepting_jobs: bool = True
+    health_has_quorum: bool = True
+    health_throughput: float = 0.0
+    health_expected_throughput: float = 0.0
+    health_overload_state: str = "healthy"
 
 
 # =============================================================================

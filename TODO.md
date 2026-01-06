@@ -147,7 +147,10 @@ Three-signal health model for all node types.
   - [x] `accepting_work`, `capacity`
   - [x] `throughput`, `expected_throughput`
   - [x] `overload_state`
-- [ ] Add health piggyback to SWIM protocol messages
+- [x] Add health piggyback to SWIM protocol messages
+  - [x] Add health fields to WorkerHeartbeat, ManagerHeartbeat, GateHeartbeat
+  - [x] Update StateEmbedders to populate health fields
+  - [x] Add integration tests for health piggyback
 
 ---
 
@@ -205,8 +208,10 @@ Three-signal health model for all node types.
   - [x] `check_rate_limit(client_id, operation) -> tuple[bool, float]`
   - [x] Returns `(allowed, retry_after_seconds)`
 - [x] Integrate rate limiter with gate handlers
+- [x] Integrate rate limiter with manager handlers
 - [x] Add response handling with Retry-After (RateLimitResponse)
 - [x] Add client-side cooperative rate limiting
+- [x] Add automatic retry-after logic (RateLimitRetryConfig, execute_with_rate_limit_retry)
 - [x] Add bucket cleanup for inactive clients (prevent memory leak)
 - [x] Add integration tests for rate limiting
 
