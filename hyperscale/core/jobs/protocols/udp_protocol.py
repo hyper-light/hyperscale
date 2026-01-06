@@ -599,22 +599,22 @@ class UDPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
 
-        try:
-            await self._sendto_with_retry(compressed, address)
-        except BlockingIOError:
-            # Socket buffer full after all retries - return error response
-            return (
-                self.id_generator.generate(),
-                Message(
-                    self.node_id,
-                    target,
-                    service_host=self.host,
-                    service_port=self.port,
-                    error="Send failed: socket buffer full.",
-                ),
-            )
+        for attempt in range(self._retries + 1):
+            try:
+                await self._sendto_with_retry(compressed, address)
+            except BlockingIOError:
+                # Socket buffer full after all retries - return error response
+                return (
+                    self.id_generator.generate(),
+                    Message(
+                        self.node_id,
+                        target,
+                        service_host=self.host,
+                        service_port=self.port,
+                        error="Send failed: socket buffer full.",
+                    ),
+                )
 
-        for _ in range(self._retries):
             try:
                 waiter = self._loop.create_future()
                 self._waiters[target].put_nowait(waiter)
@@ -634,7 +634,13 @@ class UDPProtocol(Generic[T, K]):
 
                 return (shard_id, response.data)
 
+            except asyncio.TimeoutError:
+                # Worker may not be ready yet - retry with exponential backoff
+                if attempt < self._retries:
+                    await asyncio.sleep(self._retry_interval * (2 ** attempt))
             except Exception:
+                import traceback
+                print(traceback.format_exc())
                 await asyncio.sleep(self._retry_interval)
 
         return (
@@ -668,28 +674,34 @@ class UDPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(data)
         compressed = self._compressor.compress(encrypted_message)
 
-        try:
-            await self._sendto_with_retry(compressed, address)
+        for attempt in range(self._retries + 1):
+            try:
+                await self._sendto_with_retry(compressed, address)
+            except BlockingIOError:
+                # Socket buffer full after all retries
+                return (self.id_generator.generate(), b"Send failed: socket buffer full.")
 
-            for _ in range(self._retries):
-                try:
-                    waiter = self._loop.create_future()
-                    self._waiters[target].put_nowait(waiter)
+            try:
+                waiter = self._loop.create_future()
+                self._waiters[target].put_nowait(waiter)
 
-                    result: Tuple[int, bytes] = await asyncio.wait_for(
-                        waiter,
-                        timeout=self._request_timeout,
-                    )
+                result: Tuple[int, bytes] = await asyncio.wait_for(
+                    waiter,
+                    timeout=self._request_timeout,
+                )
 
-                    (shard_id, response) = result
+                (shard_id, response) = result
 
-                    return (shard_id, response)
+                return (shard_id, response)
 
-                except Exception:
-                    await asyncio.sleep(self._retry_interval)
+            except asyncio.TimeoutError:
+                # Worker may not be ready yet - retry with exponential backoff
+                if attempt < self._retries:
+                    await asyncio.sleep(self._retry_interval * (2 ** attempt))
+            except (Exception, socket.error):
+                await asyncio.sleep(self._retry_interval)
 
-        except (Exception, socket.error):
-            return (self.id_generator.generate(), b"Request timed out.")
+        return (self.id_generator.generate(), b"Request timed out.")
 
     async def stream(
         self,
@@ -730,32 +742,55 @@ class UDPProtocol(Generic[T, K]):
         encrypted_message = self._encryptor.encrypt(item)
         compressed = self._compressor.compress(encrypted_message)
 
-        try:
-            await self._sendto_with_retry(compressed, address)
+        for attempt in range(self._retries + 1):
+            try:
+                await self._sendto_with_retry(compressed, address)
+            except BlockingIOError:
+                # Socket buffer full after all retries
+                yield (
+                    self.id_generator.generate(),
+                    Message(
+                        self.node_id,
+                        target,
+                        service_host=self.host,
+                        service_port=self.port,
+                        error="Send failed: socket buffer full.",
+                    ),
+                )
+                return
 
-            waiter = self._loop.create_future()
-            self._waiters[target].put_nowait(waiter)
+            try:
+                waiter = self._loop.create_future()
+                self._waiters[target].put_nowait(waiter)
 
-            await asyncio.wait_for(waiter, timeout=self._request_timeout)
+                await asyncio.wait_for(waiter, timeout=self._request_timeout)
 
-            for item in self.queue[target]:
-                (shard_id, response) = item
+                for item in self.queue[target]:
+                    (shard_id, response) = item
 
-                yield (shard_id, response)
+                    yield (shard_id, response)
 
-            self.queue.clear()
+                self.queue.clear()
+                return  # Success, exit the retry loop
 
-        except (Exception, socket.error):
-            yield (
-                self.id_generator.generate(),
-                Message(
-                    self.node_id,
-                    target,
-                    service_host=self.host,
-                    service_port=self.port,
-                    error="Request timed out.",
-                ),
-            )
+            except asyncio.TimeoutError:
+                # Worker may not be ready yet - retry with exponential backoff
+                if attempt < self._retries:
+                    await asyncio.sleep(self._retry_interval * (2 ** attempt))
+            except (Exception, socket.error):
+                await asyncio.sleep(self._retry_interval)
+
+        # All retries exhausted
+        yield (
+            self.id_generator.generate(),
+            Message(
+                self.node_id,
+                target,
+                service_host=self.host,
+                service_port=self.port,
+                error="Request timed out.",
+            ),
+        )
 
     async def broadcast(
         self,
