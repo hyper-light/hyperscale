@@ -295,20 +295,23 @@ Three-signal health model for all node types.
 
 ### 4.3 AD-25: Version Skew Handling
 
-- [ ] Implement `ProtocolVersion` dataclass
-  - [ ] `major: int`, `minor: int`
-  - [ ] `is_compatible_with(other) -> bool` (same major)
-  - [ ] `supports_feature(other, feature) -> bool`
-- [ ] Define feature version map
-  - [ ] `"cancellation": (1, 0)`
-  - [ ] `"batched_stats": (1, 1)`
-  - [ ] `"client_reconnection": (1, 2)`
-  - [ ] `"fence_tokens": (1, 2)`
-- [ ] Implement `NodeCapabilities` dataclass
-  - [ ] `protocol_version: ProtocolVersion`
-  - [ ] `capabilities: set[str]`
-  - [ ] `node_version: str`
-  - [ ] `negotiate(other) -> set[str]`
+- [x] Implement `ProtocolVersion` dataclass
+  - [x] `major: int`, `minor: int`
+  - [x] `is_compatible_with(other) -> bool` (same major)
+  - [x] `supports_feature(feature) -> bool`
+- [x] Define feature version map
+  - [x] `"cancellation": (1, 0)`
+  - [x] `"batched_stats": (1, 1)`
+  - [x] `"client_reconnection": (1, 2)`
+  - [x] `"fence_tokens": (1, 2)`
+  - [x] `"rate_limiting": (1, 3)`
+  - [x] `"healthcheck_extensions": (1, 4)`
+- [x] Implement `NodeCapabilities` dataclass
+  - [x] `protocol_version: ProtocolVersion`
+  - [x] `capabilities: set[str]`
+  - [x] `node_version: str`
+  - [x] `negotiate(other) -> set[str]`
+- [x] Implement `NegotiatedCapabilities` result class
 - [ ] Add version/capability fields to handshake messages
 - [ ] Update message serialization to ignore unknown fields
 - [ ] Add protocol version validation on connection
