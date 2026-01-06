@@ -46,6 +46,7 @@ async def run_server(
     server: RemoteGraphController,
     cert_path: str | None = None,
     key_path: str | None = None,
+    enable_server_cleanup: bool = False,
 ):
     try:
         await server.start_server(
@@ -62,6 +63,9 @@ async def run_server(
             await server.close()
 
             return
+        
+        if enable_server_cleanup:
+            server.start_controller_cleanup()
         
         await server.run_forever()
         await server.close()
@@ -114,6 +118,7 @@ def run_thread(
     log_level: LogLevelName = "info",
     cert_path: str | None = None,
     key_path: str | None = None,
+    enable_server_cleanup: bool = False,
 ):
     try:
         from hyperscale.logging import LoggingConfig
@@ -161,6 +166,7 @@ def run_thread(
                 server,
                 cert_path=cert_path,
                 key_path=key_path,
+                enable_server_cleanup=enable_server_cleanup,
             )
         )
 
@@ -233,6 +239,7 @@ class LocalServerPool:
         env: Env,
         cert_path: str | None = None,
         key_path: str | None = None,
+        enable_server_cleanup: bool = False,
     ):
         async with self._logger.context(
             name="local_server_pool",
@@ -265,6 +272,8 @@ class LocalServerPool:
                                 log_level=config.level.name.lower(),
                                 cert_path=cert_path,
                                 key_path=key_path,
+                                enable_server_cleanup=enable_server_cleanup,
+                                
                             ),
                         )
                         for idx, worker_ip in enumerate(worker_ips)

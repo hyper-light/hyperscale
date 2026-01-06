@@ -1,3 +1,4 @@
+from .cancellation_update import CancellationUpdate as CancellationUpdate
 from .env import Env as Env
 from .hyperscale_config import HyperscaleConfig as HyperscaleConfig
 from .hyperscale_config import TerminalMode as TerminalMode
@@ -6,6 +7,9 @@ from .job_context import JobContext as JobContext
 from .message import Message as Message
 from .received_receipt import ReceivedReceipt as ReceivedReceipt
 from .response import Response as Response
+from .workflow_cancellation import WorkflowCancellation as WorkflowCancellation
+from .workflow_cancellation_status import WorkflowCancellationStatus as WorkflowCancellationStatus
+from .workflow_cancellation_update import WorkflowCancellationUpdate as WorkflowCancellationUpdate
 from .workflow_job import WorkflowJob as WorkflowJob
 from .workflow_results import WorkflowResults as WorkflowResults
 from .workflow_status_update import WorkflowStatusUpdate as WorkflowStatusUpdate

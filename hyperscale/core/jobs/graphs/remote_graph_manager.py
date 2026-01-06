@@ -17,7 +17,12 @@ from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.graph.workflow import Workflow
 from hyperscale.core.hooks import Hook, HookType
 from hyperscale.core.jobs.models import InstanceRoleType, WorkflowStatusUpdate
-from hyperscale.core.jobs.models import WorkflowResults
+from hyperscale.core.jobs.models import (
+    CancellationUpdate,
+    WorkflowResults,
+    WorkflowCancellationStatus,
+    WorkflowCancellationUpdate,
+)
 from hyperscale.core.jobs.models.workflow_status import WorkflowStatus
 from hyperscale.core.jobs.models.env import Env
 from hyperscale.core.jobs.workers import Provisioner, StagePriority
@@ -100,6 +105,7 @@ class RemoteGraphManager:
         self._graph_updates: dict[int, dict[str, asyncio.Queue[WorkflowStatusUpdate]]] = defaultdict(lambda: defaultdict(asyncio.Queue))
         self._workflow_statuses: dict[int, dict[str, Deque[WorkflowStatusUpdate]]] = defaultdict(lambda: defaultdict(deque))
         self._available_cores_updates: asyncio.Queue[tuple[int, int, int]] | None = None
+        self._cancellation_updates: dict[int, dict[str, asyncio.Queue[CancellationUpdate]]] = defaultdict(lambda: defaultdict(asyncio.Queue))
 
         self._step_traversal_orders: Dict[
             str,
@@ -894,6 +900,50 @@ class RemoteGraphManager:
             return statuses[0]
         
         return WorkflowStatus.UNKNOWN
+    
+    def start_server_cleanup(self):
+        self._controller.start_controller_cleanup()
+    
+    async def cancel_workflow(
+        self,
+        run_id: int,
+        workflow: str,
+        timeout: str = "1m",
+        update_rate: str = "0.25s", 
+    ):
+        
+        (
+            cancellation_status_counts,
+            expected_nodes,
+        ) = await self._controller.submit_workflow_cancellation(
+            run_id,
+            workflow,
+            self._update_cancellation,
+            timeout=timeout,
+            rate=update_rate,
+        )
+
+        return CancellationUpdate(
+            run_id=run_id,
+            workflow_name=workflow,
+            cancellation_status_counts=cancellation_status_counts,
+            expected_cancellations=expected_nodes,
+        )
+
+    async def get_cancelation_update(
+        self,
+        run_id: int,
+        workflow: str,
+    ):
+        if self._cancellation_updates[run_id][workflow].empty():
+            return CancellationUpdate(
+                run_id=run_id,
+                workflow_name=workflow,
+                cancellation_status_counts=defaultdict(lambda: 0),
+                expected_cancellations=0,
+            )
+        
+        return await self._cancellation_updates[run_id][workflow].get()
 
 
     async def get_workflow_update(self, run_id: int, workflow: str) -> WorkflowStatusUpdate | None:
@@ -924,6 +974,20 @@ class RemoteGraphManager:
             assigned,
             completed,
             self._threads - max(assigned - completed, 0),
+        ))
+
+    def _update_cancellation(
+        self,
+        run_id: int,
+        workflow_name: str,
+        cancellation_status_counts: dict[WorkflowCancellationStatus, list[WorkflowCancellationUpdate]],
+        expected_cancellations: int,
+    ):
+        self._cancellation_updates[run_id][workflow_name].put_nowait(CancellationUpdate(
+            run_id=run_id,
+            workflow_name=workflow_name,
+            cancellation_status_counts=cancellation_status_counts,
+            expected_cancellations=expected_cancellations,
         ))
 
     async def _update(
