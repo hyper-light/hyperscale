@@ -111,12 +111,12 @@ Three-signal health model for all node types.
   - [x] Progress: `jobs_accepted_last_interval`, `workflows_dispatched_last_interval`, `expected_throughput`
 - [x] Implement `liveness`, `readiness`, `progress_state` properties
 - [x] Implement `get_routing_decision()` method
-- [ ] Update gate's manager tracking to use `ManagerHealthState`
-- [ ] Integrate with DC Health Classification (AD-16)
-  - [ ] ALL managers NOT liveness → DC = UNHEALTHY
-  - [ ] MAJORITY managers NOT readiness → DC = DEGRADED
-  - [ ] ANY manager progress == "stuck" → DC = DEGRADED
-- [ ] Add integration tests for manager health model
+- [x] Update gate's manager tracking to use `ManagerHealthState`
+- [x] Integrate with DC Health Classification (AD-16)
+  - [x] ALL managers NOT liveness → DC = UNHEALTHY
+  - [x] MAJORITY managers NOT readiness → DC = DEGRADED
+  - [x] ANY manager progress == "stuck" → DC = DEGRADED
+- [x] Add integration tests for manager health model
 
 ### 2.3 AD-19: Gate Health (Gates monitor peer Gates)
 
