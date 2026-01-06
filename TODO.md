@@ -27,8 +27,8 @@ Items are ordered by implementation priority and dependency.
 
 Must be completed before reliability infrastructure.
 
-- [ ] Fix `_known_gates` not initialized in gate.py (used but never created)
-- [ ] Add per-job locking to gate's job state (race condition with concurrent handlers)
+- [x] Fix `_known_gates` not initialized in gate.py (used but never created)
+- [x] Add per-job locking to gate's job state (race condition with concurrent handlers)
 
 ---
 
@@ -38,45 +38,45 @@ These provide the foundation for all other reliability features.
 
 ### 1.1 Module Structure Setup
 
-- [ ] Create `hyperscale/distributed_rewrite/reliability/` module
-- [ ] Create `hyperscale/distributed_rewrite/health/` module
-- [ ] Create `hyperscale/distributed_rewrite/jobs/gates/` module
-- [ ] Create `hyperscale/distributed_rewrite/datacenters/` module
-- [ ] Add `__init__.py` files with proper exports
+- [x] Create `hyperscale/distributed_rewrite/reliability/` module
+- [x] Create `hyperscale/distributed_rewrite/health/` module
+- [x] Create `hyperscale/distributed_rewrite/jobs/gates/` module
+- [x] Create `hyperscale/distributed_rewrite/datacenters/` module
+- [x] Add `__init__.py` files with proper exports
 
 ### 1.2 AD-21: Unified Retry Framework with Jitter
 
 Foundation for all network operations.
 
-- [ ] Implement `JitterStrategy` enum (FULL, EQUAL, DECORRELATED)
-  - [ ] FULL: `random(0, min(cap, base * 2^attempt))`
-  - [ ] EQUAL: `temp/2 + random(0, temp/2)`
-  - [ ] DECORRELATED: `random(base, previous_delay * 3)`
-- [ ] Implement `RetryConfig` dataclass
-  - [ ] `max_attempts: int = 3`
-  - [ ] `base_delay: float = 0.5`
-  - [ ] `max_delay: float = 30.0`
-  - [ ] `jitter: JitterStrategy = JitterStrategy.FULL`
-  - [ ] `retryable_exceptions: tuple[type[Exception], ...]`
-- [ ] Implement `RetryExecutor` class
-  - [ ] `calculate_delay(attempt: int) -> float`
-  - [ ] `async execute(operation, operation_name) -> T`
+- [x] Implement `JitterStrategy` enum (FULL, EQUAL, DECORRELATED)
+  - [x] FULL: `random(0, min(cap, base * 2^attempt))`
+  - [x] EQUAL: `temp/2 + random(0, temp/2)`
+  - [x] DECORRELATED: `random(base, previous_delay * 3)`
+- [x] Implement `RetryConfig` dataclass
+  - [x] `max_attempts: int = 3`
+  - [x] `base_delay: float = 0.5`
+  - [x] `max_delay: float = 30.0`
+  - [x] `jitter: JitterStrategy = JitterStrategy.FULL`
+  - [x] `retryable_exceptions: tuple[type[Exception], ...]`
+- [x] Implement `RetryExecutor` class
+  - [x] `calculate_delay(attempt: int) -> float`
+  - [x] `async execute(operation, operation_name) -> T`
 - [ ] Add integration tests for retry framework
 
 ### 1.3 AD-18: Hybrid Overload Detection
 
 Required by load shedding and health models.
 
-- [ ] Implement `OverloadConfig` dataclass
-  - [ ] Delta detection params: `ema_alpha`, `current_window`, `trend_window`
-  - [ ] Delta thresholds: `(0.2, 0.5, 1.0)` for busy/stressed/overloaded
-  - [ ] Absolute bounds: `(200.0, 500.0, 2000.0)` ms
-  - [ ] Resource thresholds for CPU and memory
-- [ ] Implement `HybridOverloadDetector` class
-  - [ ] `record_latency(latency_ms: float) -> None`
-  - [ ] `_calculate_trend() -> float` (linear regression on delta history)
-  - [ ] `get_state(cpu_percent, memory_percent) -> str`
-  - [ ] State returns: "healthy" | "busy" | "stressed" | "overloaded"
+- [x] Implement `OverloadConfig` dataclass
+  - [x] Delta detection params: `ema_alpha`, `current_window`, `trend_window`
+  - [x] Delta thresholds: `(0.2, 0.5, 1.0)` for busy/stressed/overloaded
+  - [x] Absolute bounds: `(200.0, 500.0, 2000.0)` ms
+  - [x] Resource thresholds for CPU and memory
+- [x] Implement `HybridOverloadDetector` class
+  - [x] `record_latency(latency_ms: float) -> None`
+  - [x] `_calculate_trend() -> float` (linear regression on delta history)
+  - [x] `get_state(cpu_percent, memory_percent) -> str`
+  - [x] State returns: "healthy" | "busy" | "stressed" | "overloaded"
 - [ ] Add integration tests for overload detection
 
 ---
@@ -87,14 +87,14 @@ Three-signal health model for all node types.
 
 ### 2.1 AD-19: Worker Health (Manager monitors Workers)
 
-- [ ] Implement `WorkerHealthState` dataclass
-  - [ ] Liveness: `last_liveness_response`, `consecutive_liveness_failures`
-  - [ ] Readiness: `accepting_work`, `available_capacity`
-  - [ ] Progress: `workflows_assigned`, `completions_last_interval`, `expected_completion_rate`
-- [ ] Implement `liveness` property (30s timeout, 3 consecutive failures)
-- [ ] Implement `readiness` property
-- [ ] Implement `progress_state` property → "idle" | "normal" | "slow" | "degraded" | "stuck"
-- [ ] Implement `get_routing_decision()` → "route" | "drain" | "investigate" | "evict"
+- [x] Implement `WorkerHealthState` dataclass
+  - [x] Liveness: `last_liveness_response`, `consecutive_liveness_failures`
+  - [x] Readiness: `accepting_work`, `available_capacity`
+  - [x] Progress: `workflows_assigned`, `completions_last_interval`, `expected_completion_rate`
+- [x] Implement `liveness` property (30s timeout, 3 consecutive failures)
+- [x] Implement `readiness` property
+- [x] Implement `progress_state` property → "idle" | "normal" | "slow" | "degraded" | "stuck"
+- [x] Implement `get_routing_decision()` → "route" | "drain" | "investigate" | "evict"
 - [ ] Update manager's worker tracking to use `WorkerHealthState`
 - [ ] Add integration tests for worker health model
 

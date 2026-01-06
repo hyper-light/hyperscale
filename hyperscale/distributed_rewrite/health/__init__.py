@@ -1,0 +1,21 @@
+"""
+Health model infrastructure for distributed nodes (AD-19).
+
+Three-signal health model for all node types:
+- Liveness: Is the node responding? (heartbeat-based)
+- Readiness: Can the node accept work? (capacity-based)
+- Progress: Is the node making progress? (throughput-based)
+
+This module provides:
+- WorkerHealthState: Manager monitors workers
+- ManagerHealthState: Gate monitors managers
+- GateHealthState: Gates monitor peer gates
+- NodeHealthTracker: Generic health tracking infrastructure
+"""
+
+from hyperscale.distributed_rewrite.health.worker_health import (
+    ProgressState as ProgressState,
+    RoutingDecision as RoutingDecision,
+    WorkerHealthConfig as WorkerHealthConfig,
+    WorkerHealthState as WorkerHealthState,
+)
