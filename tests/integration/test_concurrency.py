@@ -416,6 +416,86 @@ class TestServerRateLimiterConcurrency:
 
         assert len(errors) == 0, f"Errors during concurrent access: {errors}"
 
+    @pytest.mark.asyncio
+    async def test_check_rate_limit_async_serializes_access(self):
+        """Test that check_rate_limit_async serializes concurrent waiters.
+
+        This validates that ServerRateLimiter's async API properly uses
+        TokenBucket's lock-based serialization for waiting coroutines.
+        """
+        config = RateLimitConfig(
+            default_bucket_size=10,
+            default_refill_rate=0.0,  # No refill for deterministic behavior
+        )
+        limiter = ServerRateLimiter(config)
+
+        success_count = 0
+        failure_count = 0
+        results_lock = asyncio.Lock()
+
+        async def try_acquire():
+            nonlocal success_count, failure_count
+            # Each coroutine tries to acquire 5 tokens with short max_wait
+            result = await limiter.check_rate_limit_async(
+                client_id="test_client",
+                operation="default",
+                tokens=5,
+                max_wait=0.01,
+            )
+            async with results_lock:
+                if result.allowed:
+                    success_count += 1
+                else:
+                    failure_count += 1
+
+        # 5 coroutines try to acquire 5 tokens each (25 total needed)
+        # With 10 tokens available and no refill, exactly 2 should succeed
+        tasks = [try_acquire() for _ in range(5)]
+        await asyncio.gather(*tasks)
+
+        assert success_count == 2, f"Expected 2 successes, got {success_count}"
+        assert failure_count == 3, f"Expected 3 failures, got {failure_count}"
+
+    @pytest.mark.asyncio
+    async def test_check_api_concurrent_per_address_isolation(self):
+        """Test that check() API maintains per-address isolation under concurrency.
+
+        This tests the compatibility API used by TCP/UDP protocols.
+        """
+        config = RateLimitConfig(
+            default_bucket_size=5,
+            default_refill_rate=0.0,  # No refill for deterministic behavior
+        )
+        limiter = ServerRateLimiter(config)
+
+        results_by_addr: dict[str, list[bool]] = {}
+        lock = asyncio.Lock()
+
+        async def check_address(host: str, port: int):
+            addr = (host, port)
+            key = f"{host}:{port}"
+            async with lock:
+                results_by_addr[key] = []
+
+            for _ in range(10):
+                allowed = limiter.check(addr)
+                async with lock:
+                    results_by_addr[key].append(allowed)
+                await asyncio.sleep(0)
+
+        # Run checks for 3 different addresses concurrently
+        await asyncio.gather(
+            check_address("192.168.1.1", 8080),
+            check_address("192.168.1.2", 8080),
+            check_address("192.168.1.3", 8080),
+        )
+
+        # Each address should have exactly 5 allowed (bucket size) out of 10 attempts
+        for addr_key, results in results_by_addr.items():
+            allowed_count = sum(1 for r in results if r)
+            assert allowed_count == 5, \
+                f"{addr_key} had {allowed_count} allowed, expected 5"
+
 
 # =============================================================================
 # Test StatsBuffer Concurrency (AD-23)
