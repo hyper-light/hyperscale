@@ -571,8 +571,9 @@ class TestStateManagement:
 
         state = probe.get_state()
         assert state.total_checks == 100
-        assert state.total_successes == 100
+        # ProbeState tracks total_checks and total_failures, successes = total_checks - total_failures
         assert state.total_failures == 0
+        assert state.total_checks - state.total_failures == 100  # All successes
 
     @pytest.mark.asyncio
     async def test_stop_periodic_cleanup(self) -> None:
