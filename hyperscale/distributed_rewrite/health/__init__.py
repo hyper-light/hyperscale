@@ -11,6 +11,7 @@ This module provides:
 - ManagerHealthState: Gate monitors managers
 - GateHealthState: Gates monitor peer gates
 - NodeHealthTracker: Generic health tracking infrastructure
+- HealthPiggyback: Data structure for SWIM message embedding
 """
 
 from hyperscale.distributed_rewrite.health.worker_health import (
@@ -26,4 +27,11 @@ from hyperscale.distributed_rewrite.health.manager_health import (
 from hyperscale.distributed_rewrite.health.gate_health import (
     GateHealthConfig as GateHealthConfig,
     GateHealthState as GateHealthState,
+)
+from hyperscale.distributed_rewrite.health.tracker import (
+    EvictionDecision as EvictionDecision,
+    HealthPiggyback as HealthPiggyback,
+    HealthSignals as HealthSignals,
+    NodeHealthTracker as NodeHealthTracker,
+    NodeHealthTrackerConfig as NodeHealthTrackerConfig,
 )

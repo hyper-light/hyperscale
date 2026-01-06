@@ -133,20 +133,20 @@ Three-signal health model for all node types.
 
 ### 2.4 AD-19: Generic Health Infrastructure
 
-- [ ] Implement `HealthSignals` Protocol
-  - [ ] `liveness: bool`
-  - [ ] `readiness: bool`
-  - [ ] `progress_state: str`
-- [ ] Implement `NodeHealthTracker[T]` generic class
-  - [ ] `update_state(node_id, state)`
-  - [ ] `get_routing_decision(node_id) -> str`
-  - [ ] `get_healthy_nodes() -> list[str]`
-  - [ ] `should_evict(node_id) -> tuple[bool, str]` with correlation check
-- [ ] Implement `HealthPiggyback` for SWIM integration
-  - [ ] `node_id`, `node_type`
-  - [ ] `accepting_work`, `capacity`
-  - [ ] `throughput`, `expected_throughput`
-  - [ ] `overload_state`
+- [x] Implement `HealthSignals` Protocol
+  - [x] `liveness: bool`
+  - [x] `readiness: bool`
+  - [x] `progress_state: str`
+- [x] Implement `NodeHealthTracker[T]` generic class
+  - [x] `update_state(node_id, state)`
+  - [x] `get_routing_decision(node_id) -> str`
+  - [x] `get_healthy_nodes() -> list[str]`
+  - [x] `should_evict(node_id) -> tuple[bool, str]` with correlation check
+- [x] Implement `HealthPiggyback` for SWIM integration
+  - [x] `node_id`, `node_type`
+  - [x] `accepting_work`, `capacity`
+  - [x] `throughput`, `expected_throughput`
+  - [x] `overload_state`
 - [ ] Add health piggyback to SWIM protocol messages
 
 ---
