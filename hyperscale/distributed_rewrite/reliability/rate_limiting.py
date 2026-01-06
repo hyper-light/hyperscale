@@ -181,9 +181,9 @@ class AdaptiveRateLimitConfig:
 
     The adaptive rate limiter integrates with HybridOverloadDetector to
     provide health-gated limiting:
-    - When HEALTHY: All requests allowed (no false positives on bursts)
-    - When BUSY: Low-priority requests may be limited
-    - When STRESSED: Normal and low-priority requests limited
+    - When HEALTHY: Per-operation limits apply (bursts within limits are fine)
+    - When BUSY: Low-priority requests may be limited + per-operation limits
+    - When STRESSED: Fair-share limiting per client/operation
     - When OVERLOADED: Only critical requests allowed
 
     Note: RequestPriority uses IntEnum where lower values = higher priority.
@@ -193,8 +193,33 @@ class AdaptiveRateLimitConfig:
     # Window configuration for SlidingWindowCounter
     window_size_seconds: float = 60.0
 
-    # Per-client limits when system is stressed
-    # These are applied per-client, not globally
+    # Default per-operation limits when system is HEALTHY
+    # Operations not in operation_limits use these defaults
+    default_max_requests: int = 100
+    default_window_size: float = 10.0  # seconds
+
+    # Per-operation limits: operation_name -> (max_requests, window_size_seconds)
+    # These apply when system is HEALTHY or BUSY
+    operation_limits: dict[str, tuple[int, float]] = field(
+        default_factory=lambda: {
+            # High-frequency operations get larger limits
+            "stats_update": (500, 10.0),
+            "heartbeat": (200, 10.0),
+            "progress_update": (300, 10.0),
+            # Standard operations
+            "job_submit": (50, 10.0),
+            "job_status": (100, 10.0),
+            "workflow_dispatch": (100, 10.0),
+            # Infrequent operations
+            "cancel": (20, 10.0),
+            "reconnect": (10, 10.0),
+            # Default for simple check() API
+            "default": (100, 10.0),
+        }
+    )
+
+    # Per-client limits when system is stressed (applied on top of operation limits)
+    # These are applied per-client across all operations
     stressed_requests_per_window: int = 100
     overloaded_requests_per_window: int = 10
 
@@ -218,35 +243,43 @@ class AdaptiveRateLimitConfig:
     stressed_min_priority: RequestPriority = field(default=RequestPriority.CRITICAL)
     overloaded_min_priority: RequestPriority = field(default=RequestPriority.CRITICAL)
 
+    def get_operation_limits(self, operation: str) -> tuple[int, float]:
+        """Get max_requests and window_size for an operation."""
+        return self.operation_limits.get(
+            operation,
+            (self.default_max_requests, self.default_window_size),
+        )
+
 
 class AdaptiveRateLimiter:
     """
-    Health-gated adaptive rate limiter.
+    Health-gated adaptive rate limiter with per-operation limits.
 
     Integrates with HybridOverloadDetector to provide intelligent rate
-    limiting that avoids false positives during legitimate traffic bursts:
+    limiting that applies per-operation limits while adjusting behavior
+    based on system health:
 
-    - When system is HEALTHY: All requests pass (bursts are fine!)
-    - When BUSY: Low-priority requests may be shed
+    - When system is HEALTHY: Per-operation limits apply (controlled bursts)
+    - When BUSY: Low-priority requests may be shed + per-operation limits
     - When STRESSED: Fair-share limiting per client kicks in
     - When OVERLOADED: Only critical requests pass
 
-    The key insight is that during normal operation, we don't need rate
-    limiting at all - legitimate bursts from workers are expected behavior.
-    Rate limiting only activates when the system is actually stressed.
+    The key insight is that per-operation limits prevent any single operation
+    type from overwhelming the system, while health-gating ensures we shed
+    load appropriately under stress.
 
     Example:
         detector = HybridOverloadDetector()
         limiter = AdaptiveRateLimiter(detector)
 
-        # During normal operation - all pass
-        result = limiter.check("client-1", RequestPriority.NORMAL)
-        assert result.allowed  # True when system healthy
+        # During normal operation - per-operation limits apply
+        result = limiter.check("client-1", "job_submit", RequestPriority.NORMAL)
+        assert result.allowed  # True if within operation limits
 
-        # When system stressed - fair share limiting
+        # When system stressed - fair share limiting per client
         detector.record_latency(500.0)  # High latency triggers STRESSED
-        result = limiter.check("client-1", RequestPriority.NORMAL)
-        # Now subject to per-client limits
+        result = limiter.check("client-1", "job_submit", RequestPriority.NORMAL)
+        # Now subject to per-client limits on top of operation limits
     """
 
     def __init__(
@@ -257,14 +290,20 @@ class AdaptiveRateLimiter:
         self._detector = overload_detector or HybridOverloadDetector()
         self._config = config or AdaptiveRateLimitConfig()
 
-        # Per-client sliding window counters
-        self._client_counters: dict[str, SlidingWindowCounter] = {}
+        # Per-client, per-operation sliding window counters
+        # Structure: {client_id: {operation: SlidingWindowCounter}}
+        self._operation_counters: dict[str, dict[str, SlidingWindowCounter]] = {}
+
+        # Per-client stress counters (used when STRESSED/OVERLOADED)
+        self._client_stress_counters: dict[str, SlidingWindowCounter] = {}
+
+        # Track last activity per client for cleanup
         self._client_last_activity: dict[str, float] = {}
 
-        # Global counter for total request tracking
+        # Global counter for total request tracking (metrics only)
         self._global_counter = SlidingWindowCounter(
             window_size_seconds=self._config.window_size_seconds,
-            max_requests=1_000_000,  # High limit - for metrics only
+            max_requests=1_000_000,
         )
 
         # Metrics
@@ -272,6 +311,7 @@ class AdaptiveRateLimiter:
         self._allowed_requests: int = 0
         self._shed_requests: int = 0
         self._shed_by_state: dict[str, int] = {
+            "healthy": 0,  # Rate limited by operation limits when healthy
             "busy": 0,
             "stressed": 0,
             "overloaded": 0,
@@ -283,20 +323,24 @@ class AdaptiveRateLimiter:
     def check(
         self,
         client_id: str,
+        operation: str = "default",
         priority: RequestPriority = RequestPriority.NORMAL,
+        tokens: int = 1,
     ) -> "RateLimitResult":
         """
         Check if a request should be allowed.
 
-        The decision is based on current system health:
-        - HEALTHY: Always allow
-        - BUSY: Allow HIGH and CRITICAL priority
-        - STRESSED: Apply fair-share limits, allow CRITICAL unconditionally
+        The decision is based on current system health and per-operation limits:
+        - HEALTHY: Per-operation limits apply
+        - BUSY: Allow HIGH/CRITICAL priority, apply per-operation limits
+        - STRESSED: Apply per-client fair-share limits
         - OVERLOADED: Only CRITICAL allowed
 
         Args:
             client_id: Identifier for the client
+            operation: Type of operation being performed
             priority: Priority level of the request
+            tokens: Number of tokens/slots to consume
 
         Returns:
             RateLimitResult indicating if request is allowed
@@ -307,38 +351,56 @@ class AdaptiveRateLimiter:
         # Get current system state
         state = self._detector.get_state()
 
-        # HEALTHY: Everything passes
-        if state == OverloadState.HEALTHY:
+        # Check priority-based bypass first (CRITICAL always passes)
+        if priority == RequestPriority.CRITICAL:
             self._allowed_requests += 1
-            self._global_counter.try_acquire(1)
+            self._global_counter.try_acquire(tokens)
             return RateLimitResult(allowed=True, retry_after_seconds=0.0)
 
-        # Check priority-based bypass
-        if self._priority_allows_bypass(priority, state):
-            self._allowed_requests += 1
-            self._global_counter.try_acquire(1)
-            return RateLimitResult(allowed=True, retry_after_seconds=0.0)
+        # OVERLOADED: Only CRITICAL passes (handled above)
+        if state == OverloadState.OVERLOADED:
+            return self._reject_request(state)
 
-        # Apply rate limiting based on state
+        # STRESSED: Apply per-client fair-share limiting
+        if state == OverloadState.STRESSED:
+            return self._check_stress_counter(client_id, state, tokens)
+
+        # BUSY: Check priority then per-operation limits
         if state == OverloadState.BUSY:
-            # During BUSY, only LOW priority is shed unconditionally
+            # LOW priority is shed unconditionally during BUSY
             if priority == RequestPriority.LOW:
                 return self._reject_request(state)
-            # Other priorities go through counter
-            return self._check_client_counter(client_id, state)
+            # HIGH and NORMAL go through operation limits
 
-        elif state == OverloadState.STRESSED:
-            # During STRESSED, apply fair-share limiting
-            return self._check_client_counter(client_id, state)
+        # HEALTHY or BUSY (non-LOW): Apply per-operation limits
+        return self._check_operation_counter(client_id, operation, state, tokens)
 
-        else:  # OVERLOADED
-            # During OVERLOADED, only CRITICAL passes (already handled above)
-            return self._reject_request(state)
+    def check_simple(
+        self,
+        client_id: str,
+        priority: RequestPriority = RequestPriority.NORMAL,
+    ) -> "RateLimitResult":
+        """
+        Simplified check without operation tracking.
+
+        Use this for simple per-client rate limiting without operation
+        granularity. Uses "default" operation internally.
+
+        Args:
+            client_id: Identifier for the client
+            priority: Priority level of the request
+
+        Returns:
+            RateLimitResult indicating if request is allowed
+        """
+        return self.check(client_id, "default", priority)
 
     async def check_async(
         self,
         client_id: str,
+        operation: str = "default",
         priority: RequestPriority = RequestPriority.NORMAL,
+        tokens: int = 1,
         max_wait: float = 0.0,
     ) -> "RateLimitResult":
         """
@@ -346,14 +408,16 @@ class AdaptiveRateLimiter:
 
         Args:
             client_id: Identifier for the client
+            operation: Type of operation being performed
             priority: Priority level of the request
+            tokens: Number of tokens/slots to consume
             max_wait: Maximum time to wait if rate limited (0 = no wait)
 
         Returns:
             RateLimitResult indicating if request is allowed
         """
         async with self._async_lock:
-            result = self.check(client_id, priority)
+            result = self.check(client_id, operation, priority, tokens)
 
             if result.allowed or max_wait <= 0:
                 return result
@@ -363,7 +427,7 @@ class AdaptiveRateLimiter:
             await asyncio.sleep(wait_time)
 
             # Re-check (state may have changed)
-            return self.check(client_id, priority)
+            return self.check(client_id, operation, priority, tokens)
 
     def _priority_allows_bypass(
         self,
@@ -385,18 +449,20 @@ class AdaptiveRateLimiter:
         # Lower value = higher priority, so priority <= min_priority means allowed
         return priority <= min_priority
 
-    def _check_client_counter(
+    def _check_operation_counter(
         self,
         client_id: str,
+        operation: str,
         state: OverloadState,
+        tokens: int,
     ) -> "RateLimitResult":
-        """Check and update client's sliding window counter."""
-        counter = self._get_or_create_counter(client_id, state)
-        acquired, wait_time = counter.try_acquire(1)
+        """Check and update per-operation counter for client."""
+        counter = self._get_or_create_operation_counter(client_id, operation)
+        acquired, wait_time = counter.try_acquire(tokens)
 
         if acquired:
             self._allowed_requests += 1
-            self._global_counter.try_acquire(1)
+            self._global_counter.try_acquire(tokens)
             return RateLimitResult(
                 allowed=True,
                 retry_after_seconds=0.0,
@@ -405,25 +471,65 @@ class AdaptiveRateLimiter:
 
         return self._reject_request(state, wait_time, counter.available_slots)
 
-    def _get_or_create_counter(
+    def _check_stress_counter(
+        self,
+        client_id: str,
+        state: OverloadState,
+        tokens: int,
+    ) -> "RateLimitResult":
+        """Check and update per-client stress counter."""
+        counter = self._get_or_create_stress_counter(client_id, state)
+        acquired, wait_time = counter.try_acquire(tokens)
+
+        if acquired:
+            self._allowed_requests += 1
+            self._global_counter.try_acquire(tokens)
+            return RateLimitResult(
+                allowed=True,
+                retry_after_seconds=0.0,
+                tokens_remaining=counter.available_slots,
+            )
+
+        return self._reject_request(state, wait_time, counter.available_slots)
+
+    def _get_or_create_operation_counter(
+        self,
+        client_id: str,
+        operation: str,
+    ) -> SlidingWindowCounter:
+        """Get or create a counter for the client/operation combination."""
+        if client_id not in self._operation_counters:
+            self._operation_counters[client_id] = {}
+
+        counters = self._operation_counters[client_id]
+        if operation not in counters:
+            max_requests, window_size = self._config.get_operation_limits(operation)
+            counters[operation] = SlidingWindowCounter(
+                window_size_seconds=window_size,
+                max_requests=max_requests,
+            )
+
+        return counters[operation]
+
+    def _get_or_create_stress_counter(
         self,
         client_id: str,
         state: OverloadState,
     ) -> SlidingWindowCounter:
-        """Get or create a counter for the client based on current state."""
-        if client_id not in self._client_counters:
+        """Get or create a stress counter for the client based on current state."""
+        if client_id not in self._client_stress_counters:
             # Determine limit based on state
             if state == OverloadState.STRESSED:
                 max_requests = self._config.stressed_requests_per_window
-            else:  # OVERLOADED or BUSY with counter
+            else:  # OVERLOADED
                 max_requests = self._config.overloaded_requests_per_window
 
-            self._client_counters[client_id] = SlidingWindowCounter(
+            self._client_stress_counters[client_id] = SlidingWindowCounter(
                 window_size_seconds=self._config.window_size_seconds,
                 max_requests=max_requests,
             )
 
-        return self._client_counters[client_id]
+        return self._client_stress_counters[client_id]
 
     def _reject_request(
         self,
@@ -458,19 +564,38 @@ class AdaptiveRateLimiter:
         ]
 
         for client_id in inactive_clients:
-            self._client_counters.pop(client_id, None)
+            self._operation_counters.pop(client_id, None)
+            self._client_stress_counters.pop(client_id, None)
             self._client_last_activity.pop(client_id, None)
 
         return len(inactive_clients)
 
     def reset_client(self, client_id: str) -> None:
-        """Reset the counter for a client."""
-        if client_id in self._client_counters:
-            self._client_counters[client_id].reset()
+        """Reset all counters for a client."""
+        if client_id in self._operation_counters:
+            for counter in self._operation_counters[client_id].values():
+                counter.reset()
+        if client_id in self._client_stress_counters:
+            self._client_stress_counters[client_id].reset()
+
+    def get_client_stats(self, client_id: str) -> dict[str, float]:
+        """Get available slots for all operations for a client."""
+        if client_id not in self._operation_counters:
+            return {}
+
+        return {
+            operation: counter.available_slots
+            for operation, counter in self._operation_counters[client_id].items()
+        }
 
     def get_metrics(self) -> dict:
         """Get rate limiting metrics."""
         total = self._total_requests or 1  # Avoid division by zero
+
+        # Count active clients (those with any counter)
+        active_clients = len(self._operation_counters) + len(
+            set(self._client_stress_counters.keys()) - set(self._operation_counters.keys())
+        )
 
         return {
             "total_requests": self._total_requests,
@@ -478,7 +603,7 @@ class AdaptiveRateLimiter:
             "shed_requests": self._shed_requests,
             "shed_rate": self._shed_requests / total,
             "shed_by_state": dict(self._shed_by_state),
-            "active_clients": len(self._client_counters),
+            "active_clients": active_clients,
             "current_state": self._detector.get_state().value,
         }
 
@@ -488,6 +613,7 @@ class AdaptiveRateLimiter:
         self._allowed_requests = 0
         self._shed_requests = 0
         self._shed_by_state = {
+            "healthy": 0,
             "busy": 0,
             "stressed": 0,
             "overloaded": 0,
@@ -681,30 +807,30 @@ class ServerRateLimiter:
     """
     Server-side rate limiter with health-gated adaptive behavior.
 
-    Uses AdaptiveRateLimiter internally to provide intelligent rate limiting
-    that only activates under system stress. During normal operation, all
-    requests are allowed to avoid false positives on legitimate bursts.
+    Thin wrapper around AdaptiveRateLimiter that provides:
+    - Per-operation rate limiting
+    - Health-gated behavior (only limits under stress for system health)
+    - Priority-based request shedding during overload
+    - Backward-compatible check() API for TCP/UDP protocols
 
     Key behaviors:
-    - HEALTHY state: All requests pass through
-    - BUSY state: Low priority requests may be shed
+    - HEALTHY state: Per-operation limits apply
+    - BUSY state: Low priority shed + per-operation limits
     - STRESSED state: Fair-share limiting per client
     - OVERLOADED state: Only critical requests pass
 
     Example usage:
         limiter = ServerRateLimiter()
 
-        # Check rate limit
+        # Check rate limit for operation
         result = limiter.check_rate_limit("client-123", "job_submit")
         if not result.allowed:
             return Response(429, headers={"Retry-After": str(result.retry_after_seconds)})
 
-        # Process request
-        ...
-
         # For priority-aware limiting
         result = limiter.check_rate_limit_with_priority(
             "client-123",
+            "job_submit",
             RequestPriority.HIGH
         )
     """
@@ -716,14 +842,26 @@ class ServerRateLimiter:
         overload_detector: HybridOverloadDetector | None = None,
         adaptive_config: AdaptiveRateLimitConfig | None = None,
     ):
-        self._config = config or RateLimitConfig()
         self._inactive_cleanup_seconds = inactive_cleanup_seconds
 
-        # Create adaptive config from RateLimitConfig if not provided
+        # Create adaptive config, merging with RateLimitConfig if provided
         if adaptive_config is None:
             adaptive_config = AdaptiveRateLimitConfig(
                 inactive_cleanup_seconds=inactive_cleanup_seconds,
             )
+            # Merge operation limits from RateLimitConfig if provided
+            if config is not None:
+                # Convert (bucket_size, refill_rate) to (max_requests, window_size)
+                operation_limits = {}
+                for operation, (bucket_size, refill_rate) in config.operation_limits.items():
+                    window_size = bucket_size / refill_rate if refill_rate > 0 else 10.0
+                    operation_limits[operation] = (bucket_size, max(1.0, window_size))
+                # Add default
+                default_window = config.default_bucket_size / config.default_refill_rate if config.default_refill_rate > 0 else 10.0
+                operation_limits["default"] = (config.default_bucket_size, max(1.0, default_window))
+                adaptive_config.operation_limits = operation_limits
+                adaptive_config.default_max_requests = config.default_bucket_size
+                adaptive_config.default_window_size = max(1.0, default_window)
 
         # Internal adaptive rate limiter
         self._adaptive = AdaptiveRateLimiter(
@@ -731,13 +869,7 @@ class ServerRateLimiter:
             config=adaptive_config,
         )
 
-        # Per-client sliding window counters (for backward compat with per-operation limits)
-        self._client_counters: dict[str, dict[str, SlidingWindowCounter]] = {}
-        self._client_last_activity: dict[str, float] = {}
-
-        # Metrics for backward compatibility
-        self._total_requests: int = 0
-        self._rate_limited_requests: int = 0
+        # Track for backward compatibility metrics
         self._clients_cleaned: int = 0
 
     def check(
@@ -761,11 +893,8 @@ class ServerRateLimiter:
         Raises:
             RateLimitExceeded: If raise_on_limit is True and rate is exceeded
         """
-        # Convert address tuple to client_id string
         client_id = f"{addr[0]}:{addr[1]}"
-
-        # Use "default" operation for simple rate limiting
-        result = self.check_rate_limit(client_id, "default")
+        result = self._adaptive.check(client_id, "default", RequestPriority.NORMAL)
 
         if not result.allowed and raise_on_limit:
             from hyperscale.core.jobs.protocols.rate_limiter import RateLimitExceeded
@@ -782,10 +911,6 @@ class ServerRateLimiter:
         """
         Check if a request is within rate limits.
 
-        Uses health-gated adaptive limiting:
-        - When system is healthy, all requests pass
-        - When stressed, per-operation limits apply
-
         Args:
             client_id: Identifier for the client
             operation: Type of operation being performed
@@ -794,40 +919,14 @@ class ServerRateLimiter:
         Returns:
             RateLimitResult indicating if allowed and retry info
         """
-        self._total_requests += 1
-        self._client_last_activity[client_id] = time.monotonic()
-
-        # Use adaptive limiter for health-gated decisions
-        result = self._adaptive.check(client_id, RequestPriority.NORMAL)
-
-        if not result.allowed:
-            self._rate_limited_requests += 1
-            return result
-
-        # If system is healthy/adaptive passed, also check per-operation limits
-        # This maintains backward compatibility with operation-specific limits
-        state = self._adaptive.overload_detector.get_state()
-        if state != OverloadState.HEALTHY:
-            # Under stress, delegate entirely to adaptive limiter
-            return result
-
-        # When healthy, apply per-operation limits using sliding window
-        counter = self._get_or_create_counter(client_id, operation)
-        acquired, wait_time = counter.try_acquire(tokens)
-
-        if not acquired:
-            self._rate_limited_requests += 1
-
-        return RateLimitResult(
-            allowed=acquired,
-            retry_after_seconds=wait_time,
-            tokens_remaining=counter.available_slots,
-        )
+        return self._adaptive.check(client_id, operation, RequestPriority.NORMAL, tokens)
 
     def check_rate_limit_with_priority(
         self,
         client_id: str,
+        operation: str,
         priority: RequestPriority,
+        tokens: int = 1,
     ) -> RateLimitResult:
         """
         Check rate limit with priority awareness.
@@ -837,20 +936,14 @@ class ServerRateLimiter:
 
         Args:
             client_id: Identifier for the client
+            operation: Type of operation being performed
             priority: Priority level of the request
+            tokens: Number of tokens to consume
 
         Returns:
             RateLimitResult indicating if allowed
         """
-        self._total_requests += 1
-        self._client_last_activity[client_id] = time.monotonic()
-
-        result = self._adaptive.check(client_id, priority)
-
-        if not result.allowed:
-            self._rate_limited_requests += 1
-
-        return result
+        return self._adaptive.check(client_id, operation, priority, tokens)
 
     async def check_rate_limit_async(
         self,
@@ -871,67 +964,34 @@ class ServerRateLimiter:
         Returns:
             RateLimitResult indicating if allowed
         """
-        self._total_requests += 1
-        self._client_last_activity[client_id] = time.monotonic()
-
-        result = await self._adaptive.check_async(
-            client_id,
-            RequestPriority.NORMAL,
-            max_wait,
+        return await self._adaptive.check_async(
+            client_id, operation, RequestPriority.NORMAL, tokens, max_wait
         )
 
-        if not result.allowed:
-            self._rate_limited_requests += 1
-            return result
-
-        # When healthy, also check per-operation limits
-        state = self._adaptive.overload_detector.get_state()
-        if state != OverloadState.HEALTHY:
-            return result
-
-        counter = self._get_or_create_counter(client_id, operation)
-        if max_wait <= 0:
-            acquired, wait_time = counter.try_acquire(tokens)
-            if not acquired:
-                self._rate_limited_requests += 1
-            return RateLimitResult(
-                allowed=acquired,
-                retry_after_seconds=wait_time,
-                tokens_remaining=counter.available_slots,
-            )
-
-        # Async acquire with wait
-        acquired = await counter.acquire_async(tokens, max_wait)
-        if not acquired:
-            self._rate_limited_requests += 1
-
-        return RateLimitResult(
-            allowed=acquired,
-            retry_after_seconds=0.0 if acquired else max_wait,
-            tokens_remaining=counter.available_slots,
-        )
-
-    def _get_or_create_counter(
+    async def check_rate_limit_with_priority_async(
         self,
         client_id: str,
         operation: str,
-    ) -> SlidingWindowCounter:
-        """Get existing counter or create new one for client/operation."""
-        if client_id not in self._client_counters:
-            self._client_counters[client_id] = {}
+        priority: RequestPriority,
+        tokens: int = 1,
+        max_wait: float = 0.0,
+    ) -> RateLimitResult:
+        """
+        Async check rate limit with priority awareness.
 
-        counters = self._client_counters[client_id]
-        if operation not in counters:
-            bucket_size, refill_rate = self._config.get_limits(operation)
-            # Convert token bucket params to sliding window
-            # Window size based on how long to fill bucket from empty
-            window_size = bucket_size / refill_rate if refill_rate > 0 else 60.0
-            counters[operation] = SlidingWindowCounter(
-                window_size_seconds=max(1.0, window_size),
-                max_requests=bucket_size,
-            )
+        Args:
+            client_id: Identifier for the client
+            operation: Type of operation being performed
+            priority: Priority level of the request
+            tokens: Number of tokens to consume
+            max_wait: Maximum time to wait if rate limited (0 = no wait)
 
-        return counters[operation]
+        Returns:
+            RateLimitResult indicating if allowed
+        """
+        return await self._adaptive.check_async(
+            client_id, operation, priority, tokens, max_wait
+        )
 
     def cleanup_inactive_clients(self) -> int:
         """
@@ -940,57 +1000,27 @@ class ServerRateLimiter:
         Returns:
             Number of clients cleaned up
         """
-        now = time.monotonic()
-        cutoff = now - self._inactive_cleanup_seconds
-
-        inactive_clients = [
-            client_id
-            for client_id, last_activity in self._client_last_activity.items()
-            if last_activity < cutoff
-        ]
-
-        for client_id in inactive_clients:
-            self._client_counters.pop(client_id, None)
-            self._client_last_activity.pop(client_id, None)
-            self._clients_cleaned += 1
-
-        # Also cleanup in adaptive limiter
-        self._adaptive.cleanup_inactive_clients()
-
-        return len(inactive_clients)
+        cleaned = self._adaptive.cleanup_inactive_clients()
+        self._clients_cleaned += cleaned
+        return cleaned
 
     def reset_client(self, client_id: str) -> None:
         """Reset all counters for a client."""
-        if client_id in self._client_counters:
-            for counter in self._client_counters[client_id].values():
-                counter.reset()
         self._adaptive.reset_client(client_id)
 
     def get_client_stats(self, client_id: str) -> dict[str, float]:
         """Get available slots for all operations for a client."""
-        if client_id not in self._client_counters:
-            return {}
-
-        return {
-            operation: counter.available_slots
-            for operation, counter in self._client_counters[client_id].items()
-        }
+        return self._adaptive.get_client_stats(client_id)
 
     def get_metrics(self) -> dict:
         """Get rate limiting metrics."""
-        rate_limited_rate = (
-            self._rate_limited_requests / self._total_requests
-            if self._total_requests > 0
-            else 0.0
-        )
-
         adaptive_metrics = self._adaptive.get_metrics()
 
         return {
-            "total_requests": self._total_requests,
-            "rate_limited_requests": self._rate_limited_requests,
-            "rate_limited_rate": rate_limited_rate,
-            "active_clients": len(self._client_counters),
+            "total_requests": adaptive_metrics["total_requests"],
+            "rate_limited_requests": adaptive_metrics["shed_requests"],
+            "rate_limited_rate": adaptive_metrics["shed_rate"],
+            "active_clients": adaptive_metrics["active_clients"],
             "clients_cleaned": self._clients_cleaned,
             "current_state": adaptive_metrics["current_state"],
             "shed_by_state": adaptive_metrics["shed_by_state"],
@@ -998,8 +1028,6 @@ class ServerRateLimiter:
 
     def reset_metrics(self) -> None:
         """Reset all metrics."""
-        self._total_requests = 0
-        self._rate_limited_requests = 0
         self._clients_cleaned = 0
         self._adaptive.reset_metrics()
 

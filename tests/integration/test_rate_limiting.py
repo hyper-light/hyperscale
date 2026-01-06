@@ -167,7 +167,7 @@ class TestAdaptiveRateLimiter:
 
         # System is healthy by default
         for i in range(100):
-            result = limiter.check(f"client-{i}", RequestPriority.LOW)
+            result = limiter.check(f"client-{i}", "default", RequestPriority.LOW)
             assert result.allowed is True
 
     def test_sheds_low_priority_when_busy(self) -> None:
@@ -183,15 +183,15 @@ class TestAdaptiveRateLimiter:
         assert detector.get_state() == OverloadState.BUSY
 
         # LOW priority should be shed
-        result = limiter.check("client-1", RequestPriority.LOW)
+        result = limiter.check("client-1", "default", RequestPriority.LOW)
         assert result.allowed is False
 
         # HIGH priority should pass
-        result = limiter.check("client-1", RequestPriority.HIGH)
+        result = limiter.check("client-1", "default", RequestPriority.HIGH)
         assert result.allowed is True
 
         # CRITICAL always passes
-        result = limiter.check("client-1", RequestPriority.CRITICAL)
+        result = limiter.check("client-1", "default", RequestPriority.CRITICAL)
         assert result.allowed is True
 
     def test_only_critical_when_overloaded(self) -> None:
@@ -207,10 +207,10 @@ class TestAdaptiveRateLimiter:
         assert detector.get_state() == OverloadState.OVERLOADED
 
         # Only CRITICAL passes
-        assert limiter.check("client-1", RequestPriority.LOW).allowed is False
-        assert limiter.check("client-1", RequestPriority.NORMAL).allowed is False
-        assert limiter.check("client-1", RequestPriority.HIGH).allowed is False
-        assert limiter.check("client-1", RequestPriority.CRITICAL).allowed is True
+        assert limiter.check("client-1", "default", RequestPriority.LOW).allowed is False
+        assert limiter.check("client-1", "default", RequestPriority.NORMAL).allowed is False
+        assert limiter.check("client-1", "default", RequestPriority.HIGH).allowed is False
+        assert limiter.check("client-1", "default", RequestPriority.CRITICAL).allowed is True
 
     def test_fair_share_when_stressed(self) -> None:
         """Test per-client limits when system is STRESSED."""
@@ -233,16 +233,16 @@ class TestAdaptiveRateLimiter:
 
         # First 5 requests for client-1 should pass (within counter limit)
         for i in range(5):
-            result = limiter.check("client-1", RequestPriority.NORMAL)
+            result = limiter.check("client-1", "default", RequestPriority.NORMAL)
             assert result.allowed is True, f"Request {i} should be allowed"
 
         # 6th request should be rate limited
-        result = limiter.check("client-1", RequestPriority.NORMAL)
+        result = limiter.check("client-1", "default", RequestPriority.NORMAL)
         assert result.allowed is False
         assert result.retry_after_seconds > 0
 
         # Different client should still have their own limit
-        result = limiter.check("client-2", RequestPriority.NORMAL)
+        result = limiter.check("client-2", "default", RequestPriority.NORMAL)
         assert result.allowed is True
 
     def test_cleanup_inactive_clients(self) -> None:
@@ -253,8 +253,8 @@ class TestAdaptiveRateLimiter:
         limiter = AdaptiveRateLimiter(config=adaptive_config)
 
         # Create some clients
-        limiter.check("client-1", RequestPriority.NORMAL)
-        limiter.check("client-2", RequestPriority.NORMAL)
+        limiter.check("client-1", "default", RequestPriority.NORMAL)
+        limiter.check("client-2", "default", RequestPriority.NORMAL)
 
         # Wait for them to become inactive
         time.sleep(0.15)
@@ -279,8 +279,8 @@ class TestAdaptiveRateLimiter:
         )
 
         # Make requests when healthy
-        limiter.check("client-1", RequestPriority.NORMAL)
-        limiter.check("client-1", RequestPriority.NORMAL)
+        limiter.check("client-1", "default", RequestPriority.NORMAL)
+        limiter.check("client-1", "default", RequestPriority.NORMAL)
 
         metrics = limiter.get_metrics()
         assert metrics["total_requests"] == 2
@@ -291,9 +291,9 @@ class TestAdaptiveRateLimiter:
         for _ in range(15):
             detector.record_latency(50.0)
 
-        limiter.check("client-1", RequestPriority.NORMAL)  # Allowed (new counter)
-        limiter.check("client-1", RequestPriority.NORMAL)  # Allowed
-        limiter.check("client-1", RequestPriority.NORMAL)  # Shed
+        limiter.check("client-1", "default", RequestPriority.NORMAL)  # Allowed (new counter)
+        limiter.check("client-1", "default", RequestPriority.NORMAL)  # Allowed
+        limiter.check("client-1", "default", RequestPriority.NORMAL)  # Shed
 
         metrics = limiter.get_metrics()
         assert metrics["total_requests"] == 5
@@ -318,13 +318,14 @@ class TestAdaptiveRateLimiter:
             detector.record_latency(50.0)
 
         # Exhaust limit
-        limiter.check("client-1", RequestPriority.NORMAL)
-        limiter.check("client-1", RequestPriority.NORMAL)
+        limiter.check("client-1", "default", RequestPriority.NORMAL)
+        limiter.check("client-1", "default", RequestPriority.NORMAL)
 
         # Async check should wait
         start = time.monotonic()
         result = await limiter.check_async(
             "client-1",
+            "default",
             RequestPriority.NORMAL,
             max_wait=0.2,
         )
@@ -508,10 +509,10 @@ class TestServerRateLimiter:
 
         # LOW should be shed, HIGH should pass
         result_low = limiter.check_rate_limit_with_priority(
-            "client-1", RequestPriority.LOW
+            "client-1", "default", RequestPriority.LOW
         )
         result_high = limiter.check_rate_limit_with_priority(
-            "client-1", RequestPriority.HIGH
+            "client-1", "default", RequestPriority.HIGH
         )
 
         assert result_low.allowed is False
@@ -968,7 +969,7 @@ class TestHealthGatedBehavior:
         # Initially healthy - all pass
         for _ in range(5):
             result = limiter.check_rate_limit_with_priority(
-                "client-1", RequestPriority.LOW
+                "client-1", "default", RequestPriority.LOW
             )
             assert result.allowed is True
 
@@ -978,12 +979,12 @@ class TestHealthGatedBehavior:
 
         # Now should shed low priority
         result = limiter.check_rate_limit_with_priority(
-            "client-1", RequestPriority.LOW
+            "client-1", "default", RequestPriority.LOW
         )
         # May or may not be shed depending on state
         # But critical should always pass
         result_critical = limiter.check_rate_limit_with_priority(
-            "client-1", RequestPriority.CRITICAL
+            "client-1", "default", RequestPriority.CRITICAL
         )
         assert result_critical.allowed is True
 
@@ -1007,7 +1008,7 @@ class TestHealthGatedBehavior:
 
         # Should be healthy again
         result = limiter.check_rate_limit_with_priority(
-            "client-1", RequestPriority.LOW
+            "client-1", "default", RequestPriority.LOW
         )
         # After recovery, low priority should pass again
         assert result.allowed is True

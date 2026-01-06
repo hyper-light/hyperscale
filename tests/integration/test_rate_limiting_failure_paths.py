@@ -189,7 +189,7 @@ class TestAdaptiveRateLimiterEdgeCases:
         # Start healthy
         for _ in range(5):
             detector.record_latency(5.0)
-        result = limiter.check("client-1", RequestPriority.LOW)
+        result = limiter.check("client-1", "default", RequestPriority.LOW)
         assert result.allowed is True
 
         # Spike to overloaded
@@ -197,11 +197,11 @@ class TestAdaptiveRateLimiterEdgeCases:
             detector.record_latency(150.0)
 
         # Should shed low priority
-        result = limiter.check("client-1", RequestPriority.LOW)
+        result = limiter.check("client-1", "default", RequestPriority.LOW)
         # May or may not be shed depending on exact state
 
         # Critical should always pass
-        result = limiter.check("client-1", RequestPriority.CRITICAL)
+        result = limiter.check("client-1", "default", RequestPriority.CRITICAL)
         assert result.allowed is True
 
     def test_many_clients_memory_pressure(self) -> None:
@@ -213,7 +213,7 @@ class TestAdaptiveRateLimiterEdgeCases:
 
         # Create many clients
         for i in range(1000):
-            limiter.check(f"client-{i}", RequestPriority.NORMAL)
+            limiter.check(f"client-{i}", "default", RequestPriority.NORMAL)
 
         metrics = limiter.get_metrics()
         # Note: adaptive limiter only creates counters when stressed
@@ -237,10 +237,10 @@ class TestAdaptiveRateLimiterEdgeCases:
             detector.record_latency(100.0)
 
         # Verify priority ordering
-        assert limiter.check("c1", RequestPriority.CRITICAL).allowed is True
-        assert limiter.check("c2", RequestPriority.HIGH).allowed is False
-        assert limiter.check("c3", RequestPriority.NORMAL).allowed is False
-        assert limiter.check("c4", RequestPriority.LOW).allowed is False
+        assert limiter.check("c1", "default", RequestPriority.CRITICAL).allowed is True
+        assert limiter.check("c2", "default", RequestPriority.HIGH).allowed is False
+        assert limiter.check("c3", "default", RequestPriority.NORMAL).allowed is False
+        assert limiter.check("c4", "default", RequestPriority.LOW).allowed is False
 
     def test_reset_metrics_clears_counters(self) -> None:
         """Test that reset_metrics clears all counters."""
@@ -248,7 +248,7 @@ class TestAdaptiveRateLimiterEdgeCases:
 
         # Generate activity
         for i in range(100):
-            limiter.check(f"client-{i}", RequestPriority.NORMAL)
+            limiter.check(f"client-{i}", "default", RequestPriority.NORMAL)
 
         metrics_before = limiter.get_metrics()
         assert metrics_before["total_requests"] == 100

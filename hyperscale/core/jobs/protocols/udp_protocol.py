@@ -49,8 +49,7 @@ from .message_limits import (
     validate_decompressed_size,
     MessageSizeError,
 )
-from hyperscale.distributed_rewrite.reliability import ServerRateLimiter
-from .rate_limiter import RateLimitExceeded
+from .rate_limiter import RateLimitExceeded, ServerRateLimiter
 from .replay_guard import ReplayGuard, ReplayError
 from .restricted_unpickler import restricted_loads, SecurityError
 from .udp_socket_protocol import UDPSocketProtocol
