@@ -3697,7 +3697,7 @@ class ManagerServer(HealthAwareServer):
         """
         self._task_runner.run(
             self._udp_logger.log,
-            ServerError(
+            ServerInfo(
                 message=f"Received peer registration request from {addr} ({len(data)} bytes)",
                 node_host=self._host,
                 node_port=self._tcp_port,

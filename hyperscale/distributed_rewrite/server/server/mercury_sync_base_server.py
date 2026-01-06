@@ -1213,8 +1213,6 @@ class MercurySyncBaseServer(Generic[T]):
             transport.write(frame_message(response_payload))
 
         except Exception as e:
-            import traceback
-            print(traceback.format_exc())
             self._tcp_drop_counter.increment_malformed_message()
             # Log security event - could be decryption failure, malformed message, etc.
             await self._log_security_warning(
@@ -1234,8 +1232,6 @@ class MercurySyncBaseServer(Generic[T]):
                 # Frame with length prefix for proper TCP stream handling
                 transport.write(frame_message(error_response))
             except Exception:
-                import traceback
-                print(traceback.format_exc())
                 pass  # Best effort error response
 
     async def process_udp_server_request(
