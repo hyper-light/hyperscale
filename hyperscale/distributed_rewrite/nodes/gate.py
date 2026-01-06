@@ -80,6 +80,7 @@ from hyperscale.distributed_rewrite.models import (
     GateWorkflowQueryResponse,
     RegisterCallback,
     RegisterCallbackResponse,
+    RateLimitResponse,
 )
 from hyperscale.distributed_rewrite.swim.core import (
     QuorumError,
@@ -99,6 +100,8 @@ from hyperscale.distributed_rewrite.health import (
 from hyperscale.distributed_rewrite.reliability import (
     HybridOverloadDetector,
     LoadShedder,
+    ServerRateLimiter,
+    RateLimitConfig,
 )
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
@@ -197,6 +200,12 @@ class GateServer(HealthAwareServer):
         # Tracks latency and sheds low-priority requests under load
         self._overload_detector = HybridOverloadDetector()
         self._load_shedder = LoadShedder(self._overload_detector)
+
+        # Rate limiting infrastructure (AD-24)
+        # Per-client rate limiting with automatic cleanup
+        self._rate_limiter = ServerRateLimiter(
+            inactive_cleanup_seconds=300.0,  # Cleanup after 5 minutes
+        )
 
         # Versioned state clock for rejecting stale updates
         # Tracks per-datacenter versions using Lamport timestamps
@@ -1198,6 +1207,43 @@ class GateServer(HealthAwareServer):
             **self._load_shedder.get_metrics(),
         }
 
+    # =========================================================================
+    # Rate Limiting (AD-24)
+    # =========================================================================
+
+    def _check_rate_limit(
+        self,
+        client_id: str,
+        operation: str,
+    ) -> tuple[bool, float]:
+        """
+        Check if a client request is within rate limits.
+
+        Args:
+            client_id: Client identifier (e.g., from address or auth)
+            operation: Type of operation being performed
+
+        Returns:
+            Tuple of (allowed, retry_after_seconds)
+        """
+        result = self._rate_limiter.check_rate_limit(client_id, operation)
+        return result.allowed, result.retry_after_seconds
+
+    def _get_rate_limit_metrics(self) -> dict:
+        """Get rate limiting metrics for monitoring."""
+        return self._rate_limiter.get_metrics()
+
+    def _cleanup_inactive_rate_limit_clients(self) -> int:
+        """
+        Cleanup rate limit buckets for inactive clients.
+
+        Should be called periodically to prevent memory leaks.
+
+        Returns:
+            Number of clients cleaned up
+        """
+        return self._rate_limiter.cleanup_inactive_clients()
+
     def _get_available_datacenters(self) -> list[str]:
         """
         Get list of healthy datacenters (for backwards compatibility).
@@ -2027,7 +2073,8 @@ class GateServer(HealthAwareServer):
         # Start background cleanup tasks via TaskRunner
         self._task_runner.run(self._lease_cleanup_loop)
         self._task_runner.run(self._job_cleanup_loop)
-        
+        self._task_runner.run(self._rate_limit_cleanup_loop)
+
         # Start Tier 2 (periodic) batch stats loop
         self._task_runner.run(self._batch_stats_loop)
         
@@ -2256,7 +2303,38 @@ class GateServer(HealthAwareServer):
                 break
             except Exception as e:
                 await self.handle_exception(e, "job_cleanup_loop")
-    
+
+    async def _rate_limit_cleanup_loop(self) -> None:
+        """
+        Periodically clean up inactive clients from the rate limiter.
+
+        Removes token buckets for clients that haven't made requests
+        within the inactive_cleanup_seconds window to prevent memory leaks.
+        """
+        cleanup_interval = 60.0  # Check every minute
+
+        while self._running:
+            try:
+                await asyncio.sleep(cleanup_interval)
+
+                cleaned = self._cleanup_inactive_rate_limit_clients()
+
+                if cleaned > 0:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=f"Rate limiter: cleaned up {cleaned} inactive clients",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.handle_exception(e, "rate_limit_cleanup_loop")
+
     def _create_lease(self, job_id: str, datacenter: str) -> DatacenterLease:
         """Create a new lease for a job in a datacenter."""
         lease = DatacenterLease(
@@ -2612,13 +2690,22 @@ class GateServer(HealthAwareServer):
         clock_time: int,
     ):
         """Handle job submission from client.
-        
+
         Only the cluster leader accepts new jobs. Non-leaders redirect
         clients to the current leader for consistent job coordination.
         """
         try:
+            # Check rate limit first (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit(client_id, "job_submit")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="job_submit",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
             submission = JobSubmission.load(data)
-            
+
             # Only leader accepts new jobs
             if not self.is_leader():
                 leader = self.get_current_leader()
@@ -2876,6 +2963,15 @@ class GateServer(HealthAwareServer):
         """Handle job status request from client."""
         start_time = time.monotonic()
         try:
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit(client_id, "job_status")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="job_status",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
             # Load shedding check (AD-22)
             if self._should_shed_request("JobStatusRequest"):
                 return b''  # Shed request under load
@@ -3041,6 +3137,15 @@ class GateServer(HealthAwareServer):
     ):
         """Handle job cancellation from client."""
         try:
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit(client_id, "cancel")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="cancel",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
             cancel = CancelJob.load(data)
             
             job = self._jobs.get(cancel.job_id)
@@ -3631,6 +3736,15 @@ class GateServer(HealthAwareServer):
         error="Job not found".
         """
         try:
+            # Rate limit check (AD-24) - using reconnect limits
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit(client_id, "reconnect")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="reconnect",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
             request = RegisterCallback.load(data)
             job_id = request.job_id
 
@@ -3692,6 +3806,15 @@ class GateServer(HealthAwareServer):
         Unknown workflow names are silently ignored.
         """
         try:
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit(client_id, "workflow_query")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="workflow_query",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
             request = WorkflowQueryRequest.load(data)
 
             # Query all datacenter leaders concurrently

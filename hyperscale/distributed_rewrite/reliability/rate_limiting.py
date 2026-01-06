@@ -450,3 +450,69 @@ class CooperativeRateLimiter:
             "total_wait_time": self._total_wait_time,
             "active_blocks": len(self._blocked_until),
         }
+
+
+def is_rate_limit_response(data: bytes) -> bool:
+    """
+    Check if response data is a RateLimitResponse.
+
+    This is a lightweight check before attempting full deserialization.
+    Uses the msgspec message type marker to identify RateLimitResponse.
+
+    Args:
+        data: Raw response bytes from TCP handler
+
+    Returns:
+        True if this appears to be a RateLimitResponse
+    """
+    # RateLimitResponse has 'operation' and 'retry_after_seconds' fields
+    # Check for common patterns in msgspec serialization
+    # This is a heuristic - the full check requires deserialization
+    if len(data) < 10:
+        return False
+
+    # RateLimitResponse will contain 'operation' field name in the struct
+    # For msgspec Struct serialization, look for the field marker
+    return b"operation" in data and b"retry_after_seconds" in data
+
+
+async def handle_rate_limit_response(
+    limiter: CooperativeRateLimiter,
+    operation: str,
+    retry_after_seconds: float,
+    wait: bool = True,
+) -> float:
+    """
+    Handle a rate limit response from the server.
+
+    Registers the rate limit with the cooperative limiter and optionally
+    waits before returning.
+
+    Args:
+        limiter: The CooperativeRateLimiter instance
+        operation: The operation that was rate limited
+        retry_after_seconds: How long to wait before retrying
+        wait: If True, wait for the retry_after period before returning
+
+    Returns:
+        Time waited in seconds (0 if wait=False)
+
+    Example:
+        # In client code after receiving response
+        response_data = await send_tcp(addr, "job_submit", request.dump())
+        if is_rate_limit_response(response_data):
+            rate_limit = RateLimitResponse.load(response_data)
+            await handle_rate_limit_response(
+                my_limiter,
+                rate_limit.operation,
+                rate_limit.retry_after_seconds,
+            )
+            # Retry the request
+            response_data = await send_tcp(addr, "job_submit", request.dump())
+    """
+    limiter.handle_rate_limit(operation, retry_after_seconds)
+
+    if wait:
+        return await limiter.wait_if_needed(operation)
+
+    return 0.0

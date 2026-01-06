@@ -37,4 +37,7 @@ from hyperscale.distributed_rewrite.reliability.rate_limiting import (
     RateLimitResult as RateLimitResult,
     ServerRateLimiter as ServerRateLimiter,
     TokenBucket as TokenBucket,
+    # Retry-after helpers
+    is_rate_limit_response as is_rate_limit_response,
+    handle_rate_limit_response as handle_rate_limit_response,
 )

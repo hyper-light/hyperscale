@@ -484,3 +484,127 @@ class TestRateLimitResult:
         assert result.allowed is False
         assert result.retry_after_seconds == 0.5
         assert result.tokens_remaining == 0.0
+
+
+class TestRetryAfterHelpers:
+    """Test retry-after helper functions."""
+
+    def test_is_rate_limit_response_positive(self) -> None:
+        """Test detection of rate limit response data."""
+        from hyperscale.distributed_rewrite.reliability import is_rate_limit_response
+        from hyperscale.distributed_rewrite.models import RateLimitResponse
+
+        response = RateLimitResponse(
+            operation="job_submit",
+            retry_after_seconds=1.5,
+        )
+        data = response.dump()
+
+        assert is_rate_limit_response(data) is True
+
+    def test_is_rate_limit_response_negative(self) -> None:
+        """Test non-rate-limit response is not detected."""
+        from hyperscale.distributed_rewrite.reliability import is_rate_limit_response
+
+        # Some other data
+        data = b"not a rate limit response"
+
+        assert is_rate_limit_response(data) is False
+
+    def test_is_rate_limit_response_empty(self) -> None:
+        """Test empty data is not detected as rate limit."""
+        from hyperscale.distributed_rewrite.reliability import is_rate_limit_response
+
+        assert is_rate_limit_response(b"") is False
+        assert is_rate_limit_response(b"short") is False
+
+    @pytest.mark.asyncio
+    async def test_handle_rate_limit_response_with_wait(self) -> None:
+        """Test handling rate limit response with wait."""
+        from hyperscale.distributed_rewrite.reliability import (
+            CooperativeRateLimiter,
+            handle_rate_limit_response,
+        )
+
+        limiter = CooperativeRateLimiter()
+
+        # Handle rate limit with short wait
+        start = time.monotonic()
+        wait_time = await handle_rate_limit_response(
+            limiter,
+            operation="test_op",
+            retry_after_seconds=0.05,
+            wait=True,
+        )
+        elapsed = time.monotonic() - start
+
+        assert wait_time >= 0.04
+        assert elapsed >= 0.04
+
+    @pytest.mark.asyncio
+    async def test_handle_rate_limit_response_without_wait(self) -> None:
+        """Test handling rate limit response without wait."""
+        from hyperscale.distributed_rewrite.reliability import (
+            CooperativeRateLimiter,
+            handle_rate_limit_response,
+        )
+
+        limiter = CooperativeRateLimiter()
+
+        # Handle rate limit without waiting
+        wait_time = await handle_rate_limit_response(
+            limiter,
+            operation="test_op",
+            retry_after_seconds=10.0,
+            wait=False,
+        )
+
+        assert wait_time == 0.0
+        # But the operation should be blocked
+        assert limiter.is_blocked("test_op") is True
+        assert limiter.get_retry_after("test_op") >= 9.9
+
+    @pytest.mark.asyncio
+    async def test_retry_after_flow(self) -> None:
+        """Test complete retry-after flow."""
+        from hyperscale.distributed_rewrite.reliability import (
+            CooperativeRateLimiter,
+            ServerRateLimiter,
+            RateLimitConfig,
+            handle_rate_limit_response,
+        )
+
+        # Server-side: create a rate limiter with small bucket
+        config = RateLimitConfig(
+            operation_limits={"test_op": (2, 10.0)}  # 2 tokens, refill 10/s
+        )
+        server_limiter = ServerRateLimiter(config=config)
+
+        # Client-side: create cooperative limiter
+        client_limiter = CooperativeRateLimiter()
+
+        # First 2 requests succeed
+        result1 = server_limiter.check_rate_limit("client-1", "test_op")
+        result2 = server_limiter.check_rate_limit("client-1", "test_op")
+        assert result1.allowed is True
+        assert result2.allowed is True
+
+        # Third request is rate limited
+        result3 = server_limiter.check_rate_limit("client-1", "test_op")
+        assert result3.allowed is False
+        assert result3.retry_after_seconds > 0
+
+        # Client handles rate limit response
+        await handle_rate_limit_response(
+            client_limiter,
+            operation="test_op",
+            retry_after_seconds=result3.retry_after_seconds,
+            wait=True,
+        )
+
+        # After waiting, client can check if blocked and retry
+        assert client_limiter.is_blocked("test_op") is False
+
+        # Server should now allow the request again
+        result4 = server_limiter.check_rate_limit("client-1", "test_op")
+        assert result4.allowed is True

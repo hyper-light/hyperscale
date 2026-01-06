@@ -78,6 +78,10 @@ from hyperscale.distributed_rewrite.models import (
 )
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.distributed_rewrite.jobs import CoreAllocator
+from hyperscale.distributed_rewrite.reliability import (
+    BackpressureLevel,
+    BackpressureSignal,
+)
 from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError, ServerWarning, ServerDebug
 
@@ -181,6 +185,11 @@ class WorkerServer(HealthAwareServer):
         self._progress_buffer_lock = asyncio.Lock()
         self._progress_flush_interval: float = env.WORKER_PROGRESS_FLUSH_INTERVAL
         self._progress_flush_task: asyncio.Task | None = None
+
+        # Backpressure tracking (AD-23)
+        # Track backpressure signals from managers to adjust update frequency
+        self._manager_backpressure: dict[str, BackpressureLevel] = {}  # manager_id -> level
+        self._backpressure_delay_ms: int = 0  # Current delay suggestion from managers
 
         # Dead manager reap loop task
         self._dead_manager_reap_task: asyncio.Task | None = None
@@ -1681,11 +1690,22 @@ class WorkerServer(HealthAwareServer):
         Background loop that flushes buffered progress updates to manager.
 
         Runs continuously while the worker is active, flushing all buffered
-        progress updates at a controlled interval.
+        progress updates at a controlled interval. Respects backpressure signals
+        from managers to adjust update frequency (AD-23).
         """
         while self._running:
             try:
-                await asyncio.sleep(self._progress_flush_interval)
+                # Calculate effective flush interval based on backpressure
+                effective_interval = self._get_effective_flush_interval()
+                await asyncio.sleep(effective_interval)
+
+                # Skip if under heavy backpressure (BATCH or REJECT level)
+                max_backpressure = self._get_max_backpressure_level()
+                if max_backpressure >= BackpressureLevel.REJECT:
+                    # Drop non-critical updates under heavy backpressure
+                    async with self._progress_buffer_lock:
+                        self._progress_buffer.clear()
+                    continue
 
                 # Get and clear the buffer atomically
                 async with self._progress_buffer_lock:
@@ -1703,6 +1723,47 @@ class WorkerServer(HealthAwareServer):
                 break
             except Exception:
                 pass
+
+    def _get_effective_flush_interval(self) -> float:
+        """
+        Get effective flush interval based on backpressure signals.
+
+        Increases interval when managers signal backpressure.
+        """
+        base_interval = self._progress_flush_interval
+
+        # Add backpressure delay if signaled
+        if self._backpressure_delay_ms > 0:
+            delay_seconds = self._backpressure_delay_ms / 1000.0
+            return base_interval + delay_seconds
+
+        return base_interval
+
+    def _get_max_backpressure_level(self) -> BackpressureLevel:
+        """Get the maximum backpressure level across all managers."""
+        if not self._manager_backpressure:
+            return BackpressureLevel.NONE
+        return max(self._manager_backpressure.values())
+
+    def _handle_backpressure_signal(
+        self,
+        manager_id: str,
+        signal: BackpressureSignal,
+    ) -> None:
+        """
+        Handle backpressure signal from a manager.
+
+        Updates tracking state to adjust future update behavior.
+
+        Args:
+            manager_id: ID of manager that sent the signal
+            signal: BackpressureSignal from the manager
+        """
+        self._manager_backpressure[manager_id] = signal.level
+        self._backpressure_delay_ms = max(
+            self._backpressure_delay_ms,
+            signal.suggested_delay_ms,
+        )
 
     async def _dead_manager_reap_loop(self) -> None:
         """

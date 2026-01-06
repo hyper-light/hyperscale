@@ -73,6 +73,8 @@ from .distributed import (
     # Client reconnection
     RegisterCallback as RegisterCallback,
     RegisterCallbackResponse as RegisterCallbackResponse,
+    # Rate limiting
+    RateLimitResponse as RateLimitResponse,
     # State sync
     WorkerStateSnapshot as WorkerStateSnapshot,
     ManagerStateSnapshot as ManagerStateSnapshot,

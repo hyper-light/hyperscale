@@ -189,7 +189,7 @@ Three-signal health model for all node types.
   - [x] 85-95% → BATCH
   - [x] > 95% → REJECT
 - [x] Add backpressure signaling in stats update responses
-- [ ] Update stats senders to respect backpressure signals
+- [x] Update stats senders to respect backpressure signals
 - [x] Add integration tests for backpressure
 
 ### 3.3 AD-24: Rate Limiting
@@ -204,8 +204,8 @@ Three-signal health model for all node types.
   - [x] Per-client token buckets: `dict[str, TokenBucket]`
   - [x] `check_rate_limit(client_id, operation) -> tuple[bool, float]`
   - [x] Returns `(allowed, retry_after_seconds)`
-- [ ] Integrate rate limiter with gate handlers
-- [ ] Add 429 response handling with Retry-After
+- [x] Integrate rate limiter with gate handlers
+- [x] Add response handling with Retry-After (RateLimitResponse)
 - [x] Add client-side cooperative rate limiting
 - [x] Add bucket cleanup for inactive clients (prevent memory leak)
 - [x] Add integration tests for rate limiting

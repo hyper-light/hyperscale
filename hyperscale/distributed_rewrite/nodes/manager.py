@@ -115,12 +115,14 @@ from hyperscale.distributed_rewrite.models import (
     EagerWorkflowEntry,
     RegisterCallback,
     RegisterCallbackResponse,
+    RateLimitResponse,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.distributed_rewrite.reliability import (
     HybridOverloadDetector,
     LoadShedder,
+    ServerRateLimiter,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 from hyperscale.reporting.results import Results
@@ -382,6 +384,12 @@ class ManagerServer(HealthAwareServer):
         # Tracks latency and sheds low-priority requests under load
         self._overload_detector = HybridOverloadDetector()
         self._load_shedder = LoadShedder(self._overload_detector)
+
+        # Rate limiting infrastructure (AD-24)
+        # Per-client rate limiting with automatic cleanup
+        self._rate_limiter = ServerRateLimiter(
+            inactive_cleanup_seconds=300.0,  # Cleanup after 5 minutes
+        )
 
         # WorkflowDispatcher for dependency-aware workflow dispatch
         # Coordinates with JobManager and WorkerPool for allocation
@@ -1823,6 +1831,9 @@ class ManagerServer(HealthAwareServer):
         # Start background cleanup for completed jobs
         self._task_runner.run(self._job_cleanup_loop)
 
+        # Start background cleanup for rate limiter (AD-24)
+        self._task_runner.run(self._rate_limit_cleanup_loop)
+
         # Start background cleanup for dead nodes (workers, manager peers, gates)
         self._dead_node_reap_task = asyncio.create_task(self._dead_node_reap_loop())
 
@@ -2393,6 +2404,38 @@ class ManagerServer(HealthAwareServer):
             "overload_state": self._load_shedder.get_current_state().value,
             **self._load_shedder.get_metrics(),
         }
+
+    # =========================================================================
+    # Rate Limiting (AD-24)
+    # =========================================================================
+
+    def _check_rate_limit(self, client_id: str, operation: str) -> tuple[bool, float]:
+        """
+        Check if a client request is within rate limits.
+
+        Args:
+            client_id: Identifier for the client (typically addr as string)
+            operation: Type of operation being performed
+
+        Returns:
+            Tuple of (allowed, retry_after_seconds). If not allowed,
+            retry_after_seconds indicates when client can retry.
+        """
+        result = self._rate_limiter.check_rate_limit(client_id, operation)
+        return result.allowed, result.retry_after_seconds
+
+    def _get_rate_limit_metrics(self) -> dict:
+        """Get rate limiting metrics for monitoring."""
+        return self._rate_limiter.get_metrics()
+
+    def _cleanup_inactive_rate_limit_clients(self) -> int:
+        """
+        Clean up inactive clients from rate limiter.
+
+        Returns:
+            Number of clients cleaned up
+        """
+        return self._rate_limiter.cleanup_inactive_clients()
 
     async def _build_xprobe_response(
         self,
@@ -5843,7 +5886,38 @@ class ManagerServer(HealthAwareServer):
                 break
             except Exception as e:
                 await self.handle_exception(e, "job_cleanup_loop")
-    
+
+    async def _rate_limit_cleanup_loop(self) -> None:
+        """
+        Periodically clean up inactive clients from the rate limiter.
+
+        Removes token buckets for clients that haven't made requests
+        within the inactive_cleanup_seconds window to prevent memory leaks.
+        """
+        cleanup_interval = 60.0  # Check every minute
+
+        while self._running:
+            try:
+                await asyncio.sleep(cleanup_interval)
+
+                cleaned = self._cleanup_inactive_rate_limit_clients()
+
+                if cleaned > 0:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=f"Rate limiter: cleaned up {cleaned} inactive clients",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.handle_exception(e, "rate_limit_cleanup_loop")
+
     def _cleanup_job(self, job_id: str) -> None:
         """
         Clean up all state associated with a job.
@@ -6048,6 +6122,15 @@ class ManagerServer(HealthAwareServer):
         know where to route workflow results.
         """
         try:
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit(client_id, "job_submit")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="job_submit",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
             submission = JobSubmission.load(data)
 
             # Unpickle workflows
@@ -6393,6 +6476,15 @@ class ManagerServer(HealthAwareServer):
     ):
         """Handle job cancellation (from gate or client)."""
         try:
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit(client_id, "cancel")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="cancel",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
             cancel = CancelJob.load(data)
 
             job = self._job_manager.get_job_by_id(cancel.job_id)
@@ -6808,6 +6900,15 @@ class ManagerServer(HealthAwareServer):
         error="Job not found".
         """
         try:
+            # Rate limit check (AD-24) - using reconnect limits
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit(client_id, "reconnect")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="reconnect",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
             request = RegisterCallback.load(data)
             job_id = request.job_id
 
@@ -6883,6 +6984,15 @@ class ManagerServer(HealthAwareServer):
         Unknown workflow names are silently ignored.
         """
         try:
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit(client_id, "workflow_query")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="workflow_query",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
             request = WorkflowQueryRequest.load(data)
             workflow_names_set = set(request.workflow_names)
 
