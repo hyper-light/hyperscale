@@ -24,6 +24,11 @@ class TokenBucket:
     Each operation consumes tokens, and operations are rejected when
     the bucket is empty.
 
+    Thread-safety note: Synchronous methods (acquire, try_acquire) are safe
+    for use in asyncio as they run atomically within a single event loop
+    iteration. The async method (acquire_async) uses an asyncio.Lock to
+    prevent race conditions across await points.
+
     Example usage:
         bucket = TokenBucket(bucket_size=100, refill_rate=10.0)
 
@@ -42,10 +47,12 @@ class TokenBucket:
     # Internal state
     _tokens: float = field(init=False)
     _last_refill: float = field(init=False)
+    _async_lock: asyncio.Lock = field(init=False)
 
     def __post_init__(self) -> None:
         self._tokens = float(self.bucket_size)
         self._last_refill = time.monotonic()
+        self._async_lock = asyncio.Lock()
 
     def acquire(self, tokens: int = 1) -> bool:
         """
@@ -90,6 +97,9 @@ class TokenBucket:
         """
         Async version that waits for tokens if necessary.
 
+        Uses asyncio.Lock to prevent race conditions where multiple coroutines
+        wait for tokens and all try to acquire after the wait completes.
+
         Args:
             tokens: Number of tokens to acquire
             max_wait: Maximum time to wait for tokens
@@ -97,15 +107,18 @@ class TokenBucket:
         Returns:
             True if tokens were acquired, False if timed out
         """
-        acquired, wait_time = self.try_acquire(tokens)
-        if acquired:
-            return True
+        async with self._async_lock:
+            acquired, wait_time = self.try_acquire(tokens)
+            if acquired:
+                return True
 
-        if wait_time > max_wait:
-            return False
+            if wait_time > max_wait:
+                return False
 
-        await asyncio.sleep(wait_time)
-        return self.acquire(tokens)
+            # Wait while holding lock - prevents race where multiple waiters
+            # all succeed after the wait
+            await asyncio.sleep(wait_time)
+            return self.acquire(tokens)
 
     def _refill(self) -> None:
         """Refill tokens based on elapsed time."""
@@ -255,6 +268,9 @@ class ServerRateLimiter:
         """
         Check rate limit with optional wait for tokens.
 
+        Uses the TokenBucket's async acquire method which has proper locking
+        to prevent race conditions when multiple coroutines wait for tokens.
+
         Args:
             client_id: Identifier for the client
             operation: Type of operation being performed
@@ -264,18 +280,32 @@ class ServerRateLimiter:
         Returns:
             RateLimitResult indicating if allowed
         """
-        result = self.check_rate_limit(client_id, operation, tokens)
+        self._total_requests += 1
+        self._client_last_activity[client_id] = time.monotonic()
 
-        if result.allowed or max_wait <= 0:
-            return result
+        bucket = self._get_or_create_bucket(client_id, operation)
 
-        # Wait for tokens if max_wait is specified
-        if result.retry_after_seconds <= max_wait:
-            await asyncio.sleep(result.retry_after_seconds)
-            # Recheck after wait
-            result = self.check_rate_limit(client_id, operation, tokens)
+        if max_wait <= 0:
+            # No wait - use synchronous check
+            allowed, wait_time = bucket.try_acquire(tokens)
+            if not allowed:
+                self._rate_limited_requests += 1
+            return RateLimitResult(
+                allowed=allowed,
+                retry_after_seconds=wait_time,
+                tokens_remaining=bucket.available_tokens,
+            )
 
-        return result
+        # Use async acquire with lock protection
+        allowed = await bucket.acquire_async(tokens, max_wait)
+        if not allowed:
+            self._rate_limited_requests += 1
+
+        return RateLimitResult(
+            allowed=allowed,
+            retry_after_seconds=0.0 if allowed else max_wait,
+            tokens_remaining=bucket.available_tokens,
+        )
 
     def _get_or_create_bucket(
         self,
