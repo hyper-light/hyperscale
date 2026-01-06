@@ -344,7 +344,7 @@ Extract classes from monolithic files into focused modules.
 - [x] Extract `ConsistentHashRing` class
   - [x] Per-job gate ownership calculation
 - [x] Add integration tests for gate job management
-- [ ] Update gate.py imports (deferred - requires larger refactor)
+- [x] Update gate.py imports
 
 ### 5.2 Datacenter Management
 
@@ -358,7 +358,7 @@ Extract classes from monolithic files into focused modules.
   - [x] Fence token validation
   - [x] Lease transfer between gates
 - [x] Add integration tests for datacenter management
-- [ ] Update gate.py imports (deferred - requires larger refactor)
+- [x] Update gate.py imports
 
 ### 5.3 Reliability Module
 
@@ -378,7 +378,12 @@ Extract classes from monolithic files into focused modules.
 - [x] Move `NodeHealthTracker` to `health/tracker.py`
 - [x] Move `ExtensionTracker` to `health/extension_tracker.py`
 - [x] Move `WorkerHealthManager` to `health/worker_health_manager.py`
-- [ ] Add `health/probes.py` for liveness/readiness probe implementations (deferred)
+- [x] Add `health/probes.py` for liveness/readiness probe implementations
+  - [x] HealthProbe base class with threshold-based state
+  - [x] LivenessProbe for process responsiveness
+  - [x] ReadinessProbe for dependency checks
+  - [x] StartupProbe for initialization
+  - [x] CompositeProbe for multiple conditions
 - [x] Add unified exports in `health/__init__.py`
 
 ---

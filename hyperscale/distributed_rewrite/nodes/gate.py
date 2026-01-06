@@ -108,6 +108,16 @@ from hyperscale.distributed_rewrite.reliability import (
     RetryConfig,
     JitterStrategy,
 )
+from hyperscale.distributed_rewrite.jobs.gates import (
+    GateJobManager,
+    JobForwardingTracker,
+    ConsistentHashRing,
+)
+from hyperscale.distributed_rewrite.datacenters import (
+    DatacenterHealthManager,
+    ManagerDispatcher,
+    LeaseManager,
+)
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 

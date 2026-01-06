@@ -43,3 +43,14 @@ from hyperscale.distributed_rewrite.health.worker_health_manager import (
     WorkerHealthManager as WorkerHealthManager,
     WorkerHealthManagerConfig as WorkerHealthManagerConfig,
 )
+from hyperscale.distributed_rewrite.health.probes import (
+    ProbeResult as ProbeResult,
+    ProbeResponse as ProbeResponse,
+    ProbeConfig as ProbeConfig,
+    ProbeState as ProbeState,
+    HealthProbe as HealthProbe,
+    LivenessProbe as LivenessProbe,
+    ReadinessProbe as ReadinessProbe,
+    StartupProbe as StartupProbe,
+    CompositeProbe as CompositeProbe,
+)
