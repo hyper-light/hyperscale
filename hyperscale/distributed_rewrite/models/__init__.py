@@ -47,6 +47,11 @@ from .distributed import (
     JobAck as JobAck,
     WorkflowDispatch as WorkflowDispatch,
     WorkflowDispatchAck as WorkflowDispatchAck,
+    # Cancellation (AD-20)
+    JobCancelRequest as JobCancelRequest,
+    JobCancelResponse as JobCancelResponse,
+    WorkflowCancelRequest as WorkflowCancelRequest,
+    WorkflowCancelResponse as WorkflowCancelResponse,
     # Status updates
     StepStats as StepStats,
     WorkflowProgress as WorkflowProgress,

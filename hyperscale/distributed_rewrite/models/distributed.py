@@ -575,6 +575,78 @@ class WorkflowDispatchAck(Message):
 
 
 # =============================================================================
+# Cancellation (AD-20)
+# =============================================================================
+
+@dataclass(slots=True)
+class JobCancelRequest(Message):
+    """
+    Request to cancel a running job (AD-20).
+
+    Can be sent from:
+    - Client -> Gate (global cancellation across all DCs)
+    - Client -> Manager (DC-local cancellation)
+    - Gate -> Manager (forwarding client request)
+    - Manager -> Worker (cancel specific workflows)
+
+    The fence_token is used for consistency:
+    - If provided, only cancel if the job's current fence token matches
+    - This prevents cancelling a restarted job after a crash recovery
+    """
+    job_id: str                  # Job to cancel
+    requester_id: str            # Who requested cancellation (for audit)
+    timestamp: float             # When cancellation was requested
+    fence_token: int = 0         # Fence token for consistency (0 = ignore)
+    reason: str = ""             # Optional cancellation reason
+
+
+@dataclass(slots=True)
+class JobCancelResponse(Message):
+    """
+    Response to a job cancellation request (AD-20).
+
+    Returned by:
+    - Gate: Aggregated result from all DCs
+    - Manager: DC-local result
+    - Worker: Workflow-level result
+    """
+    job_id: str                  # Job that was cancelled
+    success: bool                # Whether cancellation succeeded
+    cancelled_workflow_count: int = 0  # Number of workflows cancelled
+    already_cancelled: bool = False    # True if job was already cancelled
+    already_completed: bool = False    # True if job was already completed
+    error: str | None = None     # Error message if failed
+
+
+@dataclass(slots=True)
+class WorkflowCancelRequest(Message):
+    """
+    Request to cancel a specific workflow on a worker (AD-20).
+
+    Sent from Manager -> Worker for individual workflow cancellation.
+    """
+    job_id: str                  # Parent job ID
+    workflow_id: str             # Specific workflow to cancel
+    requester_id: str            # Who requested cancellation
+    timestamp: float             # When cancellation was requested
+
+
+@dataclass(slots=True)
+class WorkflowCancelResponse(Message):
+    """
+    Response to a workflow cancellation request (AD-20).
+
+    Returned by Worker -> Manager after attempting cancellation.
+    """
+    job_id: str                  # Parent job ID
+    workflow_id: str             # Workflow that was cancelled
+    success: bool                # Whether cancellation succeeded
+    was_running: bool = False    # True if workflow was actively running
+    already_completed: bool = False  # True if already finished
+    error: str | None = None     # Error message if failed
+
+
+# =============================================================================
 # Status Updates and Reporting
 # =============================================================================
 

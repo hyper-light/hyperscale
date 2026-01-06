@@ -65,6 +65,8 @@ from hyperscale.distributed_rewrite.models import (
     GateStateSnapshot,
     CancelJob,
     CancelAck,
+    JobCancelRequest,
+    JobCancelResponse,
     DatacenterLease,
     LeaseTransfer,
     DatacenterHealth,
@@ -102,6 +104,9 @@ from hyperscale.distributed_rewrite.reliability import (
     LoadShedder,
     ServerRateLimiter,
     RateLimitConfig,
+    RetryExecutor,
+    RetryConfig,
+    JitterStrategy,
 )
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
@@ -3131,9 +3136,9 @@ class GateServer(HealthAwareServer):
             self._record_request_latency(latency_ms)
 
     # =========================================================================
-    # TCP Handlers - Cancellation
+    # TCP Handlers - Cancellation (AD-20)
     # =========================================================================
-    
+
     @tcp.receive()
     async def receive_cancel_job(
         self,
@@ -3141,7 +3146,12 @@ class GateServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ):
-        """Handle job cancellation from client."""
+        """
+        Handle job cancellation from client (AD-20).
+
+        Supports both legacy CancelJob and new JobCancelRequest formats.
+        Uses retry logic with exponential backoff when forwarding to managers.
+        """
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
@@ -3152,54 +3162,193 @@ class GateServer(HealthAwareServer):
                     retry_after_seconds=retry_after,
                 ).dump()
 
-            cancel = CancelJob.load(data)
-            
-            job = self._jobs.get(cancel.job_id)
+            # Try to parse as JobCancelRequest first (AD-20), fall back to CancelJob
+            try:
+                cancel_request = JobCancelRequest.load(data)
+                job_id = cancel_request.job_id
+                fence_token = cancel_request.fence_token
+                requester_id = cancel_request.requester_id
+                reason = cancel_request.reason
+                use_ad20_response = True
+            except Exception:
+                # Fall back to legacy CancelJob format
+                cancel = CancelJob.load(data)
+                job_id = cancel.job_id
+                fence_token = cancel.fence_token
+                requester_id = f"{addr[0]}:{addr[1]}"
+                reason = cancel.reason
+                use_ad20_response = False
+
+            job = self._jobs.get(job_id)
             if not job:
-                ack = CancelAck(
-                    job_id=cancel.job_id,
-                    cancelled=False,
-                    error="Job not found",
-                )
-                return ack.dump()
-            
-            # Cancel in all DCs
+                if use_ad20_response:
+                    return JobCancelResponse(
+                        job_id=job_id,
+                        success=False,
+                        error="Job not found",
+                    ).dump()
+                else:
+                    return CancelAck(
+                        job_id=job_id,
+                        cancelled=False,
+                        error="Job not found",
+                    ).dump()
+
+            # Check fence token if provided (prevents cancelling restarted jobs)
+            if fence_token > 0 and hasattr(job, 'fence_token'):
+                if job.fence_token != fence_token:
+                    error_msg = f"Fence token mismatch: expected {job.fence_token}, got {fence_token}"
+                    if use_ad20_response:
+                        return JobCancelResponse(
+                            job_id=job_id,
+                            success=False,
+                            error=error_msg,
+                        ).dump()
+                    else:
+                        return CancelAck(
+                            job_id=job_id,
+                            cancelled=False,
+                            error=error_msg,
+                        ).dump()
+
+            # Check if already cancelled (idempotency)
+            if job.status == JobStatus.CANCELLED.value:
+                if use_ad20_response:
+                    return JobCancelResponse(
+                        job_id=job_id,
+                        success=True,
+                        already_cancelled=True,
+                        cancelled_workflow_count=0,
+                    ).dump()
+                else:
+                    return CancelAck(
+                        job_id=job_id,
+                        cancelled=True,
+                        workflows_cancelled=0,
+                    ).dump()
+
+            # Check if already completed (cannot cancel)
+            if job.status == JobStatus.COMPLETED.value:
+                if use_ad20_response:
+                    return JobCancelResponse(
+                        job_id=job_id,
+                        success=False,
+                        already_completed=True,
+                        error="Job already completed",
+                    ).dump()
+                else:
+                    return CancelAck(
+                        job_id=job_id,
+                        cancelled=False,
+                        error="Job already completed",
+                    ).dump()
+
+            # Create retry executor with exponential backoff for DC communication
+            retry_config = RetryConfig(
+                max_attempts=3,
+                base_delay=0.5,
+                max_delay=5.0,
+                jitter=JitterStrategy.FULL,
+                retryable_exceptions=(ConnectionError, TimeoutError, OSError),
+            )
+
+            # Cancel in all DCs with retry logic
             cancelled_workflows = 0
+            errors: list[str] = []
+
             for dc in self._get_available_datacenters():
                 managers = self._datacenter_managers.get(dc, [])
+                dc_cancelled = False
+
                 for manager_addr in managers:
-                    try:
+                    if dc_cancelled:
+                        break
+
+                    # Use RetryExecutor for reliable DC communication
+                    retry_executor = RetryExecutor(retry_config)
+
+                    async def send_cancel_to_manager():
+                        # Build the cancel request for the manager
+                        if use_ad20_response:
+                            cancel_data = JobCancelRequest(
+                                job_id=job_id,
+                                requester_id=requester_id,
+                                timestamp=cancel_request.timestamp,
+                                fence_token=fence_token,
+                                reason=reason,
+                            ).dump()
+                        else:
+                            cancel_data = CancelJob(
+                                job_id=job_id,
+                                reason=reason,
+                                fence_token=fence_token,
+                            ).dump()
+
                         response, _ = await self.send_tcp(
                             manager_addr,
                             "cancel_job",
-                            cancel.dump(),
-                            timeout=2.0,
+                            cancel_data,
+                            timeout=5.0,
                         )
+                        return response
+
+                    try:
+                        response = await retry_executor.execute(
+                            send_cancel_to_manager,
+                            operation_name=f"cancel_job_dc_{dc}",
+                        )
+
                         if isinstance(response, bytes):
-                            dc_ack = CancelAck.load(response)
-                            cancelled_workflows += dc_ack.workflows_cancelled
-                            break
-                    except Exception:
+                            # Try parsing as AD-20 response first
+                            try:
+                                dc_response = JobCancelResponse.load(response)
+                                cancelled_workflows += dc_response.cancelled_workflow_count
+                                dc_cancelled = True
+                            except Exception:
+                                # Fall back to legacy format
+                                dc_ack = CancelAck.load(response)
+                                cancelled_workflows += dc_ack.workflows_cancelled
+                                dc_cancelled = True
+                    except Exception as e:
+                        errors.append(f"DC {dc}: {str(e)}")
                         continue
-            
+
+            # Update job status
             job.status = JobStatus.CANCELLED.value
             self._increment_version()
-            
-            ack = CancelAck(
-                job_id=cancel.job_id,
-                cancelled=True,
-                workflows_cancelled=cancelled_workflows,
-            )
-            return ack.dump()
-            
+
+            # Build response
+            if use_ad20_response:
+                return JobCancelResponse(
+                    job_id=job_id,
+                    success=True,
+                    cancelled_workflow_count=cancelled_workflows,
+                    error="; ".join(errors) if errors else None,
+                ).dump()
+            else:
+                return CancelAck(
+                    job_id=job_id,
+                    cancelled=True,
+                    workflows_cancelled=cancelled_workflows,
+                ).dump()
+
         except Exception as e:
             await self.handle_exception(e, "receive_cancel_job")
-            ack = CancelAck(
-                job_id="unknown",
-                cancelled=False,
-                error=str(e),
-            )
-            return ack.dump()
+            # Return error in appropriate format
+            try:
+                # Try to parse to determine format
+                JobCancelRequest.load(data)
+                return JobCancelResponse(
+                    job_id="unknown",
+                    success=False,
+                    error=str(e),
+                ).dump()
+            except Exception:
+                return CancelAck(
+                    job_id="unknown",
+                    cancelled=False,
+                    error=str(e),
+                ).dump()
     
     # =========================================================================
     # TCP Handlers - Lease Transfer (for Gate Scaling)

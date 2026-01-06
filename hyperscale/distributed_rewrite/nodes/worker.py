@@ -74,6 +74,9 @@ from hyperscale.distributed_rewrite.models import (
     CancelAck,
     WorkflowCancellationQuery,
     WorkflowCancellationResponse,
+    # AD-20: Cancellation Propagation
+    WorkflowCancelRequest,
+    WorkflowCancelResponse,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -2164,21 +2167,21 @@ class WorkerServer(HealthAwareServer):
         """Handle job cancellation request from manager."""
         try:
             cancel_request = CancelJob.load(data)
-            
+
             # Find and cancel all workflows for this job
             cancelled_count = 0
             for workflow_id, progress in list(self._active_workflows.items()):
                 if progress.job_id == cancel_request.job_id:
                     if await self._cancel_workflow(workflow_id, cancel_request.reason):
                         cancelled_count += 1
-            
+
             ack = CancelAck(
                 job_id=cancel_request.job_id,
                 cancelled=True,
                 workflows_cancelled=cancelled_count,
             )
             return ack.dump()
-            
+
         except Exception as e:
             ack = CancelAck(
                 job_id="unknown",
@@ -2186,3 +2189,105 @@ class WorkerServer(HealthAwareServer):
                 error=str(e),
             )
             return ack.dump()
+
+    @tcp.receive()
+    async def cancel_workflow(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ) -> bytes:
+        """
+        Handle workflow cancellation request from manager (AD-20).
+
+        Cancels a specific workflow rather than all workflows for a job.
+        This is the preferred method for targeted cancellation.
+        """
+        try:
+            request = WorkflowCancelRequest.load(data)
+
+            # Check if workflow exists
+            progress = self._active_workflows.get(request.workflow_id)
+            if not progress:
+                # Workflow not found - check if it was already completed/cancelled
+                # Return success with already_completed=True if we have no record
+                response = WorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    success=True,
+                    was_running=False,
+                    already_completed=True,
+                )
+                return response.dump()
+
+            # Check if workflow is for the specified job (safety check)
+            if progress.job_id != request.job_id:
+                response = WorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    success=False,
+                    error=f"Workflow {request.workflow_id} belongs to job {progress.job_id}, not {request.job_id}",
+                )
+                return response.dump()
+
+            # Check if already cancelled
+            if progress.status == WorkflowStatus.CANCELLED.value:
+                response = WorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    success=True,
+                    was_running=False,
+                    already_completed=True,
+                )
+                return response.dump()
+
+            # Check if already completed or failed
+            if progress.status in (WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value):
+                response = WorkflowCancelResponse(
+                    job_id=request.job_id,
+                    workflow_id=request.workflow_id,
+                    success=True,
+                    was_running=False,
+                    already_completed=True,
+                )
+                return response.dump()
+
+            # Cancel the workflow
+            was_running = progress.status == WorkflowStatus.RUNNING.value
+            cancelled = await self._cancel_workflow(request.workflow_id, "manager_cancel_request")
+
+            if cancelled:
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Cancelled workflow {request.workflow_id} for job {request.job_id}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            response = WorkflowCancelResponse(
+                job_id=request.job_id,
+                workflow_id=request.workflow_id,
+                success=cancelled,
+                was_running=was_running,
+                already_completed=False,
+            )
+            return response.dump()
+
+        except Exception as e:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"Failed to cancel workflow: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            response = WorkflowCancelResponse(
+                job_id="unknown",
+                workflow_id="unknown",
+                success=False,
+                error=str(e),
+            )
+            return response.dump()

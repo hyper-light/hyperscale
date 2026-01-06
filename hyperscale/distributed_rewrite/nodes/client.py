@@ -53,6 +53,9 @@ from hyperscale.distributed_rewrite.models import (
     GateWorkflowQueryResponse,
     RegisterCallback,
     RegisterCallbackResponse,
+    # Cancellation (AD-20)
+    JobCancelRequest,
+    JobCancelResponse,
 )
 from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
@@ -339,6 +342,139 @@ class HyperscaleClient(MercurySyncBaseServer):
     def get_job_status(self, job_id: str) -> JobResult | None:
         """Get current status of a job."""
         return self._jobs.get(job_id)
+
+    # =========================================================================
+    # Job Cancellation (AD-20)
+    # =========================================================================
+
+    async def cancel_job(
+        self,
+        job_id: str,
+        reason: str = "",
+        max_redirects: int = 3,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.5,
+        timeout: float = 10.0,
+    ) -> JobCancelResponse:
+        """
+        Cancel a running job.
+
+        Sends a cancellation request to the gate/manager that owns the job.
+        The cancellation propagates to all datacenters and workers executing
+        workflows for this job.
+
+        Args:
+            job_id: Job identifier to cancel.
+            reason: Optional reason for cancellation.
+            max_redirects: Maximum leader redirects to follow.
+            max_retries: Maximum retries for transient errors.
+            retry_base_delay: Base delay for exponential backoff (seconds).
+            timeout: Request timeout in seconds.
+
+        Returns:
+            JobCancelResponse with cancellation result.
+
+        Raises:
+            RuntimeError: If no gates/managers configured or cancellation fails.
+            KeyError: If job not found (never submitted through this client).
+        """
+        # Build request
+        request = JobCancelRequest(
+            job_id=job_id,
+            requester_id=f"client-{self._host}:{self._tcp_port}",
+            timestamp=time.time(),
+            fence_token=0,  # Client doesn't track fence tokens
+            reason=reason,
+        )
+
+        # Determine targets - prefer the manager/gate that accepted the job
+        all_targets: list[tuple[str, int]] = []
+
+        if job_id in self._job_targets:
+            # Job was submitted through this client, try its target first
+            all_targets.append(self._job_targets[job_id])
+
+        # Add all gates and managers as fallback
+        if self._gates:
+            for gate in self._gates:
+                if gate not in all_targets:
+                    all_targets.append(gate)
+        if self._managers:
+            for manager in self._managers:
+                if manager not in all_targets:
+                    all_targets.append(manager)
+
+        if not all_targets:
+            raise RuntimeError("No managers or gates configured")
+
+        last_error: str | None = None
+
+        # Retry loop with exponential backoff
+        for retry in range(max_retries + 1):
+            target_idx = retry % len(all_targets)
+            target = all_targets[target_idx]
+
+            # Try with leader redirect handling
+            redirects = 0
+            while redirects <= max_redirects:
+                response_data, _ = await self.send_tcp(
+                    target,
+                    "cancel_job",
+                    request.dump(),
+                    timeout=timeout,
+                )
+
+                if isinstance(response_data, Exception):
+                    last_error = str(response_data)
+                    break  # Try next retry/target
+
+                if response_data == b'error':
+                    last_error = "Server returned error"
+                    break
+
+                response = JobCancelResponse.load(response_data)
+
+                if response.success:
+                    # Update local job state
+                    job = self._jobs.get(job_id)
+                    if job:
+                        job.status = JobStatus.CANCELLED.value
+                        event = self._job_events.get(job_id)
+                        if event:
+                            event.set()
+                    return response
+
+                # Check for already completed/cancelled (not an error)
+                if response.already_cancelled or response.already_completed:
+                    # Still update local state if we have it
+                    job = self._jobs.get(job_id)
+                    if job:
+                        if response.already_cancelled:
+                            job.status = JobStatus.CANCELLED.value
+                        elif response.already_completed:
+                            job.status = JobStatus.COMPLETED.value
+                        event = self._job_events.get(job_id)
+                        if event:
+                            event.set()
+                    return response
+
+                # Check for transient error
+                if response.error and self._is_transient_error(response.error):
+                    last_error = response.error
+                    break  # Exit redirect loop, continue to retry
+
+                # Permanent error
+                raise RuntimeError(f"Job cancellation failed: {response.error}")
+
+            # Wait before retry with exponential backoff
+            if retry < max_retries:
+                delay = retry_base_delay * (2 ** retry)
+                await asyncio.sleep(delay)
+
+        # All retries exhausted
+        raise RuntimeError(
+            f"Job cancellation failed after {max_retries} retries: {last_error}"
+        )
 
     # =========================================================================
     # Client Reconnection

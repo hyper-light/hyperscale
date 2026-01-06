@@ -92,6 +92,10 @@ from hyperscale.distributed_rewrite.models import (
     ProvisionCommit,
     CancelJob,
     CancelAck,
+    JobCancelRequest,
+    JobCancelResponse,
+    WorkflowCancelRequest,
+    WorkflowCancelResponse,
     WorkflowCancellationQuery,
     WorkflowCancellationResponse,
     WorkerDiscoveryBroadcast,
@@ -6470,9 +6474,9 @@ class ManagerServer(HealthAwareServer):
             return b''
     
     # =========================================================================
-    # TCP Handlers - Cancellation
+    # TCP Handlers - Cancellation (AD-20)
     # =========================================================================
-    
+
     @tcp.receive()
     async def receive_cancel_job(
         self,
@@ -6480,7 +6484,12 @@ class ManagerServer(HealthAwareServer):
         data: bytes,
         clock_time: int,
     ):
-        """Handle job cancellation (from gate or client)."""
+        """
+        Handle job cancellation (from gate or client) (AD-20).
+
+        Supports both legacy CancelJob and new JobCancelRequest formats.
+        Forwards cancellation to workers running the job's workflows.
+        """
         try:
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
@@ -6491,55 +6500,171 @@ class ManagerServer(HealthAwareServer):
                     retry_after_seconds=retry_after,
                 ).dump()
 
-            cancel = CancelJob.load(data)
+            # Try to parse as JobCancelRequest first (AD-20), fall back to CancelJob
+            try:
+                cancel_request = JobCancelRequest.load(data)
+                job_id = cancel_request.job_id
+                fence_token = cancel_request.fence_token
+                requester_id = cancel_request.requester_id
+                reason = cancel_request.reason
+                timestamp = cancel_request.timestamp
+                use_ad20_response = True
+            except Exception:
+                # Fall back to legacy CancelJob format
+                cancel = CancelJob.load(data)
+                job_id = cancel.job_id
+                fence_token = cancel.fence_token
+                requester_id = f"{addr[0]}:{addr[1]}"
+                reason = cancel.reason
+                timestamp = time.monotonic()
+                use_ad20_response = False
 
-            job = self._job_manager.get_job_by_id(cancel.job_id)
+            job = self._job_manager.get_job_by_id(job_id)
             if not job:
-                ack = CancelAck(
-                    job_id=cancel.job_id,
-                    cancelled=False,
-                    error="Job not found",
-                )
-                return ack.dump()
+                if use_ad20_response:
+                    return JobCancelResponse(
+                        job_id=job_id,
+                        success=False,
+                        error="Job not found",
+                    ).dump()
+                else:
+                    return CancelAck(
+                        job_id=job_id,
+                        cancelled=False,
+                        error="Job not found",
+                    ).dump()
+
+            # Check fence token if provided (prevents cancelling restarted jobs)
+            if fence_token > 0 and hasattr(job, 'fence_token'):
+                if job.fence_token != fence_token:
+                    error_msg = f"Fence token mismatch: expected {job.fence_token}, got {fence_token}"
+                    if use_ad20_response:
+                        return JobCancelResponse(
+                            job_id=job_id,
+                            success=False,
+                            error=error_msg,
+                        ).dump()
+                    else:
+                        return CancelAck(
+                            job_id=job_id,
+                            cancelled=False,
+                            error=error_msg,
+                        ).dump()
+
+            # Check if already cancelled (idempotency)
+            if job.status == JobStatus.CANCELLED.value:
+                if use_ad20_response:
+                    return JobCancelResponse(
+                        job_id=job_id,
+                        success=True,
+                        already_cancelled=True,
+                        cancelled_workflow_count=0,
+                    ).dump()
+                else:
+                    return CancelAck(
+                        job_id=job_id,
+                        cancelled=True,
+                        workflows_cancelled=0,
+                    ).dump()
+
+            # Check if already completed (cannot cancel)
+            if job.status == JobStatus.COMPLETED.value:
+                if use_ad20_response:
+                    return JobCancelResponse(
+                        job_id=job_id,
+                        success=False,
+                        already_completed=True,
+                        error="Job already completed",
+                    ).dump()
+                else:
+                    return CancelAck(
+                        job_id=job_id,
+                        cancelled=False,
+                        error="Job already completed",
+                    ).dump()
 
             # Cancel all workflows on workers via sub_workflows from JobManager
             cancelled_count = 0
             workers_notified: set[str] = set()
+            errors: list[str] = []
+
             for sub_wf in job.sub_workflows.values():
                 worker_id = sub_wf.worker_id
                 if worker_id and worker_id not in workers_notified:
                     worker = self._worker_pool.get_worker(worker_id)
                     if worker and worker.registration:
                         try:
-                            await self.send_tcp(
-                                (worker.registration.node.host, worker.registration.node.port),
-                                "cancel_job",
-                                cancel.dump(),
-                                timeout=2.0,
-                            )
-                            cancelled_count += 1
-                            workers_notified.add(worker_id)
-                        except Exception:
-                            pass
+                            # Send AD-20 WorkflowCancelRequest to worker
+                            if use_ad20_response:
+                                cancel_data = WorkflowCancelRequest(
+                                    job_id=job_id,
+                                    workflow_id=sub_wf.workflow_id,
+                                    requester_id=requester_id,
+                                    timestamp=timestamp,
+                                ).dump()
+                            else:
+                                cancel_data = CancelJob(
+                                    job_id=job_id,
+                                    reason=reason,
+                                    fence_token=fence_token,
+                                ).dump()
 
+                            response, _ = await self.send_tcp(
+                                (worker.registration.node.host, worker.registration.node.port),
+                                "cancel_workflow",
+                                cancel_data,
+                                timeout=5.0,
+                            )
+
+                            if isinstance(response, bytes):
+                                # Count workflows cancelled from the worker response
+                                try:
+                                    wf_response = WorkflowCancelResponse.load(response)
+                                    if wf_response.success:
+                                        cancelled_count += 1
+                                except Exception:
+                                    # Legacy format or different response
+                                    cancelled_count += 1
+
+                            workers_notified.add(worker_id)
+                        except Exception as e:
+                            errors.append(f"Worker {worker_id}: {str(e)}")
+
+            # Update job status
             job.status = JobStatus.CANCELLED.value
             self._increment_version()
 
-            ack = CancelAck(
-                job_id=cancel.job_id,
-                cancelled=True,
-                workflows_cancelled=cancelled_count,
-            )
-            return ack.dump()
+            # Build response
+            if use_ad20_response:
+                return JobCancelResponse(
+                    job_id=job_id,
+                    success=True,
+                    cancelled_workflow_count=cancelled_count,
+                    error="; ".join(errors) if errors else None,
+                ).dump()
+            else:
+                return CancelAck(
+                    job_id=job_id,
+                    cancelled=True,
+                    workflows_cancelled=cancelled_count,
+                ).dump()
 
         except Exception as e:
             await self.handle_exception(e, "receive_cancel_job")
-            ack = CancelAck(
-                job_id="unknown",
-                cancelled=False,
-                error=str(e),
-            )
-            return ack.dump()
+            # Return error in appropriate format
+            try:
+                JobCancelRequest.load(data)
+                return JobCancelResponse(
+                    job_id="unknown",
+                    success=False,
+                    error=str(e),
+                ).dump()
+            except Exception:
+                return CancelAck(
+                    job_id="unknown",
+                    cancelled=False,
+                    error=str(e),
+                ).dump()
 
     @tcp.receive()
     async def workflow_cancellation_query(

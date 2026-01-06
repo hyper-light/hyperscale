@@ -221,28 +221,40 @@ Three-signal health model for all node types.
 
 ### 4.1 AD-20: Cancellation Propagation
 
-- [ ] Add `JobCancelRequest` message type
-  - [ ] `job_id: str`
-  - [ ] `requester_id: str`
-  - [ ] `timestamp: float`
-  - [ ] `fence_token: int`
-- [ ] Add `JobCancelResponse` message type
-  - [ ] `job_id: str`
-  - [ ] `success: bool`
-  - [ ] `cancelled_workflow_count: int`
-  - [ ] `error: str | None`
-- [ ] Implement client `cancel_job(job_id) -> JobCancelResponse`
-- [ ] Implement gate `_handle_cancel_job()` handler
-  - [ ] Forward to appropriate manager(s)
-  - [ ] Aggregate responses from all DCs
-- [ ] Implement manager `_handle_cancel_job()` handler
-  - [ ] Cancel dispatched workflows on workers
-  - [ ] Update job state to CANCELLED
-- [ ] Implement worker workflow cancellation
-  - [ ] Cancel running workflow tasks
-  - [ ] Report cancellation to manager
-- [ ] Add idempotency handling (repeated cancel returns success)
-- [ ] Add integration tests for cancellation flow
+- [x] Add `JobCancelRequest` message type
+  - [x] `job_id: str`
+  - [x] `requester_id: str`
+  - [x] `timestamp: float`
+  - [x] `fence_token: int`
+- [x] Add `JobCancelResponse` message type
+  - [x] `job_id: str`
+  - [x] `success: bool`
+  - [x] `cancelled_workflow_count: int`
+  - [x] `error: str | None`
+- [x] Add `WorkflowCancelRequest` and `WorkflowCancelResponse` message types
+- [x] Implement client `cancel_job(job_id) -> JobCancelResponse`
+  - [x] Retry logic with exponential backoff
+  - [x] Leader redirect handling
+  - [x] Local job state update on cancellation
+- [x] Implement gate `_handle_cancel_job()` handler
+  - [x] Forward to appropriate manager(s) with retry logic
+  - [x] Aggregate responses from all DCs
+  - [x] Use exponential backoff for DC communication
+  - [x] Validate fence tokens
+- [x] Implement manager `_handle_cancel_job()` handler
+  - [x] Cancel dispatched workflows on workers
+  - [x] Update job state to CANCELLED
+  - [x] Send WorkflowCancelRequest to workers
+- [x] Implement worker workflow cancellation
+  - [x] Cancel running workflow tasks via cancel_workflow handler
+  - [x] Report cancellation to manager via WorkflowCancelResponse
+  - [x] Idempotency handling for already cancelled/completed workflows
+- [x] Add idempotency handling (repeated cancel returns success)
+- [x] Add integration tests for cancellation flow
+  - [x] Message serialization tests
+  - [x] Cancellation propagation scenarios
+  - [x] Fence token validation tests
+  - [x] Legacy message compatibility tests
 
 ### 4.2 AD-26: Adaptive Healthcheck Extensions
 
@@ -369,6 +381,12 @@ Extract classes from monolithic files into focused modules.
 
 ### Gate Per-Job Leadership
 
+- [ ] Gates accept client job requests (like client -> manager pattern)
+  - [ ] Client can submit jobs directly to gates
+  - [ ] Gates forward to appropriate DC manager(s)
+  - [ ] Gates aggregate results from DCs
+- [ ] Gates use retry logic with exponential backoff for DC communication
+- [ ] Gates use fencing tokens for all job operations
 - [ ] Verify and enhance failover logic for gate leadership transfer
 - [ ] Implement cross-DC correlation for eviction decisions
 - [ ] Add eviction backoff for repeated failures
