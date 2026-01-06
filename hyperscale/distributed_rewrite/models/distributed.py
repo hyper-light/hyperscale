@@ -170,10 +170,18 @@ class ManagerPeerRegistration(Message):
 
     When a manager discovers a new peer (via SWIM or seed list),
     it sends this registration to establish the bidirectional relationship.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of supported features
     """
     node: ManagerInfo            # Registering manager's info
     term: int                    # Current leadership term
     is_leader: bool              # Whether registering manager is leader
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""       # Comma-separated feature list
 
 
 @dataclass(slots=True, kw_only=True)
@@ -183,6 +191,10 @@ class ManagerPeerRegistrationResponse(Message):
 
     Contains list of all known peer managers so the registering
     manager can discover the full cluster topology.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of supported features
     """
     accepted: bool                          # Whether registration was accepted
     manager_id: str                         # Responding manager's node_id
@@ -190,6 +202,10 @@ class ManagerPeerRegistrationResponse(Message):
     term: int                               # Responding manager's term
     known_peers: list[ManagerInfo]          # All known peer managers (for discovery)
     error: str | None = None                # Error message if not accepted
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""                  # Comma-separated feature list
 
 
 @dataclass(slots=True, kw_only=True)
@@ -199,11 +215,19 @@ class RegistrationResponse(Message):
 
     Contains list of all known healthy managers so worker can
     establish redundant communication channels.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated negotiated features
     """
     accepted: bool                          # Whether registration was accepted
     manager_id: str                         # Responding manager's node_id
     healthy_managers: list[ManagerInfo]     # All known healthy managers (including self)
     error: str | None = None                # Error message if not accepted
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""                  # Comma-separated negotiated features
 
 
 @dataclass(slots=True, kw_only=True)
@@ -379,14 +403,22 @@ class JobProgressAck(Message):
 class WorkerRegistration(Message):
     """
     Worker registration message sent to managers.
-    
+
     Contains worker identity and capacity information.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of supported features
     """
     node: NodeInfo               # Worker identity
     total_cores: int             # Total CPU cores available
     available_cores: int         # Currently free cores
     memory_mb: int               # Total memory in MB
     available_memory_mb: int     # Currently free memory
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""       # Comma-separated feature list
 
 
 @dataclass(slots=True)

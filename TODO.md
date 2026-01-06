@@ -312,7 +312,11 @@ Three-signal health model for all node types.
   - [x] `node_version: str`
   - [x] `negotiate(other) -> set[str]`
 - [x] Implement `NegotiatedCapabilities` result class
-- [ ] Add version/capability fields to handshake messages
+- [x] Add version/capability fields to handshake messages
+  - [x] WorkerRegistration: protocol_version_major/minor, capabilities
+  - [x] ManagerPeerRegistration: protocol_version_major/minor, capabilities
+  - [x] ManagerPeerRegistrationResponse: protocol_version_major/minor, capabilities
+  - [x] RegistrationResponse: protocol_version_major/minor, capabilities
 - [ ] Update message serialization to ignore unknown fields
 - [ ] Add protocol version validation on connection
 - [ ] Add integration tests for version compatibility
