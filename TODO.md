@@ -275,9 +275,11 @@ Three-signal health model for all node types.
   - [x] `worker_id`, `reason`, `current_progress`, `estimated_completion`, `active_workflow_count`
 - [x] Add `HealthcheckExtensionResponse` message type
   - [x] `granted`, `extension_seconds`, `new_deadline`, `remaining_extensions`, `denial_reason`
-- [ ] Implement `WorkerHealthManager` class
-  - [ ] `handle_extension_request()` with tracker management
-  - [ ] `on_worker_healthy()` to reset tracker
+- [x] Implement `WorkerHealthManager` class
+  - [x] `handle_extension_request()` with tracker management
+  - [x] `on_worker_healthy()` to reset tracker
+  - [x] `on_worker_removed()` for cleanup
+  - [x] `should_evict_worker()` for eviction decisions
 - [ ] Integrate with manager's worker health tracking
 - [ ] Add integration tests for extension protocol
 

@@ -39,3 +39,7 @@ from hyperscale.distributed_rewrite.health.extension_tracker import (
     ExtensionTracker as ExtensionTracker,
     ExtensionTrackerConfig as ExtensionTrackerConfig,
 )
+from hyperscale.distributed_rewrite.health.worker_health_manager import (
+    WorkerHealthManager as WorkerHealthManager,
+    WorkerHealthManagerConfig as WorkerHealthManagerConfig,
+)
