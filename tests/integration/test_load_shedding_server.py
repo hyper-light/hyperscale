@@ -704,11 +704,11 @@ class TestLoadSheddingTrendDetection:
 
     @pytest.mark.asyncio
     async def test_rising_trend_triggers_overload(self) -> None:
-        """Test that rising trend can trigger overload even at lower absolute latency."""
+        """Test that rising latencies with drift can trigger overload."""
         config = OverloadConfig(
             delta_thresholds=(0.2, 0.5, 1.0),
             absolute_bounds=(100.0, 200.0, 400.0),
-            trend_threshold=0.05,  # Sensitive to rising trends
+            drift_threshold=0.05,  # Sensitive to baseline drift
             min_samples=3,
             ema_alpha=0.1,
             trend_window=10,
@@ -719,22 +719,22 @@ class TestLoadSheddingTrendDetection:
         for _ in range(5):
             await server.process_request("Heartbeat", simulated_latency_ms=50.0)
 
-        # Create rapidly rising trend
+        # Create rapidly rising pattern (causes baseline drift)
         for latency_increase in range(20):
             latency = 50.0 + (latency_increase * 5)  # 50 -> 145ms
             await server.process_request("Heartbeat", simulated_latency_ms=latency)
 
         diagnostics = server.get_diagnostics()
-        # Trend should be positive (rising)
-        assert diagnostics["trend"] > 0
+        # Baseline drift should be positive (fast baseline > slow baseline)
+        assert diagnostics["baseline_drift"] > 0
 
     @pytest.mark.asyncio
-    async def test_stable_high_latency_vs_rising_trend(self) -> None:
-        """Test difference between stable high latency and rising trend."""
+    async def test_stable_high_latency_vs_rising_drift(self) -> None:
+        """Test difference between stable high latency and rising trend with drift."""
         config = OverloadConfig(
             delta_thresholds=(0.2, 0.5, 1.0),
             absolute_bounds=(100.0, 200.0, 400.0),
-            trend_threshold=0.1,
+            drift_threshold=0.1,
             min_samples=3,
             ema_alpha=0.1,
         )

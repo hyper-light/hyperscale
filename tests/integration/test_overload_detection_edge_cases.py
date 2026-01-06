@@ -320,12 +320,12 @@ class TestResourceDetection:
 
 
 class TestTrendDetection:
-    """Tests for trend-based overload detection."""
+    """Tests for trend-based overload detection (now uses baseline drift)."""
 
     def test_rising_trend_triggers_overload(self):
-        """Strongly rising trend triggers OVERLOADED."""
+        """Strongly rising latencies with baseline drift trigger escalation."""
         config = OverloadConfig(
-            trend_threshold=0.05,  # Low threshold for testing
+            drift_threshold=0.05,  # Low threshold for testing
             trend_window=10,
             min_samples=3,
             current_window=5,

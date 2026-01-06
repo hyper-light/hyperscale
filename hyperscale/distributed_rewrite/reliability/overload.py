@@ -48,7 +48,8 @@ class OverloadConfig:
     """Configuration for hybrid overload detection."""
 
     # Delta detection parameters
-    ema_alpha: float = 0.1  # Smoothing factor for baseline (lower = more stable)
+    ema_alpha: float = 0.1  # Smoothing factor for fast baseline (lower = more stable)
+    slow_ema_alpha: float = 0.02  # Smoothing factor for stable baseline (for drift detection)
     current_window: int = 10  # Samples for current average
     trend_window: int = 20  # Samples for trend calculation
 
@@ -65,9 +66,10 @@ class OverloadConfig:
     cpu_thresholds: tuple[float, float, float] = (0.7, 0.85, 0.95)
     memory_thresholds: tuple[float, float, float] = (0.7, 0.85, 0.95)
 
-    # Trend threshold - positive slope indicates worsening
-    # Trend must be combined with elevated delta to trigger (not standalone)
-    trend_threshold: float = 0.1  # Rising trend amplifies delta state
+    # Baseline drift threshold - detects when fast baseline drifts above slow baseline
+    # This catches gradual degradation that delta alone misses because baseline adapts
+    # Drift = (fast_ema - slow_ema) / slow_ema
+    drift_threshold: float = 0.15  # 15% drift triggers escalation
 
     # Minimum samples before delta detection is active
     min_samples: int = 3
@@ -107,14 +109,17 @@ class HybridOverloadDetector:
     def __init__(self, config: OverloadConfig | None = None):
         self._config = config or OverloadConfig()
 
-        # Baseline tracking using Exponential Moving Average
-        self._baseline_ema: float = 0.0
+        # Dual baseline tracking using Exponential Moving Averages
+        # Fast EMA: responds quickly for delta detection
+        # Slow EMA: stable reference for drift detection
+        self._baseline_ema: float = 0.0  # Fast baseline
+        self._slow_baseline_ema: float = 0.0  # Slow/stable baseline
         self._initialized: bool = False
 
         # Recent samples for current average
         self._recent: deque[float] = deque(maxlen=self._config.current_window)
 
-        # Delta history for trend calculation
+        # Delta history for trend calculation (kept for backward compatibility)
         self._delta_history: deque[float] = deque(maxlen=self._config.trend_window)
 
         # Sample count
@@ -141,14 +146,20 @@ class HybridOverloadDetector:
         # Track recent samples first (used for current average)
         self._recent.append(latency_ms)
 
-        # Update baseline EMA using configured alpha
+        # Update dual baseline EMAs
         # (warmup only affects delta detection, not EMA calculation)
         if not self._initialized:
             self._baseline_ema = latency_ms
+            self._slow_baseline_ema = latency_ms
             self._initialized = True
         else:
+            # Fast baseline - responds quickly to changes
             alpha = self._config.ema_alpha
             self._baseline_ema = alpha * latency_ms + (1 - alpha) * self._baseline_ema
+
+            # Slow baseline - stable reference for drift detection
+            slow_alpha = self._config.slow_ema_alpha
+            self._slow_baseline_ema = slow_alpha * latency_ms + (1 - slow_alpha) * self._slow_baseline_ema
 
         # Calculate and track delta (% above baseline)
         # Only track delta after we have enough samples for a meaningful average
@@ -157,12 +168,27 @@ class HybridOverloadDetector:
             delta = (current_avg - self._baseline_ema) / self._baseline_ema
             self._delta_history.append(delta)
 
+    def _calculate_baseline_drift(self) -> float:
+        """
+        Calculate baseline drift: how much fast baseline has drifted above slow baseline.
+
+        Returns (fast_ema - slow_ema) / slow_ema as a ratio.
+        Positive values indicate the operating point is shifting upward (degradation).
+        Negative values indicate recovery.
+        """
+        if self._slow_baseline_ema <= 0:
+            return 0.0
+        return (self._baseline_ema - self._slow_baseline_ema) / self._slow_baseline_ema
+
     def _calculate_trend(self) -> float:
         """
         Calculate trend slope using linear regression on delta history.
 
         Returns positive slope if things are getting worse,
         negative if improving, near-zero if stable.
+
+        Note: This is kept for backward compatibility and diagnostics.
+        The primary trend detection now uses baseline drift.
         """
         if len(self._delta_history) < 3:
             return 0.0
@@ -187,6 +213,11 @@ class HybridOverloadDetector:
         Delta detection is only active after the warmup period to ensure
         baseline stability. During warmup, returns HEALTHY to let absolute
         bounds handle detection.
+
+        Uses dual-baseline drift detection: if the fast baseline has drifted
+        significantly above the slow baseline, this indicates gradual degradation
+        that delta alone would miss (because delta compares to the fast baseline
+        which adapts to rising values).
         """
         # During warmup, delta detection is not reliable - defer to absolute bounds
         if self._sample_count < self._config.warmup_samples:
@@ -200,7 +231,7 @@ class HybridOverloadDetector:
             return OverloadState.HEALTHY
 
         delta = (current_avg - self._baseline_ema) / self._baseline_ema
-        trend = self._calculate_trend()
+        baseline_drift = self._calculate_baseline_drift()
 
         thresholds = self._config.delta_thresholds
 
@@ -214,9 +245,11 @@ class HybridOverloadDetector:
         else:
             base_state = OverloadState.HEALTHY
 
-        # Rising trend can escalate state by one level (but not trigger from HEALTHY)
-        # This prevents trend-only overload triggering without actual elevated latency
-        if trend > self._config.trend_threshold and base_state != OverloadState.HEALTHY:
+        # Baseline drift escalation: if the fast baseline has drifted significantly
+        # above the slow baseline, escalate the state. This catches gradual degradation
+        # where delta stays moderate but the operating point keeps shifting upward.
+        # Only escalate if we're already in an elevated state (not from HEALTHY).
+        if baseline_drift > self._config.drift_threshold and base_state != OverloadState.HEALTHY:
             if base_state == OverloadState.BUSY:
                 return OverloadState.STRESSED
             elif base_state == OverloadState.STRESSED:
@@ -352,8 +385,18 @@ class HybridOverloadDetector:
 
     @property
     def baseline(self) -> float:
-        """Get current baseline EMA value."""
+        """Get current (fast) baseline EMA value."""
         return self._baseline_ema
+
+    @property
+    def slow_baseline(self) -> float:
+        """Get slow/stable baseline EMA value."""
+        return self._slow_baseline_ema
+
+    @property
+    def baseline_drift(self) -> float:
+        """Get baseline drift (fast - slow) / slow."""
+        return self._calculate_baseline_drift()
 
     @property
     def current_average(self) -> float:
@@ -364,7 +407,7 @@ class HybridOverloadDetector:
 
     @property
     def trend(self) -> float:
-        """Get current trend slope."""
+        """Get current trend slope (legacy, from delta history)."""
         return self._calculate_trend()
 
     @property
@@ -380,6 +423,7 @@ class HybridOverloadDetector:
     def reset(self) -> None:
         """Reset all state."""
         self._baseline_ema = 0.0
+        self._slow_baseline_ema = 0.0
         self._initialized = False
         self._recent.clear()
         self._delta_history.clear()
@@ -393,10 +437,12 @@ class HybridOverloadDetector:
         Get diagnostic information for debugging/monitoring.
 
         Returns dict with:
-        - baseline: Current EMA baseline
+        - baseline: Current (fast) EMA baseline
+        - slow_baseline: Slow/stable EMA baseline
+        - baseline_drift: How much fast baseline has drifted above slow
         - current_avg: Current window average
         - delta: Current % above baseline
-        - trend: Trend slope
+        - trend: Trend slope (legacy)
         - sample_count: Total samples
         - in_warmup: Whether still in warmup period
         - states: Individual state components
@@ -409,6 +455,8 @@ class HybridOverloadDetector:
 
         return {
             "baseline": self._baseline_ema,
+            "slow_baseline": self._slow_baseline_ema,
+            "baseline_drift": self._calculate_baseline_drift(),
             "current_avg": current_avg,
             "delta": delta,
             "trend": self._calculate_trend(),

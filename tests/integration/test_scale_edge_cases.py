@@ -2620,18 +2620,20 @@ class TestDetectorHysteresis:
         detector.record_latency(600.0)
         assert detector.get_state() == OverloadState.OVERLOADED
 
-        # Two samples toward HEALTHY
+        # Two samples toward HEALTHY - call get_state() each time to update hysteresis
         detector.record_latency(50.0)
+        detector.get_state()
         detector.record_latency(50.0)
-        assert detector.get_state() == OverloadState.OVERLOADED  # Not yet
+        assert detector.get_state() == OverloadState.OVERLOADED  # Not yet (count=2)
 
         # Interruption with STRESSED sample resets the pending count
         detector.record_latency(300.0)
         assert detector.get_state() == OverloadState.OVERLOADED
 
-        # Now need 3 consecutive STRESSED samples
+        # Now need 3 consecutive STRESSED samples - call get_state() each iteration
         for _ in range(3):
             detector.record_latency(300.0)
+            detector.get_state()
         assert detector.get_state() == OverloadState.STRESSED
 
     def test_hysteresis_disabled_with_one_sample(self):
@@ -2677,15 +2679,20 @@ class TestDetectorHysteresis:
         assert diag["pending_state_count"] == 1
 
 
-class TestDetectorTrendEscalation:
-    """Tests for trend-based state escalation."""
+class TestDetectorDriftEscalation:
+    """Tests for baseline drift-based state escalation.
 
-    def test_trend_does_not_trigger_from_healthy(self):
-        """Rising trend should not trigger overload from HEALTHY state."""
+    Baseline drift detection uses dual EMAs (fast and slow) to detect
+    gradual degradation. When the fast baseline drifts significantly
+    above the slow baseline, it indicates sustained worsening conditions.
+    """
+
+    def test_drift_does_not_trigger_from_healthy(self):
+        """Baseline drift should not trigger overload from HEALTHY state."""
         config = OverloadConfig(
             absolute_bounds=(1000.0, 2000.0, 5000.0),  # High bounds - won't trigger
             delta_thresholds=(0.5, 1.0, 2.0),  # Moderate thresholds
-            trend_threshold=0.01,  # Very sensitive trend detection
+            drift_threshold=0.01,  # Very sensitive drift detection
             warmup_samples=0,
             hysteresis_samples=1,
             min_samples=3,
@@ -2693,23 +2700,23 @@ class TestDetectorTrendEscalation:
         )
         detector = HybridOverloadDetector(config)
 
-        # Record increasing latencies to create a rising trend
+        # Record increasing latencies to create drift
         # but keep delta below BUSY threshold
         for i in range(10):
             detector.record_latency(50.0 + i * 2)  # 50, 52, 54, ...
 
-        # Even with rising trend, should not trigger from HEALTHY
+        # Even with baseline drift, should not trigger from HEALTHY
         # because base delta is still small
         state = detector.get_state()
         assert state in (OverloadState.HEALTHY, OverloadState.BUSY)
         assert state != OverloadState.OVERLOADED
 
-    def test_trend_escalates_from_busy_to_stressed(self):
-        """Rising trend should escalate BUSY to STRESSED."""
+    def test_drift_escalates_from_busy_to_stressed(self):
+        """Baseline drift should escalate BUSY to STRESSED."""
         config = OverloadConfig(
             absolute_bounds=(1000.0, 2000.0, 5000.0),  # High - won't trigger
             delta_thresholds=(0.2, 0.5, 1.0),
-            trend_threshold=0.05,
+            drift_threshold=0.10,  # 10% drift triggers escalation
             warmup_samples=0,
             hysteresis_samples=1,
             min_samples=3,
@@ -2721,20 +2728,21 @@ class TestDetectorTrendEscalation:
         for _ in range(10):
             detector.record_latency(100.0)
 
-        # Now create rising trend that puts delta in BUSY range (20-50% above)
+        # Create rising pattern that puts delta in BUSY range
+        # and causes baseline drift
         for i in range(10):
             detector.record_latency(130.0 + i * 5)  # Rising in BUSY range
 
-        # With rising trend, should escalate from BUSY to STRESSED
+        # With baseline drift, should escalate from BUSY to STRESSED
         state = detector.get_state()
         assert state in (OverloadState.BUSY, OverloadState.STRESSED)
 
-    def test_trend_escalates_from_stressed_to_overloaded(self):
-        """Rising trend should escalate STRESSED to OVERLOADED."""
+    def test_drift_escalates_from_stressed_to_overloaded(self):
+        """Baseline drift should escalate STRESSED to OVERLOADED."""
         config = OverloadConfig(
             absolute_bounds=(1000.0, 2000.0, 5000.0),  # High - won't trigger
             delta_thresholds=(0.2, 0.5, 1.0),
-            trend_threshold=0.05,
+            drift_threshold=0.15,  # 15% drift triggers escalation
             warmup_samples=0,
             hysteresis_samples=1,
             min_samples=3,
@@ -2746,11 +2754,12 @@ class TestDetectorTrendEscalation:
         for _ in range(10):
             detector.record_latency(100.0)
 
-        # Create rising trend that puts delta in STRESSED range (50-100% above)
+        # Create rising pattern that causes significant drift
+        # Delta will be in BUSY range, but drift should escalate to STRESSED
         for i in range(10):
-            detector.record_latency(160.0 + i * 10)  # Rising in STRESSED range
+            detector.record_latency(160.0 + i * 10)  # Rising pattern
 
-        # With rising trend, should escalate from STRESSED to OVERLOADED
+        # With baseline drift > 15%, should escalate
         state = detector.get_state()
         assert state in (OverloadState.STRESSED, OverloadState.OVERLOADED)
 

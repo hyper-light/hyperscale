@@ -42,8 +42,8 @@ class TestOverloadConfig:
         assert config.cpu_thresholds == (0.7, 0.85, 0.95)
         assert config.memory_thresholds == (0.7, 0.85, 0.95)
 
-        # Trend threshold
-        assert config.trend_threshold == 0.1
+        # Drift threshold (for dual-baseline drift detection)
+        assert config.drift_threshold == 0.15
 
         # Minimum samples
         assert config.min_samples == 3
