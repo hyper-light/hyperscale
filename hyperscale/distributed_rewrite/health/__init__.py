@@ -35,3 +35,7 @@ from hyperscale.distributed_rewrite.health.tracker import (
     NodeHealthTracker as NodeHealthTracker,
     NodeHealthTrackerConfig as NodeHealthTrackerConfig,
 )
+from hyperscale.distributed_rewrite.health.extension_tracker import (
+    ExtensionTracker as ExtensionTracker,
+    ExtensionTrackerConfig as ExtensionTrackerConfig,
+)

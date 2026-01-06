@@ -258,19 +258,19 @@ Three-signal health model for all node types.
 
 ### 4.2 AD-26: Adaptive Healthcheck Extensions
 
-- [ ] Implement `ExtensionTracker` dataclass
-  - [ ] `worker_id: str`
-  - [ ] `base_deadline: float = 30.0`
-  - [ ] `min_grant: float = 1.0`
-  - [ ] `max_extensions: int = 5`
-  - [ ] `extension_count: int = 0`
-  - [ ] `last_progress: float = 0.0`
-  - [ ] `total_extended: float = 0.0`
-- [ ] Implement `request_extension(reason, current_progress) -> tuple[bool, float]`
-  - [ ] Logarithmic grant: `max(min_grant, base / 2^extension_count)`
-  - [ ] Deny if no progress since last extension
-  - [ ] Deny if max_extensions exceeded
-- [ ] Implement `reset()` for tracker cleanup
+- [x] Implement `ExtensionTracker` dataclass
+  - [x] `worker_id: str`
+  - [x] `base_deadline: float = 30.0`
+  - [x] `min_grant: float = 1.0`
+  - [x] `max_extensions: int = 5`
+  - [x] `extension_count: int = 0`
+  - [x] `last_progress: float = 0.0`
+  - [x] `total_extended: float = 0.0`
+- [x] Implement `request_extension(reason, current_progress) -> tuple[bool, float]`
+  - [x] Logarithmic grant: `max(min_grant, base / 2^extension_count)`
+  - [x] Deny if no progress since last extension
+  - [x] Deny if max_extensions exceeded
+- [x] Implement `reset()` for tracker cleanup
 - [ ] Add `HealthcheckExtensionRequest` message type
   - [ ] `worker_id`, `reason`, `current_progress`, `estimated_completion`, `active_workflow_count`
 - [ ] Add `HealthcheckExtensionResponse` message type
