@@ -325,6 +325,8 @@ class RemoteGraphManager:
                     for workflow_name, _, _ in group
                 ]
 
+                print(batch_workflows)
+
                 workflow_names = ", ".join(batch_workflows)
 
                 await ctx.log(
@@ -337,13 +339,9 @@ class RemoteGraphManager:
                     )
                 )
 
-                self._updates.update_active_workflows(
-                    [
-                        workflow_name.lower()
-                        for group in provisioned_batch
-                        for workflow_name, _, _ in group
-                    ]
-                )
+                self._updates.update_active_workflows([
+                    workflow_name.lower() for workflow_name in batch_workflows
+                ])
 
                 results = await asyncio.gather(
                     *[
@@ -357,6 +355,7 @@ class RemoteGraphManager:
                         for workflow_name, _, threads in group
                     ]
                 )
+
 
                 await ctx.log(
                     GraphDebug(
@@ -1180,13 +1179,7 @@ class RemoteGraphManager:
                     "workflow_name": workflow_name,
                     "priority": config.get("priority", StagePriority.AUTO),
                     "is_test": test_workflows[workflow_name],
-                    "threads": config.get(
-                        "threads",
-                    )
-                    if config.get("threads")
-                    else threads
-                    if test_workflows[workflow_name]
-                    else 1,
+                    "vus": config.get("vus", 1000),
                 }
                 for workflow_name, config in configs.items()
             ]

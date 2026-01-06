@@ -120,269 +120,172 @@ class Provisioner:
                     "workflow_name",
                     "priority",
                     "is_test",
-                    "threads",
+                    "vus",
                 ],
                 str | int | StagePriority,
             ]
         ],
     ) -> List[List[Tuple[str, StagePriority, int]]]:
-        # How many batches do we have? For example -> 5 stages over 4
-        # CPUs means 2 batches. The first batch will assign one stage to
-        # each core. The second will assign all four cores to the remaing
-        # one stage.
+        """
+        Allocate cores to workflows based on priority and VUs.
 
-        batches: List[List[Tuple[str, StagePriority, int]]] = []
-        seen: List[Any] = []
+        Allocation strategy (matches WorkflowDispatcher._calculate_allocations):
+        1. Non-test workflows get 0 cores (bypass partition)
+        2. EXCLUSIVE workflows get ALL cores, blocking others
+        3. Explicit priority workflows (HIGH/NORMAL/LOW) allocated proportionally by VUs
+        4. AUTO priority workflows split remaining cores equally (minimum 1 each)
 
-        sorted_priority_configs = list(
-            sorted(
-                configs,
-                key=lambda config: config.get(
-                    "priority",
-                    StagePriority.AUTO,
-                ).value
-                if config.get("is_test", False)
-                else 0,
-                reverse=True,
-            )
-        )
+        Returns list containing a single batch with all allocations.
+        """
+        if not configs:
+            return []
 
-        bypass_partition_batch: List[Tuple[str, StagePriority, int]] = []
-        for config in sorted_priority_configs:
-            if config.get("is_test", False) is False:
-                bypass_partition_batch.append(
-                    (
+        total_cores = self.max_workers
+        allocations: List[Tuple[str, StagePriority, int]] = []
+
+        # Separate non-test workflows (they bypass partitioning with 0 cores)
+        non_test_workflows: List[Tuple[str, StagePriority, int]] = []
+        test_workflows: List[Dict[str, Any]] = []
+
+        for config in configs:
+            workflow_name = config.get("workflow_name")
+            priority = config.get("priority", StagePriority.AUTO)
+
+            if not config.get("is_test", False):
+                non_test_workflows.append((workflow_name, priority, 0))
+            else:
+                test_workflows.append(config)
+
+        # Add non-test workflows to allocations (0 cores each)
+        allocations.extend(non_test_workflows)
+
+        if not test_workflows:
+            return [allocations] if allocations else []
+
+        # Check for EXCLUSIVE workflows first - they get all cores
+        exclusive_workflows = [
+            config for config in test_workflows
+            if config.get("priority", StagePriority.AUTO) == StagePriority.EXCLUSIVE
+        ]
+
+        if exclusive_workflows:
+            # First EXCLUSIVE workflow gets all cores, others get 0
+            first_exclusive = exclusive_workflows[0]
+            allocations.append((
+                first_exclusive.get("workflow_name"),
+                StagePriority.EXCLUSIVE,
+                total_cores,
+            ))
+
+            # Remaining exclusive workflows get 0 (will wait)
+            for config in exclusive_workflows[1:]:
+                allocations.append((
+                    config.get("workflow_name"),
+                    StagePriority.EXCLUSIVE,
+                    0,
+                ))
+
+            # Non-exclusive test workflows also get 0 while exclusive runs
+            for config in test_workflows:
+                if config not in exclusive_workflows:
+                    allocations.append((
                         config.get("workflow_name"),
-                        config.get(
-                            "priority",
-                            StagePriority.AUTO,
-                        ),
+                        config.get("priority", StagePriority.AUTO),
                         0,
-                    )
-                )
+                    ))
 
-                seen.append(config.get("workflow_name"))
+            return [allocations]
 
-        if len(bypass_partition_batch) > 0:
-            batches.append(bypass_partition_batch)
+        # Separate explicit priority from AUTO workflows
+        explicit_priority_workflows = [
+            config for config in test_workflows
+            if config.get("priority", StagePriority.AUTO) != StagePriority.AUTO
+        ]
+        auto_workflows = [
+            config for config in test_workflows
+            if config.get("priority", StagePriority.AUTO) == StagePriority.AUTO
+        ]
 
-        workflow_configs: Dict[
-            str,
-            Dict[str, int],
-        ] = {config.get("workflow_name"): config for config in sorted_priority_configs}
+        remaining_cores = total_cores
 
-        parallel_workflows_count = len(
-            [config for config in workflow_configs.values() if config.get("is_test")]
-        )
-
-        stages_count = len(workflow_configs)
-
-        auto_workflows_count = len(
-            [
-                config
-                for config in workflow_configs.values()
-                if config.get("priority", StagePriority.AUTO) == StagePriority.AUTO
-            ]
-        )
-
-        min_workers_counts: Dict[str, int] = {}
-        max_workers_counts: Dict[str, int] = {}
-
-        for config in sorted_priority_configs:
-            if config.get("is_test", False):
-                worker_allocation_range: Tuple[int, int] = (
-                    StagePriority.get_worker_allocation_range(
-                        config.get(
-                            "priority",
-                            StagePriority.AUTO,
-                        ),
-                        self.max_workers,
-                    )
-                )
-
-                minimum_workers, maximum_workers = worker_allocation_range
-
-                workflow_name = config.get("workflow_name")
-                min_workers_counts[workflow_name] = minimum_workers
-                max_workers_counts[workflow_name] = maximum_workers
-
-        if parallel_workflows_count == 1:
-            parallel_workflows = [
-                config
-                for config in sorted_priority_configs
-                if config.get("is_test", False)
-            ]
-
-            workflow = parallel_workflows.pop()
-
-            workflow_group = [
-                (
-                    workflow.get("workflow_name"),
-                    workflow.get("priority", StagePriority.AUTO),
-                    workflow.get("threads", self.max_workers),
-                )
-            ]
-
-            return [workflow_group]
-
-        elif auto_workflows_count == stages_count and parallel_workflows_count > 0:
-            # All workflows are auto priority so evently bin the threads between
-            # workflows.
-            parallel_auto_workflows = len(
-                [
-                    config
-                    for config in workflow_configs.values()
-                    if config.get(
-                        "priority",
-                        StagePriority.AUTO,
-                    )
-                    == StagePriority.AUTO
-                    and config.get(
-                        "is_test",
-                        False,
-                    )
-                ]
-            )
-            threads_count = max(
-                math.floor(self.max_workers / parallel_auto_workflows), 1
+        # Step 1: Allocate explicit priority workflows (proportionally by VUs)
+        if explicit_priority_workflows:
+            # Sort by priority (higher value = higher priority) then by VUs (higher first)
+            explicit_priority_workflows = sorted(
+                explicit_priority_workflows,
+                key=lambda config: (
+                    -config.get("priority", StagePriority.AUTO).value,
+                    -config.get("vus", 1000),
+                ),
             )
 
-            remainder = self.max_workers % parallel_auto_workflows
+            # Calculate total VUs for proportional allocation
+            total_vus = sum(config.get("vus", 1000) for config in explicit_priority_workflows)
+            if total_vus == 0:
+                total_vus = len(explicit_priority_workflows)
 
-            threads_counts = [threads_count for _ in range(parallel_auto_workflows)]
+            for index, config in enumerate(explicit_priority_workflows):
+                if remaining_cores <= 0:
+                    # No more cores - remaining workflows get 0
+                    allocations.append((
+                        config.get("workflow_name"),
+                        config.get("priority", StagePriority.AUTO),
+                        0,
+                    ))
+                    continue
 
-            for idx in range(remainder):
-                threads_counts[idx] += 1
+                workflow_vus = config.get("vus", 1000)
 
-            workflows_group = [
-                (
+                # Last explicit workflow gets remaining if no AUTO workflows
+                if index == len(explicit_priority_workflows) - 1 and not auto_workflows:
+                    cores = remaining_cores
+                else:
+                    # Proportional allocation by VUs
+                    share = workflow_vus / total_vus if total_vus > 0 else 1 / len(explicit_priority_workflows)
+                    cores = max(1, int(total_cores * share))
+                    cores = min(cores, remaining_cores)
+
+                allocations.append((
                     config.get("workflow_name"),
                     config.get("priority", StagePriority.AUTO),
-                    threads,
-                )
-                for threads, config in zip(
-                    threads_counts,
-                    sorted_priority_configs,
-                )
-            ]
+                    cores,
+                ))
+                remaining_cores -= cores
 
-            return [workflows_group]
+        # Step 2: Split remaining cores equally among AUTO workflows (min 1 each)
+        if auto_workflows and remaining_cores > 0:
+            # Only allocate as many workflows as we have cores for
+            num_auto_to_allocate = min(len(auto_workflows), remaining_cores)
+            cores_per_auto = remaining_cores // num_auto_to_allocate
+            leftover = remaining_cores - (cores_per_auto * num_auto_to_allocate)
 
-        else:
-            for config in sorted_priority_configs:
-                if config.get("workflow_name") not in seen:
-                    # So for example 8 - 4 = 4 we need another stage with 4
-                    batch_workers_allocated: int = max_workers_counts.get(
+            for index, config in enumerate(auto_workflows):
+                if index >= num_auto_to_allocate:
+                    # No more cores - remaining AUTO workflows get 0
+                    allocations.append((
                         config.get("workflow_name"),
+                        StagePriority.AUTO,
                         0,
-                    )
+                    ))
+                    continue
 
-                    workflow_group: List[
-                        Tuple[
-                            str,
-                            StagePriority,
-                            int,
-                        ]
-                    ] = [
-                        (
-                            config.get("workflow_name"),
-                            config.get("priority", StagePriority.AUTO),
-                            batch_workers_allocated,
-                        )
-                    ]
+                # Give one extra core to first workflows if there's leftover
+                cores = cores_per_auto + (1 if index < leftover else 0)
 
-                    for other_config in sorted_priority_configs:
-                        if (
-                            other_config != config
-                            and other_config.get("workflow_name") not in seen
-                        ):
-                            workflow_name = config.get("workflow_name")
-                            workers_allocated: int = max_workers_counts.get(
-                                workflow_name, 0
-                            )
+                allocations.append((
+                    config.get("workflow_name"),
+                    StagePriority.AUTO,
+                    cores,
+                ))
+                remaining_cores -= cores
 
-                            other_workflow_name = other_config.get("workflow_name")
-                            min_workers = min_workers_counts.get(other_workflow_name)
+        elif auto_workflows:
+            # No remaining cores - all AUTO workflows get 0
+            for config in auto_workflows:
+                allocations.append((
+                    config.get("workflow_name"),
+                    StagePriority.AUTO,
+                    0,
+                ))
 
-                            current_allocation = (
-                                batch_workers_allocated + workers_allocated
-                            )
-
-                            while (
-                                current_allocation > self.max_workers
-                                and workers_allocated >= min_workers
-                            ):
-                                workers_allocated -= 1
-                                current_allocation = (
-                                    batch_workers_allocated + workers_allocated
-                                )
-
-                            if (
-                                current_allocation <= self.max_workers
-                                and workers_allocated > 0
-                            ):
-                                batch_workers_allocated += workers_allocated
-                                workflow_group.append(
-                                    (
-                                        other_config.get("workflow_name"),
-                                        other_config.get(
-                                            "priority", StagePriority.AUTO
-                                        ),
-                                        workers_allocated,
-                                    )
-                                )
-
-                                seen.append(other_config.get("workflow_name"))
-
-                    batches.append(workflow_group)
-                    seen.append(config.get("workflow_name"))
-
-            if parallel_workflows_count <= self.max_workers:
-                for workflow_group in batches:
-                    total_workers = sum([workers for _, _, workers in workflow_group])
-                    group_size = len(workflow_group)
-
-                    completed: List[str] = []
-
-                    while (
-                        total_workers < self.max_workers and len(completed) < group_size
-                    ):
-                        priority_sorted = list(
-                            sorted(
-                                workflow_group,
-                                key=lambda workers_config: workers_config[1].value,
-                                reverse=True,
-                            )
-                        )
-
-                        remaining = sum([count for _, _, count in priority_sorted])
-
-                        for idx, group in enumerate(priority_sorted):
-                            name, priority, count = group
-
-                            worker_max = max_workers_counts.get(name, 0)
-
-                            max_increase = worker_max - remaining
-
-                            if max_increase > 0:
-                                while max_increase > 0:
-                                    count += 1
-                                    total_workers += 1
-                                    max_increase -= 1
-
-                                completed.append(name)
-
-                            elif count < worker_max:
-                                count += 1
-                                total_workers += 1
-
-                            else:
-                                completed.append(name)
-
-                            workflow_group[idx] = (
-                                name,
-                                priority,
-                                count,
-                            )
-
-        return batches
+        return [allocations]

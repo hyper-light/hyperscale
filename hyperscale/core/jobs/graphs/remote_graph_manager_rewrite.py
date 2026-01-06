@@ -1402,13 +1402,7 @@ class RemoteGraphManager:
                     "workflow_name": workflow_name,
                     "priority": config.get("priority", StagePriority.AUTO),
                     "is_test": test_workflows[workflow_name],
-                    "threads": config.get(
-                        "threads",
-                    )
-                    if config.get("threads")
-                    else threads
-                    if test_workflows[workflow_name]
-                    else 1,
+                    "vus": config.get("vus", 1000),
                 }
                 for workflow_name, config in configs.items()
             ]
