@@ -96,6 +96,8 @@ from hyperscale.distributed_rewrite.models import (
     JobCancelResponse,
     WorkflowCancelRequest,
     WorkflowCancelResponse,
+    HealthcheckExtensionRequest,
+    HealthcheckExtensionResponse,
     WorkflowCancellationQuery,
     WorkflowCancellationResponse,
     WorkerDiscoveryBroadcast,
@@ -127,6 +129,10 @@ from hyperscale.distributed_rewrite.reliability import (
     HybridOverloadDetector,
     LoadShedder,
     ServerRateLimiter,
+)
+from hyperscale.distributed_rewrite.health import (
+    WorkerHealthManager,
+    WorkerHealthManagerConfig,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 from hyperscale.reporting.results import Results
@@ -394,6 +400,21 @@ class ManagerServer(HealthAwareServer):
         self._rate_limiter = ServerRateLimiter(
             inactive_cleanup_seconds=300.0,  # Cleanup after 5 minutes
         )
+
+        # Worker health extension manager (AD-26)
+        # Tracks deadline extensions for workers that need more time
+        self._worker_health_manager = WorkerHealthManager(
+            WorkerHealthManagerConfig(
+                base_deadline=30.0,
+                min_grant=1.0,
+                max_extensions=5,
+                eviction_threshold=3,
+            )
+        )
+
+        # Worker deadlines for extension tracking
+        # Maps worker_id -> deadline timestamp
+        self._worker_deadlines: dict[str, float] = {}
 
         # WorkflowDispatcher for dependency-aware workflow dispatch
         # Coordinates with JobManager and WorkerPool for allocation
@@ -6734,6 +6755,133 @@ class ManagerServer(HealthAwareServer):
                 error=str(e),
             )
             return response.dump()
+
+    # =========================================================================
+    # TCP Handlers - Adaptive Healthcheck Extensions (AD-26)
+    # =========================================================================
+
+    @tcp.receive()
+    async def request_extension(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle deadline extension request from worker (AD-26).
+
+        Workers can request deadline extensions when:
+        - Executing long-running workflows
+        - System is under heavy load but making progress
+        - Approaching timeout but not stuck
+
+        Extensions use logarithmic decay and require progress to be granted.
+        """
+        try:
+            request = HealthcheckExtensionRequest.load(data)
+
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit(client_id, "extension")
+            if not allowed:
+                return HealthcheckExtensionResponse(
+                    granted=False,
+                    extension_seconds=0.0,
+                    new_deadline=0.0,
+                    remaining_extensions=0,
+                    denial_reason=f"Rate limited, retry after {retry_after:.1f}s",
+                ).dump()
+
+            # Check if worker is registered
+            worker = self._worker_pool.get_worker(request.worker_id)
+            if not worker:
+                return HealthcheckExtensionResponse(
+                    granted=False,
+                    extension_seconds=0.0,
+                    new_deadline=0.0,
+                    remaining_extensions=0,
+                    denial_reason="Worker not registered",
+                ).dump()
+
+            # Get current deadline (or set default)
+            current_deadline = self._worker_deadlines.get(
+                request.worker_id,
+                time.monotonic() + 30.0,  # Default 30s deadline
+            )
+
+            # Handle extension request
+            response = self._worker_health_manager.handle_extension_request(
+                request=request,
+                current_deadline=current_deadline,
+            )
+
+            # Update stored deadline if granted
+            if response.granted:
+                self._worker_deadlines[request.worker_id] = response.new_deadline
+
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Granted {response.extension_seconds:.1f}s extension to worker {request.worker_id} (reason: {request.reason})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            else:
+                await self._udp_logger.log(
+                    ServerWarning(
+                        message=f"Denied extension to worker {request.worker_id}: {response.denial_reason}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+                # Check if worker should be evicted
+                should_evict, eviction_reason = self._worker_health_manager.should_evict_worker(
+                    request.worker_id
+                )
+                if should_evict:
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Worker {request.worker_id} should be evicted: {eviction_reason}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    # Note: Actual eviction is handled by SWIM protocol
+
+            return response.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "request_extension")
+            return HealthcheckExtensionResponse(
+                granted=False,
+                extension_seconds=0.0,
+                new_deadline=0.0,
+                remaining_extensions=0,
+                denial_reason=str(e),
+            ).dump()
+
+    def _on_worker_healthy(self, worker_id: str) -> None:
+        """
+        Called when a worker becomes healthy (AD-26).
+
+        Resets the extension tracker for the worker.
+        """
+        self._worker_health_manager.on_worker_healthy(worker_id)
+        # Remove from deadline tracking
+        self._worker_deadlines.pop(worker_id, None)
+
+    def _on_worker_removed(self, worker_id: str) -> None:
+        """
+        Called when a worker is removed from the pool (AD-26).
+
+        Cleans up extension tracking state.
+        """
+        self._worker_health_manager.on_worker_removed(worker_id)
+        self._worker_deadlines.pop(worker_id, None)
 
     # =========================================================================
     # TCP Handlers - Job Leadership

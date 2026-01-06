@@ -280,7 +280,11 @@ Three-signal health model for all node types.
   - [x] `on_worker_healthy()` to reset tracker
   - [x] `on_worker_removed()` for cleanup
   - [x] `should_evict_worker()` for eviction decisions
-- [ ] Integrate with manager's worker health tracking
+- [x] Integrate with manager's worker health tracking
+  - [x] Add WorkerHealthManager to manager initialization
+  - [x] Add request_extension TCP handler
+  - [x] Add _on_worker_healthy and _on_worker_removed callbacks
+  - [x] Track worker deadlines for extension management
 - [ ] Add integration tests for extension protocol
 
 ### 4.3 AD-25: Version Skew Handling
