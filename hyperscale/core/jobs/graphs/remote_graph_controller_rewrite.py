@@ -341,13 +341,22 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         context: Context,
         threads: int,
         workflow_vus: List[int],
+        node_ids: List[int] | None = None,
     ):
         """
-        Submit a workflow to workers.
+        Submit a workflow to workers with explicit node targeting.
 
         Unlike the old version, this does NOT take update callbacks.
         Status updates are pushed to the WorkflowCompletionState queue
         and completion is signaled via the completion_event.
+
+        Args:
+            run_id: The run identifier
+            workflow: The workflow to submit
+            context: The context for the workflow
+            threads: Number of workers to submit to
+            workflow_vus: VUs per worker
+            node_ids: Explicit list of node IDs to target (if None, uses round-robin)
         """
         task_id = self.id_generator.generate()
         default_config = {
@@ -387,7 +396,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             name=f"workflow_run_{run_id}",
         ) as ctx:
             await ctx.log_prepared(
-                message=f"Submitting run {run_id} for workflow {workflow.name} with {threads} threads and {workflow.vus} VUs for {workflow.duration}",
+                message=f"Submitting run {run_id} for workflow {workflow.name} with {threads} threads to nodes {node_ids} and {workflow.vus} VUs for {workflow.duration}",
                 name="info",
             )
 
@@ -399,17 +408,38 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 run_id=task_id,
             )
 
-            return await asyncio.gather(
-                *[
-                    self.submit(
-                        run_id,
-                        workflow,
-                        workflow_vus[idx],
-                        context,
-                    )
-                    for idx in range(threads)
-                ]
-            )
+            # If explicit node_ids provided, target specific nodes
+            # Otherwise fall back to round-robin (for backward compatibility)
+            if node_ids is not None and len(node_ids) == threads:
+                return await asyncio.gather(
+                    *[
+                        self.submit(
+                            run_id,
+                            workflow,
+                            workflow_vus[idx],
+                            node_ids[idx],
+                            context,
+                        )
+                        for idx in range(threads)
+                    ]
+                )
+            else:
+                # Fallback: use all available nodes via round-robin (legacy behavior)
+                # This should rarely happen with the new per-node tracking
+                print(f"[DEBUG] {workflow.name} run {run_id}: WARNING - using round-robin submission (node_ids={node_ids}, threads={threads})")
+                all_nodes = self._nodes.items()
+                return await asyncio.gather(
+                    *[
+                        self.submit(
+                            run_id,
+                            workflow,
+                            workflow_vus[idx],
+                            all_nodes[idx % len(all_nodes)] if all_nodes else None,
+                            context,
+                        )
+                        for idx in range(threads)
+                    ]
+                )
 
     async def submit_workflow_cancellation(
         self,
@@ -592,13 +622,14 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         run_id: int,
         workflow: Workflow,
         vus: int,
+        target_node_id: int | None,
         context: Context,
     ) -> Response[JobContext[WorkflowStatusUpdate]]:
         async with self._logger.context(
             name=f"workflow_run_{run_id}",
         ) as ctx:
             await ctx.log_prepared(
-                message=f"Workflow {workflow.name} run {run_id} submitting from node {self._node_id_base} at {self.host}:{self.port} to worker",
+                message=f"Workflow {workflow.name} run {run_id} submitting from node {self._node_id_base} at {self.host}:{self.port} to node {target_node_id}",
                 name="debug",
             )
 
@@ -612,6 +643,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     ),
                     run_id=run_id,
                 ),
+                node_id=target_node_id,
             )
 
             (shard_id, workflow_status) = response
@@ -789,9 +821,12 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             # Check if all workers have completed and signal the completion event
             completion_state = self._workflow_completion_states.get(run_id, {}).get(workflow_name)
+            completions_set = self._completions[run_id][workflow_name]
+            print(f"[DEBUG] {workflow_name} run {run_id}: node {node_id} added to completions set (size now: {len(completions_set)}, has_state={completion_state is not None})")
             if completion_state:
-                completions_count = len(self._completions[run_id][workflow_name])
+                completions_count = len(completions_set)
                 completion_state.workers_completed = completions_count
+                print(f"[DEBUG] {workflow_name} run {run_id}: checking {completions_count}/{completion_state.expected_workers} (event_already_set={completion_state.completion_event.is_set()})")
 
                 # Push cores update to the queue
                 try:
@@ -803,6 +838,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     pass
 
                 if completions_count >= completion_state.expected_workers:
+                    print(f"[DEBUG] {workflow_name} run {run_id}: all {completions_count} workers completed - signaling completion")
                     completion_state.completion_event.set()
 
             if self._leader_lock.locked():

@@ -6,6 +6,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Set,
     Tuple,
 )
 
@@ -25,6 +26,11 @@ class Provisioner:
 
         self.batch_by_stages = False
 
+        # Per-node tracking: node_id -> is_available
+        self._available_nodes: Set[int] = set()
+        self._all_nodes: List[int] = []
+        self._node_lock: asyncio.Lock | None = None
+
     def setup(self, max_workers: int | None = None):
         if max_workers is None:
             max_workers = self._cpu_cores
@@ -33,6 +39,55 @@ class Provisioner:
 
         self.loop = asyncio.get_event_loop()
         self.sem = BatchedSemaphore(self.max_workers)
+
+        if self._node_lock is None:
+            self._node_lock = asyncio.Lock()
+
+    def register_nodes(self, node_ids: List[int]) -> None:
+        """
+        Register nodes as available workers.
+
+        Called when workers connect to track which specific nodes are available.
+        """
+        self._all_nodes = list(node_ids)
+        self._available_nodes = set(node_ids)
+
+    def get_available_node_count(self) -> int:
+        """Return the count of currently available nodes."""
+        return len(self._available_nodes)
+
+    def get_available_nodes(self, count: int) -> List[int]:
+        """
+        Get up to `count` available nodes for allocation.
+
+        Returns a list of node IDs that can be used. Does NOT mark them
+        as unavailable - call allocate_nodes() to actually reserve them.
+        """
+        available_list = list(self._available_nodes)
+        return available_list[:count]
+
+    def allocate_nodes(self, node_ids: List[int]) -> List[int]:
+        """
+        Mark specific nodes as allocated (in use).
+
+        Returns the list of nodes that were successfully allocated.
+        Nodes already in use are skipped.
+        """
+        allocated = []
+        for node_id in node_ids:
+            if node_id in self._available_nodes:
+                self._available_nodes.discard(node_id)
+                allocated.append(node_id)
+
+        return allocated
+
+    def release_nodes(self, node_ids: List[int]) -> None:
+        """
+        Mark nodes as available again after workflow completion.
+        """
+        for node_id in node_ids:
+            if node_id in self._all_nodes:
+                self._available_nodes.add(node_id)
 
     def availalble(self):
         return self.sem._value

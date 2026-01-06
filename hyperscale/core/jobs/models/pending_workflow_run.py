@@ -23,6 +23,8 @@ class PendingWorkflowRun:
     # Allocated at dispatch time (not upfront)
     allocated_cores: int = 0
     allocated_vus: List[int] = field(default_factory=list)
+    # Specific node IDs allocated for this workflow
+    allocated_node_ids: List[int] = field(default_factory=list)
 
     def is_ready(self) -> bool:
         """Check if all dependencies are satisfied and not yet dispatched."""
