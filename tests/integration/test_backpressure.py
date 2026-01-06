@@ -413,7 +413,9 @@ class TestRingBufferBehavior:
 
     def test_ring_buffer_overflow(self) -> None:
         """Test that old entries are evicted when buffer is full."""
-        config = StatsBufferConfig(hot_max_entries=5)
+        # Set reject_threshold to 2.0 (200%) to disable backpressure rejection
+        # so we can test the pure ring buffer eviction behavior
+        config = StatsBufferConfig(hot_max_entries=5, reject_threshold=2.0)
         buffer = StatsBuffer(config=config)
 
         # Record more than capacity
