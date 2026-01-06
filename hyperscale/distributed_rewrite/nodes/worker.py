@@ -141,6 +141,9 @@ class WorkerServer(HealthAwareServer):
         self._healthy_manager_ids: set[str] = set()
         # Primary manager for leader operations (set during registration)
         self._primary_manager_id: str | None = None
+        # Track when managers were marked unhealthy for reaping
+        self._manager_unhealthy_since: dict[str, float] = {}  # manager_id -> time.monotonic() when marked unhealthy
+        self._dead_manager_reap_interval: float = env.WORKER_DEAD_MANAGER_REAP_INTERVAL
 
         # Per-manager circuit breakers for communication failures
         # Each manager has its own circuit breaker so failures to one manager
@@ -153,6 +156,7 @@ class WorkerServer(HealthAwareServer):
         self._workflow_tokens: dict[str, str] = {}  # workflow_id -> TaskRunner token
         self._workflow_cancel_events: dict[str, asyncio.Event] = {}
         self._workflow_last_progress: dict[str, float] = {}  # workflow_id -> last update time
+        self._workflow_id_to_name: dict[str, str] = {}  # workflow_id -> workflow_name for cancellation
 
         # Fence token tracking for at-most-once dispatch
         # Tracks highest fence token seen per workflow_id to reject stale/duplicate dispatches
@@ -175,6 +179,9 @@ class WorkerServer(HealthAwareServer):
         self._progress_buffer_lock = asyncio.Lock()
         self._progress_flush_interval: float = env.WORKER_PROGRESS_FLUSH_INTERVAL
         self._progress_flush_task: asyncio.Task | None = None
+
+        # Dead manager reap loop task
+        self._dead_manager_reap_task: asyncio.Task | None = None
         
         # State versioning (Lamport clock extension)
         self._state_version = 0
@@ -407,6 +414,7 @@ class WorkerServer(HealthAwareServer):
             (self._host, self._local_udp_port),  # Must match remote_manger.start() port!
             worker_ips,
             self._local_env,
+            enable_server_cleanup=True,
         )
 
         # Add timeout wrapper since poll_for_start has no internal timeout
@@ -473,6 +481,9 @@ class WorkerServer(HealthAwareServer):
         # Start buffered progress flush loop
         self._progress_flush_task = asyncio.create_task(self._progress_flush_loop())
 
+        # Start dead manager reap loop
+        self._dead_manager_reap_task = asyncio.create_task(self._dead_manager_reap_loop())
+
         manager_count = len(self._known_managers)
         await self._udp_logger.log(
             ServerInfo(
@@ -486,13 +497,19 @@ class WorkerServer(HealthAwareServer):
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
         Called when a node is marked as DEAD via SWIM.
-        
-        Marks the manager as unhealthy in our tracking.
+
+        Marks the manager as unhealthy in our tracking and records the time
+        for eventual reaping after the configured interval.
         """
         # Find which manager this address belongs to
         for manager_id, manager in list(self._known_managers.items()):
             if (manager.udp_host, manager.udp_port) == node_addr:
                 self._healthy_manager_ids.discard(manager_id)
+
+                # Track when this manager became unhealthy for reaping
+                if manager_id not in self._manager_unhealthy_since:
+                    self._manager_unhealthy_since[manager_id] = time.monotonic()
+
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerInfo(
@@ -511,13 +528,16 @@ class WorkerServer(HealthAwareServer):
     def _on_node_alive(self, node_addr: tuple[str, int]) -> None:
         """
         Called when a node is confirmed ALIVE via SWIM.
-        
-        Marks the manager as healthy in our tracking.
+
+        Marks the manager as healthy in our tracking and clears the
+        unhealthy timestamp so it won't be reaped.
         """
         # Find which manager this address belongs to
         for manager_id, manager in list(self._known_managers.items()):
             if (manager.udp_host, manager.udp_port) == node_addr:
                 self._healthy_manager_ids.add(manager_id)
+                # Clear unhealthy tracking - manager recovered
+                self._manager_unhealthy_since.pop(manager_id, None)
                 break
     
     def _handle_manager_heartbeat(
@@ -711,6 +731,14 @@ class WorkerServer(HealthAwareServer):
             except asyncio.CancelledError:
                 pass
 
+        # Cancel dead manager reap loop
+        if self._dead_manager_reap_task and not self._dead_manager_reap_task.done():
+            self._dead_manager_reap_task.cancel()
+            try:
+                await self._dead_manager_reap_task
+            except asyncio.CancelledError:
+                pass
+
         # Cancel all active workflows via TaskRunner
         for workflow_id in list(self._workflow_tokens.keys()):
             await self._cancel_workflow(workflow_id, "server_shutdown")
@@ -761,6 +789,13 @@ class WorkerServer(HealthAwareServer):
         if self._progress_flush_task and not self._progress_flush_task.done():
             try:
                 self._progress_flush_task.cancel()
+            except Exception:
+                pass
+
+        # Cancel dead manager reap loop
+        if self._dead_manager_reap_task and not self._dead_manager_reap_task.done():
+            try:
+                self._dead_manager_reap_task.cancel()
             except Exception:
                 pass
 
@@ -985,6 +1020,7 @@ class WorkerServer(HealthAwareServer):
         workflows = await self.get_workflows_on_cores(core_indices)
         stopped = []
 
+
         for wf_id in workflows:
             if await self._cancel_workflow(wf_id, reason):
                 stopped.append(wf_id)
@@ -996,16 +1032,26 @@ class WorkerServer(HealthAwareServer):
         token = self._workflow_tokens.get(workflow_id)
         if not token:
             return False
-        
+
         cancel_event = self._workflow_cancel_events.get(workflow_id)
         if cancel_event:
             cancel_event.set()
-        
+
         await self._task_runner.cancel(token)
-        
+
         if workflow_id in self._active_workflows:
             self._active_workflows[workflow_id].status = WorkflowStatus.CANCELLED.value
-        
+
+        # Cancel in RemoteGraphManager if we have the workflow name
+        workflow_name = self._workflow_id_to_name.get(workflow_id)
+        if workflow_name:
+            run_id = hash(workflow_id) % (2**31)
+            try:
+                await self._remote_manger.cancel_workflow(run_id, workflow_name)
+            except Exception:
+                # Best effort - don't fail the cancellation if remote manager fails
+                pass
+
         self._increment_version()
         return True
     
@@ -1327,11 +1373,14 @@ class WorkerServer(HealthAwareServer):
             # Unpickle workflow and context
             workflow = dispatch.load_workflow()
             context_dict = dispatch.load_context()
-            
+
             progress.workflow_name = workflow.name
             progress.status = WorkflowStatus.RUNNING.value
             self._increment_version()
-            
+
+            # Track workflow_id -> workflow_name mapping for cancellation
+            self._workflow_id_to_name[dispatch.workflow_id] = workflow.name
+
             # Initialize cores_completed tracking
             self._workflow_cores_completed[dispatch.workflow_id] = set()
             
@@ -1461,6 +1510,11 @@ class WorkerServer(HealthAwareServer):
             self._workflow_last_progress.pop(dispatch.workflow_id, None)
             self._workflow_cores_completed.pop(dispatch.workflow_id, None)
             self._workflow_fence_tokens.pop(dispatch.workflow_id, None)
+            self._workflow_id_to_name.pop(dispatch.workflow_id, None)
+
+            # Trigger cleanup of completed workflows in RemoteGraphManager
+            # The cleanup task checks terminal states - safe to call frequently
+            self._remote_manger.start_server_cleanup()
 
         return (
             progress,
@@ -1620,6 +1674,58 @@ class WorkerServer(HealthAwareServer):
                 if self._healthy_manager_ids:
                     for workflow_id, progress in updates_to_send.items():
                         await self._send_progress_update_direct(progress)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _dead_manager_reap_loop(self) -> None:
+        """
+        Background loop that reaps dead managers after the configured interval.
+
+        Managers that have been unhealthy for longer than WORKER_DEAD_MANAGER_REAP_INTERVAL
+        are removed from _known_managers along with their circuit breakers.
+        """
+        # Check every minute, but only reap after the full interval
+        check_interval = 60.0
+
+        while self._running:
+            try:
+                await asyncio.sleep(check_interval)
+
+                now = time.monotonic()
+                managers_to_reap: list[str] = []
+
+                for manager_id, unhealthy_since in list(self._manager_unhealthy_since.items()):
+                    if now - unhealthy_since >= self._dead_manager_reap_interval:
+                        managers_to_reap.append(manager_id)
+
+                for manager_id in managers_to_reap:
+                    manager_info = self._known_managers.get(manager_id)
+                    manager_addr = None
+                    if manager_info:
+                        manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+
+                    # Remove from all tracking structures
+                    self._known_managers.pop(manager_id, None)
+                    self._healthy_manager_ids.discard(manager_id)
+                    self._manager_unhealthy_since.pop(manager_id, None)
+                    self._manager_circuits.pop(manager_id, None)
+
+                    # Also clean up address-based circuit breaker if we know the address
+                    if manager_addr:
+                        self._manager_addr_circuits.pop(manager_addr, None)
+
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Reaped dead manager {manager_id} after {self._dead_manager_reap_interval}s",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
 
             except asyncio.CancelledError:
                 break

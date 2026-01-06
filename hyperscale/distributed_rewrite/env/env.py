@@ -82,6 +82,9 @@ class Env(BaseModel):
     WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 2.0  # How often to send buffered updates to manager
     WORKER_MAX_CORES: StrictInt | None = None
 
+    # Worker Dead Manager Cleanup Settings
+    WORKER_DEAD_MANAGER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead managers (15 minutes)
+
     # Manager Startup and Dispatch Settings
     MANAGER_STARTUP_SYNC_DELAY: StrictFloat = 2.0  # Seconds to wait for leader election before state sync
     MANAGER_STATE_SYNC_TIMEOUT: StrictFloat = 5.0  # Timeout for state sync request to leader
@@ -89,6 +92,11 @@ class Env(BaseModel):
     MANAGER_DISPATCH_CORE_WAIT_TIMEOUT: StrictFloat = 5.0  # Max seconds to wait per iteration for cores
     MANAGER_HEARTBEAT_INTERVAL: StrictFloat = 5.0  # Seconds between manager heartbeats to gates
     MANAGER_PEER_SYNC_INTERVAL: StrictFloat = 10.0  # Seconds between job state sync to peer managers
+
+    # Job Cleanup Settings
+    COMPLETED_JOB_MAX_AGE: StrictFloat = 300.0  # Seconds to retain completed jobs (5 minutes)
+    FAILED_JOB_MAX_AGE: StrictFloat = 3600.0  # Seconds to retain failed/cancelled/timeout jobs (1 hour)
+    JOB_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between cleanup checks
 
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
@@ -145,6 +153,8 @@ class Env(BaseModel):
             "WORKER_PROGRESS_UPDATE_INTERVAL": float,
             "WORKER_PROGRESS_FLUSH_INTERVAL": float,
             "WORKER_MAX_CORES": int,
+            # Worker dead manager cleanup settings
+            "WORKER_DEAD_MANAGER_REAP_INTERVAL": float,
             # Manager startup and dispatch settings
             "MANAGER_STARTUP_SYNC_DELAY": float,
             "MANAGER_STATE_SYNC_TIMEOUT": float,
@@ -152,6 +162,10 @@ class Env(BaseModel):
             "MANAGER_DISPATCH_CORE_WAIT_TIMEOUT": float,
             "MANAGER_HEARTBEAT_INTERVAL": float,
             "MANAGER_PEER_SYNC_INTERVAL": float,
+            # Job cleanup settings
+            "COMPLETED_JOB_MAX_AGE": float,
+            "FAILED_JOB_MAX_AGE": float,
+            "JOB_CLEANUP_INTERVAL": float,
         }
     
     def get_swim_init_context(self) -> dict:
