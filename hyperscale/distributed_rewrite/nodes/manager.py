@@ -1668,10 +1668,11 @@ class ManagerServer(HealthAwareServer):
                     return True
 
             except Exception as e:
+                error_detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerError(
-                        message=f"Peer registration attempt {attempt + 1}/{max_retries + 1} failed for {peer_addr}: {e}",
+                        message=f"Peer registration attempt {attempt + 1}/{max_retries + 1} failed for {peer_addr}: {error_detail}",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
