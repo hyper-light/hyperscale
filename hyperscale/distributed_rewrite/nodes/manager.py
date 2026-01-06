@@ -229,7 +229,21 @@ class ManagerServer(HealthAwareServer):
 
         # Set of manager node_ids we've already registered with (avoid duplicate registrations)
         self._registered_with_managers: set[str] = set()
-        
+
+        # Dead node tracking for reaping - tracks when nodes became unhealthy
+        # (node_id -> time.monotonic() when marked unhealthy)
+        self._worker_unhealthy_since: dict[str, float] = {}
+        self._manager_peer_unhealthy_since: dict[str, float] = {}
+        self._gate_unhealthy_since: dict[str, float] = {}
+
+        # Reaping intervals from config
+        self._dead_worker_reap_interval: float = env.MANAGER_DEAD_WORKER_REAP_INTERVAL
+        self._dead_peer_reap_interval: float = env.MANAGER_DEAD_PEER_REAP_INTERVAL
+        self._dead_gate_reap_interval: float = env.MANAGER_DEAD_GATE_REAP_INTERVAL
+
+        # Dead node reap loop task
+        self._dead_node_reap_task: asyncio.Task | None = None
+
         # Registered workers (indexed by node_id)
         self._workers: dict[str, WorkerRegistration] = {}  # node_id -> registration
         self._worker_addr_to_id: dict[tuple[str, int], str] = {}  # (host, port) -> node_id (reverse mapping)
@@ -321,9 +335,10 @@ class ManagerServer(HealthAwareServer):
             half_open_after=10.0,
         )
         
-        # Job cleanup configuration
-        self._job_max_age: float = 3600.0  # 1 hour max age for completed jobs
-        self._job_cleanup_interval: float = 60.0  # Check every minute
+        # Job cleanup configuration - use shorter age for completed jobs to free memory faster
+        self._completed_job_max_age: float = env.COMPLETED_JOB_MAX_AGE
+        self._failed_job_max_age: float = env.FAILED_JOB_MAX_AGE
+        self._job_cleanup_interval: float = env.JOB_CLEANUP_INTERVAL
 
         # =======================================================================
         # New Modular Classes - Gradual Migration
@@ -407,38 +422,60 @@ class ManagerServer(HealthAwareServer):
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
         Called when a node is marked as DEAD via SWIM.
-        
+
         Handles both worker and manager peer failures:
         - Worker death → triggers workflow retry on other workers
         - Manager peer death → updates quorum tracking, logs for debugging
-        
+
         Note: Leadership handling is automatic via lease expiry in LocalLeaderElection.
         If the dead manager was the leader, lease will expire and trigger re-election.
         """
         # Check if this is a worker
         worker_node_id = self._worker_addr_to_id.get(node_addr)
         if worker_node_id:
+            # Track when this worker became unhealthy for reaping
+            if worker_node_id not in self._worker_unhealthy_since:
+                self._worker_unhealthy_since[worker_node_id] = time.monotonic()
             # This is a worker - trigger failure handling
             self._task_runner.run(self._handle_worker_failure, worker_node_id)
             return
-        
+
         # Check if this is a manager peer
         manager_tcp_addr = self._manager_udp_to_tcp.get(node_addr)
         if manager_tcp_addr:
+            # Find manager node_id if known
+            for manager_id, manager_info in self._known_manager_peers.items():
+                if (manager_info.tcp_host, manager_info.tcp_port) == manager_tcp_addr:
+                    if manager_id not in self._manager_peer_unhealthy_since:
+                        self._manager_peer_unhealthy_since[manager_id] = time.monotonic()
+                    break
             self._task_runner.run(self._handle_manager_peer_failure, node_addr, manager_tcp_addr)
     
     def _on_node_join(self, node_addr: tuple[str, int]) -> None:
         """
         Called when a node joins or rejoins the SWIM cluster.
-        
-        Handles manager peer recovery:
-        - Manager peer rejoin → adds back to active peers set for quorum
-        
+
+        Handles node recovery:
+        - Worker rejoin → clears unhealthy tracking (re-registration via TCP)
+        - Manager peer rejoin → adds back to active peers set for quorum, clears unhealthy tracking
+
         Worker joins are handled via register_worker TCP flow, not here.
         """
+        # Check if this is a worker rejoining
+        worker_node_id = self._worker_addr_to_id.get(node_addr)
+        if worker_node_id:
+            # Clear unhealthy tracking - worker recovered
+            self._worker_unhealthy_since.pop(worker_node_id, None)
+            return
+
         # Check if this is a manager peer
         manager_tcp_addr = self._manager_udp_to_tcp.get(node_addr)
         if manager_tcp_addr:
+            # Clear unhealthy tracking for any manager peer at this address
+            for manager_id, manager_info in self._known_manager_peers.items():
+                if (manager_info.tcp_host, manager_info.tcp_port) == manager_tcp_addr:
+                    self._manager_peer_unhealthy_since.pop(manager_id, None)
+                    break
             self._task_runner.run(self._handle_manager_peer_recovery, node_addr, manager_tcp_addr)
     
     async def _handle_manager_peer_recovery(
@@ -1766,6 +1803,9 @@ class ManagerServer(HealthAwareServer):
         # Start background cleanup for completed jobs
         self._task_runner.run(self._job_cleanup_loop)
 
+        # Start background cleanup for dead nodes (workers, manager peers, gates)
+        self._dead_node_reap_task = asyncio.create_task(self._dead_node_reap_loop())
+
         # Start periodic job state sync to peer managers
         self._task_runner.run(self._peer_job_state_sync_loop)
 
@@ -2149,6 +2189,14 @@ class ManagerServer(HealthAwareServer):
         # Shutdown WorkflowDispatcher to cancel all dispatch loop tasks
         if self._workflow_dispatcher:
             await self._workflow_dispatcher.shutdown()
+
+        # Cancel dead node reap loop
+        if self._dead_node_reap_task and not self._dead_node_reap_task.done():
+            self._dead_node_reap_task.cancel()
+            try:
+                await self._dead_node_reap_task
+            except asyncio.CancelledError:
+                pass
 
         # Stop federated health monitor
         await self._gate_health_monitor.stop()
@@ -5513,6 +5561,15 @@ class ManagerServer(HealthAwareServer):
         # Clean up worker from WorkerPool
         await self._worker_pool.deregister_worker(worker_node_id)
 
+        # Clean up legacy tracking dicts
+        worker_reg = self._workers.pop(worker_node_id, None)
+        if worker_reg and worker_reg.node:
+            worker_addr = (worker_reg.node.host, worker_reg.node.port)
+            self._worker_addr_to_id.pop(worker_addr, None)
+
+        # Clean up circuit breaker for this worker
+        self._worker_circuits.pop(worker_node_id, None)
+
         # Find all workflows assigned to this worker via JobManager
         workflows_to_retry: list[str] = []
         for job in self._job_manager.iter_jobs():
@@ -5605,12 +5662,17 @@ class ManagerServer(HealthAwareServer):
         """
         Periodically clean up completed/failed jobs and their associated state.
 
-        Removes jobs that have been in a terminal state for longer than _job_max_age.
+        Uses different retention periods:
+        - Completed jobs: shorter retention (faster memory cleanup)
+        - Failed/cancelled/timeout jobs: longer retention (debugging/investigation)
+
         Also cleans up workflow_assignments and workflow_retries for those jobs.
         Also checks for workflow timeouts and dispatch failures.
         """
-        terminal_states = {
-            JobStatus.COMPLETED.value,
+        # Completed jobs use shorter max age for faster memory cleanup
+        completed_state = JobStatus.COMPLETED.value
+        # Failed/cancelled/timeout jobs use longer max age for debugging
+        failed_states = {
             JobStatus.FAILED.value,
             JobStatus.CANCELLED.value,
             JobStatus.TIMEOUT.value,
@@ -5627,16 +5689,21 @@ class ManagerServer(HealthAwareServer):
                         # Mark the workflow as failed in JobManager
                         workflow_token = self._job_manager.create_workflow_token(job_id, workflow_id)
                         await self._job_manager.mark_workflow_failed(workflow_token, reason)
-                
+
                 now = time.monotonic()
                 jobs_to_remove = []
 
                 for job in self._job_manager.iter_jobs():
-                    if job.status not in terminal_states:
-                        continue
                     age = now - job.timestamp
-                    if age > self._job_max_age:
-                        jobs_to_remove.append(job.job_id)
+
+                    # Completed jobs have shorter retention for faster memory cleanup
+                    if job.status == completed_state:
+                        if age > self._completed_job_max_age:
+                            jobs_to_remove.append(job.job_id)
+                    # Failed/cancelled/timeout jobs have longer retention for debugging
+                    elif job.status in failed_states:
+                        if age > self._failed_job_max_age:
+                            jobs_to_remove.append(job.job_id)
                 
                 for job_id in jobs_to_remove:
                     self._cleanup_job(job_id)
@@ -5710,7 +5777,116 @@ class ManagerServer(HealthAwareServer):
         ]
         for wf_id in workflow_ids_to_remove:
             self._workflow_completion_events.pop(wf_id, None)
-    
+
+    async def _dead_node_reap_loop(self) -> None:
+        """
+        Background loop that reaps dead nodes after the configured intervals.
+
+        Cleans up tracking structures for:
+        - Workers: _workers, _worker_addr_to_id, _worker_circuits, _worker_unhealthy_since
+        - Manager peers: _known_manager_peers, _manager_peer_unhealthy_since
+        - Gates: _known_gates, _healthy_gate_ids, _gate_unhealthy_since
+        """
+        check_interval = 60.0  # Check every minute
+
+        while self._running:
+            try:
+                await asyncio.sleep(check_interval)
+                now = time.monotonic()
+
+                # Reap dead workers
+                workers_to_reap: list[str] = []
+                for worker_id, unhealthy_since in list(self._worker_unhealthy_since.items()):
+                    if now - unhealthy_since >= self._dead_worker_reap_interval:
+                        workers_to_reap.append(worker_id)
+
+                for worker_id in workers_to_reap:
+                    # Get worker info for address cleanup
+                    worker_reg = self._workers.get(worker_id)
+                    if worker_reg and worker_reg.node:
+                        worker_addr = (worker_reg.node.host, worker_reg.node.port)
+                        self._worker_addr_to_id.pop(worker_addr, None)
+
+                    # Remove from all tracking structures
+                    self._workers.pop(worker_id, None)
+                    self._worker_circuits.pop(worker_id, None)
+                    self._worker_unhealthy_since.pop(worker_id, None)
+
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Reaped dead worker {worker_id} after {self._dead_worker_reap_interval}s",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+                # Reap dead manager peers
+                peers_to_reap: list[str] = []
+                for peer_id, unhealthy_since in list(self._manager_peer_unhealthy_since.items()):
+                    if now - unhealthy_since >= self._dead_peer_reap_interval:
+                        peers_to_reap.append(peer_id)
+
+                for peer_id in peers_to_reap:
+                    # Get peer info for address cleanup
+                    peer_info = self._known_manager_peers.get(peer_id)
+                    if peer_info:
+                        peer_tcp_addr = (peer_info.tcp_host, peer_info.tcp_port)
+                        self._active_manager_peers.discard(peer_tcp_addr)
+                        # Find and remove UDP to TCP mapping
+                        for udp_addr, tcp_addr in list(self._manager_udp_to_tcp.items()):
+                            if tcp_addr == peer_tcp_addr:
+                                self._manager_udp_to_tcp.pop(udp_addr, None)
+                                break
+
+                    # Remove from all tracking structures
+                    self._known_manager_peers.pop(peer_id, None)
+                    self._active_manager_peer_ids.discard(peer_id)
+                    self._manager_peer_unhealthy_since.pop(peer_id, None)
+                    self._registered_with_managers.discard(peer_id)
+
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Reaped dead manager peer {peer_id} after {self._dead_peer_reap_interval}s",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+                # Reap dead gates
+                gates_to_reap: list[str] = []
+                for gate_id, unhealthy_since in list(self._gate_unhealthy_since.items()):
+                    if now - unhealthy_since >= self._dead_gate_reap_interval:
+                        gates_to_reap.append(gate_id)
+
+                for gate_id in gates_to_reap:
+                    # Remove from all tracking structures
+                    self._known_gates.pop(gate_id, None)
+                    self._healthy_gate_ids.discard(gate_id)
+                    self._gate_unhealthy_since.pop(gate_id, None)
+
+                    # Update primary gate if needed
+                    if self._primary_gate_id == gate_id:
+                        self._primary_gate_id = next(iter(self._healthy_gate_ids), None)
+
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Reaped dead gate {gate_id} after {self._dead_gate_reap_interval}s",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.handle_exception(e, "dead_node_reap_loop")
+
     # =========================================================================
     # TCP Handlers - Job Submission (from Gate or Client)
     # =========================================================================

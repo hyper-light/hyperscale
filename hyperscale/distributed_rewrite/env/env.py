@@ -98,6 +98,11 @@ class Env(BaseModel):
     FAILED_JOB_MAX_AGE: StrictFloat = 3600.0  # Seconds to retain failed/cancelled/timeout jobs (1 hour)
     JOB_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between cleanup checks
 
+    # Manager Dead Node Cleanup Settings
+    MANAGER_DEAD_WORKER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead workers (15 minutes)
+    MANAGER_DEAD_PEER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead manager peers (15 minutes)
+    MANAGER_DEAD_GATE_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead gates (15 minutes)
+
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
@@ -166,6 +171,10 @@ class Env(BaseModel):
             "COMPLETED_JOB_MAX_AGE": float,
             "FAILED_JOB_MAX_AGE": float,
             "JOB_CLEANUP_INTERVAL": float,
+            # Manager dead node cleanup settings
+            "MANAGER_DEAD_WORKER_REAP_INTERVAL": float,
+            "MANAGER_DEAD_PEER_REAP_INTERVAL": float,
+            "MANAGER_DEAD_GATE_REAP_INTERVAL": float,
         }
     
     def get_swim_init_context(self) -> dict:
