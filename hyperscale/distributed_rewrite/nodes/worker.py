@@ -85,6 +85,13 @@ from hyperscale.distributed_rewrite.reliability import (
     BackpressureLevel,
     BackpressureSignal,
 )
+from hyperscale.distributed_rewrite.protocol.version import (
+    CURRENT_PROTOCOL_VERSION,
+    NodeCapabilities,
+    ProtocolVersion,
+    NegotiatedCapabilities,
+    get_features_for_version,
+)
 from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError, ServerWarning, ServerDebug
 
@@ -203,6 +210,10 @@ class WorkerServer(HealthAwareServer):
 
         # State versioning (Lamport clock extension)
         self._state_version = 0
+
+        # Protocol version negotiation result (AD-25)
+        # Set during registration response handling
+        self._negotiated_capabilities: NegotiatedCapabilities | None = None
         
         # Queue depth tracking
         self._pending_workflows: list[WorkflowDispatch] = []
@@ -906,12 +917,19 @@ class WorkerServer(HealthAwareServer):
             )
             return False
 
+        # Build capabilities string from current protocol version (AD-25)
+        current_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
+        capabilities_str = ",".join(sorted(current_features))
+
         registration = WorkerRegistration(
             node=self.node_info,
             total_cores=self._total_cores,
             available_cores=self._core_allocator.available_cores,
             memory_mb=self._get_memory_mb(),
             available_memory_mb=self._get_available_memory_mb(),
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            capabilities=capabilities_str,
         )
 
         for attempt in range(max_retries + 1):
@@ -1120,11 +1138,11 @@ class WorkerServer(HealthAwareServer):
         """Handle registration response from manager - populate known managers."""
         try:
             response = RegistrationResponse.load(data)
-            
+
             if response.accepted:
                 # Populate known managers from response
                 self._update_known_managers(response.healthy_managers)
-                
+
                 # Set primary manager (prefer leader)
                 for manager in response.healthy_managers:
                     if manager.is_leader:
@@ -1133,11 +1151,35 @@ class WorkerServer(HealthAwareServer):
                 else:
                     # No leader indicated, use responding manager
                     self._primary_manager_id = response.manager_id
-                
+
+                # Store negotiated capabilities (AD-25)
+                manager_version = ProtocolVersion(
+                    response.protocol_version_major,
+                    response.protocol_version_minor,
+                )
+                negotiated_features = (
+                    set(response.capabilities.split(","))
+                    if response.capabilities
+                    else set()
+                )
+                # Remove empty string if present (from split of empty string)
+                negotiated_features.discard("")
+
+                # Store negotiated capabilities for this manager connection
+                self._negotiated_capabilities = NegotiatedCapabilities(
+                    local_version=CURRENT_PROTOCOL_VERSION,
+                    remote_version=manager_version,
+                    common_features=negotiated_features,
+                    compatible=True,  # If we got here with accepted=True, we're compatible
+                )
+
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerInfo(
-                        message=f"Registered with {len(response.healthy_managers)} managers, primary: {self._primary_manager_id}",
+                        message=(
+                            f"Registered with {len(response.healthy_managers)} managers, primary: {self._primary_manager_id} "
+                            f"(protocol: {manager_version}, features: {len(negotiated_features)})"
+                        ),
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
@@ -1164,7 +1206,7 @@ class WorkerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-        
+
         return data
     
     def _update_known_managers(self, managers: list[ManagerInfo]) -> None:

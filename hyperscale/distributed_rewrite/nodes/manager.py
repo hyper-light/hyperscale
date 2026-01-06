@@ -134,6 +134,13 @@ from hyperscale.distributed_rewrite.health import (
     WorkerHealthManager,
     WorkerHealthManagerConfig,
 )
+from hyperscale.distributed_rewrite.protocol.version import (
+    CURRENT_PROTOCOL_VERSION,
+    NodeCapabilities,
+    ProtocolVersion,
+    get_features_for_version,
+    negotiate_capabilities,
+)
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 from hyperscale.reporting.results import Results
 
@@ -3553,6 +3560,46 @@ class ManagerServer(HealthAwareServer):
         try:
             registration = WorkerRegistration.load(data)
 
+            # Protocol version validation (AD-25)
+            worker_version = ProtocolVersion(
+                registration.protocol_version_major,
+                registration.protocol_version_minor,
+            )
+            worker_capabilities_set = (
+                set(registration.capabilities.split(","))
+                if registration.capabilities
+                else set()
+            )
+            worker_caps = NodeCapabilities(
+                protocol_version=worker_version,
+                capabilities=worker_capabilities_set,
+            )
+            local_caps = NodeCapabilities.current()
+            negotiated = negotiate_capabilities(local_caps, worker_caps)
+
+            if not negotiated.compatible:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=(
+                            f"Worker {registration.node.node_id} rejected: incompatible protocol version "
+                            f"{worker_version} (local: {CURRENT_PROTOCOL_VERSION})"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = RegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    healthy_managers=[],
+                    error=f"Incompatible protocol version: {worker_version} (requires major version {CURRENT_PROTOCOL_VERSION.major})",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
+
             # Register with WorkerPool
             worker_info = await self._worker_pool.register_worker(registration)
 
@@ -3572,18 +3619,25 @@ class ManagerServer(HealthAwareServer):
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
-                    message=f"Worker registered: {worker_info.node_id} with {worker_info.total_cores} cores (SWIM probe added)",
+                    message=(
+                        f"Worker registered: {worker_info.node_id} with {worker_info.total_cores} cores "
+                        f"(protocol: {worker_version}, features: {len(negotiated.common_features)})"
+                    ),
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
 
-            # Return response with list of all healthy managers
+            # Return response with list of all healthy managers and negotiated capabilities
+            negotiated_capabilities_str = ",".join(sorted(negotiated.common_features))
             response = RegistrationResponse(
                 accepted=True,
                 manager_id=self._node_id.full,
                 healthy_managers=self._get_healthy_managers(),
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                capabilities=negotiated_capabilities_str,
             )
 
             # Broadcast this worker discovery to peer managers
@@ -3597,7 +3651,7 @@ class ManagerServer(HealthAwareServer):
             )
 
             return response.dump()
-            
+
         except Exception as e:
             await self.handle_exception(e, "worker_register")
             # Return error response
@@ -3606,6 +3660,8 @@ class ManagerServer(HealthAwareServer):
                 manager_id=self._node_id.full,
                 healthy_managers=[],
                 error=str(e),
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
             )
             return response.dump()
 
@@ -3625,6 +3681,48 @@ class ManagerServer(HealthAwareServer):
         try:
             registration = ManagerPeerRegistration.load(data)
             peer_info = registration.node
+
+            # Protocol version validation (AD-25)
+            peer_version = ProtocolVersion(
+                registration.protocol_version_major,
+                registration.protocol_version_minor,
+            )
+            peer_capabilities_set = (
+                set(registration.capabilities.split(","))
+                if registration.capabilities
+                else set()
+            )
+            peer_caps = NodeCapabilities(
+                protocol_version=peer_version,
+                capabilities=peer_capabilities_set,
+            )
+            local_caps = NodeCapabilities.current()
+            negotiated = negotiate_capabilities(local_caps, peer_caps)
+
+            if not negotiated.compatible:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=(
+                            f"Peer manager {peer_info.node_id} rejected: incompatible protocol version "
+                            f"{peer_version} (local: {CURRENT_PROTOCOL_VERSION})"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = ManagerPeerRegistrationResponse(
+                    accepted=False,
+                    manager_id=self._node_id.full,
+                    is_leader=self.is_leader(),
+                    term=self._leader_election.state.current_term,
+                    known_peers=[],
+                    error=f"Incompatible protocol version: {peer_version} (requires major version {CURRENT_PROTOCOL_VERSION.major})",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
 
             # Add to known peers if not already tracked
             if peer_info.node_id not in self._known_manager_peers:
@@ -3665,7 +3763,10 @@ class ManagerServer(HealthAwareServer):
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerInfo(
-                        message=f"Peer manager registered: {peer_info.node_id} (leader={registration.is_leader})",
+                        message=(
+                            f"Peer manager registered: {peer_info.node_id} (leader={registration.is_leader}, "
+                            f"protocol: {peer_version}, features: {len(negotiated.common_features)})"
+                        ),
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
@@ -3674,6 +3775,7 @@ class ManagerServer(HealthAwareServer):
 
             # Build response with all known peers (including self and the registrant)
             all_peers = [self._get_self_manager_info()] + self._get_known_peer_managers()
+            negotiated_capabilities_str = ",".join(sorted(negotiated.common_features))
 
             response = ManagerPeerRegistrationResponse(
                 accepted=True,
@@ -3681,6 +3783,9 @@ class ManagerServer(HealthAwareServer):
                 is_leader=self.is_leader(),
                 term=self._leader_election.state.current_term,
                 known_peers=all_peers,
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                capabilities=negotiated_capabilities_str,
             )
             return response.dump()
 
@@ -3693,6 +3798,8 @@ class ManagerServer(HealthAwareServer):
                 term=self._leader_election.state.current_term,
                 known_peers=[],
                 error=str(e),
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
             )
             return response.dump()
 
