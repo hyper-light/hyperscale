@@ -4702,9 +4702,15 @@ class ManagerServer(HealthAwareServer):
             return
 
         results_to_send = self._prepare_workflow_results(all_workflow_stats, is_test_workflow, for_gate=bool(origin_gate))
+
+        # Extract client-generated workflow_id from tracking token format
+        # Token format: DC:manager:job_id:workflow_id - we want just the workflow_id part
+        token_parts = parent_workflow_id.split(":")
+        client_workflow_id = token_parts[3] if len(token_parts) >= 4 else parent_workflow_id
+
         push = WorkflowResultPush(
             job_id=job_id,
-            workflow_id=parent_workflow_id,
+            workflow_id=client_workflow_id,
             workflow_name=workflow_name,
             datacenter=self._node_id.datacenter,
             status=status,
