@@ -487,7 +487,7 @@ async def run_test():
             return workflows
 
         # Query initial state via gate
-        results = await client.query_workflows(all_workflow_names, job_id=job_id)
+        results = await client.query_workflows_via_gate(all_workflow_names, job_id=job_id)
         total_workflows = sum(len(wfs) for wfs in results.values())
         print(f"  Query returned {total_workflows} workflow entries across {len(results)} DCs")
 
@@ -538,7 +538,7 @@ async def run_test():
         all_complete = False
 
         while time.time() - start_time < timeout:
-            results = await client.query_workflows(all_workflow_names, job_id=job_id)
+            results = await client.query_workflows_via_gate(all_workflow_names, job_id=job_id)
 
             # Check if all workflows are complete in at least one DC
             completed_workflows = set()
