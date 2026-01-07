@@ -1427,6 +1427,7 @@ class WorkerServer(HealthAwareServer):
                 rate_per_second=0.0,
                 elapsed_seconds=0.0,
                 timestamp=time.monotonic(),
+                collected_at=time.time(),  # Unix timestamp for cross-node alignment
                 assigned_cores=allocated_cores,
                 worker_available_cores=self._core_allocator.available_cores,
                 worker_workflow_completed_cores=0,
@@ -1567,6 +1568,7 @@ class WorkerServer(HealthAwareServer):
             # Final progress update - send directly (not buffered) since it's critical
             progress.elapsed_seconds = time.monotonic() - start_time
             progress.timestamp = time.monotonic()
+            progress.collected_at = time.time()  # Unix timestamp for cross-node alignment
             if self._healthy_manager_ids:
                 await self._send_progress_update_direct(progress)
 
@@ -1579,7 +1581,7 @@ class WorkerServer(HealthAwareServer):
                 workflow_id=dispatch.workflow_id,
                 workflow_name=progress.workflow_name,
                 status=progress.status,
-                results=workflow_results,
+                results=list(workflow_results.values()),
                 context_updates=context_updates,
                 error=workflow_error,
                 worker_id=self._node_id.full,
@@ -1691,6 +1693,7 @@ class WorkerServer(HealthAwareServer):
                     if progress.elapsed_seconds > 0 else 0.0
                 )
                 progress.timestamp = time.monotonic()
+                progress.collected_at = time.time()  # Unix timestamp for cross-node alignment
                 progress.avg_cpu_percent = avg_cpu
                 progress.avg_memory_mb = avg_mem
 

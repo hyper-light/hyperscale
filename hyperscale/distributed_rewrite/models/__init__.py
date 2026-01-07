@@ -60,6 +60,8 @@ from .distributed import (
     WorkflowProgress as WorkflowProgress,
     WorkflowFinalResult as WorkflowFinalResult,
     WorkflowResult as WorkflowResult,
+    WorkflowDCResult as WorkflowDCResult,
+    WorkflowResultPush as WorkflowResultPush,
     JobFinalResult as JobFinalResult,
     AggregatedJobStats as AggregatedJobStats,
     GlobalJobResult as GlobalJobResult,
@@ -78,6 +80,7 @@ from .distributed import (
     JobStatusPush as JobStatusPush,
     DCStats as DCStats,
     JobBatchPush as JobBatchPush,
+    ReporterResultPush as ReporterResultPush,
     # Client reconnection
     RegisterCallback as RegisterCallback,
     RegisterCallbackResponse as RegisterCallbackResponse,

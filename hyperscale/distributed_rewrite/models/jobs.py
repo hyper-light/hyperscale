@@ -289,6 +289,7 @@ class JobInfo:
         """
         # Convert internal workflow state to wire protocol WorkflowProgress
         workflow_progresses = []
+        current_time = time.time()
         for wf_token_str, wf_info in self.workflows.items():
             wf_progress = WorkflowProgress(
                 job_id=self.job_id,
@@ -300,6 +301,7 @@ class JobInfo:
                 rate_per_second=0.0,
                 elapsed_seconds=self.elapsed_seconds(),
                 timestamp=self.timestamp,
+                collected_at=current_time,
             )
             workflow_progresses.append(wf_progress)
 
@@ -313,6 +315,7 @@ class JobInfo:
             overall_rate=0.0,
             elapsed_seconds=self.elapsed_seconds(),
             timestamp=self.timestamp,
+            collected_at=current_time,  # Unix timestamp for cross-DC alignment
         )
 
 

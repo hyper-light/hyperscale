@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from hyperscale.core.graph import Workflow
 from hyperscale.core.state import Context
-from hyperscale.core.jobs.models import WorkflowResults
+from hyperscale.reporting.common.results_types import WorkflowStats
 from typing import Any
 from .message import Message
 
@@ -529,11 +529,15 @@ class ManagerHeartbeat(Message):
 class JobSubmission(Message):
     """
     Job submission from client to gate or manager.
-    
+
     A job contains one or more workflow classes to execute.
-    
+
     If callback_addr is provided, the gate/manager will push status
     updates to the client via TCP instead of requiring polling.
+
+    If reporting_configs is provided (cloudpickled list of ReporterConfig),
+    the manager/gate will submit results to reporters after aggregation
+    and notify the client of success/failure per reporter.
     """
     job_id: str                  # Unique job identifier
     workflows: bytes             # Cloudpickled list of Workflow classes
@@ -548,6 +552,10 @@ class JobSubmission(Message):
     # Set by the job leader gate when dispatching to managers
     # Managers send results directly to this gate instead of all gates
     origin_gate_addr: tuple[str, int] | None = None
+    # Optional reporter configs for result submission
+    # Cloudpickled list of ReporterConfig objects
+    # If set, manager/gate submits results to these reporters after aggregation
+    reporting_configs: bytes = b''
 
 
 @dataclass(slots=True)
@@ -766,6 +774,11 @@ class WorkflowProgress(Message):
     When cores_completed > 0, the manager can immediately provision new
     workflows to the freed cores without waiting for the entire workflow
     to complete on all cores.
+
+    Time alignment:
+    - collected_at: Unix timestamp when stats were collected at the worker.
+      Used for time-aligned aggregation across workers/DCs.
+    - timestamp: Monotonic timestamp for local ordering (not cross-node comparable).
     """
     job_id: str                  # Parent job
     workflow_id: str             # Workflow instance
@@ -776,7 +789,8 @@ class WorkflowProgress(Message):
     rate_per_second: float       # Current execution rate
     elapsed_seconds: float       # Time since start
     step_stats: list["StepStats"] = field(default_factory=list)
-    timestamp: float = 0.0       # Monotonic timestamp
+    timestamp: float = 0.0       # Monotonic timestamp (local ordering)
+    collected_at: float = 0.0    # Unix timestamp when stats were collected (cross-node alignment)
     assigned_cores: list[int] = field(default_factory=list)  # Per-core assignment
     cores_completed: int = 0     # Cores that have finished their portion
     avg_cpu_percent: float = 0.0   # Average CPU utilization
@@ -805,7 +819,7 @@ class WorkflowFinalResult(Message):
     workflow_id: str             # Workflow instance
     workflow_name: str           # Workflow class name
     status: str                  # COMPLETED | FAILED
-    results: dict[int, WorkflowResults]               # Cloudpickled dict[int, WorkflowResults]
+    results: list[WorkflowStats]  # Cloudpickled list[WorkflowResults]
     context_updates: bytes       # Cloudpickled context dict (for Provide hooks)
     error: str | None = None     # Error message if failed (no traceback)
     worker_id: str = ""          # Worker that executed this workflow
@@ -816,15 +830,54 @@ class WorkflowFinalResult(Message):
 class WorkflowResult(Message):
     """
     Simplified workflow result for aggregation (without context).
-    
+
     Used in JobFinalResult for Manager -> Gate communication.
     Context is NOT included because gates don't need it.
+
+    For gate-bound jobs: results contains raw per-core WorkflowStats for cross-DC aggregation
+    For direct-client jobs: results contains aggregated WorkflowStats (single item list)
     """
     workflow_id: str             # Workflow instance ID
     workflow_name: str           # Workflow class name
     status: str                  # COMPLETED | FAILED
-    results: bytes               # Cloudpickled WorkflowStats
+    results: list[WorkflowStats] = field(default_factory=list)  # Per-core or aggregated stats
     error: str | None = None     # Error message if failed
+
+
+@dataclass(slots=True)
+class WorkflowDCResult:
+    """Per-datacenter workflow result for cross-DC visibility."""
+    datacenter: str              # Datacenter identifier
+    status: str                  # COMPLETED | FAILED
+    stats: WorkflowStats | None = None  # Aggregated stats for this DC
+    error: str | None = None     # Error message if failed
+    elapsed_seconds: float = 0.0
+
+
+@dataclass(slots=True)
+class WorkflowResultPush(Message):
+    """
+    Push notification for a completed workflow's results.
+
+    Sent from Manager to Client (aggregated) or Manager to Gate (raw) as soon
+    as each workflow completes, without waiting for the entire job to finish.
+
+    For client-bound from manager: results contains single aggregated WorkflowStats, per_dc_results empty
+    For client-bound from gate: results contains cross-DC aggregated, per_dc_results has per-DC breakdown
+    For gate-bound: results contains raw per-core WorkflowStats list for cross-DC aggregation
+    """
+    job_id: str                  # Parent job
+    workflow_id: str             # Workflow instance ID
+    workflow_name: str           # Workflow class name
+    datacenter: str              # Source datacenter (or "aggregated" for cross-DC)
+    status: str                  # COMPLETED | FAILED
+    results: list[WorkflowStats] = field(default_factory=list)
+    error: str | None = None     # Error message if failed
+    elapsed_seconds: float = 0.0
+    # Per-DC breakdown (populated when gate aggregates cross-DC results)
+    per_dc_results: list[WorkflowDCResult] = field(default_factory=list)
+    # Completion timestamp for ordering
+    completed_at: float = 0.0    # Unix timestamp when workflow completed
 
 
 @dataclass(slots=True)
@@ -892,6 +945,11 @@ class JobProgress(Message):
     Aggregated job progress from manager to gate.
 
     Contains summary of all workflows in the job.
+
+    Time alignment:
+    - collected_at: Unix timestamp when stats were aggregated at the manager.
+      Used for time-aligned aggregation across DCs at the gate.
+    - timestamp: Monotonic timestamp for local ordering (not cross-node comparable).
     """
     job_id: str                  # Job identifier
     datacenter: str              # Reporting datacenter
@@ -901,7 +959,8 @@ class JobProgress(Message):
     total_failed: int = 0        # Total actions failed
     overall_rate: float = 0.0    # Aggregate rate
     elapsed_seconds: float = 0.0 # Time since job start
-    timestamp: float = 0.0       # Monotonic timestamp
+    timestamp: float = 0.0       # Monotonic timestamp (local ordering)
+    collected_at: float = 0.0    # Unix timestamp when aggregated (cross-DC alignment)
     # Aggregated step stats across all workflows in the job
     step_stats: list["StepStats"] = field(default_factory=list)
     fence_token: int = 0         # Fencing token for at-most-once semantics
@@ -1127,6 +1186,27 @@ class RegisterCallbackResponse(Message):
     total_failed: int = 0             # Current failure count
     elapsed_seconds: float = 0.0      # Time since job started
     error: str | None = None          # Error message if failed
+
+
+@dataclass(slots=True)
+class ReporterResultPush(Message):
+    """
+    Push notification for reporter submission result.
+
+    Sent from Manager/Gate to Client after submitting results to a reporter.
+    Each reporter config generates one notification (success or failure).
+
+    This is sent as a background task completes, not batched.
+    Clients can track which reporters succeeded or failed for a job.
+    """
+    job_id: str                       # Job the results were for
+    reporter_type: str                # ReporterTypes enum value (e.g., "json", "datadog")
+    success: bool                     # Whether submission succeeded
+    error: str | None = None          # Error message if failed
+    elapsed_seconds: float = 0.0      # Time taken for submission
+    # Source information for multi-DC scenarios
+    source: str = ""                  # "manager" or "gate"
+    datacenter: str = ""              # Datacenter that submitted (manager only)
 
 
 @dataclass(slots=True)

@@ -31,6 +31,7 @@ import cloudpickle
 
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.reporting.results import Results
+from hyperscale.reporting.reporter import Reporter
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, GateStateEmbedder
@@ -83,6 +84,10 @@ from hyperscale.distributed_rewrite.models import (
     RegisterCallback,
     RegisterCallbackResponse,
     RateLimitResponse,
+    ReporterResultPush,
+    WorkflowResultPush,
+    WorkflowDCResult,
+    restricted_loads,
 )
 from hyperscale.distributed_rewrite.swim.core import (
     QuorumError,
@@ -241,7 +246,11 @@ class GateServer(HealthAwareServer):
         # Per-DC final results for job completion aggregation
         # job_id -> {datacenter -> JobFinalResult}
         self._job_dc_results: dict[str, dict[str, JobFinalResult]] = {}
-        
+
+        # Per-workflow results from all DCs for cross-DC aggregation
+        # job_id -> workflow_id -> datacenter -> WorkflowResultPush
+        self._workflow_dc_results: dict[str, dict[str, dict[str, WorkflowResultPush]]] = {}
+
         # Track which DCs were assigned for each job (to know when complete)
         # job_id -> set of datacenter IDs
         self._job_target_dcs: dict[str, set[str]] = {}
@@ -249,7 +258,16 @@ class GateServer(HealthAwareServer):
         # Client push notification callbacks
         # job_id -> callback address for push notifications
         self._job_callbacks: dict[str, tuple[str, int]] = {}
-        
+
+        # Job submissions for reporting configs
+        # job_id -> JobSubmission (needed for reporting_configs after aggregation)
+        self._job_submissions: dict[str, JobSubmission] = {}
+
+        # Background reporter tasks per job
+        # Maps job_id -> dict[reporter_type -> asyncio.Task]
+        # Tasks are tracked for cleanup when job is cleaned up
+        self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
+
         # Lease management for at-most-once
         self._leases: dict[str, DatacenterLease] = {}  # job_id:dc -> lease
         self._fence_token = 0
@@ -2489,8 +2507,11 @@ class GateServer(HealthAwareServer):
                     # Also clean up related tracking dicts
                     self._job_fence_tokens.pop(job_id, None)
                     self._job_dc_results.pop(job_id, None)
+                    self._workflow_dc_results.pop(job_id, None)
                     self._job_target_dcs.pop(job_id, None)
                     self._job_callbacks.pop(job_id, None)
+                    # Clean up reporter tasks and submissions
+                    self._cleanup_reporter_tasks(job_id)
                     # Clean up any leases for this job
                     lease_keys_to_remove = [
                         key for key in self._leases
@@ -2975,7 +2996,11 @@ class GateServer(HealthAwareServer):
             # Store callback for push notifications (if provided)
             if submission.callback_addr:
                 self._job_callbacks[submission.job_id] = submission.callback_addr
-            
+
+            # Store submission for reporter configs access after aggregation
+            if submission.reporting_configs:
+                self._job_submissions[submission.job_id] = submission
+
             self._increment_version()
             
             # Record success for circuit breaker
@@ -3750,6 +3775,183 @@ class GateServer(HealthAwareServer):
             await self.handle_exception(e, "job_final_result")
             return b'error'
 
+    @tcp.receive()
+    async def workflow_result_push(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle workflow result push from manager.
+
+        Managers send raw per-core WorkflowStats for each completed workflow.
+        Gate aggregates results from all DCs using Results.merge_results()
+        and forwards to client.
+        """
+        try:
+            push = WorkflowResultPush.load(data)
+
+            # Check if we own this job
+            if push.job_id not in self._jobs:
+                # Forward to peer gates
+                await self._forward_workflow_result_to_peers(push)
+                return b'ok'
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Received workflow result for {push.job_id}:{push.workflow_id} from DC {push.datacenter}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Store per-DC workflow result
+            if push.job_id not in self._workflow_dc_results:
+                self._workflow_dc_results[push.job_id] = {}
+            if push.workflow_id not in self._workflow_dc_results[push.job_id]:
+                self._workflow_dc_results[push.job_id][push.workflow_id] = {}
+            self._workflow_dc_results[push.job_id][push.workflow_id][push.datacenter] = push
+
+            # Check if we have results from all target DCs for this workflow
+            target_dcs = self._job_target_dcs.get(push.job_id, set())
+            received_dcs = set(self._workflow_dc_results[push.job_id][push.workflow_id].keys())
+
+            if target_dcs and received_dcs >= target_dcs:
+                # All DCs reported for this workflow - aggregate and send to client
+                await self._aggregate_and_forward_workflow_result(push.job_id, push.workflow_id)
+
+            return b'ok'
+
+        except Exception as e:
+            await self.handle_exception(e, "workflow_result_push")
+            return b'error'
+
+    async def _aggregate_and_forward_workflow_result(
+        self,
+        job_id: str,
+        workflow_id: str,
+    ) -> None:
+        """
+        Aggregate workflow results from all DCs and forward to client.
+
+        Uses Results.merge_results() to combine all WorkflowStats.
+        Includes per-DC breakdown for client visibility.
+        """
+        workflow_results = self._workflow_dc_results.get(job_id, {}).get(workflow_id, {})
+        if not workflow_results:
+            return
+
+        # Collect all WorkflowStats from all DCs and build per-DC results
+        all_workflow_stats: list[WorkflowStats] = []
+        per_dc_results: list[WorkflowDCResult] = []
+        workflow_name = ""
+        has_failure = False
+        error_messages: list[str] = []
+        max_elapsed = 0.0
+
+        for datacenter, dc_push in workflow_results.items():
+            workflow_name = dc_push.workflow_name
+            all_workflow_stats.extend(dc_push.results)
+
+            # Aggregate this DC's results for per-DC breakdown
+            dc_aggregated_stats: WorkflowStats | None = None
+            if dc_push.results:
+                if len(dc_push.results) > 1:
+                    aggregator = Results()
+                    dc_aggregated_stats = aggregator.merge_results(dc_push.results)
+                else:
+                    dc_aggregated_stats = dc_push.results[0]
+
+            # Build per-DC result entry
+            per_dc_results.append(WorkflowDCResult(
+                datacenter=datacenter,
+                status=dc_push.status,
+                stats=dc_aggregated_stats,
+                error=dc_push.error,
+                elapsed_seconds=dc_push.elapsed_seconds,
+            ))
+
+            if dc_push.status == "FAILED":
+                has_failure = True
+                if dc_push.error:
+                    error_messages.append(f"{datacenter}: {dc_push.error}")
+
+            if dc_push.elapsed_seconds > max_elapsed:
+                max_elapsed = dc_push.elapsed_seconds
+
+        if not all_workflow_stats:
+            return
+
+        # Aggregate cross-DC using Results.merge_results()
+        aggregator = Results()
+        if len(all_workflow_stats) > 1:
+            aggregated = aggregator.merge_results(all_workflow_stats)
+        else:
+            aggregated = all_workflow_stats[0]
+
+        status = "FAILED" if has_failure else "COMPLETED"
+        error = "; ".join(error_messages) if error_messages else None
+
+        # Build aggregated push for client with per-DC breakdown
+        client_push = WorkflowResultPush(
+            job_id=job_id,
+            workflow_id=workflow_id,
+            workflow_name=workflow_name,
+            datacenter="aggregated",
+            status=status,
+            results=[aggregated],
+            error=error,
+            elapsed_seconds=max_elapsed,
+            per_dc_results=per_dc_results,
+            completed_at=time.time(),
+        )
+
+        # Send to client
+        callback = self._job_callbacks.get(job_id)
+        if callback:
+            try:
+                await self.send_tcp(
+                    callback,
+                    "workflow_result_push",
+                    client_push.dump(),
+                    timeout=5.0,
+                )
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Failed to send workflow result to client {callback}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+        # Clean up this workflow's DC results
+        if job_id in self._workflow_dc_results:
+            self._workflow_dc_results[job_id].pop(workflow_id, None)
+
+    async def _forward_workflow_result_to_peers(self, push: WorkflowResultPush) -> bool:
+        """Forward workflow result to peer gates that may own the job."""
+        for gate_id, gate_info in list(self._known_gates.items()):
+            if gate_id == self._node_id.full:
+                continue
+            try:
+                gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
+                await self.send_tcp(
+                    gate_addr,
+                    "workflow_result_push",
+                    push.dump(),
+                    timeout=3.0,
+                )
+                return True
+            except Exception:
+                continue
+        return False
+
     async def _forward_job_result_to_peers(self, result: JobFinalResult) -> bool:
         """
         Forward a job final result to peer gates that may own the job.
@@ -3838,34 +4040,23 @@ class GateServer(HealthAwareServer):
         # =================================================================
         # Aggregate WorkflowStats using Results.merge_results()
         # =================================================================
-        
+
         # 1. Collect all WorkflowStats from all DCs, grouped by workflow name
+        # Manager sends list[WorkflowStats] (raw per-core results from all workers)
         all_workflow_stats: dict[str, list[WorkflowStats]] = defaultdict(list)
-        
+
         for dc_result in all_dc_results:
             for wf_result in dc_result.workflow_results:
-                try:
-                    # Unpickle WorkflowStats from the workflow result
-                    workflow_stats: WorkflowStats = cloudpickle.loads(wf_result.results)
-                    all_workflow_stats[wf_result.workflow_name].append(workflow_stats)
-                except Exception as e:
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerWarning(
-                            message=f"Failed to unpickle WorkflowStats for {wf_result.workflow_name}: {e}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-        
+                # wf_result.results is list[WorkflowStats] - extend to flatten all per-core stats
+                all_workflow_stats[wf_result.workflow_name].extend(wf_result.results)
+
         # 2. Merge WorkflowStats per workflow using Results.merge_results()
         merged_workflow_stats: list[WorkflowStats] = []
         aggregator = Results()
-        
+
         for workflow_name, stats_list in all_workflow_stats.items():
             if len(stats_list) > 1:
-                # Multiple DCs ran this workflow - merge their stats
+                # Multiple workers/DCs ran this workflow - merge their stats
                 merged = aggregator.merge_results(stats_list)
             elif len(stats_list) == 1:
                 merged = stats_list[0]
@@ -3996,8 +4187,229 @@ class GateServer(HealthAwareServer):
         if job_id in self._jobs:
             self._jobs[job_id].status = overall_status
 
-        # Clean up
+        # Start background reporter submission after DC aggregation
+        # Pass the merged workflow stats for reporting
+        if merged_workflow_stats:
+            self._start_background_reporter_submission(
+                job_id=job_id,
+                aggregated_stats=merged_workflow_stats,
+                callback_addr=callback,
+            )
+
+        # Clean up DC results (but not job submission - needed for reporter tasks)
         self._job_dc_results.pop(job_id, None)
+        self._workflow_dc_results.pop(job_id, None)
+
+    # =========================================================================
+    # Background Reporter Submission
+    # =========================================================================
+
+    def _start_background_reporter_submission(
+        self,
+        job_id: str,
+        aggregated_stats: list[WorkflowStats],
+        callback_addr: tuple[str, int] | None,
+    ) -> None:
+        """
+        Start background tasks to submit results to configured reporters.
+
+        Each reporter config gets its own background task that:
+        1. Connects to the reporter
+        2. Submits workflow and step results
+        3. Closes the reporter
+        4. Sends success/failure notification to client
+
+        Tasks are tracked per job for cleanup.
+
+        Args:
+            job_id: The job ID for tracking
+            aggregated_stats: List of aggregated WorkflowStats from all DCs
+            callback_addr: Client callback address for push notifications
+        """
+        submission = self._job_submissions.get(job_id)
+        if not submission or not submission.reporting_configs:
+            return
+
+        # Unpickle reporter configs
+        try:
+            reporter_configs = restricted_loads(submission.reporting_configs)
+            if not reporter_configs:
+                return
+            if not isinstance(reporter_configs, list):
+                reporter_configs = [reporter_configs]
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to unpickle reporter configs for job {job_id}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+
+        # Initialize task tracking for this job
+        if job_id not in self._job_reporter_tasks:
+            self._job_reporter_tasks[job_id] = {}
+
+        # Start a background task for each reporter
+        for config in reporter_configs:
+            reporter_type = config.reporter_type.value
+            task = asyncio.create_task(
+                self._submit_to_reporter(
+                    job_id=job_id,
+                    reporter_config=config,
+                    aggregated_stats=aggregated_stats,
+                    callback_addr=callback_addr,
+                )
+            )
+            self._job_reporter_tasks[job_id][reporter_type] = task
+
+            # Add cleanup callback when task completes
+            task.add_done_callback(
+                lambda t, jid=job_id, rt=reporter_type: self._on_reporter_task_complete(jid, rt, t)
+            )
+
+    def _on_reporter_task_complete(
+        self,
+        job_id: str,
+        reporter_type: str,
+        task: asyncio.Task,
+    ) -> None:
+        """Callback when a reporter task completes - remove from tracking."""
+        job_tasks = self._job_reporter_tasks.get(job_id)
+        if job_tasks and reporter_type in job_tasks:
+            del job_tasks[reporter_type]
+            # Clean up job entry if no more tasks
+            if not job_tasks:
+                del self._job_reporter_tasks[job_id]
+                # Also clean up submission since we no longer need it
+                self._job_submissions.pop(job_id, None)
+
+    async def _submit_to_reporter(
+        self,
+        job_id: str,
+        reporter_config,
+        aggregated_stats: list[WorkflowStats],
+        callback_addr: tuple[str, int] | None,
+    ) -> None:
+        """
+        Submit aggregated results to a single reporter.
+
+        Runs as a background task. Sends push notification to client
+        on success or failure.
+
+        For gates, we submit each workflow's merged stats. The reporter
+        receives multiple calls (one per workflow) with cross-DC aggregated data.
+
+        Args:
+            job_id: The job ID
+            reporter_config: The ReporterConfig instance
+            aggregated_stats: List of merged WorkflowStats (one per workflow)
+            callback_addr: Client callback for push notification
+        """
+        reporter_type = reporter_config.reporter_type.value
+        start_time = time.monotonic()
+        success = False
+        error_message: str | None = None
+
+        try:
+            reporter = Reporter(reporter_config)
+            await reporter.connect()
+
+            try:
+                # Submit each workflow's aggregated stats
+                for workflow_stats in aggregated_stats:
+                    await reporter.submit_workflow_results(workflow_stats)
+                    await reporter.submit_step_results(workflow_stats)
+                success = True
+            finally:
+                await reporter.close()
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Successfully submitted job {job_id} results to {reporter_type} ({len(aggregated_stats)} workflows)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        except Exception as e:
+            error_message = str(e)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to submit job {job_id} results to {reporter_type}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        elapsed = time.monotonic() - start_time
+
+        # Send push notification to client
+        if callback_addr:
+            await self._send_reporter_result_push(
+                job_id=job_id,
+                reporter_type=reporter_type,
+                success=success,
+                error=error_message,
+                elapsed_seconds=elapsed,
+                callback_addr=callback_addr,
+            )
+
+    async def _send_reporter_result_push(
+        self,
+        job_id: str,
+        reporter_type: str,
+        success: bool,
+        error: str | None,
+        elapsed_seconds: float,
+        callback_addr: tuple[str, int],
+    ) -> None:
+        """Send ReporterResultPush notification to client."""
+        push = ReporterResultPush(
+            job_id=job_id,
+            reporter_type=reporter_type,
+            success=success,
+            error=error,
+            elapsed_seconds=elapsed_seconds,
+            source="gate",
+            datacenter="",  # Gates span DCs, no single DC
+        )
+
+        try:
+            await self.send_tcp(
+                callback_addr,
+                "reporter_result_push",
+                push.dump(),
+                timeout=5.0,
+            )
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to send reporter result push to client {callback_addr}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    def _cleanup_reporter_tasks(self, job_id: str) -> None:
+        """Cancel and clean up any pending reporter tasks for a job."""
+        job_tasks = self._job_reporter_tasks.get(job_id)
+        if job_tasks:
+            for reporter_type, task in list(job_tasks.items()):
+                if not task.done():
+                    task.cancel()
+            del self._job_reporter_tasks[job_id]
+        # Also clean up submission
+        self._job_submissions.pop(job_id, None)
 
     # =========================================================================
     # TCP Handlers - Ping/Health Check

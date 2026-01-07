@@ -75,14 +75,28 @@ class ReporterResult:
 
 
 @dataclass
+class WorkflowDCResultClient:
+    """Per-datacenter workflow result for client-side tracking."""
+    datacenter: str
+    status: str
+    stats: Any = None  # WorkflowStats for this DC
+    error: str | None = None
+    elapsed_seconds: float = 0.0
+
+
+@dataclass
 class WorkflowResult:
     """Result of a completed workflow within a job."""
     workflow_id: str
     workflow_name: str
     status: str
-    stats: Any = None  # Aggregated WorkflowStats
+    stats: Any = None  # Aggregated WorkflowStats (cross-DC if from gate)
     error: str | None = None
     elapsed_seconds: float = 0.0
+    # Completion timestamp for ordering (Unix timestamp)
+    completed_at: float = 0.0
+    # Per-datacenter breakdown (populated for multi-DC jobs via gates)
+    per_dc_results: list[WorkflowDCResultClient] = field(default_factory=list)
 
 
 @dataclass
@@ -1180,14 +1194,31 @@ class HyperscaleClient(MercurySyncBaseServer):
 
         Called when a workflow completes with aggregated results.
         Updates the job's workflow_results for immediate access.
+
+        For multi-DC jobs (via gates), includes per_dc_results with per-datacenter breakdown.
+        For single-DC jobs (direct from manager), per_dc_results will be empty.
         """
         try:
             push = WorkflowResultPush.load(data)
 
             job = self._jobs.get(push.job_id)
             if job:
-                # Extract aggregated stats (should be single item list)
+                # Extract aggregated stats (should be single item list for client-bound)
                 stats = push.results[0] if push.results else None
+
+                # Convert per-DC results from message format to client format
+                per_dc_results: list[WorkflowDCResultClient] = []
+                for dc_result in push.per_dc_results:
+                    per_dc_results.append(WorkflowDCResultClient(
+                        datacenter=dc_result.datacenter,
+                        status=dc_result.status,
+                        stats=dc_result.stats,
+                        error=dc_result.error,
+                        elapsed_seconds=dc_result.elapsed_seconds,
+                    ))
+
+                # Use push.completed_at if provided, otherwise use current time
+                completed_at = push.completed_at if push.completed_at > 0 else time.time()
 
                 job.workflow_results[push.workflow_id] = WorkflowResult(
                     workflow_id=push.workflow_id,
@@ -1196,6 +1227,8 @@ class HyperscaleClient(MercurySyncBaseServer):
                     stats=stats,
                     error=push.error,
                     elapsed_seconds=push.elapsed_seconds,
+                    completed_at=completed_at,
+                    per_dc_results=per_dc_results,
                 )
 
             # Call user callback if registered
