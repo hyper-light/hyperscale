@@ -148,31 +148,30 @@ async def run_test():
     workers: list[WorkerServer] = []
     client: HyperscaleClient | None = None
 
-    # Counters for tracking push notifications
-    status_updates_received = 0
-    progress_updates_received = 0
-    workflow_results_received: dict[str, str] = {}  # workflow_name -> status
-    # Track which workflows we received progress stats for (workflow_name -> update count)
-    workflow_progress_counts: dict[str, int] = {}
+    # Container for tracking push notifications (avoids nonlocal anti-pattern)
+    counters: dict[str, int | dict] = {
+        'status_updates': 0,
+        'progress_updates': 0,
+        'workflow_results': {},  # workflow_name -> status
+        'workflow_progress_counts': {},  # workflow_name -> update count
+    }
 
     def on_status_update(push):
         """Callback for critical status updates (job status changes)."""
-        nonlocal status_updates_received
-        status_updates_received += 1
+        counters['status_updates'] += 1
 
     def on_progress_update(push: WindowedStatsPush):
         """Callback for streaming windowed stats updates."""
-        nonlocal progress_updates_received
-        progress_updates_received += 1
+        counters['progress_updates'] += 1
         # Track per-workflow progress updates
         workflow_name = push.workflow_name
         if workflow_name:
-            workflow_progress_counts[workflow_name] = workflow_progress_counts.get(workflow_name, 0) + 1
+            progress_counts = counters['workflow_progress_counts']
+            progress_counts[workflow_name] = progress_counts.get(workflow_name, 0) + 1
 
     def on_workflow_result(push):
         """Callback for workflow completion results."""
-        nonlocal workflow_results_received
-        workflow_results_received[push.workflow_name] = push.status
+        counters['workflow_results'][push.workflow_name] = push.status
 
     try:
         # ==============================================================
@@ -496,6 +495,7 @@ async def run_test():
 
         # Check workflow results received via callback
         expected_workflows = {'TestWorkflow', 'TestWorkflowTwo', 'NonTestWorkflow', 'NonTestWorkflowTwo'}
+        workflow_results_received = counters['workflow_results']
         received_workflows = set(workflow_results_received.keys())
 
         workflow_results_ok = received_workflows == expected_workflows
@@ -514,12 +514,14 @@ async def run_test():
         print(f"  Workflow results verification: {'PASS' if workflow_results_ok else 'FAIL'}")
 
         # Check streaming progress updates received (windowed stats)
+        progress_updates_received = counters['progress_updates']
         progress_updates_ok = progress_updates_received > 0
         print(f"\n  Progress updates received (windowed stats): {progress_updates_received}")
         print(f"  Progress updates verification (>0): {'PASS' if progress_updates_ok else 'FAIL'}")
 
         # Check per-workflow progress updates (should have stats for test workflows)
         # Test workflows (TestWorkflow, TestWorkflowTwo) run longer and should have progress
+        workflow_progress_counts = counters['workflow_progress_counts']
         test_workflow_progress_ok = (
             workflow_progress_counts.get('TestWorkflow', 0) > 0 and
             workflow_progress_counts.get('TestWorkflowTwo', 0) > 0
