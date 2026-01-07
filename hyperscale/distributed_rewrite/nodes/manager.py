@@ -4618,46 +4618,53 @@ class ManagerServer(HealthAwareServer):
         origin_gate = self._job_origin_gates.get(job_id)
         callback = self._job_callbacks.get(job_id)
 
+        # Build the push - gate gets raw stats, client gets aggregated (for tests) or raw (for non-tests)
+        destination = origin_gate or callback
+        if not destination:
+            return
+
+        results_to_send = self._prepare_workflow_results(all_workflow_stats, is_test_workflow, for_gate=bool(origin_gate))
+        push = WorkflowResultPush(
+            job_id=job_id,
+            workflow_id=parent_workflow_id,
+            workflow_name=workflow_name,
+            datacenter=self._node_id.datacenter,
+            status=status,
+            results=results_to_send,
+            error=error,
+            elapsed_seconds=max_elapsed,
+            is_test=is_test_workflow,
+        )
+
         if origin_gate:
-            # Gate job: forward raw stats for cross-DC aggregation
-            push = WorkflowResultPush(
-                job_id=job_id,
-                workflow_id=parent_workflow_id,
-                workflow_name=workflow_name,
-                datacenter=self._node_id.datacenter,
-                status=status,
-                results=all_workflow_stats,
-                error=error,
-                elapsed_seconds=max_elapsed,
-                is_test=is_test_workflow,
-            )
             await self._send_workflow_result_to_gate(push, origin_gate)
-
-        elif callback:
-            # Client job: aggregate only for test workflows, otherwise return raw stats
-            if is_test_workflow:
-                results_helper = Results()
-                if len(all_workflow_stats) > 1:
-                    aggregated = results_helper.merge_results(all_workflow_stats)
-                else:
-                    aggregated = all_workflow_stats[0] if all_workflow_stats else {}
-                results_to_send = [aggregated]
-            else:
-                # Non-test workflow: return unaggregated list of WorkflowStats
-                results_to_send = all_workflow_stats
-
-            push = WorkflowResultPush(
-                job_id=job_id,
-                workflow_id=parent_workflow_id,
-                workflow_name=workflow_name,
-                datacenter=self._node_id.datacenter,
-                status=status,
-                results=results_to_send,
-                error=error,
-                elapsed_seconds=max_elapsed,
-                is_test=is_test_workflow,
-            )
+        else:
             await self._send_workflow_result_to_client(push, callback)
+
+    def _prepare_workflow_results(
+        self,
+        all_workflow_stats: list[WorkflowStats],
+        is_test_workflow: bool,
+        for_gate: bool,
+    ) -> list[WorkflowStats]:
+        """
+        Prepare workflow results for sending to gate or client.
+
+        Gate: Always receives raw stats for cross-DC aggregation.
+        Client (test workflow): Receives aggregated stats.
+        Client (non-test workflow): Receives raw stats.
+        """
+        if for_gate or not is_test_workflow:
+            return all_workflow_stats
+
+        # Test workflow for client: aggregate results
+        if len(all_workflow_stats) > 1:
+            results_helper = Results()
+            aggregated = results_helper.merge_results(all_workflow_stats)
+        else:
+            aggregated = all_workflow_stats[0] if all_workflow_stats else {}
+
+        return [aggregated]
 
     async def _send_workflow_result_to_gate(
         self,
