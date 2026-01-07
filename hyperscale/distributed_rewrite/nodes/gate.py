@@ -281,6 +281,12 @@ class GateServer(HealthAwareServer):
         self._job_leaders: dict[str, str] = {}  # job_id -> leader_node_id
         self._job_leader_addrs: dict[str, tuple[str, int]] = {}  # job_id -> (host, tcp_port)
 
+        # Per-job per-DC manager leader tracking
+        # Tracks which manager accepted each job in each datacenter
+        # Used for routing queries to the authoritative manager for each job
+        # job_id -> {dc_id -> (manager_host, manager_tcp_port)}
+        self._job_dc_managers: dict[str, dict[str, tuple[str, int]]] = {}
+
         # Client push notification callbacks
         # job_id -> callback address for push notifications
         self._job_callbacks: dict[str, tuple[str, int]] = {}
@@ -426,18 +432,20 @@ class GateServer(HealthAwareServer):
     ) -> None:
         """
         Handle a gate peer becoming unavailable (detected via SWIM).
-        
+
         This is important for split-brain awareness:
         - If we lose contact with majority of peers, we should be cautious
         - Leadership re-election is automatic via LocalLeaderElection
+
+        Also handles per-job leadership takeover when the failed gate was leading jobs.
         """
         # Remove from active peers
         self._active_gate_peers.discard(tcp_addr)
-        
+
         # Check if this was the leader
         current_leader = self.get_current_leader()
         was_leader = current_leader == udp_addr
-        
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -448,11 +456,14 @@ class GateServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-        
+
+        # Handle job leadership takeover for jobs led by the failed gate
+        await self._handle_job_leader_failure(tcp_addr)
+
         # Log quorum status (gates don't use quorum for operations, but useful for monitoring)
         active_count = len(self._active_gate_peers) + 1  # Include self
         total_gates = len(self._gate_peers) + 1
-        
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -712,6 +723,68 @@ class GateServer(HealthAwareServer):
         """Get the TCP address of the job leader, or None if unknown."""
         return self._job_leader_addrs.get(job_id)
 
+    async def _handle_job_leader_failure(
+        self,
+        failed_gate_addr: tuple[str, int],
+    ) -> None:
+        """
+        Handle job leadership takeover when a gate fails.
+
+        When a gate that was leading jobs fails, another gate takes over
+        leadership for those jobs. This ensures jobs continue to be monitored
+        and results are properly aggregated.
+
+        Only takes over jobs that are not yet in a terminal state
+        (COMPLETED, FAILED, CANCELLED).
+        """
+        # Find all jobs led by the failed gate
+        orphaned_jobs: list[str] = []
+        for job_id, leader_addr in list(self._job_leader_addrs.items()):
+            if leader_addr == failed_gate_addr:
+                # Check if job is still active (not terminal)
+                job = self._jobs.get(job_id)
+                if job and job.status not in (
+                    JobStatus.COMPLETED.value,
+                    JobStatus.FAILED.value,
+                    JobStatus.CANCELLED.value,
+                ):
+                    orphaned_jobs.append(job_id)
+
+        if not orphaned_jobs:
+            return
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Taking over {len(orphaned_jobs)} jobs from failed gate at {failed_gate_addr}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # Take over leadership for each orphaned job
+        for job_id in orphaned_jobs:
+            # Update leadership to self
+            self._job_leaders[job_id] = self._node_id.full
+            self._job_leader_addrs[job_id] = (self._host, self._tcp_port)
+
+            # Broadcast new leadership to peer gates
+            target_dc_count = len(self._job_target_dcs.get(job_id, set()))
+            await self._broadcast_job_leadership(job_id, target_dc_count)
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Assumed leadership for job {job_id[:8]}...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        self._increment_version()
+
     async def _broadcast_job_leadership(
         self,
         job_id: str,
@@ -788,6 +861,8 @@ class GateServer(HealthAwareServer):
             # Include per-job leadership tracking for cross-gate sync
             job_leaders=dict(self._job_leaders),
             job_leader_addrs=dict(self._job_leader_addrs),
+            # Include per-job per-DC manager leaders for query routing
+            job_dc_managers={job_id: dict(dc_mgrs) for job_id, dc_mgrs in self._job_dc_managers.items()},
         )
     
     def _on_gate_become_leader(self) -> None:
@@ -916,6 +991,17 @@ class GateServer(HealthAwareServer):
                 # Also get the leader address if available
                 if job_id in snapshot.job_leader_addrs:
                     self._job_leader_addrs[job_id] = snapshot.job_leader_addrs[job_id]
+
+        # Merge per-job per-DC manager leaders
+        # Only add jobs we don't already have DC manager info for
+        for job_id, dc_managers in snapshot.job_dc_managers.items():
+            if job_id not in self._job_dc_managers:
+                self._job_dc_managers[job_id] = dict(dc_managers)
+            else:
+                # Merge DC managers we don't already have
+                for dc_id, manager_addr in dc_managers.items():
+                    if dc_id not in self._job_dc_managers[job_id]:
+                        self._job_dc_managers[job_id][dc_id] = manager_addr
 
         self._increment_version()
     
@@ -1745,30 +1831,31 @@ class GateServer(HealthAwareServer):
         job_id: str,
         dc: str,
         submission: JobSubmission,
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[bool, str | None, tuple[str, int] | None]:
         """
         Try to dispatch job to a single datacenter.
-        
+
         Iterates through managers in the DC, using _try_dispatch_to_manager
         which handles retries and circuit breakers.
-        
+
         Returns:
-            (success: bool, error: str | None)
-            - True if DC accepted (even if queued)
+            (success: bool, error: str | None, accepting_manager: tuple[str, int] | None)
+            - True if DC accepted (even if queued), with the accepting manager address
             - False only if DC is UNHEALTHY (should try fallback)
         """
         managers = self._datacenter_managers.get(dc, [])
-        
+
         for manager_addr in managers:
             success, error = await self._try_dispatch_to_manager(
                 manager_addr, submission
             )
             if success:
-                return (True, None)
+                # Return the accepting manager address for job leader tracking
+                return (True, None, manager_addr)
             # Continue to next manager
-        
+
         # All managers failed = DC is UNHEALTHY for this dispatch
-        return (False, f"All managers in {dc} failed to accept job")
+        return (False, f"All managers in {dc} failed to accept job", None)
     
     async def _dispatch_job_with_fallback(
         self,
@@ -1778,55 +1865,69 @@ class GateServer(HealthAwareServer):
     ) -> tuple[list[str], list[str]]:
         """
         Dispatch job to datacenters with automatic fallback.
-        
+
         Priority: HEALTHY > BUSY > DEGRADED
         Only fails if ALL DCs are UNHEALTHY.
-        
+
+        Also records per-DC job leader (the manager that accepted the job)
+        for routing queries to the authoritative manager.
+
         Args:
             submission: The job submission
             primary_dcs: Primary target DCs
             fallback_dcs: Fallback DCs to try if primary fails
-            
+
         Returns:
             (successful_dcs, failed_dcs)
         """
         successful = []
         failed = []
         fallback_queue = list(fallback_dcs)
-        
+        job_id = submission.job_id
+
+        # Initialize job DC managers tracking if needed
+        if job_id not in self._job_dc_managers:
+            self._job_dc_managers[job_id] = {}
+
         for dc in primary_dcs:
-            success, error = await self._try_dispatch_to_dc(
-                submission.job_id, dc, submission
+            success, error, accepting_manager = await self._try_dispatch_to_dc(
+                job_id, dc, submission
             )
-            
+
             if success:
                 successful.append(dc)
+                # Record the accepting manager as job leader for this DC
+                if accepting_manager:
+                    self._job_dc_managers[job_id][dc] = accepting_manager
             else:
                 # Try fallback
                 fallback_success = False
                 while fallback_queue:
                     fallback_dc = fallback_queue.pop(0)
-                    fb_success, fb_error = await self._try_dispatch_to_dc(
-                        submission.job_id, fallback_dc, submission
+                    fb_success, fb_error, fb_manager = await self._try_dispatch_to_dc(
+                        job_id, fallback_dc, submission
                     )
                     if fb_success:
                         successful.append(fallback_dc)
+                        # Record the accepting manager as job leader for fallback DC
+                        if fb_manager:
+                            self._job_dc_managers[job_id][fallback_dc] = fb_manager
                         fallback_success = True
                         self._task_runner.run(
                             self._udp_logger.log,
                             ServerInfo(
-                                message=f"Job {submission.job_id}: Fallback from {dc} to {fallback_dc}",
+                                message=f"Job {job_id}: Fallback from {dc} to {fallback_dc}",
                                 node_host=self._host,
                                 node_port=self._tcp_port,
                                 node_id=self._node_id.short,
                             )
                         )
                         break
-                
+
                 if not fallback_success:
                     # No fallback worked
                     failed.append(dc)
-        
+
         return (successful, failed)
     
     # =========================================================================
@@ -2739,6 +2840,7 @@ class GateServer(HealthAwareServer):
                     # Clean up per-job leadership tracking
                     self._job_leaders.pop(job_id, None)
                     self._job_leader_addrs.pop(job_id, None)
+                    self._job_dc_managers.pop(job_id, None)
                     # Clean up windowed stats for this job
                     await self._windowed_stats.cleanup_job_windows(job_id)
                     # Clean up reporter tasks and submissions
@@ -4893,11 +4995,11 @@ class GateServer(HealthAwareServer):
             # Query all datacenter leaders concurrently
             dc_results: dict[str, list[WorkflowStatusInfo]] = {}
 
-            async def query_dc(dc_id: str, leader_addr: tuple[str, int]) -> None:
-                """Query a single datacenter's leader manager."""
+            async def query_dc(dc_id: str, manager_addr: tuple[str, int]) -> None:
+                """Query a single datacenter's manager."""
                 try:
                     response_data, _ = await self.send_tcp(
-                        leader_addr,
+                        manager_addr,
                         "workflow_query",
                         request.dump(),
                         timeout=5.0,
@@ -4912,27 +5014,36 @@ class GateServer(HealthAwareServer):
                     # DC query failed - skip this DC
                     pass
 
+            # Get per-DC job leaders if this query has a job_id
+            # Job leaders are the managers that accepted the job in each DC
+            job_dc_managers = self._job_dc_managers.get(request.job_id, {}) if request.job_id else {}
+
             # Find a manager address for each datacenter
-            # Prefer the leader if one exists, otherwise use any healthy manager
-            # (workflow queries work against any manager since they have shared state)
+            # Priority: job leader > cluster leader > any healthy manager
             query_tasks = []
             for dc_id in self._datacenter_managers.keys():
-                manager_statuses = self._datacenter_manager_status.get(dc_id, {})
                 target_addr: tuple[str, int] | None = None
-                fallback_addr: tuple[str, int] | None = None
 
-                for manager_addr, heartbeat in manager_statuses.items():
-                    # Track any valid manager as fallback
-                    if fallback_addr is None:
-                        fallback_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
-                    # Prefer leader if available
-                    if heartbeat.is_leader:
-                        target_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
-                        break
+                # First priority: use job leader for this DC if known
+                if dc_id in job_dc_managers:
+                    target_addr = job_dc_managers[dc_id]
+                else:
+                    # Fall back to cluster leader or any healthy manager
+                    manager_statuses = self._datacenter_manager_status.get(dc_id, {})
+                    fallback_addr: tuple[str, int] | None = None
 
-                # Use leader if found, otherwise use any manager
-                if target_addr is None:
-                    target_addr = fallback_addr
+                    for manager_addr, heartbeat in manager_statuses.items():
+                        # Track any valid manager as fallback
+                        if fallback_addr is None:
+                            fallback_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+                        # Prefer cluster leader if available
+                        if heartbeat.is_leader:
+                            target_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+                            break
+
+                    # Use cluster leader if found, otherwise any manager
+                    if target_addr is None:
+                        target_addr = fallback_addr
 
                 if target_addr:
                     query_tasks.append(query_dc(dc_id, target_addr))

@@ -1335,6 +1335,8 @@ class GateStateSnapshot(Message):
     # Per-job leadership tracking (independent of SWIM cluster leadership)
     job_leaders: dict[str, str] = field(default_factory=dict)  # job_id -> leader_node_id
     job_leader_addrs: dict[str, tuple[str, int]] = field(default_factory=dict)  # job_id -> (host, tcp_port)
+    # Per-job per-DC manager leader tracking (which manager accepted each job in each DC)
+    job_dc_managers: dict[str, dict[str, tuple[str, int]]] = field(default_factory=dict)  # job_id -> {dc_id -> (host, port)}
 
 
 @dataclass(slots=True)
