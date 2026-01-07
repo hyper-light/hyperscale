@@ -345,7 +345,7 @@ class LocalServerPool:
                 if self._pool_task and not self._pool_task.done():
                     self._pool_task.cancel()
                     try:
-                        await asyncio.wait_for(self._pool_task, timeout=2.0)
+                        await asyncio.wait_for(self._pool_task, timeout=0.25)
                     except (asyncio.CancelledError, asyncio.TimeoutError):
                         pass
 
@@ -358,26 +358,7 @@ class LocalServerPool:
                     warnings.simplefilter("ignore")
 
                     if self._executor and self._executor._processes:
-                        # Terminate processes gracefully first
-                        for pid, proc in list(self._executor._processes.items()):
-                            if proc.is_alive():
-                                try:
-                                    proc.terminate()
-                                except Exception:
-                                    pass
-
-                        # Wait for graceful termination with timeout
-                        termination_deadline = asyncio.get_event_loop().time() + 2.0
-                        while asyncio.get_event_loop().time() < termination_deadline:
-                            alive_count = sum(
-                                1 for proc in self._executor._processes.values()
-                                if proc.is_alive()
-                            )
-                            if alive_count == 0:
-                                break
-                            await asyncio.sleep(0.1)
-
-                        # Force kill any remaining processes
+                        # Kill processes immediately - no graceful termination needed
                         for pid, proc in list(self._executor._processes.items()):
                             if proc.is_alive():
                                 try:

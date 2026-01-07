@@ -1125,66 +1125,54 @@ class TCPProtocol(Generic[T, K]):
         self._stream = False
         self._running = False
 
-        await self._shutdown_task
+        # Wait for shutdown task only if it exists and with a short timeout
+        if self._shutdown_task is not None:
+            try:
+                await asyncio.wait_for(self._shutdown_task, timeout=0.5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
 
         close_task = asyncio.current_task()
 
+        # Abort all client transports immediately
         for client in self._client_transports.values():
             client.abort()
 
         for tcp_socket in self._client_sockets.values():
             try:
                 tcp_socket.close()
-
             except Exception:
                 pass
 
         if self._server:
             try:
                 self._server.close()
-
             except Exception:
                 pass
 
         if self.server_socket:
             try:
                 self.server_socket.close()
-
             except Exception:
                 pass
 
-        if self._sleep_task:
-            try:
-                self._sleep_task.cancel()
-
-            except Exception:
-                pass
-
-            except asyncio.CancelledError:
-                pass
-
-        if self._cleanup_task:
-            try:
-                self._cleanup_task.cancel()
-
-            except Exception:
-                pass
-
-            except asyncio.CancelledError:
-                pass
+        # Cancel helper tasks
+        for task in [self._sleep_task, self._cleanup_task]:
+            if task is not None:
+                try:
+                    task.cancel()
+                except (Exception, asyncio.CancelledError):
+                    pass
 
         if self.tasks:
             self.tasks.abort()
 
-        for task in asyncio.all_tasks():
+        # Cancel all pending response tasks immediately (don't wait)
+        for task in list(self._pending_responses):
             try:
-                if task != close_task and task.cancelled() is False:
+                if not task.done():
                     task.cancel()
-
-            except Exception:
-                pass
-
-            except asyncio.CancelledError:
+            except (Exception, asyncio.CancelledError):
                 pass
 
         if self._run_future and (
@@ -1192,14 +1180,12 @@ class TCPProtocol(Generic[T, K]):
         ):
             try:
                 self._run_future.set_result(None)
-
-            except asyncio.InvalidStateError:
-                pass
-
-            except asyncio.CancelledError:
+            except (asyncio.InvalidStateError, asyncio.CancelledError):
                 pass
 
         self._pending_responses.clear()
+        self._client_transports.clear()
+        self._client_sockets.clear()
 
     def stop(self):
         self._shutdown_task = asyncio.ensure_future(self._shutdown())
@@ -1214,12 +1200,12 @@ class TCPProtocol(Generic[T, K]):
             if not task.done():
                 task.cancel()
 
-        # Wait for cancelled tasks to complete (with timeout to avoid hanging)
+        # Wait briefly for cancelled tasks (0.25s is enough for graceful cleanup)
         if pending_tasks:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*pending_tasks, return_exceptions=True),
-                    timeout=2.0,
+                    timeout=0.25,
                 )
             except asyncio.TimeoutError:
                 pass
@@ -1228,11 +1214,7 @@ class TCPProtocol(Generic[T, K]):
         if self._run_future:
             try:
                 self._run_future.set_result(None)
-
-            except asyncio.InvalidStateError:
-                pass
-
-            except asyncio.CancelledError:
+            except (asyncio.InvalidStateError, asyncio.CancelledError):
                 pass
 
     def abort(self):
