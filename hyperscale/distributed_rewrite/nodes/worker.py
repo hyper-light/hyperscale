@@ -1509,26 +1509,24 @@ class WorkerServer(HealthAwareServer):
         start_time = time.monotonic()
         run_id = hash(dispatch.workflow_id) % (2**31)
         error: Exception | None = None
-        final_result_sent = False
         workflow_error: str | None = None
+        workflow_results: dict = {}
+        context_updates: bytes = b''
+        progress_token = None
 
         try:
-            # Unpickle workflow and context
+            # Phase 1: Setup - unpickle workflow and context
             workflow = dispatch.load_workflow()
             context_dict = dispatch.load_context()
 
             progress.workflow_name = workflow.name
             self._increment_version()
-
-            # Track workflow_id -> workflow_name mapping for cancellation
             self._workflow_id_to_name[dispatch.workflow_id] = workflow.name
+            self._workflow_cores_completed[dispatch.workflow_id] = set()
 
             # Transition to RUNNING - sends immediate update (lifecycle event)
             await self._transition_workflow_status(progress, WorkflowStatus.RUNNING, start_time)
 
-            # Initialize cores_completed tracking
-            self._workflow_cores_completed[dispatch.workflow_id] = set()
-            
             # Start progress monitor
             progress_token = self._task_runner.run(
                 self._monitor_workflow_progress,
@@ -1538,121 +1536,55 @@ class WorkerServer(HealthAwareServer):
                 cancel_event,
                 alias=f"progress:{dispatch.workflow_id}",
             )
-            
 
-            workflow_results = {}
-            context_updates: bytes = b''
-            
-            try:
-                # Execute the workflow
-                (
-                    _,
-                    workflow_results,
-                    context,
-                    error,
-                    status,
-                ) = await self._remote_manger.execute_workflow(
-                    run_id,
-                    workflow,
-                    context_dict,
-                    allocated_vus,
-                    max(allocated_cores, 1),
-                )
-
-                progress.cores_completed = len(progress.assigned_cores)
-
-                # Determine final status and transition (sends immediate update)
-                if status != CoreWorkflowStatus.COMPLETED:
-                    workflow_error = str(error) if error else "Unknown error"
-                    await self._transition_workflow_status(progress, WorkflowStatus.FAILED, start_time)
-                else:
-                    await self._transition_workflow_status(progress, WorkflowStatus.COMPLETED, start_time)
-
-                # Serialize results and context for final result
-                context_updates = cloudpickle.dumps(context.dict() if context else {})
-
-            except asyncio.CancelledError:
-                workflow_error = "Cancelled"
-                await self._transition_workflow_status(progress, WorkflowStatus.CANCELLED, start_time)
-                raise
-            except Exception as e:
-                workflow_error = str(e)
-                await self._transition_workflow_status(progress, WorkflowStatus.FAILED, start_time)
-            finally:
-                # Cancel progress monitor using its token
-                if progress_token:
-                    await self._task_runner.cancel(progress_token.token)
-
-            # Free cores BEFORE sending final result so we can report accurate availability
-            await self._core_allocator.free(dispatch.workflow_id)
-
-            # Send final result to manager with updated core availability
-            final_result = WorkflowFinalResult(
-                job_id=dispatch.job_id,
-                workflow_id=dispatch.workflow_id,
-                workflow_name=progress.workflow_name,
-                status=progress.status,
-                results=workflow_results,
-                context_updates=context_updates,
-                error=workflow_error,
-                worker_id=self._node_id.full,
-                worker_available_cores=self._core_allocator.available_cores,
+            # Phase 2: Execute the workflow
+            (
+                _,
+                workflow_results,
+                context,
+                error,
+                status,
+            ) = await self._remote_manger.execute_workflow(
+                run_id,
+                workflow,
+                context_dict,
+                allocated_vus,
+                max(allocated_cores, 1),
             )
-            await self._send_final_result(final_result)
-            final_result_sent = True
+
+            progress.cores_completed = len(progress.assigned_cores)
+
+            # Phase 3: Determine final status and transition
+            if status != CoreWorkflowStatus.COMPLETED:
+                workflow_error = str(error) if error else "Unknown error"
+                await self._transition_workflow_status(progress, WorkflowStatus.FAILED, start_time)
+            else:
+                await self._transition_workflow_status(progress, WorkflowStatus.COMPLETED, start_time)
+
+            context_updates = cloudpickle.dumps(context.dict() if context else {})
 
         except asyncio.CancelledError:
-            # Status already transitioned by inner handler before re-raise
-            # Just ensure workflow_error is set for final result
-            if workflow_error is None:
-                workflow_error = "Cancelled"
-                # If cancelled before inner try block ran, status may not be set
-                if progress.status != WorkflowStatus.CANCELLED.value:
-                    progress.status = WorkflowStatus.CANCELLED.value
-                    progress.collected_at = time.time()
+            workflow_error = "Cancelled"
+            await self._transition_workflow_status(progress, WorkflowStatus.CANCELLED, start_time)
         except Exception as e:
-            # Exception may have occurred before or after status was transitioned
-            # Set status and error for final result
             workflow_error = str(e) if e else "Unknown error"
             error = e
-            if progress.status not in (WorkflowStatus.FAILED.value, WorkflowStatus.COMPLETED.value):
-                progress.status = WorkflowStatus.FAILED.value
-                progress.collected_at = time.time()
+            await self._transition_workflow_status(progress, WorkflowStatus.FAILED, start_time)
         finally:
-            # Free cores if not already freed (exception path)
-            if not final_result_sent:
-                await self._core_allocator.free(dispatch.workflow_id)
+            # Stop progress monitor
+            if progress_token:
+                await self._task_runner.cancel(progress_token.token)
 
-            # ALWAYS send final result to manager, even if we failed
-            # This ensures the manager can update workflow status and potentially retry
-            if not final_result_sent:
-                try:
-                    final_result = WorkflowFinalResult(
-                        job_id=dispatch.job_id,
-                        workflow_id=dispatch.workflow_id,
-                        workflow_name=progress.workflow_name,
-                        status=progress.status,
-                        results=b'',  # No results on failure
-                        context_updates=b'',  # No context on failure
-                        error=workflow_error,
-                        worker_id=self._node_id.full,
-                        worker_available_cores=self._core_allocator.available_cores,
-                    )
-                    await self._send_final_result(final_result)
-                except Exception as send_err:
-                    # Log but don't propagate - we tried our best
-                    self._task_runner.run(
-                        self._udp_logger.log,
-                        ServerError(
-                            message=f"Failed to send final result for {dispatch.workflow_id}: {send_err}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
+            # Free cores
+            await self._core_allocator.free(dispatch.workflow_id)
 
+            # Send final result to manager
+            await self._send_workflow_final_result(
+                dispatch, progress, workflow_results, context_updates, workflow_error
+            )
+
+            # Cleanup state
             self._increment_version()
-
             self._workflow_tokens.pop(dispatch.workflow_id, None)
             self._workflow_cancel_events.pop(dispatch.workflow_id, None)
             self._active_workflows.pop(dispatch.workflow_id, None)
@@ -1660,9 +1592,6 @@ class WorkerServer(HealthAwareServer):
             self._workflow_cores_completed.pop(dispatch.workflow_id, None)
             self._workflow_fence_tokens.pop(dispatch.workflow_id, None)
             self._workflow_id_to_name.pop(dispatch.workflow_id, None)
-
-            # Trigger cleanup of completed workflows in RemoteGraphManager
-            # The cleanup task checks terminal states - safe to call frequently
             self._remote_manger.start_server_cleanup()
 
         return (
@@ -2182,6 +2111,45 @@ class WorkerServer(HealthAwareServer):
             except Exception:
                 circuit.record_error()
     
+    async def _send_workflow_final_result(
+        self,
+        dispatch: WorkflowDispatch,
+        progress: WorkflowProgress,
+        workflow_results: dict,
+        context_updates: bytes,
+        workflow_error: str | None,
+    ) -> None:
+        """
+        Build and send final result to manager.
+
+        Encapsulates the final result creation and sending logic.
+        Logs but does not propagate errors from sending.
+        """
+        final_result = WorkflowFinalResult(
+            job_id=dispatch.job_id,
+            workflow_id=dispatch.workflow_id,
+            workflow_name=progress.workflow_name,
+            status=progress.status,
+            results=workflow_results if workflow_results else b'',
+            context_updates=context_updates if context_updates else b'',
+            error=workflow_error,
+            worker_id=self._node_id.full,
+            worker_available_cores=self._core_allocator.available_cores,
+        )
+
+        try:
+            await self._send_final_result(final_result)
+        except Exception as send_err:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerError(
+                    message=f"Failed to send final result for {dispatch.workflow_id}: {send_err}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
     async def _send_final_result(
         self,
         final_result: WorkflowFinalResult,
