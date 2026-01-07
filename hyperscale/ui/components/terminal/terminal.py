@@ -370,11 +370,12 @@ class Terminal:
                 self._writer.write(frame)
                 await self._writer.drain()
 
-                if self._stdout_lock.locked():
-                    self._stdout_lock.release()
-
             except Exception:
                 pass
+
+            finally:
+                if self._stdout_lock.locked():
+                    self._stdout_lock.release()
 
             # Wait for either a render signal or the interval timeout
             try:
