@@ -204,16 +204,16 @@ class Env(BaseModel):
     # ==========================================================================
     # Time-Windowed Stats Streaming Settings
     # ==========================================================================
-    STATS_WINDOW_SIZE_MS: StrictFloat = 100.0  # Window bucket size in milliseconds
-    # Drift tolerance must be >= WORKER_PROGRESS_FLUSH_INTERVAL to allow for buffering delay
-    # Workers collect at collected_at timestamp, but send up to flush_interval later
-    STATS_DRIFT_TOLERANCE_MS: StrictFloat = 150.0  # Must exceed worker flush interval (100ms) + network latency
-    STATS_PUSH_INTERVAL_MS: StrictFloat = 100.0  # How often to flush windows and push (ms)
+    STATS_WINDOW_SIZE_MS: StrictFloat = 50.0  # Window bucket size in milliseconds (smaller = more granular)
+    # Drift tolerance allows for network latency between worker send and manager receive
+    # Workers now send directly (not buffered), so we only need network latency margin
+    STATS_DRIFT_TOLERANCE_MS: StrictFloat = 25.0  # Network latency allowance only
+    STATS_PUSH_INTERVAL_MS: StrictFloat = 50.0  # How often to flush windows and push (ms)
     STATS_MAX_WINDOW_AGE_MS: StrictFloat = 5000.0  # Max age before window is dropped (cleanup)
 
     # Client rate limiting for progress updates only
-    CLIENT_PROGRESS_RATE_LIMIT: StrictFloat = 20.0  # Max progress callbacks per second
-    CLIENT_PROGRESS_BURST: StrictInt = 5  # Burst allowance for progress callbacks
+    CLIENT_PROGRESS_RATE_LIMIT: StrictFloat = 100.0  # Max progress callbacks per second
+    CLIENT_PROGRESS_BURST: StrictInt = 20  # Burst allowance for progress callbacks
 
     # ==========================================================================
     # Cross-DC Correlation Settings (Phase 7)
