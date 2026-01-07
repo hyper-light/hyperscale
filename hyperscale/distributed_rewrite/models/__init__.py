@@ -22,6 +22,7 @@ from .distributed import (
     ManagerState as ManagerState,
     GateState as GateState,
     DatacenterHealth as DatacenterHealth,
+    DatacenterRegistrationStatus as DatacenterRegistrationStatus,
     UpdateTier as UpdateTier,
     # Node identity (Worker <-> Manager)
     NodeInfo as NodeInfo,
@@ -123,6 +124,9 @@ from .distributed import (
     DatacenterWorkflowStatus as DatacenterWorkflowStatus,
     GateWorkflowQueryResponse as GateWorkflowQueryResponse,
     EagerWorkflowEntry as EagerWorkflowEntry,
+    # Datacenter registration state (Gate-side tracking)
+    ManagerRegistrationState as ManagerRegistrationState,
+    DatacenterRegistrationState as DatacenterRegistrationState,
     # Datacenter list query
     DatacenterListRequest as DatacenterListRequest,
     DatacenterListResponse as DatacenterListResponse,

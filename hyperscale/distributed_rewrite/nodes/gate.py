@@ -71,6 +71,8 @@ from hyperscale.distributed_rewrite.models import (
     DatacenterLease,
     LeaseTransfer,
     DatacenterHealth,
+    DatacenterRegistrationStatus,
+    DatacenterRegistrationState,
     DatacenterStatus,
     UpdateTier,
     PingRequest,
@@ -184,7 +186,17 @@ class GateServer(HealthAwareServer):
         # Datacenter -> manager addresses mapping
         self._datacenter_managers = datacenter_managers or {}  # TCP
         self._datacenter_manager_udp = datacenter_manager_udp or {}  # UDP for SWIM
-        
+
+        # Per-DC registration state tracking (AD-27: Explicit Registration with Readiness Gating)
+        # Tracks which managers have sent heartbeats and quorum status per DC.
+        # Health classification only applies to DCs with READY registration status.
+        self._dc_registration_states: dict[str, DatacenterRegistrationState] = {}
+        for dc_id, manager_addrs in self._datacenter_managers.items():
+            self._dc_registration_states[dc_id] = DatacenterRegistrationState(
+                dc_id=dc_id,
+                configured_managers=list(manager_addrs),
+            )
+
         # Per-manager circuit breakers for dispatch failures
         # Key is manager TCP address tuple, value is ErrorStats
         self._manager_circuits: dict[tuple[str, int], ErrorStats] = {}
@@ -1196,11 +1208,19 @@ class GateServer(HealthAwareServer):
         )
     
     def _get_all_datacenter_health(self) -> dict[str, DatacenterStatus]:
-        """Get health classification for all configured datacenters."""
-        return {
-            dc_id: self._classify_datacenter_health(dc_id)
-            for dc_id in self._datacenter_managers.keys()
-        }
+        """
+        Get health classification for all registered datacenters.
+
+        Only classifies DCs that have achieved READY or PARTIAL registration
+        status (AD-27). DCs that are still AWAITING_INITIAL or INITIALIZING
+        are excluded from health classification to prevent false UNHEALTHY
+        classifications during startup.
+        """
+        result: dict[str, DatacenterStatus] = {}
+        for dc_id in self._datacenter_managers.keys():
+            if self._is_dc_ready_for_health_classification(dc_id):
+                result[dc_id] = self._classify_datacenter_health(dc_id)
+        return result
 
     # =========================================================================
     # Three-Signal Manager Health (AD-19)
@@ -1392,6 +1412,87 @@ class GateServer(HealthAwareServer):
         """
         self._overload_detector.record_latency(latency_ms)
 
+    def _record_manager_heartbeat(
+        self,
+        dc_id: str,
+        manager_addr: tuple[str, int],
+        node_id: str,
+        generation: int,
+    ) -> None:
+        """
+        Record a manager heartbeat for DC registration state tracking (AD-27).
+
+        This updates the per-DC registration state to track which managers
+        have sent heartbeats. DCs transition through registration states:
+        - AWAITING_INITIAL → INITIALIZING (first heartbeat)
+        - INITIALIZING → READY (quorum of managers)
+        - READY → PARTIAL (below quorum)
+        - PARTIAL → UNAVAILABLE (all stale)
+
+        Args:
+            dc_id: Datacenter ID
+            manager_addr: Manager TCP address tuple
+            node_id: Manager's node ID (for detecting restarts)
+            generation: Manager's generation/version (for detecting restarts)
+        """
+        now = time.monotonic()
+
+        # Ensure DC registration state exists (for dynamically discovered DCs)
+        if dc_id not in self._dc_registration_states:
+            self._dc_registration_states[dc_id] = DatacenterRegistrationState(
+                dc_id=dc_id,
+                configured_managers=[manager_addr],
+            )
+        else:
+            # Add manager to configured list if not already present
+            dc_state = self._dc_registration_states[dc_id]
+            if manager_addr not in dc_state.configured_managers:
+                dc_state.configured_managers.append(manager_addr)
+
+        # Record the heartbeat
+        dc_state = self._dc_registration_states[dc_id]
+        is_restart = dc_state.record_heartbeat(manager_addr, node_id, generation, now)
+
+        # Debug: Print registration status after each heartbeat
+        status = dc_state.get_registration_status(now)
+        active_count = dc_state.get_active_manager_count(now)
+        configured_count = len(dc_state.configured_managers)
+        print(f"[GATE {self._node_id.short}] DC {dc_id} heartbeat from {manager_addr}: status={status.value}, active={active_count}/{configured_count}")
+
+        if is_restart:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Manager restart detected: {node_id} in DC {dc_id} (gen={generation})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    def _get_dc_registration_status(self, dc_id: str) -> DatacenterRegistrationStatus:
+        """
+        Get the current registration status for a datacenter.
+
+        Returns AWAITING_INITIAL if DC is not in registration states.
+        """
+        if dc_id not in self._dc_registration_states:
+            return DatacenterRegistrationStatus.AWAITING_INITIAL
+        return self._dc_registration_states[dc_id].get_registration_status(time.monotonic())
+
+    def _is_dc_ready_for_health_classification(self, dc_id: str) -> bool:
+        """
+        Check if a datacenter is ready for health classification.
+
+        A DC is ready when it has achieved READY registration status,
+        meaning a quorum of configured managers have sent heartbeats.
+        """
+        status = self._get_dc_registration_status(dc_id)
+        return status in (
+            DatacenterRegistrationStatus.READY,
+            DatacenterRegistrationStatus.PARTIAL,
+        )
+
     def _get_load_shedding_metrics(self) -> dict:
         """Get load shedding metrics for monitoring."""
         return {
@@ -1474,34 +1575,40 @@ class GateServer(HealthAwareServer):
     ) -> tuple[list[str], list[str], str]:
         """
         Select datacenters with fallback list for resilient routing.
-        
+
         Routing Rules (evaluated in order):
         - UNHEALTHY: Fallback to non-UNHEALTHY DC, else fail job with error
-        - DEGRADED: Fallback to non-DEGRADED DC, else queue with warning  
+        - DEGRADED: Fallback to non-DEGRADED DC, else queue with warning
         - BUSY: Fallback to HEALTHY DC, else queue
         - HEALTHY: Enqueue (preferred)
-        
+
         Args:
             count: Number of primary DCs to select
             preferred: Optional list of preferred DCs
-            
+
         Returns:
             (primary_dcs, fallback_dcs, worst_health)
             worst_health indicates the worst state we had to accept:
             - "healthy": All selected DCs are healthy
             - "busy": Had to accept BUSY DCs (no HEALTHY available)
             - "degraded": Had to accept DEGRADED DCs (no HEALTHY/BUSY available)
-            - "unhealthy": All DCs are unhealthy (job should fail)
+            - "unhealthy": All registered DCs are unhealthy (job should fail)
+            - "initializing": No DCs have completed registration yet (retry later)
         """
-        # Classify all DCs
+        # Classify all registered DCs (AD-27: only DCs with READY/PARTIAL status)
         dc_health = self._get_all_datacenter_health()
-        
+
+        # Check if we have any configured DCs that are still initializing
+        # This distinguishes "no healthy DCs" from "DCs still starting up"
+        configured_dc_count = len(self._datacenter_managers)
+        registered_dc_count = len(dc_health)
+
         # Bucket by health
         healthy: list[tuple[str, DatacenterStatus]] = []
         busy: list[tuple[str, DatacenterStatus]] = []
         degraded: list[tuple[str, DatacenterStatus]] = []
         unhealthy_count = 0
-        
+
         for dc_id, status in dc_health.items():
             if status.health == DatacenterHealth.HEALTHY.value:
                 healthy.append((dc_id, status))
@@ -1511,21 +1618,21 @@ class GateServer(HealthAwareServer):
                 degraded.append((dc_id, status))
             else:  # UNHEALTHY
                 unhealthy_count += 1
-        
+
         # Sort healthy by capacity (highest first)
         healthy.sort(key=lambda x: x[1].available_capacity, reverse=True)
-        
+
         # Extract just DC IDs
         healthy_ids = [dc for dc, _ in healthy]
         busy_ids = [dc for dc, _ in busy]
         degraded_ids = [dc for dc, _ in degraded]
-        
+
         # Respect preferences within healthy
         if preferred:
             preferred_healthy = [dc for dc in preferred if dc in healthy_ids]
             other_healthy = [dc for dc in healthy_ids if dc not in preferred]
             healthy_ids = preferred_healthy + other_healthy
-        
+
         # Determine worst health we need to accept
         if healthy_ids:
             worst_health = "healthy"
@@ -1535,19 +1642,24 @@ class GateServer(HealthAwareServer):
             worst_health = "degraded"
         else:
             worst_health = "unhealthy"
-        
+
         # Build selection: HEALTHY first, then BUSY, then DEGRADED
         all_usable = healthy_ids + busy_ids + degraded_ids
-        
+
         if len(all_usable) == 0:
-            # All DCs are UNHEALTHY - will cause job failure
+            # No usable DCs - determine why
+            if registered_dc_count == 0 and configured_dc_count > 0:
+                # DCs are configured but none have completed registration
+                # This is a startup scenario - client should retry
+                return ([], [], "initializing")
+            # All registered DCs are UNHEALTHY - job should fail
             return ([], [], "unhealthy")
-        
+
         # Primary = first `count` DCs
         primary = all_usable[:count]
         # Fallback = remaining usable DCs
         fallback = all_usable[count:]
-        
+
         return (primary, fallback, worst_health)
     
     def _select_datacenters(
@@ -2845,27 +2957,33 @@ class GateServer(HealthAwareServer):
     ):
         """
         Handle manager status update via TCP.
-        
+
         This is NOT a healthcheck - DC liveness is tracked via per-manager heartbeat freshness.
         This contains job progress and worker capacity information.
-        
+
         Stored per-datacenter, per-manager to enable proper aggregation.
+
+        Also updates DC registration state for registration status tracking (AD-27).
         """
         try:
             status = ManagerHeartbeat.load(data)
-            
+
             # Store per-datacenter, per-manager using manager's self-reported address
             # (TCP source addr is ephemeral, not the manager's listening address)
             dc = status.datacenter
             manager_addr = (status.tcp_host, status.tcp_port)
-            
+
             if dc not in self._datacenter_manager_status:
                 self._datacenter_manager_status[dc] = {}
             self._datacenter_manager_status[dc][manager_addr] = status
             self._manager_last_status[manager_addr] = time.monotonic()
-            
+
+            # Update DC registration state (AD-27)
+            # Use version as generation proxy - detects restarts via node_id change
+            self._record_manager_heartbeat(dc, manager_addr, status.node_id, status.version)
+
             return b'ok'
-            
+
         except Exception as e:
             await self.handle_exception(e, "manager_status_update")
             return b'error'
@@ -2901,6 +3019,10 @@ class GateServer(HealthAwareServer):
             if manager_addr not in self._datacenter_managers[dc]:
                 self._datacenter_managers[dc].append(manager_addr)
             
+            # Update DC registration state (AD-27)
+            # Use version as generation proxy - detects restarts via node_id change
+            self._record_manager_heartbeat(dc, manager_addr, heartbeat.node_id, heartbeat.version)
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
@@ -2910,7 +3032,7 @@ class GateServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-            
+
             # Return ack with all healthy gates
             response = ManagerRegistrationResponse(
                 accepted=True,
@@ -3082,17 +3204,39 @@ class GateServer(HealthAwareServer):
                     required_quorum=self._quorum_size(),
                 )
             
-            # Select datacenters
-            target_dcs = self._select_datacenters(
+            # Select datacenters with fallback support
+            primary_dcs, fallback_dcs, worst_health = self._select_datacenters_with_fallback(
                 submission.datacenter_count,
                 submission.datacenters if submission.datacenters else None,
             )
-            
-            if not target_dcs:
+
+            # If DCs are still initializing (no manager heartbeats yet), return retryable error
+            if worst_health == "initializing":
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"Job {submission.job_id}: Datacenters still initializing - client should retry",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
                 ack = JobAck(
                     job_id=submission.job_id,
                     accepted=False,
-                    error="No available datacenters",
+                    error="initializing",  # Client will retry
+                )
+                return ack.dump()
+
+            # Use primary_dcs as target_dcs
+            target_dcs = primary_dcs
+
+            if not target_dcs:
+                # All DCs are unhealthy (not initializing, actually unhealthy)
+                ack = JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error="No available datacenters - all unhealthy",
                 )
                 return ack.dump()
             
@@ -3205,11 +3349,28 @@ class GateServer(HealthAwareServer):
         self._increment_version()
         
         # Get primary and fallback DCs based on health classification
+        # Note: "initializing" case is normally handled in job_submission before this method is called.
+        # However, if DC state changes between job acceptance and dispatch, we handle it here too.
         primary_dcs, fallback_dcs, worst_health = self._select_datacenters_with_fallback(
             len(target_dcs),
             target_dcs if target_dcs else None,
         )
-        
+
+        # If DCs regressed to initializing (rare race condition), mark job pending
+        if worst_health == "initializing":
+            job.status = JobStatus.PENDING.value
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Job {submission.job_id}: DCs became initializing after acceptance (race) - waiting",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            # Don't fail - the job was accepted, we'll retry dispatch when DCs are ready
+            return
+
         # If ALL DCs are UNHEALTHY, fail immediately
         if worst_health == "unhealthy":
             job.status = JobStatus.FAILED.value

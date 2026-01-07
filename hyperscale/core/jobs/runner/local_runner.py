@@ -11,7 +11,7 @@ import psutil
 
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph import Workflow
-from hyperscale.core.jobs.graphs.remote_graph_manager_rewrite import RemoteGraphManager
+from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
 from hyperscale.core.jobs.models import Env, TerminalMode
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (

@@ -422,11 +422,13 @@ class WorkerPool:
 
     def get_total_available_cores(self) -> int:
         """Get total available cores across all healthy workers."""
-        return sum(
+        total = sum(
             worker.available_cores - worker.reserved_cores
             for worker in self._workers.values()
             if self.is_worker_healthy(worker.node_id)
         )
+
+        return total
 
     async def allocate_cores(
         self,
@@ -448,6 +450,7 @@ class WorkerPool:
         Returns:
             List of (node_id, cores) tuples, or None if timeout
         """
+
         start_time = time.monotonic()
 
         while True:

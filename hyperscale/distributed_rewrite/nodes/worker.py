@@ -426,7 +426,9 @@ class WorkerServer(HealthAwareServer):
         # Start the underlying server (TCP/UDP listeners, task runner, etc.)
         # Uses SWIM settings from Env configuration
         await self.start_server(init_context=self.env.get_swim_init_context())
-        
+
+        # Mark as started for stop() guard
+        self._started = True
 
         """Start the worker server and register with managers."""
         if timeout is None:
@@ -451,6 +453,10 @@ class WorkerServer(HealthAwareServer):
             self._local_udp_port,
             self._local_env,
         )
+
+        # Register callback for instant core availability notifications
+        # This enables event-driven dispatch when workflows complete
+        self._remote_manger.set_on_cores_available(self._on_cores_available)
 
         # IMPORTANT: leader_address must match where RemoteGraphManager is listening
         # This was previously using self._udp_port which caused workers to connect
@@ -759,6 +765,11 @@ class WorkerServer(HealthAwareServer):
         broadcast_leave: bool = True
     ) -> None:
         """Stop the worker server."""
+        # Guard against stopping a server that was never started
+        # _running is False by default and only set to True in start()
+        if not self._running and not hasattr(self, '_started'):
+            return
+
         # Set _running to False early to stop all background loops
         # This ensures progress monitors and flush loop exit their while loops
         self._running = False
@@ -1527,7 +1538,6 @@ class WorkerServer(HealthAwareServer):
             
             try:
                 # Execute the workflow
- 
                 (
                     _,
                     workflow_results,
@@ -1543,7 +1553,6 @@ class WorkerServer(HealthAwareServer):
                 )
 
                 progress.cores_completed = len(progress.assigned_cores)
-
 
                 progress.status = WorkflowStatus.COMPLETED.value
                 if status != CoreWorkflowStatus.COMPLETED:
@@ -1581,7 +1590,7 @@ class WorkerServer(HealthAwareServer):
                 workflow_id=dispatch.workflow_id,
                 workflow_name=progress.workflow_name,
                 status=progress.status,
-                results=list(workflow_results.values()),
+                results=workflow_results,
                 context_updates=context_updates,
                 error=workflow_error,
                 worker_id=self._node_id.full,
@@ -1860,6 +1869,57 @@ class WorkerServer(HealthAwareServer):
             self._backpressure_delay_ms,
             signal.suggested_delay_ms,
         )
+
+    def _on_cores_available(self, available_cores: int) -> None:
+        """
+        Callback invoked by RemoteGraphManager when cores become available.
+
+        Immediately notifies the Manager so it can dispatch waiting workflows.
+        This enables event-driven dispatch instead of polling-based.
+
+        Args:
+            available_cores: Number of cores now available
+        """
+        if not self._running or available_cores <= 0:
+            return
+
+        # Update the core allocator first
+        # Note: free_subset is async but we're in a sync callback,
+        # so we schedule it on the event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Schedule the async notification
+                loop.create_task(self._notify_manager_cores_available(available_cores))
+        except RuntimeError:
+            pass  # Event loop not available, skip notification
+
+    async def _notify_manager_cores_available(self, available_cores: int) -> None:
+        """
+        Send immediate core availability notification to Manager.
+
+        Creates a lightweight heartbeat with current core status and sends
+        it directly to trigger workflow dispatch.
+        """
+        if not self._healthy_manager_ids:
+            return
+
+        try:
+            # Create heartbeat with current state
+            heartbeat = self._get_heartbeat()
+
+            # Send to primary manager via TCP
+            manager_addr = self._get_primary_manager_tcp_addr()
+            if manager_addr:
+                await self.send_tcp(
+                    manager_addr,
+                    "worker_heartbeat",
+                    heartbeat.dump(),
+                    timeout=1.0,
+                )
+        except Exception:
+            # Best effort - don't fail if notification fails
+            pass
 
     async def _dead_manager_reap_loop(self) -> None:
         """

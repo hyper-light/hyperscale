@@ -27,7 +27,7 @@ def _atexit_cleanup():
 
 atexit.register(_atexit_cleanup)
 
-from hyperscale.core.jobs.graphs.remote_graph_controller_rewrite import (
+from hyperscale.core.jobs.graphs.remote_graph_controller import (
     RemoteGraphController,
 )
 from hyperscale.core.jobs.models import Env

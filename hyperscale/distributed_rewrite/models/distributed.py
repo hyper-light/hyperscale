@@ -99,17 +99,39 @@ class GateState(str, Enum):
 class DatacenterHealth(str, Enum):
     """
     Health classification for datacenter routing decisions.
-    
+
     Key insight: BUSY ≠ UNHEALTHY
     - BUSY = transient, will clear when workflows complete → accept job (queued)
     - UNHEALTHY = structural problem, requires intervention → try fallback
-    
+
     See AD-16 in docs/architecture.md for design rationale.
     """
     HEALTHY = "healthy"      # Managers responding, workers available, capacity exists
     BUSY = "busy"            # Managers responding, workers available, no immediate capacity
     DEGRADED = "degraded"    # Some managers responding, reduced capacity
     UNHEALTHY = "unhealthy"  # No managers responding OR all workers down
+
+
+class DatacenterRegistrationStatus(str, Enum):
+    """
+    Registration status for a datacenter (distinct from health).
+
+    Registration tracks whether managers have announced themselves to the gate.
+    Health classification only applies to READY datacenters.
+
+    State machine:
+      AWAITING_INITIAL → (first heartbeat) → INITIALIZING
+      INITIALIZING → (quorum heartbeats) → READY
+      INITIALIZING → (grace period, no quorum) → UNAVAILABLE
+      READY → (heartbeats continue) → READY
+      READY → (heartbeats stop, < quorum) → PARTIAL
+      READY → (all heartbeats stop) → UNAVAILABLE
+    """
+    AWAITING_INITIAL = "awaiting_initial"  # Configured but no heartbeats received yet
+    INITIALIZING = "initializing"          # Some managers registered, waiting for quorum
+    READY = "ready"                        # Quorum of managers registered, health classification applies
+    PARTIAL = "partial"                    # Was ready, now below quorum (degraded but not lost)
+    UNAVAILABLE = "unavailable"            # Was ready, lost all heartbeats (need recovery)
 
 
 class UpdateTier(str, Enum):
@@ -1817,4 +1839,169 @@ class EagerWorkflowEntry:
     dependencies: set[str]               # Set of workflow names this depends on
     completed_dependencies: set[str] = field(default_factory=set)  # Dependencies that have completed
     dispatched: bool = False             # Whether this workflow has been dispatched
-    cores_allocated: int = 0             # Cores allocated (set at dispatch time)
+
+
+# =============================================================================
+# Datacenter Registration State (Gate-side tracking)
+# =============================================================================
+
+@dataclass(slots=True)
+class ManagerRegistrationState:
+    """
+    Per-manager registration state tracked by a Gate.
+
+    Tracks when each manager registered and heartbeat patterns for
+    adaptive staleness detection. Generation IDs handle manager restarts.
+    """
+    manager_addr: tuple[str, int]        # (host, tcp_port)
+    node_id: str | None = None           # Manager's node_id (from first heartbeat)
+    generation: int = 0                  # Increments on manager restart (from heartbeat)
+
+    # Timing
+    first_seen_at: float = 0.0           # monotonic time of first heartbeat
+    last_heartbeat_at: float = 0.0       # monotonic time of most recent heartbeat
+
+    # Heartbeat interval tracking (for adaptive staleness)
+    heartbeat_count: int = 0             # Total heartbeats received
+    avg_heartbeat_interval: float = 5.0  # Running average interval (seconds)
+
+    @property
+    def is_registered(self) -> bool:
+        """Manager has sent at least one heartbeat."""
+        return self.first_seen_at > 0
+
+    def is_stale(self, now: float, staleness_multiplier: float = 3.0) -> bool:
+        """
+        Check if manager is stale based on adaptive interval.
+
+        A manager is stale if no heartbeat received for staleness_multiplier
+        times the average heartbeat interval.
+        """
+        if not self.is_registered:
+            return False
+        expected_interval = max(self.avg_heartbeat_interval, 1.0)
+        return (now - self.last_heartbeat_at) > (staleness_multiplier * expected_interval)
+
+    def record_heartbeat(self, now: float, node_id: str, generation: int) -> bool:
+        """
+        Record a heartbeat from this manager.
+
+        Returns True if this is a new generation (manager restarted).
+        """
+        is_new_generation = generation > self.generation
+
+        if is_new_generation or not self.is_registered:
+            # New registration or restart - reset state
+            self.node_id = node_id
+            self.generation = generation
+            self.first_seen_at = now
+            self.heartbeat_count = 1
+            self.avg_heartbeat_interval = 5.0  # Reset to default
+        else:
+            # Update running average of heartbeat interval
+            if self.last_heartbeat_at > 0:
+                interval = now - self.last_heartbeat_at
+                # Exponential moving average (alpha = 0.2)
+                self.avg_heartbeat_interval = 0.8 * self.avg_heartbeat_interval + 0.2 * interval
+            self.heartbeat_count += 1
+
+        self.last_heartbeat_at = now
+        return is_new_generation
+
+
+@dataclass(slots=True)
+class DatacenterRegistrationState:
+    """
+    Per-datacenter registration state tracked by a Gate.
+
+    Tracks which managers have registered and provides registration status
+    based on quorum requirements. Health classification only applies once
+    the datacenter is READY.
+    """
+    dc_id: str                                                      # Datacenter identifier
+    configured_managers: list[tuple[str, int]]                      # Manager addrs from config
+
+    # Per-manager tracking
+    manager_states: dict[tuple[str, int], ManagerRegistrationState] = field(default_factory=dict)
+
+    # Timing
+    first_heartbeat_at: float = 0.0      # When first manager registered (monotonic)
+    last_heartbeat_at: float = 0.0       # Most recent heartbeat from any manager (monotonic)
+
+    def get_registration_status(self, now: float, staleness_multiplier: float = 3.0) -> DatacenterRegistrationStatus:
+        """
+        Compute current registration status based on manager heartbeats.
+
+        Uses quorum (majority) of configured managers as the threshold
+        for READY status.
+        """
+        configured_count = len(self.configured_managers)
+        if configured_count == 0:
+            return DatacenterRegistrationStatus.UNAVAILABLE
+
+        # Count non-stale registered managers
+        active_count = sum(
+            1 for state in self.manager_states.values()
+            if state.is_registered and not state.is_stale(now, staleness_multiplier)
+        )
+
+        quorum = configured_count // 2 + 1
+
+        if active_count == 0:
+            if self.first_heartbeat_at == 0:
+                # Never received any heartbeats
+                return DatacenterRegistrationStatus.AWAITING_INITIAL
+            else:
+                # Had heartbeats before but all are now stale/lost
+                return DatacenterRegistrationStatus.UNAVAILABLE
+        elif active_count < quorum:
+            if self.first_heartbeat_at == 0 or self._was_ever_ready():
+                # Was ready before, now below quorum
+                return DatacenterRegistrationStatus.PARTIAL
+            else:
+                # Still coming up, not yet at quorum
+                return DatacenterRegistrationStatus.INITIALIZING
+        else:
+            # At or above quorum
+            return DatacenterRegistrationStatus.READY
+
+    def _was_ever_ready(self) -> bool:
+        """Check if this DC ever had quorum (any manager with heartbeat_count > 1)."""
+        # If any manager has received multiple heartbeats, we were likely ready before
+        return any(
+            state.heartbeat_count > 1
+            for state in self.manager_states.values()
+        )
+
+    def get_active_manager_count(self, now: float, staleness_multiplier: float = 3.0) -> int:
+        """Get count of non-stale registered managers."""
+        return sum(
+            1 for state in self.manager_states.values()
+            if state.is_registered and not state.is_stale(now, staleness_multiplier)
+        )
+
+    def record_heartbeat(
+        self,
+        manager_addr: tuple[str, int],
+        node_id: str,
+        generation: int,
+        now: float,
+    ) -> bool:
+        """
+        Record a heartbeat from a manager in this datacenter.
+
+        Returns True if this is a new manager or a manager restart (new generation).
+        """
+        if manager_addr not in self.manager_states:
+            self.manager_states[manager_addr] = ManagerRegistrationState(
+                manager_addr=manager_addr,
+            )
+
+        is_new = self.manager_states[manager_addr].record_heartbeat(now, node_id, generation)
+
+        # Update DC-level timing
+        if self.first_heartbeat_at == 0:
+            self.first_heartbeat_at = now
+        self.last_heartbeat_at = now
+
+        return is_new
