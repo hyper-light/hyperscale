@@ -123,15 +123,57 @@ class SlidingWindowCounter:
             self._current_count += count
             return True, 0.0
 
-        # Calculate wait time based on window progress
-        # The effective count will decrease as window_progress increases
-        # and previous_count contribution decreases
-        window_progress = (time.monotonic() - self._window_start) / self.window_size_seconds
-        remaining_window = (1.0 - window_progress) * self.window_size_seconds
+        # Calculate accurate wait time for sliding window decay
+        # We need: current_count + previous_count * (1 - progress) + count <= max_requests
+        # After window rotation, current becomes previous, so we need:
+        #   0 + total_count * (1 - progress) + count <= max_requests
+        # Solving for progress:
+        #   progress >= 1 - (max_requests - count) / total_count
+        #
+        # The wait time is: progress * window_size - elapsed_in_current_window
 
-        # Estimate: assume request will be allowed when window rotates
-        # This is conservative but avoids complex calculations
-        return False, remaining_window
+        now = time.monotonic()
+        elapsed_in_window = now - self._window_start
+
+        # Total count that will become "previous" after rotation
+        total_count = self._current_count + self._previous_count
+
+        if total_count <= 0:
+            # Edge case: no history, just wait for window to rotate
+            return False, max(0.0, self.window_size_seconds - elapsed_in_window)
+
+        # Calculate the progress needed for effective count to allow our request
+        available_slots = self.max_requests - count
+        if available_slots < 0:
+            # Request exceeds max even with empty counter
+            return False, float('inf')
+
+        # After rotation: effective = 0 + total_count * (1 - progress)
+        # We need: total_count * (1 - progress) <= available_slots
+        # So: (1 - progress) <= available_slots / total_count
+        # progress >= 1 - available_slots / total_count
+        required_progress = 1.0 - (available_slots / total_count)
+
+        if required_progress <= 0:
+            # Should already be allowed (edge case)
+            return False, 0.01  # Small wait to recheck
+
+        # Time from window start to reach required progress
+        time_to_progress = required_progress * self.window_size_seconds
+
+        # Account for current window progress and potential rotation
+        current_progress = elapsed_in_window / self.window_size_seconds
+
+        if current_progress >= 1.0:
+            # Window has already rotated, calculate from new window start
+            # After rotation, we're at progress 0 in new window
+            wait_time = time_to_progress
+        else:
+            # We need to wait for window to rotate first, then decay
+            time_until_rotation = self.window_size_seconds - elapsed_in_window
+            wait_time = time_until_rotation + time_to_progress
+
+        return False, max(0.01, wait_time)
 
     async def acquire_async(self, count: int = 1, max_wait: float = 10.0) -> bool:
         """
@@ -148,27 +190,19 @@ class SlidingWindowCounter:
             True if slots were acquired, False if timed out
         """
         async with self._async_lock:
-            start_time = time.monotonic()
+            acquired, wait_time = self.try_acquire(count)
+            if acquired:
+                return True
 
-            while True:
-                acquired, wait_time = self.try_acquire(count)
-                if acquired:
-                    return True
+            if wait_time > max_wait or wait_time == float('inf'):
+                return False
 
-                elapsed = time.monotonic() - start_time
-                remaining_budget = max_wait - elapsed
+            # Wait for the calculated time (try_acquire computes accurate decay time)
+            await asyncio.sleep(wait_time)
 
-                if remaining_budget <= 0:
-                    return False
-
-                # Wait for the minimum of wait_time or remaining budget
-                # Use small increments to allow for window rotation effects
-                actual_wait = min(wait_time, remaining_budget, self.window_size_seconds * 0.1)
-                if actual_wait <= 0:
-                    # No more budget, final check
-                    return False
-
-                await asyncio.sleep(actual_wait)
+            # Try again after wait - should succeed if calculation was accurate
+            acquired, _ = self.try_acquire(count)
+            return acquired
 
     @property
     def available_slots(self) -> float:
@@ -426,30 +460,20 @@ class AdaptiveRateLimiter:
             RateLimitResult indicating if request is allowed
         """
         async with self._async_lock:
-            start_time = time.monotonic()
+            result = self.check(client_id, operation, priority, tokens)
 
-            while True:
-                result = self.check(client_id, operation, priority, tokens)
+            if result.allowed or max_wait <= 0:
+                return result
 
-                if result.allowed:
-                    return result
+            # Use the calculated retry_after time (now accurate for sliding window decay)
+            wait_time = min(result.retry_after_seconds, max_wait)
+            if wait_time <= 0 or wait_time == float('inf'):
+                return result
 
-                elapsed = time.monotonic() - start_time
-                remaining_budget = max_wait - elapsed
+            await asyncio.sleep(wait_time)
 
-                if remaining_budget <= 0:
-                    return result
-
-                # Wait in small increments to account for sliding window decay
-                wait_time = min(
-                    result.retry_after_seconds,
-                    remaining_budget,
-                    self._config.default_window_size * 0.1,
-                )
-                if wait_time <= 0:
-                    return result
-
-                await asyncio.sleep(wait_time)
+            # Re-check after wait (state may have changed)
+            return self.check(client_id, operation, priority, tokens)
 
     def _priority_allows_bypass(
         self,
@@ -808,6 +832,10 @@ class RateLimitConfig:
         }
     )
 
+    # Minimum window size when converting bucket configs to sliding windows
+    # Lower values allow faster recovery but may increase CPU usage
+    min_window_size_seconds: float = 0.05
+
     def get_limits(self, operation: str) -> tuple[int, float]:
         """Get bucket size and refill rate for an operation."""
         return self.operation_limits.get(
@@ -874,17 +902,17 @@ class ServerRateLimiter:
             # Merge operation limits from RateLimitConfig if provided
             if config is not None:
                 # Convert (bucket_size, refill_rate) to (max_requests, window_size)
-                # Use minimum window of 0.05s to allow for fast-refilling buckets in tests
+                min_window = config.min_window_size_seconds
                 operation_limits = {}
                 for operation, (bucket_size, refill_rate) in config.operation_limits.items():
                     window_size = bucket_size / refill_rate if refill_rate > 0 else 10.0
-                    operation_limits[operation] = (bucket_size, max(0.05, window_size))
+                    operation_limits[operation] = (bucket_size, max(min_window, window_size))
                 # Add default
                 default_window = config.default_bucket_size / config.default_refill_rate if config.default_refill_rate > 0 else 10.0
-                operation_limits["default"] = (config.default_bucket_size, max(0.05, default_window))
+                operation_limits["default"] = (config.default_bucket_size, max(min_window, default_window))
                 adaptive_config.operation_limits = operation_limits
                 adaptive_config.default_max_requests = config.default_bucket_size
-                adaptive_config.default_window_size = max(0.05, default_window)
+                adaptive_config.default_window_size = max(min_window, default_window)
 
         # Internal adaptive rate limiter
         self._adaptive = AdaptiveRateLimiter(
