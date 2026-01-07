@@ -120,6 +120,10 @@ from hyperscale.distributed_rewrite.jobs.gates import (
     JobForwardingTracker,
     ConsistentHashRing,
 )
+from hyperscale.distributed_rewrite.jobs import (
+    WindowedStatsCollector,
+    WindowedStatsPush,
+)
 from hyperscale.distributed_rewrite.datacenters import (
     DatacenterHealthManager,
     ManagerDispatcher,
@@ -260,6 +264,21 @@ class GateServer(HealthAwareServer):
         # Client push notification callbacks
         # job_id -> callback address for push notifications
         self._job_callbacks: dict[str, tuple[str, int]] = {}
+
+        # Progress update callbacks (for streaming windowed stats)
+        # job_id -> callback address for progress updates
+        self._progress_callbacks: dict[str, tuple[str, int]] = {}
+
+        # Time-windowed stats collector for cross-DC aggregation
+        # Receives unaggregated stats from Managers, aggregates across DCs
+        self._windowed_stats = WindowedStatsCollector(
+            window_size_ms=env.STATS_WINDOW_SIZE_MS,
+            drift_tolerance_ms=env.STATS_DRIFT_TOLERANCE_MS,
+            max_window_age_ms=env.STATS_MAX_WINDOW_AGE_MS,
+        )
+
+        # Stats push interval (from env config)
+        self._stats_push_interval_ms: float = env.STATS_PUSH_INTERVAL_MS
 
         # Job submissions for reporting configs
         # job_id -> JobSubmission (needed for reporting_configs after aggregation)
@@ -1722,9 +1741,11 @@ class GateServer(HealthAwareServer):
                 # Client unreachable - don't block on this
                 pass
             
-            # Clean up callback if job is final
+            # Clean up callbacks and windowed stats if job is final
             if is_final:
                 self._job_callbacks.pop(job_id, None)
+                self._progress_callbacks.pop(job_id, None)
+                await self._windowed_stats.cleanup_job_windows(job_id)
     
     async def _batch_stats_update(self) -> None:
         """
@@ -2174,7 +2195,10 @@ class GateServer(HealthAwareServer):
 
         # Start Tier 2 (periodic) batch stats loop
         self._task_runner.run(self._batch_stats_loop)
-        
+
+        # Start windowed stats push loop for streaming progress to clients
+        self._task_runner.run(self._windowed_stats_push_loop)
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -2512,6 +2536,9 @@ class GateServer(HealthAwareServer):
                     self._workflow_dc_results.pop(job_id, None)
                     self._job_target_dcs.pop(job_id, None)
                     self._job_callbacks.pop(job_id, None)
+                    self._progress_callbacks.pop(job_id, None)
+                    # Clean up windowed stats for this job
+                    await self._windowed_stats.cleanup_job_windows(job_id)
                     # Clean up reporter tasks and submissions
                     self._cleanup_reporter_tasks(job_id)
                     # Clean up any leases for this job
@@ -2998,6 +3025,8 @@ class GateServer(HealthAwareServer):
             # Store callback for push notifications (if provided)
             if submission.callback_addr:
                 self._job_callbacks[submission.job_id] = submission.callback_addr
+                # Also register for progress updates (same address, different message type)
+                self._progress_callbacks[submission.job_id] = submission.callback_addr
 
             # Store submission for reporter configs access after aggregation
             if submission.reporting_configs:
@@ -4550,8 +4579,9 @@ class GateServer(HealthAwareServer):
                 )
                 return response.dump()
 
-            # Register the callback address
+            # Register the callback address for both status and progress updates
             self._job_callbacks[job_id] = request.callback_addr
+            self._progress_callbacks[job_id] = request.callback_addr
 
             # Calculate elapsed time
             elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
@@ -4736,3 +4766,108 @@ class GateServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "datacenter_list")
             return b'error'
+
+    @tcp.receive()
+    async def windowed_stats_push(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle windowed stats push from Manager.
+
+        Managers send unaggregated per-worker stats within time windows.
+        Gate aggregates these across all DCs and forwards to clients.
+
+        The stats include a datacenter field to enable cross-DC aggregation.
+        """
+        try:
+            push: WindowedStatsPush = cloudpickle.loads(data)
+
+            # Add to windowed stats collector using datacenter as worker_id
+            # This aggregates stats from the same time window across DCs
+            from hyperscale.distributed_rewrite.models import WorkflowProgress
+
+            # For each worker stat from the DC, add to our collector
+            for worker_stat in push.per_worker_stats:
+                progress = WorkflowProgress(
+                    job_id=push.job_id,
+                    workflow_id=push.workflow_id,
+                    workflow_name=push.workflow_name,
+                    status="running",
+                    completed_count=worker_stat.completed_count,
+                    failed_count=worker_stat.failed_count,
+                    rate_per_second=worker_stat.rate_per_second,
+                    step_stats=worker_stat.step_stats,
+                    avg_cpu_percent=worker_stat.avg_cpu_percent,
+                    avg_memory_mb=worker_stat.avg_memory_mb,
+                    collected_at=(push.window_start + push.window_end) / 2,
+                )
+                # Use DC:worker_id as the key so we track individual workers across DCs
+                worker_key = f"{push.datacenter}:{worker_stat.worker_id}"
+                await self._windowed_stats.add_progress(worker_key, progress)
+
+            return b'ok'
+
+        except Exception as e:
+            await self.handle_exception(e, "windowed_stats_push")
+            return b'error'
+
+    async def _windowed_stats_push_loop(self) -> None:
+        """
+        Background loop for time-windowed stats streaming to clients.
+
+        Flushes closed time windows and pushes aggregated stats to clients.
+        Gate aggregates stats from all DCs before forwarding.
+
+        Runs at STATS_PUSH_INTERVAL_MS (default 100ms) for low-latency streaming.
+        """
+        interval_seconds = self._stats_push_interval_ms / 1000.0
+
+        while self._running:
+            try:
+                await asyncio.sleep(interval_seconds)
+                if not self._running:
+                    break
+
+                # Flush closed windows with aggregation (Gate always aggregates for clients)
+                pushes = await self._windowed_stats.flush_closed_windows(aggregate=True)
+
+                if not pushes:
+                    continue
+
+                # Push aggregated stats to clients
+                for push in pushes:
+                    await self._push_windowed_stats_to_client(push)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Windowed stats push loop error: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                await asyncio.sleep(interval_seconds)
+
+    async def _push_windowed_stats_to_client(self, push: WindowedStatsPush) -> None:
+        """Push aggregated windowed stats to client callback."""
+        callback = self._progress_callbacks.get(push.job_id)
+        if not callback:
+            return
+
+        try:
+            await self.send_tcp(
+                callback,
+                "windowed_stats_push",
+                cloudpickle.dumps(push),
+                timeout=1.0,
+            )
+        except Exception:
+            # Client unreachable - continue, will retry next window
+            pass
