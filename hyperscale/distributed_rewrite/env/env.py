@@ -181,6 +181,32 @@ class Env(BaseModel):
     CROSS_DC_CORRELATION_HIGH_FRACTION: StrictFloat = 0.5  # Fraction of DCs for HIGH (requires count too)
     CROSS_DC_CORRELATION_BACKOFF: StrictFloat = 60.0  # Backoff duration after correlation detected
 
+    # Anti-flapping settings for cross-DC correlation
+    CROSS_DC_FAILURE_CONFIRMATION: StrictFloat = 5.0  # Seconds failure must persist before counting
+    CROSS_DC_RECOVERY_CONFIRMATION: StrictFloat = 30.0  # Seconds recovery must persist before healthy
+    CROSS_DC_FLAP_THRESHOLD: StrictInt = 3  # State changes in window to be considered flapping
+    CROSS_DC_FLAP_DETECTION_WINDOW: StrictFloat = 120.0  # Window for flap detection
+    CROSS_DC_FLAP_COOLDOWN: StrictFloat = 300.0  # Cooldown after flapping before can be stable
+
+    # Latency-based correlation settings
+    CROSS_DC_ENABLE_LATENCY_CORRELATION: StrictBool = True
+    CROSS_DC_LATENCY_ELEVATED_THRESHOLD_MS: StrictFloat = 100.0  # Latency above this is elevated
+    CROSS_DC_LATENCY_CRITICAL_THRESHOLD_MS: StrictFloat = 500.0  # Latency above this is critical
+    CROSS_DC_MIN_LATENCY_SAMPLES: StrictInt = 3  # Min samples before latency decisions
+    CROSS_DC_LATENCY_SAMPLE_WINDOW: StrictFloat = 60.0  # Window for latency samples
+    CROSS_DC_LATENCY_CORRELATION_FRACTION: StrictFloat = 0.5  # Fraction of DCs for latency correlation
+
+    # Extension-based correlation settings
+    CROSS_DC_ENABLE_EXTENSION_CORRELATION: StrictBool = True
+    CROSS_DC_EXTENSION_COUNT_THRESHOLD: StrictInt = 2  # Extensions to consider DC under load
+    CROSS_DC_EXTENSION_CORRELATION_FRACTION: StrictFloat = 0.5  # Fraction of DCs for extension correlation
+    CROSS_DC_EXTENSION_WINDOW: StrictFloat = 120.0  # Window for extension tracking
+
+    # LHM-based correlation settings
+    CROSS_DC_ENABLE_LHM_CORRELATION: StrictBool = True
+    CROSS_DC_LHM_STRESSED_THRESHOLD: StrictInt = 3  # LHM score (0-8) to consider DC stressed
+    CROSS_DC_LHM_CORRELATION_FRACTION: StrictFloat = 0.5  # Fraction of DCs for LHM correlation
+
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
@@ -306,6 +332,28 @@ class Env(BaseModel):
             "CROSS_DC_CORRELATION_HIGH_COUNT_THRESHOLD": int,
             "CROSS_DC_CORRELATION_HIGH_FRACTION": float,
             "CROSS_DC_CORRELATION_BACKOFF": float,
+            # Anti-flapping settings
+            "CROSS_DC_FAILURE_CONFIRMATION": float,
+            "CROSS_DC_RECOVERY_CONFIRMATION": float,
+            "CROSS_DC_FLAP_THRESHOLD": int,
+            "CROSS_DC_FLAP_DETECTION_WINDOW": float,
+            "CROSS_DC_FLAP_COOLDOWN": float,
+            # Latency-based correlation settings
+            "CROSS_DC_ENABLE_LATENCY_CORRELATION": bool,
+            "CROSS_DC_LATENCY_ELEVATED_THRESHOLD_MS": float,
+            "CROSS_DC_LATENCY_CRITICAL_THRESHOLD_MS": float,
+            "CROSS_DC_MIN_LATENCY_SAMPLES": int,
+            "CROSS_DC_LATENCY_SAMPLE_WINDOW": float,
+            "CROSS_DC_LATENCY_CORRELATION_FRACTION": float,
+            # Extension-based correlation settings
+            "CROSS_DC_ENABLE_EXTENSION_CORRELATION": bool,
+            "CROSS_DC_EXTENSION_COUNT_THRESHOLD": int,
+            "CROSS_DC_EXTENSION_CORRELATION_FRACTION": float,
+            "CROSS_DC_EXTENSION_WINDOW": float,
+            # LHM-based correlation settings
+            "CROSS_DC_ENABLE_LHM_CORRELATION": bool,
+            "CROSS_DC_LHM_STRESSED_THRESHOLD": int,
+            "CROSS_DC_LHM_CORRELATION_FRACTION": float,
         }
     
     def get_swim_init_context(self) -> dict:
@@ -532,16 +580,49 @@ class Env(BaseModel):
         - Count of DCs >= high_count_threshold (e.g., 4)
 
         This prevents false positives when few DCs exist.
+
+        Anti-flapping mechanisms:
+        - Failure confirmation: failures must persist before counting
+        - Recovery confirmation: recovery must be sustained before healthy
+        - Flap detection: too many state changes marks DC as flapping
+
+        Secondary correlation signals:
+        - Latency correlation: elevated latency across DCs = network issue
+        - Extension correlation: many extensions across DCs = load spike
+        - LHM correlation: high LHM scores across DCs = systemic stress
         """
         from hyperscale.distributed_rewrite.datacenters.cross_dc_correlation import (
             CrossDCCorrelationConfig,
         )
 
         return CrossDCCorrelationConfig(
+            # Primary thresholds
             correlation_window_seconds=self.CROSS_DC_CORRELATION_WINDOW,
             low_threshold=self.CROSS_DC_CORRELATION_LOW_THRESHOLD,
             medium_threshold=self.CROSS_DC_CORRELATION_MEDIUM_THRESHOLD,
             high_count_threshold=self.CROSS_DC_CORRELATION_HIGH_COUNT_THRESHOLD,
             high_threshold_fraction=self.CROSS_DC_CORRELATION_HIGH_FRACTION,
             correlation_backoff_seconds=self.CROSS_DC_CORRELATION_BACKOFF,
+            # Anti-flapping
+            failure_confirmation_seconds=self.CROSS_DC_FAILURE_CONFIRMATION,
+            recovery_confirmation_seconds=self.CROSS_DC_RECOVERY_CONFIRMATION,
+            flap_threshold=self.CROSS_DC_FLAP_THRESHOLD,
+            flap_detection_window_seconds=self.CROSS_DC_FLAP_DETECTION_WINDOW,
+            flap_cooldown_seconds=self.CROSS_DC_FLAP_COOLDOWN,
+            # Latency-based correlation
+            enable_latency_correlation=self.CROSS_DC_ENABLE_LATENCY_CORRELATION,
+            latency_elevated_threshold_ms=self.CROSS_DC_LATENCY_ELEVATED_THRESHOLD_MS,
+            latency_critical_threshold_ms=self.CROSS_DC_LATENCY_CRITICAL_THRESHOLD_MS,
+            min_latency_samples=self.CROSS_DC_MIN_LATENCY_SAMPLES,
+            latency_sample_window_seconds=self.CROSS_DC_LATENCY_SAMPLE_WINDOW,
+            latency_correlation_fraction=self.CROSS_DC_LATENCY_CORRELATION_FRACTION,
+            # Extension-based correlation
+            enable_extension_correlation=self.CROSS_DC_ENABLE_EXTENSION_CORRELATION,
+            extension_count_threshold=self.CROSS_DC_EXTENSION_COUNT_THRESHOLD,
+            extension_correlation_fraction=self.CROSS_DC_EXTENSION_CORRELATION_FRACTION,
+            extension_window_seconds=self.CROSS_DC_EXTENSION_WINDOW,
+            # LHM-based correlation
+            enable_lhm_correlation=self.CROSS_DC_ENABLE_LHM_CORRELATION,
+            lhm_stressed_threshold=self.CROSS_DC_LHM_STRESSED_THRESHOLD,
+            lhm_correlation_fraction=self.CROSS_DC_LHM_CORRELATION_FRACTION,
         )

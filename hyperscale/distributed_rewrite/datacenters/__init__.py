@@ -27,4 +27,8 @@ from hyperscale.distributed_rewrite.datacenters.cross_dc_correlation import (
     CorrelationDecision as CorrelationDecision,
     CorrelationSeverity as CorrelationSeverity,
     DCFailureRecord as DCFailureRecord,
+    DCHealthState as DCHealthState,
+    DCStateInfo as DCStateInfo,
+    LatencySample as LatencySample,
+    ExtensionRecord as ExtensionRecord,
 )
