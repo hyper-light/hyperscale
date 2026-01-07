@@ -231,21 +231,31 @@ class LocalRunner:
                     name="debug",
                 )
 
+                # Send shutdown request to workers (non-blocking, workers will terminate)
                 await self._remote_manger.shutdown_workers()
-                await self._remote_manger.close()
 
+                # Run cleanup operations in parallel for faster shutdown
                 loop = asyncio.get_event_loop()
-                children = await loop.run_in_executor(None, active_children)
+
+                async def cleanup_children():
+                    children = await loop.run_in_executor(None, active_children)
+                    if children:
+                        await asyncio.gather(
+                            *[loop.run_in_executor(None, child.kill) for child in children],
+                            return_exceptions=True,
+                        )
 
                 await asyncio.gather(
-                    *[loop.run_in_executor(None, child.kill) for child in children]
+                    self._remote_manger.close(),
+                    self._server_pool.shutdown(),
+                    cleanup_children(),
+                    return_exceptions=True,
                 )
 
                 await ctx.log_prepared(
-                    f"Stopping Hyperscale Server Pool for test {test_name}",
+                    f"Stopped Hyperscale Server Pool for test {test_name}",
                     name="debug",
                 )
-                await self._server_pool.shutdown()
 
                 await ctx.log_prepared(f"Exiting test {test_name}", name="info")
 

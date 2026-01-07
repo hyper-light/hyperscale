@@ -1649,6 +1649,9 @@ class RemoteGraphManager:
         self._controller.stop()
         await self._controller.close()
 
+        # Clear all tracking data to prevent memory leaks
+        self._cleanup_tracking_data()
+
     def abort(self):
         try:
             self._logger.abort()
@@ -1656,3 +1659,22 @@ class RemoteGraphManager:
 
         except Exception:
             pass
+
+        # Clear all tracking data to prevent memory leaks
+        self._cleanup_tracking_data()
+
+    def _cleanup_tracking_data(self):
+        """Clear all tracking dictionaries to prevent memory leaks."""
+        self._workflows.clear()
+        self._workflow_timers.clear()
+        self._workflow_completion_rates.clear()
+        self._workflow_last_elapsed.clear()
+        self._graph_updates.clear()
+        self._workflow_statuses.clear()
+        self._cancellation_updates.clear()
+        self._step_traversal_orders.clear()
+        self._workflow_traversal_order.clear()
+        self._workflow_configs.clear()
+        self._workflow_dependencies.clear()
+        self._completed_workflows.clear()
+        self._failed_workflows.clear()

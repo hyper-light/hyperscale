@@ -37,3 +37,10 @@ class InterfaceUpdatesController:
     def shutdown(self):
         if not self._active_workflows_update_ready.is_set():
             self._active_workflows_update_ready.set()
+
+        # Drain the queue to release any held references
+        while not self._active_workflows_updates.empty():
+            try:
+                self._active_workflows_updates.get_nowait()
+            except asyncio.QueueEmpty:
+                break
