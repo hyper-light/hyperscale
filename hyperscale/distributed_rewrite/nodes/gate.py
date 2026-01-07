@@ -213,6 +213,13 @@ class GateServer(HealthAwareServer):
         self._gate_peer_health: dict[str, GateHealthState] = {}
         self._gate_health_config = GateHealthConfig()
 
+        # Latency tracking for peer gates
+        # Used to detect network degradation within the gate cluster
+        # High latency to all peers indicates network issues vs specific gate failures
+        self._peer_gate_latency_samples: dict[str, list[tuple[float, float]]] = {}  # gate_id -> [(timestamp, latency_ms)]
+        self._latency_sample_max_age: float = 60.0  # Keep samples for 60 seconds
+        self._latency_sample_max_count: int = 30  # Keep at most 30 samples per peer
+
         # Load shedding infrastructure (AD-22)
         # Tracks latency and sheds low-priority requests under load
         self._overload_detector = HybridOverloadDetector()
@@ -2284,6 +2291,60 @@ class GateServer(HealthAwareServer):
             latency_ms=latency_ms,
             probe_type="federated",
         )
+
+    def _record_peer_gate_latency(self, gate_id: str, latency_ms: float) -> None:
+        """
+        Record latency measurement from a peer gate healthcheck.
+
+        Used to detect network degradation within the gate cluster.
+        High latency to all peers indicates network issues vs specific
+        gate failures.
+
+        Args:
+            gate_id: The peer gate's node ID.
+            latency_ms: Round-trip latency in milliseconds.
+        """
+        now = time.monotonic()
+        if gate_id not in self._peer_gate_latency_samples:
+            self._peer_gate_latency_samples[gate_id] = []
+
+        samples = self._peer_gate_latency_samples[gate_id]
+        samples.append((now, latency_ms))
+
+        # Prune old samples
+        cutoff = now - self._latency_sample_max_age
+        self._peer_gate_latency_samples[gate_id] = [
+            (ts, lat) for ts, lat in samples
+            if ts > cutoff
+        ][-self._latency_sample_max_count:]
+
+    def get_average_peer_gate_latency(self) -> float | None:
+        """
+        Get average latency to peer gates.
+
+        Returns None if no samples available.
+        """
+        all_latencies = [
+            lat for samples in self._peer_gate_latency_samples.values()
+            for _, lat in samples
+        ]
+        if not all_latencies:
+            return None
+        return sum(all_latencies) / len(all_latencies)
+
+    def get_peer_gate_latency(self, gate_id: str) -> float | None:
+        """
+        Get average latency to a specific peer gate.
+
+        Args:
+            gate_id: The peer gate's node ID.
+
+        Returns None if no samples available.
+        """
+        samples = self._peer_gate_latency_samples.get(gate_id)
+        if not samples:
+            return None
+        return sum(lat for _, lat in samples) / len(samples)
 
     async def _handle_xack_response(
         self,
