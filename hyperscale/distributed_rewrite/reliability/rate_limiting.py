@@ -148,18 +148,27 @@ class SlidingWindowCounter:
             True if slots were acquired, False if timed out
         """
         async with self._async_lock:
-            acquired, wait_time = self.try_acquire(count)
-            if acquired:
-                return True
+            start_time = time.monotonic()
 
-            if wait_time > max_wait:
-                return False
+            while True:
+                acquired, wait_time = self.try_acquire(count)
+                if acquired:
+                    return True
 
-            # Wait while holding lock
-            await asyncio.sleep(wait_time)
-            # Try again after wait
-            acquired, _ = self.try_acquire(count)
-            return acquired
+                elapsed = time.monotonic() - start_time
+                remaining_budget = max_wait - elapsed
+
+                if remaining_budget <= 0:
+                    return False
+
+                # Wait for the minimum of wait_time or remaining budget
+                # Use small increments to allow for window rotation effects
+                actual_wait = min(wait_time, remaining_budget, self.window_size_seconds * 0.1)
+                if actual_wait <= 0:
+                    # No more budget, final check
+                    return False
+
+                await asyncio.sleep(actual_wait)
 
     @property
     def available_slots(self) -> float:
@@ -417,17 +426,30 @@ class AdaptiveRateLimiter:
             RateLimitResult indicating if request is allowed
         """
         async with self._async_lock:
-            result = self.check(client_id, operation, priority, tokens)
+            start_time = time.monotonic()
 
-            if result.allowed or max_wait <= 0:
-                return result
+            while True:
+                result = self.check(client_id, operation, priority, tokens)
 
-            # Wait and retry
-            wait_time = min(result.retry_after_seconds, max_wait)
-            await asyncio.sleep(wait_time)
+                if result.allowed:
+                    return result
 
-            # Re-check (state may have changed)
-            return self.check(client_id, operation, priority, tokens)
+                elapsed = time.monotonic() - start_time
+                remaining_budget = max_wait - elapsed
+
+                if remaining_budget <= 0:
+                    return result
+
+                # Wait in small increments to account for sliding window decay
+                wait_time = min(
+                    result.retry_after_seconds,
+                    remaining_budget,
+                    self._config.default_window_size * 0.1,
+                )
+                if wait_time <= 0:
+                    return result
+
+                await asyncio.sleep(wait_time)
 
     def _priority_allows_bypass(
         self,
@@ -852,16 +874,17 @@ class ServerRateLimiter:
             # Merge operation limits from RateLimitConfig if provided
             if config is not None:
                 # Convert (bucket_size, refill_rate) to (max_requests, window_size)
+                # Use minimum window of 0.05s to allow for fast-refilling buckets in tests
                 operation_limits = {}
                 for operation, (bucket_size, refill_rate) in config.operation_limits.items():
                     window_size = bucket_size / refill_rate if refill_rate > 0 else 10.0
-                    operation_limits[operation] = (bucket_size, max(1.0, window_size))
+                    operation_limits[operation] = (bucket_size, max(0.05, window_size))
                 # Add default
                 default_window = config.default_bucket_size / config.default_refill_rate if config.default_refill_rate > 0 else 10.0
-                operation_limits["default"] = (config.default_bucket_size, max(1.0, default_window))
+                operation_limits["default"] = (config.default_bucket_size, max(0.05, default_window))
                 adaptive_config.operation_limits = operation_limits
                 adaptive_config.default_max_requests = config.default_bucket_size
-                adaptive_config.default_window_size = max(1.0, default_window)
+                adaptive_config.default_window_size = max(0.05, default_window)
 
         # Internal adaptive rate limiter
         self._adaptive = AdaptiveRateLimiter(

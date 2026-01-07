@@ -109,16 +109,16 @@ class TestMemoryLeakPrevention:
         assert limiter.get_metrics()["active_clients"] == 0
 
     def test_rate_limiter_client_buckets_per_operation(self):
-        """Verify per-operation buckets don't grow unboundedly."""
+        """Verify per-operation counters don't grow unboundedly."""
         limiter = ServerRateLimiter()
 
         # Single client, many different operations
         for i in range(100):
             limiter.check_rate_limit("client-1", f"operation-{i}")
 
-        # Each operation creates a bucket for the client
-        client_buckets = limiter._client_buckets.get("client-1", {})
-        assert len(client_buckets) == 100
+        # Each operation creates a counter for the client (via AdaptiveRateLimiter)
+        client_counters = limiter._adaptive._operation_counters.get("client-1", {})
+        assert len(client_counters) == 100
 
         # This is a known growth pattern - operations should be bounded
         # by the application, not by the limiter
@@ -1795,9 +1795,9 @@ class TestMetricCardinalityExplosion:
         for i in range(1000):
             limiter.check_rate_limit("client-1", f"operation-{i}")
 
-        # Check that client has many buckets
-        client_buckets = limiter._client_buckets.get("client-1", {})
-        assert len(client_buckets) == 1000
+        # Check that client has many counters (via AdaptiveRateLimiter)
+        client_counters = limiter._adaptive._operation_counters.get("client-1", {})
+        assert len(client_counters) == 1000
 
     def test_load_shedder_custom_message_types(self):
         """Test load shedder with many custom message types."""
