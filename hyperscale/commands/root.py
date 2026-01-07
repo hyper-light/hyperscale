@@ -1,4 +1,6 @@
 import asyncio
+import gc
+import os
 import logging
 import sys
 
@@ -86,6 +88,7 @@ async def hyperscale():
 
 def run():
     logging.disable(logging.CRITICAL)
+    status = 0
 
     try:
         asyncio.run(CLI.run(args=sys.argv[1:]))
@@ -95,4 +98,10 @@ def run():
         asyncio.CancelledError,
         asyncio.InvalidStateError,
     ):
-        pass
+        status = 1
+
+    # Speed up Python exit by running GC before interpreter cleanup
+    gc.disable()
+    gc.collect()
+    gc.collect()  # Second pass catches reference cycles
+    os._exit(status)
