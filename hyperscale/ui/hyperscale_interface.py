@@ -89,8 +89,8 @@ class HyperscaleInterface:
         interval = self._terminal._interval
 
         while not self._run_switch_loop.is_set():
-            Terminal.trigger_render()
             await asyncio.sleep(interval)
+            Terminal.trigger_render()
 
     async def _run(self):
         start = time.monotonic()
