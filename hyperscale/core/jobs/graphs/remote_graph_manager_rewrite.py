@@ -1239,7 +1239,7 @@ class RemoteGraphManager:
         Uses event-driven completion signaling from the controller.
         Processes status updates from the queue to update UI.
         """
-        workflow_slug = workflow_name.lower()
+
         timeout_error: Exception | None = None
         start_time = time.monotonic()
 
@@ -1313,6 +1313,9 @@ class RemoteGraphManager:
 
             await asyncio.gather(
                 *[
+                    update_active_workflow_message(
+                        workflow_slug, f"Running - {workflow_name}"
+                    ),
                     update_workflow_executions_counter(
                         workflow_slug,
                         completed_count,
