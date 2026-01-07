@@ -423,7 +423,6 @@ class Logger:
 
         # Clear references to help GC
         self._contexts.clear()
-        self._models.clear()
 
 
 
