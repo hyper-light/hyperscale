@@ -6943,6 +6943,8 @@ class ManagerServer(HealthAwareServer):
             # Store callback for push notifications (if provided)
             if submission.callback_addr:
                 self._job_callbacks[submission.job_id] = submission.callback_addr
+                # Also register for progress updates (same address, different message type)
+                self._progress_callbacks[submission.job_id] = submission.callback_addr
 
             # Store origin gate for direct DC-to-Job-Leader routing
             # This gate is the job leader gate and receives all results directly
@@ -7931,8 +7933,9 @@ class ManagerServer(HealthAwareServer):
                 )
                 return response.dump()
 
-            # Register the callback address
+            # Register the callback address for both status and progress updates
             self._job_callbacks[job_id] = request.callback_addr
+            self._progress_callbacks[job_id] = request.callback_addr
 
             # Calculate elapsed time
             elapsed = time.monotonic() - job.timestamp if job.timestamp > 0 else 0.0
