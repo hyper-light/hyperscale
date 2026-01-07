@@ -221,8 +221,6 @@ class RemoteGraphManager:
                 *[self._controller.connect_client(address) for address in workers]
             )
 
-            print(f'[DEBUG] Connected: {len(connected)}')
-
             self._provisioner.setup(max_workers=len(self._controller.acknowledged_start_node_ids))
 
             # Register all connected nodes with the provisioner for per-node tracking
@@ -447,13 +445,11 @@ class RemoteGraphManager:
                 if ready_workflows:
                     # Calculate available cores based on provisioner's per-node tracking
                     available_cores = self._provisioner.get_available_node_count()
-                    print(f"[DEBUG] {test_name}: allocating cores - available: {available_cores}, in_use: {cores_in_use}, total: {total_cores}, ready: {[p.workflow_name for p in ready_workflows]}")
 
                     # Dynamically allocate cores and specific nodes for ready workflows
                     allocations = self._allocate_cores_for_ready_workflows(
                         ready_workflows, available_cores
                     )
-                    print(f"[DEBUG] {test_name}: allocation results: {[(p.workflow_name, c, n) for p, c, n in allocations]}")
 
                     for pending, cores, node_ids in allocations:
                         if cores == 0 or len(node_ids) == 0:
@@ -527,7 +523,6 @@ class RemoteGraphManager:
                 for task in done:
                     workflow_name = running_tasks.pop(task)
                     pending = pending_workflows[workflow_name]
-                    print(f"[DEBUG] {test_name}: workflow {workflow_name} task completed, releasing nodes {pending.allocated_node_ids} (was {cores_in_use} cores in use)")
 
                     # Release nodes used by this workflow
                     self._provisioner.release_nodes(pending.allocated_node_ids)
@@ -973,16 +968,12 @@ class RemoteGraphManager:
 
                 self._workflow_timers[workflow.name] = time.monotonic()
 
-                print(f"[DEBUG] {workflow.name} run {run_id}: registering for {threads} workers with VUs {workflow_vus}")
-
                 # Register for event-driven completion tracking
                 completion_state = self._controller.register_workflow_completion(
                     run_id,
                     workflow.name,
                     threads,
                 )
-
-                print(f"[DEBUG] {workflow.name} run {run_id}: submitting to {threads} workers with node_ids={node_ids}")
 
                 # Submit workflow to workers with explicit node targeting
                 await self._controller.submit_workflow_to_workers(
@@ -998,8 +989,6 @@ class RemoteGraphManager:
                     message=f"Submitted Workflow {workflow.name} with run id {run_id}",
                     name="trace",
                 )
-
-                print(f"[DEBUG] {workflow.name} run {run_id}: waiting for {threads} workers (expected_workers={completion_state.expected_workers})")
 
                 workflow_timeout = int(
                     TimeParser(workflow.duration).time
@@ -1052,7 +1041,6 @@ class RemoteGraphManager:
                 )
 
                 results = [result_set for _, result_set in results.values() if result_set is not None]
-                print(f"[DEBUG] {workflow.name} run {run_id}: received {len(results)} results, expected {threads} workers")
 
                 if is_test_workflow and len(results) > 1:
                     await ctx.log_prepared(
@@ -1230,16 +1218,11 @@ class RemoteGraphManager:
             BrokenPipeError,
             asyncio.CancelledError,
         ) as err:
-            import traceback
-            print(traceback.format_exc())
             await update_active_workflow_message(workflow_slug, "Aborted")
 
             raise err
 
         except Exception as err:
-            import traceback
-            print(f"[DEBUG] _run_workflow EXCEPTION: {err}")
-            print(traceback.format_exc())
             raise err
 
     async def _wait_for_workflow_completion(
@@ -1260,12 +1243,9 @@ class RemoteGraphManager:
         timeout_error: Exception | None = None
         start_time = time.monotonic()
 
-        print(f"[DEBUG] {workflow_name} run {run_id}: entering wait loop (expected={completion_state.expected_workers}, assigned={completion_state.workers_assigned}, timeout={timeout}s)")
-
         while not completion_state.completion_event.is_set():
             remaining_timeout = timeout - (time.monotonic() - start_time)
             if remaining_timeout <= 0:
-                print(f"[DEBUG] {workflow_name} run {run_id}: TIMEOUT after {timeout}s with {completion_state.workers_completed}/{completion_state.expected_workers} completions")
                 timeout_error = asyncio.TimeoutError(
                     f"Workflow {workflow_name} exceeded timeout of {timeout} seconds"
                 )
@@ -1287,8 +1267,6 @@ class RemoteGraphManager:
                 completion_state,
                 threads,
             )
-
-        print(f"[DEBUG] {workflow_name} run {run_id}: wait loop exited (event_set={completion_state.completion_event.is_set()}, workers_completed={completion_state.workers_completed}, timeout_error={timeout_error is not None})")
 
         # Process any final status updates
         await self._process_status_updates(

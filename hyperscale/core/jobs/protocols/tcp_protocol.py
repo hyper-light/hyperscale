@@ -4,6 +4,7 @@ import pickle
 import signal
 import socket
 import ssl
+import time
 import uuid
 from collections import defaultdict, deque
 from typing import (
@@ -48,7 +49,6 @@ from .message_limits import (
     validate_decompressed_size,
     MessageSizeError,
 )
-from .rate_limiter import RateLimitExceeded, ServerRateLimiter
 from .replay_guard import ReplayGuard, ReplayError
 from .restricted_unpickler import restricted_loads, SecurityError
 from .server_protocol import MercurySyncTCPServerProtocol
@@ -115,6 +115,7 @@ class TCPProtocol(Generic[T, K]):
         self._connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_TIMEOUT).time
         self._retry_interval = TimeParser(env.MERCURY_SYNC_RETRY_INTERVAL).time
         self._shutdown_poll_rate = TimeParser(env.MERCURY_SYNC_SHUTDOWN_POLL_RATE).time
+        self._max_connect_time = TimeParser(env.MERCURY_SYNC_MAX_CONNECT_TIME).time
         self._retries = env.MERCURY_SYNC_SEND_RETRIES
 
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
@@ -132,9 +133,6 @@ class TCPProtocol(Generic[T, K]):
             max_future_seconds=60,  # 1 minute clock skew tolerance
             max_window_size=100000,
         )
-        
-        # Rate limiting (per-source)
-        self._rate_limiter = ServerRateLimiter()
 
     @property
     def nodes(self):
@@ -416,10 +414,30 @@ class TCPProtocol(Generic[T, K]):
                 key_path=key_path,
             )
 
-        run_start = True
         instance_id: int | None = None
+        start_time = time.monotonic()
+        attempt = 0
 
-        while run_start:
+        # Connect retry with exponential backoff
+        # Start with short timeout/interval, increase as processes may be slow to start
+        base_timeout = 2.0  # Initial per-attempt timeout
+        base_interval = 0.5  # Initial retry interval
+        max_timeout = 10.0  # Cap per-attempt timeout
+        max_interval = 5.0  # Cap retry interval
+
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= self._max_connect_time:
+                if self._connect_lock.locked():
+                    self._connect_lock.release()
+                raise TimeoutError(
+                    f"Failed to connect to {address} after {self._max_connect_time}s ({attempt} attempts)"
+                )
+
+            # Calculate timeouts with exponential backoff, capped at max values
+            attempt_timeout = min(base_timeout * (1.5 ** min(attempt, 5)), max_timeout)
+            retry_interval = min(base_interval * (1.5 ** min(attempt, 5)), max_interval)
+
             try:
                 if worker_socket is None:
                     tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -428,7 +446,7 @@ class TCPProtocol(Generic[T, K]):
 
                     await asyncio.wait_for(
                         self._loop.run_in_executor(None, tcp_socket.connect, address),
-                        timeout=self._connect_timeout,
+                        timeout=attempt_timeout,
                     )
 
                     tcp_socket.setblocking(False)
@@ -442,7 +460,7 @@ class TCPProtocol(Generic[T, K]):
                         sock=tcp_socket,
                         ssl=self._client_ssl_context,
                     ),
-                    timeout=self._connect_timeout,
+                    timeout=attempt_timeout,
                 )
 
                 self._client_transports[address] = client_transport
@@ -454,7 +472,7 @@ class TCPProtocol(Generic[T, K]):
                         target_address=address,
                         request_type="connect",
                     ),
-                    timeout=self._connect_timeout,
+                    timeout=attempt_timeout,
                 )
 
                 shard_id, _ = result
@@ -466,18 +484,15 @@ class TCPProtocol(Generic[T, K]):
                 self._node_host_map[instance_id] = address
                 self._nodes.put_no_wait(instance_id)
 
-                run_start = False
+                # Successfully connected
+                break
 
-            except Exception:
-                pass
-
-            except OSError:
-                pass
-
-            except asyncio.CancelledError:
-                pass
-
-            await asyncio.sleep(1)
+            except (Exception, OSError, asyncio.CancelledError):
+                attempt += 1
+                # Don't sleep if we've exceeded the max time
+                remaining = self._max_connect_time - (time.monotonic() - start_time)
+                if remaining > 0:
+                    await asyncio.sleep(min(retry_interval, remaining))
 
         default_config = {
             "node_id": self._node_id_base,
@@ -815,14 +830,6 @@ class TCPProtocol(Generic[T, K]):
         data: bytes,
         transport: asyncio.Transport,
     ) -> None:
-        # Get peer address for rate limiting
-        try:
-            addr = transport.get_extra_info('peername')
-            if addr and not self._rate_limiter.check(addr, raise_on_limit=False):
-                return  # Rate limited - silently drop
-        except Exception:
-            pass  # Continue if we can't get address
-        
         # Validate compressed message size
         try:
             validate_compressed_size(data, raise_on_error=True)

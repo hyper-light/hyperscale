@@ -6,6 +6,7 @@ import pickle
 import signal
 import socket
 import ssl
+import time
 import uuid
 from collections import defaultdict, deque
 from typing import (
@@ -32,7 +33,6 @@ from hyperscale.core.jobs.data_structures import LockedSet
 from hyperscale.core.jobs.hooks.hook_type import HookType
 from hyperscale.core.jobs.models import Env, JobContext, Message
 from hyperscale.core.jobs.tasks import TaskRunner
-from hyperscale.core.snowflake import Snowflake
 from hyperscale.core.snowflake.snowflake_generator import SnowflakeGenerator
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
@@ -49,7 +49,6 @@ from .message_limits import (
     validate_decompressed_size,
     MessageSizeError,
 )
-from .rate_limiter import RateLimitExceeded, ServerRateLimiter
 from .replay_guard import ReplayGuard, ReplayError
 from .restricted_unpickler import restricted_loads, SecurityError
 from .udp_socket_protocol import UDPSocketProtocol
@@ -116,6 +115,7 @@ class UDPProtocol(Generic[T, K]):
         self._connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_TIMEOUT).time
         self._retry_interval = TimeParser(env.MERCURY_SYNC_RETRY_INTERVAL).time
         self._shutdown_poll_rate = TimeParser(env.MERCURY_SYNC_SHUTDOWN_POLL_RATE).time
+        self._max_connect_time = TimeParser(env.MERCURY_SYNC_MAX_CONNECT_TIME).time
         self._retries = env.MERCURY_SYNC_SEND_RETRIES
 
         self._max_concurrency = env.MERCURY_SYNC_MAX_CONCURRENCY
@@ -133,9 +133,6 @@ class UDPProtocol(Generic[T, K]):
             max_future_seconds=60,  # 1 minute clock skew tolerance
             max_window_size=100000,
         )
-        
-        # Rate limiting (per-source)
-        self._rate_limiter = ServerRateLimiter()
 
     @property
     def nodes(self):
@@ -204,10 +201,24 @@ class UDPProtocol(Generic[T, K]):
                 key_path=key_path,
             )
 
-        run_start = True
         instance_id: int | None = None
+        start_time = time.monotonic()
+        attempt = 0
 
-        while run_start:
+        # Connect retry with exponential backoff
+        # Start with short timeout/interval, increase as processes may be slow to start
+        base_timeout = 2.0  # Initial per-attempt timeout
+        base_interval = 0.5  # Initial retry interval
+        max_timeout = 10.0  # Cap per-attempt timeout
+        max_interval = 5.0  # Cap retry interval
+
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= self._max_connect_time:
+                raise TimeoutError(
+                    f"Failed to connect to {address} after {self._max_connect_time}s ({attempt} attempts)"
+                )
+
             if self._transport is None:
                 await self.start_server(
                     cert_path=cert_path,
@@ -215,6 +226,10 @@ class UDPProtocol(Generic[T, K]):
                     worker_socket=worker_socket,
                     worker_server=worker_server,
                 )
+
+            # Calculate timeouts with exponential backoff, capped at max values
+            attempt_timeout = min(base_timeout * (1.5 ** min(attempt, 5)), max_timeout)
+            retry_interval = min(base_interval * (1.5 ** min(attempt, 5)), max_interval)
 
             try:
                 result: Tuple[int, Message[None]] = await asyncio.wait_for(
@@ -224,7 +239,7 @@ class UDPProtocol(Generic[T, K]):
                         target_address=address,
                         request_type="connect",
                     ),
-                    timeout=self._connect_timeout,
+                    timeout=attempt_timeout,
                 )
 
                 shard_id, response = result
@@ -235,12 +250,15 @@ class UDPProtocol(Generic[T, K]):
                 self._node_host_map[instance_id] = address
                 self._nodes.put_no_wait(instance_id)
 
-                run_start = False
+                # Successfully connected
+                break
 
             except (Exception, asyncio.CancelledError, socket.error, OSError):
-                pass
-
-            await asyncio.sleep(self._retry_interval)
+                attempt += 1
+                # Don't sleep if we've exceeded the max time
+                remaining = self._max_connect_time - (time.monotonic() - start_time)
+                if remaining > 0:
+                    await asyncio.sleep(min(retry_interval, remaining))
 
         default_config = {
             "node_id": self._node_id_base,
@@ -338,8 +356,6 @@ class UDPProtocol(Generic[T, K]):
         if self.node_id is None:
             # Use full 64-bit UUID to avoid collisions (10-bit snowflake instance is too small)
             self.node_id = self._node_id_base
-
-            print('[DEBUG] NODE ID', self.node_id)
 
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._max_concurrency)
@@ -577,28 +593,29 @@ class UDPProtocol(Generic[T, K]):
         if request_type is None:
             request_type = "request"
 
-        if target == "submit_workflow":
-            print(f"[DEBUG] Submitting to: node_id {node_id} at {address}")
-
-        item = cloudpickle.dumps(
-            (
-                request_type,
-                self.id_generator.generate(),
-                Message(
-                    self.node_id,
-                    target,
-                    data=data,
-                    service_host=self.host,
-                    service_port=self.port,
-                ),
-            ),
-            pickle.HIGHEST_PROTOCOL,
+        # Build message once - we'll regenerate shard_id on each retry
+        message = Message(
+            self.node_id,
+            target,
+            data=data,
+            service_host=self.host,
+            service_port=self.port,
         )
 
-        encrypted_message = self._encryptor.encrypt(item)
-        compressed = self._compressor.compress(encrypted_message)
-
         for attempt in range(self._retries + 1):
+            # Generate new shard_id for each attempt to avoid replay detection
+            item = cloudpickle.dumps(
+                (
+                    request_type,
+                    self.id_generator.generate(),
+                    message,
+                ),
+                pickle.HIGHEST_PROTOCOL,
+            )
+
+            encrypted_message = self._encryptor.encrypt(item)
+            compressed = self._compressor.compress(encrypted_message)
+
             try:
                 await self._sendto_with_retry(compressed, address)
             except BlockingIOError:
@@ -723,25 +740,29 @@ class UDPProtocol(Generic[T, K]):
         if request_type is None:
             request_type = "request"
 
-        item = cloudpickle.dumps(
-            (
-                request_type,
-                self.id_generator.generate(),
-                Message(
-                    self.node_id,
-                    target,
-                    data=data,
-                    service_host=self.host,
-                    service_port=self.port,
-                ),
-            ),
-            pickle.HIGHEST_PROTOCOL,
+        # Build message once - we'll regenerate shard_id on each retry
+        message = Message(
+            self.node_id,
+            target,
+            data=data,
+            service_host=self.host,
+            service_port=self.port,
         )
 
-        encrypted_message = self._encryptor.encrypt(item)
-        compressed = self._compressor.compress(encrypted_message)
-
         for attempt in range(self._retries + 1):
+            # Generate new shard_id for each attempt to avoid replay detection
+            item = cloudpickle.dumps(
+                (
+                    request_type,
+                    self.id_generator.generate(),
+                    message,
+                ),
+                pickle.HIGHEST_PROTOCOL,
+            )
+
+            encrypted_message = self._encryptor.encrypt(item)
+            compressed = self._compressor.compress(encrypted_message)
+
             try:
                 await self._sendto_with_retry(compressed, address)
             except BlockingIOError:
@@ -764,8 +785,8 @@ class UDPProtocol(Generic[T, K]):
 
                 await asyncio.wait_for(waiter, timeout=self._request_timeout)
 
-                for item in self.queue[target]:
-                    (shard_id, response) = item
+                for queued_item in self.queue[target]:
+                    (shard_id, response) = queued_item
 
                     yield (shard_id, response)
 
@@ -808,10 +829,6 @@ class UDPProtocol(Generic[T, K]):
         )
 
     def read(self, data: bytes, addr: Tuple[str, int]) -> None:
-        # Rate limiting - silently drop if rate exceeded
-        if not self._rate_limiter.check(addr, raise_on_limit=False):
-            return
-        
         # Validate compressed message size before decompression
         try:
             validate_compressed_size(data, raise_on_error=True)
@@ -929,7 +946,7 @@ class UDPProtocol(Generic[T, K]):
             return
 
         # Replay attack protection - validate message freshness and uniqueness
-        # Skip for "response" (replies to our requests) and "connect" (idempotent, 
+        # Skip for "response" (replies to our requests) and "connect" (idempotent,
         # often retried during startup when processes may be slow to spin up)
         if message_type not in ("response", "connect"):
             try:

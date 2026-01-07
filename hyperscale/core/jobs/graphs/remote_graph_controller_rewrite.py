@@ -411,7 +411,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
 
             # If explicit node_ids provided, target specific nodes
             # Otherwise fall back to round-robin (for backward compatibility)
-            print(f"[DEBUG] {workflow.name} run {run_id}: about to submit to {len(node_ids)} specific nodes")
             results = await asyncio.gather(
                 *[
                     self.submit(
@@ -424,7 +423,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     for idx, node_id in enumerate(node_ids)
                 ]
             )
-            print(f"[DEBUG] {workflow.name} run {run_id}: submit completed, got {len(results)} responses")
             return results
 
     async def submit_workflow_cancellation(
@@ -620,8 +618,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 name="debug",
             )
 
-            print(f"[DEBUG] submit: {workflow.name} run {run_id} -> node {target_node_id} (vus={vus})")
-
             response: Response[JobContext[WorkflowStatusUpdate]] = await self.send(
                 "start_workflow",
                 JobContext(
@@ -634,8 +630,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 ),
                 node_id=target_node_id,
             )
-
-            print(f"[DEBUG] submit: {workflow.name} run {run_id} -> node {target_node_id} got response")
 
             (shard_id, workflow_status) = response
 
@@ -687,9 +681,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                 message=f"Workflow {results.workflow} run {run_id} pushing results to Node {node_id}",
                 name="debug",
             )
-
-            address = self._node_host_map.get(node_id)
-            print(f"[DEBUG] push_results: {results.workflow} run {run_id} -> node {node_id}, address={address}, host_map_keys={list(self._node_host_map.keys())[:5]}")
 
             return await self.send(
                 "process_results",
@@ -818,11 +809,9 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             # Check if all workers have completed and signal the completion event
             completion_state = self._workflow_completion_states.get(run_id, {}).get(workflow_name)
             completions_set = self._completions[run_id][workflow_name]
-            print(f"[DEBUG] {workflow_name} run {run_id}: node {node_id} added to completions set (size now: {len(completions_set)}, has_state={completion_state is not None})")
             if completion_state:
                 completions_count = len(completions_set)
                 completion_state.workers_completed = completions_count
-                print(f"[DEBUG] {workflow_name} run {run_id}: checking {completions_count}/{completion_state.expected_workers} (event_already_set={completion_state.completion_event.is_set()})")
 
                 # Push cores update to the queue
                 try:
@@ -834,7 +823,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     pass
 
                 if completions_count >= completion_state.expected_workers:
-                    print(f"[DEBUG] {workflow_name} run {run_id}: all {completions_count} workers completed - signaling completion")
                     completion_state.completion_event.set()
 
             if self._leader_lock.locked():
@@ -876,8 +864,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         node_id = context.node_id
 
         workflow_name = context.data.workflow.name
-
-        print(f"[DEBUG] start_workflow: node {self._node_id_base} received {workflow_name} run {context.run_id} from node {node_id}, host_map_has_sender={node_id in self._node_host_map}, host_map_keys={list(self._node_host_map.keys())[:3]}")
 
         default_config = {
             "node_id": self._node_id_base,
@@ -1128,8 +1114,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     job.vus,
                 )
 
-                print(f"[DEBUG] run_workflow: {job.workflow.name} completed - results={results is not None}, run_id={run_id}, status={status}, error={error}")
-
                 if context is None:
                     context = job.context
 
@@ -1149,8 +1133,6 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
                     message=f"Workflow {job.workflow.name} run {run_id} failed with error: {err}",
                     name="error",
                 )
-
-                print(f"[DEBUG] run_workflow: {job.workflow.name} run {run_id} EXCEPTION: {err}")
 
                 await self.push_results(
                     node_id,
