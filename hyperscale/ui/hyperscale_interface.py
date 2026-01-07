@@ -95,35 +95,31 @@ class HyperscaleInterface:
                 ]
             )
 
-            active_workflows_update: list[str] | None = None
-
             elapsed = time.monotonic() - start
 
-            if self._active_workflow == "initializing":
-                active_workflows_update: (
-                    list[str] | None
-                ) = await self._updates.get_active_workflows(
-                    self._config.update_interval
-                )
+            # Always check for new workflow updates from the controller
+            active_workflows_update = await self._updates.get_active_workflows(
+                self._config.update_interval
+            )
 
             if isinstance(active_workflows_update, list):
+                # New batch of workflows received - reset to show them
                 self._active_workflows = active_workflows_update
                 self._current_active_idx = 0
                 self._active_workflow = active_workflows_update[
                     self._current_active_idx
                 ]
+                start = time.monotonic()
 
             elif len(self._active_workflows) > 0:
-                self._active_workflow = self._active_workflows[self._current_active_idx]
+                # No new update - continue cycling through current batch
+                if elapsed > self._config.update_interval:
+                    self._current_active_idx = (self._current_active_idx + 1) % len(
+                        self._active_workflows
+                    )
+                    start = time.monotonic()
 
-            if (
-                not isinstance(active_workflows_update, list)
-                and elapsed > self._config.update_interval
-            ):
-                self._current_active_idx = (self._current_active_idx + 1) % len(
-                    self._active_workflows
-                )
-                start = time.monotonic()
+                self._active_workflow = self._active_workflows[self._current_active_idx]
 
     async def stop(self):
         if self._run_switch_loop.is_set() is False:
