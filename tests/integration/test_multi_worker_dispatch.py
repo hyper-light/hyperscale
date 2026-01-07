@@ -152,6 +152,8 @@ async def run_test():
     status_updates_received = 0
     progress_updates_received = 0
     workflow_results_received: dict[str, str] = {}  # workflow_name -> status
+    # Track which workflows we received progress stats for (workflow_name -> update count)
+    workflow_progress_counts: dict[str, int] = {}
 
     def on_status_update(push):
         """Callback for critical status updates (job status changes)."""
@@ -162,6 +164,10 @@ async def run_test():
         """Callback for streaming windowed stats updates."""
         nonlocal progress_updates_received
         progress_updates_received += 1
+        # Track per-workflow progress updates
+        workflow_name = push.workflow_name
+        if workflow_name:
+            workflow_progress_counts[workflow_name] = workflow_progress_counts.get(workflow_name, 0) + 1
 
     def on_workflow_result(push):
         """Callback for workflow completion results."""
@@ -512,6 +518,18 @@ async def run_test():
         print(f"\n  Progress updates received (windowed stats): {progress_updates_received}")
         print(f"  Progress updates verification (>0): {'PASS' if progress_updates_ok else 'FAIL'}")
 
+        # Check per-workflow progress updates (should have stats for test workflows)
+        # Test workflows (TestWorkflow, TestWorkflowTwo) run longer and should have progress
+        test_workflow_progress_ok = (
+            workflow_progress_counts.get('TestWorkflow', 0) > 0 and
+            workflow_progress_counts.get('TestWorkflowTwo', 0) > 0
+        )
+        print(f"\n  Per-workflow progress updates:")
+        for workflow_name in ['TestWorkflow', 'TestWorkflowTwo', 'NonTestWorkflow', 'NonTestWorkflowTwo']:
+            count = workflow_progress_counts.get(workflow_name, 0)
+            print(f"    - {workflow_name}: {count} updates")
+        print(f"  Test workflow progress verification (both > 0): {'PASS' if test_workflow_progress_ok else 'FAIL'}")
+
         # Also check the job result's workflow_results dict
         job_result = client.get_job_status(job_id)
         job_workflow_results_ok = False
@@ -536,6 +554,7 @@ async def run_test():
             all_complete and
             workflow_results_ok and
             progress_updates_ok and
+            test_workflow_progress_ok and
             job_workflow_results_ok
         )
 
@@ -552,6 +571,7 @@ async def run_test():
         print(f"    - All workflows completed: {'PASS' if all_complete else 'FAIL'}")
         print(f"    - Workflow results pushed to client (4/4): {'PASS' if workflow_results_ok else 'FAIL'}")
         print(f"    - Progress updates received (>0): {'PASS' if progress_updates_ok else 'FAIL'}")
+        print(f"    - Test workflow progress stats (both > 0): {'PASS' if test_workflow_progress_ok else 'FAIL'}")
         print(f"    - Job workflow_results populated: {'PASS' if job_workflow_results_ok else 'FAIL'}")
         print()
         print("=" * 70)
@@ -613,7 +633,8 @@ def main():
     print("  4. Dependency-based scheduling triggers eager dispatch")
     print("  5. Workflow results are pushed to client for each completed workflow")
     print("  6. Windowed progress updates are streamed to client (>0 received)")
-    print("  7. Job's workflow_results dict is populated with all 4 workflow results")
+    print("  7. Per-workflow progress stats received for both test workflows")
+    print("  8. Job's workflow_results dict is populated with all 4 workflow results")
     print()
     print("Workflow dependencies:")
     print("  - TestWorkflow: no dependencies")
