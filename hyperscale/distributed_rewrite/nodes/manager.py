@@ -4929,14 +4929,6 @@ class ManagerServer(HealthAwareServer):
             return JobStatus.FAILED.value
         return "PARTIAL"
 
-    def _aggregate_workflow_stats(self, all_stats: list[WorkflowStats]) -> WorkflowStats | None:
-        """Aggregate multiple WorkflowStats into one using Results.merge_results()."""
-        if not all_stats:
-            return None
-        if len(all_stats) == 1:
-            return all_stats[0]
-        return Results().merge_results(all_stats)
-
     async def _handle_job_completion(self, job_id: str) -> None:
         """
         Handle job completion - notify client/gate and trigger reporter submission.
@@ -4994,17 +4986,14 @@ class ManagerServer(HealthAwareServer):
             await self._send_job_final_result_to_client(job_final, callback)
 
             # Use pre-aggregated results from _handle_workflow_completion
-            # instead of recomputing aggregation
+            # Results are already aggregated per-workflow, just pass them directly
             stored_results = self._job_aggregated_results.pop(job_id, [])
             if stored_results:
-                # Merge all stored workflow results into a single aggregated stat
-                aggregated = self._aggregate_workflow_stats(stored_results)
-                if aggregated:
-                    self._start_background_reporter_submission(
-                        job_id=job_id,
-                        aggregated_stats=aggregated,
-                        callback_addr=callback,
-                    )
+                self._start_background_reporter_submission(
+                    job_id=job_id,
+                    aggregated_stats=stored_results,
+                    callback_addr=callback,
+                )
 
     async def _send_job_final_result_to_gates(self, job_final: JobFinalResult) -> None:
         """
@@ -5091,7 +5080,7 @@ class ManagerServer(HealthAwareServer):
     def _start_background_reporter_submission(
         self,
         job_id: str,
-        aggregated_stats: dict,
+        aggregated_stats: list[WorkflowStats],
         callback_addr: tuple[str, int] | None,
     ) -> None:
         """
@@ -5099,7 +5088,7 @@ class ManagerServer(HealthAwareServer):
 
         Each reporter config gets its own background task that:
         1. Connects to the reporter
-        2. Submits workflow and step results
+        2. Submits workflow and step results for each workflow
         3. Closes the reporter
         4. Sends success/failure notification to client
 
@@ -5107,7 +5096,7 @@ class ManagerServer(HealthAwareServer):
 
         Args:
             job_id: The job ID for tracking
-            aggregated_stats: The aggregated WorkflowStats to submit
+            aggregated_stats: List of WorkflowStats to submit (one per workflow)
             callback_addr: Client callback address for push notifications
         """
         submission = self._job_submissions.get(job_id)
@@ -5173,11 +5162,11 @@ class ManagerServer(HealthAwareServer):
         self,
         job_id: str,
         reporter_config,
-        aggregated_stats: dict,
+        aggregated_stats: list[WorkflowStats],
         callback_addr: tuple[str, int] | None,
     ) -> None:
         """
-        Submit aggregated results to a single reporter.
+        Submit workflow results to a single reporter.
 
         Runs as a background task. Sends push notification to client
         on success or failure.
@@ -5185,7 +5174,7 @@ class ManagerServer(HealthAwareServer):
         Args:
             job_id: The job ID
             reporter_config: The ReporterConfig instance
-            aggregated_stats: The aggregated WorkflowStats dict
+            aggregated_stats: List of WorkflowStats to submit
             callback_addr: Client callback for push notification
         """
         reporter_type = reporter_config.reporter_type.value
@@ -5198,8 +5187,10 @@ class ManagerServer(HealthAwareServer):
             await reporter.connect()
 
             try:
-                await reporter.submit_workflow_results(aggregated_stats)
-                await reporter.submit_step_results(aggregated_stats)
+                # Submit each workflow's results
+                for workflow_stats in aggregated_stats:
+                    await reporter.submit_workflow_results(workflow_stats)
+                    await reporter.submit_step_results(workflow_stats)
                 success = True
             finally:
                 await reporter.close()
