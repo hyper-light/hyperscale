@@ -120,5 +120,5 @@ async def run(
     ) as e:
         await runner.abort(
             error=e,
-            terminal_mode=terminal_mode,
+            terminal_mode=config.data.terminal_mode,
         )
