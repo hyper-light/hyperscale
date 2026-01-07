@@ -1696,9 +1696,10 @@ class WorkerServer(HealthAwareServer):
                 elif status == CoreWorkflowStatus.PENDING:
                     progress.status = WorkflowStatus.ASSIGNED.value
                 
-                # Send update
+                # Send update directly (not buffered) for real-time streaming
+                # The manager's windowed stats collector handles time-correlation
                 if self._healthy_manager_ids:
-                    await self._send_progress_update(progress)
+                    await self._send_progress_update_direct(progress)
                     self._workflow_last_progress[dispatch.workflow_id] = time.monotonic()
                 
             except asyncio.CancelledError:
