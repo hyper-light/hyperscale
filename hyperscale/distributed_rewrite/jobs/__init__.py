@@ -45,6 +45,12 @@ from hyperscale.distributed_rewrite.jobs.core_allocator import (
     CoreAllocator as CoreAllocator,
     AllocationResult as AllocationResult,
 )
+from hyperscale.distributed_rewrite.jobs.windowed_stats_collector import (
+    WindowedStatsCollector as WindowedStatsCollector,
+    WindowedStatsPush as WindowedStatsPush,
+    WorkerWindowStats as WorkerWindowStats,
+    WindowBucket as WindowBucket,
+)
 from hyperscale.distributed_rewrite.jobs.logging_models import (
     WorkerPoolTrace as WorkerPoolTrace,
     WorkerPoolDebug as WorkerPoolDebug,

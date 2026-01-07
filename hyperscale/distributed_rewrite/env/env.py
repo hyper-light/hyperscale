@@ -178,6 +178,18 @@ class Env(BaseModel):
     ORPHAN_SCAN_WORKER_TIMEOUT: StrictFloat = 5.0  # Timeout for querying workers during scan
 
     # ==========================================================================
+    # Time-Windowed Stats Streaming Settings
+    # ==========================================================================
+    STATS_WINDOW_SIZE_MS: StrictFloat = 100.0  # Window bucket size in milliseconds
+    STATS_DRIFT_TOLERANCE_MS: StrictFloat = 50.0  # Clock drift tolerance between workers
+    STATS_PUSH_INTERVAL_MS: StrictFloat = 100.0  # How often to flush windows and push (ms)
+    STATS_MAX_WINDOW_AGE_MS: StrictFloat = 5000.0  # Max age before window is dropped (cleanup)
+
+    # Client rate limiting for progress updates only
+    CLIENT_PROGRESS_RATE_LIMIT: StrictFloat = 20.0  # Max progress callbacks per second
+    CLIENT_PROGRESS_BURST: StrictInt = 5  # Burst allowance for progress callbacks
+
+    # ==========================================================================
     # Cross-DC Correlation Settings (Phase 7)
     # ==========================================================================
     # These settings control correlation detection for cascade eviction prevention
@@ -338,6 +350,13 @@ class Env(BaseModel):
             # Orphaned workflow scanner settings
             "ORPHAN_SCAN_INTERVAL": float,
             "ORPHAN_SCAN_WORKER_TIMEOUT": float,
+            # Time-windowed stats streaming settings
+            "STATS_WINDOW_SIZE_MS": float,
+            "STATS_DRIFT_TOLERANCE_MS": float,
+            "STATS_PUSH_INTERVAL_MS": float,
+            "STATS_MAX_WINDOW_AGE_MS": float,
+            "CLIENT_PROGRESS_RATE_LIMIT": float,
+            "CLIENT_PROGRESS_BURST": int,
             # Cross-DC correlation settings (Phase 7)
             "CROSS_DC_CORRELATION_WINDOW": float,
             "CROSS_DC_CORRELATION_LOW_THRESHOLD": int,
