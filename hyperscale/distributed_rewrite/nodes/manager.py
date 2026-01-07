@@ -7028,7 +7028,7 @@ class ManagerServer(HealthAwareServer):
         self,
         submission: JobSubmission,
         workflows: list[
-            tuple[list[str], Workflow]
+            tuple[str, list[str], Workflow]
         ],
     ) -> None:
         """
