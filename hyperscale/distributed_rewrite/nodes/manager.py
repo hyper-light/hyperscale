@@ -4036,7 +4036,34 @@ class ManagerServer(HealthAwareServer):
             worker_id = self._worker_addr_to_id.get(addr, f"{addr[0]}:{addr[1]}")
 
             # Add to windowed stats collector for streaming progress updates
-            await self._windowed_stats.add_progress(worker_id, progress)
+            # Use parent workflow ID if this is a sub-workflow, so all sub-workflow
+            # stats get aggregated together under the parent workflow
+            parent_workflow_id = self._get_parent_workflow_id(progress.workflow_id)
+            stats_workflow_id = parent_workflow_id if parent_workflow_id else progress.workflow_id
+
+            # Create a copy with the parent workflow ID for windowed stats
+            stats_progress = WorkflowProgress(
+                job_id=progress.job_id,
+                workflow_id=stats_workflow_id,
+                workflow_name=progress.workflow_name,
+                status=progress.status,
+                completed_count=progress.completed_count,
+                failed_count=progress.failed_count,
+                rate_per_second=progress.rate_per_second,
+                elapsed_seconds=progress.elapsed_seconds,
+                step_stats=progress.step_stats,
+                timestamp=progress.timestamp,
+                collected_at=progress.collected_at,
+                assigned_cores=progress.assigned_cores,
+                cores_completed=progress.cores_completed,
+                avg_cpu_percent=progress.avg_cpu_percent,
+                avg_memory_mb=progress.avg_memory_mb,
+                vus=progress.vus,
+                worker_workflow_assigned_cores=progress.worker_workflow_assigned_cores,
+                worker_workflow_completed_cores=progress.worker_workflow_completed_cores,
+                worker_available_cores=progress.worker_available_cores,
+            )
+            await self._windowed_stats.add_progress(worker_id, stats_progress)
 
             # Forward to job leader if we're not the leader
             forwarded = await self._try_forward_progress_to_leader(progress)
