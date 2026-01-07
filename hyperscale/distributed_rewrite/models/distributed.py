@@ -510,6 +510,10 @@ class ManagerHeartbeat(Message):
     health_throughput: float = 0.0
     health_expected_throughput: float = 0.0
     health_overload_state: str = "healthy"
+    # Extension and LHM tracking for cross-DC correlation (Phase 7)
+    # Used by gates to distinguish load from failures
+    workers_with_extensions: int = 0  # Workers currently with active extensions
+    lhm_score: int = 0  # Local Health Multiplier score (0-8, higher = more stressed)
 
 
 # =============================================================================

@@ -2711,6 +2711,9 @@ class ManagerServer(HealthAwareServer):
             tcp_port=self._tcp_port,
             job_leaderships=job_leaderships,
             known_gates=known_gates_piggyback,
+            # Extension and LHM tracking for cross-DC correlation (Phase 7)
+            workers_with_extensions=self._worker_health_manager.workers_with_active_extensions,
+            lhm_score=self._local_health.score,
         )
     
     async def _gate_heartbeat_loop(self) -> None:

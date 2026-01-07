@@ -478,6 +478,25 @@ class GateServer(HealthAwareServer):
         )
         # Progress is updated from throughput metrics if available
 
+        # Record extension and LHM data for cross-DC correlation (Phase 7)
+        # This helps distinguish load from failures - high extensions + high LHM
+        # across DCs indicates load spike, not health issues
+        if heartbeat.workers_with_extensions > 0:
+            # Record extension activity for this DC
+            # We track at DC level (aggregated from manager heartbeats)
+            self._cross_dc_correlation.record_extension(
+                datacenter_id=dc,
+                worker_id=f"{dc}:{heartbeat.node_id}",  # Use manager as proxy
+                extension_count=heartbeat.workers_with_extensions,
+                reason="aggregated from manager heartbeat",
+            )
+        if heartbeat.lhm_score > 0:
+            # Record LHM score for this DC
+            self._cross_dc_correlation.record_lhm_score(
+                datacenter_id=dc,
+                lhm_score=heartbeat.lhm_score,
+            )
+
         # Update version tracking via TaskRunner
         self._task_runner.run(
             self._versioned_clock.update_entity, dc_key, heartbeat.version
@@ -2110,6 +2129,7 @@ class GateServer(HealthAwareServer):
             cluster_id=f"gate-{self._node_id.datacenter}",
             node_id=self._node_id.full,
             on_dc_health_change=self._on_dc_health_change,
+            on_dc_latency=self._on_dc_latency,
         )
         
         # Add known DC leaders to monitor (will be updated via TCP registrations)
@@ -2246,7 +2266,25 @@ class GateServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-    
+
+    def _on_dc_latency(self, datacenter: str, latency_ms: float) -> None:
+        """
+        Called when a latency measurement is received from a DC probe.
+
+        Records latency for cross-DC correlation detection (Phase 7).
+        High latency across multiple DCs indicates network degradation
+        rather than individual DC failures.
+
+        Args:
+            datacenter: The datacenter that was probed.
+            latency_ms: Round-trip latency in milliseconds.
+        """
+        self._cross_dc_correlation.record_latency(
+            datacenter_id=datacenter,
+            latency_ms=latency_ms,
+            probe_type="federated",
+        )
+
     async def _handle_xack_response(
         self,
         source_addr: tuple[str, int] | bytes,
@@ -2254,7 +2292,7 @@ class GateServer(HealthAwareServer):
     ) -> None:
         """
         Handle a cross-cluster health acknowledgment from a DC leader.
-        
+
         Passes the ack to the FederatedHealthMonitor for processing.
         """
         try:

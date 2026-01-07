@@ -254,3 +254,17 @@ class WorkerHealthManager:
     def tracked_worker_count(self) -> int:
         """Get the number of workers with active extension trackers."""
         return len(self._trackers)
+
+    @property
+    def workers_with_active_extensions(self) -> int:
+        """
+        Get the count of workers that have requested at least one extension.
+
+        Used for cross-DC correlation to distinguish load from failures.
+        Workers with active extensions are busy with legitimate work,
+        not necessarily unhealthy.
+        """
+        return sum(
+            1 for tracker in self._trackers.values()
+            if tracker.extension_count > 0
+        )
