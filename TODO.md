@@ -426,15 +426,18 @@ Extract classes from monolithic files into focused modules.
 
 ### Gate Per-Job Leadership
 
-- [ ] Gates accept client job requests (like client -> manager pattern)
-  - [ ] Client can submit jobs directly to gates
-  - [ ] Gates forward to appropriate DC manager(s)
-  - [ ] Gates aggregate results from DCs
-- [ ] Gates use retry logic with exponential backoff for DC communication
-- [ ] Gates use fencing tokens for all job operations
-- [ ] Verify and enhance failover logic for gate leadership transfer
-- [ ] Implement cross-DC correlation for eviction decisions
-- [ ] Add eviction backoff for repeated failures
+- [x] Gates accept client job requests (like client -> manager pattern)
+  - [x] Client can submit jobs directly to gates (job_submission handler)
+  - [x] Gates forward to appropriate DC manager(s) (_dispatch_job_to_datacenters)
+  - [x] Gates aggregate results from DCs (job_final_result handler)
+- [x] Gates use retry logic with exponential backoff for DC communication
+- [x] Gates use fencing tokens for all job operations
+- [x] Verify and enhance failover logic for gate leadership transfer
+- [x] Implement cross-DC correlation for eviction decisions
+  - [x] Add CrossDCCorrelationDetector class to datacenters module
+  - [x] Integrate with gate's _on_dc_health_change handler
+  - [x] Add integration tests for cross-DC correlation
+- [x] Add eviction backoff for repeated failures (NodeHealthTracker)
 
 ---
 

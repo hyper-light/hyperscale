@@ -117,6 +117,9 @@ from hyperscale.distributed_rewrite.datacenters import (
     DatacenterHealthManager,
     ManagerDispatcher,
     LeaseManager,
+    CrossDCCorrelationDetector,
+    CrossDCCorrelationConfig,
+    CorrelationSeverity,
 )
 from hyperscale.distributed_rewrite.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
@@ -316,6 +319,22 @@ class GateServer(HealthAwareServer):
             suspicion_timeout=fed_config['suspicion_timeout'],
             max_consecutive_failures=fed_config['max_consecutive_failures'],
         )
+
+        # Cross-DC correlation detector for eviction decisions (Phase 7)
+        # Prevents cascade evictions when multiple DCs fail simultaneously
+        # (likely network partition, not actual DC failures)
+        self._cross_dc_correlation = CrossDCCorrelationDetector(
+            config=CrossDCCorrelationConfig(
+                correlation_window_seconds=30.0,  # 30s window for correlation detection
+                low_threshold=2,  # 2+ DCs failing = LOW correlation
+                medium_threshold=3,  # 3+ DCs failing = MEDIUM correlation
+                high_threshold_fraction=0.5,  # 50%+ DCs failing = HIGH correlation
+                correlation_backoff_seconds=60.0,  # Wait 60s after correlation detected
+            )
+        )
+        # Register known DCs with correlation detector
+        for dc_id in self._datacenter_managers.keys():
+            self._cross_dc_correlation.add_datacenter(dc_id)
     
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
@@ -2159,18 +2178,80 @@ class GateServer(HealthAwareServer):
     def _on_dc_health_change(self, datacenter: str, new_health: str) -> None:
         """
         Called when a datacenter's health status changes.
-        
+
         Logs the change and updates internal tracking.
+        Uses cross-DC correlation detection to prevent cascade evictions
+        when multiple DCs fail simultaneously (likely network issue).
         """
-        self._task_runner.run(
-            self._udp_logger.log,
-            ServerInfo(
-                message=f"DC {datacenter} health changed to {new_health}",
-                node_host=self._host,
-                node_port=self._tcp_port,
-                node_id=self._node_id.short,
+        # Register DC with correlation detector if not known
+        self._cross_dc_correlation.add_datacenter(datacenter)
+
+        # Record failure or recovery with correlation detector
+        if new_health in ("unhealthy", "degraded"):
+            # Count affected managers for this DC
+            manager_count = len(self._datacenter_managers.get(datacenter, []))
+            self._cross_dc_correlation.record_failure(
+                datacenter_id=datacenter,
+                failure_type=new_health,
+                manager_count_affected=manager_count,
             )
-        )
+
+            # Check for correlated failures before taking action
+            correlation = self._cross_dc_correlation.check_correlation(datacenter)
+
+            if correlation.should_delay_eviction:
+                # High/medium correlation - likely network issue, don't evict
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=(
+                            f"DC {datacenter} health changed to {new_health}, "
+                            f"but CORRELATION DETECTED ({correlation.severity.value}): "
+                            f"{correlation.reason}. Affected DCs: {correlation.affected_datacenters}. "
+                            f"Recommendation: {correlation.recommendation}"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            elif correlation.severity == CorrelationSeverity.LOW:
+                # Low correlation - proceed cautiously with warning
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=(
+                            f"DC {datacenter} health changed to {new_health} "
+                            f"(low correlation with {len(correlation.affected_datacenters)} other DCs)"
+                        ),
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            else:
+                # No correlation - normal health change handling
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerInfo(
+                        message=f"DC {datacenter} health changed to {new_health}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+        else:
+            # DC recovered (healthy or busy)
+            self._cross_dc_correlation.record_recovery(datacenter)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"DC {datacenter} health changed to {new_health}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
     
     async def _handle_xack_response(
         self,

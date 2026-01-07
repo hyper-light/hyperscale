@@ -775,9 +775,11 @@ class TestServerRateLimiterCheckEdgeCases:
         limiter.check(addr)
         assert limiter.check(addr) is False
 
-        # Sliding window counter needs time for previous count to decay
-        # Window size is max(0.05, 2/100) = 0.05s, need ~1.5 windows for
-        # enough decay to allow 1 more request (effective count < max)
+        # Window size is max(0.05, 2/100) = 0.05s
+        # With sliding window, we need: total_count * (1 - progress) + 1 <= 2
+        # So: 2 * (1 - progress) <= 1, meaning progress >= 0.5
+        # That's 0.5 * 0.05 = 0.025s into the new window, plus the remaining
+        # time in current window. Total wait ~0.05 + 0.025 = 0.075s
         time.sleep(0.08)
 
         assert limiter.check(addr) is True
