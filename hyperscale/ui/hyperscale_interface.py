@@ -94,8 +94,6 @@ class HyperscaleInterface:
 
     async def _run(self):
         start = time.monotonic()
-        # Use terminal's configured refresh interval for spinner
-        spinner_interval = self._terminal._interval
 
         while not self._run_switch_loop.is_set():
             await asyncio.gather(
@@ -108,11 +106,6 @@ class HyperscaleInterface:
             )
 
             elapsed = time.monotonic() - start
-
-            # Until first progress update arrives, trigger periodic renders for spinner animation
-            if not HyperscaleInterface._received_first_progress_update:
-                Terminal.trigger_render()
-                await asyncio.sleep(spinner_interval)
 
             # Always check for new workflow updates from the controller
             active_workflows_update = await self._updates.get_active_workflows(

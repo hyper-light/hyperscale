@@ -152,7 +152,7 @@ class ProgressBar:
 
     async def get_next_frame(self):
         if self._bar_status == ProgressBarStatus.READY:
-            self._bar_status == ProgressBarStatus.ACTIVE
+            self._bar_status = ProgressBarStatus.ACTIVE
 
         if self._bar_status in [ProgressBarStatus.COMPLETE, ProgressBarStatus.FAILED]:
             frame = await self._create_last_bar()
@@ -216,6 +216,8 @@ class ProgressBar:
         completed = await self._check_if_should_rerender()
         if completed is None:
             completed = self._last_completed
+        else:
+            self._last_completed = completed
 
         active_idx = self._completed_to_active_idx(completed)
 
