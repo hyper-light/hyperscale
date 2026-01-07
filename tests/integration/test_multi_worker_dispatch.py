@@ -38,6 +38,7 @@ from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
 from hyperscale.distributed_rewrite.nodes.client import HyperscaleClient
 from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.distributed_rewrite.models import ManagerState, WorkflowStatus
+from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
 from hyperscale.logging.config.logging_config import LoggingConfig
 
 # Initialize logging directory (required for server pool)
@@ -149,12 +150,18 @@ async def run_test():
 
     # Counters for tracking push notifications
     status_updates_received = 0
+    progress_updates_received = 0
     workflow_results_received: dict[str, str] = {}  # workflow_name -> status
 
     def on_status_update(push):
-        """Callback for status updates (stats pushes)."""
+        """Callback for critical status updates (job status changes)."""
         nonlocal status_updates_received
         status_updates_received += 1
+
+    def on_progress_update(push: WindowedStatsPush):
+        """Callback for streaming windowed stats updates."""
+        nonlocal progress_updates_received
+        progress_updates_received += 1
 
     def on_workflow_result(push):
         """Callback for workflow completion results."""
@@ -280,6 +287,7 @@ async def run_test():
             timeout_seconds=120.0,
             on_status_update=on_status_update,
             on_workflow_result=on_workflow_result,
+            on_progress_update=on_progress_update,
         )
         print(f"  Job submitted: {job_id}")
 
@@ -499,10 +507,10 @@ async def run_test():
 
         print(f"  Workflow results verification: {'PASS' if workflow_results_ok else 'FAIL'}")
 
-        # Check stats updates received
-        stats_updates_ok = status_updates_received > 0
-        print(f"\n  Status updates received: {status_updates_received}")
-        print(f"  Stats updates verification (>0): {'PASS' if stats_updates_ok else 'FAIL'}")
+        # Check streaming progress updates received (windowed stats)
+        progress_updates_ok = progress_updates_received > 0
+        print(f"\n  Progress updates received (windowed stats): {progress_updates_received}")
+        print(f"  Progress updates verification (>0): {'PASS' if progress_updates_ok else 'FAIL'}")
 
         # Also check the job result's workflow_results dict
         job_result = client.get_job_status(job_id)
@@ -527,7 +535,7 @@ async def run_test():
             non_test_two_assigned and
             all_complete and
             workflow_results_ok and
-            stats_updates_ok and
+            progress_updates_ok and
             job_workflow_results_ok
         )
 
@@ -543,7 +551,7 @@ async def run_test():
         print(f"    - After TestWorkflow done (NonTestWorkflowTwo assigned): {'PASS' if non_test_two_assigned else 'FAIL'}")
         print(f"    - All workflows completed: {'PASS' if all_complete else 'FAIL'}")
         print(f"    - Workflow results pushed to client (4/4): {'PASS' if workflow_results_ok else 'FAIL'}")
-        print(f"    - Stats updates received (>0): {'PASS' if stats_updates_ok else 'FAIL'}")
+        print(f"    - Progress updates received (>0): {'PASS' if progress_updates_ok else 'FAIL'}")
         print(f"    - Job workflow_results populated: {'PASS' if job_workflow_results_ok else 'FAIL'}")
         print()
         print("=" * 70)
@@ -604,7 +612,7 @@ def main():
     print("  3. NonTestWorkflowTwo (depends on BOTH) waits for both to complete")
     print("  4. Dependency-based scheduling triggers eager dispatch")
     print("  5. Workflow results are pushed to client for each completed workflow")
-    print("  6. Stats updates are pushed to client (>0 received)")
+    print("  6. Windowed progress updates are streamed to client (>0 received)")
     print("  7. Job's workflow_results dict is populated with all 4 workflow results")
     print()
     print("Workflow dependencies:")
