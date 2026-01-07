@@ -1518,17 +1518,13 @@ class WorkerServer(HealthAwareServer):
             context_dict = dispatch.load_context()
 
             progress.workflow_name = workflow.name
-            progress.status = WorkflowStatus.RUNNING.value
-            progress.collected_at = time.time()  # Unix timestamp for cross-node alignment
             self._increment_version()
 
             # Track workflow_id -> workflow_name mapping for cancellation
             self._workflow_id_to_name[dispatch.workflow_id] = workflow.name
 
-            # Send immediate "started" progress update - ensures short workflows
-            # get at least start + completion updates regardless of duration
-            if self._healthy_manager_ids:
-                await self._send_progress_update_direct(progress)
+            # Transition to RUNNING - sends immediate update (lifecycle event)
+            await self._transition_workflow_status(progress, WorkflowStatus.RUNNING, start_time)
 
             # Initialize cores_completed tracking
             self._workflow_cores_completed[dispatch.workflow_id] = set()
@@ -1565,32 +1561,27 @@ class WorkerServer(HealthAwareServer):
 
                 progress.cores_completed = len(progress.assigned_cores)
 
-                progress.status = WorkflowStatus.COMPLETED.value
+                # Determine final status and transition (sends immediate update)
                 if status != CoreWorkflowStatus.COMPLETED:
-                    progress.status = WorkflowStatus.FAILED.value
                     workflow_error = str(error) if error else "Unknown error"
+                    await self._transition_workflow_status(progress, WorkflowStatus.FAILED, start_time)
+                else:
+                    await self._transition_workflow_status(progress, WorkflowStatus.COMPLETED, start_time)
 
                 # Serialize results and context for final result
                 context_updates = cloudpickle.dumps(context.dict() if context else {})
 
             except asyncio.CancelledError:
-                progress.status = WorkflowStatus.CANCELLED.value
                 workflow_error = "Cancelled"
+                await self._transition_workflow_status(progress, WorkflowStatus.CANCELLED, start_time)
                 raise
             except Exception as e:
-                progress.status = WorkflowStatus.FAILED.value
                 workflow_error = str(e)
+                await self._transition_workflow_status(progress, WorkflowStatus.FAILED, start_time)
             finally:
                 # Cancel progress monitor using its token
                 if progress_token:
                     await self._task_runner.cancel(progress_token.token)
-            
-            # Final progress update - send directly (not buffered) since it's critical
-            progress.elapsed_seconds = time.monotonic() - start_time
-            progress.timestamp = time.monotonic()
-            progress.collected_at = time.time()  # Unix timestamp for cross-node alignment
-            if self._healthy_manager_ids:
-                await self._send_progress_update_direct(progress)
 
             # Free cores BEFORE sending final result so we can report accurate availability
             await self._core_allocator.free(dispatch.workflow_id)
@@ -1611,12 +1602,22 @@ class WorkerServer(HealthAwareServer):
             final_result_sent = True
 
         except asyncio.CancelledError:
-            progress.status = WorkflowStatus.CANCELLED.value
-            workflow_error = "Cancelled"
+            # Status already transitioned by inner handler before re-raise
+            # Just ensure workflow_error is set for final result
+            if workflow_error is None:
+                workflow_error = "Cancelled"
+                # If cancelled before inner try block ran, status may not be set
+                if progress.status != WorkflowStatus.CANCELLED.value:
+                    progress.status = WorkflowStatus.CANCELLED.value
+                    progress.collected_at = time.time()
         except Exception as e:
-            progress.status = WorkflowStatus.FAILED.value
+            # Exception may have occurred before or after status was transitioned
+            # Set status and error for final result
             workflow_error = str(e) if e else "Unknown error"
             error = e
+            if progress.status not in (WorkflowStatus.FAILED.value, WorkflowStatus.COMPLETED.value):
+                progress.status = WorkflowStatus.FAILED.value
+                progress.collected_at = time.time()
         finally:
             # Free cores if not already freed (exception path)
             if not final_result_sent:
@@ -1783,6 +1784,39 @@ class WorkerServer(HealthAwareServer):
                     )
                 )
     
+    async def _transition_workflow_status(
+        self,
+        progress: WorkflowProgress,
+        new_status: WorkflowStatus,
+        start_time: float | None = None,
+    ) -> None:
+        """
+        Transition workflow to a new status and send an immediate progress update.
+
+        This is the ONLY method that should change workflow status. By funneling
+        all status changes through here, we guarantee:
+        1. Every status transition triggers a progress update
+        2. Updates are sent immediately (not buffered) for lifecycle events
+        3. Timestamps are consistently set
+        4. Consistent behavior regardless of workflow duration
+
+        Args:
+            progress: The workflow progress to update
+            new_status: The new status to transition to
+            start_time: Optional start time for elapsed_seconds calculation
+        """
+        progress.status = new_status.value
+        progress.timestamp = time.monotonic()
+        progress.collected_at = time.time()
+
+        if start_time is not None:
+            progress.elapsed_seconds = time.monotonic() - start_time
+
+        # Always send lifecycle transitions immediately (not buffered)
+        # This ensures short-running workflows still get all state updates
+        if self._healthy_manager_ids:
+            await self._send_progress_update_direct(progress)
+
     async def _send_progress_update(
         self,
         progress: WorkflowProgress,
@@ -1793,6 +1827,9 @@ class WorkerServer(HealthAwareServer):
         Instead of sending immediately, updates are collected in a buffer
         and flushed periodically by _progress_flush_loop. This reduces
         network traffic and noisy status updates.
+
+        NOTE: For status transitions, use _transition_workflow_status instead
+        to ensure immediate delivery.
 
         Args:
             progress: Workflow progress to buffer
