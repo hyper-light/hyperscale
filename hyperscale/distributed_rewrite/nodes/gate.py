@@ -89,6 +89,8 @@ from hyperscale.distributed_rewrite.models import (
     ReporterResultPush,
     WorkflowResultPush,
     WorkflowDCResult,
+    JobLeadershipAnnouncement,
+    JobLeadershipAck,
     restricted_loads,
 )
 from hyperscale.distributed_rewrite.swim.core import (
@@ -260,7 +262,13 @@ class GateServer(HealthAwareServer):
         # Track which DCs were assigned for each job (to know when complete)
         # job_id -> set of datacenter IDs
         self._job_target_dcs: dict[str, set[str]] = {}
-        
+
+        # Per-job leader tracking (Context Consistency Protocol)
+        # Each job has one leader gate responsible for aggregation and client communication
+        # Any gate can accept a job and become its leader (independent of SWIM cluster leadership)
+        self._job_leaders: dict[str, str] = {}  # job_id -> leader_node_id
+        self._job_leader_addrs: dict[str, tuple[str, int]] = {}  # job_id -> (host, tcp_port)
+
         # Client push notification callbacks
         # job_id -> callback address for push notifications
         self._job_callbacks: dict[str, tuple[str, int]] = {}
@@ -675,7 +683,80 @@ class GateServer(HealthAwareServer):
         """Generate a new fencing token."""
         self._fence_token += 1
         return self._fence_token
-    
+
+    # =========================================================================
+    # Per-Job Leader Helpers (independent of SWIM cluster leadership)
+    # =========================================================================
+
+    def _is_job_leader(self, job_id: str) -> bool:
+        """Check if this gate is the leader for the given job."""
+        return self._job_leaders.get(job_id) == self._node_id.full
+
+    def _get_job_leader(self, job_id: str) -> str | None:
+        """Get the node_id of the job leader, or None if unknown."""
+        return self._job_leaders.get(job_id)
+
+    def _get_job_leader_addr(self, job_id: str) -> tuple[str, int] | None:
+        """Get the TCP address of the job leader, or None if unknown."""
+        return self._job_leader_addrs.get(job_id)
+
+    async def _broadcast_job_leadership(
+        self,
+        job_id: str,
+        datacenter_count: int,
+    ) -> None:
+        """
+        Broadcast job leadership announcement to all peer gates.
+
+        This ensures all gates in the cluster know who is leading
+        a specific job, enabling proper routing of DC results
+        and allowing non-leaders to forward requests to the leader.
+        """
+        announcement = JobLeadershipAnnouncement(
+            job_id=job_id,
+            leader_id=self._node_id.full,
+            leader_host=self._host,
+            leader_tcp_port=self._tcp_port,
+            term=self._leader_election.state.current_term,
+            workflow_count=datacenter_count,  # Repurposed for DC count at gate level
+            timestamp=time.monotonic(),
+            workflow_names=[],  # Not applicable for gate-level leadership
+        )
+
+        # Get all active peer gate addresses
+        for peer_addr in self._active_gate_peers:
+            try:
+                response, _ = await self.send_tcp(
+                    peer_addr,
+                    action='job_leadership_announcement',
+                    data=announcement.dump(),
+                    timeout=2.0,
+                )
+
+                if response and isinstance(response, bytes) and response != b'error':
+                    ack = JobLeadershipAck.load(response)
+                    if ack.accepted:
+                        self._task_runner.run(
+                            self._udp_logger.log,
+                            ServerDebug(
+                                message=f"Job {job_id[:8]}... leadership accepted by {ack.responder_id[:8]}...",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Failed to announce job {job_id[:8]}... leadership to {peer_addr}: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
     def _get_state_snapshot(self) -> GateStateSnapshot:
         """Get a complete state snapshot for state sync."""
         return GateStateSnapshot(
@@ -2537,6 +2618,9 @@ class GateServer(HealthAwareServer):
                     self._job_target_dcs.pop(job_id, None)
                     self._job_callbacks.pop(job_id, None)
                     self._progress_callbacks.pop(job_id, None)
+                    # Clean up per-job leadership tracking
+                    self._job_leaders.pop(job_id, None)
+                    self._job_leader_addrs.pop(job_id, None)
                     # Clean up windowed stats for this job
                     await self._windowed_stats.cleanup_job_windows(job_id)
                     # Clean up reporter tasks and submissions
@@ -2952,8 +3036,9 @@ class GateServer(HealthAwareServer):
     ):
         """Handle job submission from client.
 
-        Only the cluster leader accepts new jobs. Non-leaders redirect
-        clients to the current leader for consistent job coordination.
+        Any gate can accept a job and become its leader. Per-job leadership
+        is independent of SWIM cluster leadership - each job has exactly one
+        leader gate that handles aggregation and client communication.
         """
         try:
             # Check rate limit first (AD-24)
@@ -2967,17 +3052,6 @@ class GateServer(HealthAwareServer):
 
             submission = JobSubmission.load(data)
 
-            # Only leader accepts new jobs
-            if not self.is_leader():
-                leader = self.get_current_leader()
-                ack = JobAck(
-                    job_id=submission.job_id,
-                    accepted=False,
-                    error=f"Not leader" if leader else "No leader elected",
-                    leader_addr=leader,
-                )
-                return ack.dump()
-            
             # Check quorum circuit breaker (fail-fast)
             if self._quorum_circuit.circuit_state == CircuitState.OPEN:
                 # Calculate retry_after from half_open_after setting
@@ -3032,11 +3106,22 @@ class GateServer(HealthAwareServer):
             if submission.reporting_configs:
                 self._job_submissions[submission.job_id] = submission
 
+            # Set this gate as job leader (first to accept = job leader)
+            # Per-job leadership is independent of SWIM cluster leadership
+            self._job_leaders[submission.job_id] = self._node_id.full
+            self._job_leader_addrs[submission.job_id] = (self._host, self._tcp_port)
+
             self._increment_version()
-            
+
+            # Broadcast job leadership to peer gates
+            await self._broadcast_job_leadership(
+                submission.job_id,
+                len(target_dcs),
+            )
+
             # Record success for circuit breaker
             self._quorum_circuit.record_success()
-            
+
             # Dispatch to each DC (in background via TaskRunner)
             self._task_runner.run(
                 self._dispatch_job_to_datacenters, submission, target_dcs
@@ -4766,6 +4851,57 @@ class GateServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "datacenter_list")
             return b'error'
+
+    @tcp.receive()
+    async def job_leadership_announcement(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle job leadership announcement from peer gate.
+
+        When a gate accepts a job, it broadcasts leadership to peers.
+        Peers record the leader for that job to enable proper routing
+        of DC results and client requests.
+        """
+        try:
+            announcement = JobLeadershipAnnouncement.load(data)
+
+            # Don't overwrite if we already know about this job
+            # (we might be the leader ourselves)
+            if announcement.job_id not in self._job_leaders:
+                self._job_leaders[announcement.job_id] = announcement.leader_id
+                self._job_leader_addrs[announcement.job_id] = (
+                    announcement.leader_host,
+                    announcement.leader_tcp_port,
+                )
+
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"Recorded job {announcement.job_id[:8]}... leader: {announcement.leader_id[:8]}...",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
+            return JobLeadershipAck(
+                job_id=announcement.job_id,
+                accepted=True,
+                responder_id=self._node_id.full,
+            ).dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "job_leadership_announcement")
+            return JobLeadershipAck(
+                job_id="unknown",
+                accepted=False,
+                responder_id=self._node_id.full,
+                error=str(e),
+            ).dump()
 
     @tcp.receive()
     async def windowed_stats_push(
