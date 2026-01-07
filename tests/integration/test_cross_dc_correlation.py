@@ -165,6 +165,7 @@ class TestCorrelationDetection:
         config = CrossDCCorrelationConfig(
             low_threshold=2,
             medium_threshold=3,
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
         detector.add_datacenter("dc-west")
@@ -186,6 +187,7 @@ class TestCorrelationDetection:
             low_threshold=2,
             medium_threshold=3,
             high_threshold_fraction=0.8,  # Set high so we don't trigger HIGH
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
         for dc in ["dc-west", "dc-east", "dc-central", "dc-north", "dc-south"]:
@@ -205,6 +207,7 @@ class TestCorrelationDetection:
         config = CrossDCCorrelationConfig(
             high_threshold_fraction=0.5,  # 50% threshold
             high_count_threshold=3,  # Need at least 3 for HIGH
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
         detector.add_datacenter("dc-west")
@@ -266,6 +269,7 @@ class TestCorrelationWindow:
         config = CrossDCCorrelationConfig(
             correlation_window_seconds=10.0,
             low_threshold=2,
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
         detector.add_datacenter("dc-west")
@@ -326,6 +330,7 @@ class TestBackoffBehavior:
         config = CrossDCCorrelationConfig(
             correlation_backoff_seconds=0.2,  # Short for testing
             medium_threshold=2,
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
         detector.add_datacenter("dc-west")
@@ -352,6 +357,7 @@ class TestBackoffBehavior:
         config = CrossDCCorrelationConfig(
             correlation_backoff_seconds=0.1,  # Very short for testing
             medium_threshold=2,
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
         detector.add_datacenter("dc-west")
@@ -409,6 +415,7 @@ class TestEdgeCases:
         config = CrossDCCorrelationConfig(
             high_threshold_fraction=0.5,
             high_count_threshold=2,  # Lower threshold for testing with few DCs
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
 
@@ -487,6 +494,7 @@ class TestStatisticsAndMonitoring:
         """Test that correlation events are counted."""
         config = CrossDCCorrelationConfig(
             medium_threshold=2,
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
         detector.add_datacenter("dc-west")
@@ -505,6 +513,7 @@ class TestStatisticsAndMonitoring:
         config = CrossDCCorrelationConfig(
             correlation_backoff_seconds=1.0,
             medium_threshold=2,
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
         detector.add_datacenter("dc-west")
@@ -536,6 +545,7 @@ class TestConcurrentFailureScenarios:
         config = CrossDCCorrelationConfig(
             high_threshold_fraction=0.5,
             high_count_threshold=3,  # Need 3 for HIGH
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
 
@@ -607,6 +617,7 @@ class TestConcurrentFailureScenarios:
             correlation_window_seconds=30.0,
             low_threshold=2,
             medium_threshold=3,
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
 
@@ -633,6 +644,7 @@ class TestConcurrentFailureScenarios:
         """Test behavior when some DCs recover but others remain failed."""
         config = CrossDCCorrelationConfig(
             medium_threshold=3,
+            failure_confirmation_seconds=0,  # Immediate confirmation for testing
         )
         detector = CrossDCCorrelationDetector(config=config)
 
