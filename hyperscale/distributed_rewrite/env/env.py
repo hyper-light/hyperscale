@@ -205,7 +205,9 @@ class Env(BaseModel):
     # Time-Windowed Stats Streaming Settings
     # ==========================================================================
     STATS_WINDOW_SIZE_MS: StrictFloat = 100.0  # Window bucket size in milliseconds
-    STATS_DRIFT_TOLERANCE_MS: StrictFloat = 50.0  # Clock drift tolerance between workers
+    # Drift tolerance must be >= WORKER_PROGRESS_FLUSH_INTERVAL to allow for buffering delay
+    # Workers collect at collected_at timestamp, but send up to flush_interval later
+    STATS_DRIFT_TOLERANCE_MS: StrictFloat = 300.0  # Must exceed worker flush interval (250ms) + network latency
     STATS_PUSH_INTERVAL_MS: StrictFloat = 100.0  # How often to flush windows and push (ms)
     STATS_MAX_WINDOW_AGE_MS: StrictFloat = 5000.0  # Max age before window is dropped (cleanup)
 
