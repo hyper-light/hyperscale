@@ -182,6 +182,16 @@ class HyperscaleClient(MercurySyncBaseServer):
         # Workflow result callbacks (called when each workflow completes)
         self._workflow_callbacks: dict[str, Callable[[WorkflowResultPush], None]] = {}
 
+        # Progress update callbacks (for streaming windowed stats)
+        from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
+        self._progress_callbacks: dict[str, Callable[[WindowedStatsPush], None]] = {}
+
+        # Rate limiter for progress updates (to prevent callback spam)
+        self._progress_rate_limit_tokens: float = env.CLIENT_PROGRESS_BURST
+        self._progress_rate_limit_max: float = env.CLIENT_PROGRESS_BURST
+        self._progress_rate_limit_refill: float = env.CLIENT_PROGRESS_RATE_LIMIT
+        self._progress_rate_limit_last_refill: float = 0.0
+
         # For selecting targets
         self._current_manager_idx = 0
         self._current_gate_idx = 0
@@ -244,6 +254,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         datacenter_count: int = 1,
         datacenters: list[str] | None = None,
         on_status_update: Callable[[JobStatusPush], None] | None = None,
+        on_progress_update: Callable | None = None,  # Callable[[WindowedStatsPush], None]
         on_workflow_result: Callable[[WorkflowResultPush], None] | None = None,
         reporting_configs: list | None = None,
         on_reporter_result: Callable[[ReporterResultPush], None] | None = None,
@@ -261,6 +272,9 @@ class HyperscaleClient(MercurySyncBaseServer):
             datacenter_count: Number of datacenters to run in (gates only)
             datacenters: Specific datacenters to target (optional)
             on_status_update: Callback for status updates (optional)
+            on_progress_update: Callback for streaming progress updates (optional).
+                Called with WindowedStatsPush containing time-correlated aggregated
+                stats from workers. Rate-limited to prevent callback spam.
             on_workflow_result: Callback for workflow completion results (optional)
             reporting_configs: List of ReporterConfig objects for result submission (optional)
             on_reporter_result: Callback for reporter submission results (optional)
@@ -303,6 +317,8 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._job_events[job_id] = asyncio.Event()
         if on_status_update:
             self._job_callbacks[job_id] = on_status_update
+        if on_progress_update:
+            self._progress_callbacks[job_id] = on_progress_update
         if on_workflow_result:
             self._workflow_callbacks[job_id] = on_workflow_result
         if on_reporter_result:
@@ -1326,6 +1342,66 @@ class HyperscaleClient(MercurySyncBaseServer):
 
             # Call user callback if registered
             callback = self._workflow_callbacks.get(push.job_id)
+            if callback:
+                try:
+                    callback(push)
+                except Exception:
+                    pass  # Don't let callback errors break the handler
+
+            return b'ok'
+
+        except Exception:
+            return b'error'
+
+    def _try_acquire_progress_rate_limit(self) -> bool:
+        """
+        Try to acquire a token for progress callback rate limiting.
+
+        Uses a token bucket algorithm to limit progress callback frequency.
+        Returns True if allowed, False if rate limited.
+        """
+        now = time.time()
+
+        # Refill tokens based on elapsed time
+        if self._progress_rate_limit_last_refill > 0:
+            elapsed = now - self._progress_rate_limit_last_refill
+            refill = elapsed * self._progress_rate_limit_refill
+            self._progress_rate_limit_tokens = min(
+                self._progress_rate_limit_max,
+                self._progress_rate_limit_tokens + refill,
+            )
+        self._progress_rate_limit_last_refill = now
+
+        # Try to consume a token
+        if self._progress_rate_limit_tokens >= 1.0:
+            self._progress_rate_limit_tokens -= 1.0
+            return True
+        return False
+
+    @tcp.receive()
+    async def windowed_stats_push(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle windowed stats push from manager or gate.
+
+        Called periodically with time-correlated aggregated stats.
+        Rate-limited to prevent overwhelming the user's callback.
+        """
+        try:
+            # Apply rate limiting - drop if over limit
+            if not self._try_acquire_progress_rate_limit():
+                return b'rate_limited'
+
+            import cloudpickle
+            from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
+            push: WindowedStatsPush = cloudpickle.loads(data)
+
+            # Call user callback if registered
+            callback = self._progress_callbacks.get(push.job_id)
             if callback:
                 try:
                     callback(push)
