@@ -295,11 +295,47 @@ class WindowedStatsCollector:
             is_aggregated=False,
         )
 
+    async def flush_job_windows(
+        self,
+        job_id: str,
+        aggregate: bool = True,
+    ) -> list[WindowedStatsPush]:
+        """
+        Flush ALL pending windows for a job, ignoring drift tolerance.
+
+        Called when a job completes to get final stats before cleanup.
+        Unlike flush_closed_windows, this doesn't wait for drift tolerance
+        since we know no more updates are coming.
+
+        Args:
+            job_id: The job identifier to flush.
+            aggregate: If True, aggregate stats within window.
+
+        Returns:
+            List of WindowedStatsPush messages for the job.
+        """
+        results: list[WindowedStatsPush] = []
+
+        async with self._lock:
+            keys_to_flush = [key for key in self._buckets.keys() if key[0] == job_id]
+
+            for key in keys_to_flush:
+                bucket = self._buckets[key]
+                if aggregate:
+                    push = self._aggregate_bucket(bucket)
+                else:
+                    push = self._unaggregated_bucket(bucket)
+                results.append(push)
+                del self._buckets[key]
+
+        return results
+
     async def cleanup_job_windows(self, job_id: str) -> int:
         """
         Remove all windows for a completed job.
 
         Called when a job completes to free memory.
+        NOTE: Consider using flush_job_windows first to get final stats.
 
         Args:
             job_id: The job identifier to clean up.

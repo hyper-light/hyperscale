@@ -5081,8 +5081,19 @@ class ManagerServer(HealthAwareServer):
                     callback_addr=callback,
                 )
 
-        # Cleanup windowed stats for completed job to prevent memory leaks
-        await self._windowed_stats.cleanup_job_windows(job_id)
+        # Flush any remaining windowed stats before cleanup (don't wait for drift tolerance)
+        # This ensures final progress updates are delivered even if job completed quickly
+        has_gates = bool(self._gate_addrs or self._known_gates)
+        final_pushes = await self._windowed_stats.flush_job_windows(
+            job_id,
+            aggregate=not has_gates,
+        )
+        for push in final_pushes:
+            if has_gates:
+                push.datacenter = self._node_id.datacenter
+                await self._forward_windowed_stats_to_gates(push)
+            else:
+                await self._push_windowed_stats_to_client(push)
 
         # Cleanup progress callback for completed job
         self._progress_callbacks.pop(job_id, None)

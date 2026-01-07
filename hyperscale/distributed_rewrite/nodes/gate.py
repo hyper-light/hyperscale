@@ -2168,9 +2168,16 @@ class GateServer(HealthAwareServer):
             
             # Clean up callbacks and windowed stats if job is final
             if is_final:
+                # Flush any remaining windowed stats before cleanup
+                final_pushes = await self._windowed_stats.flush_job_windows(
+                    job_id,
+                    aggregate=True,  # Gate always aggregates for clients
+                )
+                for push in final_pushes:
+                    await self._push_windowed_stats_to_client(push)
+
                 self._job_callbacks.pop(job_id, None)
                 self._progress_callbacks.pop(job_id, None)
-                await self._windowed_stats.cleanup_job_windows(job_id)
     
     async def _batch_stats_update(self) -> None:
         """
@@ -2988,8 +2995,13 @@ class GateServer(HealthAwareServer):
                     # Clean up per-job leadership tracking
                     self._job_leadership_tracker.release_leadership(job_id)
                     self._job_dc_managers.pop(job_id, None)
-                    # Clean up windowed stats for this job
-                    await self._windowed_stats.cleanup_job_windows(job_id)
+                    # Flush and clean up windowed stats for this job
+                    final_pushes = await self._windowed_stats.flush_job_windows(
+                        job_id,
+                        aggregate=True,
+                    )
+                    for push in final_pushes:
+                        await self._push_windowed_stats_to_client(push)
                     # Clean up reporter tasks and submissions
                     self._cleanup_reporter_tasks(job_id)
                     # Clean up any leases for this job
