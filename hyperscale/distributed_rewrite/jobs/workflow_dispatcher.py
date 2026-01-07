@@ -150,9 +150,10 @@ class WorkflowDispatcher:
 
             dependencies, instance = wf_data
             try:
-           
+
                 # Generate workflow ID
                 workflow_id = f"wf-{i:04d}"
+                name = getattr(instance, 'name', None) or type(instance).__name__
                 vus = instance.vus if instance.vus and instance.vus > 0 else submission.vus
 
                 # Register with JobManager
