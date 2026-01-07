@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import os
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import (
@@ -259,6 +260,9 @@ class LocalRunner:
 
                 await ctx.log_prepared(f"Exiting test {test_name}", name="info")
 
+                # Speed up Python exit by clearing references and running GC
+                self._cleanup_for_exit()
+
                 return results
 
             except (
@@ -414,6 +418,32 @@ class LocalRunner:
             except asyncio.CancelledError:
                 pass
 
+    def _cleanup_for_exit(self):
+        """
+        Aggressively clean up references to speed up Python exit.
+
+        Python's GC can be slow when there are many objects with reference cycles.
+        By explicitly clearing references and running GC, we reduce exit time.
+        """
+        # Disable GC during cleanup to avoid repeated collections
+        gc.disable()
+
+        try:
+            # Clear logger state
+            self._logger.abort()
+
+            # Clear references to large objects
+            self._remote_manger = None
+            self._server_pool = None
+            self._interface = None
+            self._updates = None
+
+            # Run GC once to clean up cycles
+            gc.collect()
+
+        finally:
+            # Re-enable GC
+            gc.enable()
 
     def _bin_and_check_socket_range(self):
         base_worker_port = self.port + self._workers

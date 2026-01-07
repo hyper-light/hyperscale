@@ -418,10 +418,12 @@ class Logger:
             ])
 
     def abort(self):
-
         for context in self._contexts.values():
             context.stream.abort()
-            
+
+        # Clear references to help GC
+        self._contexts.clear()
+        self._models.clear()
 
 
 
