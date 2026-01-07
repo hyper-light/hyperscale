@@ -499,11 +499,11 @@ async def run_test():
 
         print(f"\n  TestWorkflow: {len(test_wf_entries)} entries")
         for dc_id, wf in test_wf_entries:
-            print(f"    [{dc_id}] status={wf.status}, cores={wf.cores_allocated}")
+            print(f"    [{dc_id}] status={wf.status}, cores={wf.provisioned_cores}")
 
         print(f"  TestWorkflowTwo: {len(test_wf_two_entries)} entries")
         for dc_id, wf in test_wf_two_entries:
-            print(f"    [{dc_id}] status={wf.status}, cores={wf.cores_allocated}")
+            print(f"    [{dc_id}] status={wf.status}, cores={wf.provisioned_cores}")
 
         print(f"  NonTestWorkflow: {len(non_test_wf_entries)} entries")
         for dc_id, wf in non_test_wf_entries:
