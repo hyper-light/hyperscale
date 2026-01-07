@@ -61,7 +61,14 @@ class CrossDCCorrelationConfig:
     # Minimum DCs failing within window to trigger MEDIUM correlation
     medium_threshold: int = 3
 
+    # Minimum DCs failing within window to trigger HIGH correlation (count-based)
+    # HIGH requires BOTH this count AND the fraction threshold
+    # Default of 4 means: need at least 4 DCs failing AND >= 50% of known DCs
+    # This prevents false positives when few DCs exist
+    high_count_threshold: int = 4
+
     # Minimum fraction of known DCs failing to trigger HIGH correlation
+    # HIGH requires BOTH this fraction AND the count threshold above
     high_threshold_fraction: float = 0.5
 
     # Backoff duration after correlation detected (seconds)
@@ -253,13 +260,14 @@ class CrossDCCorrelationDetector:
         reason: str
         recommendation: str
 
-        # HIGH: Both fraction AND count must be significant
+        # HIGH: Both fraction AND high count threshold must be met
         # Rationale: A global network partition affects many DCs simultaneously
-        # We need at least medium_threshold failures to confirm it's not coincidence
+        # We need at least high_count_threshold failures to confirm it's not coincidence
+        # This prevents false positives when few DCs exist (e.g., 2/2 = 100% but only 2 DCs)
         is_high_fraction = failure_fraction >= self._config.high_threshold_fraction
-        is_medium_count = failure_count >= self._config.medium_threshold
+        is_high_count = failure_count >= self._config.high_count_threshold
 
-        if is_high_fraction and is_medium_count:
+        if is_high_fraction and is_high_count:
             severity = CorrelationSeverity.HIGH
             reason = (
                 f"{failure_count}/{known_dc_count} DCs ({failure_fraction:.0%}) "

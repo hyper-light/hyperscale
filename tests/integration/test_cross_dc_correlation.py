@@ -204,6 +204,7 @@ class TestCorrelationDetection:
         """Test HIGH correlation when majority of DCs fail."""
         config = CrossDCCorrelationConfig(
             high_threshold_fraction=0.5,  # 50% threshold
+            high_count_threshold=3,  # Need at least 3 for HIGH
         )
         detector = CrossDCCorrelationDetector(config=config)
         detector.add_datacenter("dc-west")
@@ -211,7 +212,7 @@ class TestCorrelationDetection:
         detector.add_datacenter("dc-central")
         detector.add_datacenter("dc-north")
 
-        # 3 out of 4 = 75% > 50% threshold
+        # 3 out of 4 = 75% >= 50% AND 3 >= high_count_threshold=3 → HIGH
         detector.record_failure("dc-west", "unhealthy")
         detector.record_failure("dc-east", "unhealthy")
         detector.record_failure("dc-central", "unhealthy")
@@ -407,6 +408,7 @@ class TestEdgeCases:
         """Test correlation check with no known datacenters."""
         config = CrossDCCorrelationConfig(
             high_threshold_fraction=0.5,
+            high_count_threshold=2,  # Lower threshold for testing with few DCs
         )
         detector = CrossDCCorrelationDetector(config=config)
 
@@ -416,7 +418,7 @@ class TestEdgeCases:
 
         # Should handle division by known_dc_count gracefully
         decision = detector.check_correlation("dc-west")
-        # With 2 known DCs (auto-added), 2 failing = 100% > 50%
+        # With 2 known DCs (auto-added), 2 failing = 100% >= 50% AND 2 >= high_count_threshold=2
         assert decision.severity == CorrelationSeverity.HIGH
 
     def test_clear_all_resets_state(self):
@@ -533,6 +535,7 @@ class TestConcurrentFailureScenarios:
         """Test simulating a network partition affecting multiple DCs."""
         config = CrossDCCorrelationConfig(
             high_threshold_fraction=0.5,
+            high_count_threshold=3,  # Need 3 for HIGH
         )
         detector = CrossDCCorrelationDetector(config=config)
 
@@ -548,7 +551,7 @@ class TestConcurrentFailureScenarios:
         # Check any of the failing DCs
         decision = detector.check_correlation("dc-west")
 
-        # Should detect HIGH correlation (75% of DCs failing)
+        # Should detect HIGH correlation (75% of DCs failing AND count >= 3)
         assert decision.severity == CorrelationSeverity.HIGH
         assert decision.should_delay_eviction
         assert "network" in decision.recommendation.lower()

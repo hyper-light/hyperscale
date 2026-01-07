@@ -177,7 +177,8 @@ class Env(BaseModel):
     CROSS_DC_CORRELATION_WINDOW: StrictFloat = 30.0  # Seconds window for correlation detection
     CROSS_DC_CORRELATION_LOW_THRESHOLD: StrictInt = 2  # Min DCs failing for LOW correlation
     CROSS_DC_CORRELATION_MEDIUM_THRESHOLD: StrictInt = 3  # Min DCs failing for MEDIUM correlation
-    CROSS_DC_CORRELATION_HIGH_FRACTION: StrictFloat = 0.5  # Fraction of DCs for HIGH (requires medium count too)
+    CROSS_DC_CORRELATION_HIGH_COUNT_THRESHOLD: StrictInt = 4  # Min DCs failing for HIGH (count)
+    CROSS_DC_CORRELATION_HIGH_FRACTION: StrictFloat = 0.5  # Fraction of DCs for HIGH (requires count too)
     CROSS_DC_CORRELATION_BACKOFF: StrictFloat = 60.0  # Backoff duration after correlation detected
 
     @classmethod
@@ -302,6 +303,7 @@ class Env(BaseModel):
             "CROSS_DC_CORRELATION_WINDOW": float,
             "CROSS_DC_CORRELATION_LOW_THRESHOLD": int,
             "CROSS_DC_CORRELATION_MEDIUM_THRESHOLD": int,
+            "CROSS_DC_CORRELATION_HIGH_COUNT_THRESHOLD": int,
             "CROSS_DC_CORRELATION_HIGH_FRACTION": float,
             "CROSS_DC_CORRELATION_BACKOFF": float,
         }
@@ -526,10 +528,10 @@ class Env(BaseModel):
         simultaneously (likely network partition, not actual DC failures).
 
         HIGH correlation requires BOTH:
-        - Fraction of DCs >= high_threshold_fraction
-        - Count of DCs >= medium_threshold
+        - Fraction of DCs >= high_threshold_fraction (e.g., 50%)
+        - Count of DCs >= high_count_threshold (e.g., 4)
 
-        This prevents false positives with few DCs.
+        This prevents false positives when few DCs exist.
         """
         from hyperscale.distributed_rewrite.datacenters.cross_dc_correlation import (
             CrossDCCorrelationConfig,
@@ -539,6 +541,7 @@ class Env(BaseModel):
             correlation_window_seconds=self.CROSS_DC_CORRELATION_WINDOW,
             low_threshold=self.CROSS_DC_CORRELATION_LOW_THRESHOLD,
             medium_threshold=self.CROSS_DC_CORRELATION_MEDIUM_THRESHOLD,
+            high_count_threshold=self.CROSS_DC_CORRELATION_HIGH_COUNT_THRESHOLD,
             high_threshold_fraction=self.CROSS_DC_CORRELATION_HIGH_FRACTION,
             correlation_backoff_seconds=self.CROSS_DC_CORRELATION_BACKOFF,
         )
