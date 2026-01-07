@@ -21,7 +21,6 @@ import cloudpickle
 import networkx
 
 from hyperscale.core.graph.workflow import Workflow
-from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.jobs.workers.stage_priority import StagePriority
 from hyperscale.distributed_rewrite.models import (
     JobSubmission,
@@ -126,7 +125,9 @@ class WorkflowDispatcher:
     async def register_workflows(
         self,
         submission: JobSubmission,
-        workflows: list[type[Workflow] | DependentWorkflow],
+        workflows: list[
+            tuple[list[str], Workflow]
+        ],
     ) -> bool:
         """
         Register all workflows from a job submission.
@@ -145,21 +146,14 @@ class WorkflowDispatcher:
         priorities: dict[str, StagePriority] = {}
         is_test: dict[str, bool] = {}
 
-        for i, wf in enumerate(workflows):
-            try:
-                # Handle DependentWorkflow specially to preserve name and get dependencies
-                dependencies: list[str] = []
-                if isinstance(wf, DependentWorkflow):
-                    dependencies = wf.dependencies
-                    name = wf.dependent_workflow.__name__
-                    instance = wf.dependent_workflow()
-                else:
-                    name = wf.__name__
-                    instance = wf()
+        for i, wf_data in enumerate(workflows):
 
+            dependencies, instance = wf_data
+            try:
+           
                 # Generate workflow ID
                 workflow_id = f"wf-{i:04d}"
-                vus = getattr(instance, 'vus', submission.vus)
+                vus = instance.vus if instance.vus and instance.vus > 0 else submission.vus
 
                 # Register with JobManager
                 await self._job_manager.register_workflow(

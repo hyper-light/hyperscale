@@ -1058,6 +1058,8 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             name=f"workflow_run_{run_id}",
         ) as ctx:
             try:
+
+                print('GOT', job.workflow)
                 await ctx.log_prepared(
                     message=f"Workflow {job.workflow.name} starting run {run_id} via task on Node {self._node_id_base} at {self.host}:{self.port}",
                     name="trace",

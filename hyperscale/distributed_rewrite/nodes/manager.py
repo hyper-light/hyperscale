@@ -33,7 +33,6 @@ from collections import defaultdict
 
 from hyperscale.core.hooks import Hook
 from hyperscale.core.graph.workflow import Workflow
-from hyperscale.core.graph.dependent_workflow import DependentWorkflow
 from hyperscale.core.state.context import Context
 from hyperscale.core.jobs.workers.stage_priority import StagePriority
 from hyperscale.core.hooks import HookType
@@ -118,7 +117,6 @@ from hyperscale.distributed_rewrite.models import (
     WorkflowQueryRequest,
     WorkflowStatusInfo,
     WorkflowQueryResponse,
-    EagerWorkflowEntry,
     RegisterCallback,
     RegisterCallbackResponse,
     RateLimitResponse,
@@ -138,7 +136,6 @@ from hyperscale.distributed_rewrite.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
     NodeCapabilities,
     ProtocolVersion,
-    get_features_for_version,
     negotiate_capabilities,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
@@ -2585,148 +2582,6 @@ class ManagerServer(HealthAwareServer):
         
         return "HEALTHY"
     
-    def _get_workflow_priority(self, workflow) -> StagePriority:
-        """
-        Get the priority of a workflow.
-        
-        Workflows can specify priority via a 'priority' attribute.
-        If not specified, defaults to AUTO.
-        """
-        priority_attr = getattr(workflow, 'priority', None)
-        if priority_attr is None:
-            return StagePriority.AUTO
-        
-        if isinstance(priority_attr, StagePriority):
-            return priority_attr
-        
-        if isinstance(priority_attr, str):
-            return StagePriority.map(priority_attr.lower())
-        
-        return StagePriority.AUTO
-    
-    def _is_test_workflow(self, workflow) -> bool:
-        """
-        Determine if a workflow is a test workflow.
-        
-        A workflow is considered a test workflow if it has any hooks
-        with hook_type == HookType.TEST.
-        """
-        import inspect
-        from hyperscale.core.hooks import Hook
-        
-        for name, member in inspect.getmembers(workflow):
-            if isinstance(member, Hook) and member.hook_type == HookType.TEST:
-                return True
-        return False
-    
-    def _calculate_layer_cores(
-        self,
-        layer_workflows: list[str],
-        workflow_by_name: dict[str, tuple[int, Any]],
-        workflow_priorities: dict[str, StagePriority],
-        workflow_is_test: dict[str, bool],
-        total_pool: int,
-    ) -> tuple[dict[str, int], list[str]]:
-        """
-        Calculate cores for workflows in a single layer based on priority.
-
-        Priority allocation rules:
-        1. EXCLUSIVE workflows get 100% of pool and run sequentially (first-come first-serve)
-        2. Specific priority workflows (HIGH, NORMAL, LOW) get allocated first based on ranges
-        3. AUTO workflows split remaining cores evenly
-        4. If all workflows are AUTO, split cores evenly among them
-        5. Non-test workflows always get 1 core (they don't parallelize)
-
-        Args:
-            layer_workflows: Names of workflows in this layer
-            workflow_by_name: Map of name -> (index, workflow)
-            workflow_priorities: Map of name -> StagePriority
-            workflow_is_test: Map of name -> is_test_workflow
-            total_pool: Total available cores
-
-        Returns:
-            Tuple of:
-            - workflow_cores: Map of name -> cores allocated (for concurrent dispatch)
-            - exclusive_order: List of EXCLUSIVE workflow names to run sequentially
-        """
-        workflow_cores: dict[str, int] = {}
-        exclusive_order: list[str] = []
-
-        if not layer_workflows:
-            return workflow_cores, exclusive_order
-
-        # Categorize workflows
-        exclusive_workflows: list[str] = []
-        specific_priority_workflows: list[str] = []  # HIGH, NORMAL, LOW
-        auto_workflows: list[str] = []
-        non_test_workflows: list[str] = []
-
-        for name in layer_workflows:
-            if not workflow_is_test.get(name, False):
-                non_test_workflows.append(name)
-                continue
-
-            priority = workflow_priorities.get(name, StagePriority.AUTO)
-            if priority == StagePriority.EXCLUSIVE:
-                exclusive_workflows.append(name)
-            elif priority == StagePriority.AUTO:
-                auto_workflows.append(name)
-            else:
-                specific_priority_workflows.append(name)
-
-        # Non-test workflows always get 1 core
-        for name in non_test_workflows:
-            workflow_cores[name] = 1
-
-        # EXCLUSIVE workflows run sequentially with full pool
-        # Return them in exclusive_order for sequential dispatch
-        if exclusive_workflows:
-            exclusive_order = exclusive_workflows
-            # Each EXCLUSIVE workflow gets full pool when it runs
-            for name in exclusive_workflows:
-                workflow_cores[name] = total_pool
-            # Other workflows in this layer must wait - don't allocate cores
-            # (They'll be dispatched after EXCLUSIVE workflows complete)
-            return workflow_cores, exclusive_order
-
-        # Calculate remaining pool after non-test allocations
-        remaining_pool = total_pool - len(non_test_workflows)
-        if remaining_pool <= 0:
-            remaining_pool = 1
-
-        # Allocate specific priority workflows first (HIGH > NORMAL > LOW)
-        # Sort by priority descending
-        specific_priority_workflows.sort(
-            key=lambda n: workflow_priorities.get(n, StagePriority.AUTO).value,
-            reverse=True
-        )
-
-        for name in specific_priority_workflows:
-            priority = workflow_priorities.get(name, StagePriority.AUTO)
-            min_cores, max_cores = StagePriority.get_worker_allocation_range(priority, total_pool)
-            # Allocate up to max, but leave at least 1 core for remaining workflows
-            others_remaining = len(specific_priority_workflows) + len(auto_workflows) - len(workflow_cores) - 1
-            reserved_for_others = max(others_remaining, 0)
-            available = remaining_pool - reserved_for_others
-            cores = max(min(available, max_cores), min_cores, 1)
-            workflow_cores[name] = cores
-            remaining_pool -= cores
-
-        # Divide remaining cores evenly among AUTO workflows
-        if auto_workflows:
-            if remaining_pool <= 0:
-                remaining_pool = len(auto_workflows)  # At least 1 core each
-
-            cores_per_auto = remaining_pool // len(auto_workflows)
-            extra_cores = remaining_pool % len(auto_workflows)
-
-            for i, name in enumerate(auto_workflows):
-                # Distribute extra cores to first few workflows
-                cores = cores_per_auto + (1 if i < extra_cores else 0)
-                workflow_cores[name] = max(cores, 1)
-
-        return workflow_cores, exclusive_order
-    
     # =========================================================================
     # Job Leader Helpers (Context Consistency Protocol)
     # =========================================================================
@@ -3127,30 +2982,6 @@ class ManagerServer(HealthAwareServer):
         Uses monotonic increasing state version as the token.
         """
         return self._state_version
-    
-    async def _extract_dependency_context(
-        self,
-        job_id: str,
-        workflow: Any,
-    ) -> bytes:
-        """
-        Extract context values for workflow dependencies.
-        
-        Returns cloudpickled dict of context values that this workflow
-        may need from its dependencies.
-        """
-        
-        job_context = self._job_contexts.get(job_id)
-        if not job_context:
-            return cloudpickle.dumps({})
-        
-        # For now, return the full context dict
-        # A more sophisticated approach would filter based on @state() decorators
-        try:
-            context_dict = job_context.dict()
-            return cloudpickle.dumps(context_dict)
-        except Exception:
-            return cloudpickle.dumps({})
     
     def _select_worker_for_workflow(self, vus_needed: int) -> str | None:
         """
@@ -5020,50 +4851,6 @@ class ManagerServer(HealthAwareServer):
         # Fallback: use the ID itself
         return workflow_id
     
-    async def _extract_dependency_context(
-        self,
-        job_id: str,
-        workflow: Any,
-    ) -> bytes:
-        """
-        Extract context from workflow dependencies.
-        
-        For dependent workflows, this extracts only the context values
-        from their dependencies, not the full job context.
-        
-        Args:
-            job_id: The job ID
-            workflow: The workflow object (may be DependentWorkflow)
-        
-        Returns:
-            Serialized dependency context (cloudpickle bytes)
-        """
-        context = self._job_contexts.get(job_id)
-        if not context:
-            return b''
-        
-        # Check if workflow has dependencies
-        dependencies = []
-        if isinstance(workflow, DependentWorkflow):
-            dependencies = [dep.__name__ for dep in workflow.dependencies]
-        elif hasattr(workflow, 'dependencies') and workflow.dependencies:
-            dependencies = [dep.__name__ for dep in workflow.dependencies]
-        
-        if not dependencies:
-            # No dependencies - no context needed
-            return b''
-        
-        # Extract context for each dependency
-        relevant_context = {}
-        for dep_name in dependencies:
-            if dep_name in context:
-                relevant_context[dep_name] = context[dep_name].dict()
-        
-        if not relevant_context:
-            return b''
-        
-        return cloudpickle.dumps(relevant_context)
-    
     def _get_manager_tcp_addr(self, node_id: str) -> tuple[str, int] | None:
         """Get the TCP address for a manager by node_id."""
         # Check _known_manager_peers first (keyed by node_id)
@@ -6298,7 +6085,9 @@ class ManagerServer(HealthAwareServer):
             submission = JobSubmission.load(data)
 
             # Unpickle workflows
-            workflows = restricted_loads(submission.workflows)
+            workflows: list[
+                tuple[list[str], Workflow]
+            ] = restricted_loads(submission.workflows)
 
             # Only active managers accept jobs (not SYNCING)
             if self._manager_state != ManagerState.ACTIVE:
@@ -6371,7 +6160,7 @@ class ManagerServer(HealthAwareServer):
 
             # Broadcast job leadership to peer managers
             # Include workflow names so non-leaders can respond to workflow queries
-            workflow_names = [wf.dependent_workflow.__name__ if isinstance(wf, DependentWorkflow) else wf.__name__ for wf in workflows]
+            workflow_names = [wf.name for _, wf in workflows]
 
             await self._broadcast_job_leadership(
                 submission.job_id,
@@ -6404,12 +6193,14 @@ class ManagerServer(HealthAwareServer):
     async def _dispatch_job_workflows(
         self,
         submission: JobSubmission,
-        workflows: list[type[Workflow] | DependentWorkflow],
+        workflows: list[
+            tuple[list[str], Workflow]
+        ],
     ) -> None:
         """
         Dispatch workflows respecting dependencies and resource constraints.
 
-        Builds a DAG from DependentWorkflow dependencies and dispatches
+        Builds a DAG from Workflow dependencies and dispatches
         in topological order (layer by layer). Workflows in the same layer
         can run in parallel, but dependent workflows wait for their
         dependencies to complete before dispatching.
@@ -6432,7 +6223,8 @@ class ManagerServer(HealthAwareServer):
             # =================================================================
             if self._workflow_dispatcher:
                 registered = await self._workflow_dispatcher.register_workflows(
-                    submission, workflows
+                    submission, 
+                    workflows,
                 )
                 if registered:
                     self._task_runner.run(

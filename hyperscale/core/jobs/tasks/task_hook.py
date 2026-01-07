@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from collections import defaultdict
 import time
 from typing import (
@@ -22,9 +23,9 @@ T = TypeVar("T")
 
 class Task(Generic[T]):
     def __init__(
-        self, task: Callable[[], T], snowflake_generator: SnowflakeGenerator
+        self, task: Callable[[], T]
     ) -> None:
-        self.task_id = snowflake_generator.generate()
+        self.task_id = Task.create_id()
         self.name: str = task.name
         self.schedule: Optional[int | float] = task.schedule
         self.trigger: Literal["MANUAL", "ON_START"] = task.trigger
@@ -39,8 +40,6 @@ class Task(Generic[T]):
         self._schedules: Dict[int, asyncio.Task] = {}
         self._schedule_running_statuses: Dict[int, bool] = defaultdict(lambda: False)
 
-        self._snowflake_generator = snowflake_generator
-
         keep = self.keep
         if keep is None:
             keep = 10
@@ -53,6 +52,11 @@ class Task(Generic[T]):
             return run.status
 
         return RunStatus.IDLE
+    
+    @classmethod
+    def create_id(cls):
+        return uuid.uuid4().int >> 64
+    
 
     def get_run_status(self, run_id: str):
         if run := self._runs.get(run_id):
@@ -157,8 +161,8 @@ class Task(Generic[T]):
             timeout = self.timeout
 
         if run_id is None:
-            run_id = self._snowflake_generator.generate()
-
+            run_id = Task.create_id()
+            
         run = Run(run_id, self.call, timeout=timeout)
 
         run.execute(*args, **kwargs)
@@ -180,7 +184,7 @@ class Task(Generic[T]):
         **kwargs,
     ):
         if run_id is None:
-            run_id = self._snowflake_generator.generate()
+            run_id = Task.create_id()
 
         if timeout is None:
             timeout = self.timeout
@@ -206,7 +210,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    self._snowflake_generator.generate(),
+                    Task.create_id(),
                     self.call,
                     timeout=self.timeout,
                 )
@@ -224,7 +228,7 @@ class Task(Generic[T]):
 
                 await asyncio.sleep(self.schedule)
                 run = Run(
-                    self._snowflake_generator.generate(),
+                    Task.create_id(),
                     self.call,
                     timeout=self.timeout,
                 )

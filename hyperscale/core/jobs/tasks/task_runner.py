@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional, Type, TypeVar
 
@@ -22,7 +23,7 @@ class TaskRunner:
         self._cleanup_interval = TimeParser(config.MERCURY_SYNC_CLEANUP_INTERVAL).time
         self._cleanup_task: Optional[asyncio.Task] = None
         self._run_cleanup: bool = False
-        self._snowflake_generator = SnowflakeGenerator(instance_id)
+        self.instance_id = instance_id
 
     def all_tasks(self):
         for task in self.tasks.values():
@@ -33,10 +34,10 @@ class TaskRunner:
         self._cleanup_task = asyncio.ensure_future(self._cleanup())
 
     def create_task_id(self):
-        return self._snowflake_generator.generate()
+        return uuid.uuid4().int>>64
 
     def add(self, task: Type[T]):
-        runnable = Task(task, self._snowflake_generator)
+        runnable = Task(task)
         self.tasks[runnable.name] = runnable
 
     def run(

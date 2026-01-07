@@ -733,6 +733,7 @@ class RemoteGraphManager:
                 )
 
                 results = [result_set for _, result_set in results.values() if result_set is not None]
+                print(len(results), threads)
 
                 if is_test_workflow and len(results) > 1:
                     await ctx.log_prepared(
@@ -914,6 +915,8 @@ class RemoteGraphManager:
             BrokenPipeError,
             asyncio.CancelledError,
         ) as err:
+            import traceback
+            print(traceback.format_exc())
             self._provisioner.release(threads)
             await update_active_workflow_message(workflow_slug, "Aborted")
 

@@ -11,7 +11,7 @@ import psutil
 
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.graph import Workflow
-from hyperscale.core.jobs.graphs.remote_graph_manager import RemoteGraphManager
+from hyperscale.core.jobs.graphs.remote_graph_manager_rewrite import RemoteGraphManager
 from hyperscale.core.jobs.models import Env, TerminalMode
 from hyperscale.logging import Logger
 from hyperscale.logging.hyperscale_logging_models import (
@@ -96,13 +96,15 @@ class LocalRunner:
     async def run(
         self,
         test_name: str,
-        workflows: List[Workflow],
+        workflows: List[
+            tuple[list[str], Workflow]
+        ],
         cert_path: str | None = None,
         key_path: str | None = None,
         timeout: int | float | str | None = None,
         terminal_mode: TerminalMode = "full",
     ):
-        workflow_names = [workflow.name for workflow in workflows]
+        workflow_names = [workflow.name for _, workflow in workflows]
 
         default_config = {
             "runner_type": self._runner_type,
@@ -137,7 +139,7 @@ class LocalRunner:
             )
 
             self._interface.initialize(
-                workflows,
+                [workflow for _, workflow in workflows],
                 terminal_mode=terminal_mode,
             )
 

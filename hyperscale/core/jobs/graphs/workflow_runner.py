@@ -314,6 +314,8 @@ class WorkflowRunner:
                     name="error",
                 )
 
+                self._run_check_lock.release()
+
                 return (
                     run_id,
                     None,
@@ -327,6 +329,8 @@ class WorkflowRunner:
                     message=f"Run {run_id} of Workflow {workflow.name} failed to start due to workflow already being in running stats with duplicate job policy of REJECT",
                     name="error",
                 )
+
+                self._run_check_lock.release()
 
                 return (
                     run_id,
@@ -715,7 +719,7 @@ class WorkflowRunner:
                     reset_connections=config.get("reset_connections"),
                 )
 
-            self._workflow_hooks[run_id][workflow] = list(hooks.keys())
+            self._workflow_hooks[run_id][workflow.name] = list(hooks.keys())
 
             step_graph = networkx.DiGraph()
             sources = []
