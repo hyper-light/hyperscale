@@ -1296,7 +1296,7 @@ class ManagerStateSnapshot(Message):
 class GateStateSnapshot(Message):
     """
     Complete state snapshot from a gate.
-    
+
     Used for state sync between gates when a new leader is elected.
     Contains global job state and datacenter status.
     """
@@ -1310,6 +1310,9 @@ class GateStateSnapshot(Message):
     # Manager discovery - shared between gates
     datacenter_managers: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     datacenter_manager_udp: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    # Per-job leadership tracking (independent of SWIM cluster leadership)
+    job_leaders: dict[str, str] = field(default_factory=dict)  # job_id -> leader_node_id
+    job_leader_addrs: dict[str, tuple[str, int]] = field(default_factory=dict)  # job_id -> (host, tcp_port)
 
 
 @dataclass(slots=True)

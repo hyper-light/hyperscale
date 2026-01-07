@@ -773,6 +773,9 @@ class GateServer(HealthAwareServer):
             # Include manager discovery info for cross-gate sync
             datacenter_managers={dc: list(addrs) for dc, addrs in self._datacenter_managers.items()},
             datacenter_manager_udp={dc: list(addrs) for dc, addrs in self._datacenter_manager_udp.items()},
+            # Include per-job leadership tracking for cross-gate sync
+            job_leaders=dict(self._job_leaders),
+            job_leader_addrs=dict(self._job_leader_addrs),
         )
     
     def _on_gate_become_leader(self) -> None:
@@ -878,7 +881,7 @@ class GateServer(HealthAwareServer):
     def _apply_gate_state_snapshot(self, snapshot: GateStateSnapshot) -> None:
         """
         Apply a state snapshot from another gate.
-        
+
         Merges job state, preferring entries with higher versions.
         """
         # Merge jobs - keep newer versions
@@ -886,13 +889,22 @@ class GateServer(HealthAwareServer):
             existing = self._jobs.get(job_id)
             if not existing or getattr(job, 'timestamp', 0) > getattr(existing, 'timestamp', 0):
                 self._jobs[job_id] = job
-        
+
         # Merge leases - keep ones with higher fence tokens
         for lease_key, lease in snapshot.leases.items():
             existing = self._leases.get(lease_key)
             if not existing or lease.fence_token > existing.fence_token:
                 self._leases[lease_key] = lease
-        
+
+        # Merge per-job leadership tracking
+        # Only add jobs we don't already know about (don't overwrite our own leadership)
+        for job_id, leader_id in snapshot.job_leaders.items():
+            if job_id not in self._job_leaders:
+                self._job_leaders[job_id] = leader_id
+                # Also get the leader address if available
+                if job_id in snapshot.job_leader_addrs:
+                    self._job_leader_addrs[job_id] = snapshot.job_leader_addrs[job_id]
+
         self._increment_version()
     
     async def _broadcast_manager_discovery(
