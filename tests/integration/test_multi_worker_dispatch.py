@@ -18,6 +18,9 @@ This validates:
 - Core allocation (test workflows split cores evenly)
 - Enqueued/pending state for dependent workflows
 - Eager dispatch when dependencies complete
+- Aggregate workflow results pushed to client (WorkflowResultPush)
+- Stats updates pushed to client (JobStatusPush)
+- Job's workflow_results dict populated with all workflow results
 """
 
 import asyncio
@@ -144,6 +147,20 @@ async def run_test():
     workers: list[WorkerServer] = []
     client: HyperscaleClient | None = None
 
+    # Counters for tracking push notifications
+    status_updates_received = 0
+    workflow_results_received: dict[str, str] = {}  # workflow_name -> status
+
+    def on_status_update(push):
+        """Callback for status updates (stats pushes)."""
+        nonlocal status_updates_received
+        status_updates_received += 1
+
+    def on_workflow_result(push):
+        """Callback for workflow completion results."""
+        nonlocal workflow_results_received
+        workflow_results_received[push.workflow_name] = push.status
+
     try:
         # ==============================================================
         # STEP 1: Create servers
@@ -259,8 +276,10 @@ async def run_test():
         print("-" * 60)
 
         job_id = await client.submit_job(
-            workflows=[TestWorkflow, TestWorkflowTwo, NonTestWorkflow, NonTestWorkflowTwo],
+            workflows=[([], TestWorkflow()), ([], TestWorkflowTwo()), (["TestWorkflowTwo"],NonTestWorkflow()), (["TestWorkflow", "TestWorkflowTwo"], NonTestWorkflowTwo())],
             timeout_seconds=120.0,
+            on_status_update=on_status_update,
+            on_workflow_result=on_workflow_result,
         )
         print(f"  Job submitted: {job_id}")
 
@@ -452,11 +471,65 @@ async def run_test():
             print("  WARNING: Not all workflows completed in time")
 
         # ==============================================================
+        # STEP 11: Verify aggregate results and stats updates
+        # ==============================================================
+        print()
+        print("[11/11] Verifying aggregate results and stats updates...")
+        print("-" * 60)
+
+        # Give a moment for any final push notifications
+        await asyncio.sleep(1)
+
+        # Check workflow results received via callback
+        expected_workflows = {'TestWorkflow', 'TestWorkflowTwo', 'NonTestWorkflow', 'NonTestWorkflowTwo'}
+        received_workflows = set(workflow_results_received.keys())
+
+        workflow_results_ok = received_workflows == expected_workflows
+        print(f"  Workflow results received: {len(workflow_results_received)}/4")
+        for workflow_name, status in sorted(workflow_results_received.items()):
+            print(f"    - {workflow_name}: {status}")
+
+        if not workflow_results_ok:
+            missing = expected_workflows - received_workflows
+            extra = received_workflows - expected_workflows
+            if missing:
+                print(f"  Missing workflow results: {missing}")
+            if extra:
+                print(f"  Unexpected workflow results: {extra}")
+
+        print(f"  Workflow results verification: {'PASS' if workflow_results_ok else 'FAIL'}")
+
+        # Check stats updates received
+        stats_updates_ok = status_updates_received > 0
+        print(f"\n  Status updates received: {status_updates_received}")
+        print(f"  Stats updates verification (>0): {'PASS' if stats_updates_ok else 'FAIL'}")
+
+        # Also check the job result's workflow_results dict
+        job_result = client.get_job_status(job_id)
+        job_workflow_results_ok = False
+        if job_result:
+            job_workflow_results = set(job_result.workflow_results.keys())
+            # workflow_results is keyed by workflow_id, not name, so check count
+            job_workflow_results_ok = len(job_result.workflow_results) == 4
+            print(f"\n  Job result workflow_results count: {len(job_result.workflow_results)}/4")
+            for workflow_id, wf_result in sorted(job_result.workflow_results.items()):
+                print(f"    - {wf_result.workflow_name} ({workflow_id}): {wf_result.status}")
+            print(f"  Job workflow_results verification: {'PASS' if job_workflow_results_ok else 'FAIL'}")
+
+        # ==============================================================
         # Final Results
         # ==============================================================
         print()
         print("=" * 70)
-        all_passed = initial_state_ok and step8_ok and non_test_two_assigned and all_complete
+        all_passed = (
+            initial_state_ok and
+            step8_ok and
+            non_test_two_assigned and
+            all_complete and
+            workflow_results_ok and
+            stats_updates_ok and
+            job_workflow_results_ok
+        )
 
         if all_passed:
             print("TEST RESULT: PASSED")
@@ -469,6 +542,9 @@ async def run_test():
         print(f"    - After TestWorkflowTwo done (NonTestWorkflow assigned): {'PASS' if step8_ok else 'FAIL'}")
         print(f"    - After TestWorkflow done (NonTestWorkflowTwo assigned): {'PASS' if non_test_two_assigned else 'FAIL'}")
         print(f"    - All workflows completed: {'PASS' if all_complete else 'FAIL'}")
+        print(f"    - Workflow results pushed to client (4/4): {'PASS' if workflow_results_ok else 'FAIL'}")
+        print(f"    - Stats updates received (>0): {'PASS' if stats_updates_ok else 'FAIL'}")
+        print(f"    - Job workflow_results populated: {'PASS' if job_workflow_results_ok else 'FAIL'}")
         print()
         print("=" * 70)
 
@@ -527,6 +603,9 @@ def main():
     print("  2. NonTestWorkflow (depends on TestWorkflowTwo) waits, then runs")
     print("  3. NonTestWorkflowTwo (depends on BOTH) waits for both to complete")
     print("  4. Dependency-based scheduling triggers eager dispatch")
+    print("  5. Workflow results are pushed to client for each completed workflow")
+    print("  6. Stats updates are pushed to client (>0 received)")
+    print("  7. Job's workflow_results dict is populated with all 4 workflow results")
     print()
     print("Workflow dependencies:")
     print("  - TestWorkflow: no dependencies")
