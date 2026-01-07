@@ -325,6 +325,8 @@ class GateHeartbeat(Message):
     Piggybacking (like manager/worker discovery):
     - known_managers: Managers this gate knows about, for manager discovery
     - known_gates: Other gates this gate knows about (for gate cluster membership)
+    - job_leaderships: Jobs this gate leads (for distributed consistency, like managers)
+    - job_dc_managers: Per-DC manager leaders for each job (for query routing)
 
     Health piggyback fields (AD-19):
     - health_has_dc_connectivity: Whether gate has DC connectivity
@@ -342,11 +344,19 @@ class GateHeartbeat(Message):
     active_jobs: int             # Number of active global jobs
     active_datacenters: int      # Number of datacenters with active work
     manager_count: int           # Number of registered managers
+    tcp_host: str = ""           # Gate's TCP host (for proper storage/routing)
+    tcp_port: int = 0            # Gate's TCP port (for proper storage/routing)
     # Piggybacked discovery info - managers learn about other managers/gates
     # Maps node_id -> (tcp_host, tcp_port, udp_host, udp_port, datacenter)
     known_managers: dict[str, tuple[str, int, str, int, str]] = field(default_factory=dict)
     # Maps node_id -> (tcp_host, tcp_port, udp_host, udp_port)
     known_gates: dict[str, tuple[str, int, str, int]] = field(default_factory=dict)
+    # Per-job leadership - piggybacked on SWIM UDP for distributed consistency (like managers)
+    # Maps job_id -> (fencing_token, target_dc_count) for jobs this gate leads
+    job_leaderships: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Per-job per-DC manager leaders - for query routing after failover
+    # Maps job_id -> {dc_id -> (manager_host, manager_port)}
+    job_dc_managers: dict[str, dict[str, tuple[str, int]]] = field(default_factory=dict)
     # Health piggyback fields (AD-19)
     health_has_dc_connectivity: bool = True
     health_connected_dc_count: int = 0
@@ -1335,6 +1345,7 @@ class GateStateSnapshot(Message):
     # Per-job leadership tracking (independent of SWIM cluster leadership)
     job_leaders: dict[str, str] = field(default_factory=dict)  # job_id -> leader_node_id
     job_leader_addrs: dict[str, tuple[str, int]] = field(default_factory=dict)  # job_id -> (host, tcp_port)
+    job_fencing_tokens: dict[str, int] = field(default_factory=dict)  # job_id -> fencing token (for leadership consistency)
     # Per-job per-DC manager leader tracking (which manager accepted each job in each DC)
     job_dc_managers: dict[str, dict[str, tuple[str, int]]] = field(default_factory=dict)  # job_id -> {dc_id -> (host, port)}
 

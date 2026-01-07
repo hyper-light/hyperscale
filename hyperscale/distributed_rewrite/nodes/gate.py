@@ -127,6 +127,7 @@ from hyperscale.distributed_rewrite.jobs.gates import (
 from hyperscale.distributed_rewrite.jobs import (
     WindowedStatsCollector,
     WindowedStatsPush,
+    JobLeadershipTracker,
 )
 from hyperscale.distributed_rewrite.datacenters import (
     DatacenterHealthManager,
@@ -278,8 +279,12 @@ class GateServer(HealthAwareServer):
         # Per-job leader tracking (Context Consistency Protocol)
         # Each job has one leader gate responsible for aggregation and client communication
         # Any gate can accept a job and become its leader (independent of SWIM cluster leadership)
-        self._job_leaders: dict[str, str] = {}  # job_id -> leader_node_id
-        self._job_leader_addrs: dict[str, tuple[str, int]] = {}  # job_id -> (host, tcp_port)
+        # Uses JobLeadershipTracker for clean, modular implementation with fencing tokens
+        # Metadata type is int (target_dc_count) for gates
+        self._job_leadership_tracker: JobLeadershipTracker[int] = JobLeadershipTracker(
+            node_id="",  # Set properly in start() when node_id is available
+            node_addr=("", 0),  # Set properly in start()
+        )
 
         # Per-job per-DC manager leader tracking
         # Tracks which manager accepted each job in each datacenter
@@ -359,11 +364,16 @@ class GateServer(HealthAwareServer):
             get_manager_count=lambda: sum(
                 len(managers) for managers in self._datacenter_managers.values()
             ),
+            get_tcp_host=lambda: self._host,
+            get_tcp_port=lambda: self._tcp_port,
             on_manager_heartbeat=self._handle_embedded_manager_heartbeat,
             on_gate_heartbeat=self._handle_gate_peer_heartbeat,
             # Piggybacking for discovery
             get_known_managers=self._get_known_managers_for_piggyback,
             get_known_gates=self._get_known_gates_for_piggyback,
+            # Job leadership piggybacking (Serf-style like managers)
+            get_job_leaderships=self._get_job_leaderships_for_piggyback,
+            get_job_dc_managers=self._get_job_dc_managers_for_piggyback,
             # Health piggyback fields (AD-19)
             get_health_has_dc_connectivity=lambda: len(self._datacenter_managers) > 0,
             get_health_connected_dc_count=self._count_active_datacenters,
@@ -586,11 +596,13 @@ class GateServer(HealthAwareServer):
     ) -> None:
         """
         Handle GateHeartbeat received from peer gates via SWIM.
-        
+
         This enables:
         1. Proper node_id tracking for peers (instead of synthetic IDs)
         2. Leader tracking across the gate cluster
         3. Version-based stale update rejection
+        4. Job leadership propagation (Serf-style piggybacking)
+        5. Per-DC manager tracking for job queries
         """
         # Check if update is stale using versioned clock
         if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
@@ -617,11 +629,72 @@ class GateServer(HealthAwareServer):
             overload_state=getattr(heartbeat, 'overload_state', 'healthy'),
         )
 
+        # Get peer TCP address for job leadership tracking
+        peer_tcp_addr = (heartbeat.tcp_host, heartbeat.tcp_port) if heartbeat.tcp_host else source_addr
+
+        # Process job leadership claims (Serf-style UDP piggybacking)
+        self._process_job_leadership_heartbeat(heartbeat, peer_tcp_addr)
+
+        # Process per-DC manager tracking for jobs led by this peer
+        self._process_job_dc_managers_heartbeat(heartbeat)
+
         # Update version tracking
         self._task_runner.run(
             self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
         )
-    
+
+    def _process_job_leadership_heartbeat(
+        self,
+        heartbeat: GateHeartbeat,
+        peer_tcp_addr: tuple[str, int],
+    ) -> None:
+        """
+        Process job leadership claims from a peer gate's heartbeat.
+
+        Uses fencing tokens for consistency:
+        - Accept leadership claim only if fencing token is higher than what we have
+        - This prevents stale leaders from reasserting leadership after recovery
+
+        This is the UDP-based job leadership protocol (Serf-style piggybacking),
+        mirroring the manager implementation for architectural consistency.
+        """
+        for job_id, (fencing_token, target_dc_count) in heartbeat.job_leaderships.items():
+            # Use tracker's process_leadership_claim (handles fencing token comparison)
+            self._job_leadership_tracker.process_leadership_claim(
+                job_id=job_id,
+                claimer_id=heartbeat.node_id,
+                claimer_addr=peer_tcp_addr,
+                fencing_token=fencing_token,
+                metadata=target_dc_count,
+            )
+
+    def _process_job_dc_managers_heartbeat(
+        self,
+        heartbeat: GateHeartbeat,
+    ) -> None:
+        """
+        Process per-DC manager tracking from a peer gate's heartbeat.
+
+        This enables non-leader gates to know which manager to query
+        for each job's results in each datacenter. When a job leader
+        fails, this information allows the new leader to route queries
+        correctly.
+        """
+        for job_id, dc_managers in heartbeat.job_dc_managers.items():
+            # Only accept if this peer is the job leader (has authority)
+            peer_is_leader = self._job_leadership_tracker.get_leader(job_id) == heartbeat.node_id
+
+            if peer_is_leader:
+                # Merge DC manager info - peer's data is authoritative for jobs they lead
+                if job_id not in self._job_dc_managers:
+                    self._job_dc_managers[job_id] = {}
+
+                for dc_id, manager_addr in dc_managers.items():
+                    # Only update if we don't have info for this DC yet
+                    # (prevent overwrites during failover transitions)
+                    if dc_id not in self._job_dc_managers[job_id]:
+                        self._job_dc_managers[job_id][dc_id] = manager_addr
+
     def _get_healthy_gates(self) -> list[GateInfo]:
         """
         Build list of all known healthy gates for manager discovery.
@@ -713,15 +786,15 @@ class GateServer(HealthAwareServer):
 
     def _is_job_leader(self, job_id: str) -> bool:
         """Check if this gate is the leader for the given job."""
-        return self._job_leaders.get(job_id) == self._node_id.full
+        return self._job_leadership_tracker.is_leader(job_id)
 
     def _get_job_leader(self, job_id: str) -> str | None:
         """Get the node_id of the job leader, or None if unknown."""
-        return self._job_leaders.get(job_id)
+        return self._job_leadership_tracker.get_leader(job_id)
 
     def _get_job_leader_addr(self, job_id: str) -> tuple[str, int] | None:
         """Get the TCP address of the job leader, or None if unknown."""
-        return self._job_leader_addrs.get(job_id)
+        return self._job_leadership_tracker.get_leader_addr(job_id)
 
     async def _handle_job_leader_failure(
         self,
@@ -737,18 +810,19 @@ class GateServer(HealthAwareServer):
         Only takes over jobs that are not yet in a terminal state
         (COMPLETED, FAILED, CANCELLED).
         """
-        # Find all jobs led by the failed gate
+        # Find all jobs led by the failed gate (using tracker's helper)
+        candidate_jobs = self._job_leadership_tracker.get_jobs_led_by_addr(failed_gate_addr)
+
+        # Filter to only active (non-terminal) jobs
         orphaned_jobs: list[str] = []
-        for job_id, leader_addr in list(self._job_leader_addrs.items()):
-            if leader_addr == failed_gate_addr:
-                # Check if job is still active (not terminal)
-                job = self._jobs.get(job_id)
-                if job and job.status not in (
-                    JobStatus.COMPLETED.value,
-                    JobStatus.FAILED.value,
-                    JobStatus.CANCELLED.value,
-                ):
-                    orphaned_jobs.append(job_id)
+        for job_id in candidate_jobs:
+            job = self._jobs.get(job_id)
+            if job and job.status not in (
+                JobStatus.COMPLETED.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+            ):
+                orphaned_jobs.append(job_id)
 
         if not orphaned_jobs:
             return
@@ -765,12 +839,11 @@ class GateServer(HealthAwareServer):
 
         # Take over leadership for each orphaned job
         for job_id in orphaned_jobs:
-            # Update leadership to self
-            self._job_leaders[job_id] = self._node_id.full
-            self._job_leader_addrs[job_id] = (self._host, self._tcp_port)
+            # Use tracker's takeover method (handles fencing token increment)
+            target_dc_count = len(self._job_target_dcs.get(job_id, set()))
+            self._job_leadership_tracker.takeover_leadership(job_id, metadata=target_dc_count)
 
             # Broadcast new leadership to peer gates
-            target_dc_count = len(self._job_target_dcs.get(job_id, set()))
             await self._broadcast_job_leadership(job_id, target_dc_count)
 
             self._task_runner.run(
@@ -844,6 +917,9 @@ class GateServer(HealthAwareServer):
 
     def _get_state_snapshot(self) -> GateStateSnapshot:
         """Get a complete state snapshot for state sync."""
+        # Get job leadership snapshot once (efficient)
+        job_leaders, job_leader_addrs, job_fencing_tokens = self._job_leadership_tracker.to_snapshot()
+
         return GateStateSnapshot(
             node_id=self._node_id.full,
             is_leader=self.is_leader(),
@@ -858,9 +934,10 @@ class GateServer(HealthAwareServer):
             # Include manager discovery info for cross-gate sync
             datacenter_managers={dc: list(addrs) for dc, addrs in self._datacenter_managers.items()},
             datacenter_manager_udp={dc: list(addrs) for dc, addrs in self._datacenter_manager_udp.items()},
-            # Include per-job leadership tracking for cross-gate sync
-            job_leaders=dict(self._job_leaders),
-            job_leader_addrs=dict(self._job_leader_addrs),
+            # Include per-job leadership tracking for cross-gate sync (via tracker)
+            job_leaders=job_leaders,
+            job_leader_addrs=job_leader_addrs,
+            job_fencing_tokens=job_fencing_tokens,
             # Include per-job per-DC manager leaders for query routing
             job_dc_managers={job_id: dict(dc_mgrs) for job_id, dc_mgrs in self._job_dc_managers.items()},
         )
@@ -983,14 +1060,13 @@ class GateServer(HealthAwareServer):
             if not existing or lease.fence_token > existing.fence_token:
                 self._leases[lease_key] = lease
 
-        # Merge per-job leadership tracking
-        # Only add jobs we don't already know about (don't overwrite our own leadership)
-        for job_id, leader_id in snapshot.job_leaders.items():
-            if job_id not in self._job_leaders:
-                self._job_leaders[job_id] = leader_id
-                # Also get the leader address if available
-                if job_id in snapshot.job_leader_addrs:
-                    self._job_leader_addrs[job_id] = snapshot.job_leader_addrs[job_id]
+        # Merge per-job leadership tracking via tracker
+        # Uses fencing tokens for proper consistency
+        self._job_leadership_tracker.merge_from_snapshot(
+            job_leaders=snapshot.job_leaders,
+            job_leader_addrs=snapshot.job_leader_addrs,
+            job_fencing_tokens=snapshot.job_fencing_tokens,
+        )
 
         # Merge per-job per-DC manager leaders
         # Only add jobs we don't already have DC manager info for
@@ -1160,7 +1236,46 @@ class GateServer(HealthAwareServer):
                 gate_info.udp_port,
             )
         return result
-    
+
+    def _get_job_leaderships_for_piggyback(self) -> dict[str, tuple[int, int]]:
+        """
+        Get job leadership info for piggybacking in SWIM heartbeats.
+
+        Only includes jobs where this gate is the leader. This enables
+        Serf-style distributed consistency - other gates learn about
+        job leadership via UDP heartbeats (passive propagation).
+
+        Returns: dict mapping job_id -> (fencing_token, target_dc_count)
+        """
+        # Get claims from tracker (job_id -> (fencing_token, metadata))
+        # Metadata is target_dc_count for gates
+        claims = self._job_leadership_tracker.get_leadership_claims()
+
+        # Convert to expected format, using stored metadata or computing from _job_target_dcs
+        result: dict[str, tuple[int, int]] = {}
+        for job_id, (fencing_token, metadata) in claims.items():
+            target_dc_count = metadata if metadata is not None else len(self._job_target_dcs.get(job_id, set()))
+            result[job_id] = (fencing_token, target_dc_count)
+        return result
+
+    def _get_job_dc_managers_for_piggyback(self) -> dict[str, dict[str, tuple[str, int]]]:
+        """
+        Get per-job per-DC manager leader info for piggybacking in SWIM heartbeats.
+
+        Only includes jobs where this gate is the leader. This enables
+        other gates to know which manager to query for each job's
+        results in each datacenter.
+
+        Returns: dict mapping job_id -> {dc_id -> (manager_host, manager_port)}
+        """
+        result: dict[str, dict[str, tuple[str, int]]] = {}
+        # Get jobs we lead from the tracker
+        for job_id in self._job_leadership_tracker.get_leadership_claims().keys():
+            dc_managers = self._job_dc_managers.get(job_id)
+            if dc_managers:
+                result[job_id] = dict(dc_managers)
+        return result
+
     def _get_best_manager_heartbeat(self, dc_id: str) -> tuple[ManagerHeartbeat | None, int, int]:
         """
         Get the most authoritative manager heartbeat for a datacenter.
@@ -2409,11 +2524,29 @@ class GateServer(HealthAwareServer):
                 addr_tuple = tuple(addr) if isinstance(addr, list) else addr
                 if addr_tuple not in self._datacenter_manager_udp[dc]:
                     self._datacenter_manager_udp[dc].append(addr_tuple)
-        
+
+        # Merge per-job leadership tracking via tracker
+        # Uses fencing tokens for proper consistency
+        self._job_leadership_tracker.merge_from_snapshot(
+            job_leaders=snapshot.job_leaders,
+            job_leader_addrs=snapshot.job_leader_addrs,
+            job_fencing_tokens=snapshot.job_fencing_tokens,
+        )
+
+        # Merge per-job per-DC manager leaders
+        for job_id, dc_managers in snapshot.job_dc_managers.items():
+            if job_id not in self._job_dc_managers:
+                self._job_dc_managers[job_id] = dict(dc_managers)
+            else:
+                # Merge DC managers we don't already have
+                for dc_id, manager_addr in dc_managers.items():
+                    if dc_id not in self._job_dc_managers[job_id]:
+                        self._job_dc_managers[job_id][dc_id] = manager_addr
+
         # Update state version if snapshot is newer
         if snapshot.version > self._state_version:
             self._state_version = snapshot.version
-        
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -2440,7 +2573,11 @@ class GateServer(HealthAwareServer):
         # Start the underlying server (TCP/UDP listeners, task runner, etc.)
         # Uses SWIM settings from Env configuration
         await self.start_server(init_context=self.env.get_swim_init_context())
-        
+
+        # Now that node_id is available, initialize the job leadership tracker
+        self._job_leadership_tracker.node_id = self._node_id.full
+        self._job_leadership_tracker.node_addr = (self._host, self._tcp_port)
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -2838,8 +2975,7 @@ class GateServer(HealthAwareServer):
                     self._job_callbacks.pop(job_id, None)
                     self._progress_callbacks.pop(job_id, None)
                     # Clean up per-job leadership tracking
-                    self._job_leaders.pop(job_id, None)
-                    self._job_leader_addrs.pop(job_id, None)
+                    self._job_leadership_tracker.release_leadership(job_id)
                     self._job_dc_managers.pop(job_id, None)
                     # Clean up windowed stats for this job
                     await self._windowed_stats.cleanup_job_windows(job_id)
@@ -3360,8 +3496,10 @@ class GateServer(HealthAwareServer):
 
             # Set this gate as job leader (first to accept = job leader)
             # Per-job leadership is independent of SWIM cluster leadership
-            self._job_leaders[submission.job_id] = self._node_id.full
-            self._job_leader_addrs[submission.job_id] = (self._host, self._tcp_port)
+            self._job_leadership_tracker.assume_leadership(
+                job_id=submission.job_id,
+                metadata=len(target_dcs),  # Store target_dc_count as metadata
+            )
 
             self._increment_version()
 
@@ -5158,15 +5296,17 @@ class GateServer(HealthAwareServer):
         try:
             announcement = JobLeadershipAnnouncement.load(data)
 
-            # Don't overwrite if we already know about this job
-            # (we might be the leader ourselves)
-            if announcement.job_id not in self._job_leaders:
-                self._job_leaders[announcement.job_id] = announcement.leader_id
-                self._job_leader_addrs[announcement.job_id] = (
-                    announcement.leader_host,
-                    announcement.leader_tcp_port,
-                )
+            # Use tracker to process claim - it will only accept if we don't already know
+            # or if the fencing token is higher (TCP announcements use term as a proxy)
+            accepted = self._job_leadership_tracker.process_leadership_claim(
+                job_id=announcement.job_id,
+                claimer_id=announcement.leader_id,
+                claimer_addr=(announcement.leader_host, announcement.leader_tcp_port),
+                fencing_token=announcement.term,  # Use term as fencing token for TCP
+                metadata=announcement.workflow_count,  # workflow_count is DC count for gates
+            )
 
+            if accepted:
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerDebug(

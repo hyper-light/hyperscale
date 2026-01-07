@@ -359,16 +359,21 @@ class GateStateEmbedder:
         get_active_jobs: Callable returning active job count.
         get_active_datacenters: Callable returning active datacenter count.
         get_manager_count: Callable returning registered manager count.
+        get_tcp_host: Callable returning TCP host for routing.
+        get_tcp_port: Callable returning TCP port for routing.
         on_manager_heartbeat: Callable to handle received ManagerHeartbeat.
         on_gate_heartbeat: Callable to handle received GateHeartbeat from peers.
         get_known_managers: Callable returning piggybacked manager info.
         get_known_gates: Callable returning piggybacked gate info.
+        get_job_leaderships: Callable returning job leadership info (like managers).
+        get_job_dc_managers: Callable returning per-DC manager leaders for each job.
         get_health_has_dc_connectivity: Callable returning DC connectivity status.
         get_health_connected_dc_count: Callable returning connected DC count.
         get_health_throughput: Callable returning current throughput.
         get_health_expected_throughput: Callable returning expected throughput.
         get_health_overload_state: Callable returning overload state.
     """
+    # Required fields (no defaults) - must come first
     get_node_id: Callable[[], str]
     get_datacenter: Callable[[], str]
     is_leader: Callable[[], bool]
@@ -379,10 +384,16 @@ class GateStateEmbedder:
     get_active_datacenters: Callable[[], int]
     get_manager_count: Callable[[], int]
     on_manager_heartbeat: Callable[[Any, tuple[str, int]], None]
+    # Optional fields (with defaults)
+    get_tcp_host: Callable[[], str] | None = None
+    get_tcp_port: Callable[[], int] | None = None
     on_gate_heartbeat: Callable[[Any, tuple[str, int]], None] | None = None
     # Piggybacking callbacks for discovery
     get_known_managers: Callable[[], dict[str, tuple[str, int, str, int, str]]] | None = None
     get_known_gates: Callable[[], dict[str, tuple[str, int, str, int]]] | None = None
+    # Job leadership piggybacking (like managers - Serf-style consistency)
+    get_job_leaderships: Callable[[], dict[str, tuple[int, int]]] | None = None
+    get_job_dc_managers: Callable[[], dict[str, dict[str, tuple[str, int]]]] | None = None
     # Health piggyback fields (AD-19)
     get_health_has_dc_connectivity: Callable[[], bool] | None = None
     get_health_connected_dc_count: Callable[[], int] | None = None
@@ -401,6 +412,15 @@ class GateStateEmbedder:
         if self.get_known_gates:
             known_gates = self.get_known_gates()
 
+        # Build job leadership piggybacking (Serf-style like managers)
+        job_leaderships: dict[str, tuple[int, int]] = {}
+        if self.get_job_leaderships:
+            job_leaderships = self.get_job_leaderships()
+
+        job_dc_managers: dict[str, dict[str, tuple[str, int]]] = {}
+        if self.get_job_dc_managers:
+            job_dc_managers = self.get_job_dc_managers()
+
         heartbeat = GateHeartbeat(
             node_id=self.get_node_id(),
             datacenter=self.get_datacenter(),
@@ -411,8 +431,13 @@ class GateStateEmbedder:
             active_jobs=self.get_active_jobs(),
             active_datacenters=self.get_active_datacenters(),
             manager_count=self.get_manager_count(),
+            tcp_host=self.get_tcp_host() if self.get_tcp_host else "",
+            tcp_port=self.get_tcp_port() if self.get_tcp_port else 0,
             known_managers=known_managers,
             known_gates=known_gates,
+            # Job leadership piggybacking (Serf-style like managers)
+            job_leaderships=job_leaderships,
+            job_dc_managers=job_dc_managers,
             # Health piggyback fields
             health_has_dc_connectivity=self.get_health_has_dc_connectivity() if self.get_health_has_dc_connectivity else True,
             health_connected_dc_count=self.get_health_connected_dc_count() if self.get_health_connected_dc_count else 0,
