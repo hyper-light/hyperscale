@@ -654,6 +654,7 @@ class TestConcurrentFailureScenarios:
             medium_threshold=3,
             failure_confirmation_seconds=0,  # Immediate confirmation for testing
             recovery_confirmation_seconds=0,  # Immediate recovery confirmation
+            correlation_backoff_seconds=0,  # Disable backoff for this test
         )
         detector = CrossDCCorrelationDetector(config=config)
 
