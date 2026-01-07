@@ -1,6 +1,5 @@
 from typing import Literal
 from .components.terminal import action
-from .hyperscale_interface import HyperscaleInterface
 
 
 StepStatsType = Literal["step", "total", "ok", "err"]
@@ -13,9 +12,6 @@ async def update_workflow_progress_seconds(
     workflow: str,
     elapsed: float,
 ):
-    # Signal that progress updates have started (stops spinner polling)
-    HyperscaleInterface.mark_progress_started()
-
     return (
         f"update_run_progress_seconds_{workflow}",
         int(elapsed),

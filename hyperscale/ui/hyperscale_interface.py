@@ -11,13 +11,6 @@ from .interface_updates_controller import InterfaceUpdatesController
 
 
 class HyperscaleInterface:
-    _received_first_progress_update: bool = False
-
-    @classmethod
-    def mark_progress_started(cls):
-        """Signal that the first progress update has been received."""
-        cls._received_first_progress_update = True
-
     def __init__(
         self,
         updates: InterfaceUpdatesController,
@@ -62,9 +55,6 @@ class HyperscaleInterface:
         self._start: float | None = None
         self._spinner_task: asyncio.Task | None = None
 
-        # Reset class-level flag for new interface instance
-        HyperscaleInterface._received_first_progress_update = False
-
     def initialize(
         self,
         workflows: list[Workflow],
@@ -95,13 +85,10 @@ class HyperscaleInterface:
             )
 
     async def _run_spinner(self):
-        """Trigger renders at refresh interval until first progress update arrives."""
+        """Trigger renders at refresh interval for smooth animations."""
         interval = self._terminal._interval
 
         while not self._run_switch_loop.is_set():
-            if HyperscaleInterface._received_first_progress_update:
-                return
-
             Terminal.trigger_render()
             await asyncio.sleep(interval)
 
