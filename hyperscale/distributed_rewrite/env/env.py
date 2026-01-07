@@ -79,7 +79,7 @@ class Env(BaseModel):
 
     # Worker Progress Update Settings (tuned for real-time terminal UI)
     WORKER_PROGRESS_UPDATE_INTERVAL: StrictFloat = 0.1  # How often to collect progress locally (100ms)
-    WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 0.15  # How often to send buffered updates to manager (150ms)
+    WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 0.1  # How often to send buffered updates to manager (100ms)
     WORKER_MAX_CORES: StrictInt | None = None
 
     # Worker Dead Manager Cleanup Settings
@@ -207,7 +207,7 @@ class Env(BaseModel):
     STATS_WINDOW_SIZE_MS: StrictFloat = 100.0  # Window bucket size in milliseconds
     # Drift tolerance must be >= WORKER_PROGRESS_FLUSH_INTERVAL to allow for buffering delay
     # Workers collect at collected_at timestamp, but send up to flush_interval later
-    STATS_DRIFT_TOLERANCE_MS: StrictFloat = 200.0  # Must exceed worker flush interval (150ms) + network latency
+    STATS_DRIFT_TOLERANCE_MS: StrictFloat = 150.0  # Must exceed worker flush interval (100ms) + network latency
     STATS_PUSH_INTERVAL_MS: StrictFloat = 100.0  # How often to flush windows and push (ms)
     STATS_MAX_WINDOW_AGE_MS: StrictFloat = 5000.0  # Max age before window is dropped (cleanup)
 
