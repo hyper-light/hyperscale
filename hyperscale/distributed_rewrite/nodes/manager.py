@@ -4577,17 +4577,44 @@ class ManagerServer(HealthAwareServer):
                 pass
 
     def _is_job_complete(self, job_id: str) -> bool:
-        """Check if all workflows in a job have completed."""
+        """
+        Check if all workflows in a job have completed.
+
+        A job is complete when:
+        1. All WorkflowInfo statuses are terminal (COMPLETED, FAILED, etc.)
+        2. All sub-workflows have their final results recorded
+
+        This ensures WorkflowResultPush has been sent for all workflows
+        before job completion is triggered.
+        """
         # Note: Use get_job_by_id(), not get_job() - the latter expects a full token string
         job_info = self._job_manager.get_job_by_id(job_id)
         if not job_info or not job_info.workflows:
             return False
 
-        return all(
-            wf.status in (WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
-                          WorkflowStatus.AGGREGATED, WorkflowStatus.AGGREGATION_FAILED)
+        # Check all WorkflowInfo statuses are terminal
+        terminal_statuses = (
+            WorkflowStatus.COMPLETED, WorkflowStatus.FAILED,
+            WorkflowStatus.AGGREGATED, WorkflowStatus.AGGREGATION_FAILED
+        )
+        all_statuses_terminal = all(
+            wf.status in terminal_statuses
             for wf in job_info.workflows.values()
         )
+        if not all_statuses_terminal:
+            return False
+
+        # Also verify all sub-workflows have results recorded
+        # This prevents race where status is updated from progress but final result hasn't arrived
+        if job_info.sub_workflows:
+            all_results_recorded = all(
+                sub_wf.result is not None
+                for sub_wf in job_info.sub_workflows.values()
+            )
+            if not all_results_recorded:
+                return False
+
+        return True
 
     def _get_parent_workflow_id(self, sub_workflow_id: str) -> str | None:
         """
