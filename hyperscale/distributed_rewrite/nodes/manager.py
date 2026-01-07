@@ -6994,7 +6994,7 @@ class ManagerServer(HealthAwareServer):
 
             # Broadcast job leadership to peer managers
             # Include workflow names so non-leaders can respond to workflow queries
-            workflow_names = [wf.name for _, wf in workflows]
+            workflow_names = [wf.name for _, _, wf in workflows]
 
             await self._broadcast_job_leadership(
                 submission.job_id,
