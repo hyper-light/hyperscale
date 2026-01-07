@@ -370,6 +370,11 @@ class ManagerServer(HealthAwareServer):
         self._eager_dispatch_lock: asyncio.Lock | None = None
         self._workflow_results_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
+        # Store aggregated workflow results for reporter submission
+        # job_id -> list of aggregated WorkflowStats (one per completed workflow)
+        # Populated by _handle_workflow_completion, consumed by _handle_job_completion
+        self._job_aggregated_results: dict[str, list[WorkflowStats]] = defaultdict(list)
+
         # Fencing tokens for at-most-once
         self._fence_token = 0
         
@@ -4549,13 +4554,15 @@ class ManagerServer(HealthAwareServer):
             # for backwards compatibility (will aggregate results)
             return True
 
-        hooks = {
+        hooks: dict[str, Hook] = {
             name: hook
             for name, hook in inspect.getmembers(
                 workflow,
                 predicate=lambda member: isinstance(member, Hook),
             )
         }
+
+        print(f"[DEBUG][Manager] Workflow={workflow.name} has {len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST]) } test hooks")
 
         return len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST]) > 0
 
@@ -4603,7 +4610,6 @@ class ManagerServer(HealthAwareServer):
         if not all_workflow_stats:
             return
 
-        print("[DEBUG][Manager] First Workflow",all_workflow_stats[0])
 
         # Determine status
         status = WorkflowStatus.FAILED.value if has_failure else WorkflowStatus.COMPLETED.value
@@ -4613,6 +4619,8 @@ class ManagerServer(HealthAwareServer):
         workflow_info = job.workflows.get(parent_workflow_id)
         workflow_object = workflow_info.workflow if workflow_info else None
         is_test_workflow = self._is_test_workflow(workflow_object)
+
+        print("[DEBUG][Manager] First Workflow",all_workflow_stats[0], is_test_workflow)
 
         # Determine if job came from gate or client
         origin_gate = self._job_origin_gates.get(job_id)
@@ -4640,6 +4648,10 @@ class ManagerServer(HealthAwareServer):
             await self._send_workflow_result_to_gate(push, origin_gate)
         else:
             await self._send_workflow_result_to_client(push, callback)
+            # Store results for reporter submission (only for client jobs)
+            # For test workflows, store the aggregated result
+            # For non-test workflows, store raw stats
+            self._job_aggregated_results[job_id].extend(results_to_send)
 
     def _prepare_workflow_results(
         self,
@@ -4654,6 +4666,7 @@ class ManagerServer(HealthAwareServer):
         Client (test workflow): Receives aggregated stats.
         Client (non-test workflow): Receives raw stats.
         """
+        print(f"[DEBUG][Manager] for_gate={for_gate} is_test_workflow={is_test_workflow}")
         if for_gate or not is_test_workflow:
             return all_workflow_stats
 
@@ -4979,13 +4992,19 @@ class ManagerServer(HealthAwareServer):
             await self._send_job_final_result_to_gates(job_final)
         elif callback:
             await self._send_job_final_result_to_client(job_final, callback)
-            aggregated = self._aggregate_workflow_stats(all_stats)
-            if aggregated:
-                self._start_background_reporter_submission(
-                    job_id=job_id,
-                    aggregated_stats=aggregated,
-                    callback_addr=callback,
-                )
+
+            # Use pre-aggregated results from _handle_workflow_completion
+            # instead of recomputing aggregation
+            stored_results = self._job_aggregated_results.pop(job_id, [])
+            if stored_results:
+                # Merge all stored workflow results into a single aggregated stat
+                aggregated = self._aggregate_workflow_stats(stored_results)
+                if aggregated:
+                    self._start_background_reporter_submission(
+                        job_id=job_id,
+                        aggregated_stats=aggregated,
+                        callback_addr=callback,
+                    )
 
     async def _send_job_final_result_to_gates(self, job_final: JobFinalResult) -> None:
         """
@@ -6412,6 +6431,7 @@ class ManagerServer(HealthAwareServer):
         self._job_callbacks.pop(job_id, None)
         self._job_submissions.pop(job_id, None)
         self._job_origin_gates.pop(job_id, None)
+        self._job_aggregated_results.pop(job_id, None)
 
         # Clean up any pending reporter background tasks for this job
         self._cleanup_reporter_tasks(job_id)
