@@ -4926,24 +4926,30 @@ class GateServer(HealthAwareServer):
                     # DC query failed - skip this DC
                     pass
 
-            # Find leader address for each datacenter
+            # Find a manager address for each datacenter
+            # Prefer the leader if one exists, otherwise use any healthy manager
+            # (workflow queries work against any manager since they have shared state)
             query_tasks = []
             for dc_id in self._datacenter_managers.keys():
                 manager_statuses = self._datacenter_manager_status.get(dc_id, {})
-                leader_addr: tuple[str, int] | None = None
+                target_addr: tuple[str, int] | None = None
+                fallback_addr: tuple[str, int] | None = None
 
-                # Debug: print what we see
-                print(f"[GATE {self._node_id.short}] workflow_query: DC {dc_id} has {len(manager_statuses)} manager statuses")
                 for manager_addr, heartbeat in manager_statuses.items():
-                    print(f"[GATE {self._node_id.short}]   {manager_addr}: is_leader={heartbeat.is_leader}, node_id={heartbeat.node_id}")
+                    # Track any valid manager as fallback
+                    if fallback_addr is None:
+                        fallback_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+                    # Prefer leader if available
                     if heartbeat.is_leader:
-                        leader_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+                        target_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
                         break
 
-                if leader_addr:
-                    query_tasks.append(query_dc(dc_id, leader_addr))
-                else:
-                    print(f"[GATE {self._node_id.short}] workflow_query: No leader found for DC {dc_id}")
+                # Use leader if found, otherwise use any manager
+                if target_addr is None:
+                    target_addr = fallback_addr
+
+                if target_addr:
+                    query_tasks.append(query_dc(dc_id, target_addr))
 
             # Run all DC queries concurrently
             if query_tasks:
