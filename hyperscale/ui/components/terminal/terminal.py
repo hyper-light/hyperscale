@@ -360,7 +360,31 @@ class Terminal:
         # Initialize the class-level render event
         Terminal._render_event = asyncio.Event()
 
+        # Initial render
+        try:
+            await self._stdout_lock.acquire()
+
+            frame = await self.canvas.render()
+
+            frame = f"\033[3J\033[H{frame}\n".encode()
+            self._writer.write(frame)
+            await self._writer.drain()
+
+        except Exception:
+            pass
+
+        finally:
+            if self._stdout_lock.locked():
+                self._stdout_lock.release()
+
+        # Wait for action triggers to re-render
         while not self._stop_run.is_set():
+            await Terminal._render_event.wait()
+            Terminal._render_event.clear()
+
+            if self._stop_run.is_set():
+                break
+
             try:
                 await self._stdout_lock.acquire()
 
@@ -376,17 +400,6 @@ class Terminal:
             finally:
                 if self._stdout_lock.locked():
                     self._stdout_lock.release()
-
-            # Wait for either a render signal or the interval timeout
-            try:
-                await asyncio.wait_for(
-                    Terminal._render_event.wait(),
-                    timeout=self._interval,
-                )
-                Terminal._render_event.clear()
-            except asyncio.TimeoutError:
-                # Timeout - continue rendering for spinner animation
-                pass
 
     async def _show_cursor(self):
         if await self._loop.run_in_executor(None, self._stdout.isatty):
