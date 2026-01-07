@@ -4288,14 +4288,20 @@ class ManagerServer(HealthAwareServer):
 
     async def _notify_workflow_dispatcher(self, job_id: str, workflow_id: str, status: str) -> None:
         """Notify workflow dispatcher of completion/failure for dependency tracking."""
+        print(f"[DEBUG][Manager] _notify_workflow_dispatcher called: job_id={job_id}, workflow_id={workflow_id}, status={status}")
         if not self._workflow_dispatcher:
+            print(f"[DEBUG][Manager] _notify_workflow_dispatcher: NO dispatcher, returning")
             return
 
         if status == WorkflowStatus.COMPLETED.value:
+            print(f"[DEBUG][Manager] _notify_workflow_dispatcher: calling mark_workflow_completed")
             await self._workflow_dispatcher.mark_workflow_completed(job_id, workflow_id)
             submission = self._job_submissions.get(job_id)
             if submission:
+                print(f"[DEBUG][Manager] _notify_workflow_dispatcher: calling try_dispatch")
                 await self._workflow_dispatcher.try_dispatch(job_id, submission)
+            else:
+                print(f"[DEBUG][Manager] _notify_workflow_dispatcher: NO submission found for job {job_id}")
         elif status == WorkflowStatus.FAILED.value:
             await self._workflow_dispatcher.mark_workflow_failed(job_id, workflow_id)
 
@@ -4357,10 +4363,12 @@ class ManagerServer(HealthAwareServer):
         """
         try:
             result = WorkflowFinalResult.load(data)
+            print(f"[DEBUG][Manager] workflow_final_result received: workflow_id={result.workflow_id}, status={result.status}")
 
             # Forward to job leader if we're not the leader
             forward_response = await self._forward_result_to_job_leader(result, data)
             if forward_response is not None:
+                print(f"[DEBUG][Manager] workflow_final_result: forwarded to job leader")
                 return forward_response
 
             # Update initial workflow status
@@ -4368,12 +4376,14 @@ class ManagerServer(HealthAwareServer):
 
             # Process under lock for sub-workflow coordination
             parent_workflow_id = self._get_parent_workflow_id(result.workflow_id)
+            print(f"[DEBUG][Manager] workflow_final_result: parent_workflow_id={parent_workflow_id}")
             await self._workflow_results_locks[parent_workflow_id].acquire()
 
             try:
                 await self._update_worker_cores(result)
 
                 recorded, _ = await self._job_manager.record_sub_workflow_result(result.workflow_id, result)
+                print(f"[DEBUG][Manager] workflow_final_result: recorded={recorded}")
                 if not recorded:
                     return b'error'
 
@@ -4381,7 +4391,10 @@ class ManagerServer(HealthAwareServer):
                 if parent_workflow_id is not None:
                     await self._handle_context_updates(result)
 
-                    if not self._is_parent_workflow_complete(parent_workflow_id):
+                    is_parent_complete = self._is_parent_workflow_complete(parent_workflow_id)
+                    print(f"[DEBUG][Manager] workflow_final_result: is_parent_complete={is_parent_complete}")
+                    if not is_parent_complete:
+                        print(f"[DEBUG][Manager] workflow_final_result: parent not complete, returning early (NOT calling _finalize)")
                         return b'ok'
 
                     await self._handle_workflow_completion(result.job_id, parent_workflow_id)
@@ -4389,6 +4402,7 @@ class ManagerServer(HealthAwareServer):
                     # Non-sub-workflow context updates
                     await self._handle_context_updates(result)
 
+                print(f"[DEBUG][Manager] workflow_final_result: calling _finalize_workflow_result")
                 await self._finalize_workflow_result(result)
 
                 if self._is_job_complete(result.job_id):
@@ -4401,6 +4415,9 @@ class ManagerServer(HealthAwareServer):
                 self._workflow_results_locks[parent_workflow_id].release()
 
         except Exception as e:
+            import traceback
+            print(f"[DEBUG][Manager] workflow_final_result EXCEPTION: {e}")
+            print(f"[DEBUG][Manager] Traceback:\n{traceback.format_exc()}")
             await self.handle_exception(e, "workflow_final_result")
             return b'error'
     
@@ -4521,6 +4538,27 @@ class ManagerServer(HealthAwareServer):
         # Check if all have results
         return all(sub_wf.result is not None for sub_wf in parent_sub_workflows)
 
+    def _is_test_workflow(self, workflow: Workflow | None) -> bool:
+        """
+        Determine if a workflow is a test workflow based on its hooks.
+
+        A workflow is considered a test workflow if it has any hooks with HookType.TEST.
+        """
+        if workflow is None:
+            # If no workflow object available, default to treating as test workflow
+            # for backwards compatibility (will aggregate results)
+            return True
+
+        hooks = {
+            name: hook
+            for name, hook in inspect.getmembers(
+                workflow,
+                predicate=lambda member: isinstance(member, Hook),
+            )
+        }
+
+        return len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST]) > 0
+
     async def _handle_workflow_completion(self, job_id: str, parent_workflow_id: str) -> None:
         """
         Handle completion of a parent workflow (all sub-workflows done).
@@ -4565,9 +4603,16 @@ class ManagerServer(HealthAwareServer):
         if not all_workflow_stats:
             return
 
+        print("[DEBUG][Manager] First Workflow",all_workflow_stats[0])
+
         # Determine status
         status = WorkflowStatus.FAILED.value if has_failure else WorkflowStatus.COMPLETED.value
         error = "; ".join(error_messages) if error_messages else None
+
+        # Get the parent workflow info to check if it's a test workflow
+        workflow_info = job.workflows.get(parent_workflow_id)
+        workflow_object = workflow_info.workflow if workflow_info else None
+        is_test_workflow = self._is_test_workflow(workflow_object)
 
         # Determine if job came from gate or client
         origin_gate = self._job_origin_gates.get(job_id)
@@ -4588,12 +4633,17 @@ class ManagerServer(HealthAwareServer):
             await self._send_workflow_result_to_gate(push, origin_gate)
 
         elif callback:
-            # Client job: aggregate and send to client
-            results_helper = Results()
-            if len(all_workflow_stats) > 1:
-                aggregated = results_helper.merge_results(all_workflow_stats)
+            # Client job: aggregate only for test workflows, otherwise return raw stats
+            if is_test_workflow:
+                results_helper = Results()
+                if len(all_workflow_stats) > 1:
+                    aggregated = results_helper.merge_results(all_workflow_stats)
+                else:
+                    aggregated = all_workflow_stats[0] if all_workflow_stats else {}
+                results_to_send = [aggregated]
             else:
-                aggregated = all_workflow_stats[0] if all_workflow_stats else {}
+                # Non-test workflow: return unaggregated list of WorkflowStats
+                results_to_send = all_workflow_stats
 
             push = WorkflowResultPush(
                 job_id=job_id,
@@ -4601,7 +4651,7 @@ class ManagerServer(HealthAwareServer):
                 workflow_name=workflow_name,
                 datacenter=self._node_id.datacenter,
                 status=status,
-                results=[aggregated],
+                results=results_to_send,
                 error=error,
                 elapsed_seconds=max_elapsed,
             )
@@ -6670,24 +6720,29 @@ class ManagerServer(HealthAwareServer):
         know where to route workflow results.
         """
         try:
+            print(f"[DEBUG][Manager] job_submission handler called from {addr}")
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
             allowed, retry_after = self._check_rate_limit_for_operation(client_id, "job_submit")
             if not allowed:
+                print(f"[DEBUG][Manager] job_submission RATE LIMITED for {client_id}")
                 return RateLimitResponse(
                     operation="job_submit",
                     retry_after_seconds=retry_after,
                 ).dump()
 
             submission = JobSubmission.load(data)
+            print(f"[DEBUG][Manager] job_submission loaded: job_id={submission.job_id}")
 
             # Unpickle workflows
             workflows: list[
                 tuple[list[str], Workflow]
             ] = restricted_loads(submission.workflows)
+            print(f"[DEBUG][Manager] job_submission unpickled {len(workflows)} workflows")
 
             # Only active managers accept jobs (not SYNCING)
             if self._manager_state != ManagerState.ACTIVE:
+                print(f"[DEBUG][Manager] job_submission REJECTED - manager state is {self._manager_state.value}")
                 ack = JobAck(
                     job_id=submission.job_id,
                     accepted=False,
@@ -6779,6 +6834,9 @@ class ManagerServer(HealthAwareServer):
             return ack.dump()
             
         except Exception as e:
+            import traceback
+            print(f"[DEBUG][Manager] job_submission EXCEPTION: {e}")
+            print(f"[DEBUG][Manager] Traceback:\n{traceback.format_exc()}")
             await self.handle_exception(e, "job_submission")
             ack = JobAck(
                 job_id="unknown",
@@ -6862,6 +6920,9 @@ class ManagerServer(HealthAwareServer):
                 self._increment_version()
 
         except Exception as e:
+            import traceback
+            print(f"[DEBUG][Manager] _dispatch_job_workflows EXCEPTION: {e}")
+            print(f"[DEBUG][Manager] Traceback:\n{traceback.format_exc()}")
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(
@@ -6873,6 +6934,7 @@ class ManagerServer(HealthAwareServer):
             )
             job = self._job_manager.get_job_by_id(submission.job_id)
             if job:
+                print(f"[DEBUG][Manager] Setting job {submission.job_id} status to FAILED due to exception")
                 job.status = JobStatus.FAILED.value
             self._increment_version()
 
