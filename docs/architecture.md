@@ -9907,7 +9907,7 @@ await runner.run(
 |------|---------|
 | `hyperscale/core/jobs/runner/local_runner.py` | LocalRunner entry point |
 | `hyperscale/core/jobs/runner/local_server_pool.py` | Worker subprocess pool |
-| `hyperscale/core/jobs/graphs/remote_graph_manager_rewrite.py` | Workflow dispatch |
+| `hyperscale/core/jobs/graphs/remote_graph_manager.py` | Workflow dispatch |
 
 ---
 
@@ -10669,3 +10669,547 @@ git branch --show-current  # AL-distributed-wip
 
 See the main project LICENSE file.
 
+
+---
+
+## Time-Windowed Streaming Stats System
+
+### Overview
+
+The streaming stats system provides real-time progress updates from workers to clients while:
+1. **Correlating stats across workers by time** - Stats from different workers within the same time window are aggregated together
+2. **Preventing client spam** - One aggregated push per window interval instead of per-worker updates
+3. **Bounding memory usage** - Windows are cleared after each push cycle
+4. **Supporting hierarchical aggregation** - Manager aggregates for direct clients; Gate aggregates across DCs
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    TIME-WINDOWED STATS FLOW                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Workers (rapid updates ~1s)                                                │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐                        │
+│  │Worker 1 │  │Worker 2 │  │Worker 3 │  │Worker N │                        │
+│  │ t=0.1s  │  │ t=0.15s │  │ t=0.12s │  │ t=0.18s │  ← collected_at        │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘    (Unix timestamp)    │
+│       │            │            │            │                              │
+│       └────────────┴─────┬──────┴────────────┘                              │
+│                          ▼                                                  │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │                    MANAGER - WindowedStatsCollector                   │  │
+│  ├───────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                       │  │
+│  │  Time Windows (100ms buckets):                                        │  │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                   │  │
+│  │  │ Window T=0  │  │ Window T=1  │  │ Window T=2  │  ...              │  │
+│  │  │ [0ms-100ms) │  │[100ms-200ms)│  │[200ms-300ms)│                   │  │
+│  │  │             │  │             │  │             │                   │  │
+│  │  │ Worker1 ──┐ │  │ Worker2 ──┐ │  │ Worker1 ──┐ │                   │  │
+│  │  │ Worker3 ──┼─│  │ Worker4 ──┼─│  │ Worker2 ──┼─│                   │  │
+│  │  │ Worker2 ──┘ │  │ Worker1 ──┘ │  │ Worker3 ──┘ │                   │  │
+│  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                   │  │
+│  │         │                │                │                           │  │
+│  │         ▼                ▼                ▼                           │  │
+│  │    [aggregate]      [aggregate]      [aggregate]                      │  │
+│  │         │                │                │                           │  │
+│  │         └────────────────┼────────────────┘                           │  │
+│  │                          │                                            │  │
+│  │  Flush Timer (100ms)     │                                            │  │
+│  │  ────────────────────────┼──────────────────────────────              │  │
+│  │                          ▼                                            │  │
+│  │              ┌───────────────────────┐                                │  │
+│  │              │  Closed windows only  │                                │  │
+│  │              │  (T < current - drift)│                                │  │
+│  │              └───────────┬───────────┘                                │  │
+│  │                          │                                            │  │
+│  └──────────────────────────┼────────────────────────────────────────────┘  │
+│                             │                                               │
+│          ┌──────────────────┴──────────────────┐                           │
+│          │                                     │                           │
+│          ▼                                     ▼                           │
+│  ┌───────────────────┐               ┌─────────────────────┐               │
+│  │  Direct Client    │               │       Gate          │               │
+│  │  (aggregated)     │               │   (unaggregated)    │               │
+│  │                   │               │                     │               │
+│  │  WindowedStatsPush│               │  WindowedStatsPush  │               │
+│  │  - window_start   │               │  - window_start     │               │
+│  │  - window_end     │               │  - window_end       │               │
+│  │  - aggregated:    │               │  - per_worker:      │               │
+│  │    completed,     │               │    [{worker_id,     │               │
+│  │    failed,        │               │      completed,     │               │
+│  │    rate,          │               │      failed, ...}]  │               │
+│  │    step_stats     │               │                     │               │
+│  └───────────────────┘               └──────────┬──────────┘               │
+│                                                 │                          │
+│                                                 ▼                          │
+│                                      ┌─────────────────────┐               │
+│                                      │  Gate Aggregation   │               │
+│                                      │  (same windowing)   │               │
+│                                      │                     │               │
+│                                      │  Correlates windows │               │
+│                                      │  across DCs         │               │
+│                                      └──────────┬──────────┘               │
+│                                                 │                          │
+│                                                 ▼                          │
+│                                      ┌─────────────────────┐               │
+│                                      │      Client         │               │
+│                                      │   (aggregated)      │               │
+│                                      └─────────────────────┘               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Time Window Bucketing
+
+Stats are bucketed by their `collected_at` Unix timestamp into discrete windows:
+
+```python
+WINDOW_SIZE_MS = 100  # 100ms windows
+DRIFT_TOLERANCE_MS = 50  # Allow 50ms clock drift between workers
+
+def get_window_bucket(collected_at: float) -> int:
+    """Convert Unix timestamp to window bucket number."""
+    return int(collected_at * 1000 / WINDOW_SIZE_MS)
+
+def is_window_closed(bucket: int, now: float) -> bool:
+    """Check if a window can be flushed (all expected stats have arrived)."""
+    window_end_ms = (bucket + 1) * WINDOW_SIZE_MS
+    current_ms = now * 1000
+    # Window is closed when current time exceeds window_end + drift tolerance
+    return current_ms > window_end_ms + DRIFT_TOLERANCE_MS
+```
+
+### WindowedStatsCollector Class
+
+Located at `hyperscale/distributed_rewrite/jobs/windowed_stats_collector.py`:
+
+```python
+@dataclass
+class WindowBucket:
+    """Stats collected within a single time window."""
+    window_start: float  # Unix timestamp of window start
+    window_end: float    # Unix timestamp of window end
+    job_id: str
+    workflow_id: str
+    worker_stats: dict[str, WorkflowProgress]  # worker_id -> progress
+    created_at: float    # When this bucket was created (for cleanup)
+
+class WindowedStatsCollector:
+    """
+    Collects workflow progress updates into time-correlated windows.
+    
+    Thread-safe for concurrent progress updates from multiple workers.
+    """
+    
+    def __init__(
+        self,
+        window_size_ms: float = 100.0,
+        drift_tolerance_ms: float = 50.0,
+        max_window_age_ms: float = 5000.0,  # Cleanup windows older than 5s
+    ):
+        self._window_size_ms = window_size_ms
+        self._drift_tolerance_ms = drift_tolerance_ms
+        self._max_window_age_ms = max_window_age_ms
+        
+        # Buckets indexed by (job_id, workflow_id, bucket_number)
+        self._buckets: dict[tuple[str, str, int], WindowBucket] = {}
+        self._lock = asyncio.Lock()
+    
+    async def add_progress(
+        self,
+        worker_id: str,
+        progress: WorkflowProgress,
+    ) -> None:
+        """Add a progress update to the appropriate time window."""
+        bucket_num = self._get_bucket_number(progress.collected_at)
+        key = (progress.job_id, progress.workflow_id, bucket_num)
+        
+        async with self._lock:
+            if key not in self._buckets:
+                self._buckets[key] = WindowBucket(
+                    window_start=bucket_num * self._window_size_ms / 1000,
+                    window_end=(bucket_num + 1) * self._window_size_ms / 1000,
+                    job_id=progress.job_id,
+                    workflow_id=progress.workflow_id,
+                    worker_stats={},
+                    created_at=time.time(),
+                )
+            
+            self._buckets[key].worker_stats[worker_id] = progress
+    
+    async def flush_closed_windows(
+        self,
+        aggregate: bool = True,
+    ) -> list[WindowedStatsPush]:
+        """
+        Flush all closed windows and return them for pushing.
+        
+        Args:
+            aggregate: If True, aggregate stats within window.
+                      If False, return per-worker stats (for Gate forwarding).
+        
+        Returns:
+            List of WindowedStatsPush messages ready for client/gate.
+        """
+        now = time.time()
+        results = []
+        keys_to_remove = []
+        
+        async with self._lock:
+            for key, bucket in self._buckets.items():
+                _, _, bucket_num = key
+                
+                if self._is_window_closed(bucket_num, now):
+                    if aggregate:
+                        push = self._aggregate_bucket(bucket)
+                    else:
+                        push = self._unaggregated_bucket(bucket)
+                    results.append(push)
+                    keys_to_remove.append(key)
+                
+                # Also cleanup very old windows (missed or stuck)
+                elif (now - bucket.created_at) * 1000 > self._max_window_age_ms:
+                    keys_to_remove.append(key)
+            
+            for key in keys_to_remove:
+                del self._buckets[key]
+        
+        return results
+    
+    def _aggregate_bucket(self, bucket: WindowBucket) -> WindowedStatsPush:
+        """Aggregate all worker stats in a bucket into single stats."""
+        total_completed = 0
+        total_failed = 0
+        total_rate = 0.0
+        step_stats_by_name: dict[str, StepStats] = {}
+        
+        for progress in bucket.worker_stats.values():
+            total_completed += progress.completed_count
+            total_failed += progress.failed_count
+            total_rate += progress.rate_per_second
+            
+            for step in progress.step_stats:
+                if step.step_name in step_stats_by_name:
+                    existing = step_stats_by_name[step.step_name]
+                    step_stats_by_name[step.step_name] = StepStats(
+                        step_name=step.step_name,
+                        completed_count=existing.completed_count + step.completed_count,
+                        failed_count=existing.failed_count + step.failed_count,
+                        total_count=existing.total_count + step.total_count,
+                    )
+                else:
+                    step_stats_by_name[step.step_name] = step
+        
+        return WindowedStatsPush(
+            job_id=bucket.job_id,
+            workflow_id=bucket.workflow_id,
+            window_start=bucket.window_start,
+            window_end=bucket.window_end,
+            completed_count=total_completed,
+            failed_count=total_failed,
+            rate_per_second=total_rate,
+            step_stats=list(step_stats_by_name.values()),
+            worker_count=len(bucket.worker_stats),
+            is_aggregated=True,
+        )
+```
+
+### Message Types
+
+```python
+@dataclass(slots=True)
+class WindowedStatsPush(Message):
+    """
+    Time-windowed stats push to client or gate.
+    
+    When is_aggregated=True (for clients):
+        - Contains aggregated stats across all workers in window
+        - step_stats are merged by step name
+        
+    When is_aggregated=False (for gates):
+        - per_worker_stats contains individual worker progress
+        - Gate performs its own aggregation across DCs
+    """
+    job_id: str
+    workflow_id: str
+    workflow_name: str = ""
+    window_start: float = 0.0  # Unix timestamp
+    window_end: float = 0.0    # Unix timestamp
+    
+    # Aggregated stats (when is_aggregated=True)
+    completed_count: int = 0
+    failed_count: int = 0
+    rate_per_second: float = 0.0
+    step_stats: list[StepStats] = field(default_factory=list)
+    worker_count: int = 0
+    
+    # Per-worker stats (when is_aggregated=False, for gate forwarding)
+    per_worker_stats: list[WorkerWindowStats] = field(default_factory=list)
+    
+    is_aggregated: bool = True
+    datacenter: str = ""  # Set by manager when forwarding to gate
+
+
+@dataclass(slots=True)
+class WorkerWindowStats(Message):
+    """Individual worker stats within a time window."""
+    worker_id: str
+    completed_count: int = 0
+    failed_count: int = 0
+    rate_per_second: float = 0.0
+    step_stats: list[StepStats] = field(default_factory=list)
+```
+
+### Manager Integration
+
+The Manager integrates the WindowedStatsCollector into its workflow progress handling:
+
+```python
+class ManagerServer:
+    def __init__(self, ...):
+        ...
+        # Windowed stats for streaming to clients
+        self._windowed_stats = WindowedStatsCollector(
+            window_size_ms=env.STATS_WINDOW_SIZE_MS,      # Default: 100ms
+            drift_tolerance_ms=env.STATS_DRIFT_TOLERANCE_MS,  # Default: 50ms
+        )
+        
+    async def workflow_progress(self, addr, data, clock_time):
+        """Handle workflow progress update from worker."""
+        progress = WorkflowProgress.load(data)
+        
+        # Add to windowed collector for streaming
+        worker_id = self._resolve_worker_id_from_addr(addr)
+        await self._windowed_stats.add_progress(worker_id, progress)
+        
+        # ... existing progress handling ...
+    
+    async def _windowed_stats_push_loop(self):
+        """Background loop to flush and push windowed stats."""
+        interval = self._env.STATS_PUSH_INTERVAL  # Default: 100ms
+        
+        while self._running:
+            await asyncio.sleep(interval / 1000)
+            
+            # Determine if we're pushing to clients or gates
+            has_gates = bool(self._gate_addrs or self._known_gates)
+            
+            # Flush closed windows
+            pushes = await self._windowed_stats.flush_closed_windows(
+                aggregate=not has_gates  # Aggregate for clients, not for gates
+            )
+            
+            if not pushes:
+                continue
+            
+            if has_gates:
+                # Forward unaggregated to gates
+                for push in pushes:
+                    push.datacenter = self._node_id.datacenter
+                    await self._forward_stats_to_gates(push)
+            else:
+                # Push aggregated to clients
+                for push in pushes:
+                    await self._push_stats_to_client(push)
+```
+
+### Gate Integration
+
+Gates receive unaggregated windowed stats from managers and perform cross-DC aggregation:
+
+```python
+class GateServer:
+    def __init__(self, ...):
+        ...
+        # Collect stats from all DCs for cross-DC aggregation
+        self._dc_windowed_stats: dict[str, WindowedStatsCollector] = {}
+        
+    @tcp.receive()
+    async def windowed_stats_push(self, addr, data, clock_time):
+        """Receive windowed stats from a manager."""
+        push = WindowedStatsPush.load(data)
+        
+        # Store in per-DC collector
+        dc_id = push.datacenter
+        if dc_id not in self._dc_windowed_stats:
+            self._dc_windowed_stats[dc_id] = WindowedStatsCollector()
+        
+        # Re-add each worker's stats to preserve window alignment
+        for worker_stats in push.per_worker_stats:
+            # Create a synthetic progress for the collector
+            progress = WorkflowProgress(
+                job_id=push.job_id,
+                workflow_id=push.workflow_id,
+                collected_at=push.window_start,  # Use window start for alignment
+                completed_count=worker_stats.completed_count,
+                ...
+            )
+            await self._dc_windowed_stats[dc_id].add_progress(
+                f"{dc_id}:{worker_stats.worker_id}",
+                progress,
+            )
+        
+        return b'ok'
+    
+    async def _gate_windowed_stats_push_loop(self):
+        """Aggregate across DCs and push to clients."""
+        interval = self._env.STATS_PUSH_INTERVAL
+        
+        while self._running:
+            await asyncio.sleep(interval / 1000)
+            
+            # Collect and aggregate from all DCs
+            all_pushes: dict[tuple[str, str, float], list[WindowedStatsPush]] = {}
+            
+            for dc_id, collector in self._dc_windowed_stats.items():
+                pushes = await collector.flush_closed_windows(aggregate=True)
+                for push in pushes:
+                    key = (push.job_id, push.workflow_id, push.window_start)
+                    if key not in all_pushes:
+                        all_pushes[key] = []
+                    all_pushes[key].append(push)
+            
+            # Aggregate same-window stats across DCs
+            for key, dc_pushes in all_pushes.items():
+                aggregated = self._aggregate_dc_pushes(dc_pushes)
+                await self._push_stats_to_client(aggregated)
+```
+
+### Client Integration
+
+The client receives windowed stats via a new `on_progress_update` callback:
+
+```python
+class HyperscaleClient:
+    async def submit_job(
+        self,
+        workflows: list[type],
+        ...
+        on_status_update: Callable[[JobStatusPush], None] | None = None,
+        on_progress_update: Callable[[WindowedStatsPush], None] | None = None,  # NEW
+        on_workflow_result: Callable[[WorkflowResultPush], None] | None = None,
+        ...
+    ) -> str:
+        """
+        Submit a job for execution.
+        
+        Args:
+            ...
+            on_status_update: Callback for job status changes (started, completed, failed)
+            on_progress_update: Callback for streaming progress stats (time-windowed)
+            on_workflow_result: Callback for workflow completion results
+        """
+        ...
+        if on_progress_update:
+            self._progress_callbacks[job_id] = on_progress_update
+    
+    @tcp.receive()
+    async def windowed_stats_push(self, addr, data, clock_time):
+        """Handle windowed stats push from manager/gate."""
+        push = WindowedStatsPush.load(data)
+        
+        callback = self._progress_callbacks.get(push.job_id)
+        if callback:
+            try:
+                callback(push)
+            except Exception:
+                pass
+        
+        return b'ok'
+```
+
+### Client Rate Limiting (Stats Updates Only)
+
+The client applies rate limiting specifically to `windowed_stats_push` to prevent overwhelming the callback:
+
+```python
+class HyperscaleClient:
+    def __init__(self, ...):
+        ...
+        # Rate limit for progress updates (stats streaming)
+        self._progress_rate_limit = RateLimiter(
+            max_per_second=env.CLIENT_PROGRESS_RATE_LIMIT,  # Default: 20/sec
+            burst=env.CLIENT_PROGRESS_BURST,  # Default: 5
+        )
+    
+    @tcp.receive()
+    async def windowed_stats_push(self, addr, data, clock_time):
+        """Handle windowed stats push with rate limiting."""
+        # Apply rate limiting - drop if over limit
+        if not self._progress_rate_limit.try_acquire():
+            return b'rate_limited'
+        
+        push = WindowedStatsPush.load(data)
+        
+        callback = self._progress_callbacks.get(push.job_id)
+        if callback:
+            try:
+                callback(push)
+            except Exception:
+                pass
+        
+        return b'ok'
+```
+
+### Configuration
+
+New environment variables in `Env`:
+
+```python
+# Stats windowing
+STATS_WINDOW_SIZE_MS: float = 100.0        # Window bucket size
+STATS_DRIFT_TOLERANCE_MS: float = 50.0     # Clock drift tolerance
+STATS_PUSH_INTERVAL: float = 100.0         # How often to flush windows (ms)
+
+# Client rate limiting (progress updates only)
+CLIENT_PROGRESS_RATE_LIMIT: float = 20.0   # Max progress callbacks per second
+CLIENT_PROGRESS_BURST: int = 5             # Burst allowance
+```
+
+### Memory Management
+
+Windows are automatically cleaned up:
+
+1. **On flush**: Closed windows are removed after being pushed
+2. **Age-based cleanup**: Windows older than `max_window_age_ms` (default 5s) are dropped
+3. **Job completion**: All windows for a job are cleared when job completes
+
+```python
+async def cleanup_job_windows(self, job_id: str) -> None:
+    """Remove all windows for a completed job."""
+    async with self._lock:
+        keys_to_remove = [
+            key for key in self._buckets.keys()
+            if key[0] == job_id
+        ]
+        for key in keys_to_remove:
+            del self._buckets[key]
+```
+
+### Sequence Diagram
+
+```
+Worker1     Worker2     Manager           Gate           Client
+   │           │           │                │               │
+   │──progress─▶│          │                │               │
+   │  t=0.12s  │──progress─▶                │               │
+   │           │  t=0.15s  │                │               │
+   │           │           │                │               │
+   │           │      [bucket 0: W1, W2]    │               │
+   │           │           │                │               │
+   │           │      (100ms flush timer)   │               │
+   │           │           │                │               │
+   │           │      [window closed]       │               │
+   │           │           │                │               │
+   │           │           │──(unaggregated)─▶              │
+   │           │           │  WindowedStats  │              │
+   │           │           │                │              │
+   │           │           │                │──(aggregated)─▶
+   │           │           │                │ WindowedStats │
+   │           │           │                │               │
+   │           │           │                │     [callback]│
+```
+
+---
