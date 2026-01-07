@@ -458,8 +458,6 @@ class Terminal:
         except Exception:
             pass
 
-        await self._clear_terminal(force=True)
-
     async def resume(self):
         try:
             self._start_time = time.time()
