@@ -264,7 +264,9 @@ class HealthGossipBuffer:
         # Enforce capacity limit
         if health.node_id not in self._entries:
             if len(self._entries) >= self.config.max_entries:
-                self._evict_least_important()
+                # Only evict enough to make room (evict 10% or at least 1)
+                evict_count = max(1, self.config.max_entries // 10)
+                self._evict_least_important(count=evict_count)
 
         # Calculate max broadcasts based on severity
         severity = _OVERLOAD_STATE_TO_SEVERITY.get(

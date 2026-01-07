@@ -246,11 +246,20 @@ class CrossDCCorrelationDetector:
         failure_fraction = failure_count / known_dc_count
 
         # Determine severity based on thresholds
+        # Priority: HIGH requires BOTH fraction threshold AND medium count threshold
+        # This prevents false positives when few DCs exist but most fail
+        # For global distributed systems, we need enough failing DCs to be significant
         severity: CorrelationSeverity
         reason: str
         recommendation: str
 
-        if failure_fraction >= self._config.high_threshold_fraction:
+        # HIGH: Both fraction AND count must be significant
+        # Rationale: A global network partition affects many DCs simultaneously
+        # We need at least medium_threshold failures to confirm it's not coincidence
+        is_high_fraction = failure_fraction >= self._config.high_threshold_fraction
+        is_medium_count = failure_count >= self._config.medium_threshold
+
+        if is_high_fraction and is_medium_count:
             severity = CorrelationSeverity.HIGH
             reason = (
                 f"{failure_count}/{known_dc_count} DCs ({failure_fraction:.0%}) "
@@ -264,6 +273,7 @@ class CrossDCCorrelationDetector:
             self._correlation_events_detected += 1
 
         elif failure_count >= self._config.medium_threshold:
+            # MEDIUM: Count-based threshold met, but fraction not critical
             severity = CorrelationSeverity.MEDIUM
             reason = (
                 f"{failure_count} DCs failing within "
@@ -277,6 +287,7 @@ class CrossDCCorrelationDetector:
             self._correlation_events_detected += 1
 
         elif failure_count >= self._config.low_threshold:
+            # LOW: Some correlation, warrants attention but not blocking
             severity = CorrelationSeverity.LOW
             reason = (
                 f"{failure_count} DCs failing within "

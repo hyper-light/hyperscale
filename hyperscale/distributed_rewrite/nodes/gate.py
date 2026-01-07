@@ -118,7 +118,6 @@ from hyperscale.distributed_rewrite.datacenters import (
     ManagerDispatcher,
     LeaseManager,
     CrossDCCorrelationDetector,
-    CrossDCCorrelationConfig,
     CorrelationSeverity,
 )
 from hyperscale.distributed_rewrite.env import Env
@@ -323,14 +322,9 @@ class GateServer(HealthAwareServer):
         # Cross-DC correlation detector for eviction decisions (Phase 7)
         # Prevents cascade evictions when multiple DCs fail simultaneously
         # (likely network partition, not actual DC failures)
+        # Configuration is user-configurable via Env
         self._cross_dc_correlation = CrossDCCorrelationDetector(
-            config=CrossDCCorrelationConfig(
-                correlation_window_seconds=30.0,  # 30s window for correlation detection
-                low_threshold=2,  # 2+ DCs failing = LOW correlation
-                medium_threshold=3,  # 3+ DCs failing = MEDIUM correlation
-                high_threshold_fraction=0.5,  # 50%+ DCs failing = HIGH correlation
-                correlation_backoff_seconds=60.0,  # Wait 60s after correlation detected
-            )
+            config=env.get_cross_dc_correlation_config()
         )
         # Register known DCs with correlation detector
         for dc_id in self._datacenter_managers.keys():

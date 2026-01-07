@@ -259,6 +259,27 @@ class OutOfBandHealthChannel:
                     error="Timeout",
                 )
 
+            except asyncio.CancelledError:
+                # Probe was cancelled (e.g., during shutdown)
+                # Return graceful failure instead of propagating
+                return OOBProbeResult(
+                    target=target,
+                    success=False,
+                    is_overloaded=False,
+                    latency_ms=(time.monotonic() - start_time) * 1000,
+                    error="Cancelled",
+                )
+
+        except asyncio.CancelledError:
+            # Cancelled during send - graceful failure
+            return OOBProbeResult(
+                target=target,
+                success=False,
+                is_overloaded=False,
+                latency_ms=(time.monotonic() - start_time) * 1000,
+                error="Cancelled",
+            )
+
         except Exception as e:
             return OOBProbeResult(
                 target=target,

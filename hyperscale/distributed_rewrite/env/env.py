@@ -169,6 +169,17 @@ class Env(BaseModel):
     EXTENSION_MAX_EXTENSIONS: StrictInt = 5  # Maximum extensions per cycle
     EXTENSION_EVICTION_THRESHOLD: StrictInt = 3  # Failures before eviction
 
+    # ==========================================================================
+    # Cross-DC Correlation Settings (Phase 7)
+    # ==========================================================================
+    # These settings control correlation detection for cascade eviction prevention
+    # Tuned for globally distributed datacenters with high latency
+    CROSS_DC_CORRELATION_WINDOW: StrictFloat = 30.0  # Seconds window for correlation detection
+    CROSS_DC_CORRELATION_LOW_THRESHOLD: StrictInt = 2  # Min DCs failing for LOW correlation
+    CROSS_DC_CORRELATION_MEDIUM_THRESHOLD: StrictInt = 3  # Min DCs failing for MEDIUM correlation
+    CROSS_DC_CORRELATION_HIGH_FRACTION: StrictFloat = 0.5  # Fraction of DCs for HIGH (requires medium count too)
+    CROSS_DC_CORRELATION_BACKOFF: StrictFloat = 60.0  # Backoff duration after correlation detected
+
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
@@ -287,6 +298,12 @@ class Env(BaseModel):
             "EXTENSION_MIN_GRANT": float,
             "EXTENSION_MAX_EXTENSIONS": int,
             "EXTENSION_EVICTION_THRESHOLD": int,
+            # Cross-DC correlation settings (Phase 7)
+            "CROSS_DC_CORRELATION_WINDOW": float,
+            "CROSS_DC_CORRELATION_LOW_THRESHOLD": int,
+            "CROSS_DC_CORRELATION_MEDIUM_THRESHOLD": int,
+            "CROSS_DC_CORRELATION_HIGH_FRACTION": float,
+            "CROSS_DC_CORRELATION_BACKOFF": float,
         }
     
     def get_swim_init_context(self) -> dict:
@@ -499,4 +516,29 @@ class Env(BaseModel):
             base_deadline=self.EXTENSION_BASE_DEADLINE,
             min_grant=self.EXTENSION_MIN_GRANT,
             max_extensions=self.EXTENSION_MAX_EXTENSIONS,
+        )
+
+    def get_cross_dc_correlation_config(self):
+        """
+        Get cross-DC correlation configuration (Phase 7).
+
+        Controls cascade eviction prevention when multiple DCs fail
+        simultaneously (likely network partition, not actual DC failures).
+
+        HIGH correlation requires BOTH:
+        - Fraction of DCs >= high_threshold_fraction
+        - Count of DCs >= medium_threshold
+
+        This prevents false positives with few DCs.
+        """
+        from hyperscale.distributed_rewrite.datacenters.cross_dc_correlation import (
+            CrossDCCorrelationConfig,
+        )
+
+        return CrossDCCorrelationConfig(
+            correlation_window_seconds=self.CROSS_DC_CORRELATION_WINDOW,
+            low_threshold=self.CROSS_DC_CORRELATION_LOW_THRESHOLD,
+            medium_threshold=self.CROSS_DC_CORRELATION_MEDIUM_THRESHOLD,
+            high_threshold_fraction=self.CROSS_DC_CORRELATION_HIGH_FRACTION,
+            correlation_backoff_seconds=self.CROSS_DC_CORRELATION_BACKOFF,
         )
