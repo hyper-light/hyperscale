@@ -594,17 +594,17 @@ class Terminal:
         )
 
     async def _handle_keyboard_interrupt(self):
-        """Handle keyboard interrupt by aborting the terminal and re-raising."""
+        """Handle keyboard interrupt by aborting the terminal and re-sending SIGINT."""
         try:
             await self.abort()
         except Exception:
             pass
 
-        # Restore the default SIGINT handler and re-raise KeyboardInterrupt
+        # Restore the default SIGINT handler
         if signal.SIGINT in self._dfl_sigmap:
             original_handler = self._dfl_sigmap[signal.SIGINT]
             if original_handler is not None:
                 signal.signal(signal.SIGINT, original_handler)
 
-        # Re-raise KeyboardInterrupt so the application can handle it
-        raise KeyboardInterrupt()
+        # Re-send SIGINT to ourselves so the signal propagates correctly
+        os.kill(os.getpid(), signal.SIGINT)
