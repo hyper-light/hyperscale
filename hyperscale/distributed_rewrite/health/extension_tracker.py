@@ -30,31 +30,44 @@ class ExtensionTracker:
     Extensions require progress since the last extension to be granted.
     This prevents stuck workers from getting unlimited extensions.
 
+    Graceful Exhaustion:
+    - When remaining extensions hit warning_threshold, sends warning
+    - After exhaustion, grace_period gives final time before eviction
+    - Allows workflows to checkpoint/save before being killed
+
     Attributes:
         worker_id: Unique identifier for the worker being tracked.
         base_deadline: Base deadline in seconds (default 30.0).
         min_grant: Minimum extension grant in seconds (default 1.0).
         max_extensions: Maximum number of extensions allowed (default 5).
+        warning_threshold: Remaining extensions count to trigger warning (default 1).
+        grace_period: Seconds of grace after exhaustion before kill (default 10.0).
         extension_count: Number of extensions granted so far.
         last_progress: Progress value at last extension (for comparison).
         total_extended: Total seconds extended so far.
         last_extension_time: Timestamp of last extension grant.
+        exhaustion_time: Timestamp when extensions were exhausted (None if not exhausted).
+        warning_sent: Whether exhaustion warning has been sent.
     """
 
     worker_id: str
     base_deadline: float = 30.0
     min_grant: float = 1.0
     max_extensions: int = 5
+    warning_threshold: int = 1
+    grace_period: float = 10.0
     extension_count: int = 0
     last_progress: float = 0.0
     total_extended: float = 0.0
     last_extension_time: float = field(default_factory=time.monotonic)
+    exhaustion_time: float | None = None
+    warning_sent: bool = False
 
     def request_extension(
         self,
         reason: str,
         current_progress: float,
-    ) -> tuple[bool, float, str | None]:
+    ) -> tuple[bool, float, str | None, bool]:
         """
         Request a deadline extension.
 
@@ -70,17 +83,22 @@ class ExtensionTracker:
             current_progress: Current progress metric (must increase to show progress).
 
         Returns:
-            Tuple of (granted, extension_seconds, denial_reason).
+            Tuple of (granted, extension_seconds, denial_reason, is_warning).
             - granted: True if extension was granted
             - extension_seconds: Amount of time granted (0 if denied)
             - denial_reason: Reason for denial, or None if granted
+            - is_warning: True if this is a warning about impending exhaustion
         """
         # Check max extensions
         if self.extension_count >= self.max_extensions:
+            # Track exhaustion time for grace period
+            if self.exhaustion_time is None:
+                self.exhaustion_time = time.monotonic()
             return (
                 False,
                 0.0,
                 f"Maximum extensions ({self.max_extensions}) exceeded",
+                False,
             )
 
         # Check for progress since last extension
@@ -90,6 +108,7 @@ class ExtensionTracker:
                 False,
                 0.0,
                 f"No progress since last extension (current={current_progress}, last={self.last_progress})",
+                False,
             )
 
         # Calculate extension grant with logarithmic decay
@@ -103,7 +122,13 @@ class ExtensionTracker:
         self.total_extended += grant
         self.last_extension_time = time.monotonic()
 
-        return (True, grant, None)
+        # Check if we should send a warning about impending exhaustion
+        remaining = self.get_remaining_extensions()
+        is_warning = remaining <= self.warning_threshold and not self.warning_sent
+        if is_warning:
+            self.warning_sent = True
+
+        return (True, grant, None, is_warning)
 
     def reset(self) -> None:
         """
@@ -116,6 +141,8 @@ class ExtensionTracker:
         self.last_progress = 0.0
         self.total_extended = 0.0
         self.last_extension_time = time.monotonic()
+        self.exhaustion_time = None
+        self.warning_sent = False
 
     def get_remaining_extensions(self) -> int:
         """Get the number of remaining extension requests allowed."""
@@ -139,6 +166,39 @@ class ExtensionTracker:
         """Check if all extensions have been used."""
         return self.extension_count >= self.max_extensions
 
+    @property
+    def is_in_grace_period(self) -> bool:
+        """Check if currently in grace period after exhaustion."""
+        if self.exhaustion_time is None:
+            return False
+        elapsed = time.monotonic() - self.exhaustion_time
+        return elapsed < self.grace_period
+
+    @property
+    def grace_period_remaining(self) -> float:
+        """Get seconds remaining in grace period (0 if not in grace period or expired)."""
+        if self.exhaustion_time is None:
+            return 0.0
+        elapsed = time.monotonic() - self.exhaustion_time
+        remaining = self.grace_period - elapsed
+        return max(0.0, remaining)
+
+    @property
+    def should_evict(self) -> bool:
+        """
+        Check if worker should be evicted.
+
+        Returns True if:
+        - Extensions are exhausted AND
+        - Grace period has expired
+        """
+        if not self.is_exhausted:
+            return False
+        if self.exhaustion_time is None:
+            return False
+        elapsed = time.monotonic() - self.exhaustion_time
+        return elapsed >= self.grace_period
+
 
 @dataclass(slots=True)
 class ExtensionTrackerConfig:
@@ -149,11 +209,15 @@ class ExtensionTrackerConfig:
         base_deadline: Base deadline in seconds.
         min_grant: Minimum extension grant in seconds.
         max_extensions: Maximum number of extensions allowed.
+        warning_threshold: Remaining extensions to trigger warning.
+        grace_period: Seconds of grace after exhaustion before kill.
     """
 
     base_deadline: float = 30.0
     min_grant: float = 1.0
     max_extensions: int = 5
+    warning_threshold: int = 1
+    grace_period: float = 10.0
 
     def create_tracker(self, worker_id: str) -> ExtensionTracker:
         """Create an ExtensionTracker with this configuration."""
@@ -162,4 +226,6 @@ class ExtensionTrackerConfig:
             base_deadline=self.base_deadline,
             min_grant=self.min_grant,
             max_extensions=self.max_extensions,
+            warning_threshold=self.warning_threshold,
+            grace_period=self.grace_period,
         )

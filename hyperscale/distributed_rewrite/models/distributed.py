@@ -736,6 +736,11 @@ class HealthcheckExtensionResponse(Message):
     - No progress since last extension
     - Worker is being evicted
 
+    Graceful exhaustion:
+    - is_exhaustion_warning: True when close to exhaustion (remaining <= threshold)
+    - grace_period_remaining: Seconds of grace time left after exhaustion
+    - in_grace_period: True if exhausted but still within grace period
+
     Sent from: Manager -> Worker
     """
     granted: bool                # Whether extension was granted
@@ -743,6 +748,9 @@ class HealthcheckExtensionResponse(Message):
     new_deadline: float          # New deadline timestamp (if granted)
     remaining_extensions: int    # Number of extensions remaining
     denial_reason: str | None = None  # Why extension was denied
+    is_exhaustion_warning: bool = False  # True if about to exhaust extensions
+    grace_period_remaining: float = 0.0  # Seconds of grace remaining after exhaustion
+    in_grace_period: bool = False  # True if exhausted but within grace period
 
 
 # =============================================================================

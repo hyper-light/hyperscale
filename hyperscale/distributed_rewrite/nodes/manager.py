@@ -75,11 +75,13 @@ from hyperscale.distributed_rewrite.models import (
     JobStatus,
     JobStatusPush,
     JobBatchPush,
+    ReporterResultPush,
     WorkflowDispatch,
     WorkflowDispatchAck,
     WorkflowProgress,
     WorkflowFinalResult,
     WorkflowResult,
+    WorkflowResultPush,
     WorkflowStatus,
     JobProgress,
     JobFinalResult,
@@ -140,6 +142,7 @@ from hyperscale.distributed_rewrite.protocol.version import (
 )
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 from hyperscale.reporting.results import Results
+from hyperscale.reporting.reporter import Reporter
 
 # New modular classes for job/workflow management
 from hyperscale.distributed_rewrite.jobs import (
@@ -155,6 +158,8 @@ from hyperscale.distributed_rewrite.jobs import (
     WorkflowDispatcher,
 )
 from hyperscale.distributed_rewrite.models import PendingWorkflow
+from hyperscale.distributed_rewrite.models.jobs import JobInfo
+from hyperscale.reporting.common.results_types import WorkflowStats
 
 
 class ManagerServer(HealthAwareServer):
@@ -267,8 +272,14 @@ class ManagerServer(HealthAwareServer):
         self._dead_peer_reap_interval: float = env.MANAGER_DEAD_PEER_REAP_INTERVAL
         self._dead_gate_reap_interval: float = env.MANAGER_DEAD_GATE_REAP_INTERVAL
 
+        # Orphan scan settings from config
+        self._orphan_scan_interval: float = env.ORPHAN_SCAN_INTERVAL
+        self._orphan_scan_worker_timeout: float = env.ORPHAN_SCAN_WORKER_TIMEOUT
+
         # Dead node reap loop task
         self._dead_node_reap_task: asyncio.Task | None = None
+        # Orphan workflow scanner task
+        self._orphan_scan_task: asyncio.Task | None = None
 
         # Registered workers (indexed by node_id)
         self._workers: dict[str, WorkerRegistration] = {}  # node_id -> registration
@@ -307,7 +318,12 @@ class ManagerServer(HealthAwareServer):
 
         # Job submissions for eager dispatch (need access to submission params)
         self._job_submissions: dict[str, JobSubmission] = {}  # job_id -> submission
-        
+
+        # Background reporter tasks per job
+        # Maps job_id -> dict[reporter_type -> asyncio.Task]
+        # Tasks are tracked for cleanup when job is cleaned up
+        self._job_reporter_tasks: dict[str, dict[str, asyncio.Task]] = {}
+
         # Workflow retry tracking
         # Maps workflow_id -> (retry_count, original_dispatch, failed_workers)
         self._workflow_retries: dict[str, tuple[int, bytes, set[str]]] = {}
@@ -1936,6 +1952,9 @@ class ManagerServer(HealthAwareServer):
 
         # Start background cleanup for dead nodes (workers, manager peers, gates)
         self._dead_node_reap_task = asyncio.create_task(self._dead_node_reap_loop())
+
+        # Start orphaned workflow scanner
+        self._orphan_scan_task = asyncio.create_task(self._orphan_workflow_scan_loop())
 
         # Start periodic job state sync to peer managers
         self._task_runner.run(self._peer_job_state_sync_loop)
@@ -4158,6 +4177,167 @@ class ManagerServer(HealthAwareServer):
             healthy_managers=self._get_healthy_managers(),
         )
     
+    def _parse_workflow_token(self, workflow_id: str) -> tuple[str, str] | None:
+        """
+        Parse workflow_id token to extract job_id and workflow_id components.
+
+        Format: DC:manager:job_id:workflow_id:worker_id (5 parts)
+        Returns (job_id, workflow_id) or None if invalid format.
+        """
+        parts = workflow_id.split(":")
+        if len(parts) >= 5:
+            return parts[2], parts[3]
+        return None
+
+    async def _forward_result_to_job_leader(
+        self,
+        result: WorkflowFinalResult,
+        data: bytes,
+    ) -> bytes | None:
+        """
+        Forward workflow result to job leader if we're not the leader.
+
+        Returns response bytes if forwarded, None if we should process locally.
+        """
+        if self._is_job_leader(result.job_id):
+            return None
+
+        leader_addr = self._get_job_leader_addr(result.job_id)
+        if not leader_addr:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"[workflow_final_result] Not job leader and no leader addr known for job {result.job_id}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return None  # Fall through - maybe we have the job locally
+
+        await self._udp_logger.log(
+            ServerInfo(
+                message=f"[workflow_final_result] Forwarding to job leader at {leader_addr}",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        try:
+            response, _ = await self.send_tcp(leader_addr, "workflow_final_result", data, timeout=5.0)
+            return response if response else b'ok'
+        except Exception as forward_err:
+            await self._udp_logger.log(
+                ServerError(
+                    message=f"[workflow_final_result] Failed to forward to leader: {forward_err}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return b'error'
+
+    async def _update_initial_workflow_status(self, result: WorkflowFinalResult) -> None:
+        """Update workflow status in JobManager when result first arrives."""
+        parsed = self._parse_workflow_token(result.workflow_id)
+        if not parsed:
+            return
+
+        job_id, workflow_id = parsed
+        job_info = self._job_manager.get_job_by_id(job_id)
+        if not job_info:
+            return
+
+        new_status = WorkflowStatus.COMPLETED if result.status == WorkflowStatus.COMPLETED.value else WorkflowStatus.FAILED
+        workflow_token_str = str(self._job_manager.create_workflow_token(job_id, workflow_id))
+
+        if workflow_token_str in job_info.workflows:
+            await self._job_manager.update_workflow_status(job_id, workflow_token_str, new_status)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"JobManager: Updated workflow {workflow_token_str} to status {new_status.value}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _update_worker_cores(self, result: WorkflowFinalResult) -> None:
+        """Update worker's available cores from result."""
+        if not result.worker_id or result.worker_available_cores < 0:
+            return
+
+        updated = await self._worker_pool.update_worker_cores_from_progress(
+            result.worker_id, result.worker_available_cores
+        )
+        if updated and result.worker_available_cores > 0:
+            self._cores_available_event.set()
+            if self._workflow_dispatcher:
+                self._workflow_dispatcher.signal_cores_available()
+
+    async def _handle_context_updates(self, result: WorkflowFinalResult) -> None:
+        """Handle context updates from workflow result."""
+        if not result.context_updates or len(result.context_updates) == 0:
+            return
+
+        if self._is_job_leader(result.job_id):
+            await self._apply_context_updates_from_result(result)
+        else:
+            await self._forward_context_from_result(result)
+
+    async def _notify_workflow_dispatcher(self, job_id: str, workflow_id: str, status: str) -> None:
+        """Notify workflow dispatcher of completion/failure for dependency tracking."""
+        if not self._workflow_dispatcher:
+            return
+
+        if status == WorkflowStatus.COMPLETED.value:
+            await self._workflow_dispatcher.mark_workflow_completed(job_id, workflow_id)
+            submission = self._job_submissions.get(job_id)
+            if submission:
+                await self._workflow_dispatcher.try_dispatch(job_id, submission)
+        elif status == WorkflowStatus.FAILED.value:
+            await self._workflow_dispatcher.mark_workflow_failed(job_id, workflow_id)
+
+    async def _finalize_workflow_result(self, result: WorkflowFinalResult) -> None:
+        """Handle final bookkeeping after storing workflow result."""
+        self._workflow_retries.pop(result.workflow_id, None)
+
+        completion_event = self._workflow_completion_events.get(result.workflow_id)
+        if completion_event:
+            completion_event.set()
+
+        parsed = self._parse_workflow_token(result.workflow_id)
+        if not parsed:
+            return
+
+        job_id, workflow_id = parsed
+        job = self._job_manager.get_job_by_id(job_id)
+        if not job:
+            return
+
+        workflow_token_str = str(self._job_manager.create_workflow_token(job_id, workflow_id))
+        wf_info = job.workflows.get(workflow_token_str)
+
+        if wf_info:
+            try:
+                wf_info.status = WorkflowStatus(result.status)
+                await self._udp_logger.log(
+                    ServerInfo(
+                        message=f"Updated workflow status: {workflow_id} -> {result.status}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+            except ValueError:
+                pass
+
+        if self._known_gates or self._gate_addrs:
+            self._task_runner.run(self._send_job_progress_to_gate, job)
+
+        await self._notify_workflow_dispatcher(job_id, workflow_id, result.status)
+
     @tcp.receive()
     async def workflow_final_result(
         self,
@@ -4168,204 +4348,49 @@ class ManagerServer(HealthAwareServer):
         """
         Handle workflow final result from worker.
 
-        This is the critical path for workflow completion:
-        1. Store the final result
-        2. Process context updates for dependent workflows
-        3. Check job completion
-        4. Forward to gates or clients if appropriate
-
-        Multi-worker dispatch: When a workflow is split across multiple workers,
-        each worker sends a final result with a sub-workflow ID. We aggregate
-        these using Results.merge_results() when all sub-workflows complete.
+        Orchestrates the workflow completion flow:
+        1. Forward to job leader if needed
+        2. Update workflow status
+        3. Process context updates
+        4. Handle sub-workflow aggregation
+        5. Check job completion
         """
         try:
             result = WorkflowFinalResult.load(data)
 
-            # =================================================================
             # Forward to job leader if we're not the leader
-            # =================================================================
-            # The job state (workflows, sub-workflows) only exists on the job leader.
-            # If a worker sends a result to the wrong manager, forward it.
-            if not self._is_job_leader(result.job_id):
-                leader_addr = self._get_job_leader_addr(result.job_id)
-                if leader_addr:
-                    await self._udp_logger.log(
-                        ServerInfo(
-                            message=f"[workflow_final_result] Forwarding to job leader at {leader_addr} (we are not leader for job {result.job_id})",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    try:
-                        response, _ = await self.send_tcp(
-                            leader_addr,
-                            "workflow_final_result",
-                            data,  # Forward the raw data
-                            timeout=5.0,
-                        )
-                        return response if response else b'ok'
-                    except Exception as forward_err:
-                        await self._udp_logger.log(
-                            ServerError(
-                                message=f"[workflow_final_result] Failed to forward to leader: {forward_err}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
-                        return b'error'
-                else:
-                    await self._udp_logger.log(
-                        ServerError(
-                            message=f"[workflow_final_result] Not job leader and no leader addr known for job {result.job_id}",
-                            node_host=self._host,
-                            node_port=self._tcp_port,
-                            node_id=self._node_id.short,
-                        )
-                    )
-                    # Fall through - maybe we have the job locally anyway
+            forward_response = await self._forward_result_to_job_leader(result, data)
+            if forward_response is not None:
+                return forward_response
 
-            # =================================================================
-            # Record result in JobManager (new system)
-            # =================================================================
-            # Parse the workflow_id to extract job_id and workflow components
-            # Format: DC:manager:job_id:workflow_id:worker_id (5 parts)
-            parts = result.workflow_id.split(":")
-            if len(parts) >= 5:
-                jm_job_id = parts[2]  # job_id is the 3rd component
-                jm_workflow_id = parts[3]  # workflow_id is the 4th component (e.g., "wf-0001")
-                # Try to find the workflow in JobManager by job_id
-                # Note: Use get_job_by_id(), not get_job() - the latter expects a full token string
-                job_info = self._job_manager.get_job_by_id(jm_job_id)
-                if job_info:
-                    # Determine status based on result status
-                    new_status = WorkflowStatus.COMPLETED if result.status == WorkflowStatus.COMPLETED.value else WorkflowStatus.FAILED
+            # Update initial workflow status
+            await self._update_initial_workflow_status(result)
 
-                    # Find matching workflow by workflow_id (parts[3] is workflow_id like "wf-0001")
-                    workflow_token_str = str(self._job_manager.create_workflow_token(jm_job_id, jm_workflow_id))
-                    wf_info = job_info.workflows.get(workflow_token_str)
-                    if wf_info:
-                        await self._job_manager.update_workflow_status(
-                            jm_job_id, workflow_token_str, new_status
-                        )
-                        self._task_runner.run(
-                            self._udp_logger.log,
-                            ServerDebug(
-                                message=f"JobManager: Updated workflow {workflow_token_str} to status {new_status.value}",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
-                        )
-
-            # Check if this is a sub-workflow (dispatched to multiple workers)
+            # Process under lock for sub-workflow coordination
             parent_workflow_id = self._get_parent_workflow_id(result.workflow_id)
-
-            # Use try/finally to ensure lock is always released
-            # This prevents lock leaks from early returns
             await self._workflow_results_locks[parent_workflow_id].acquire()
-            try:
-                # Update worker's available cores via WorkerPool
-                if result.worker_id and result.worker_available_cores >= 0:
-                    updated = await self._worker_pool.update_worker_cores_from_progress(
-                        result.worker_id, result.worker_available_cores
-                    )
-                    if updated and result.worker_available_cores > 0:
-                        self._cores_available_event.set()
-                        if self._workflow_dispatcher:
-                            self._workflow_dispatcher.signal_cores_available()
 
-                # Store final result in JobManager first
+            try:
+                await self._update_worker_cores(result)
+
                 recorded, _ = await self._job_manager.record_sub_workflow_result(result.workflow_id, result)
                 if not recorded:
                     return b'error'
 
+                # Handle sub-workflow completion
                 if parent_workflow_id is not None:
-                    # This is a sub-workflow - check if parent is complete
+                    await self._handle_context_updates(result)
 
-                    # Handle context updates from sub-workflow
-                    if result.context_updates and len(result.context_updates) > 0:
-                        if self._is_job_leader(result.job_id):
-                            await self._apply_context_updates_from_result(result)
-                        else:
-                            await self._forward_context_from_result(result)
-
-                    # Check if all sub-workflows have completed
                     if not self._is_parent_workflow_complete(parent_workflow_id):
-                        # More sub-workflows pending - just ack
                         return b'ok'
 
-                # Handle context updates (for dependent workflows) - only for non-sub-workflows
-                # Sub-workflows already had context applied above
-                if parent_workflow_id is None and result.context_updates and len(result.context_updates) > 0:
-                    if self._is_job_leader(result.job_id):
-                        # We are job leader - apply context directly
-                        await self._apply_context_updates_from_result(result)
-                    else:
-                        # Forward context to job leader
-                        await self._forward_context_from_result(result)
+                    await self._handle_workflow_completion(result.job_id, parent_workflow_id)
+                else:
+                    # Non-sub-workflow context updates
+                    await self._handle_context_updates(result)
 
-                # Clean up retry tracking on any final result
-                self._workflow_retries.pop(result.workflow_id, None)
+                await self._finalize_workflow_result(result)
 
-                # Signal completion for dependency tracking
-                completion_event = self._workflow_completion_events.get(result.workflow_id)
-                if completion_event:
-                    completion_event.set()
-
-                # Update job progress status via JobManager
-                # Parse the workflow_id from the sub-workflow token
-                parts = result.workflow_id.split(":")
-                if len(parts) >= 5:
-                    jm_job_id = parts[2]  # job_id is the 3rd component
-                    jm_workflow_id = parts[3]  # workflow_id is the 4th component (e.g., "wf-0001")
-
-                    job = self._job_manager.get_job_by_id(jm_job_id)
-                    if job:
-                        # Find workflow by constructing the proper token
-                        workflow_token_str = str(self._job_manager.create_workflow_token(jm_job_id, jm_workflow_id))
-                        wf_info = job.workflows.get(workflow_token_str)
-                        if wf_info:
-                            # Convert result status to WorkflowStatus
-                            try:
-                                new_status = WorkflowStatus(result.status)
-                                wf_info.status = new_status
-                                await self._udp_logger.log(
-                                    ServerInfo(
-                                        message=f"Updated workflow status: {jm_workflow_id} -> {result.status}",
-                                        node_host=self._host,
-                                        node_port=self._tcp_port,
-                                        node_id=self._node_id.short,
-                                    )
-                                )
-                            except ValueError:
-                                pass  # Invalid status, keep current
-
-                        # Forward to gates (if connected)
-                        if self._known_gates or self._gate_addrs:
-                            self._task_runner.run(self._send_job_progress_to_gate, job)
-
-                        # Notify WorkflowDispatcher of completion/failure for dependency tracking
-                        if self._workflow_dispatcher:
-                            if result.status == WorkflowStatus.COMPLETED.value:
-                                # Workflow completed successfully - notify dependents
-                                await self._workflow_dispatcher.mark_workflow_completed(
-                                    jm_job_id, jm_workflow_id
-                                )
-                                # Try to dispatch newly ready workflows
-                                submission = self._job_submissions.get(jm_job_id)
-                                if submission:
-                                    await self._workflow_dispatcher.try_dispatch(
-                                        jm_job_id, submission
-                                    )
-                            elif result.status == WorkflowStatus.FAILED.value:
-                                # Workflow failed - fail all dependents
-                                await self._workflow_dispatcher.mark_workflow_failed(
-                                    jm_job_id, jm_workflow_id
-                                )
-
-                # Check if job is complete
                 if self._is_job_complete(result.job_id):
                     await self._handle_job_completion(result.job_id)
 
@@ -4373,7 +4398,6 @@ class ManagerServer(HealthAwareServer):
                 return b'ok'
 
             finally:
-                # Always release the lock, even on early returns or exceptions
                 self._workflow_results_locks[parent_workflow_id].release()
 
         except Exception as e:
@@ -4496,6 +4520,140 @@ class ManagerServer(HealthAwareServer):
 
         # Check if all have results
         return all(sub_wf.result is not None for sub_wf in parent_sub_workflows)
+
+    async def _handle_workflow_completion(self, job_id: str, parent_workflow_id: str) -> None:
+        """
+        Handle completion of a parent workflow (all sub-workflows done).
+
+        Collects all WorkflowStats from sub-workflows and either:
+        - Client job: Aggregates using Results.merge_results() and sends to client
+        - Gate job: Forwards raw list to gate for cross-DC aggregation
+        """
+        job = self._job_manager.get_job_for_workflow(parent_workflow_id)
+        if not job:
+            return
+
+        # Collect all sub-workflows for this parent
+        parent_sub_workflows = [
+            sub_wf for sub_wf in job.sub_workflows.values()
+            if str(sub_wf.parent_token) == parent_workflow_id
+        ]
+
+        if not parent_sub_workflows:
+            return
+
+        # Collect all WorkflowStats from all sub-workflows
+        all_workflow_stats: list[WorkflowStats] = []
+        workflow_name = ""
+        has_failure = False
+        error_messages: list[str] = []
+        max_elapsed = 0.0
+
+        for sub_wf in parent_sub_workflows:
+            if sub_wf.result:
+                workflow_name = sub_wf.result.workflow_name
+                all_workflow_stats.extend(sub_wf.result.results)
+
+                if sub_wf.result.status == WorkflowStatus.FAILED.value:
+                    has_failure = True
+                    if sub_wf.result.error:
+                        error_messages.append(sub_wf.result.error)
+
+            if sub_wf.progress and sub_wf.progress.elapsed_seconds > max_elapsed:
+                max_elapsed = sub_wf.progress.elapsed_seconds
+
+        if not all_workflow_stats:
+            return
+
+        # Determine status
+        status = WorkflowStatus.FAILED.value if has_failure else WorkflowStatus.COMPLETED.value
+        error = "; ".join(error_messages) if error_messages else None
+
+        # Determine if job came from gate or client
+        origin_gate = self._job_origin_gates.get(job_id)
+        callback = self._job_callbacks.get(job_id)
+
+        if origin_gate:
+            # Gate job: forward raw stats for cross-DC aggregation
+            push = WorkflowResultPush(
+                job_id=job_id,
+                workflow_id=parent_workflow_id,
+                workflow_name=workflow_name,
+                datacenter=self._node_id.datacenter,
+                status=status,
+                results=all_workflow_stats,
+                error=error,
+                elapsed_seconds=max_elapsed,
+            )
+            await self._send_workflow_result_to_gate(push, origin_gate)
+
+        elif callback:
+            # Client job: aggregate and send to client
+            results_helper = Results()
+            if len(all_workflow_stats) > 1:
+                aggregated = results_helper.merge_results(all_workflow_stats)
+            else:
+                aggregated = all_workflow_stats[0] if all_workflow_stats else {}
+
+            push = WorkflowResultPush(
+                job_id=job_id,
+                workflow_id=parent_workflow_id,
+                workflow_name=workflow_name,
+                datacenter=self._node_id.datacenter,
+                status=status,
+                results=[aggregated],
+                error=error,
+                elapsed_seconds=max_elapsed,
+            )
+            await self._send_workflow_result_to_client(push, callback)
+
+    async def _send_workflow_result_to_gate(
+        self,
+        push: WorkflowResultPush,
+        gate_addr: tuple[str, int],
+    ) -> None:
+        """Send workflow result to gate for cross-DC aggregation."""
+        try:
+            await self.send_tcp(
+                gate_addr,
+                "workflow_result_push",
+                push.dump(),
+                timeout=5.0,
+            )
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to send workflow result to gate {gate_addr}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    async def _send_workflow_result_to_client(
+        self,
+        push: WorkflowResultPush,
+        callback: tuple[str, int],
+    ) -> None:
+        """Send aggregated workflow result to client."""
+        try:
+            await self.send_tcp(
+                callback,
+                "workflow_result_push",
+                push.dump(),
+                timeout=5.0,
+            )
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to send workflow result to client {callback}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     def _aggregate_sub_workflow_progress(self, parent_workflow_id: str) -> WorkflowProgress | None:
         """
@@ -4640,216 +4798,135 @@ class ManagerServer(HealthAwareServer):
                 total_rate += sub_wf.progress.rate_per_second
         return total_rate
 
-    def _aggregate_sub_workflow_final_results(
+    def _collect_job_completion_stats(
         self,
-        parent_workflow_id: str,
-    ) -> WorkflowFinalResult | None:
+        job: JobInfo,
+    ) -> tuple[list[str], list[WorkflowStats], int, int, int, float, bool]:
         """
-        Aggregate final results from all sub-workflows into a unified result.
+        Collect statistics from all sub-workflows for job completion.
 
-        Uses Results.merge_results() to combine WorkflowResults from all sub-workflows.
-        This follows the same pattern as RemoteGraphManager.
-
-        Args:
-            parent_workflow_id: 4-part workflow token (DC:manager:job_id:workflow_id)
-
-        Returns None if aggregation fails.
+        Returns:
+            Tuple of (errors, all_stats, workflow_count, total_completed, total_failed, max_elapsed, has_failures)
         """
-        try:
-            # Get job from workflow token
-            job = self._job_manager.get_job_for_workflow(parent_workflow_id)
-            if not job:
-                return None
+        errors: list[str] = []
+        all_workflow_stats: list[WorkflowStats] = []
+        workflow_count = 0
+        total_completed = 0
+        total_failed = 0
+        max_elapsed = 0.0
+        has_failures = False
 
-            # Get workflow info to access the workflow instance
-            wf_info = job.workflows.get(parent_workflow_id)
-            if not wf_info:
-                return None
+        for sub_wf in job.sub_workflows.values():
+            if sub_wf.progress and sub_wf.progress.elapsed_seconds > max_elapsed:
+                max_elapsed = sub_wf.progress.elapsed_seconds
 
-            # Find sub-workflows for this parent workflow
-            parent_sub_workflows = [
-                sub_wf for sub_wf in job.sub_workflows.values()
-                if str(sub_wf.parent_token) == parent_workflow_id
-            ]
+            wf_result = sub_wf.result
+            if not wf_result:
+                continue
 
-            if not parent_sub_workflows:
-                return None
+            workflow_count += 1
+            all_workflow_stats.extend(wf_result.results)
 
-            # Collect all sub-workflow results
-            sub_results = [
-                sub_wf.result for sub_wf in parent_sub_workflows
-                if sub_wf.result is not None
-            ]
+            if wf_result.status == WorkflowStatus.FAILED.value:
+                has_failures = True
+                if wf_result.error:
+                    errors.append(f"{wf_result.workflow_name}: {wf_result.error}")
 
-            if not sub_results or len(sub_results) != len(parent_sub_workflows):
-                # Not all sub-workflows have completed
-                return None
+            completed, failed = self._extract_counts_from_stats(wf_result.results)
+            total_completed += completed
+            total_failed += failed
 
-            # Determine overall status (any failure = failure)
-            overall_status = WorkflowStatus.COMPLETED.value
-            errors = []
-            for r in sub_results:
-                if r.status == WorkflowStatus.FAILED.value:
-                    overall_status = WorkflowStatus.FAILED.value
-                    if r.error:
-                        errors.append(r.error)
+        return errors, all_workflow_stats, workflow_count, total_completed, total_failed, max_elapsed, has_failures
 
-            # Unpack and merge WorkflowResults from all sub-workflows
-            workflow_stats_list = []
-            for r in sub_results:
-                # Skip empty results (e.g., from failed workflows)
-                if not r.results or len(r.results) == 0:
-                    continue
-                try:
-                    workflow_stats_list.extend(r.results.values())
-                except Exception:
-                    # Skip malformed results
-                    pass
+    def _extract_counts_from_stats(self, stats_list: list[WorkflowStats]) -> tuple[int, int]:
+        """Extract completed/failed counts from a list of WorkflowStats."""
+        completed = 0
+        failed = 0
+        for workflow_stats in stats_list:
+            if isinstance(workflow_stats, dict):
+                stats = workflow_stats.get("stats", {})
+                completed += stats.get("succeeded", 0) or 0
+                failed += stats.get("failed", 0) or 0
+        return completed, failed
 
-            # Get workflow instance for hooks
-            workflow = wf_info.workflow
-            if workflow is None:
-                return None
+    def _determine_job_status(self, has_failures: bool, error_count: int, workflow_count: int) -> str:
+        """Determine final job status based on failures."""
+        if not has_failures:
+            return JobStatus.COMPLETED.value
+        if error_count == workflow_count:
+            return JobStatus.FAILED.value
+        return "PARTIAL"
 
-            hooks: dict[str, Hook] = {
-                name: hook
-                for name, hook in inspect.getmembers(
-                    workflow,
-                    predicate=lambda member: isinstance(member, Hook),
-                )
-            }
-
-            # Merge results using Results helper (same pattern as RemoteGraphManager)
-            if len(workflow_stats_list) > 1:
-                results_helper = Results(hooks)
-                merged_stats = results_helper.merge_results(workflow_stats_list)
-            elif len(workflow_stats_list) == 1:
-                merged_stats = workflow_stats_list[0]
-            else:
-                # No valid stats - create empty result
-                merged_stats = {
-                    "workflow": sub_results[0].workflow_name,
-                    "stats": {},
-                    "results": [],
-                    "checks": [],
-                    "metrics": [],
-                }
-
-            # Merge context updates from all sub-workflows
-            merged_context = {}
-            for r in sub_results:
-                if r.context_updates and len(r.context_updates) > 0:
-                    try:
-                        ctx = cloudpickle.loads(r.context_updates)
-                        if ctx:
-                            merged_context.update(ctx)
-                    except Exception:
-                        pass
-
-            # Create aggregated final result
-            return WorkflowFinalResult(
-                job_id=job.job_id,
-                workflow_id=parent_workflow_id,
-                workflow_name=sub_results[0].workflow_name,
-                status=overall_status,
-                results=cloudpickle.dumps(merged_stats),
-                context_updates=cloudpickle.dumps(merged_context) if merged_context else b'',
-                error="; ".join(errors) if errors else None,
-            )
-
-        except Exception:
+    def _aggregate_workflow_stats(self, all_stats: list[WorkflowStats]) -> WorkflowStats | None:
+        """Aggregate multiple WorkflowStats into one using Results.merge_results()."""
+        if not all_stats:
             return None
+        if len(all_stats) == 1:
+            return all_stats[0]
+        return Results().merge_results(all_stats)
 
     async def _handle_job_completion(self, job_id: str) -> None:
-        """Handle job completion - build and send JobFinalResult."""
+        """
+        Handle job completion - notify client/gate and trigger reporter submission.
+
+        Workflow results have already been sent per-workflow via _handle_workflow_completion.
+        This method:
+        1. Collects final stats from all sub-workflows
+        2. Notifies that the job is complete
+        3. Triggers reporter submission for client jobs
+        """
         job = self._job_manager.get_job_by_id(job_id)
         if not job:
             return
 
-        # Collect results from sub_workflows
-        errors: list[str] = []
-        has_failures = False
-        max_elapsed = 0.0
-        workflow_results: list[WorkflowResult] = []
+        origin_gate = self._job_origin_gates.get(job_id)
+        callback = self._job_callbacks.get(job_id)
 
-        for sub_wf in job.sub_workflows.values():
-            wf_result = sub_wf.result
-            if wf_result:
-                if wf_result.status == WorkflowStatus.FAILED.value:
-                    has_failures = True
-                    if wf_result.error:
-                        errors.append(f"{wf_result.workflow_name}: {wf_result.error}")
+        # Collect stats from all sub-workflows
+        errors, all_stats, workflow_count, total_completed, total_failed, max_elapsed, has_failures = \
+            self._collect_job_completion_stats(job)
 
-                workflow_results.append(WorkflowResult(
-                    workflow_id=str(sub_wf.token),
-                    workflow_name=wf_result.workflow_name,
-                    status=wf_result.status,
-                    results=wf_result.results,
-                    error=wf_result.error,
-                ))
+        # Use progress-based counts if available
+        if job.workflows_completed > 0 or job.workflows_failed > 0:
+            total_completed = job.workflows_completed
+            total_failed = job.workflows_failed
 
-            # Calculate max elapsed from progress
-            if sub_wf.progress and sub_wf.progress.elapsed_seconds > max_elapsed:
-                max_elapsed = sub_wf.progress.elapsed_seconds
-
-        # Determine final status
-        result_count = len(workflow_results)
-        if has_failures:
-            job_status = JobStatus.FAILED.value if len(errors) == result_count else "PARTIAL"
-        else:
-            job_status = JobStatus.COMPLETED.value
-
+        job_status = self._determine_job_status(has_failures, len(errors), workflow_count)
         job.status = job_status
-        job.elapsed_seconds = max_elapsed
         job.timestamp = time.monotonic()
 
-        # Extract completion counts from WorkflowStats if progress-based counts are zero
-        total_completed = job.workflows_completed
-        total_failed = job.workflows_failed
-
-        if total_completed == 0 and total_failed == 0:
-            for sub_wf in job.sub_workflows.values():
-                wf_result = sub_wf.result
-                if wf_result and wf_result.results and len(wf_result.results) > 0:
-                    try:
-                        workflow_stats = cloudpickle.loads(wf_result.results)
-                        if isinstance(workflow_stats, dict):
-                            stats = workflow_stats.get("stats", {})
-                            total_completed += stats.get("succeeded", 0) or 0
-                            total_failed += stats.get("failed", 0) or 0
-                    except Exception:
-                        pass
-
-        # Build JobFinalResult
-        job_final = JobFinalResult(
-            job_id=job_id,
-            datacenter=self._node_id.datacenter,
-            status=job_status,
-            workflow_results=workflow_results,
-            total_completed=total_completed,
-            total_failed=total_failed,
-            errors=errors,
-            elapsed_seconds=max_elapsed,
-        )
-        
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
-                message=f"Job {job_id} completed with status={job_status}, {len(workflow_results)} workflows",
+                message=f"Job {job_id} completed with status={job_status}, {workflow_count} workflows",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
             )
         )
-        
-        # Send to gates (if connected)
-        if self._known_gates or self._gate_addrs:
+
+        job_final = JobFinalResult(
+            job_id=job_id,
+            datacenter=self._node_id.datacenter,
+            status=job_status,
+            workflow_results=[],  # Results already sent per-workflow
+            total_completed=total_completed,
+            total_failed=total_failed,
+            errors=errors,
+            elapsed_seconds=max_elapsed,
+        )
+
+        if origin_gate:
             await self._send_job_final_result_to_gates(job_final)
-        
-        # Send directly to client (if no gates and callback registered)
-        callback = self._job_callbacks.get(job_id)
-        if callback and not (self._known_gates or self._gate_addrs):
+        elif callback:
             await self._send_job_final_result_to_client(job_final, callback)
+            aggregated = self._aggregate_workflow_stats(all_stats)
+            if aggregated:
+                self._start_background_reporter_submission(
+                    job_id=job_id,
+                    aggregated_stats=aggregated,
+                    callback_addr=callback,
+                )
 
     async def _send_job_final_result_to_gates(self, job_final: JobFinalResult) -> None:
         """
@@ -4928,7 +5005,209 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
-    
+
+    # =========================================================================
+    # Background Reporter Submission
+    # =========================================================================
+
+    def _start_background_reporter_submission(
+        self,
+        job_id: str,
+        aggregated_stats: dict,
+        callback_addr: tuple[str, int] | None,
+    ) -> None:
+        """
+        Start background tasks to submit results to configured reporters.
+
+        Each reporter config gets its own background task that:
+        1. Connects to the reporter
+        2. Submits workflow and step results
+        3. Closes the reporter
+        4. Sends success/failure notification to client
+
+        Tasks are tracked per job for cleanup.
+
+        Args:
+            job_id: The job ID for tracking
+            aggregated_stats: The aggregated WorkflowStats to submit
+            callback_addr: Client callback address for push notifications
+        """
+        submission = self._job_submissions.get(job_id)
+        if not submission or not submission.reporting_configs:
+            return
+
+        # Unpickle reporter configs
+        try:
+            reporter_configs = restricted_loads(submission.reporting_configs)
+            if not reporter_configs:
+                return
+            if not isinstance(reporter_configs, list):
+                reporter_configs = [reporter_configs]
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to unpickle reporter configs for job {job_id}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+
+        # Initialize task tracking for this job
+        if job_id not in self._job_reporter_tasks:
+            self._job_reporter_tasks[job_id] = {}
+
+        # Start a background task for each reporter
+        for config in reporter_configs:
+            reporter_type = config.reporter_type.value
+            task = asyncio.create_task(
+                self._submit_to_reporter(
+                    job_id=job_id,
+                    reporter_config=config,
+                    aggregated_stats=aggregated_stats,
+                    callback_addr=callback_addr,
+                )
+            )
+            self._job_reporter_tasks[job_id][reporter_type] = task
+
+            # Add cleanup callback when task completes
+            task.add_done_callback(
+                lambda t, jid=job_id, rt=reporter_type: self._on_reporter_task_complete(jid, rt, t)
+            )
+
+    def _on_reporter_task_complete(
+        self,
+        job_id: str,
+        reporter_type: str,
+        task: asyncio.Task,
+    ) -> None:
+        """Callback when a reporter task completes - remove from tracking."""
+        job_tasks = self._job_reporter_tasks.get(job_id)
+        if job_tasks and reporter_type in job_tasks:
+            del job_tasks[reporter_type]
+            # Clean up job entry if no more tasks
+            if not job_tasks:
+                del self._job_reporter_tasks[job_id]
+
+    async def _submit_to_reporter(
+        self,
+        job_id: str,
+        reporter_config,
+        aggregated_stats: dict,
+        callback_addr: tuple[str, int] | None,
+    ) -> None:
+        """
+        Submit aggregated results to a single reporter.
+
+        Runs as a background task. Sends push notification to client
+        on success or failure.
+
+        Args:
+            job_id: The job ID
+            reporter_config: The ReporterConfig instance
+            aggregated_stats: The aggregated WorkflowStats dict
+            callback_addr: Client callback for push notification
+        """
+        reporter_type = reporter_config.reporter_type.value
+        start_time = time.monotonic()
+        success = False
+        error_message: str | None = None
+
+        try:
+            reporter = Reporter(reporter_config)
+            await reporter.connect()
+
+            try:
+                await reporter.submit_workflow_results(aggregated_stats)
+                await reporter.submit_step_results(aggregated_stats)
+                success = True
+            finally:
+                await reporter.close()
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Successfully submitted job {job_id} results to {reporter_type}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        except Exception as e:
+            error_message = str(e)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to submit job {job_id} results to {reporter_type}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        elapsed = time.monotonic() - start_time
+
+        # Send push notification to client
+        if callback_addr:
+            await self._send_reporter_result_push(
+                job_id=job_id,
+                reporter_type=reporter_type,
+                success=success,
+                error=error_message,
+                elapsed_seconds=elapsed,
+                callback_addr=callback_addr,
+            )
+
+    async def _send_reporter_result_push(
+        self,
+        job_id: str,
+        reporter_type: str,
+        success: bool,
+        error: str | None,
+        elapsed_seconds: float,
+        callback_addr: tuple[str, int],
+    ) -> None:
+        """Send ReporterResultPush notification to client."""
+        push = ReporterResultPush(
+            job_id=job_id,
+            reporter_type=reporter_type,
+            success=success,
+            error=error,
+            elapsed_seconds=elapsed_seconds,
+            source="manager",
+            datacenter=self._node_id.datacenter,
+        )
+
+        try:
+            await self.send_tcp(
+                callback_addr,
+                "reporter_result_push",
+                push.dump(),
+                timeout=5.0,
+            )
+        except Exception as e:
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to send reporter result push to client {callback_addr}: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    def _cleanup_reporter_tasks(self, job_id: str) -> None:
+        """Cancel and clean up any pending reporter tasks for a job."""
+        job_tasks = self._job_reporter_tasks.get(job_id)
+        if job_tasks:
+            for reporter_type, task in list(job_tasks.items()):
+                if not task.done():
+                    task.cancel()
+            del self._job_reporter_tasks[job_id]
+
     # =========================================================================
     # Context Forwarding (Context Consistency Protocol)
     # =========================================================================
@@ -6075,6 +6354,9 @@ class ManagerServer(HealthAwareServer):
         self._job_submissions.pop(job_id, None)
         self._job_origin_gates.pop(job_id, None)
 
+        # Clean up any pending reporter background tasks for this job
+        self._cleanup_reporter_tasks(job_id)
+
         # Clean up WorkflowDispatcher tracking for this job
         if self._workflow_dispatcher:
             self._task_runner.run(
@@ -6212,6 +6494,141 @@ class ManagerServer(HealthAwareServer):
                 break
             except Exception as e:
                 await self.handle_exception(e, "dead_node_reap_loop")
+
+    async def _orphan_workflow_scan_loop(self) -> None:
+        """
+        Background loop that scans for orphaned workflows.
+
+        An orphaned workflow is one that:
+        1. The manager thinks is running on a worker, but
+        2. The worker no longer has it (worker restarted, crashed, etc.)
+
+        This reconciliation ensures no workflows are "lost" due to state
+        inconsistencies between manager and workers.
+
+        Scan process:
+        1. Collect all workflows the manager believes are dispatched
+        2. Query each worker for their active workflow list
+        3. Mark any workflows not found on workers as orphaned
+        4. Re-dispatch orphaned workflows or mark them failed
+        """
+        # Wait for initial startup to complete
+        await asyncio.sleep(self._orphan_scan_interval)
+
+        while self._running:
+            try:
+                await asyncio.sleep(self._orphan_scan_interval)
+
+                # Skip if not leader - only leader does orphan scanning
+                if not self._is_leader:
+                    continue
+
+                # Skip if no dispatcher (shouldn't happen, but be safe)
+                if not self._workflow_dispatcher:
+                    continue
+
+                # Build map of expected workflow locations from JobManager
+                # workflow_id -> (job_id, worker_node_id)
+                expected_workflows: dict[str, tuple[str, str]] = {}
+
+                for job_id, job_info in self._job_manager.get_all_jobs().items():
+                    for workflow_id, workflow_info in job_info.workflows.items():
+                        if workflow_info.dispatched_to:
+                            expected_workflows[workflow_id] = (job_id, workflow_info.dispatched_to)
+
+                if not expected_workflows:
+                    continue  # No dispatched workflows to check
+
+                # Group workflows by worker for efficient querying
+                worker_workflows: dict[str, list[str]] = {}
+                for workflow_id, (job_id, worker_id) in expected_workflows.items():
+                    if worker_id not in worker_workflows:
+                        worker_workflows[worker_id] = []
+                    worker_workflows[worker_id].append(workflow_id)
+
+                # Query each worker for their active workflows
+                orphaned_workflows: list[tuple[str, str, str]] = []  # (job_id, workflow_id, worker_id)
+
+                for worker_id, workflow_ids in worker_workflows.items():
+                    worker_reg = self._workers.get(worker_id)
+                    if not worker_reg or not worker_reg.node:
+                        # Worker is gone - all its workflows are orphaned
+                        for workflow_id in workflow_ids:
+                            job_id, _ = expected_workflows[workflow_id]
+                            orphaned_workflows.append((job_id, workflow_id, worker_id))
+                        continue
+
+                    try:
+                        # Query worker for active workflows
+                        worker_addr = (worker_reg.node.host, worker_reg.node.port)
+                        response_data, _ = await self.send_tcp(
+                            worker_addr,
+                            "workflow_status_query",
+                            b"",  # Empty request means "list all active"
+                            timeout=self._orphan_scan_worker_timeout,
+                        )
+
+                        if isinstance(response_data, Exception):
+                            # Failed to reach worker - skip for now, will retry next scan
+                            continue
+
+                        # Parse worker's active workflow list
+                        # Response format: comma-separated workflow IDs or empty
+                        if response_data and response_data != b'error':
+                            worker_active_ids = set(
+                                wid.strip()
+                                for wid in response_data.decode('utf-8').split(',')
+                                if wid.strip()
+                            )
+                        else:
+                            worker_active_ids = set()
+
+                        # Check which expected workflows are missing
+                        for workflow_id in workflow_ids:
+                            if workflow_id not in worker_active_ids:
+                                job_id, _ = expected_workflows[workflow_id]
+                                orphaned_workflows.append((job_id, workflow_id, worker_id))
+
+                    except asyncio.TimeoutError:
+                        # Worker timeout - skip for now
+                        continue
+                    except Exception as e:
+                        await self.handle_exception(e, f"orphan_scan_worker_{worker_id}")
+                        continue
+
+                # Handle orphaned workflows
+                for job_id, workflow_id, worker_id in orphaned_workflows:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=f"Orphaned workflow {workflow_id} detected "
+                                    f"(expected on worker {worker_id})",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+                    # Mark workflow as failed and let dispatcher retry if possible
+                    await self._workflow_dispatcher.mark_workflow_failed(
+                        job_id, workflow_id
+                    )
+
+                if orphaned_workflows:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Orphan scan found {len(orphaned_workflows)} orphaned workflows",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.handle_exception(e, "orphan_workflow_scan_loop")
 
     # =========================================================================
     # TCP Handlers - Job Submission (from Gate or Client)

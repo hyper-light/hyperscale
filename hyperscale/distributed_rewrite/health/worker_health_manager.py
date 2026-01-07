@@ -34,12 +34,16 @@ class WorkerHealthManagerConfig:
         min_grant: Minimum extension grant in seconds.
         max_extensions: Maximum extensions per worker per cycle.
         eviction_threshold: Number of failed extensions before eviction.
+        warning_threshold: Remaining extensions to trigger warning notification.
+        grace_period: Seconds of grace after exhaustion before kill.
     """
 
     base_deadline: float = 30.0
     min_grant: float = 1.0
     max_extensions: int = 5
     eviction_threshold: int = 3
+    warning_threshold: int = 1
+    grace_period: float = 10.0
 
 
 class WorkerHealthManager:
@@ -81,6 +85,8 @@ class WorkerHealthManager:
             base_deadline=self._config.base_deadline,
             min_grant=self._config.min_grant,
             max_extensions=self._config.max_extensions,
+            warning_threshold=self._config.warning_threshold,
+            grace_period=self._config.grace_period,
         )
 
         # Per-worker extension trackers
@@ -109,11 +115,16 @@ class WorkerHealthManager:
 
         Returns:
             HealthcheckExtensionResponse with the decision.
+
+        Includes graceful exhaustion handling:
+        - is_exhaustion_warning set when close to running out of extensions
+        - grace_period_remaining shows time left after exhaustion before eviction
+        - in_grace_period indicates if worker is in final grace period
         """
         tracker = self._get_tracker(request.worker_id)
 
         # Attempt to grant extension
-        granted, extension_seconds, denial_reason = tracker.request_extension(
+        granted, extension_seconds, denial_reason, is_warning = tracker.request_extension(
             reason=request.reason,
             current_progress=request.current_progress,
         )
@@ -130,11 +141,18 @@ class WorkerHealthManager:
                 new_deadline=new_deadline,
                 remaining_extensions=tracker.get_remaining_extensions(),
                 denial_reason=None,
+                is_exhaustion_warning=is_warning,
+                grace_period_remaining=0.0,
+                in_grace_period=False,
             )
         else:
             # Track extension failures
             failures = self._extension_failures.get(request.worker_id, 0) + 1
             self._extension_failures[request.worker_id] = failures
+
+            # Check if worker is in grace period after exhaustion
+            in_grace = tracker.is_in_grace_period
+            grace_remaining = tracker.grace_period_remaining
 
             return HealthcheckExtensionResponse(
                 granted=False,
@@ -142,6 +160,9 @@ class WorkerHealthManager:
                 new_deadline=current_deadline,  # Unchanged
                 remaining_extensions=tracker.get_remaining_extensions(),
                 denial_reason=denial_reason,
+                is_exhaustion_warning=False,
+                grace_period_remaining=grace_remaining,
+                in_grace_period=in_grace,
             )
 
     def on_worker_healthy(self, worker_id: str) -> None:
@@ -182,8 +203,12 @@ class WorkerHealthManager:
         """
         Determine if a worker should be evicted based on extension failures.
 
-        A worker should be evicted if it has exhausted all extensions
-        and failed to make progress, indicating it is stuck.
+        A worker should be evicted if:
+        1. It has exceeded the consecutive failure threshold, OR
+        2. It has exhausted all extensions AND the grace period has expired
+
+        The grace period allows the worker time to checkpoint/save state
+        before being forcefully evicted.
 
         Args:
             worker_id: ID of the worker to check.
@@ -200,10 +225,12 @@ class WorkerHealthManager:
             )
 
         tracker = self._trackers.get(worker_id)
-        if tracker and tracker.is_exhausted:
+        if tracker and tracker.should_evict:
+            # Extensions exhausted AND grace period expired
             return (
                 True,
-                f"Worker exhausted all {self._config.max_extensions} deadline extensions",
+                f"Worker exhausted all {self._config.max_extensions} extensions "
+                f"and {self._config.grace_period}s grace period",
             )
 
         return (False, None)
@@ -235,6 +262,10 @@ class WorkerHealthManager:
             "total_extended": tracker.total_extended,
             "last_progress": tracker.last_progress,
             "is_exhausted": tracker.is_exhausted,
+            "in_grace_period": tracker.is_in_grace_period,
+            "grace_period_remaining": tracker.grace_period_remaining,
+            "should_evict": tracker.should_evict,
+            "warning_sent": tracker.warning_sent,
             "extension_failures": self._extension_failures.get(worker_id, 0),
         }
 

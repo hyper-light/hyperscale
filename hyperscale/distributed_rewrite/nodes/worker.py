@@ -2379,3 +2379,26 @@ class WorkerServer(HealthAwareServer):
                 error=str(e),
             )
             return response.dump()
+
+    @tcp.receive()
+    async def workflow_status_query(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle workflow status query from manager.
+
+        Used by the manager's orphan scanner to verify which workflows
+        are actually running on this worker.
+
+        Returns comma-separated list of active workflow IDs.
+        """
+        try:
+            # Return list of all active workflow IDs
+            active_ids = list(self._active_workflows.keys())
+            return ",".join(active_ids).encode('utf-8')
+
+        except Exception:
+            return b'error'

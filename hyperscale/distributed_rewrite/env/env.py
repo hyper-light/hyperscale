@@ -168,6 +168,14 @@ class Env(BaseModel):
     EXTENSION_MIN_GRANT: StrictFloat = 1.0  # Minimum extension grant in seconds
     EXTENSION_MAX_EXTENSIONS: StrictInt = 5  # Maximum extensions per cycle
     EXTENSION_EVICTION_THRESHOLD: StrictInt = 3  # Failures before eviction
+    EXTENSION_EXHAUSTION_WARNING_THRESHOLD: StrictInt = 1  # Remaining extensions to trigger warning
+    EXTENSION_EXHAUSTION_GRACE_PERIOD: StrictFloat = 10.0  # Seconds of grace after exhaustion before kill
+
+    # ==========================================================================
+    # Orphaned Workflow Scanner Settings
+    # ==========================================================================
+    ORPHAN_SCAN_INTERVAL: StrictFloat = 120.0  # Seconds between orphan scans (2 minutes)
+    ORPHAN_SCAN_WORKER_TIMEOUT: StrictFloat = 5.0  # Timeout for querying workers during scan
 
     # ==========================================================================
     # Cross-DC Correlation Settings (Phase 7)
@@ -325,6 +333,11 @@ class Env(BaseModel):
             "EXTENSION_MIN_GRANT": float,
             "EXTENSION_MAX_EXTENSIONS": int,
             "EXTENSION_EVICTION_THRESHOLD": int,
+            "EXTENSION_EXHAUSTION_WARNING_THRESHOLD": int,
+            "EXTENSION_EXHAUSTION_GRACE_PERIOD": float,
+            # Orphaned workflow scanner settings
+            "ORPHAN_SCAN_INTERVAL": float,
+            "ORPHAN_SCAN_WORKER_TIMEOUT": float,
             # Cross-DC correlation settings (Phase 7)
             "CROSS_DC_CORRELATION_WINDOW": float,
             "CROSS_DC_CORRELATION_LOW_THRESHOLD": int,
