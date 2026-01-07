@@ -47,7 +47,7 @@ class ErrorCategory(Enum):
     """Leader election specific errors."""
 
 
-@dataclass(slots=True)
+@dataclass
 class SwimError(Exception):
     """
     Base exception for SWIM protocol errors.

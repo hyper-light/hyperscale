@@ -13,7 +13,7 @@ from .suspicion_state import SuspicionState
 from ..core.protocols import LoggerProtocol
 
 
-@dataclass(slots=True)
+@dataclass
 class SuspicionManager:
     """
     Manages suspicions for all nodes using the Lifeguard protocol.
