@@ -845,7 +845,7 @@ class UDPProtocol(Generic[T, K]):
         except Exception:
             # Sanitized error - don't leak internal details
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._return_error(
                         Message(
                             node_id=self.node_id,
@@ -875,7 +875,7 @@ class UDPProtocol(Generic[T, K]):
         except (EncryptionError, Exception):
             # Sanitized error - don't leak encryption details
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._return_error(
                         Message(
                             node_id=self.node_id,
@@ -901,7 +901,7 @@ class UDPProtocol(Generic[T, K]):
             print(traceback.format_exc())
             # Sanitized error - don't leak details about what was blocked
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._return_error(
                         Message(
                             node_id=self.node_id,
@@ -930,7 +930,7 @@ class UDPProtocol(Generic[T, K]):
         except Exception:
             # Sanitized error - don't leak message structure details
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._return_error(
                         Message(
                             node_id=self.node_id,
@@ -958,7 +958,7 @@ class UDPProtocol(Generic[T, K]):
 
         if message_type == "connect":
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._read_connect(
                         shard_id,
                         message,
@@ -974,7 +974,7 @@ class UDPProtocol(Generic[T, K]):
                 data.node_id = message.node_id
 
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._read(
                         shard_id,
                         message,
@@ -994,7 +994,7 @@ class UDPProtocol(Generic[T, K]):
                 stream_data.node_id = message.node_id
 
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._read_iterator(
                         message.name,
                         message,
@@ -1006,7 +1006,7 @@ class UDPProtocol(Generic[T, K]):
 
         else:
             self._pending_responses.append(
-                asyncio.create_task(
+                asyncio.ensure_future(
                     self._receive_response(
                         shard_id,
                         message,
@@ -1298,17 +1298,8 @@ class UDPProtocol(Generic[T, K]):
         pending_tasks = list(self._pending_responses)
         for task in pending_tasks:
             if not task.done():
-                task.cancel()
+                task.set_result(None)
 
-        # Wait for cancelled tasks to complete (with timeout to avoid hanging)
-        if pending_tasks:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending_tasks, return_exceptions=True),
-                    timeout=2.0,
-                )
-            except asyncio.TimeoutError:
-                pass
 
         # Signal run_forever() to exit
         if self._run_future:

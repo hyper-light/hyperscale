@@ -122,3 +122,4 @@ async def run(
             error=e,
             terminal_mode=config.data.terminal_mode,
         )
+

@@ -237,20 +237,16 @@ class LocalRunner:
                 # Run cleanup operations in parallel for faster shutdown
                 loop = asyncio.get_event_loop()
 
-                async def cleanup_children():
-                    children = await loop.run_in_executor(None, active_children)
-                    if children:
-                        await asyncio.gather(
-                            *[loop.run_in_executor(None, child.kill) for child in children],
-                            return_exceptions=True,
-                        )
+                await self._remote_manger.close()
+
+                loop = asyncio.get_event_loop()
+                children = await loop.run_in_executor(None, active_children)
 
                 await asyncio.gather(
-                    self._remote_manger.close(),
-                    self._server_pool.shutdown(),
-                    cleanup_children(),
-                    return_exceptions=True,
+                    *[loop.run_in_executor(None, child.kill) for child in children]
                 )
+
+                await self._server_pool.shutdown()
 
                 await ctx.log_prepared(
                     f"Stopped Hyperscale Server Pool for test {test_name}",

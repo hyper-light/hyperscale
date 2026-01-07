@@ -152,6 +152,7 @@ def run_thread(
     key_path: str | None = None,
     enable_server_cleanup: bool = False,
 ):
+    
     try:
         from hyperscale.logging import LoggingConfig
 
