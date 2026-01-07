@@ -4947,6 +4947,7 @@ class GateServer(HealthAwareServer):
                     completed_count=worker_stat.completed_count,
                     failed_count=worker_stat.failed_count,
                     rate_per_second=worker_stat.rate_per_second,
+                    elapsed_seconds=push.window_end - push.window_start,  # Window duration
                     step_stats=worker_stat.step_stats,
                     avg_cpu_percent=worker_stat.avg_cpu_percent,
                     avg_memory_mb=worker_stat.avg_memory_mb,
