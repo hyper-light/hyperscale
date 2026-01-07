@@ -102,7 +102,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
             lambda: defaultdict(dict)
         )
 
-        self._node_context: NodeContextSet = defaultdict(dict)
+        self._node_context: NodeContextSet = defaultdict(Context)
         self._statuses: NodeData[WorkflowStatus] = defaultdict(
             lambda: defaultdict(dict)
         )

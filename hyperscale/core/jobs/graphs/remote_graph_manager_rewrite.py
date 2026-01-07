@@ -1236,6 +1236,12 @@ class RemoteGraphManager:
 
             raise err
 
+        except Exception as err:
+            import traceback
+            print(f"[DEBUG] _run_workflow EXCEPTION: {err}")
+            print(traceback.format_exc())
+            raise err
+
     async def _wait_for_workflow_completion(
         self,
         run_id: int,
