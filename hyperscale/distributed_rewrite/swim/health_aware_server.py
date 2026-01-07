@@ -70,6 +70,7 @@ from .detection.probe_scheduler import ProbeScheduler
 
 # Gossip
 from .gossip.gossip_buffer import GossipBuffer, MAX_UDP_PAYLOAD
+from .gossip.health_gossip_buffer import HealthGossipBuffer, HealthGossipBufferConfig
 
 # Leadership
 from .leadership.local_leader_election import LocalLeaderElection
@@ -128,6 +129,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._gossip_buffer = GossipBuffer()
         self._gossip_buffer.set_overflow_callback(self._on_gossip_overflow)
         self._probe_scheduler = ProbeScheduler()
+
+        # Health gossip buffer for O(log n) health state dissemination (Phase 6.1)
+        self._health_gossip_buffer = HealthGossipBuffer(
+            config=HealthGossipBufferConfig(),
+        )
         
         # Initialize leader election with configurable parameters from Env
         from hyperscale.distributed_rewrite.swim.leadership.leader_state import LeaderState
@@ -659,19 +665,43 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     def _add_piggyback_safe(self, base_message: bytes) -> bytes:
         """
         Add piggybacked gossip updates to a message, respecting MTU limits.
-        
+
+        This adds both membership gossip and health gossip (Phase 6.1) to
+        outgoing messages for O(log n) dissemination of both membership
+        and health state.
+
         Args:
             base_message: The core message to send.
-        
+
         Returns:
             Message with piggybacked updates that fits within UDP MTU.
         """
         if len(base_message) >= MAX_UDP_PAYLOAD:
             # Base message already at limit, can't add piggyback
             return base_message
-        
-        piggyback = self._gossip_buffer.encode_piggyback_with_base(base_message)
-        return base_message + piggyback
+
+        # Add membership gossip (format: |type:incarnation:host:port|...)
+        membership_piggyback = self._gossip_buffer.encode_piggyback_with_base(base_message)
+        message_with_membership = base_message + membership_piggyback
+
+        # Calculate remaining space for health gossip
+        remaining = MAX_UDP_PAYLOAD - len(message_with_membership)
+        if remaining < 50:
+            # Not enough room for health piggyback
+            return message_with_membership
+
+        # Update local health state in the buffer before encoding
+        health_piggyback = self._state_embedder.get_health_piggyback()
+        if health_piggyback:
+            self._health_gossip_buffer.update_local_health(health_piggyback)
+
+        # Add health gossip (format: #h|entry1#entry2#...)
+        health_gossip = self._health_gossip_buffer.encode_piggyback(
+            max_count=5,
+            max_size=remaining,
+        )
+
+        return message_with_membership + health_gossip
     
     def _check_message_size(self, message: bytes) -> bool:
         """
@@ -2561,7 +2591,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 # Duplicate - still send ack but don't process
                 return b'ack>' + self._udp_addr_slug
             
-            # Extract any piggybacked membership updates first
+            # Extract health gossip piggyback first (format: #h|entry1#entry2#...)
+            # This must be done before membership piggyback since health uses #h| marker
+            health_piggyback_idx = data.find(b'#h|')
+            if health_piggyback_idx > 0:
+                health_piggyback_data = data[health_piggyback_idx:]
+                data = data[:health_piggyback_idx]
+                self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback_data)
+
+            # Extract any piggybacked membership updates (format: |type:incarnation:host:port|...)
             piggyback_idx = data.find(b'|')
             if piggyback_idx > 0:
                 main_data = data[:piggyback_idx]

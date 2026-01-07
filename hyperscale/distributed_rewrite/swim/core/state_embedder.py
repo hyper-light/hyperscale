@@ -8,6 +8,10 @@ dissemination.
 The StateEmbedder protocol is injected into HealthAwareServer, allowing different
 node types (Worker, Manager, Gate) to provide their own state without
 requiring inheritance-based overrides.
+
+Phase 6.1 Enhancement: StateEmbedders now also provide HealthPiggyback objects
+for the HealthGossipBuffer, enabling O(log n) health state dissemination
+alongside membership gossip.
 """
 
 from dataclasses import dataclass
@@ -19,26 +23,28 @@ from hyperscale.distributed_rewrite.models import (
     ManagerHeartbeat,
     GateHeartbeat,
 )
+from hyperscale.distributed_rewrite.health.tracker import HealthPiggyback
 
 
 class StateEmbedder(Protocol):
     """
     Protocol for embedding and processing state in SWIM messages.
-    
+
     Implementations provide:
     - get_state(): Returns serialized state to embed in outgoing messages
     - process_state(): Handles state received from other nodes
+    - get_health_piggyback(): Returns HealthPiggyback for gossip buffer (Phase 6.1)
     """
-    
+
     def get_state(self) -> bytes | None:
         """
         Get serialized state to embed in SWIM probe responses.
-        
+
         Returns:
             Serialized state bytes, or None if no state to embed.
         """
         ...
-    
+
     def process_state(
         self,
         state_data: bytes,
@@ -46,10 +52,24 @@ class StateEmbedder(Protocol):
     ) -> None:
         """
         Process embedded state received from another node.
-        
+
         Args:
             state_data: Serialized state bytes from the remote node.
             source_addr: The (host, port) of the node that sent the state.
+        """
+        ...
+
+    def get_health_piggyback(self) -> HealthPiggyback | None:
+        """
+        Get HealthPiggyback for the HealthGossipBuffer (Phase 6.1).
+
+        This returns a compact health representation for O(log n) gossip
+        dissemination. Unlike get_state() which embeds full heartbeats in
+        ACK messages, this provides minimal health info for gossip on all
+        SWIM messages.
+
+        Returns:
+            HealthPiggyback with current health state, or None if unavailable.
         """
         ...
 
@@ -57,14 +77,14 @@ class StateEmbedder(Protocol):
 class NullStateEmbedder:
     """
     Default no-op state embedder.
-    
+
     Used when no state embedding is needed (base HealthAwareServer behavior).
     """
-    
+
     def get_state(self) -> bytes | None:
         """No state to embed."""
         return None
-    
+
     def process_state(
         self,
         state_data: bytes,
@@ -72,6 +92,10 @@ class NullStateEmbedder:
     ) -> None:
         """Ignore received state."""
         pass
+
+    def get_health_piggyback(self) -> HealthPiggyback | None:
+        """No health piggyback available."""
+        return None
 
 
 @dataclass(slots=True)
@@ -139,7 +163,7 @@ class WorkerStateEmbedder:
             health_overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
         )
         return heartbeat.dump()
-    
+
     def process_state(
         self,
         state_data: bytes,
@@ -155,6 +179,25 @@ class WorkerStateEmbedder:
             except Exception:
                 # Invalid data - ignore
                 pass
+
+    def get_health_piggyback(self) -> HealthPiggyback | None:
+        """
+        Get HealthPiggyback for gossip dissemination (Phase 6.1).
+
+        Returns compact health state for O(log n) propagation on all SWIM
+        messages, not just ACKs.
+        """
+        return HealthPiggyback(
+            node_id=self.get_node_id(),
+            node_type="worker",
+            is_alive=True,
+            accepting_work=self.get_health_accepting_work() if self.get_health_accepting_work else True,
+            capacity=self.get_available_cores(),
+            throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
+            expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
+            overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            timestamp=time.monotonic(),
+        )
 
 
 @dataclass(slots=True)
@@ -269,6 +312,25 @@ class ManagerStateEmbedder:
         elif isinstance(obj, GateHeartbeat) and self.on_gate_heartbeat:
             self.on_gate_heartbeat(obj, source_addr)
 
+    def get_health_piggyback(self) -> HealthPiggyback | None:
+        """
+        Get HealthPiggyback for gossip dissemination (Phase 6.1).
+
+        Returns compact health state for O(log n) propagation on all SWIM
+        messages, not just ACKs.
+        """
+        return HealthPiggyback(
+            node_id=self.get_node_id(),
+            node_type="manager",
+            is_alive=True,
+            accepting_work=self.get_health_accepting_jobs() if self.get_health_accepting_jobs else True,
+            capacity=self.get_available_cores(),
+            throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
+            expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
+            overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            timestamp=time.monotonic(),
+        )
+
 
 @dataclass(slots=True)
 class GateStateEmbedder:
@@ -372,3 +434,24 @@ class GateStateEmbedder:
             if obj.node_id != self.get_node_id():
                 self.on_gate_heartbeat(obj, source_addr)
 
+    def get_health_piggyback(self) -> HealthPiggyback | None:
+        """
+        Get HealthPiggyback for gossip dissemination (Phase 6.1).
+
+        Returns compact health state for O(log n) propagation on all SWIM
+        messages, not just ACKs.
+        """
+        # Gates use connected DC count as capacity metric
+        connected_dcs = self.get_health_connected_dc_count() if self.get_health_connected_dc_count else 0
+
+        return HealthPiggyback(
+            node_id=self.get_node_id(),
+            node_type="gate",
+            is_alive=True,
+            accepting_work=self.get_health_has_dc_connectivity() if self.get_health_has_dc_connectivity else True,
+            capacity=connected_dcs,
+            throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
+            expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
+            overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            timestamp=time.monotonic(),
+        )
