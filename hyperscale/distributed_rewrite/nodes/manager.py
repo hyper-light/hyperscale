@@ -6915,9 +6915,10 @@ class ManagerServer(HealthAwareServer):
 
             submission = JobSubmission.load(data)
 
-            # Unpickle workflows
+            # Unpickle workflows (new format with client-generated workflow IDs)
+            # Format: list[tuple[str, list[str], Workflow]] - (workflow_id, dependencies, workflow)
             workflows: list[
-                tuple[list[str], Workflow]
+                tuple[str, list[str], Workflow]
             ] = restricted_loads(submission.workflows)
 
             # Only active managers accept jobs (not SYNCING)

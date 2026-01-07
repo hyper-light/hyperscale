@@ -248,7 +248,7 @@ class HyperscaleClient(MercurySyncBaseServer):
 
     async def submit_job(
         self,
-        workflows: list[type],
+        workflows: list[tuple[list[str], object]],
         vus: int = 1,
         timeout_seconds: float = 300.0,
         datacenter_count: int = 1,
@@ -266,7 +266,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         Submit a job for execution.
 
         Args:
-            workflows: List of Workflow classes to execute
+            workflows: List of (dependencies, workflow_instance) tuples
             vus: Virtual users (cores) per workflow
             timeout_seconds: Maximum execution time
             datacenter_count: Number of datacenters to run in (gates only)
@@ -290,8 +290,16 @@ class HyperscaleClient(MercurySyncBaseServer):
         """
         job_id = f"job-{secrets.token_hex(8)}"
 
-        # Serialize workflows
-        workflows_bytes = cloudpickle.dumps(workflows)
+        # Generate workflow IDs and transform to new format
+        # Input: list[tuple[list[str], Workflow]] - (dependencies, workflow)
+        # Output: list[tuple[str, list[str], Workflow]] - (workflow_id, dependencies, workflow)
+        workflows_with_ids: list[tuple[str, list[str], object]] = []
+        for dependencies, workflow_instance in workflows:
+            workflow_id = f"wf-{secrets.token_hex(8)}"
+            workflows_with_ids.append((workflow_id, dependencies, workflow_instance))
+
+        # Serialize workflows with IDs
+        workflows_bytes = cloudpickle.dumps(workflows_with_ids)
 
         # Serialize reporter configs if provided
         reporting_configs_bytes = b''

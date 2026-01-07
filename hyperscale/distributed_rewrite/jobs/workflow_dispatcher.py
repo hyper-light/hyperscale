@@ -127,7 +127,7 @@ class WorkflowDispatcher:
         self,
         submission: JobSubmission,
         workflows: list[
-            tuple[list[str], Workflow]
+            tuple[str, list[str], Workflow]
         ],
     ) -> bool:
         """
@@ -136,6 +136,11 @@ class WorkflowDispatcher:
         Builds the dependency graph and registers workflows with
         JobManager. Workflows without dependencies are immediately
         eligible for dispatch.
+
+        Args:
+            submission: The job submission
+            workflows: List of (workflow_id, dependencies, workflow) tuples
+                       workflow_id is client-generated for cross-DC consistency
 
         Returns True if registration succeeded.
         """
@@ -147,13 +152,13 @@ class WorkflowDispatcher:
         priorities: dict[str, StagePriority] = {}
         is_test: dict[str, bool] = {}
 
-        for i, wf_data in enumerate(workflows):
+        for wf_data in workflows:
 
-            dependencies, instance = wf_data
+            # Unpack with client-generated workflow_id
+            workflow_id, dependencies, instance = wf_data
             try:
 
-                # Generate workflow ID
-                workflow_id = f"wf-{i:04d}"
+                # Use the client-provided workflow_id (globally unique across DCs)
                 name = getattr(instance, 'name', None) or type(instance).__name__
                 vus = instance.vus if instance.vus and instance.vus > 0 else submission.vus
 

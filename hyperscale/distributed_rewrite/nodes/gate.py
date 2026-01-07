@@ -276,6 +276,11 @@ class GateServer(HealthAwareServer):
         # job_id -> set of datacenter IDs
         self._job_target_dcs: dict[str, set[str]] = {}
 
+        # Track expected workflow IDs per job (client-generated, globally unique)
+        # job_id -> set of workflow IDs
+        # Used to verify all expected workflows are reported from each DC
+        self._job_workflow_ids: dict[str, set[str]] = {}
+
         # Per-job leader tracking (Context Consistency Protocol)
         # Each job has one leader gate responsible for aggregation and client communication
         # Any gate can accept a job and become its leader (independent of SWIM cluster leadership)
@@ -2972,6 +2977,7 @@ class GateServer(HealthAwareServer):
                     self._job_dc_results.pop(job_id, None)
                     self._workflow_dc_results.pop(job_id, None)
                     self._job_target_dcs.pop(job_id, None)
+                    self._job_workflow_ids.pop(job_id, None)
                     self._job_callbacks.pop(job_id, None)
                     self._progress_callbacks.pop(job_id, None)
                     # Clean up per-job leadership tracking
@@ -3483,7 +3489,17 @@ class GateServer(HealthAwareServer):
             
             # Track which DCs this job targets (for completion detection)
             self._job_target_dcs[submission.job_id] = set(target_dcs)
-            
+
+            # Extract and track workflow IDs from submission (client-generated)
+            # Format: list[tuple[str, list[str], Workflow]] - (workflow_id, dependencies, workflow)
+            try:
+                workflows: list[tuple[str, list[str], object]] = cloudpickle.loads(submission.workflows)
+                workflow_ids = {wf_id for wf_id, _, _ in workflows}
+                self._job_workflow_ids[submission.job_id] = workflow_ids
+            except Exception:
+                # If unpickling fails, we can still proceed but won't have workflow ID tracking
+                self._job_workflow_ids[submission.job_id] = set()
+
             # Store callback for push notifications (if provided)
             if submission.callback_addr:
                 self._job_callbacks[submission.job_id] = submission.callback_addr
