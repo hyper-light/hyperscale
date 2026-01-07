@@ -63,6 +63,12 @@ from hyperscale.distributed_rewrite.models import (
     JobCancelResponse,
 )
 from hyperscale.distributed_rewrite.env.env import Env
+from hyperscale.distributed_rewrite.reliability.rate_limiting import (
+    AdaptiveRateLimiter,
+    AdaptiveRateLimitConfig,
+    RequestPriority,
+)
+from hyperscale.distributed_rewrite.reliability.overload import HybridOverloadDetector
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 
 
@@ -186,11 +192,17 @@ class HyperscaleClient(MercurySyncBaseServer):
         from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
         self._progress_callbacks: dict[str, Callable[[WindowedStatsPush], None]] = {}
 
-        # Rate limiter for progress updates (to prevent callback spam)
-        self._progress_rate_limit_tokens: float = env.CLIENT_PROGRESS_BURST
-        self._progress_rate_limit_max: float = env.CLIENT_PROGRESS_BURST
-        self._progress_rate_limit_refill: float = env.CLIENT_PROGRESS_RATE_LIMIT
-        self._progress_rate_limit_last_refill: float = 0.0
+        # Rate limiter for progress updates using the same AdaptiveRateLimiter
+        # as manager, gate, and worker. This provides health-gated rate limiting
+        # with per-operation limits.
+        self._rate_limiter = AdaptiveRateLimiter(
+            overload_detector=HybridOverloadDetector(),
+            config=AdaptiveRateLimitConfig(
+                # Progress updates use the default operation limits from
+                # AdaptiveRateLimitConfig: (300, 10.0) = 30/s
+                # This is more generous than the old token bucket
+            ),
+        )
 
         # For selecting targets
         self._current_manager_idx = 0
@@ -1361,31 +1373,6 @@ class HyperscaleClient(MercurySyncBaseServer):
         except Exception:
             return b'error'
 
-    def _try_acquire_progress_rate_limit(self) -> bool:
-        """
-        Try to acquire a token for progress callback rate limiting.
-
-        Uses a token bucket algorithm to limit progress callback frequency.
-        Returns True if allowed, False if rate limited.
-        """
-        now = time.time()
-
-        # Refill tokens based on elapsed time
-        if self._progress_rate_limit_last_refill > 0:
-            elapsed = now - self._progress_rate_limit_last_refill
-            refill = elapsed * self._progress_rate_limit_refill
-            self._progress_rate_limit_tokens = min(
-                self._progress_rate_limit_max,
-                self._progress_rate_limit_tokens + refill,
-            )
-        self._progress_rate_limit_last_refill = now
-
-        # Try to consume a token
-        if self._progress_rate_limit_tokens >= 1.0:
-            self._progress_rate_limit_tokens -= 1.0
-            return True
-        return False
-
     @tcp.receive()
     async def windowed_stats_push(
         self,
@@ -1397,11 +1384,19 @@ class HyperscaleClient(MercurySyncBaseServer):
         Handle windowed stats push from manager or gate.
 
         Called periodically with time-correlated aggregated stats.
-        Rate-limited to prevent overwhelming the user's callback.
+        Rate-limited using the same AdaptiveRateLimiter as manager/gate/worker.
         """
         try:
-            # Apply rate limiting - drop if over limit
-            if not self._try_acquire_progress_rate_limit():
+            # Use the same AdaptiveRateLimiter infrastructure as manager/gate/worker
+            # Client ID is "client-local" since we're the receiver
+            # Operation is "progress_update" which has limits of (300, 10.0) = 30/s
+            client_id = f"{addr[0]}:{addr[1]}"
+            result = self._rate_limiter.check(
+                client_id=client_id,
+                operation="progress_update",
+                priority=RequestPriority.NORMAL,
+            )
+            if not result.allowed:
                 return b'rate_limited'
 
             import cloudpickle
