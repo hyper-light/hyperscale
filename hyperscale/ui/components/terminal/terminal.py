@@ -412,35 +412,15 @@ class Terminal:
                     self._stdout_lock.release()
 
     async def _show_cursor(self):
-        try:
-            if self._writer is not None and self._stdout is not None:
-                loop = self._loop if self._loop is not None else asyncio.get_event_loop()
-                is_tty = await loop.run_in_executor(None, self._stdout.isatty)
+        if await self._loop.run_in_executor(None, self._stdout.isatty):
+            # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
 
-                if is_tty:
-                    # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
+            await self._stdout_lock.acquire()
+            self._writer.write(b"\033[?25h")
+            await self._writer.drain()
 
-                    if self._stdout_lock is not None:
-                        await self._stdout_lock.acquire()
-
-                    self._writer.write(b"\033[?25h")
-                    await self._writer.drain()
-
-                    if self._stdout_lock is not None and self._stdout_lock.locked():
-                        self._stdout_lock.release()
-                    return
-
-            # Fallback: write directly to sys.stdout
-            sys.stdout.write("\033[?25h")
-            sys.stdout.flush()
-
-        except Exception:
-            # Last resort fallback
-            try:
-                sys.stdout.write("\033[?25h")
-                sys.stdout.flush()
-            except Exception:
-                pass
+            if self._stdout_lock.locked():
+                self._stdout_lock.release()
 
     async def _hide_cursor(self):
         if await self._loop.run_in_executor(None, self._stdout.isatty):
@@ -548,25 +528,20 @@ class Terminal:
     async def abort(self):
         self._stop_time = time.time()
 
-        try:
-            await self.canvas.stop()
-        except Exception:
-            pass
+        await self.canvas.stop()
 
         if self._dfl_sigmap:
             # Reset registered signal handlers to default ones
             self._reset_signal_handlers()
 
-        if self._stop_run is not None:
-            self._stop_run.set()
+        self._stop_run.set()
 
         # Wake up the render loop so it can exit
         Terminal.trigger_render()
 
         try:
-            if self._spin_thread is not None:
-                self._spin_thread.cancel()
-                await asyncio.sleep(0)
+            self._spin_thread.cancel()
+            await asyncio.sleep(0)
 
         except (
             asyncio.CancelledError,
@@ -574,38 +549,31 @@ class Terminal:
             asyncio.TimeoutError,
         ):
             pass
+
+        if self._stdout_lock.locked():
+            self._stdout_lock.release()
+
+        await self._stdout_lock.acquire()
+
+        frame = await self.canvas.render()
+
+        self._writer.write(self._frame_prefix)
+        self._writer.write(frame.encode())
+        self._writer.write(self._frame_suffix)
+        await self._writer.drain()
 
         try:
-            if self._stdout_lock is not None and self._stdout_lock.locked():
-                self._stdout_lock.release()
-
-            if self._stdout_lock is not None:
-                await self._stdout_lock.acquire()
-
-            if self._writer is not None:
-                frame = await self.canvas.render()
-
-                self._writer.write(self._frame_prefix)
-                self._writer.write(frame.encode())
-                self._writer.write(self._frame_suffix)
-                await self._writer.drain()
-
-            if self._run_engine is not None:
-                self._run_engine.cancel()
-                await asyncio.sleep(0)
-
-            if self._stdout_lock is not None and self._stdout_lock.locked():
-                self._stdout_lock.release()
-
+            self._run_engine.cancel()
+            await asyncio.sleep(0)
         except (
             asyncio.CancelledError,
             asyncio.InvalidStateError,
             asyncio.TimeoutError,
-            Exception,
         ):
             pass
 
-        # Always show cursor, even if everything else failed
+        self._stdout_lock.release()
+
         await self._show_cursor()
 
     def _reset_signal_handlers(self):
