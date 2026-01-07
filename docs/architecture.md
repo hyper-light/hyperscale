@@ -25,6 +25,14 @@ A high-performance, fault-tolerant distributed workflow execution system designe
   - [Failure Recovery Flows](#failure-recovery-flows)
   - [Network Partition Handling](#network-partition-handling)
   - [Cascading Failure Protection](#cascading-failure-protection)
+- [Zombie Job Prevention & Detection](#zombie-job-prevention--detection)
+  - [Zombie Job Lifecycle Diagram](#zombie-job-lifecycle-diagram)
+  - [Detection Mechanisms](#detection-mechanisms)
+  - [Prevention Mechanisms](#prevention-mechanisms)
+  - [Cleanup Mechanisms](#cleanup-mechanisms)
+  - [Cancellation Flow](#cancellation-flow-killing-zombie-jobs)
+  - [Complete Zombie Prevention State Machine](#complete-zombie-prevention-state-machine)
+  - [Known Gaps and Future Improvements](#known-gaps-and-future-improvements)
 - [Backpressure & Degradation](#backpressure--degradation)
 - [Scaling Operations](#scaling-operations)
 - [State Management](#state-management)
@@ -3792,6 +3800,711 @@ Hierarchical lease-based leadership with LHM (Local Health Multiplier) eligibili
 │  │                                                                         │ │
 │  │    Prevents: Leadership oscillation under unstable conditions          │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Zombie Job Prevention & Detection
+
+This section documents the mechanisms for detecting, preventing, and cleaning up "zombie" jobs - jobs that become stuck, orphaned, or fail to complete properly.
+
+### Zombie Job Lifecycle Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE JOB LIFECYCLE & PREVENTION                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  What is a "Zombie Job"?                                                     │
+│  ───────────────────────                                                     │
+│  A job that:                                                                 │
+│  • Consumes resources without making progress                                │
+│  • Has no live owner/manager tracking it                                     │
+│  • Cannot be cancelled via normal means                                      │
+│  • Prevents completion of parent job                                         │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │                    ZOMBIE CREATION SCENARIOS                           │ │
+│  │                                                                        │ │
+│  │  Scenario 1: Worker Dies Mid-Workflow                                  │ │
+│  │  ─────────────────────────────────────────                             │ │
+│  │  Worker ──[executing workflow]──► CRASH! ──► Workflow state lost       │ │
+│  │                                                                        │ │
+│  │  Scenario 2: Manager Dies After Dispatch                               │ │
+│  │  ─────────────────────────────────────────                             │ │
+│  │  Manager ──[dispatch]──► Worker ──► Manager CRASH ──► No result recv   │ │
+│  │                                                                        │ │
+│  │  Scenario 3: Network Partition                                         │ │
+│  │  ─────────────────────────────────────────                             │ │
+│  │  Manager ◄──X──► Worker   (both think workflow is running)             │ │
+│  │                                                                        │ │
+│  │  Scenario 4: Workflow Execution Hang                                   │ │
+│  │  ─────────────────────────────────────────                             │ │
+│  │  Worker ──[workflow.execute() hangs indefinitely]──► Never completes   │ │
+│  │                                                                        │ │
+│  │  Scenario 5: Result Delivery Failure                                   │ │
+│  │  ─────────────────────────────────────────                             │ │
+│  │  Worker ──► Result ──X──► Manager   (result lost, no retry)            │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Detection Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE DETECTION MECHANISMS                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. WORKFLOW TIMEOUT DETECTION (WorkflowDispatcher)                     │ │
+│  │                                                                        │ │
+│  │    Location: hyperscale/distributed_rewrite/jobs/workflow_dispatcher.py│ │
+│  │                                                                        │ │
+│  │    ┌─────────────────────────────────────────────────────────────────┐ │ │
+│  │    │                                                                  │ │ │
+│  │    │    WorkflowDispatcher.check_timeouts()                          │ │ │
+│  │    │           │                                                      │ │ │
+│  │    │           ▼                                                      │ │ │
+│  │    │    for pending in self._pending:                                │ │ │
+│  │    │        age = now - pending.registered_at                        │ │ │
+│  │    │        │                                                         │ │ │
+│  │    │        ├── if age > pending.timeout_seconds:                    │ │ │
+│  │    │        │       └── EVICT (reason: "timeout")                    │ │ │
+│  │    │        │                                                         │ │ │
+│  │    │        └── if pending.dispatch_attempts > max_attempts:         │ │ │
+│  │    │                └── EVICT (reason: "max_dispatch_attempts")       │ │ │
+│  │    │                                                                  │ │ │
+│  │    │    Default timeout_seconds: 300 (5 minutes)                     │ │ │
+│  │    │    Default max_dispatch_attempts: 5                             │ │ │
+│  │    │    Check interval: 30 seconds (via _job_cleanup_loop)            │ │ │
+│  │    │                                                                  │ │ │
+│  │    └─────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                        │ │
+│  │    Callbacks Invoked:                                                  │ │
+│  │    • on_workflow_evicted(job_id, workflow_id, reason)                 │ │
+│  │    • on_dispatch_failed(job_id, workflow_id)                          │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 2. DEAD WORKER DETECTION (SWIM Protocol + Callbacks)                   │ │
+│  │                                                                        │ │
+│  │    Detection Flow:                                                     │ │
+│  │                                                                        │ │
+│  │    SWIM Probe ──► Timeout ──► Indirect Probe ──► Timeout               │ │
+│  │                                    │                                   │ │
+│  │                                    ▼                                   │ │
+│  │                           Enter SUSPECT state                          │ │
+│  │                                    │                                   │ │
+│  │                           No refutation (30s)                          │ │
+│  │                                    │                                   │ │
+│  │                                    ▼                                   │ │
+│  │                           Mark DEAD ──► _on_node_dead() callback       │ │
+│  │                                    │                                   │ │
+│  │                                    ▼                                   │ │
+│  │    Manager identifies all workflows assigned to dead worker            │ │
+│  │    │                                                                   │ │
+│  │    ├── Retry count < max: Re-dispatch to new worker                   │ │
+│  │    │       └── Failed worker added to exclusion set                   │ │
+│  │    │                                                                   │ │
+│  │    └── Retry count >= max: Mark workflow FAILED                       │ │
+│  │                                                                        │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 3. PROGRESS-BASED HEALTH DETECTION (AD-19 Three-Signal Model)          │ │
+│  │                                                                        │ │
+│  │    Location: hyperscale/distributed_rewrite/health/                    │ │
+│  │                                                                        │ │
+│  │    ProgressState Assessment:                                           │ │
+│  │    ┌─────────────────────────────────────────────────────────────────┐ │ │
+│  │    │ State     │ Criteria                  │ Implication             │ │ │
+│  │    │───────────┼───────────────────────────┼─────────────────────────│ │ │
+│  │    │ IDLE      │ No active workflows       │ Normal - no work        │ │ │
+│  │    │ NORMAL    │ completion_rate >= expected │ Healthy operation     │ │ │
+│  │    │ SLOW      │ completion_rate < 50%     │ Possible contention     │ │ │
+│  │    │ DEGRADED  │ completion_rate < 25%     │ Significant slowdown    │ │ │
+│  │    │ STUCK     │ No progress for threshold │ Potential zombie        │ │ │
+│  │    └─────────────────────────────────────────────────────────────────┘ │ │
+│  │                                                                        │ │
+│  │    Routing Decision Based on Health:                                   │ │
+│  │    • ROUTE: Send new work                                              │ │
+│  │    • DRAIN: Stop sending work, let existing complete                   │ │
+│  │    • INVESTIGATE: Suspect issue, check more signals                    │ │
+│  │    • EVICT: Remove from routing, assume dead/zombie                    │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 4. LEASE EXPIRY DETECTION (Gate Layer)                                 │ │
+│  │                                                                        │ │
+│  │    Location: hyperscale/distributed_rewrite/leases/job_lease.py        │ │
+│  │                                                                        │ │
+│  │    Job Lease Lifecycle:                                                │ │
+│  │                                                                        │ │
+│  │    Gate-1 acquires lease ──► lease.expires_at = now + 30s              │ │
+│  │          │                                                             │ │
+│  │          ├── Renew: lease.expires_at += renewal_period                 │ │
+│  │          │                                                             │ │
+│  │          └── Fail to renew (crash/partition):                          │ │
+│  │                  │                                                     │ │
+│  │                  ▼                                                     │ │
+│  │          Lease expires ──► Gate-2 can claim ──► fence_token++          │ │
+│  │                                   │                                    │ │
+│  │                                   ▼                                    │ │
+│  │          Old results with stale fence_token are REJECTED               │ │
+│  │                                                                        │ │
+│  │    Default lease_timeout: 30 seconds                                   │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Prevention Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE PREVENTION MECHANISMS                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. FENCE TOKENS (At-Most-Once Dispatch Semantics)                      │ │
+│  │                                                                        │ │
+│  │    Location: Worker._workflow_fence_tokens                             │ │
+│  │                                                                        │ │
+│  │    Purpose: Prevent duplicate/stale dispatches from creating zombies   │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  Worker receives WorkflowDispatch(workflow_id, fence_token=5)  │  │ │
+│  │    │              │                                                  │  │ │
+│  │    │              ▼                                                  │  │ │
+│  │    │  current = _workflow_fence_tokens.get(workflow_id, -1)         │  │ │
+│  │    │              │                                                  │  │ │
+│  │    │   ┌──────────┴──────────┐                                       │  │ │
+│  │    │   │                     │                                       │  │ │
+│  │    │   ▼                     ▼                                       │  │ │
+│  │    │ fence_token <= current  fence_token > current                  │  │ │
+│  │    │   │                     │                                       │  │ │
+│  │    │   ▼                     ▼                                       │  │ │
+│  │    │ REJECT (stale)        ACCEPT                                   │  │ │
+│  │    │ Return NACK            │                                       │  │ │
+│  │    │                        ▼                                       │  │ │
+│  │    │              _workflow_fence_tokens[workflow_id] = fence_token │  │ │
+│  │    │              Execute workflow                                  │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Prevents:                                                           │ │
+│  │    • Duplicate execution from retry storms                            │ │
+│  │    • Stale dispatches from recovered old manager                      │ │
+│  │    • Split-brain double execution                                      │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 2. VERSIONED STATE CLOCK (Stale Update Rejection)                      │ │
+│  │                                                                        │ │
+│  │    Location: hyperscale/distributed_rewrite/swim/versioned_clock.py    │ │
+│  │                                                                        │ │
+│  │    Purpose: Reject out-of-order updates that could create             │ │
+│  │             inconsistent state                                         │ │
+│  │                                                                        │ │
+│  │    VersionedStateClock {                                               │ │
+│  │        _entity_versions: dict[str, (version, timestamp)]              │ │
+│  │                                                                        │ │
+│  │        is_entity_stale(entity_id, incoming_version) -> bool           │ │
+│  │        check_and_update(entity_id, incoming_version) -> bool          │ │
+│  │        cleanup_old_entities(max_age) -> None                          │ │
+│  │    }                                                                   │ │
+│  │                                                                        │ │
+│  │    Used at:                                                            │ │
+│  │    • Manager receiving WorkerHeartbeat                                │ │
+│  │    • Manager receiving WorkflowProgress                               │ │
+│  │    • Gate receiving ManagerHeartbeat                                  │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 3. CANCELLATION POLLING (Fallback When Push Fails)                     │ │
+│  │                                                                        │ │
+│  │    Location: Worker._cancellation_poll_loop()                          │ │
+│  │                                                                        │ │
+│  │    Problem: Cancellation push from manager might not reach worker      │ │
+│  │    Solution: Worker periodically polls manager for cancellation status │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  while running:                                                 │  │ │
+│  │    │      await sleep(poll_interval)  # Default: 5-10s              │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      for workflow_id in active_workflows:                      │  │ │
+│  │    │          │                                                      │  │ │
+│  │    │          ▼                                                      │  │ │
+│  │    │      Send WorkflowCancellationQuery to manager                 │  │ │
+│  │    │          │                                                      │  │ │
+│  │    │          ▼                                                      │  │ │
+│  │    │      if response.is_cancelled:                                 │  │ │
+│  │    │          _cancel_workflow(workflow_id, "poll_detected")        │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Ensures: Cancellations are never "lost" due to network issues      │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 4. ADAPTIVE HEALTHCHECK EXTENSIONS (AD-26)                             │ │
+│  │                                                                        │ │
+│  │    Location: hyperscale/distributed_rewrite/health/extension_tracker.py│ │
+│  │                                                                        │ │
+│  │    Problem: Long-running workflows might be killed as "stuck"         │ │
+│  │    Solution: Allow legitimate slow workers to request deadline extensions│
+│  │                                                                        │ │
+│  │    Extension Request Flow:                                             │ │
+│  │                                                                        │ │
+│  │    Worker ──► Heartbeat with extension_requested=True ──► Manager      │ │
+│  │                    │                                                   │ │
+│  │                    ▼                                                   │ │
+│  │    ExtensionTracker.request_extension(reason, current_progress)        │ │
+│  │                    │                                                   │ │
+│  │        ┌───────────┴───────────┐                                       │ │
+│  │        │                       │                                       │ │
+│  │        ▼                       ▼                                       │ │
+│  │    GRANTED                  DENIED                                     │ │
+│  │    (extension_seconds)      (denial_reason)                            │ │
+│  │                                                                        │ │
+│  │    Grant Decay (Logarithmic):                                          │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │ Grant # │ Formula        │ Example (base=30s) │                │  │ │
+│  │    │─────────┼────────────────┼────────────────────│                │  │ │
+│  │    │ 1       │ base / 2       │ 15s                │                │  │ │
+│  │    │ 2       │ base / 4       │ 7.5s               │                │  │ │
+│  │    │ 3       │ base / 8       │ 3.75s              │                │  │ │
+│  │    │ 4       │ base / 16      │ 1.875s             │                │  │ │
+│  │    │ 5       │ min_grant      │ 1s (capped)        │                │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Denial Reasons:                                                     │ │
+│  │    • "max_extensions_exceeded" - Already used all extensions          │ │
+│  │    • "no_progress" - Progress same as last request (stuck)            │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cleanup Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE CLEANUP MECHANISMS                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. MANAGER JOB CLEANUP LOOP                                            │ │
+│  │                                                                        │ │
+│  │    Location: Manager._job_cleanup_loop() (manager.py:6225)             │ │
+│  │                                                                        │ │
+│  │    Interval: MERCURY_SYNC_CLEANUP_INTERVAL (default: 30s)              │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  while running:                                                 │  │ │
+│  │    │      await sleep(cleanup_interval)                             │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      # 1. Check workflow timeouts via dispatcher               │  │ │
+│  │    │      evicted = await _workflow_dispatcher.check_timeouts()     │  │ │
+│  │    │      for (job_id, workflow_id, reason) in evicted:             │  │ │
+│  │    │          mark_workflow_failed(job_id, workflow_id, reason)     │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      # 2. Clean completed jobs after retention period          │  │ │
+│  │    │      for job_id, job in _jobs.items():                         │  │ │
+│  │    │          if job.status == COMPLETED:                           │  │ │
+│  │    │              if age > _completed_job_max_age:  # ~30 min       │  │ │
+│  │    │                  cleanup_job(job_id)                           │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      # 3. Clean failed/cancelled/timeout jobs                  │  │ │
+│  │    │      for job_id, job in _jobs.items():                         │  │ │
+│  │    │          if job.status in [FAILED, CANCELLED, TIMEOUT]:        │  │ │
+│  │    │              if age > _failed_job_max_age:  # longer retention │  │ │
+│  │    │                  cleanup_job(job_id)                           │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 2. DEAD NODE REAP LOOP                                                 │ │
+│  │                                                                        │ │
+│  │    Location: Manager._dead_node_reap_loop() (manager.py:6380)          │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  Reap Intervals:                                                │  │ │
+│  │    │  ├── Dead workers: MANAGER_DEAD_WORKER_REAP_INTERVAL (~24h)    │  │ │
+│  │    │  ├── Dead peers:   MANAGER_DEAD_PEER_REAP_INTERVAL   (~24h)    │  │ │
+│  │    │  └── Dead gates:   MANAGER_DEAD_GATE_REAP_INTERVAL   (~24h)    │  │ │
+│  │    │                                                                 │  │ │
+│  │    │  For each dead node past reap interval:                        │  │ │
+│  │    │  ├── Remove from _dead_workers / _dead_peers / _dead_gates     │  │ │
+│  │    │  ├── Remove from all tracking structures                       │  │ │
+│  │    │  └── Free any resources/leases associated                      │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Note: 24h is conservative for debugging. In production,            │ │
+│  │    consider reducing to 1-2h via environment variables.               │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 3. WORKER WORKFLOW CLEANUP (finally block)                             │ │
+│  │                                                                        │ │
+│  │    Location: Worker._execute_workflow() finally block                  │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  async def _execute_workflow(...):                             │  │ │
+│  │    │      try:                                                       │  │ │
+│  │    │          # Execute workflow                                    │  │ │
+│  │    │          result = await remote_manager.execute(...)            │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      except CancelledError:                                    │  │ │
+│  │    │          # Handle cancellation                                 │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      except Exception:                                         │  │ │
+│  │    │          # Handle failure                                      │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      finally:                                                   │  │ │
+│  │    │          # ALWAYS cleanup - prevents resource leaks            │  │ │
+│  │    │          await _core_allocator.free(workflow_id)  ◄── Free CPU │  │ │
+│  │    │          _workflow_tokens.pop(workflow_id)        ◄── Remove   │  │ │
+│  │    │          _workflow_cancel_events.pop(workflow_id) ◄── tracking │  │ │
+│  │    │          _active_workflows.pop(workflow_id)       ◄── state    │  │ │
+│  │    │          _workflow_fence_tokens.pop(workflow_id)  ◄── data     │  │ │
+│  │    │          _remote_manger.start_server_cleanup()    ◄── Cleanup  │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Guarantees: Workflow resources are ALWAYS freed, regardless of     │ │
+│  │    success, failure, or cancellation.                                 │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ 4. GATE LEASE CLEANUP LOOP                                             │ │
+│  │                                                                        │ │
+│  │    Location: Gate._lease_cleanup_loop()                                │ │
+│  │                                                                        │ │
+│  │    ┌────────────────────────────────────────────────────────────────┐  │ │
+│  │    │                                                                 │  │ │
+│  │    │  while running:                                                 │  │ │
+│  │    │      await sleep(cleanup_interval)                             │  │ │
+│  │    │                                                                 │  │ │
+│  │    │      for lease_key, lease in _leases.items():                  │  │ │
+│  │    │          if time.monotonic() > lease.expires_at:               │  │ │
+│  │    │              │                                                  │  │ │
+│  │    │              ▼                                                  │  │ │
+│  │    │          Mark job's DC as FAILED                               │  │ │
+│  │    │          │                                                      │  │ │
+│  │    │          ▼                                                      │  │ │
+│  │    │          Remove expired lease                                  │  │ │
+│  │    │          │                                                      │  │ │
+│  │    │          ▼                                                      │  │ │
+│  │    │          Notify client of partial failure                      │  │ │
+│  │    │                                                                 │  │ │
+│  │    └────────────────────────────────────────────────────────────────┘  │ │
+│  │                                                                        │ │
+│  │    Ensures: Jobs with dead datacenters don't hang forever             │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cancellation Flow (Killing Zombie Jobs)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CANCELLATION PROPAGATION FLOW                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  User Request: client.cancel_job(job_id)                                     │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                          │ │
+│  │  CLIENT                                                                  │ │
+│  │    │                                                                     │ │
+│  │    │ JobCancelRequest(job_id, fence_token, reason)                      │ │
+│  │    │                                                                     │ │
+│  │    ▼                                                                     │ │
+│  │  GATE                                                                    │ │
+│  │    │                                                                     │ │
+│  │    ├── Validate fence_token (reject stale)                              │ │
+│  │    ├── Check lease ownership (am I responsible?)                        │ │
+│  │    │                                                                     │ │
+│  │    │ FOR EACH datacenter with active workflows:                         │ │
+│  │    │    │                                                                │ │
+│  │    │    │ WorkflowCancelRequest(job_id, workflow_ids)                   │ │
+│  │    │    │                                                                │ │
+│  │    │    ▼                                                                │ │
+│  │  MANAGER                                                                 │ │
+│  │    │                                                                     │ │
+│  │    ├── Update job status to CANCELLING                                  │ │
+│  │    ├── Update workflow status to CANCELLED                              │ │
+│  │    │                                                                     │ │
+│  │    │ FOR EACH worker with workflow:                                     │ │
+│  │    │    │                                                                │ │
+│  │    │    │ WorkflowCancelRequest(workflow_id, fence_token)               │ │
+│  │    │    │                                                                │ │
+│  │    │    ▼                                                                │ │
+│  │  WORKER                                                                  │ │
+│  │    │                                                                     │ │
+│  │    ├── Set _workflow_cancel_events[workflow_id]                         │ │
+│  │    ├── TaskRunner.cancel(workflow_token)                                │ │
+│  │    ├── RemoteGraphManager.cancel_workflow(run_id)                       │ │
+│  │    │                                                                     │ │
+│  │    │ RESPONSE PROPAGATION (reverse):                                    │ │
+│  │    │                                                                     │ │
+│  │    ▼                                                                     │ │
+│  │  WorkflowCancelResponse(success=True, cancelled_count=N)                │ │
+│  │    │                                                                     │ │
+│  │    ▼                                                                     │ │
+│  │  JobCancelResponse(success=True, cancelled_workflow_count=M)            │ │
+│  │    │                                                                     │ │
+│  │    ▼                                                                     │ │
+│  │  CLIENT receives confirmation                                            │ │
+│  │                                                                          │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  Fallback Mechanism (if push fails):                                         │ │
+│  ┌─────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                          │ │
+│  │  Worker._cancellation_poll_loop():                                       │ │
+│  │                                                                          │ │
+│  │    Every 5-10 seconds:                                                   │ │
+│  │    ├── For each active workflow                                          │ │
+│  │    │    │                                                                │ │
+│  │    │    │ WorkflowCancellationQuery(workflow_id)                        │ │
+│  │    │    │                                                                │ │
+│  │    │    ▼                                                                │ │
+│  │    │    Manager checks if cancelled ──► Response                        │ │
+│  │    │                                        │                            │ │
+│  │    │    ┌───────────────────────────────────┘                            │ │
+│  │    │    │                                                                │ │
+│  │    │    ├── is_cancelled=True → _cancel_workflow()                      │ │
+│  │    │    └── is_cancelled=False → continue execution                     │ │
+│  │    │                                                                     │ │
+│  │    Ensures: Even if manager→worker push is lost, worker will            │ │
+│  │    discover cancellation within poll_interval seconds                   │ │
+│  │                                                                          │ │
+│  └─────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Complete Zombie Prevention State Machine
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│               ZOMBIE PREVENTION STATE MACHINE (per workflow)                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│                                                                              │
+│                           ┌──────────────┐                                  │
+│                           │   PENDING    │                                  │
+│                           │   (queued)   │                                  │
+│                           └──────┬───────┘                                  │
+│                                  │                                          │
+│                    ┌─────────────┼─────────────┐                            │
+│                    │             │             │                            │
+│                    ▼             ▼             ▼                            │
+│           ┌────────────┐ ┌────────────┐ ┌────────────┐                      │
+│           │  TIMEOUT   │ │ DISPATCHED │ │ MAX_RETRY  │                      │
+│           │ (evicted)  │ │            │ │ (evicted)  │                      │
+│           └─────┬──────┘ └──────┬─────┘ └──────┬─────┘                      │
+│                 │               │              │                            │
+│                 │               ▼              │                            │
+│                 │        ┌────────────┐        │                            │
+│                 │        │  RUNNING   │        │                            │
+│                 │        │ (on worker)│        │                            │
+│                 │        └──────┬─────┘        │                            │
+│                 │               │              │                            │
+│        ┌────────┼───────────────┼──────────────┼────────┐                   │
+│        │        │               │              │        │                   │
+│        ▼        ▼               ▼              ▼        ▼                   │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐          │
+│  │ COMPLETED│ │  FAILED  │ │CANCELLED │ │ TIMEOUT  │ │WORKER_DIE│          │
+│  │          │ │(internal)│ │ (user)   │ │(runtime) │ │(detected)│          │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘          │
+│       │            │            │            │            │                 │
+│       │            │            │            │            │                 │
+│       │            │            │            │      ┌─────┴─────┐           │
+│       │            │            │            │      │           │           │
+│       │            │            │            │      ▼           ▼           │
+│       │            │            │            │  RETRY #N   MAX_RETRY        │
+│       │            │            │            │  (redispatch) (failed)       │
+│       │            │            │            │      │           │           │
+│       │            │            │            │      │           │           │
+│       ▼            ▼            ▼            ▼      ▼           ▼           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        CLEANUP (always)                              │   │
+│  │  • Free cores: _core_allocator.free(workflow_id)                    │   │
+│  │  • Remove tracking: _workflow_tokens, _active_workflows, etc.       │   │
+│  │  • Send result/status to manager                                    │   │
+│  │  • RemoteGraphManager.start_server_cleanup()                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Legend:                                                                     │
+│  ───────                                                                     │
+│  • Timeout paths prevent indefinite waiting                                 │
+│  • Worker death triggers immediate retry or failure                         │
+│  • All paths lead to CLEANUP (no resource leaks)                           │
+│  • Fence tokens prevent duplicate execution on retry                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Mechanism Summary Table
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE PREVENTION MECHANISM SUMMARY                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────────┬───────────────┬──────────────────────────────────┐│
+│  │ Mechanism            │ Location      │ Protects Against                 ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Workflow Timeout     │ Dispatcher    │ Hung pending workflows           ││
+│  │ (check_timeouts)     │               │ (default: 300s)                  ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ SWIM Dead Detection  │ All nodes     │ Dead workers/managers/gates      ││
+│  │ (_on_node_dead)      │               │ (suspicion: ~30s)                ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Progress Health      │ Manager       │ Stuck workers without progress   ││
+│  │ (AD-19)              │               │ (STUCK state detection)          ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Lease Expiry         │ Gate          │ Jobs orphaned by gate failure    ││
+│  │ (job_lease)          │               │ (default: 30s)                   ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Fence Tokens         │ Worker        │ Duplicate/stale dispatches       ││
+│  │                      │               │ (at-most-once semantics)         ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Versioned Clock      │ Manager/Gate  │ Out-of-order state updates       ││
+│  │                      │               │ (stale update rejection)         ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Cancel Polling       │ Worker        │ Lost cancellation messages       ││
+│  │                      │               │ (poll interval: 5-10s)           ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Extension Tracking   │ Manager       │ Legitimate slow work killed      ││
+│  │ (AD-26)              │               │ (max 5 extensions, decay)        ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Job Cleanup Loop     │ Manager       │ Resource accumulation            ││
+│  │                      │               │ (interval: 30s)                  ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ Dead Node Reaping    │ Manager       │ Stale dead node tracking         ││
+│  │                      │               │ (interval: ~24h)                 ││
+│  ├──────────────────────┼───────────────┼──────────────────────────────────┤│
+│  │ finally Cleanup      │ Worker        │ Resource leaks on any exit       ││
+│  │ (_execute_workflow)  │               │ (always runs)                    ││
+│  └──────────────────────┴───────────────┴──────────────────────────────────┘│
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Known Gaps and Future Improvements
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    KNOWN GAPS & FUTURE IMPROVEMENTS                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GAP 1: NO RUNTIME EXECUTION TIMEOUT                                    │ │
+│  │                                                                        │ │
+│  │ Current: timeout_seconds only affects dispatch eligibility             │ │
+│  │ Problem: Workflow can run indefinitely if execution hangs             │ │
+│  │                                                                        │ │
+│  │ Recommendation: Add execution_timeout at RemoteGraphManager level     │ │
+│  │   • asyncio.wait_for() wrapper with hard timeout                      │ │
+│  │   • Separate from dispatch timeout (dispatch_timeout vs exec_timeout) │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GAP 2: LONG DEAD NODE REAP INTERVAL                                    │ │
+│  │                                                                        │ │
+│  │ Current: 24h default for dead node reaping                            │ │
+│  │ Problem: Dead worker tracking accumulates memory                       │ │
+│  │                                                                        │ │
+│  │ Recommendation: Reduce to 1-2h in production                          │ │
+│  │   • Configure via MANAGER_DEAD_WORKER_REAP_INTERVAL                   │ │
+│  │   • Keep 24h for debugging/development only                           │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GAP 3: NO HARD KILL SIGNAL                                             │ │
+│  │                                                                        │ │
+│  │ Current: Cancellation relies on workflow respecting cancel event       │ │
+│  │ Problem: Misbehaving workflow can ignore cancellation                  │ │
+│  │                                                                        │ │
+│  │ Recommendation: Add process-level kill capability                      │ │
+│  │   • Track workflow PID at execution start                             │ │
+│  │   • SIGKILL after grace period if cancel not acknowledged             │ │
+│  │   • May require process isolation (subprocess vs thread)              │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GAP 4: NO ORPHAN JOB SCANNER                                           │ │
+│  │                                                                        │ │
+│  │ Current: Rely on timeout and heartbeat for detection                   │ │
+│  │ Problem: Jobs can be orphaned if all tracking state lost              │ │
+│  │                                                                        │ │
+│  │ Recommendation: Add periodic reconciliation scan                       │ │
+│  │   • Manager queries all workers for active workflow list              │ │
+│  │   • Compare with manager's tracking → find orphans                    │ │
+│  │   • Clean up or re-adopt orphaned workflows                           │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐ │
+│  │ GAP 5: EXTENSION EXHAUSTION HARD CUTOFF                                │ │
+│  │                                                                        │ │
+│  │ Current: After max extensions, no more time granted                    │ │
+│  │ Problem: Legitimate slow work killed abruptly                          │ │
+│  │                                                                        │ │
+│  │ Recommendation: Graceful degradation                                   │ │
+│  │   • Notify workflow of impending timeout                              │ │
+│  │   • Allow checkpoint/save before kill                                 │ │
+│  │   • Configurable behavior (kill vs pause vs notify)                   │ │
+│  └────────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Configuration Reference
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ZOMBIE PREVENTION CONFIGURATION                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Environment Variables:                                                      │
+│                                                                              │
+│  ┌────────────────────────────────────┬──────────┬────────────────────────┐ │
+│  │ Variable                           │ Default  │ Description            │ │
+│  ├────────────────────────────────────┼──────────┼────────────────────────┤ │
+│  │ MERCURY_SYNC_CLEANUP_INTERVAL      │ 30s      │ Job cleanup loop freq  │ │
+│  │ MANAGER_DEAD_WORKER_REAP_INTERVAL  │ 86400s   │ Dead worker reap (24h) │ │
+│  │ MANAGER_DEAD_PEER_REAP_INTERVAL    │ 86400s   │ Dead peer reap (24h)   │ │
+│  │ MANAGER_DEAD_GATE_REAP_INTERVAL    │ 86400s   │ Dead gate reap (24h)   │ │
+│  │ WORKER_CANCELLATION_POLL_INTERVAL  │ 5s       │ Cancel poll frequency  │ │
+│  │ SWIM_SUSPICION_TIMEOUT             │ 30s      │ Time before DEAD       │ │
+│  └────────────────────────────────────┴──────────┴────────────────────────┘ │
+│                                                                              │
+│  Per-Job Configuration:                                                      │
+│                                                                              │
+│  ┌────────────────────────────────────┬──────────┬────────────────────────┐ │
+│  │ Parameter                          │ Default  │ Description            │ │
+│  ├────────────────────────────────────┼──────────┼────────────────────────┤ │
+│  │ timeout_seconds                    │ 300s     │ Workflow dispatch time │ │
+│  │ max_dispatch_attempts              │ 5        │ Retries before fail    │ │
+│  │ max_extensions                     │ 5        │ Deadline extensions    │ │
+│  │ lease_timeout                      │ 30s      │ Gate job lease duration│ │
+│  └────────────────────────────────────┴──────────┴────────────────────────┘ │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
