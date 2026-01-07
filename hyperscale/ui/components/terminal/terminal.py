@@ -97,6 +97,7 @@ async def handle_resize(engine: Terminal):
 class Terminal:
     _actions: List[tuple[Action[Any, ActionData], str | None]] = []
     _updates = SubscriptionSet()
+    _render_event: asyncio.Event | None = None
 
     def __init__(
         self,
@@ -165,6 +166,12 @@ class Terminal:
                 self._updates.add_topic(subscription, [update])
 
     @classmethod
+    def trigger_render(cls):
+        """Signal the render loop to wake up and re-render immediately."""
+        if cls._render_event is not None and not cls._render_event.is_set():
+            cls._render_event.set()
+
+    @classmethod
     def wrap_action(
         cls,
         func: Action[K, T],
@@ -175,6 +182,7 @@ class Terminal:
             func,
             cls._updates,
             default_channel=default_channel,
+            on_update=cls.trigger_render,
         )
 
     async def set_component_active(self, component_name: str):
@@ -349,7 +357,33 @@ class Terminal:
     async def _execute_render_loop(self):
         await self._clear_terminal(force=True)
 
+        # Initialize the class-level render event
+        Terminal._render_event = asyncio.Event()
+
+        # Initial render
+        try:
+            await self._stdout_lock.acquire()
+
+            frame = await self.canvas.render()
+
+            frame = f"\033[3J\033[H{frame}\n".encode()
+            self._writer.write(frame)
+            await self._writer.drain()
+
+            if self._stdout_lock.locked():
+                self._stdout_lock.release()
+
+        except Exception:
+            pass
+
+        # Only re-render when an action signals an update
         while not self._stop_run.is_set():
+            await Terminal._render_event.wait()
+            Terminal._render_event.clear()
+
+            if self._stop_run.is_set():
+                break
+
             try:
                 await self._stdout_lock.acquire()
 
@@ -364,9 +398,6 @@ class Terminal:
 
             except Exception:
                 pass
-
-                # Wait
-            await asyncio.sleep(self._interval)
 
     async def _show_cursor(self):
         if await self._loop.run_in_executor(None, self._stdout.isatty):
@@ -411,6 +442,9 @@ class Terminal:
         if not self._stop_run.is_set():
             self._stop_run.set()
 
+        # Wake up the render loop so it can exit
+        Terminal.trigger_render()
+
         try:
             await self._spin_thread
 
@@ -450,6 +484,9 @@ class Terminal:
 
         self._stop_run.set()
 
+        # Wake up the render loop so it can exit
+        Terminal.trigger_render()
+
         try:
             await self._spin_thread
 
@@ -487,6 +524,9 @@ class Terminal:
             self._reset_signal_handlers()
 
         self._stop_run.set()
+
+        # Wake up the render loop so it can exit
+        Terminal.trigger_render()
 
         try:
             self._spin_thread.cancel()
