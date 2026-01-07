@@ -137,6 +137,10 @@ class Terminal:
         # custom handlers set by ``sigmap`` at the cleanup phase.
         self._dfl_sigmap: dict[signal.Signals, SignalHandlers] = {}
 
+        # Pre-encoded ANSI sequences for efficiency
+        self._frame_prefix = b"\033[3J\033[H"
+        self._frame_suffix = b"\n"
+
         components: dict[str, tuple[list[str], Action[ActionData, ActionData]]] = {}
 
         for action, default_channel in self._actions:
@@ -366,8 +370,9 @@ class Terminal:
 
             frame = await self.canvas.render()
 
-            frame = f"\033[3J\033[H{frame}\n".encode()
-            self._writer.write(frame)
+            self._writer.write(self._frame_prefix)
+            self._writer.write(frame.encode())
+            self._writer.write(self._frame_suffix)
             await self._writer.drain()
 
         except Exception:
@@ -385,13 +390,18 @@ class Terminal:
             if self._stop_run.is_set():
                 break
 
+            # Coalesce rapid triggers - wait briefly to batch multiple events
+            await asyncio.sleep(0)
+            Terminal._render_event.clear()
+
             try:
                 await self._stdout_lock.acquire()
 
                 frame = await self.canvas.render()
 
-                frame = f"\033[3J\033[H{frame}\n".encode()
-                self._writer.write(frame)
+                self._writer.write(self._frame_prefix)
+                self._writer.write(frame.encode())
+                self._writer.write(self._frame_suffix)
                 await self._writer.drain()
 
             except Exception:
@@ -500,8 +510,9 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        frame = f"\033[3J\033[H{frame}\n".encode()
-        self._writer.write(frame)
+        self._writer.write(self._frame_prefix)
+        self._writer.write(frame.encode())
+        self._writer.write(self._frame_suffix)
         await self._writer.drain()
 
         try:
@@ -546,8 +557,9 @@ class Terminal:
 
         frame = await self.canvas.render()
 
-        frame = f"\033[3J\033[H{frame}\n".encode()
-        self._writer.write(frame)
+        self._writer.write(self._frame_prefix)
+        self._writer.write(frame.encode())
+        self._writer.write(self._frame_suffix)
         await self._writer.drain()
 
         try:
