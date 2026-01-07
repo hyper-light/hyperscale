@@ -60,6 +60,7 @@ class HyperscaleInterface:
         self._current_active_idx: int = 0
         self._updated_active_workflows: asyncio.Event | None = None
         self._start: float | None = None
+        self._spinner_task: asyncio.Task | None = None
 
         # Reset class-level flag for new interface instance
         HyperscaleInterface._received_first_progress_update = False
@@ -86,11 +87,23 @@ class HyperscaleInterface:
             self._initial_tasks_set = asyncio.Future()
 
             self._terminal_task = asyncio.ensure_future(self._run())
+            self._spinner_task = asyncio.ensure_future(self._run_spinner())
 
             await self._terminal.render(
                 horizontal_padding=self._horizontal_padding,
                 vertical_padding=self._vertical_padding,
             )
+
+    async def _run_spinner(self):
+        """Trigger renders at refresh interval until first progress update arrives."""
+        interval = self._terminal._interval
+
+        while not self._run_switch_loop.is_set():
+            if HyperscaleInterface._received_first_progress_update:
+                return
+
+            Terminal.trigger_render()
+            await asyncio.sleep(interval)
 
     async def _run(self):
         start = time.monotonic()
@@ -137,6 +150,13 @@ class HyperscaleInterface:
 
         self._updates.shutdown()
 
+        if self._spinner_task is not None:
+            self._spinner_task.cancel()
+            try:
+                await self._spinner_task
+            except asyncio.CancelledError:
+                pass
+
         if (
             self._updated_active_workflows
             and self._updated_active_workflows.is_set() is False
@@ -157,6 +177,13 @@ class HyperscaleInterface:
 
         except Exception:
             pass
+
+        if self._spinner_task is not None:
+            try:
+                self._spinner_task.cancel()
+                await self._spinner_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         try:
             if (
