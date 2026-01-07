@@ -76,6 +76,8 @@ from hyperscale.distributed_rewrite.models import (
     PingRequest,
     DatacenterInfo,
     GatePingResponse,
+    DatacenterListRequest,
+    DatacenterListResponse,
     WorkflowQueryRequest,
     WorkflowStatusInfo,
     WorkflowQueryResponse,
@@ -4642,4 +4644,73 @@ class GateServer(HealthAwareServer):
 
         except Exception as e:
             await self.handle_exception(e, "workflow_query")
+            return b'error'
+
+    @tcp.receive()
+    async def datacenter_list(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle datacenter list request from client.
+
+        Returns a lightweight list of registered datacenters with their
+        health status and capacity information. This allows clients to
+        discover available datacenters before submitting jobs.
+        """
+        try:
+            # Rate limit check (AD-24)
+            client_id = f"{addr[0]}:{addr[1]}"
+            allowed, retry_after = self._check_rate_limit_for_operation(client_id, "datacenter_list")
+            if not allowed:
+                return RateLimitResponse(
+                    operation="datacenter_list",
+                    retry_after_seconds=retry_after,
+                ).dump()
+
+            request = DatacenterListRequest.load(data)
+
+            # Build per-datacenter info
+            datacenters: list[DatacenterInfo] = []
+            total_available_cores = 0
+            healthy_datacenter_count = 0
+
+            for dc_id in self._datacenter_managers.keys():
+                status = self._classify_datacenter_health(dc_id)
+
+                # Find the DC leader address
+                leader_addr: tuple[str, int] | None = None
+                manager_statuses = self._datacenter_manager_status.get(dc_id, {})
+                for manager_addr, heartbeat in manager_statuses.items():
+                    if heartbeat.is_leader:
+                        leader_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+                        break
+
+                datacenters.append(DatacenterInfo(
+                    dc_id=dc_id,
+                    health=status.health,
+                    leader_addr=leader_addr,
+                    available_cores=status.available_capacity,
+                    manager_count=status.manager_count,
+                    worker_count=status.worker_count,
+                ))
+
+                total_available_cores += status.available_capacity
+                if status.health == DatacenterHealth.HEALTHY:
+                    healthy_datacenter_count += 1
+
+            response = DatacenterListResponse(
+                request_id=request.request_id,
+                gate_id=self._node_id.full,
+                datacenters=datacenters,
+                total_available_cores=total_available_cores,
+                healthy_datacenter_count=healthy_datacenter_count,
+            )
+
+            return response.dump()
+
+        except Exception as e:
+            await self.handle_exception(e, "datacenter_list")
             return b'error'

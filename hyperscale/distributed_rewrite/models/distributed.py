@@ -1675,6 +1675,35 @@ class GatePingResponse(Message):
 
 
 # =============================================================================
+# Datacenter Query Messages
+# =============================================================================
+
+@dataclass(slots=True)
+class DatacenterListRequest(Message):
+    """
+    Request to list registered datacenters from a gate.
+
+    Clients use this to discover available datacenters before submitting jobs.
+    This is a lightweight query that returns datacenter identifiers and health status.
+    """
+    request_id: str = ""  # Optional request identifier for correlation
+
+
+@dataclass(slots=True)
+class DatacenterListResponse(Message):
+    """
+    Response containing list of registered datacenters.
+
+    Returns datacenter information including health status and capacity.
+    """
+    request_id: str = ""                 # Echoed from request
+    gate_id: str = ""                    # Responding gate's node_id
+    datacenters: list[DatacenterInfo] = field(default_factory=list)  # Per-DC info
+    total_available_cores: int = 0       # Total available cores across all DCs
+    healthy_datacenter_count: int = 0    # Count of healthy DCs
+
+
+# =============================================================================
 # Workflow Query Messages
 # =============================================================================
 

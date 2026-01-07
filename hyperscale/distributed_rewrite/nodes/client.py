@@ -46,6 +46,9 @@ from hyperscale.distributed_rewrite.models import (
     PingRequest,
     ManagerPingResponse,
     GatePingResponse,
+    DatacenterInfo,
+    DatacenterListRequest,
+    DatacenterListResponse,
     WorkflowQueryRequest,
     WorkflowStatusInfo,
     WorkflowQueryResponse,
@@ -993,6 +996,96 @@ class HyperscaleClient(MercurySyncBaseServer):
 
         results = await asyncio.gather(
             *[query_one(addr) for addr in self._gates],
+            return_exceptions=False,
+        )
+
+        return dict(results)
+
+    # =========================================================================
+    # Datacenter Discovery
+    # =========================================================================
+
+    async def get_datacenters(
+        self,
+        addr: tuple[str, int] | None = None,
+        timeout: float = 5.0,
+    ) -> DatacenterListResponse:
+        """
+        Get list of registered datacenters from a gate.
+
+        Returns datacenter information including health status, capacity,
+        and leader addresses. Use this to discover available datacenters
+        before submitting jobs or to check cluster health.
+
+        Args:
+            addr: Gate (host, port) to query. If None, uses next gate in rotation.
+            timeout: Request timeout in seconds.
+
+        Returns:
+            DatacenterListResponse containing:
+            - gate_id: Responding gate's node ID
+            - datacenters: List of DatacenterInfo with health/capacity details
+            - total_available_cores: Sum of available cores across all DCs
+            - healthy_datacenter_count: Count of healthy datacenters
+
+        Raises:
+            RuntimeError: If no gates configured or query fails.
+        """
+        target = addr or self._get_next_gate()
+        if not target:
+            raise RuntimeError("No gates configured")
+
+        request = DatacenterListRequest(
+            request_id=secrets.token_hex(8),
+        )
+
+        response_data, _ = await self.send_tcp(
+            target,
+            "datacenter_list",
+            request.dump(),
+            timeout=timeout,
+        )
+
+        if isinstance(response_data, Exception):
+            raise RuntimeError(f"Datacenter list query failed: {response_data}")
+
+        if response_data == b'error':
+            raise RuntimeError("Datacenter list query failed: gate returned error")
+
+        return DatacenterListResponse.load(response_data)
+
+    async def get_datacenters_from_all_gates(
+        self,
+        timeout: float = 5.0,
+    ) -> dict[tuple[str, int], DatacenterListResponse | Exception]:
+        """
+        Query datacenter list from all configured gates concurrently.
+
+        Each gate returns its view of registered datacenters. In a healthy
+        cluster, all gates should return the same information.
+
+        Args:
+            timeout: Request timeout in seconds per gate.
+
+        Returns:
+            Dict mapping gate address to either:
+            - DatacenterListResponse on success
+            - Exception if query failed
+        """
+        if not self._gates:
+            return {}
+
+        async def query_one(
+            gate_addr: tuple[str, int],
+        ) -> tuple[tuple[str, int], DatacenterListResponse | Exception]:
+            try:
+                result = await self.get_datacenters(addr=gate_addr, timeout=timeout)
+                return (gate_addr, result)
+            except Exception as e:
+                return (gate_addr, e)
+
+        results = await asyncio.gather(
+            *[query_one(gate_addr) for gate_addr in self._gates],
             return_exceptions=False,
         )
 

@@ -123,6 +123,9 @@ from .distributed import (
     DatacenterWorkflowStatus as DatacenterWorkflowStatus,
     GateWorkflowQueryResponse as GateWorkflowQueryResponse,
     EagerWorkflowEntry as EagerWorkflowEntry,
+    # Datacenter list query
+    DatacenterListRequest as DatacenterListRequest,
+    DatacenterListResponse as DatacenterListResponse,
 )
 
 # CRDTs for cross-datacenter synchronization
