@@ -175,32 +175,53 @@ class SlidingWindowCounter:
 
         return False, max(0.01, wait_time)
 
-    async def acquire_async(self, count: int = 1, max_wait: float = 10.0) -> bool:
+    async def acquire_async(
+        self,
+        count: int = 1,
+        max_wait: float = 10.0,
+        retry_increment_factor: float = 0.1,
+    ) -> bool:
         """
         Async version that waits for slots if necessary.
 
         Uses asyncio.Lock to prevent race conditions where multiple coroutines
         wait for slots and all try to acquire after the wait completes.
 
+        The method uses a retry loop with small increments to handle concurrency:
+        when multiple coroutines are waiting for slots, only one may succeed after
+        the calculated wait time. The retry loop ensures others keep trying in
+        small increments rather than failing immediately.
+
         Args:
             count: Number of request slots to acquire
             max_wait: Maximum time to wait for slots
+            retry_increment_factor: Fraction of window size to wait per retry iteration
 
         Returns:
             True if slots were acquired, False if timed out
         """
         async with self._async_lock:
-            acquired, wait_time = self.try_acquire(count)
-            if acquired:
-                return True
+            total_waited = 0.0
+            wait_increment = self.window_size_seconds * retry_increment_factor
 
-            if wait_time > max_wait or wait_time == float('inf'):
-                return False
+            while total_waited < max_wait:
+                acquired, wait_time = self.try_acquire(count)
+                if acquired:
+                    return True
 
-            # Wait for the calculated time (try_acquire computes accurate decay time)
-            await asyncio.sleep(wait_time)
+                if wait_time == float('inf'):
+                    return False
 
-            # Try again after wait - should succeed if calculation was accurate
+                # Wait in small increments to handle concurrency
+                # Use the smaller of: calculated wait time, increment, or remaining time
+                actual_wait = min(wait_time, wait_increment, max_wait - total_waited)
+                if actual_wait <= 0:
+                    return False
+
+                await asyncio.sleep(actual_wait)
+                total_waited += actual_wait
+
+            # Final attempt after exhausting max_wait
             acquired, _ = self.try_acquire(count)
             return acquired
 
@@ -285,6 +306,11 @@ class AdaptiveRateLimitConfig:
     busy_min_priority: RequestPriority = field(default=RequestPriority.HIGH)
     stressed_min_priority: RequestPriority = field(default=RequestPriority.CRITICAL)
     overloaded_min_priority: RequestPriority = field(default=RequestPriority.CRITICAL)
+
+    # Async retry configuration for handling concurrency
+    # When multiple coroutines are waiting for slots, they retry in small increments
+    # to handle race conditions where only one can acquire after the calculated wait
+    async_retry_increment_factor: float = 0.1  # Fraction of window size per retry iteration
 
     def get_operation_limits(self, operation: str) -> tuple[int, float]:
         """Get max_requests and window_size for an operation."""
@@ -449,6 +475,11 @@ class AdaptiveRateLimiter:
         """
         Async version of check with optional wait.
 
+        Uses a retry loop to handle concurrency: when multiple coroutines are
+        waiting for rate limit slots, only one may succeed after the calculated
+        wait time. The retry loop ensures others keep trying in small increments
+        rather than failing immediately.
+
         Args:
             client_id: Identifier for the client
             operation: Type of operation being performed
@@ -465,14 +496,31 @@ class AdaptiveRateLimiter:
             if result.allowed or max_wait <= 0:
                 return result
 
-            # Use the calculated retry_after time (now accurate for sliding window decay)
-            wait_time = min(result.retry_after_seconds, max_wait)
-            if wait_time <= 0 or wait_time == float('inf'):
-                return result
+            # Get operation window size for calculating wait increment
+            _, window_size = self._config.get_operation_limits(operation)
+            wait_increment = window_size * self._config.async_retry_increment_factor
 
-            await asyncio.sleep(wait_time)
+            total_waited = 0.0
+            while total_waited < max_wait:
+                # Use the smaller of: calculated wait time, increment, or remaining time
+                wait_time = min(
+                    result.retry_after_seconds,
+                    wait_increment,
+                    max_wait - total_waited,
+                )
 
-            # Re-check after wait (state may have changed)
+                if wait_time <= 0 or result.retry_after_seconds == float('inf'):
+                    return result
+
+                await asyncio.sleep(wait_time)
+                total_waited += wait_time
+
+                # Re-check after wait (state may have changed)
+                result = self.check(client_id, operation, priority, tokens)
+                if result.allowed:
+                    return result
+
+            # Final check after exhausting max_wait
             return self.check(client_id, operation, priority, tokens)
 
     def _priority_allows_bypass(
