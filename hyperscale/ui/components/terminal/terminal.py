@@ -413,26 +413,32 @@ class Terminal:
 
     async def _show_cursor(self):
         try:
-            if self._stdout is None or self._writer is None:
-                return
+            if self._writer is not None and self._stdout is not None:
+                loop = self._loop if self._loop is not None else asyncio.get_event_loop()
+                is_tty = await loop.run_in_executor(None, self._stdout.isatty)
 
-            if await self._loop.run_in_executor(None, self._stdout.isatty):
-                # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
+                if is_tty:
+                    # ANSI Control Sequence DECTCEM 1 does not work in Jupyter
 
-                if self._stdout_lock is not None:
-                    await self._stdout_lock.acquire()
+                    if self._stdout_lock is not None:
+                        await self._stdout_lock.acquire()
 
-                self._writer.write(b"\033[?25h")
-                await self._writer.drain()
-
-                if self._stdout_lock is not None and self._stdout_lock.locked():
-                    self._stdout_lock.release()
-        except Exception:
-            # Ensure cursor is shown even if something fails
-            try:
-                if self._writer is not None:
                     self._writer.write(b"\033[?25h")
                     await self._writer.drain()
+
+                    if self._stdout_lock is not None and self._stdout_lock.locked():
+                        self._stdout_lock.release()
+                    return
+
+            # Fallback: write directly to sys.stdout
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+
+        except Exception:
+            # Last resort fallback
+            try:
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
             except Exception:
                 pass
 
