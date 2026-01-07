@@ -1453,12 +1453,6 @@ class GateServer(HealthAwareServer):
         dc_state = self._dc_registration_states[dc_id]
         is_restart = dc_state.record_heartbeat(manager_addr, node_id, generation, now)
 
-        # Debug: Print registration status after each heartbeat
-        status = dc_state.get_registration_status(now)
-        active_count = dc_state.get_active_manager_count(now)
-        configured_count = len(dc_state.configured_managers)
-        print(f"[GATE {self._node_id.short}] DC {dc_id} heartbeat from {manager_addr}: status={status.value}, active={active_count}/{configured_count}")
-
         if is_restart:
             self._task_runner.run(
                 self._udp_logger.log,
@@ -1708,7 +1702,6 @@ class GateServer(HealthAwareServer):
         
         for attempt in range(max_retries + 1):
             try:
-                print(f"[GATE {self._node_id.short}] _try_dispatch_to_manager: Sending to {manager_addr} (attempt {attempt+1})")
                 response, _ = await self.send_tcp(
                     manager_addr,
                     "job_submission",
@@ -1718,7 +1711,6 @@ class GateServer(HealthAwareServer):
 
                 if isinstance(response, bytes):
                     ack = JobAck.load(response)
-                    print(f"[GATE {self._node_id.short}] _try_dispatch_to_manager: Got ack from {manager_addr}: accepted={ack.accepted}, error={ack.error}")
                     if ack.accepted:
                         circuit.record_success()
                         return (True, None)
@@ -1732,11 +1724,8 @@ class GateServer(HealthAwareServer):
                     # Manager rejected - don't retry
                     circuit.record_error()
                     return (False, ack.error)
-                else:
-                    print(f"[GATE {self._node_id.short}] _try_dispatch_to_manager: Got non-bytes response from {manager_addr}: {type(response)}")
 
             except Exception as e:
-                print(f"[GATE {self._node_id.short}] _try_dispatch_to_manager: Exception sending to {manager_addr}: {e}")
                 # Connection error - retry
                 if attempt == max_retries:
                     circuit.record_error()
@@ -3284,7 +3273,6 @@ class GateServer(HealthAwareServer):
             self._quorum_circuit.record_success()
 
             # Dispatch to each DC (in background via TaskRunner)
-            print(f"[GATE {self._node_id.short}] job_submission: Dispatching job {submission.job_id} to DCs: {target_dcs}")
             self._task_runner.run(
                 self._dispatch_job_to_datacenters, submission, target_dcs
             )
@@ -3419,13 +3407,11 @@ class GateServer(HealthAwareServer):
             )
         
         # Dispatch with fallback support
-        print(f"[GATE {self._node_id.short}] _dispatch_job_to_datacenters: primary_dcs={primary_dcs}, fallback_dcs={fallback_dcs}")
         successful_dcs, failed_dcs = await self._dispatch_job_with_fallback(
             submission,
             primary_dcs,
             fallback_dcs,
         )
-        print(f"[GATE {self._node_id.short}] _dispatch_job_to_datacenters: successful={successful_dcs}, failed={failed_dcs}")
         
         if not successful_dcs:
             # All DCs failed (all UNHEALTHY) - record for circuit breaker
