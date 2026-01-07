@@ -392,19 +392,27 @@ Extract classes from monolithic files into focused modules.
 
 ### 6.1 Health State Piggyback
 
-- [ ] Add `HealthPiggyback` to SWIM message embedding
-- [ ] Update `StateEmbedder` to include health signals
-- [ ] Parse health piggyback in SWIM message handlers
+- [x] Add `HealthPiggyback` to SWIM message embedding
+- [x] Create `HealthGossipBuffer` for O(log n) health dissemination
+- [x] Update `StateEmbedder` to include health signals (`get_health_piggyback()`)
+- [x] Parse health piggyback in SWIM message handlers
+- [x] Add integration tests for health gossip buffer
 
 ### 6.2 Overload Signaling
 
-- [ ] Piggyback overload state on SWIM messages
-- [ ] React to peer overload state (reduce traffic)
+- [x] Piggyback overload state on SWIM messages
+- [x] Create `PeerHealthAwareness` for tracking peer load state
+- [x] React to peer overload state (reduce traffic)
+  - [x] Extend probe timeouts for overloaded peers
+  - [x] Prefer healthy peers for indirect probe proxies
+  - [x] Reduce gossip piggyback to stressed peers
+- [x] Add integration tests for peer health awareness
 
 ### 6.3 Adaptive Timeouts
 
-- [ ] Scale SWIM probe timeouts based on reported load
-- [ ] Implement out-of-band health channel for high-priority probes
+- [x] Scale SWIM probe timeouts based on reported load
+- [x] Implement `OutOfBandHealthChannel` for high-priority probes
+- [x] Add integration tests for out-of-band health channel
 
 ---
 
@@ -412,9 +420,9 @@ Extract classes from monolithic files into focused modules.
 
 ### Previously Identified
 
-- [ ] Add `fence_token` field to `JobFinalResult`, `JobProgress`, `JobStatusPush`
-- [ ] Implement fence token validation in Gate handlers
-- [ ] Write integration test for fencing tokens
+- [x] Add `fence_token` field to `JobFinalResult`, `JobProgress`, `JobStatusPush`
+- [x] Implement fence token validation in Gate handlers
+- [x] Write integration test for fencing tokens
 
 ### Gate Per-Job Leadership
 
