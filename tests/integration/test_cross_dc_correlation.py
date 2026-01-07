@@ -116,13 +116,21 @@ class TestBasicFunctionality:
         assert "dc-unknown" in stats["recent_failing_dcs"]
 
     def test_record_recovery_clears_failures(self):
-        """Test that recording recovery clears failure history."""
-        detector = CrossDCCorrelationDetector()
+        """Test that recording recovery clears failure history when confirmed."""
+        # With anti-flapping, recovery must be confirmed before clearing failures
+        # Set recovery_confirmation_seconds=0 for immediate confirmation
+        config = CrossDCCorrelationConfig(
+            recovery_confirmation_seconds=0,  # Immediate recovery confirmation
+        )
+        detector = CrossDCCorrelationDetector(config=config)
 
         detector.record_failure("dc-west", "unhealthy")
         detector.record_failure("dc-west", "timeout")
         assert detector.get_recent_failure_count("dc-west") == 2
 
+        # First recovery transitions to RECOVERING state
+        detector.record_recovery("dc-west")
+        # Second recovery confirms (since confirmation_seconds=0)
         detector.record_recovery("dc-west")
         assert detector.get_recent_failure_count("dc-west") == 0
 
@@ -645,6 +653,7 @@ class TestConcurrentFailureScenarios:
         config = CrossDCCorrelationConfig(
             medium_threshold=3,
             failure_confirmation_seconds=0,  # Immediate confirmation for testing
+            recovery_confirmation_seconds=0,  # Immediate recovery confirmation
         )
         detector = CrossDCCorrelationDetector(config=config)
 
@@ -659,7 +668,8 @@ class TestConcurrentFailureScenarios:
         decision1 = detector.check_correlation("dc-a")
         assert decision1.severity == CorrelationSeverity.MEDIUM
 
-        # One DC recovers
+        # One DC recovers (needs two calls: first to RECOVERING, second to confirm HEALTHY)
+        detector.record_recovery("dc-a")
         detector.record_recovery("dc-a")
 
         # Check remaining failures
