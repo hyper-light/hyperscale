@@ -3839,12 +3839,17 @@ class GateServer(HealthAwareServer):
         """
         Aggregate workflow results from all DCs and forward to client.
 
-        Uses Results.merge_results() to combine all WorkflowStats.
+        For test workflows: Uses Results.merge_results() to combine all WorkflowStats.
+        For non-test workflows: Returns per-DC raw results without aggregation.
         Includes per-DC breakdown for client visibility.
         """
         workflow_results = self._workflow_dc_results.get(job_id, {}).get(workflow_id, {})
         if not workflow_results:
             return
+
+        # Determine if this is a test workflow from any DC push (all should match)
+        first_dc_push = next(iter(workflow_results.values()))
+        is_test_workflow = first_dc_push.is_test
 
         # Collect all WorkflowStats from all DCs and build per-DC results
         all_workflow_stats: list[WorkflowStats] = []
@@ -3858,23 +3863,34 @@ class GateServer(HealthAwareServer):
             workflow_name = dc_push.workflow_name
             all_workflow_stats.extend(dc_push.results)
 
-            # Aggregate this DC's results for per-DC breakdown
-            dc_aggregated_stats: WorkflowStats | None = None
-            if dc_push.results:
-                if len(dc_push.results) > 1:
-                    aggregator = Results()
-                    dc_aggregated_stats = aggregator.merge_results(dc_push.results)
-                else:
-                    dc_aggregated_stats = dc_push.results[0]
+            if is_test_workflow:
+                # Test workflow: aggregate this DC's results for per-DC breakdown
+                dc_aggregated_stats: WorkflowStats | None = None
+                if dc_push.results:
+                    if len(dc_push.results) > 1:
+                        aggregator = Results()
+                        dc_aggregated_stats = aggregator.merge_results(dc_push.results)
+                    else:
+                        dc_aggregated_stats = dc_push.results[0]
 
-            # Build per-DC result entry
-            per_dc_results.append(WorkflowDCResult(
-                datacenter=datacenter,
-                status=dc_push.status,
-                stats=dc_aggregated_stats,
-                error=dc_push.error,
-                elapsed_seconds=dc_push.elapsed_seconds,
-            ))
+                # Build per-DC result entry with aggregated stats
+                per_dc_results.append(WorkflowDCResult(
+                    datacenter=datacenter,
+                    status=dc_push.status,
+                    stats=dc_aggregated_stats,
+                    error=dc_push.error,
+                    elapsed_seconds=dc_push.elapsed_seconds,
+                ))
+            else:
+                # Non-test workflow: include raw results list per DC
+                per_dc_results.append(WorkflowDCResult(
+                    datacenter=datacenter,
+                    status=dc_push.status,
+                    stats=None,  # No aggregated stats for non-test workflows
+                    error=dc_push.error,
+                    elapsed_seconds=dc_push.elapsed_seconds,
+                    raw_results=dc_push.results,  # Raw unaggregated results
+                ))
 
             if dc_push.status == "FAILED":
                 has_failure = True
@@ -3887,28 +3903,34 @@ class GateServer(HealthAwareServer):
         if not all_workflow_stats:
             return
 
-        # Aggregate cross-DC using Results.merge_results()
-        aggregator = Results()
-        if len(all_workflow_stats) > 1:
-            aggregated = aggregator.merge_results(all_workflow_stats)
-        else:
-            aggregated = all_workflow_stats[0]
-
         status = "FAILED" if has_failure else "COMPLETED"
         error = "; ".join(error_messages) if error_messages else None
 
-        # Build aggregated push for client with per-DC breakdown
+        if is_test_workflow:
+            # Test workflow: aggregate cross-DC using Results.merge_results()
+            aggregator = Results()
+            if len(all_workflow_stats) > 1:
+                aggregated = aggregator.merge_results(all_workflow_stats)
+            else:
+                aggregated = all_workflow_stats[0]
+            results_to_send = [aggregated]
+        else:
+            # Non-test workflow: return all raw stats without aggregation
+            results_to_send = all_workflow_stats
+
+        # Build push for client with per-DC breakdown
         client_push = WorkflowResultPush(
             job_id=job_id,
             workflow_id=workflow_id,
             workflow_name=workflow_name,
             datacenter="aggregated",
             status=status,
-            results=[aggregated],
+            results=results_to_send,
             error=error,
             elapsed_seconds=max_elapsed,
             per_dc_results=per_dc_results,
             completed_at=time.time(),
+            is_test=is_test_workflow,
         )
 
         # Send to client

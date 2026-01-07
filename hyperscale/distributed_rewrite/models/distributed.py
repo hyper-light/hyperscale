@@ -857,9 +857,11 @@ class WorkflowDCResult:
     """Per-datacenter workflow result for cross-DC visibility."""
     datacenter: str              # Datacenter identifier
     status: str                  # COMPLETED | FAILED
-    stats: WorkflowStats | None = None  # Aggregated stats for this DC
+    stats: WorkflowStats | None = None  # Aggregated stats for this DC (test workflows)
     error: str | None = None     # Error message if failed
     elapsed_seconds: float = 0.0
+    # Raw results list for non-test workflows (unaggregated)
+    raw_results: list[WorkflowStats] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -886,6 +888,10 @@ class WorkflowResultPush(Message):
     per_dc_results: list[WorkflowDCResult] = field(default_factory=list)
     # Completion timestamp for ordering
     completed_at: float = 0.0    # Unix timestamp when workflow completed
+    # Whether this workflow contains test hooks (determines aggregation behavior)
+    # True: aggregate results using merge_results()
+    # False: return raw list of WorkflowStats per DC
+    is_test: bool = True
 
 
 @dataclass(slots=True)

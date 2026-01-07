@@ -4629,6 +4629,7 @@ class ManagerServer(HealthAwareServer):
                 results=all_workflow_stats,
                 error=error,
                 elapsed_seconds=max_elapsed,
+                is_test=is_test_workflow,
             )
             await self._send_workflow_result_to_gate(push, origin_gate)
 
@@ -4654,6 +4655,7 @@ class ManagerServer(HealthAwareServer):
                 results=results_to_send,
                 error=error,
                 elapsed_seconds=max_elapsed,
+                is_test=is_test_workflow,
             )
             await self._send_workflow_result_to_client(push, callback)
 
