@@ -1157,24 +1157,6 @@ class HyperscaleClient(MercurySyncBaseServer):
                 job.overall_rate = push.overall_rate
                 job.elapsed_seconds = push.elapsed_seconds
 
-            # Call user callback if registered - convert to JobStatusPush format
-            callback = self._job_callbacks.get(push.job_id)
-            if callback:
-                try:
-                    status_push = JobStatusPush(
-                        job_id=push.job_id,
-                        status=push.status,
-                        message="batch_update",
-                        total_completed=push.total_completed,
-                        total_failed=push.total_failed,
-                        overall_rate=push.overall_rate,
-                        elapsed_seconds=push.elapsed_seconds,
-                        is_final=False,
-                    )
-                    callback(status_push)
-                except Exception:
-                    pass  # Don't let callback errors break us
-
             return b'ok'
 
         except Exception:

@@ -156,6 +156,8 @@ from hyperscale.distributed_rewrite.jobs import (
     WorkerInfo,
     WorkerHealth,
     WorkflowDispatcher,
+    WindowedStatsCollector,
+    WindowedStatsPush,
 )
 from hyperscale.distributed_rewrite.models import PendingWorkflow
 from hyperscale.distributed_rewrite.models.jobs import JobInfo
@@ -449,6 +451,21 @@ class ManagerServer(HealthAwareServer):
         # Worker deadlines for extension tracking
         # Maps worker_id -> deadline timestamp
         self._worker_deadlines: dict[str, float] = {}
+
+        # Time-windowed stats collector for streaming progress updates
+        # Collects WorkflowProgress updates into time-correlated windows
+        self._windowed_stats = WindowedStatsCollector(
+            window_size_ms=env.STATS_WINDOW_SIZE_MS,
+            drift_tolerance_ms=env.STATS_DRIFT_TOLERANCE_MS,
+            max_window_age_ms=env.STATS_MAX_WINDOW_AGE_MS,
+        )
+
+        # Stats push interval from config (in milliseconds)
+        self._stats_push_interval_ms = env.STATS_PUSH_INTERVAL_MS
+
+        # Progress update callbacks (for streaming stats to clients)
+        # job_id -> callback address for progress updates
+        self._progress_callbacks: dict[str, tuple[str, int]] = {}
 
         # WorkflowDispatcher for dependency-aware workflow dispatch
         # Coordinates with JobManager and WorkerPool for allocation
@@ -2007,7 +2024,13 @@ class ManagerServer(HealthAwareServer):
         else:
             # No gates - start batch push loop for direct client connections
             self._task_runner.run(self._client_batch_push_loop)
-        
+
+        # Start windowed stats push loop for streaming progress updates
+        # This runs regardless of gate presence:
+        # - With gates: Sends unaggregated windowed stats to gates
+        # - Without gates: Sends aggregated windowed stats to clients
+        self._task_runner.run(self._windowed_stats_push_loop)
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -3955,7 +3978,41 @@ class ManagerServer(HealthAwareServer):
         finally:
             latency_ms = (time.monotonic() - start_time) * 1000
             self._record_request_latency(latency_ms)
-    
+
+    @tcp.receive()
+    async def worker_heartbeat(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle worker heartbeat via TCP.
+
+        This is called when workers send immediate core availability notifications.
+        It triggers workflow dispatch when cores become available.
+        """
+        start_time = time.monotonic()
+        try:
+            heartbeat = WorkerHeartbeat.load(data)
+
+            # Process heartbeat via WorkerPool (updates available cores)
+            await self._worker_pool.process_heartbeat(heartbeat.node_id, heartbeat)
+
+            # Trigger dispatch for all active jobs that might have waiting workflows
+            if self._workflow_dispatcher:
+                for job_id, submission in list(self._job_submissions.items()):
+                    await self._workflow_dispatcher.try_dispatch(job_id, submission)
+
+            return b'ok'
+
+        except Exception as e:
+            await self.handle_exception(e, "worker_heartbeat")
+            return b'error'
+        finally:
+            latency_ms = (time.monotonic() - start_time) * 1000
+            self._record_request_latency(latency_ms)
+
     @tcp.receive()
     async def workflow_progress(
         self,
@@ -3974,6 +4031,12 @@ class ManagerServer(HealthAwareServer):
         """
         try:
             progress = WorkflowProgress.load(data)
+
+            # Resolve worker_id from address for windowed stats tracking
+            worker_id = self._worker_addr_to_id.get(addr, f"{addr[0]}:{addr[1]}")
+
+            # Add to windowed stats collector for streaming progress updates
+            await self._windowed_stats.add_progress(worker_id, progress)
 
             # Forward to job leader if we're not the leader
             forwarded = await self._try_forward_progress_to_leader(progress)
@@ -4293,20 +4356,14 @@ class ManagerServer(HealthAwareServer):
 
     async def _notify_workflow_dispatcher(self, job_id: str, workflow_id: str, status: str) -> None:
         """Notify workflow dispatcher of completion/failure for dependency tracking."""
-        print(f"[DEBUG][Manager] _notify_workflow_dispatcher called: job_id={job_id}, workflow_id={workflow_id}, status={status}")
         if not self._workflow_dispatcher:
-            print(f"[DEBUG][Manager] _notify_workflow_dispatcher: NO dispatcher, returning")
             return
 
         if status == WorkflowStatus.COMPLETED.value:
-            print(f"[DEBUG][Manager] _notify_workflow_dispatcher: calling mark_workflow_completed")
             await self._workflow_dispatcher.mark_workflow_completed(job_id, workflow_id)
             submission = self._job_submissions.get(job_id)
             if submission:
-                print(f"[DEBUG][Manager] _notify_workflow_dispatcher: calling try_dispatch")
                 await self._workflow_dispatcher.try_dispatch(job_id, submission)
-            else:
-                print(f"[DEBUG][Manager] _notify_workflow_dispatcher: NO submission found for job {job_id}")
         elif status == WorkflowStatus.FAILED.value:
             await self._workflow_dispatcher.mark_workflow_failed(job_id, workflow_id)
 
@@ -4368,12 +4425,10 @@ class ManagerServer(HealthAwareServer):
         """
         try:
             result = WorkflowFinalResult.load(data)
-            print(f"[DEBUG][Manager] workflow_final_result received: workflow_id={result.workflow_id}, status={result.status}")
 
             # Forward to job leader if we're not the leader
             forward_response = await self._forward_result_to_job_leader(result, data)
             if forward_response is not None:
-                print(f"[DEBUG][Manager] workflow_final_result: forwarded to job leader")
                 return forward_response
 
             # Update initial workflow status
@@ -4381,14 +4436,12 @@ class ManagerServer(HealthAwareServer):
 
             # Process under lock for sub-workflow coordination
             parent_workflow_id = self._get_parent_workflow_id(result.workflow_id)
-            print(f"[DEBUG][Manager] workflow_final_result: parent_workflow_id={parent_workflow_id}")
             await self._workflow_results_locks[parent_workflow_id].acquire()
 
             try:
                 await self._update_worker_cores(result)
 
                 recorded, _ = await self._job_manager.record_sub_workflow_result(result.workflow_id, result)
-                print(f"[DEBUG][Manager] workflow_final_result: recorded={recorded}")
                 if not recorded:
                     return b'error'
 
@@ -4397,9 +4450,7 @@ class ManagerServer(HealthAwareServer):
                     await self._handle_context_updates(result)
 
                     is_parent_complete = self._is_parent_workflow_complete(parent_workflow_id)
-                    print(f"[DEBUG][Manager] workflow_final_result: is_parent_complete={is_parent_complete}")
                     if not is_parent_complete:
-                        print(f"[DEBUG][Manager] workflow_final_result: parent not complete, returning early (NOT calling _finalize)")
                         return b'ok'
 
                     await self._handle_workflow_completion(result.job_id, parent_workflow_id)
@@ -4407,7 +4458,6 @@ class ManagerServer(HealthAwareServer):
                     # Non-sub-workflow context updates
                     await self._handle_context_updates(result)
 
-                print(f"[DEBUG][Manager] workflow_final_result: calling _finalize_workflow_result")
                 await self._finalize_workflow_result(result)
 
                 if self._is_job_complete(result.job_id):
@@ -4420,9 +4470,6 @@ class ManagerServer(HealthAwareServer):
                 self._workflow_results_locks[parent_workflow_id].release()
 
         except Exception as e:
-            import traceback
-            print(f"[DEBUG][Manager] workflow_final_result EXCEPTION: {e}")
-            print(f"[DEBUG][Manager] Traceback:\n{traceback.format_exc()}")
             await self.handle_exception(e, "workflow_final_result")
             return b'error'
     
@@ -4562,8 +4609,6 @@ class ManagerServer(HealthAwareServer):
             )
         }
 
-        print(f"[DEBUG][Manager] Workflow={workflow.name} has {len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST]) } test hooks")
-
         return len([hook for hook in hooks.values() if hook.hook_type == HookType.TEST]) > 0
 
     async def _handle_workflow_completion(self, job_id: str, parent_workflow_id: str) -> None:
@@ -4620,8 +4665,6 @@ class ManagerServer(HealthAwareServer):
         workflow_object = workflow_info.workflow if workflow_info else None
         is_test_workflow = self._is_test_workflow(workflow_object)
 
-        print("[DEBUG][Manager] First Workflow",all_workflow_stats[0], is_test_workflow)
-
         # Determine if job came from gate or client
         origin_gate = self._job_origin_gates.get(job_id)
         callback = self._job_callbacks.get(job_id)
@@ -4666,7 +4709,6 @@ class ManagerServer(HealthAwareServer):
         Client (test workflow): Receives aggregated stats.
         Client (non-test workflow): Receives raw stats.
         """
-        print(f"[DEBUG][Manager] for_gate={for_gate} is_test_workflow={is_test_workflow}")
         if for_gate or not is_test_workflow:
             return all_workflow_stats
 
@@ -4994,6 +5036,12 @@ class ManagerServer(HealthAwareServer):
                     aggregated_stats=stored_results,
                     callback_addr=callback,
                 )
+
+        # Cleanup windowed stats for completed job to prevent memory leaks
+        await self._windowed_stats.cleanup_job_windows(job_id)
+
+        # Cleanup progress callback for completed job
+        self._progress_callbacks.pop(job_id, None)
 
     async def _send_job_final_result_to_gates(self, job_final: JobFinalResult) -> None:
         """
@@ -5849,6 +5897,95 @@ class ManagerServer(HealthAwareServer):
                     )
                 )
                 await asyncio.sleep(batch_interval)
+
+    async def _windowed_stats_push_loop(self) -> None:
+        """
+        Background loop for time-windowed stats streaming.
+
+        Flushes closed time windows and pushes stats:
+        - With gates: Sends unaggregated stats to gates for cross-DC aggregation
+        - Without gates: Sends aggregated stats directly to clients
+
+        Runs at STATS_PUSH_INTERVAL_MS (default 100ms) for low-latency streaming.
+        """
+        interval_seconds = self._stats_push_interval_ms / 1000.0
+
+        while self._running:
+            try:
+                await asyncio.sleep(interval_seconds)
+                if not self._running:
+                    break
+
+                # Determine if we're pushing to gates or clients
+                has_gates = bool(self._gate_addrs or self._known_gates)
+
+                # Flush closed windows - aggregate for clients, not for gates
+                pushes = await self._windowed_stats.flush_closed_windows(
+                    aggregate=not has_gates
+                )
+
+                if not pushes:
+                    continue
+
+                if has_gates:
+                    # Forward unaggregated stats to gates
+                    for push in pushes:
+                        push.datacenter = self._node_id.datacenter
+                        await self._forward_windowed_stats_to_gates(push)
+                else:
+                    # Push aggregated stats to clients
+                    for push in pushes:
+                        await self._push_windowed_stats_to_client(push)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerError(
+                        message=f"Windowed stats push loop error: {e}",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                await asyncio.sleep(interval_seconds)
+
+    async def _forward_windowed_stats_to_gates(self, push: WindowedStatsPush) -> None:
+        """Forward unaggregated windowed stats to all healthy gates."""
+        for gate_id in list(self._healthy_gate_ids):
+            gate_info = self._known_gates.get(gate_id)
+            if not gate_info:
+                continue
+
+            gate_addr = (gate_info.tcp_host, gate_info.tcp_port)
+            try:
+                await self.send_tcp(
+                    gate_addr,
+                    "windowed_stats_push",
+                    cloudpickle.dumps(push),
+                    timeout=1.0,
+                )
+            except Exception:
+                # Gate unreachable - continue with others
+                pass
+
+    async def _push_windowed_stats_to_client(self, push: WindowedStatsPush) -> None:
+        """Push aggregated windowed stats to client callback."""
+        callback = self._progress_callbacks.get(push.job_id)
+        if not callback:
+            return
+
+        try:
+            await self.send_tcp(
+                callback,
+                "windowed_stats_push",
+                cloudpickle.dumps(push),
+                timeout=1.0,
+            )
+        except Exception:
+            # Client unreachable - don't block
+            pass
 
     # =========================================================================
     # Peer Job State Sync
@@ -6740,29 +6877,24 @@ class ManagerServer(HealthAwareServer):
         know where to route workflow results.
         """
         try:
-            print(f"[DEBUG][Manager] job_submission handler called from {addr}")
             # Rate limit check (AD-24)
             client_id = f"{addr[0]}:{addr[1]}"
             allowed, retry_after = self._check_rate_limit_for_operation(client_id, "job_submit")
             if not allowed:
-                print(f"[DEBUG][Manager] job_submission RATE LIMITED for {client_id}")
                 return RateLimitResponse(
                     operation="job_submit",
                     retry_after_seconds=retry_after,
                 ).dump()
 
             submission = JobSubmission.load(data)
-            print(f"[DEBUG][Manager] job_submission loaded: job_id={submission.job_id}")
 
             # Unpickle workflows
             workflows: list[
                 tuple[list[str], Workflow]
             ] = restricted_loads(submission.workflows)
-            print(f"[DEBUG][Manager] job_submission unpickled {len(workflows)} workflows")
 
             # Only active managers accept jobs (not SYNCING)
             if self._manager_state != ManagerState.ACTIVE:
-                print(f"[DEBUG][Manager] job_submission REJECTED - manager state is {self._manager_state.value}")
                 ack = JobAck(
                     job_id=submission.job_id,
                     accepted=False,
@@ -6854,9 +6986,6 @@ class ManagerServer(HealthAwareServer):
             return ack.dump()
             
         except Exception as e:
-            import traceback
-            print(f"[DEBUG][Manager] job_submission EXCEPTION: {e}")
-            print(f"[DEBUG][Manager] Traceback:\n{traceback.format_exc()}")
             await self.handle_exception(e, "job_submission")
             ack = JobAck(
                 job_id="unknown",
@@ -6940,9 +7069,6 @@ class ManagerServer(HealthAwareServer):
                 self._increment_version()
 
         except Exception as e:
-            import traceback
-            print(f"[DEBUG][Manager] _dispatch_job_workflows EXCEPTION: {e}")
-            print(f"[DEBUG][Manager] Traceback:\n{traceback.format_exc()}")
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerError(
@@ -6954,7 +7080,6 @@ class ManagerServer(HealthAwareServer):
             )
             job = self._job_manager.get_job_by_id(submission.job_id)
             if job:
-                print(f"[DEBUG][Manager] Setting job {submission.job_id} status to FAILED due to exception")
                 job.status = JobStatus.FAILED.value
             self._increment_version()
 
