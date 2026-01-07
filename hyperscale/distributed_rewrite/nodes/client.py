@@ -53,6 +53,8 @@ from hyperscale.distributed_rewrite.models import (
     GateWorkflowQueryResponse,
     RegisterCallback,
     RegisterCallbackResponse,
+    ReporterResultPush,
+    WorkflowResultPush,
     # Cancellation (AD-20)
     JobCancelRequest,
     JobCancelResponse,
@@ -62,10 +64,32 @@ from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 
 
 @dataclass
+class ReporterResult:
+    """Result of a reporter submission."""
+    reporter_type: str
+    success: bool
+    error: str | None = None
+    elapsed_seconds: float = 0.0
+    source: str = ""  # "manager" or "gate"
+    datacenter: str = ""  # For manager source
+
+
+@dataclass
+class WorkflowResult:
+    """Result of a completed workflow within a job."""
+    workflow_id: str
+    workflow_name: str
+    status: str
+    stats: Any = None  # Aggregated WorkflowStats
+    error: str | None = None
+    elapsed_seconds: float = 0.0
+
+
+@dataclass
 class JobResult:
     """
     Result of a completed job.
-    
+
     For single-DC jobs, only basic fields are populated.
     For multi-DC jobs (via gates), per_datacenter_results and aggregated are populated.
     """
@@ -76,9 +100,13 @@ class JobResult:
     overall_rate: float = 0.0
     elapsed_seconds: float = 0.0
     error: str | None = None
+    # Workflow results (populated as each workflow completes)
+    workflow_results: dict[str, WorkflowResult] = field(default_factory=dict)  # workflow_id -> result
     # Multi-DC fields (populated when result comes from a gate)
     per_datacenter_results: list = field(default_factory=list)  # list[JobFinalResult]
     aggregated: Any = None  # AggregatedJobStats
+    # Reporter results (populated as reporters complete)
+    reporter_results: dict[str, ReporterResult] = field(default_factory=dict)  # reporter_type -> result
 
 
 class HyperscaleClient(MercurySyncBaseServer):
@@ -130,7 +158,13 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._job_events: dict[str, asyncio.Event] = {}
         self._job_callbacks: dict[str, Callable[[JobStatusPush], None]] = {}
         self._job_targets: dict[str, tuple[str, int]] = {}  # job_id -> manager/gate that accepted
-        
+
+        # Reporter result callbacks (called when reporter submission completes)
+        self._reporter_callbacks: dict[str, Callable[[ReporterResultPush], None]] = {}
+
+        # Workflow result callbacks (called when each workflow completes)
+        self._workflow_callbacks: dict[str, Callable[[WorkflowResultPush], None]] = {}
+
         # For selecting targets
         self._current_manager_idx = 0
         self._current_gate_idx = 0
@@ -193,6 +227,9 @@ class HyperscaleClient(MercurySyncBaseServer):
         datacenter_count: int = 1,
         datacenters: list[str] | None = None,
         on_status_update: Callable[[JobStatusPush], None] | None = None,
+        on_workflow_result: Callable[[WorkflowResultPush], None] | None = None,
+        reporting_configs: list | None = None,
+        on_reporter_result: Callable[[ReporterResultPush], None] | None = None,
         max_redirects: int = 3,
         max_retries: int = 5,
         retry_base_delay: float = 0.5,
@@ -207,6 +244,9 @@ class HyperscaleClient(MercurySyncBaseServer):
             datacenter_count: Number of datacenters to run in (gates only)
             datacenters: Specific datacenters to target (optional)
             on_status_update: Callback for status updates (optional)
+            on_workflow_result: Callback for workflow completion results (optional)
+            reporting_configs: List of ReporterConfig objects for result submission (optional)
+            on_reporter_result: Callback for reporter submission results (optional)
             max_redirects: Maximum leader redirects to follow
             max_retries: Maximum retries for transient errors (syncing, etc.)
             retry_base_delay: Base delay for exponential backoff (seconds)
@@ -222,6 +262,11 @@ class HyperscaleClient(MercurySyncBaseServer):
         # Serialize workflows
         workflows_bytes = cloudpickle.dumps(workflows)
 
+        # Serialize reporter configs if provided
+        reporting_configs_bytes = b''
+        if reporting_configs:
+            reporting_configs_bytes = cloudpickle.dumps(reporting_configs)
+
         submission = JobSubmission(
             job_id=job_id,
             workflows=workflows_bytes,
@@ -230,6 +275,7 @@ class HyperscaleClient(MercurySyncBaseServer):
             datacenter_count=datacenter_count,
             datacenters=datacenters or [],
             callback_addr=self._get_callback_addr(),
+            reporting_configs=reporting_configs_bytes,
         )
 
         # Initialize job tracking
@@ -240,6 +286,10 @@ class HyperscaleClient(MercurySyncBaseServer):
         self._job_events[job_id] = asyncio.Event()
         if on_status_update:
             self._job_callbacks[job_id] = on_status_update
+        if on_workflow_result:
+            self._workflow_callbacks[job_id] = on_workflow_result
+        if on_reporter_result:
+            self._reporter_callbacks[job_id] = on_reporter_result
 
         # Get all available targets for fallback
         all_targets = []
@@ -972,10 +1022,10 @@ class HyperscaleClient(MercurySyncBaseServer):
                         event.set()
             
             return b'ok'
-            
-        except Exception as e:
+
+        except Exception:
             return b'error'
-    
+
     @tcp.receive()
     async def job_batch_push(
         self,
@@ -986,7 +1036,7 @@ class HyperscaleClient(MercurySyncBaseServer):
         """Handle batch stats push notification from gate/manager."""
         try:
             push = JobBatchPush.load(data)
-            
+
             # Update all jobs in the batch
             for job_id, stats in push.job_stats.items():
                 job = self._jobs.get(job_id)
@@ -994,12 +1044,12 @@ class HyperscaleClient(MercurySyncBaseServer):
                     job.total_completed = stats.get('completed', 0)
                     job.total_failed = stats.get('failed', 0)
                     job.overall_rate = stats.get('rate', 0.0)
-            
+
             return b'ok'
-            
-        except Exception as e:
+
+        except Exception:
             return b'error'
-    
+
     @tcp.receive()
     async def job_final_result(
         self,
@@ -1030,10 +1080,10 @@ class HyperscaleClient(MercurySyncBaseServer):
                     event.set()
             
             return b'ok'
-            
-        except Exception as e:
+
+        except Exception:
             return b'error'
-    
+
     @tcp.receive()
     async def global_job_result(
         self,
@@ -1068,7 +1118,91 @@ class HyperscaleClient(MercurySyncBaseServer):
                     event.set()
             
             return b'ok'
-            
-        except Exception as e:
+
+        except Exception:
+            return b'error'
+
+    @tcp.receive()
+    async def reporter_result_push(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle reporter result notification from manager or gate.
+
+        Called when a reporter submission completes (success or failure).
+        Updates the job's reporter_results and calls any registered callback.
+        """
+        try:
+            push = ReporterResultPush.load(data)
+
+            job = self._jobs.get(push.job_id)
+            if job:
+                # Store the result
+                job.reporter_results[push.reporter_type] = ReporterResult(
+                    reporter_type=push.reporter_type,
+                    success=push.success,
+                    error=push.error,
+                    elapsed_seconds=push.elapsed_seconds,
+                    source=push.source,
+                    datacenter=push.datacenter,
+                )
+
+            # Call user callback if registered
+            callback = self._reporter_callbacks.get(push.job_id)
+            if callback:
+                try:
+                    callback(push)
+                except Exception:
+                    pass  # Don't let callback errors break the handler
+
+            return b'ok'
+
+        except Exception:
+            return b'error'
+
+    @tcp.receive()
+    async def workflow_result_push(
+        self,
+        addr: tuple[str, int],
+        data: bytes,
+        clock_time: int,
+    ):
+        """
+        Handle workflow result push from manager or gate.
+
+        Called when a workflow completes with aggregated results.
+        Updates the job's workflow_results for immediate access.
+        """
+        try:
+            push = WorkflowResultPush.load(data)
+
+            job = self._jobs.get(push.job_id)
+            if job:
+                # Extract aggregated stats (should be single item list)
+                stats = push.results[0] if push.results else None
+
+                job.workflow_results[push.workflow_id] = WorkflowResult(
+                    workflow_id=push.workflow_id,
+                    workflow_name=push.workflow_name,
+                    status=push.status,
+                    stats=stats,
+                    error=push.error,
+                    elapsed_seconds=push.elapsed_seconds,
+                )
+
+            # Call user callback if registered
+            callback = self._workflow_callbacks.get(push.job_id)
+            if callback:
+                try:
+                    callback(push)
+                except Exception:
+                    pass  # Don't let callback errors break the handler
+
+            return b'ok'
+
+        except Exception:
             return b'error'
 
