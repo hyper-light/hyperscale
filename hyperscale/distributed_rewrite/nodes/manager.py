@@ -7510,11 +7510,17 @@ class ManagerServer(HealthAwareServer):
             # Check specific workflow status in sub_workflows
             for sub_wf in job.sub_workflows.values():
                 if str(sub_wf.token) == query.workflow_id:
+                    # Extract workflow_name and status from progress if available
+                    workflow_name = ""
+                    status = WorkflowStatus.RUNNING.value
+                    if sub_wf.progress is not None:
+                        workflow_name = sub_wf.progress.workflow_name
+                        status = sub_wf.progress.status
                     response = WorkflowCancellationResponse(
                         job_id=query.job_id,
                         workflow_id=query.workflow_id,
-                        workflow_name=sub_wf.workflow_name,
-                        status=sub_wf.status or WorkflowStatus.RUNNING.value,
+                        workflow_name=workflow_name,
+                        status=status,
                     )
                     return response.dump()
 
