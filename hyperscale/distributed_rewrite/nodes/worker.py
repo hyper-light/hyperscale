@@ -1519,10 +1519,16 @@ class WorkerServer(HealthAwareServer):
 
             progress.workflow_name = workflow.name
             progress.status = WorkflowStatus.RUNNING.value
+            progress.collected_at = time.time()  # Unix timestamp for cross-node alignment
             self._increment_version()
 
             # Track workflow_id -> workflow_name mapping for cancellation
             self._workflow_id_to_name[dispatch.workflow_id] = workflow.name
+
+            # Send immediate "started" progress update - ensures short workflows
+            # get at least start + completion updates regardless of duration
+            if self._healthy_manager_ids:
+                await self._send_progress_update_direct(progress)
 
             # Initialize cores_completed tracking
             self._workflow_cores_completed[dispatch.workflow_id] = set()
