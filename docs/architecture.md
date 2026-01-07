@@ -9600,6 +9600,1047 @@ if __name__ == "__main__":
 
 ---
 
+---
+
+## Implemented Feature Documentation
+
+This section documents features that have been implemented, including their architecture, configuration, and usage patterns.
+
+### Terminal UI Architecture
+
+The Terminal UI provides real-time visual feedback during test execution with workflow progress, metrics, and statistics.
+
+#### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Terminal UI Architecture                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                  HyperscaleInterface                      │  │
+│  │                                                           │  │
+│  │  • Coordinates UI components                              │  │
+│  │  • Cycles through active workflows                        │  │
+│  │  • Handles updates from InterfaceUpdatesController        │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                      Terminal                             │  │
+│  │                                                           │  │
+│  │  • Raw terminal control (ANSI escape sequences)          │  │
+│  │  • Manages Canvas layout                                  │  │
+│  │  • Handles refresh rate and rendering                     │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                       Canvas                              │  │
+│  │                                                           │  │
+│  │  • Contains Sections arranged in rows                     │  │
+│  │  • Handles resize and layout calculations                 │  │
+│  │  • Manages padding (horizontal/vertical)                  │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                      Sections                             │  │
+│  │                                                           │  │
+│  │  • Group related components                               │  │
+│  │  • Support auto-width and fixed-width modes              │  │
+│  │  • Handle component visibility toggling                   │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                     Components                            │  │
+│  │                                                           │  │
+│  │  • Header: ASCII art title with gradient colors           │  │
+│  │  • ProgressBar: Animated progress with fill/background    │  │
+│  │  • Spinner: Multiple animation styles (dots, bars, etc.)  │  │
+│  │  • Counter: Numeric display with formatting               │  │
+│  │  • TotalRate: Requests/second over entire run             │  │
+│  │  • WindowedRate: Recent requests/second (sliding window)  │  │
+│  │  • ScatterPlot: Plotille-based latency visualization      │  │
+│  │  • Table: Tabulated statistics display                    │  │
+│  │  • Text/MultilineText: Status messages                    │  │
+│  │  • Timer: Elapsed time display                            │  │
+│  │  • StatusBar/AnimatedStatusBar: Status indicators         │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Component Hierarchy
+
+```python
+# Main interface entry point
+interface = HyperscaleInterface(updates_controller)
+interface.initialize(workflows, terminal_mode="full")
+await interface.run()
+
+# Terminal modes:
+# - "full": Complete TUI with all components
+# - "ci": Simplified output for CI environments
+# - "none": No UI output (headless)
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/ui/__init__.py` | Main exports (HyperscaleInterface, InterfaceUpdatesController) |
+| `hyperscale/ui/hyperscale_interface.py` | Interface orchestration, workflow cycling |
+| `hyperscale/ui/interface_updates_controller.py` | Async update queue management |
+| `hyperscale/ui/components/terminal/terminal.py` | Raw terminal control |
+| `hyperscale/ui/components/terminal/canvas.py` | Layout engine |
+| `hyperscale/ui/components/terminal/section.py` | Section container |
+| `hyperscale/ui/styling/` | Colors, attributes, stylization |
+
+#### Update Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      UI Update Flow                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Worker Progress  ──►  RemoteGraphManager  ──►  Updates Queue  │
+│       │                      │                       │          │
+│       │                      │                       ▼          │
+│       │               ┌──────┴──────┐    InterfaceUpdatesController
+│       │               │             │               │           │
+│       │               ▼             ▼               ▼           │
+│       │        Stats Update   Progress Update   Workflow List   │
+│       │               │             │               │           │
+│       │               └──────┬──────┘               │           │
+│       │                      │                      │           │
+│       │                      ▼                      ▼           │
+│       │              HyperscaleInterface._run() loop            │
+│       │                      │                                  │
+│       │                      ▼                                  │
+│       │              Set active components for                  │
+│       │              current workflow                           │
+│       │                      │                                  │
+│       │                      ▼                                  │
+│       │              Terminal.trigger_render()                  │
+│       │                      │                                  │
+│       └──────────────────────┴──────────────────────────────────│
+│                                                                 │
+│  Refresh rate: Configurable via _interval (default ~30fps)     │
+│  Workflow cycling: update_interval (default 3 seconds)         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Reporting Architecture
+
+Hyperscale supports exporting test results to numerous backends for analysis and visualization.
+
+#### Supported Backends
+
+| Category | Backends |
+|----------|----------|
+| **Time Series** | InfluxDB, TimescaleDB, AWS Timestream, Prometheus, Graphite |
+| **Cloud Storage** | S3, Google Cloud Storage, BigQuery, BigTable |
+| **Databases** | PostgreSQL, MySQL, SQLite, MongoDB, Cassandra, CosmosDB, Redis |
+| **Monitoring** | Datadog, NewRelic, Cloudwatch, Honeycomb, Netdata |
+| **Metrics** | StatsD, DogStatsD, Telegraf, Telegraf-StatsD |
+| **Message Queue** | Kafka |
+| **File Formats** | JSON, CSV, XML |
+| **Serverless** | AWS Lambda |
+| **Custom** | CustomReporter (user-defined) |
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Reporting Architecture                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                      Reporter[T]                          │  │
+│  │                                                           │  │
+│  │  • Generic reporter with backend type parameter           │  │
+│  │  • Factory pattern for backend instantiation              │  │
+│  │  • Unified submit() interface                             │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    Backend Config                         │  │
+│  │                                                           │  │
+│  │  • PostgresConfig, InfluxDBConfig, S3Config, etc.        │  │
+│  │  • Connection parameters                                  │  │
+│  │  • Batching and retry settings                            │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                  Metrics/Results                          │  │
+│  │                                                           │  │
+│  │  • WorkflowMetric: Per-workflow statistics                │  │
+│  │  • WorkflowMetricSet: Collection of workflow metrics      │  │
+│  │  • StepMetricSet: Per-step breakdown                      │  │
+│  │  • ResultSet: Final aggregated results                    │  │
+│  │  • MetricsSet: Timing and throughput metrics              │  │
+│  │  • CheckSet: Validation check results                     │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Usage Example
+
+```python
+from hyperscale.reporting import Reporter, PostgresConfig, ReporterTypes
+
+# Configure backend
+config = PostgresConfig(
+    host="localhost",
+    port=5432,
+    database="hyperscale_results",
+    username="user",
+    password="password",
+)
+
+# Create reporter
+reporter = Reporter[PostgresConfig](
+    reporter_type=ReporterTypes.Postgres,
+    config=config,
+)
+
+# Submit results
+await reporter.connect()
+await reporter.submit(workflow_metrics)
+await reporter.close()
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/reporting/reporter.py` | Generic Reporter class, backend factory |
+| `hyperscale/reporting/results.py` | Result aggregation and merging |
+| `hyperscale/reporting/common/types.py` | ReporterTypes enum |
+| `hyperscale/reporting/common/results_types.py` | Metric data classes |
+| `hyperscale/reporting/<backend>/` | Per-backend implementation |
+
+---
+
+### Local Execution Mode
+
+Local mode enables single-machine testing without distributed infrastructure.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Local Execution Mode                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                     LocalRunner                           │  │
+│  │                                                           │  │
+│  │  • Entry point for local test execution                   │  │
+│  │  • Manages worker subprocess pool                         │  │
+│  │  • Coordinates UI and results collection                  │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│            ┌──────────────┼──────────────┐                     │
+│            │              │              │                      │
+│            ▼              ▼              ▼                      │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │
+│  │LocalServer  │  │LocalServer  │  │LocalServer  │  ...       │
+│  │Pool Worker 1│  │Pool Worker 2│  │Pool Worker N│            │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘            │
+│         │                │                │                     │
+│         └────────────────┼────────────────┘                     │
+│                          │                                      │
+│                          ▼                                      │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                  RemoteGraphManager                       │  │
+│  │                                                           │  │
+│  │  • Manages workflow dispatch to workers                   │  │
+│  │  • Collects results and progress                          │  │
+│  │  • Feeds InterfaceUpdatesController                       │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  Worker Count: Auto-detected via psutil.cpu_count(logical=False)│
+│  Communication: In-process TCP (localhost bindings)             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Usage
+
+```python
+from hyperscale.core.jobs.runner.local_runner import LocalRunner
+from hyperscale.core.graph import Workflow
+
+# Create runner
+runner = LocalRunner(
+    host="localhost",
+    port=8080,
+    workers=4,  # Optional, defaults to CPU cores
+)
+
+# Define workflows
+workflows = [
+    (["tag1"], MyWorkflow()),
+]
+
+# Execute
+await runner.run(
+    test_name="my_test",
+    workflows=workflows,
+    terminal_mode="full",  # "full", "ci", or "none"
+    timeout="5m",
+)
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/core/jobs/runner/local_runner.py` | LocalRunner entry point |
+| `hyperscale/core/jobs/runner/local_server_pool.py` | Worker subprocess pool |
+| `hyperscale/core/jobs/graphs/remote_graph_manager_rewrite.py` | Workflow dispatch |
+
+---
+
+### Rate Limiting Implementation (AD-24)
+
+Rate limiting prevents any single client from overwhelming the system while adapting behavior based on system health.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Rate Limiting Architecture                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              HybridOverloadDetector (AD-18)               │  │
+│  │                                                           │  │
+│  │  Provides health state: HEALTHY / BUSY / STRESSED /       │  │
+│  │  OVERLOADED based on latency, CPU, memory signals         │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│                           ▼                                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                 AdaptiveRateLimiter                       │  │
+│  │                                                           │  │
+│  │  Health-gated rate limiting:                              │  │
+│  │  • HEALTHY: Per-operation limits apply                    │  │
+│  │  • BUSY: LOW priority shed + per-operation limits         │  │
+│  │  • STRESSED: Per-client fair-share limiting               │  │
+│  │  • OVERLOADED: Only CRITICAL requests pass                │  │
+│  └────────────────────────┬─────────────────────────────────┘  │
+│                           │                                     │
+│            ┌──────────────┴──────────────┐                     │
+│            │                             │                      │
+│            ▼                             ▼                      │
+│  ┌─────────────────────┐      ┌─────────────────────┐         │
+│  │ SlidingWindowCounter│      │ Per-Client Stress   │         │
+│  │                     │      │ Counters            │         │
+│  │ Per-operation limits│      │                     │         │
+│  │ (100 req/10s for    │      │ Fair-share limits   │         │
+│  │ job_submit, etc.)   │      │ when stressed       │         │
+│  └─────────────────────┘      └─────────────────────┘         │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                   Request Priority                        │  │
+│  │                                                           │  │
+│  │  CRITICAL (0): Health checks, cancellation, final results│  │
+│  │  HIGH (1): Job submission, workflow dispatch             │  │
+│  │  NORMAL (2): Progress updates, stats queries             │  │
+│  │  LOW (3): Debug requests, non-essential sync             │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### SlidingWindowCounter
+
+The SlidingWindowCounter provides deterministic rate limiting without the edge cases of token bucket algorithms:
+
+```python
+effective_count = current_window_count + previous_window_count * (1 - window_progress)
+```
+
+Example:
+- Window size: 60 seconds
+- Previous window: 100 requests
+- Current window: 30 requests
+- 15 seconds into current window (25% progress)
+- Effective count = 30 + 100 * 0.75 = 105
+
+#### Configuration
+
+```python
+# Environment variables for rate limiting
+RATE_LIMIT_DEFAULT_BUCKET_SIZE: int = 100
+RATE_LIMIT_DEFAULT_REFILL_RATE: float = 10.0
+RATE_LIMIT_CLIENT_IDLE_TIMEOUT: float = 300.0
+RATE_LIMIT_CLEANUP_INTERVAL: float = 60.0
+RATE_LIMIT_MAX_RETRIES: int = 3
+RATE_LIMIT_MAX_TOTAL_WAIT: float = 60.0
+RATE_LIMIT_BACKOFF_MULTIPLIER: float = 1.5
+```
+
+#### Per-Operation Limits
+
+| Operation | Max Requests | Window (seconds) |
+|-----------|--------------|------------------|
+| stats_update | 500 | 10.0 |
+| heartbeat | 200 | 10.0 |
+| progress_update | 300 | 10.0 |
+| job_submit | 50 | 10.0 |
+| job_status | 100 | 10.0 |
+| workflow_dispatch | 100 | 10.0 |
+| cancel | 20 | 10.0 |
+| reconnect | 10 | 10.0 |
+
+#### Client-Side Cooperation
+
+The `CooperativeRateLimiter` enables clients to respect server rate limits:
+
+```python
+limiter = CooperativeRateLimiter()
+
+# Before sending request
+await limiter.wait_if_needed("job_submit")
+
+# After receiving 429 response
+if response.status == 429:
+    retry_after = float(response.headers.get("Retry-After", 1.0))
+    limiter.handle_rate_limit("job_submit", retry_after)
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/distributed_rewrite/reliability/rate_limiting.py` | All rate limiting components |
+| `hyperscale/distributed_rewrite/reliability/overload.py` | HybridOverloadDetector |
+| `hyperscale/distributed_rewrite/reliability/load_shedding.py` | RequestPriority enum |
+
+---
+
+### Three-Signal Health Detection (AD-19)
+
+The three-signal health model provides nuanced health tracking beyond simple alive/dead status.
+
+#### The Three Signals
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Three-Signal Health Model                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────────┐
+│  │ Signal 1: LIVENESS                                          │
+│  │                                                             │
+│  │ "Is the node alive and responsive?"                         │
+│  │                                                             │
+│  │ • UDP ping/ack from SWIM protocol                           │
+│  │ • Timeout: LIVENESS_PROBE_TIMEOUT (1.0s)                    │
+│  │ • Period: LIVENESS_PROBE_PERIOD (10.0s)                     │
+│  │ • Failure threshold: LIVENESS_PROBE_FAILURE_THRESHOLD (3)   │
+│  └─────────────────────────────────────────────────────────────┘
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────────┐
+│  │ Signal 2: READINESS                                         │
+│  │                                                             │
+│  │ "Can the node accept new work?"                             │
+│  │                                                             │
+│  │ • Capacity check (available cores/slots)                    │
+│  │ • Overload state from HybridOverloadDetector                │
+│  │ • Not accepting if: at capacity, overloaded, draining       │
+│  │ • Timeout: READINESS_PROBE_TIMEOUT (2.0s)                   │
+│  └─────────────────────────────────────────────────────────────┘
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────────┐
+│  │ Signal 3: PROGRESS                                          │
+│  │                                                             │
+│  │ "Is the node making forward progress?"                      │
+│  │                                                             │
+│  │ States:                                                     │
+│  │ • IDLE: No active work, but healthy                         │
+│  │ • PROGRESSING: Completing work (throughput > 0)             │
+│  │ • STALLED: Active work but no recent completions            │
+│  │ • STUCK: Extended period without progress                   │
+│  └─────────────────────────────────────────────────────────────┘
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Routing Decisions
+
+The three signals combine to produce routing decisions:
+
+| Liveness | Readiness | Progress | Decision |
+|----------|-----------|----------|----------|
+| ✓ | ✓ | PROGRESSING/IDLE | **ROUTE** - Send work |
+| ✓ | ✗ | Any | **HOLD** - Don't send new work |
+| ✓ | ✓ | STALLED | **INVESTIGATE** - Probe further |
+| ✓ | Any | STUCK | **DRAIN** - Complete existing, no new |
+| ✗ | Any | Any | **EVICT** - Node is dead |
+
+#### Health State Protocol
+
+```python
+class HealthSignals(Protocol):
+    """Protocol defining the three-signal health interface."""
+
+    @property
+    def liveness(self) -> bool:
+        """Is the node alive and responsive?"""
+        ...
+
+    @property
+    def readiness(self) -> bool:
+        """Can the node accept work?"""
+        ...
+
+    @property
+    def progress_state(self) -> ProgressState:
+        """Is the node making progress?"""
+        ...
+
+    def get_routing_decision(self) -> RoutingDecision:
+        """Get routing decision based on combined signals."""
+        ...
+```
+
+#### Correlation Detection
+
+The NodeHealthTracker prevents cascade evictions when multiple nodes fail simultaneously (likely network issue):
+
+```python
+tracker = NodeHealthTracker[WorkerHealthState]()
+
+# Check if we should evict (with correlation detection)
+evict_decision = tracker.should_evict("worker-1")
+if evict_decision.should_evict:
+    if evict_decision.correlated_failures:
+        # Investigate network issue, don't evict
+        pass
+    else:
+        # Safe to evict
+        pass
+```
+
+#### Configuration
+
+```python
+# Health probe settings
+LIVENESS_PROBE_TIMEOUT: float = 1.0
+LIVENESS_PROBE_PERIOD: float = 10.0
+LIVENESS_PROBE_FAILURE_THRESHOLD: int = 3
+LIVENESS_PROBE_SUCCESS_THRESHOLD: int = 1
+
+READINESS_PROBE_TIMEOUT: float = 2.0
+READINESS_PROBE_PERIOD: float = 10.0
+READINESS_PROBE_FAILURE_THRESHOLD: int = 3
+READINESS_PROBE_SUCCESS_THRESHOLD: int = 1
+
+STARTUP_PROBE_TIMEOUT: float = 5.0
+STARTUP_PROBE_PERIOD: float = 5.0
+STARTUP_PROBE_FAILURE_THRESHOLD: int = 30  # Allow slow startups (150s)
+STARTUP_PROBE_SUCCESS_THRESHOLD: int = 1
+```
+
+#### SWIM Piggyback
+
+Health signals are piggybacked on SWIM protocol messages for efficiency:
+
+```python
+@dataclass
+class HealthPiggyback:
+    node_id: str
+    node_type: str  # "worker" | "manager" | "gate"
+    is_alive: bool = True
+    accepting_work: bool = True
+    capacity: int = 0
+    throughput: float = 0.0
+    expected_throughput: float = 0.0
+    overload_state: str = "healthy"
+    timestamp: float = field(default_factory=time.monotonic)
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/distributed_rewrite/health/tracker.py` | NodeHealthTracker, HealthSignals protocol |
+| `hyperscale/distributed_rewrite/health/worker_health.py` | WorkerHealthState implementation |
+| `hyperscale/distributed_rewrite/health/worker_health_manager.py` | Manager-side health tracking |
+
+---
+
+### Adaptive Healthcheck Extensions (AD-26)
+
+Allows workers to request deadline extensions for long-running operations with graceful exhaustion handling.
+
+#### Extension Grant Formula
+
+Extensions use logarithmic decay to prevent indefinite delays:
+
+```
+grant = max(min_grant, base_deadline / 2^(extension_count + 1))
+```
+
+| Extension # | Formula | Grant (base=30s) | Cumulative |
+|-------------|---------|------------------|------------|
+| 1 | 30 / 2^1 | 15.0s | 15.0s |
+| 2 | 30 / 2^2 | 7.5s | 22.5s |
+| 3 | 30 / 2^3 | 3.75s | 26.25s |
+| 4 | 30 / 2^4 | 1.875s | 28.125s |
+| 5 | 30 / 2^5 | 1.0s (min) | 29.125s |
+| 6+ | — | denied | — |
+
+#### Graceful Exhaustion
+
+When extensions run out, the system provides warning and grace period:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                Graceful Exhaustion Timeline                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Extension 1  Extension 2  Extension 3  Extension 4  Extension 5│
+│      │            │            │            │            │      │
+│      ▼            ▼            ▼            ▼            ▼      │
+│  ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐     │
+│  │ 15s  │    │ 7.5s │    │3.75s │    │1.875s│    │ 1s   │     │
+│  │grant │    │grant │    │grant │    │grant │    │grant │     │
+│  └──────┘    └──────┘    └──────┘    └──────┘    └──┬───┘     │
+│                                                      │          │
+│                                           ┌──────────▼────────┐│
+│                                           │  WARNING SENT     ││
+│                                           │  (remaining <= 1) ││
+│                                           └──────────┬────────┘│
+│                                                      │          │
+│                                                      ▼          │
+│                                           ┌─────────────────┐  │
+│                                           │  EXHAUSTED      │  │
+│                                           │                 │  │
+│                                           │  Grace Period   │  │
+│                                           │  (10s default)  │  │
+│                                           │                 │  │
+│                                           │  Worker can:    │  │
+│                                           │  • Checkpoint   │  │
+│                                           │  • Save state   │  │
+│                                           │  • Clean up     │  │
+│                                           └────────┬────────┘  │
+│                                                    │            │
+│                                                    ▼            │
+│                                           ┌─────────────────┐  │
+│                                           │  EVICTION       │  │
+│                                           │  (after grace)  │  │
+│                                           └─────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Extension Tracker State
+
+```python
+@dataclass(slots=True)
+class ExtensionTracker:
+    worker_id: str
+    base_deadline: float = 30.0
+    min_grant: float = 1.0
+    max_extensions: int = 5
+    warning_threshold: int = 1      # Extensions remaining to trigger warning
+    grace_period: float = 10.0      # Seconds after exhaustion before kill
+
+    extension_count: int = 0
+    last_progress: float = 0.0
+    total_extended: float = 0.0
+    last_extension_time: float = field(default_factory=time.monotonic)
+    exhaustion_time: float | None = None
+    warning_sent: bool = False
+
+    def request_extension(
+        self,
+        reason: str,
+        current_progress: float,
+    ) -> tuple[bool, float, str | None, bool]:
+        """
+        Returns: (granted, extension_seconds, denial_reason, is_warning)
+        """
+        ...
+
+    @property
+    def is_exhausted(self) -> bool: ...
+
+    @property
+    def is_in_grace_period(self) -> bool: ...
+
+    @property
+    def grace_period_remaining(self) -> float: ...
+
+    @property
+    def should_evict(self) -> bool:
+        """True if exhausted AND grace period expired."""
+        ...
+```
+
+#### Extension Response Fields
+
+```python
+@dataclass
+class HealthcheckExtensionResponse:
+    granted: bool
+    extension_seconds: float
+    new_deadline: float
+    remaining_extensions: int
+    denial_reason: str | None = None
+    is_exhaustion_warning: bool = False    # True if about to exhaust
+    grace_period_remaining: float = 0.0    # Seconds remaining after exhaustion
+    in_grace_period: bool = False          # True if exhausted but within grace
+```
+
+#### Configuration
+
+```python
+# Environment variables
+EXTENSION_BASE_DEADLINE: float = 30.0
+EXTENSION_MIN_GRANT: float = 1.0
+EXTENSION_MAX_EXTENSIONS: int = 5
+EXTENSION_EVICTION_THRESHOLD: int = 3
+EXTENSION_EXHAUSTION_WARNING_THRESHOLD: int = 1
+EXTENSION_EXHAUSTION_GRACE_PERIOD: float = 10.0
+```
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `hyperscale/distributed_rewrite/health/extension_tracker.py` | ExtensionTracker, ExtensionTrackerConfig |
+| `hyperscale/distributed_rewrite/health/worker_health_manager.py` | WorkerHealthManager integration |
+| `hyperscale/distributed_rewrite/models/distributed.py` | HealthcheckExtensionRequest/Response |
+
+---
+
+### Zombie Job Prevention & Detection
+
+Multiple mechanisms work together to detect and prevent zombie jobs (jobs that appear running but are actually stuck or orphaned).
+
+#### Detection Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Zombie Detection Mechanisms                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. TIMEOUT DETECTION                                           │
+│     ├─ Per-workflow timeout (user-configured)                   │
+│     ├─ Checked during progress updates                          │
+│     └─ Triggers workflow failure and cleanup                    │
+│                                                                 │
+│  2. SWIM DEAD DETECTION                                         │
+│     ├─ SWIM protocol detects unresponsive workers              │
+│     ├─ States: alive → suspect → dead                          │
+│     ├─ Dead workers trigger workflow reassignment              │
+│     └─ Reap interval: MANAGER_DEAD_WORKER_REAP_INTERVAL (15m)  │
+│                                                                 │
+│  3. PROGRESS HEALTH (AD-19)                                     │
+│     ├─ Three-signal model tracks progress state                │
+│     ├─ States: IDLE → PROGRESSING → STALLED → STUCK            │
+│     ├─ STUCK triggers investigation and potential eviction     │
+│     └─ Correlation detection prevents cascade evictions        │
+│                                                                 │
+│  4. LEASE EXPIRY                                                │
+│     ├─ Gates hold time-limited leases for jobs                 │
+│     ├─ Lease duration: configurable per-job                    │
+│     ├─ Expired leases allow other gates to take over           │
+│     └─ Prevents single-gate failures from blocking jobs        │
+│                                                                 │
+│  5. ORPHAN WORKFLOW SCANNER (New)                               │
+│     ├─ Manager periodically queries workers for active workflows│
+│     ├─ Compares against manager's workflow assignments          │
+│     ├─ Marks orphaned workflows as failed                       │
+│     ├─ Interval: ORPHAN_SCAN_INTERVAL (120s)                    │
+│     └─ Worker timeout: ORPHAN_SCAN_WORKER_TIMEOUT (5s)          │
+│                                                                 │
+│  6. EXTENSION EXHAUSTION (AD-26)                                │
+│     ├─ Workers have limited extension requests                  │
+│     ├─ Exhaustion triggers warning, then grace period           │
+│     ├─ Grace period expiry triggers eviction                    │
+│     └─ Prevents infinitely-extending stuck workflows            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Prevention Mechanisms
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Zombie Prevention Mechanisms                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. FENCE TOKENS                                                │
+│     ├─ Monotonically increasing token per job                  │
+│     ├─ Prevents stale updates from old job executions          │
+│     ├─ Gates reject results with outdated fence tokens         │
+│     └─ Incremented on: retry, failover, reassignment           │
+│                                                                 │
+│  2. VERSIONED CLOCK                                             │
+│     ├─ Per-entity Lamport timestamps                           │
+│     ├─ All state updates include clock version                 │
+│     ├─ Rejects updates with older clock values                 │
+│     └─ Ensures consistent ordering across DCs                  │
+│                                                                 │
+│  3. CANCELLATION POLLING                                        │
+│     ├─ Workers poll manager for job cancellation status        │
+│     ├─ Interval: WORKER_CANCELLATION_POLL_INTERVAL (5s)        │
+│     ├─ Catches cancellations even if push notification fails   │
+│     └─ Self-termination on discovering cancelled state         │
+│                                                                 │
+│  4. QUORUM CONFIRMATION                                         │
+│     ├─ Critical state changes require manager quorum           │
+│     ├─ Prevents split-brain scenarios                          │
+│     └─ Failed quorum blocks state transition                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Orphan Workflow Scanner
+
+The orphan scanner runs periodically on managers to detect workflows that:
+- Are tracked by the manager but not running on any worker
+- Are running on workers but not tracked by the manager
+
+```python
+async def _orphan_workflow_scan_loop(self) -> None:
+    """Background loop that scans for orphaned workflows."""
+    while not self._shutdown_event.is_set():
+        try:
+            await asyncio.sleep(self._orphan_scan_interval)
+
+            # Get all known workflow IDs from manager state
+            known_workflow_ids = set(self._workflow_assignments.keys())
+
+            # Query each worker for active workflows
+            worker_workflows: dict[str, set[str]] = {}
+            for worker_id, registration in self._workers.items():
+                active_ids = await self._query_worker_workflows(
+                    worker_id,
+                    registration.address,
+                )
+                worker_workflows[worker_id] = active_ids
+
+            # Find orphans: known to manager but not on any worker
+            all_worker_workflows = set()
+            for workflows in worker_workflows.values():
+                all_worker_workflows.update(workflows)
+
+            orphaned = known_workflow_ids - all_worker_workflows
+
+            # Mark orphaned workflows as failed
+            for workflow_id in orphaned:
+                await self._mark_workflow_failed(
+                    workflow_id,
+                    "Orphaned - not found on any worker",
+                )
+```
+
+#### Configuration
+
+```python
+# Dead node reaping
+MANAGER_DEAD_WORKER_REAP_INTERVAL: float = 900.0  # 15 minutes
+MANAGER_DEAD_PEER_REAP_INTERVAL: float = 900.0
+MANAGER_DEAD_GATE_REAP_INTERVAL: float = 900.0
+WORKER_DEAD_MANAGER_REAP_INTERVAL: float = 900.0
+
+# Job cleanup
+COMPLETED_JOB_MAX_AGE: float = 300.0  # 5 minutes
+FAILED_JOB_MAX_AGE: float = 3600.0    # 1 hour
+JOB_CLEANUP_INTERVAL: float = 60.0
+
+# Orphan scanning
+ORPHAN_SCAN_INTERVAL: float = 120.0       # 2 minutes
+ORPHAN_SCAN_WORKER_TIMEOUT: float = 5.0
+
+# Cancellation polling
+WORKER_CANCELLATION_POLL_INTERVAL: float = 5.0
+```
+
+---
+
+### Per-Workflow Result Streaming
+
+Results are streamed from workers to managers to gates to clients as workflows complete, rather than waiting for entire jobs to finish.
+
+#### Streaming Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│               Per-Workflow Result Streaming                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Worker                Manager               Gate        Client │
+│    │                     │                    │            │    │
+│    │─ WorkflowResult ───►│                    │            │    │
+│    │  (wf-001 complete)  │                    │            │    │
+│    │                     │─ WorkflowResult ──►│            │    │
+│    │                     │  (aggregated)      │            │    │
+│    │                     │                    │─ Stream ──►│    │
+│    │                     │                    │  Result    │    │
+│    │                     │                    │            │    │
+│    │─ WorkflowResult ───►│                    │            │    │
+│    │  (wf-002 complete)  │                    │            │    │
+│    │                     │─ WorkflowResult ──►│            │    │
+│    │                     │                    │─ Stream ──►│    │
+│    │                     │                    │            │    │
+│    │                     │                    │            │    │
+│    │  [All workflows complete]                │            │    │
+│    │                     │                    │            │    │
+│    │                     │─ JobComplete ─────►│            │    │
+│    │                     │                    │─ Final ───►│    │
+│    │                     │                    │  Summary   │    │
+│                                                                 │
+│  Benefits:                                                      │
+│  • Real-time progress visibility                                │
+│  • Early failure detection                                      │
+│  • Lower latency for time-sensitive results                     │
+│  • Memory efficiency (results processed incrementally)          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Client API
+
+```python
+client = HyperscaleClient(gate_tcp_addrs=[...])
+await client.start()
+
+# Submit job
+job_id = await client.submit_job(submission)
+
+# Stream results as they arrive
+async for workflow_result in client.stream_workflow_results(job_id):
+    print(f"Workflow {workflow_result.workflow_id}: {workflow_result.status}")
+    # Process individual workflow results...
+
+# Or wait for all results
+final_result = await client.wait_for_completion(job_id)
+```
+
+---
+
+### Time Alignment for Cross-DC Aggregation
+
+When aggregating results across datacenters, clock skew must be handled to produce accurate timing metrics.
+
+#### Clock Synchronization
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Cross-DC Time Alignment                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Problem: Different DCs have different wall-clock times         │
+│                                                                 │
+│  DC-West (PDT)        DC-East (EDT)        DC-EU (CET)         │
+│  10:00:00.000         13:00:00.050         19:00:00.120        │
+│       │                    │                    │               │
+│       │  Clock skew: 50ms  │  Clock skew: 70ms  │              │
+│       │                    │                    │               │
+│                                                                 │
+│  Solution: Versioned Clock with Lamport timestamps              │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ VersionedClock                                            │  │
+│  │                                                           │  │
+│  │ • Logical clock increments on each event                  │  │
+│  │ • Merged with received clock on message receipt           │  │
+│  │ • Provides total ordering without wall-clock dependency   │  │
+│  │                                                           │  │
+│  │ clock_value = max(local_clock, received_clock) + 1        │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  For latency metrics:                                           │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │ Monotonic Time Basis                                      │  │
+│  │                                                           │  │
+│  │ • All timing within a node uses time.monotonic()          │  │
+│  │ • Cross-node timing uses relative deltas                  │  │
+│  │ • Aggregation preserves statistical properties            │  │
+│  │   (min, max, mean, percentiles all computed from deltas)  │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Datacenter List Query
+
+Clients can query gates for the list of registered datacenters.
+
+#### API
+
+```python
+# Client-side
+client = HyperscaleClient(gate_tcp_addrs=[...])
+await client.start()
+
+# Query available datacenters
+datacenters = await client.get_datacenters()
+# Returns: ["us-west-1", "us-east-1", "eu-west-1", ...]
+
+# Submit job to specific datacenters
+submission = JobSubmission(
+    workflows=[...],
+    target_datacenters=["us-west-1", "us-east-1"],
+)
+```
+
+#### Message Types
+
+```python
+@dataclass
+class DatacenterListRequest:
+    """Request to list available datacenters."""
+    request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+@dataclass
+class DatacenterListResponse:
+    """Response containing available datacenters."""
+    request_id: str
+    datacenters: list[str]
+    timestamp: float = field(default_factory=time.time)
+```
+
+#### Handler (Gate)
+
+```python
+@tcp.receive()
+async def datacenter_list(self, addr, data, clock_time):
+    """Handle datacenter list query from client."""
+    request = DatacenterListRequest.load(data)
+
+    # Collect datacenter IDs from known managers
+    datacenter_ids = list(self._datacenter_status.keys())
+
+    response = DatacenterListResponse(
+        request_id=request.request_id,
+        datacenters=datacenter_ids,
+    )
+
+    return response.dump()
+```
+
+---
+
 ### Known Issues to Investigate
 
 ---
