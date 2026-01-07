@@ -585,3 +585,26 @@ class Terminal:
         self._loop.add_signal_handler(
             signal.SIGWINCH, lambda: asyncio.create_task(handle_resize(self))
         )
+
+        # Store the original SIGINT handler so we can restore and re-raise
+        self._dfl_sigmap[signal.SIGINT] = signal.getsignal(signal.SIGINT)
+
+        self._loop.add_signal_handler(
+            signal.SIGINT, lambda: asyncio.create_task(self._handle_keyboard_interrupt())
+        )
+
+    async def _handle_keyboard_interrupt(self):
+        """Handle keyboard interrupt by aborting the terminal and re-raising."""
+        try:
+            await self.abort()
+        except Exception:
+            pass
+
+        # Restore the default SIGINT handler and re-raise KeyboardInterrupt
+        if signal.SIGINT in self._dfl_sigmap:
+            original_handler = self._dfl_sigmap[signal.SIGINT]
+            if original_handler is not None:
+                signal.signal(signal.SIGINT, original_handler)
+
+        # Re-raise KeyboardInterrupt so the application can handle it
+        raise KeyboardInterrupt()

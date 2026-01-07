@@ -277,7 +277,7 @@ class LocalRunner:
                             f"Aborting Hyperscale Terminal UI for test {test_name}",
                             name="debug",
                         )
-                        await self._interface.stop()
+                        await self._interface.abort()
 
                 except Exception as e:
                     await ctx.log_prepared(
@@ -373,6 +373,7 @@ class LocalRunner:
                     name="trace",
                 )
 
+
             except asyncio.CancelledError:
                 pass
 
@@ -402,6 +403,7 @@ class LocalRunner:
 
             except asyncio.CancelledError:
                 pass
+
 
     def _bin_and_check_socket_range(self):
         base_worker_port = self.port + self._workers
