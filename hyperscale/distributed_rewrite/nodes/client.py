@@ -1033,17 +1033,22 @@ class HyperscaleClient(MercurySyncBaseServer):
         data: bytes,
         clock_time: int,
     ):
-        """Handle batch stats push notification from gate/manager."""
+        """
+        Handle batch stats push notification from gate/manager.
+
+        JobBatchPush contains detailed progress for a single job including
+        step-level stats and per-datacenter breakdown.
+        """
         try:
             push = JobBatchPush.load(data)
 
-            # Update all jobs in the batch
-            for job_id, stats in push.job_stats.items():
-                job = self._jobs.get(job_id)
-                if job:
-                    job.total_completed = stats.get('completed', 0)
-                    job.total_failed = stats.get('failed', 0)
-                    job.overall_rate = stats.get('rate', 0.0)
+            job = self._jobs.get(push.job_id)
+            if job:
+                job.status = push.status
+                job.total_completed = push.total_completed
+                job.total_failed = push.total_failed
+                job.overall_rate = push.overall_rate
+                job.elapsed_seconds = push.elapsed_seconds
 
             return b'ok'
 
