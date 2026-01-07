@@ -1125,6 +1125,8 @@ class ManagerServer(HealthAwareServer):
 
         Uses versioned clock to reject stale updates - if the incoming
         heartbeat has a version <= our tracked version, it's discarded.
+
+        Also handles extension requests piggybacked on heartbeats (AD-26).
         """
         # Check if update is stale using versioned clock
         if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
@@ -1138,11 +1140,64 @@ class ManagerServer(HealthAwareServer):
             heartbeat,
         )
 
+        # Handle extension request if piggybacked on heartbeat (AD-26)
+        # This allows workers to request extensions without a separate TCP call
+        if heartbeat.extension_requested:
+            self._handle_heartbeat_extension_request(heartbeat)
+
         # Update version tracking (fire-and-forget, no await needed for sync operation)
         # We track the worker's version so future updates with same/lower version are rejected
         self._task_runner.run(
             self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
         )
+
+    def _handle_heartbeat_extension_request(self, heartbeat: WorkerHeartbeat) -> None:
+        """
+        Handle extension request piggybacked on worker heartbeat (AD-26).
+
+        This is a lightweight alternative to the TCP request_extension handler.
+        Workers can request extensions via their regular heartbeat to reduce
+        latency and avoid extra round-trips during load spikes.
+        """
+        from hyperscale.distributed_rewrite.models import HealthcheckExtensionRequest
+
+        # Check if worker is registered
+        worker = self._worker_pool.get_worker(heartbeat.node_id)
+        if not worker:
+            return
+
+        # Get current deadline (or set default)
+        current_deadline = self._worker_deadlines.get(
+            heartbeat.node_id,
+            time.monotonic() + 30.0,  # Default 30s deadline
+        )
+
+        # Create extension request from heartbeat data
+        request = HealthcheckExtensionRequest(
+            worker_id=heartbeat.node_id,
+            reason=heartbeat.extension_reason or "heartbeat_piggyback",
+            current_progress=heartbeat.extension_current_progress,
+        )
+
+        # Handle extension request
+        response = self._worker_health_manager.handle_extension_request(
+            request=request,
+            current_deadline=current_deadline,
+        )
+
+        # Update stored deadline if granted
+        if response.granted:
+            self._worker_deadlines[heartbeat.node_id] = response.new_deadline
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Granted {response.extension_seconds:.1f}s extension to worker "
+                            f"{heartbeat.node_id} via heartbeat (reason: {request.reason})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
     
     def _handle_manager_peer_heartbeat(
         self,

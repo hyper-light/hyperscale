@@ -142,6 +142,10 @@ class WorkerStateEmbedder:
     get_health_throughput: Callable[[], float] | None = None
     get_health_expected_throughput: Callable[[], float] | None = None
     get_health_overload_state: Callable[[], str] | None = None
+    # Extension request fields (AD-26)
+    get_extension_requested: Callable[[], bool] | None = None
+    get_extension_reason: Callable[[], str] | None = None
+    get_extension_current_progress: Callable[[], float] | None = None
 
     def get_state(self) -> bytes | None:
         """Get WorkerHeartbeat to embed in SWIM messages."""
@@ -161,6 +165,10 @@ class WorkerStateEmbedder:
             health_throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
             health_expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
             health_overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            # Extension request fields (AD-26)
+            extension_requested=self.get_extension_requested() if self.get_extension_requested else False,
+            extension_reason=self.get_extension_reason() if self.get_extension_reason else "",
+            extension_current_progress=self.get_extension_current_progress() if self.get_extension_current_progress else 0.0,
         )
         return heartbeat.dump()
 

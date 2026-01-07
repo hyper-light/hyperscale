@@ -211,6 +211,13 @@ class WorkerServer(HealthAwareServer):
         # State versioning (Lamport clock extension)
         self._state_version = 0
 
+        # Extension request state (AD-26)
+        # Workers can request deadline extensions via heartbeat piggyback
+        # when running long workflows that may exceed the default deadline
+        self._extension_requested: bool = False
+        self._extension_reason: str = ""
+        self._extension_current_progress: float = 0.0  # 0.0-1.0 progress indicator
+
         # Protocol version negotiation result (AD-25)
         # Set during registration response handling
         self._negotiated_capabilities: NegotiatedCapabilities | None = None
@@ -238,6 +245,10 @@ class WorkerServer(HealthAwareServer):
             get_health_throughput=lambda: 0.0,  # Actual throughput tracking deferred
             get_health_expected_throughput=lambda: 0.0,  # Expected throughput calculation deferred
             get_health_overload_state=lambda: "healthy",  # Workers don't have overload detector yet
+            # Extension request fields (AD-26)
+            get_extension_requested=lambda: self._extension_requested,
+            get_extension_reason=lambda: self._extension_reason,
+            get_extension_current_progress=lambda: self._extension_current_progress,
         )
         
         # Initialize parent HealthAwareServer
@@ -1056,7 +1067,39 @@ class WorkerServer(HealthAwareServer):
             active_workflows={
                 wf_id: wf.status for wf_id, wf in self._active_workflows.items()
             },
+            # Extension request fields (AD-26)
+            extension_requested=self._extension_requested,
+            extension_reason=self._extension_reason,
+            extension_current_progress=self._extension_current_progress,
         )
+
+    def request_extension(self, reason: str, progress: float = 0.0) -> None:
+        """
+        Request a deadline extension via heartbeat piggyback (AD-26).
+
+        This sets the extension request fields in the worker's heartbeat,
+        which will be processed by the manager when the next heartbeat is
+        received. This is more efficient than a separate TCP call for
+        extension requests.
+
+        Args:
+            reason: Human-readable reason for the extension request.
+            progress: Current progress (0.0-1.0) to help manager make decisions.
+        """
+        self._extension_requested = True
+        self._extension_reason = reason
+        self._extension_current_progress = max(0.0, min(1.0, progress))
+
+    def clear_extension_request(self) -> None:
+        """
+        Clear the extension request after it's been processed.
+
+        Called when the worker completes its task or the manager has
+        processed the extension request.
+        """
+        self._extension_requested = False
+        self._extension_reason = ""
+        self._extension_current_progress = 0.0
     
     # =========================================================================
     # Core Allocation (delegates to CoreAllocator)

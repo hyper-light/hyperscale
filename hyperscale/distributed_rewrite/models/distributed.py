@@ -451,6 +451,11 @@ class WorkerHeartbeat(Message):
     health_throughput: float = 0.0
     health_expected_throughput: float = 0.0
     health_overload_state: str = "healthy"
+    # Extension request piggyback (AD-26)
+    # Workers can request deadline extensions via heartbeat instead of separate TCP call
+    extension_requested: bool = False
+    extension_reason: str = ""
+    extension_current_progress: float = 0.0  # 0.0-1.0 progress indicator
 
 
 @dataclass(slots=True)
