@@ -77,16 +77,21 @@ class Env(BaseModel):
     CIRCUIT_BREAKER_WINDOW_SECONDS: StrictFloat = 30.0
     CIRCUIT_BREAKER_HALF_OPEN_AFTER: StrictFloat = 10.0
 
-    # Worker Progress Update Settings
-    WORKER_PROGRESS_UPDATE_INTERVAL: StrictFloat = 1.0  # How often to collect progress locally
-    WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 2.0  # How often to send buffered updates to manager
+    # Worker Progress Update Settings (tuned for real-time terminal UI)
+    WORKER_PROGRESS_UPDATE_INTERVAL: StrictFloat = 0.1  # How often to collect progress locally (100ms)
+    WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 0.25  # How often to send buffered updates to manager (250ms)
     WORKER_MAX_CORES: StrictInt | None = None
 
     # Worker Dead Manager Cleanup Settings
     WORKER_DEAD_MANAGER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead managers (15 minutes)
+    WORKER_DEAD_MANAGER_CHECK_INTERVAL: StrictFloat = 60.0  # Seconds between dead manager checks
 
     # Worker Cancellation Polling Settings
     WORKER_CANCELLATION_POLL_INTERVAL: StrictFloat = 5.0  # Seconds between cancellation poll requests
+
+    # Worker TCP Timeout Settings
+    WORKER_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations
+    WORKER_TCP_TIMEOUT_STANDARD: StrictFloat = 5.0  # Standard timeout for progress/result pushes
 
     # Manager Startup and Dispatch Settings
     MANAGER_STARTUP_SYNC_DELAY: StrictFloat = 2.0  # Seconds to wait for leader election before state sync
@@ -105,6 +110,25 @@ class Env(BaseModel):
     MANAGER_DEAD_WORKER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead workers (15 minutes)
     MANAGER_DEAD_PEER_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead manager peers (15 minutes)
     MANAGER_DEAD_GATE_REAP_INTERVAL: StrictFloat = 900.0  # Seconds before reaping dead gates (15 minutes)
+    MANAGER_DEAD_NODE_CHECK_INTERVAL: StrictFloat = 60.0  # Seconds between dead node checks
+    MANAGER_RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between rate limit client cleanup
+
+    # Manager TCP Timeout Settings
+    MANAGER_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations (peer sync, worker queries)
+    MANAGER_TCP_TIMEOUT_STANDARD: StrictFloat = 5.0  # Standard timeout for job dispatch, result forwarding
+
+    # Manager Batch Stats Settings
+    MANAGER_BATCH_PUSH_INTERVAL: StrictFloat = 0.25  # Seconds between batch stats pushes to clients (when no gates)
+
+    # ==========================================================================
+    # Gate Settings
+    # ==========================================================================
+    GATE_JOB_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between job cleanup checks
+    GATE_RATE_LIMIT_CLEANUP_INTERVAL: StrictFloat = 60.0  # Seconds between rate limit client cleanup
+    GATE_BATCH_STATS_INTERVAL: StrictFloat = 0.25  # Seconds between batch stats pushes to clients
+    GATE_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations
+    GATE_TCP_TIMEOUT_STANDARD: StrictFloat = 5.0  # Standard timeout for job dispatch, result forwarding
+    GATE_TCP_TIMEOUT_FORWARD: StrictFloat = 3.0  # Timeout for forwarding to peers
 
     # ==========================================================================
     # Overload Detection Settings (AD-18)
@@ -284,8 +308,12 @@ class Env(BaseModel):
             "WORKER_MAX_CORES": int,
             # Worker dead manager cleanup settings
             "WORKER_DEAD_MANAGER_REAP_INTERVAL": float,
+            "WORKER_DEAD_MANAGER_CHECK_INTERVAL": float,
             # Worker cancellation polling settings
             "WORKER_CANCELLATION_POLL_INTERVAL": float,
+            # Worker TCP timeout settings
+            "WORKER_TCP_TIMEOUT_SHORT": float,
+            "WORKER_TCP_TIMEOUT_STANDARD": float,
             # Manager startup and dispatch settings
             "MANAGER_STARTUP_SYNC_DELAY": float,
             "MANAGER_STATE_SYNC_TIMEOUT": float,
@@ -301,6 +329,20 @@ class Env(BaseModel):
             "MANAGER_DEAD_WORKER_REAP_INTERVAL": float,
             "MANAGER_DEAD_PEER_REAP_INTERVAL": float,
             "MANAGER_DEAD_GATE_REAP_INTERVAL": float,
+            "MANAGER_DEAD_NODE_CHECK_INTERVAL": float,
+            "MANAGER_RATE_LIMIT_CLEANUP_INTERVAL": float,
+            # Manager TCP timeout settings
+            "MANAGER_TCP_TIMEOUT_SHORT": float,
+            "MANAGER_TCP_TIMEOUT_STANDARD": float,
+            # Manager batch stats settings
+            "MANAGER_BATCH_PUSH_INTERVAL": float,
+            # Gate settings
+            "GATE_JOB_CLEANUP_INTERVAL": float,
+            "GATE_RATE_LIMIT_CLEANUP_INTERVAL": float,
+            "GATE_BATCH_STATS_INTERVAL": float,
+            "GATE_TCP_TIMEOUT_SHORT": float,
+            "GATE_TCP_TIMEOUT_STANDARD": float,
+            "GATE_TCP_TIMEOUT_FORWARD": float,
             # Overload detection settings (AD-18)
             "OVERLOAD_EMA_ALPHA": float,
             "OVERLOAD_CURRENT_WINDOW": int,

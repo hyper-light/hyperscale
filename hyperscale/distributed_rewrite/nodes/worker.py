@@ -160,6 +160,11 @@ class WorkerServer(HealthAwareServer):
         # Track when managers were marked unhealthy for reaping
         self._manager_unhealthy_since: dict[str, float] = {}  # manager_id -> time.monotonic() when marked unhealthy
         self._dead_manager_reap_interval: float = env.WORKER_DEAD_MANAGER_REAP_INTERVAL
+        self._dead_manager_check_interval: float = env.WORKER_DEAD_MANAGER_CHECK_INTERVAL
+
+        # TCP timeout settings
+        self._tcp_timeout_short: float = env.WORKER_TCP_TIMEOUT_SHORT
+        self._tcp_timeout_standard: float = env.WORKER_TCP_TIMEOUT_STANDARD
 
         # Per-manager circuit breakers for communication failures
         # Each manager has its own circuit breaker so failures to one manager
@@ -1928,12 +1933,9 @@ class WorkerServer(HealthAwareServer):
         Managers that have been unhealthy for longer than WORKER_DEAD_MANAGER_REAP_INTERVAL
         are removed from _known_managers along with their circuit breakers.
         """
-        # Check every minute, but only reap after the full interval
-        check_interval = 60.0
-
         while self._running:
             try:
-                await asyncio.sleep(check_interval)
+                await asyncio.sleep(self._dead_manager_check_interval)
 
                 now = time.monotonic()
                 managers_to_reap: list[str] = []

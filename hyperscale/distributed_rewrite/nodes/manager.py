@@ -403,6 +403,17 @@ class ManagerServer(HealthAwareServer):
         self._failed_job_max_age: float = env.FAILED_JOB_MAX_AGE
         self._job_cleanup_interval: float = env.JOB_CLEANUP_INTERVAL
 
+        # Dead node cleanup and rate limit cleanup intervals
+        self._dead_node_check_interval: float = env.MANAGER_DEAD_NODE_CHECK_INTERVAL
+        self._rate_limit_cleanup_interval: float = env.MANAGER_RATE_LIMIT_CLEANUP_INTERVAL
+
+        # TCP timeout settings
+        self._tcp_timeout_short: float = env.MANAGER_TCP_TIMEOUT_SHORT
+        self._tcp_timeout_standard: float = env.MANAGER_TCP_TIMEOUT_STANDARD
+
+        # Batch stats push interval (when no gates)
+        self._batch_push_interval: float = env.MANAGER_BATCH_PUSH_INTERVAL
+
         # =======================================================================
         # New Modular Classes - Gradual Migration
         # These classes will progressively replace the direct dict-based tracking
@@ -5909,7 +5920,7 @@ class ManagerServer(HealthAwareServer):
         Only runs when manager operates without gates (direct client mode).
         Sends batched progress updates to clients every few seconds.
         """
-        batch_interval = getattr(self, '_batch_push_interval', 2.0)
+        batch_interval = self._batch_push_interval
 
         while self._running:
             try:
@@ -6543,11 +6554,9 @@ class ManagerServer(HealthAwareServer):
         Removes token buckets for clients that haven't made requests
         within the inactive_cleanup_seconds window to prevent memory leaks.
         """
-        cleanup_interval = 60.0  # Check every minute
-
         while self._running:
             try:
-                await asyncio.sleep(cleanup_interval)
+                await asyncio.sleep(self._rate_limit_cleanup_interval)
 
                 cleaned = self._cleanup_inactive_rate_limit_clients()
 
@@ -6635,11 +6644,9 @@ class ManagerServer(HealthAwareServer):
         - Manager peers: _known_manager_peers, _manager_peer_unhealthy_since
         - Gates: _known_gates, _healthy_gate_ids, _gate_unhealthy_since
         """
-        check_interval = 60.0  # Check every minute
-
         while self._running:
             try:
-                await asyncio.sleep(check_interval)
+                await asyncio.sleep(self._dead_node_check_interval)
                 now = time.monotonic()
 
                 # Reap dead workers

@@ -351,10 +351,15 @@ class GateServer(HealthAwareServer):
         
         # Configuration
         self._lease_timeout = lease_timeout
-        
+
         # Job cleanup configuration
         self._job_max_age: float = 3600.0  # 1 hour max age for completed jobs
-        self._job_cleanup_interval: float = 60.0  # Check every minute
+        self._job_cleanup_interval: float = env.GATE_JOB_CLEANUP_INTERVAL
+        self._rate_limit_cleanup_interval: float = env.GATE_RATE_LIMIT_CLEANUP_INTERVAL
+        self._batch_stats_interval: float = env.GATE_BATCH_STATS_INTERVAL
+        self._tcp_timeout_short: float = env.GATE_TCP_TIMEOUT_SHORT
+        self._tcp_timeout_standard: float = env.GATE_TCP_TIMEOUT_STANDARD
+        self._tcp_timeout_forward: float = env.GATE_TCP_TIMEOUT_FORWARD
         
         # Inject state embedder for Serf-style heartbeat embedding in SWIM messages
         self.set_state_embedder(GateStateEmbedder(
@@ -2245,7 +2250,7 @@ class GateServer(HealthAwareServer):
         Runs every 1-5 seconds (configurable) to batch and send progress updates.
         This reduces network overhead compared to sending each update immediately.
         """
-        batch_interval = getattr(self, '_batch_stats_interval', 2.0)  # Default 2s
+        batch_interval = self._batch_stats_interval
         
         while self._running:
             try:
@@ -3018,11 +3023,9 @@ class GateServer(HealthAwareServer):
         Removes token buckets for clients that haven't made requests
         within the inactive_cleanup_seconds window to prevent memory leaks.
         """
-        cleanup_interval = 60.0  # Check every minute
-
         while self._running:
             try:
-                await asyncio.sleep(cleanup_interval)
+                await asyncio.sleep(self._rate_limit_cleanup_interval)
 
                 cleaned = self._cleanup_inactive_rate_limit_clients()
 
