@@ -1844,7 +1844,7 @@ class GateWorkflowQueryResponse(Message):
     datacenters: list[DatacenterWorkflowStatus] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class EagerWorkflowEntry:
     """
     Tracking entry for a workflow pending eager dispatch.

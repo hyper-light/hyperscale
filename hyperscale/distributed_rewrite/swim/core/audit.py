@@ -58,7 +58,7 @@ class AuditEvent:
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class AuditLog:
     """
     Bounded audit log for membership and leadership events.

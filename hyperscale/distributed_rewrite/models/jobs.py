@@ -196,7 +196,7 @@ class TrackingToken:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class WorkflowInfo:
     """Information about a workflow within a job."""
     token: TrackingToken          # Full tracking token (DC:manager:job:workflow)
@@ -214,7 +214,7 @@ class WorkflowInfo:
         return str(self.token)
 
 
-@dataclass
+@dataclass(slots=True)
 class SubWorkflowInfo:
     """Information about a sub-workflow dispatched to a specific worker."""
     token: TrackingToken          # Full tracking token (DC:manager:job:workflow:worker)
@@ -234,7 +234,7 @@ class SubWorkflowInfo:
         return self.token.worker_id or ""
 
 
-@dataclass
+@dataclass(slots=True)
 class JobInfo:
     """All state for a single job, protected by its own lock."""
     token: TrackingToken          # Job-level token (DC:manager:job)
@@ -319,7 +319,7 @@ class JobInfo:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class PendingWorkflow:
     """
     A workflow waiting to be dispatched.

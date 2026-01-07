@@ -155,7 +155,7 @@ class NodeId:
         return self.priority < other.priority
 
 
-@dataclass
+@dataclass(slots=True)
 class NodeAddress:
     """
     Combines a NodeId with network address information.

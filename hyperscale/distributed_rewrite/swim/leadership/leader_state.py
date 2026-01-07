@@ -17,7 +17,7 @@ MAX_TERM = (2**53) - 1
 MAX_VOTES = 1000
 
 
-@dataclass
+@dataclass(slots=True)
 class LeaderState:
     """
     Tracks the leadership state for a node.

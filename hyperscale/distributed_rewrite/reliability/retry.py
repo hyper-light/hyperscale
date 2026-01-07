@@ -40,7 +40,7 @@ class JitterStrategy(Enum):
     NONE = "none"
 
 
-@dataclass
+@dataclass(slots=True)
 class RetryConfig:
     """Configuration for retry behavior."""
 

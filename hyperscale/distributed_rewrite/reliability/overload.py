@@ -43,7 +43,7 @@ _STATE_ORDER = {
 }
 
 
-@dataclass
+@dataclass(slots=True)
 class OverloadConfig:
     """Configuration for hybrid overload detection."""
 

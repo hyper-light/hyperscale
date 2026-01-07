@@ -39,7 +39,7 @@ class RoutingDecision(Enum):
     EVICT = "evict"  # Remove from pool
 
 
-@dataclass
+@dataclass(slots=True)
 class WorkerHealthConfig:
     """Configuration for worker health thresholds."""
 
@@ -54,7 +54,7 @@ class WorkerHealthConfig:
     # Zero completions with work = stuck
 
 
-@dataclass
+@dataclass(slots=True)
 class WorkerHealthState:
     """
     Unified health state combining all three signals for a worker.

@@ -66,7 +66,7 @@ from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 
 
-@dataclass
+@dataclass(slots=True)
 class ReporterResult:
     """Result of a reporter submission."""
     reporter_type: str
@@ -77,7 +77,7 @@ class ReporterResult:
     datacenter: str = ""  # For manager source
 
 
-@dataclass
+@dataclass(slots=True)
 class WorkflowDCResultClient:
     """Per-datacenter workflow result for client-side tracking."""
     datacenter: str
@@ -87,7 +87,7 @@ class WorkflowDCResultClient:
     elapsed_seconds: float = 0.0
 
 
-@dataclass
+@dataclass(slots=True)
 class WorkflowResult:
     """Result of a completed workflow within a job."""
     workflow_id: str
@@ -102,7 +102,7 @@ class WorkflowResult:
     per_dc_results: list[WorkflowDCResultClient] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class JobResult:
     """
     Result of a completed job.

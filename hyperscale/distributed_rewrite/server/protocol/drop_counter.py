@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-@dataclass
+@dataclass(slots=True)
 class DropCounter:
     """
     Thread-safe counter for tracking silently dropped messages.

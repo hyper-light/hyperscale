@@ -42,7 +42,7 @@ OOB_MAX_PROBES_PER_SECOND = 100
 OOB_PROBE_COOLDOWN = 0.01  # 10ms between probes to same target
 
 
-@dataclass
+@dataclass(slots=True)
 class OOBHealthChannelConfig:
     """Configuration for out-of-band health channel."""
 
@@ -65,7 +65,7 @@ class OOBHealthChannelConfig:
     send_nack_when_overloaded: bool = True
 
 
-@dataclass
+@dataclass(slots=True)
 class OOBProbeResult:
     """Result of an out-of-band probe."""
 
@@ -76,7 +76,7 @@ class OOBProbeResult:
     error: str | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class OutOfBandHealthChannel:
     """
     Out-of-band health channel for high-priority probes.

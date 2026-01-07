@@ -5,7 +5,7 @@ Lifeguard Local Health Multiplier (LHM) implementation.
 from dataclasses import dataclass
 
 
-@dataclass
+@dataclass(slots=True)
 class LocalHealthMultiplier:
     """
     Lifeguard Local Health Multiplier (LHM).

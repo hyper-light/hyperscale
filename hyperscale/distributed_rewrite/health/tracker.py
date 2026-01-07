@@ -49,7 +49,7 @@ class HealthSignals(Protocol):
 T = TypeVar("T", bound=HealthSignals)
 
 
-@dataclass
+@dataclass(slots=True)
 class EvictionDecision:
     """Result of an eviction decision check."""
 
@@ -58,7 +58,7 @@ class EvictionDecision:
     correlated_failures: bool = False  # True if multiple nodes failing simultaneously
 
 
-@dataclass
+@dataclass(slots=True)
 class NodeHealthTrackerConfig:
     """Configuration for NodeHealthTracker."""
 
@@ -308,7 +308,7 @@ class NodeHealthTracker(Generic[T]):
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class HealthPiggyback:
     """
     Health information for SWIM message embedding.

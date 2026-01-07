@@ -9,7 +9,7 @@ from .pending_indirect_probe import PendingIndirectProbe
 from ..core.protocols import LoggerProtocol
 
 
-@dataclass
+@dataclass(slots=True)
 class IndirectProbeManager:
     """
     Manages indirect probe requests for SWIM protocol.

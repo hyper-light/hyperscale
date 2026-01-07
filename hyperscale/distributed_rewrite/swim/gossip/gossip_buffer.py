@@ -22,7 +22,7 @@ MAX_PIGGYBACK_SIZE = 1200  # Safe size for piggybacked data
 MAX_UDP_PAYLOAD = 1400  # Maximum total UDP payload
 
 
-@dataclass
+@dataclass(slots=True)
 class GossipBuffer:
     """
     Buffer for membership updates to be piggybacked on messages.

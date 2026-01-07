@@ -92,7 +92,7 @@ class DCLeaderAnnouncement(Message):
     timestamp: float = field(default_factory=time.time)
 
 
-@dataclass
+@dataclass(slots=True)
 class DCHealthState:
     """
     Gate's view of a datacenter's health.
@@ -141,7 +141,7 @@ class DCHealthState:
         return self.last_ack.dc_health in ("HEALTHY", "DEGRADED", "BUSY")
 
 
-@dataclass
+@dataclass(slots=True)
 class FederatedHealthMonitor:
     """
     Monitors external datacenter clusters using SWIM-style probes.

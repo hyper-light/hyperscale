@@ -41,7 +41,7 @@ class CircuitState(Enum):
 from .protocols import LoggerProtocol
 
 
-@dataclass
+@dataclass(slots=True)
 class ErrorStats:
     """
     Track error rates for circuit breaker decisions.
@@ -135,7 +135,7 @@ class ErrorStats:
         self._circuit_opened_at = None
 
 
-@dataclass
+@dataclass(slots=True)
 class ErrorHandler:
     """
     Centralized error handling with recovery actions.

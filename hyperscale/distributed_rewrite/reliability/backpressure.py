@@ -33,7 +33,7 @@ class BackpressureLevel(IntEnum):
     REJECT = 3  # Reject non-critical updates
 
 
-@dataclass
+@dataclass(slots=True)
 class StatsEntry:
     """A single stats entry with timestamp."""
 
@@ -73,7 +73,7 @@ class StatsEntry:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class StatsBufferConfig:
     """Configuration for StatsBuffer."""
 
@@ -343,7 +343,7 @@ class StatsBuffer:
         self._archive_dirty = False
 
 
-@dataclass
+@dataclass(slots=True)
 class BackpressureSignal:
     """
     Backpressure signal to include in responses.

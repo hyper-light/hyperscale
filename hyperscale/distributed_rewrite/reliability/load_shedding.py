@@ -39,7 +39,7 @@ class RequestPriority(IntEnum):
     LOW = 3  # Detailed stats, debug requests
 
 
-@dataclass
+@dataclass(slots=True)
 class LoadShedderConfig:
     """Configuration for LoadShedder behavior."""
 

@@ -27,7 +27,7 @@ from hyperscale.distributed_rewrite.reliability.load_shedding import (
 )
 
 
-@dataclass
+@dataclass(slots=True)
 class SlidingWindowCounter:
     """
     Sliding window counter for deterministic rate limiting.
@@ -238,7 +238,7 @@ class SlidingWindowCounter:
         self._window_start = time.monotonic()
 
 
-@dataclass
+@dataclass(slots=True)
 class AdaptiveRateLimitConfig:
     """
     Configuration for adaptive rate limiting.
@@ -719,7 +719,7 @@ class AdaptiveRateLimiter:
         return self._detector
 
 
-@dataclass
+@dataclass(slots=True)
 class TokenBucket:
     """
     Classic token bucket algorithm for rate limiting.
@@ -851,7 +851,7 @@ class TokenBucket:
         self._last_refill = time.monotonic()
 
 
-@dataclass
+@dataclass(slots=True)
 class RateLimitConfig:
     """
     Configuration for rate limits per operation type.
@@ -892,7 +892,7 @@ class RateLimitConfig:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class RateLimitResult:
     """Result of a rate limit check."""
 

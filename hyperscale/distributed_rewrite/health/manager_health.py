@@ -30,7 +30,7 @@ from hyperscale.distributed_rewrite.health.worker_health import (
 )
 
 
-@dataclass
+@dataclass(slots=True)
 class ManagerHealthConfig:
     """Configuration for manager health thresholds."""
 
@@ -45,7 +45,7 @@ class ManagerHealthConfig:
     # Zero dispatches with accepted jobs = stuck
 
 
-@dataclass
+@dataclass(slots=True)
 class ManagerHealthState:
     """
     Unified health state combining all three signals for a manager.

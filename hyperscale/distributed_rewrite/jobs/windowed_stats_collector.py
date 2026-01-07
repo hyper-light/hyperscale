@@ -21,7 +21,7 @@ from hyperscale.distributed_rewrite.models import (
 )
 
 
-@dataclass
+@dataclass(slots=True)
 class WorkerWindowStats:
     """Individual worker stats within a time window."""
 
@@ -34,7 +34,7 @@ class WorkerWindowStats:
     avg_memory_mb: float = 0.0
 
 
-@dataclass
+@dataclass(slots=True)
 class WindowedStatsPush:
     """
     Time-windowed stats push to client or gate.
@@ -70,7 +70,7 @@ class WindowedStatsPush:
     datacenter: str = ""  # Set by manager when forwarding to gate
 
 
-@dataclass
+@dataclass(slots=True)
 class WindowBucket:
     """Stats collected within a single time window."""
 

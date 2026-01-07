@@ -29,7 +29,7 @@ from hyperscale.distributed_rewrite.health.worker_health import (
 )
 
 
-@dataclass
+@dataclass(slots=True)
 class GateHealthConfig:
     """Configuration for gate health thresholds."""
 
@@ -47,7 +47,7 @@ class GateHealthConfig:
     overload_not_ready_states: tuple[str, ...] = ("stressed", "overloaded")
 
 
-@dataclass
+@dataclass(slots=True)
 class GateHealthState:
     """
     Unified health state combining all three signals for a gate.

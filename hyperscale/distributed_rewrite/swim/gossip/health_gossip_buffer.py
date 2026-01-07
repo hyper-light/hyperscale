@@ -146,7 +146,7 @@ class HealthGossipEntry:
             return None
 
 
-@dataclass
+@dataclass(slots=True)
 class HealthGossipBufferConfig:
     """Configuration for HealthGossipBuffer."""
 
@@ -169,7 +169,7 @@ class HealthGossipBufferConfig:
     min_broadcasts_overloaded: int = 8
 
 
-@dataclass
+@dataclass(slots=True)
 class HealthGossipBuffer:
     """
     Buffer for health state updates to be piggybacked on SWIM messages.

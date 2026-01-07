@@ -48,7 +48,7 @@ _OVERLOAD_STATE_TO_LEVEL: dict[str, PeerLoadLevel] = {
 }
 
 
-@dataclass
+@dataclass(slots=True)
 class PeerHealthInfo:
     """
     Cached health information for a single peer.
@@ -102,7 +102,7 @@ class PeerHealthInfo:
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class PeerHealthAwarenessConfig:
     """Configuration for peer health awareness."""
 
@@ -124,7 +124,7 @@ class PeerHealthAwarenessConfig:
     enable_gossip_reduction: bool = True
 
 
-@dataclass
+@dataclass(slots=True)
 class PeerHealthAwareness:
     """
     Tracks peer health state and provides SWIM behavior recommendations.
