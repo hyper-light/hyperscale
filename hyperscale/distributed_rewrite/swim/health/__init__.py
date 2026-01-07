@@ -26,6 +26,13 @@ from .federated_health_monitor import (
     DCLeaderAnnouncement,
 )
 
+from .peer_health_awareness import (
+    PeerHealthAwareness,
+    PeerHealthAwarenessConfig,
+    PeerHealthInfo,
+    PeerLoadLevel,
+)
+
 
 __all__ = [
     # Local Health Multiplier
@@ -46,5 +53,10 @@ __all__ = [
     'CrossClusterProbe',
     'CrossClusterAck',
     'DCLeaderAnnouncement',
+    # Peer Health Awareness (Phase 6.2)
+    'PeerHealthAwareness',
+    'PeerHealthAwarenessConfig',
+    'PeerHealthInfo',
+    'PeerLoadLevel',
 ]
 

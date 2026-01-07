@@ -60,6 +60,7 @@ from .core.error_handler import ErrorContext
 from .health.local_health_multiplier import LocalHealthMultiplier
 from .health.health_monitor import EventLoopHealthMonitor
 from .health.graceful_degradation import GracefulDegradation, DegradationLevel
+from .health.peer_health_awareness import PeerHealthAwareness, PeerHealthAwarenessConfig
 
 # Failure detection
 from .detection.incarnation_tracker import IncarnationTracker, MessageFreshness
@@ -133,6 +134,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Health gossip buffer for O(log n) health state dissemination (Phase 6.1)
         self._health_gossip_buffer = HealthGossipBuffer(
             config=HealthGossipBufferConfig(),
+        )
+
+        # Peer health awareness for adapting to peer load (Phase 6.2)
+        self._peer_health_awareness = PeerHealthAwareness(
+            config=PeerHealthAwarenessConfig(),
+        )
+        # Connect health gossip to peer awareness
+        self._health_gossip_buffer.set_health_update_callback(
+            self._peer_health_awareness.on_health_update
         )
         
         # Initialize leader election with configurable parameters from Env
@@ -1679,11 +1689,29 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         else:
             self._local_health.decrement()
     
-    def get_lhm_adjusted_timeout(self, base_timeout: float) -> float:
-        """Get timeout adjusted by Local Health Multiplier and degradation level."""
+    def get_lhm_adjusted_timeout(self, base_timeout: float, target_node_id: str | None = None) -> float:
+        """
+        Get timeout adjusted by Local Health Multiplier, degradation level, and peer health.
+
+        Phase 6.2: When probing a peer that we know is overloaded (via health gossip),
+        we extend the timeout to avoid false failure detection.
+
+        Args:
+            base_timeout: Base probe timeout in seconds
+            target_node_id: Optional node ID of the probe target for peer-aware adjustment
+
+        Returns:
+            Adjusted timeout in seconds
+        """
         lhm_multiplier = self._local_health.get_multiplier()
         degradation_multiplier = self._degradation.get_timeout_multiplier()
-        return base_timeout * lhm_multiplier * degradation_multiplier
+        base_adjusted = base_timeout * lhm_multiplier * degradation_multiplier
+
+        # Apply peer health-aware timeout adjustment (Phase 6.2)
+        if target_node_id:
+            return self._peer_health_awareness.get_probe_timeout(target_node_id, base_adjusted)
+
+        return base_adjusted
     
     def get_self_incarnation(self) -> int:
         """Get this node's current incarnation number."""
@@ -2174,24 +2202,62 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         return state.time_remaining() if state else None
     
     def get_random_proxy_nodes(
-        self, 
-        target: tuple[str, int], 
+        self,
+        target: tuple[str, int],
         k: int = 3,
     ) -> list[tuple[str, int]]:
-        """Get k random nodes to use as proxies for indirect probing."""
+        """
+        Get k random nodes to use as proxies for indirect probing.
+
+        Phase 6.2: Prefers healthy nodes over stressed/overloaded ones.
+        We avoid using stressed peers as proxies because:
+        1. They may be slow to respond, causing indirect probe timeouts
+        2. We want to reduce load on already-stressed nodes
+        """
         nodes: Nodes = self._context.read('nodes')
         self_addr = self._get_self_udp_addr()
-        
+
         # Snapshot nodes.items() to avoid dict mutation during iteration
-        candidates = [
+        all_candidates = [
             node for node, queue in list(nodes.items())
             if node != target and node != self_addr
         ]
-        
-        k = min(k, len(candidates))
+
+        if not all_candidates:
+            return []
+
+        # Phase 6.2: Filter to prefer healthy proxies
+        # We need node_id (string) but have (host, port) tuples
+        # For filtering, use addr-based lookup since health gossip uses node_id
+        healthy_candidates: list[tuple[str, int]] = []
+        stressed_candidates: list[tuple[str, int]] = []
+
+        for node in all_candidates:
+            # Convert to node_id format for health lookup
+            node_id = f"{node[0]}:{node[1]}"
+            if self._peer_health_awareness.should_use_as_proxy(node_id):
+                healthy_candidates.append(node)
+            else:
+                stressed_candidates.append(node)
+
+        # Prefer healthy nodes, but fall back to stressed if necessary
+        k = min(k, len(all_candidates))
         if k <= 0:
             return []
-        return random.sample(candidates, k)
+
+        if len(healthy_candidates) >= k:
+            return random.sample(healthy_candidates, k)
+        elif healthy_candidates:
+            # Use all healthy + some stressed to fill
+            result = healthy_candidates.copy()
+            remaining = k - len(result)
+            if remaining > 0 and stressed_candidates:
+                additional = random.sample(stressed_candidates, min(remaining, len(stressed_candidates)))
+                result.extend(additional)
+            return result
+        else:
+            # No healthy candidates, use stressed
+            return random.sample(stressed_candidates, min(k, len(stressed_candidates)))
     
     def _get_self_udp_addr(self) -> tuple[str, int]:
         """Get this server's UDP address as a tuple."""
