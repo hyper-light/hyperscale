@@ -56,7 +56,7 @@ class DCHealthState(Enum):
     FLAPPING = "flapping"  # DC is oscillating rapidly
 
 
-@dataclass
+@dataclass(slots=True)
 class CorrelationDecision:
     """Result of correlation analysis."""
 
@@ -97,7 +97,7 @@ class CorrelationDecision:
         return self.latency_correlated or (self.extension_correlated and self.lhm_correlated)
 
 
-@dataclass
+@dataclass(slots=True)
 class CrossDCCorrelationConfig:
     """Configuration for cross-DC correlation detection."""
 
@@ -234,7 +234,7 @@ class ExtensionRecord:
     reason: str = ""
 
 
-@dataclass
+@dataclass(slots=True)
 class DCStateInfo:
     """Per-datacenter state tracking with anti-flapping."""
 
