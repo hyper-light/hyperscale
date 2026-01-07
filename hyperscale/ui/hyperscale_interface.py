@@ -1,4 +1,5 @@
 import asyncio
+import sys
 import time
 
 from hyperscale.core.graph import Workflow
@@ -183,9 +184,19 @@ class HyperscaleInterface:
             pass
 
         try:
-            await self._terminal.abort()
+            if self._terminal is not None:
+                await self._terminal.abort()
+            else:
+                # Terminal not initialized, restore cursor directly
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
         except Exception:
-            pass
+            # Last resort - try to restore cursor anyway
+            try:
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
+            except Exception:
+                pass
 
         if self._terminal_task is None:
             return
