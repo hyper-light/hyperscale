@@ -328,6 +328,15 @@ class ManagerServer(HealthAwareServer):
             suspicion_timeout=fed_config['suspicion_timeout'],
             max_consecutive_failures=fed_config['max_consecutive_failures'],
         )
+
+        # Latency tracking for health-aware decisions
+        # Tracks recent latency samples per target (gate, peer manager, worker)
+        # Used for detecting network degradation vs node failure
+        self._gate_latency_samples: list[tuple[float, float]] = []  # (timestamp, latency_ms)
+        self._peer_manager_latency_samples: dict[str, list[tuple[float, float]]] = {}  # node_id -> samples
+        self._worker_latency_samples: dict[str, list[tuple[float, float]]] = {}  # node_id -> samples
+        self._latency_sample_max_age: float = 60.0  # Keep samples for 60 seconds
+        self._latency_sample_max_count: int = 30  # Keep at most 30 samples per target
         
         # Workflow completion events for dependency tracking
         # Maps workflow_id -> asyncio.Event (set when workflow completes)
@@ -1942,6 +1951,7 @@ class ManagerServer(HealthAwareServer):
             cluster_id=f"manager-{self._node_id.datacenter}",
             node_id=self._node_id.full,
             on_dc_health_change=self._on_gate_health_change,
+            on_dc_latency=self._on_gate_latency,
         )
         
         # Add known gate addresses to the federated health monitor
@@ -2342,7 +2352,7 @@ class ManagerServer(HealthAwareServer):
     def _on_gate_health_change(self, datacenter: str, new_health: str) -> None:
         """
         Called when gate cluster health status changes.
-        
+
         Logs the change and updates internal tracking.
         """
         self._task_runner.run(
@@ -2354,6 +2364,118 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
+
+    def _on_gate_latency(self, datacenter: str, latency_ms: float) -> None:
+        """
+        Called when a latency measurement is received from a gate probe.
+
+        Records latency for health-aware decisions. High latency to gates
+        may indicate network degradation rather than gate failure, which
+        affects eviction and routing decisions.
+
+        Args:
+            datacenter: The datacenter/cluster ID (usually "gate-cluster").
+            latency_ms: Round-trip latency in milliseconds.
+        """
+        now = time.monotonic()
+        self._gate_latency_samples.append((now, latency_ms))
+
+        # Prune old samples
+        cutoff = now - self._latency_sample_max_age
+        self._gate_latency_samples = [
+            (ts, lat) for ts, lat in self._gate_latency_samples
+            if ts > cutoff
+        ][-self._latency_sample_max_count:]
+
+    def _record_peer_manager_latency(self, node_id: str, latency_ms: float) -> None:
+        """
+        Record latency measurement from a peer manager healthcheck.
+
+        Used to detect network degradation between managers within a DC.
+        High latency to all peers indicates network issues vs specific
+        manager failures.
+
+        Args:
+            node_id: The peer manager's node ID.
+            latency_ms: Round-trip latency in milliseconds.
+        """
+        now = time.monotonic()
+        if node_id not in self._peer_manager_latency_samples:
+            self._peer_manager_latency_samples[node_id] = []
+
+        samples = self._peer_manager_latency_samples[node_id]
+        samples.append((now, latency_ms))
+
+        # Prune old samples
+        cutoff = now - self._latency_sample_max_age
+        self._peer_manager_latency_samples[node_id] = [
+            (ts, lat) for ts, lat in samples
+            if ts > cutoff
+        ][-self._latency_sample_max_count:]
+
+    def _record_worker_latency(self, node_id: str, latency_ms: float) -> None:
+        """
+        Record latency measurement from a worker healthcheck.
+
+        Used to detect network degradation between manager and workers.
+        High latency to all workers indicates network issues vs specific
+        worker failures.
+
+        Args:
+            node_id: The worker's node ID.
+            latency_ms: Round-trip latency in milliseconds.
+        """
+        now = time.monotonic()
+        if node_id not in self._worker_latency_samples:
+            self._worker_latency_samples[node_id] = []
+
+        samples = self._worker_latency_samples[node_id]
+        samples.append((now, latency_ms))
+
+        # Prune old samples
+        cutoff = now - self._latency_sample_max_age
+        self._worker_latency_samples[node_id] = [
+            (ts, lat) for ts, lat in samples
+            if ts > cutoff
+        ][-self._latency_sample_max_count:]
+
+    def get_average_gate_latency(self) -> float | None:
+        """
+        Get average gate latency over recent samples.
+
+        Returns None if no samples available.
+        """
+        if not self._gate_latency_samples:
+            return None
+        return sum(lat for _, lat in self._gate_latency_samples) / len(self._gate_latency_samples)
+
+    def get_average_peer_latency(self) -> float | None:
+        """
+        Get average latency to peer managers.
+
+        Returns None if no samples available.
+        """
+        all_latencies = [
+            lat for samples in self._peer_manager_latency_samples.values()
+            for _, lat in samples
+        ]
+        if not all_latencies:
+            return None
+        return sum(all_latencies) / len(all_latencies)
+
+    def get_average_worker_latency(self) -> float | None:
+        """
+        Get average latency to workers.
+
+        Returns None if no samples available.
+        """
+        all_latencies = [
+            lat for samples in self._worker_latency_samples.values()
+            for _, lat in samples
+        ]
+        if not all_latencies:
+            return None
+        return sum(all_latencies) / len(all_latencies)
     
     async def _handle_xack_response(
         self,
