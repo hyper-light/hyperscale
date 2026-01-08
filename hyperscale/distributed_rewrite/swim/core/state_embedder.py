@@ -463,19 +463,30 @@ class GateStateEmbedder:
         source_addr: tuple[str, int],
     ) -> None:
         """Process embedded state from managers or peer gates."""
+        # DEBUG: Track state processing
+        print(f"[DEBUG GateStateEmbedder] process_state called from {source_addr}, data_len={len(state_data)}")
+
         # Unpickle once and dispatch based on actual type
         try:
             obj = ManagerHeartbeat.load(state_data)  # Base unpickle
-        except Exception:
+            print(f"[DEBUG GateStateEmbedder] Deserialized: type={type(obj).__name__}")
+        except Exception as e:
+            print(f"[DEBUG GateStateEmbedder] Deserialization FAILED: {e}")
             return  # Invalid data
 
         # Dispatch based on actual type
         if isinstance(obj, ManagerHeartbeat):
+            print(f"[DEBUG GateStateEmbedder] Processing as ManagerHeartbeat from {source_addr}")
             self.on_manager_heartbeat(obj, source_addr)
         elif isinstance(obj, GateHeartbeat) and self.on_gate_heartbeat:
             # Don't process our own heartbeat
             if obj.node_id != self.get_node_id():
+                print(f"[DEBUG GateStateEmbedder] Processing as GateHeartbeat from {source_addr}, node_id={obj.node_id[:20]}...")
                 self.on_gate_heartbeat(obj, source_addr)
+            else:
+                print(f"[DEBUG GateStateEmbedder] Ignoring our own GateHeartbeat")
+        else:
+            print(f"[DEBUG GateStateEmbedder] Unknown message type: {type(obj).__name__}")
 
     def get_health_piggyback(self) -> HealthPiggyback | None:
         """
