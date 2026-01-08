@@ -338,6 +338,11 @@ class HealthGossipBuffer:
             if entry.health.node_id in self._entries:
                 self._entries[entry.health.node_id].mark_broadcast()
 
+    # Health piggyback marker - consistent with #|s (state) and #|m (membership)
+    HEALTH_SEPARATOR = b"#|h"
+    # Entry separator within health piggyback (safe since we strip #|h block first)
+    ENTRY_SEPARATOR = b";"
+
     def encode_piggyback(
         self,
         max_count: int = 10,
@@ -346,9 +351,9 @@ class HealthGossipBuffer:
         """
         Get piggybacked health updates as bytes.
 
-        Format: #h|entry1#entry2#entry3
-        - Starts with '#h|' marker to distinguish from membership gossip
-        - Entries separated by '#'
+        Format: #|hentry1;entry2;entry3
+        - Starts with '#|h' marker (consistent with #|s state, #|m membership)
+        - Entries separated by ';'
 
         Args:
             max_count: Maximum entries to include
@@ -366,12 +371,12 @@ class HealthGossipBuffer:
 
         # Build result respecting size limit
         result_parts: list[bytes] = []
-        total_size = 3  # '#h|' prefix
+        total_size = 3  # '#|h' prefix
         included_entries: list[HealthGossipEntry] = []
 
         for entry in entries:
             encoded = entry.to_bytes()
-            entry_size = len(encoded) + 1  # +1 for '#' separator
+            entry_size = len(encoded) + 1  # +1 for ';' separator
 
             if total_size + entry_size > max_size:
                 self._size_limited_count += 1
@@ -385,19 +390,19 @@ class HealthGossipBuffer:
             return b""
 
         self.mark_broadcasts(included_entries)
-        return b"#h|" + b"#".join(result_parts)
+        return self.HEALTH_SEPARATOR + self.ENTRY_SEPARATOR.join(result_parts)
 
-    @staticmethod
-    def is_health_piggyback(data: bytes) -> bool:
+    @classmethod
+    def is_health_piggyback(cls, data: bytes) -> bool:
         """Check if data contains health piggyback."""
-        return data.startswith(b"#h|")
+        return data.startswith(cls.HEALTH_SEPARATOR)
 
     def decode_and_process_piggyback(self, data: bytes) -> int:
         """
         Decode and process health piggyback data.
 
         Args:
-            data: Raw piggyback data starting with '#h|'
+            data: Raw piggyback data starting with '#|h'
 
         Returns:
             Number of health updates processed
@@ -405,13 +410,13 @@ class HealthGossipBuffer:
         if not self.is_health_piggyback(data):
             return 0
 
-        # Remove '#h|' prefix
+        # Remove '#|h' prefix
         content = data[3:]
         if not content:
             return 0
 
         processed = 0
-        parts = content.split(b"#")
+        parts = content.split(self.ENTRY_SEPARATOR)
 
         for part in parts:
             if not part:

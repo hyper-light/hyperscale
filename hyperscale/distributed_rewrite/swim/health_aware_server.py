@@ -633,9 +633,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     # State embedding is handled via composition (StateEmbedder protocol).
     # Node types (Worker, Manager, Gate) inject their own embedder implementation.
     
-    # Separator for embedded state in messages
-    # Uses multi-byte sequence to avoid conflicts with health gossip (#h|entry#entry)
-    _STATE_SEPARATOR = b'#s|'
+    # Piggyback separators - all use consistent #|x pattern
+    # This avoids conflicts since we search for the full 3-byte marker
+    _STATE_SEPARATOR = b'#|s'      # State piggyback: #|sbase64...
+    _MEMBERSHIP_SEPARATOR = b'#|m'  # Membership piggyback: #|mtype:inc:host:port...
+    _HEALTH_SEPARATOR = b'#|h'      # Health piggyback: #|hentry1;entry2...
     
     def set_state_embedder(self, embedder: StateEmbedder) -> None:
         """
@@ -726,7 +728,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         Build an ack response with embedded state (using self address).
 
-        Format: ack>host:port#s|base64_state (if state available)
+        Format: ack>host:port#|sbase64_state (if state available)
                 ack>host:port (if no state)
 
         Returns:
@@ -738,12 +740,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         Build an ack response with embedded state for a specific address.
 
-        Format: ack>host:port#s|base64_state|membership_gossip#h|health_gossip
+        Format: ack>host:port#|sbase64_state#|mtype:inc:host:port#|hentry1;entry2
 
-        This method adds:
-        1. Serf-style embedded state (heartbeat) after #s|
-        2. Membership gossip piggyback after |
-        3. Health gossip piggyback after #h|
+        All piggyback uses consistent #|x pattern:
+        1. Serf-style embedded state (heartbeat) after #|s
+        2. Membership gossip piggyback after #|m
+        3. Health gossip piggyback after #|h
 
         Args:
             addr_slug: The address slug to include in the ack (e.g., b'127.0.0.1:9000')
@@ -776,12 +778,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Separates the message content from any embedded state, processes
         the state if present, and returns the clean message.
 
-        Wire format: msg_type>host:port#s|base64_state|membership_piggyback#h|health_gossip
+        Wire format: msg_type>host:port#|sbase64_state#|mtype:inc:host:port#|hentry1;entry2
 
-        Parsing order is critical - must match the reverse of how piggyback is added:
-        1. Strip health gossip (#h|...) - added last, strip first
-        2. Strip membership piggyback (|...) - added second, strip second
-        3. Extract state (#s|base64) - part of base message, uses unique separator
+        All piggyback uses consistent #|x pattern - parsing is unambiguous:
+        1. Strip health gossip (#|h...) - added last, strip first
+        2. Strip membership piggyback (#|m...) - added second, strip second
+        3. Extract state (#|s...) - part of base message
 
         Args:
             message: Raw message that may contain embedded state and piggyback.
@@ -796,30 +798,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         health_piggyback: bytes | None = None
         membership_piggyback: bytes | None = None
 
-        # Step 1: Find health gossip piggyback (#h|...)
-        # Health is always appended last, so search from end is valid
-        health_idx = message.find(b'#h|')
+        # Step 1: Find health gossip piggyback (#|h...)
+        # Health is always appended last, so strip first
+        health_idx = message.find(self._HEALTH_SEPARATOR)
         if health_idx > 0:
             health_piggyback = message[health_idx:]
             msg_end = health_idx
 
-        # Step 2: Find membership piggyback (|...) in the remaining portion
-        # Only search up to msg_end to avoid finding '|' in health data
-        # Must skip the '|' in state separator '#s|' - only match bare '|'
-        membership_idx = message.find(b'|', 0, msg_end)
-        # Check if this '|' is part of the state separator '#s|'
-        while membership_idx > 0:
-            if membership_idx >= 2 and message[membership_idx - 2:membership_idx + 1] == b'#s|':
-                # This '|' is part of state separator, find next '|'
-                membership_idx = message.find(b'|', membership_idx + 1, msg_end)
-            else:
-                break
+        # Step 2: Find membership piggyback (#|m...) in the remaining portion
+        membership_idx = message.find(self._MEMBERSHIP_SEPARATOR, 0, msg_end)
         if membership_idx > 0:
             membership_piggyback = message[membership_idx:msg_end]
             msg_end = membership_idx
 
         # Step 3: Find message structure in core message only
-        # Format: msg_type>host:port#s|base64_state
+        # Format: msg_type>host:port#|sbase64_state
         addr_sep_idx = message.find(b'>', 0, msg_end)
         if addr_sep_idx < 0:
             # No address separator - process piggyback and return
@@ -830,7 +823,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return message[:msg_end] if msg_end < len(message) else message
 
         # Find state separator after '>' but before piggyback
-        # Uses #s| to avoid conflicts with health gossip (#h|entry#entry)
         state_sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
 
         # Process piggyback data (can happen in parallel with state processing)
@@ -845,7 +837,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # Extract and decode state
         # Slice once: encoded_state is between state_sep and msg_end
-        # Skip 3 bytes for '#s|' separator
+        # Skip 3 bytes for '#|s' separator
         encoded_state = message[state_sep_idx + 3:msg_end]
 
         try:
@@ -878,7 +870,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # Base message already at limit, can't add piggyback
             return base_message
 
-        # Add membership gossip (format: |type:incarnation:host:port|...)
+        # Add membership gossip (format: #|mtype:incarnation:host:port...)
         membership_piggyback = self._gossip_buffer.encode_piggyback_with_base(base_message)
         message_with_membership = base_message + membership_piggyback
 
@@ -893,7 +885,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         if health_piggyback:
             self._health_gossip_buffer.update_local_health(health_piggyback)
 
-        # Add health gossip (format: #h|entry1#entry2#...)
+        # Add health gossip (format: #|hentry1;entry2;...)
         health_gossip = self._health_gossip_buffer.encode_piggyback(
             max_count=5,
             max_size=remaining,
@@ -2928,7 +2920,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return data
 
         # Extract embedded state from response (Serf-style)
-        # Response format: msg_type>host:port#s|base64_state
+        # Response format: msg_type>host:port#|sbase64_state
         clean_data = self._extract_embedded_state(data, addr)
         return clean_data
 
@@ -2974,24 +2966,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 # Duplicate - still send ack but don't process
                 return b'ack>' + self._udp_addr_slug
             
-            # Extract health gossip piggyback first (format: #h|entry1#entry2#...)
-            # This must be done before membership piggyback since health uses #h| marker
-            health_piggyback_idx = data.find(b'#h|')
+            # Extract health gossip piggyback first (format: #|hentry1;entry2;...)
+            health_piggyback_idx = data.find(self._HEALTH_SEPARATOR)
             if health_piggyback_idx > 0:
                 health_piggyback_data = data[health_piggyback_idx:]
                 data = data[:health_piggyback_idx]
                 self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback_data)
 
-            # Extract any piggybacked membership updates (format: |type:incarnation:host:port|...)
-            # Must skip the '|' in state separator '#s|' - only match bare '|' not preceded by '#s'
-            piggyback_idx = data.find(b'|')
-            # Check if this '|' is part of the state separator '#s|'
-            while piggyback_idx > 0:
-                if piggyback_idx >= 2 and data[piggyback_idx - 2:piggyback_idx + 1] == b'#s|':
-                    # This '|' is part of state separator, find next '|'
-                    piggyback_idx = data.find(b'|', piggyback_idx + 1)
-                else:
-                    break
+            # Extract membership piggyback (format: #|mtype:incarnation:host:port...)
+            piggyback_idx = data.find(self._MEMBERSHIP_SEPARATOR)
             if piggyback_idx > 0:
                 main_data = data[:piggyback_idx]
                 piggyback_data = data[piggyback_idx:]
@@ -3019,7 +3002,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     message, target_addr = parsed
 
                     # Extract embedded state from address portion (Serf-style)
-                    # Format: host:port#s|base64_state
+                    # Format: host:port#|sbase64_state
                     if self._STATE_SEPARATOR in target_addr:
                         print(f"[DEBUG SWIM {self._udp_port}] FOUND STATE_SEPARATOR in target_addr, parsing state from {addr}")
                         addr_part, state_part = target_addr.split(self._STATE_SEPARATOR, 1)

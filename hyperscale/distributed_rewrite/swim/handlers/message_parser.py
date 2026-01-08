@@ -25,16 +25,19 @@ class MessageParser:
     Parses raw UDP data into structured MessageContext.
 
     Handles:
-    - Health gossip piggyback extraction (#h|...)
-    - Membership piggyback extraction (|type:incarnation:...)
+    - Health gossip piggyback extraction (#|h...)
+    - Membership piggyback extraction (#|m...)
     - Message type and target extraction
-    - Embedded state extraction (Serf-style #s|base64)
+    - Embedded state extraction (Serf-style #|sbase64)
     - Cross-cluster message detection (xprobe/xack/xnack)
+
+    All piggyback uses consistent #|x pattern for unambiguous parsing.
     """
 
-    # Separator for embedded state in address portion
-    # Uses multi-byte sequence to avoid conflicts with health gossip (#h|entry#entry)
-    STATE_SEPARATOR = b'#s|'
+    # Piggyback separators - all use consistent #|x pattern
+    STATE_SEPARATOR = b'#|s'       # State piggyback
+    MEMBERSHIP_SEPARATOR = b'#|m'  # Membership piggyback
+    HEALTH_SEPARATOR = b'#|h'      # Health piggyback
 
     def __init__(
         self,
@@ -67,23 +70,14 @@ class MessageParser:
         health_piggyback: bytes | None = None
         membership_piggyback: bytes | None = None
 
-        # Extract health gossip piggyback first (format: #h|entry1#entry2#...)
-        # Must be done before membership piggyback since health uses #h| marker
-        health_idx = data.find(b'#h|')
+        # Extract health gossip piggyback first (format: #|hentry1;entry2;...)
+        health_idx = data.find(self.HEALTH_SEPARATOR)
         if health_idx > 0:
             health_piggyback = data[health_idx:]
             data = data[:health_idx]
 
-        # Extract membership piggyback (format: |type:incarnation:host:port|...)
-        # Must skip the '|' in state separator '#s|' - only match bare '|'
-        piggyback_idx = data.find(b'|')
-        # Check if this '|' is part of the state separator '#s|'
-        while piggyback_idx > 0:
-            if piggyback_idx >= 2 and data[piggyback_idx - 2:piggyback_idx + 1] == b'#s|':
-                # This '|' is part of state separator, find next '|'
-                piggyback_idx = data.find(b'|', piggyback_idx + 1)
-            else:
-                break
+        # Extract membership piggyback (format: #|mtype:inc:host:port|...)
+        piggyback_idx = data.find(self.MEMBERSHIP_SEPARATOR)
         if piggyback_idx > 0:
             membership_piggyback = data[piggyback_idx:]
             data = data[:piggyback_idx]
@@ -108,7 +102,7 @@ class MessageParser:
                 target_addr_bytes = parsed[1]
 
                 # Extract embedded state from address portion (Serf-style)
-                # Format: host:port#s|base64_state
+                # Format: host:port#|sbase64_state
                 if self.STATE_SEPARATOR in target_addr_bytes:
                     addr_part, state_part = target_addr_bytes.split(
                         self.STATE_SEPARATOR, 1
