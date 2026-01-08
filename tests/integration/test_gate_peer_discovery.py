@@ -107,7 +107,7 @@ def get_gate_peer_udp_addrs(configs: list[dict], exclude_udp: int) -> list[tuple
 # Test: Gate Peer Discovery - Basic Cluster Formation
 # ==========================================================================
 
-async def test_gate_peer_discovery_cluster_size(cluster_size: int) -> bool:
+async def scenario_gate_peer_discovery_cluster_size(cluster_size: int) -> bool:
     """
     Test that gates discover each other for a given cluster size.
 
@@ -206,7 +206,7 @@ async def test_gate_peer_discovery_cluster_size(cluster_size: int) -> bool:
 # Test: Gate Heartbeat Message Validation
 # ==========================================================================
 
-async def test_gate_heartbeat_message_validation(cluster_size: int) -> bool:
+async def scenario_gate_heartbeat_message_validation(cluster_size: int) -> bool:
     """
     Test that GateHeartbeat messages contain correct fields.
 
@@ -373,7 +373,7 @@ async def test_gate_heartbeat_message_validation(cluster_size: int) -> bool:
 # Test: Gate Peer Discovery - Failure and Recovery
 # ==========================================================================
 
-async def test_gate_peer_discovery_failure_recovery(cluster_size: int) -> bool:
+async def scenario_gate_peer_discovery_failure_recovery(cluster_size: int) -> bool:
     """
     Test that gate peer discovery handles failure and recovery.
 
@@ -521,7 +521,7 @@ async def test_gate_peer_discovery_failure_recovery(cluster_size: int) -> bool:
 # Test: Gate Discovery Service Selection
 # ==========================================================================
 
-async def test_gate_discovery_peer_selection(cluster_size: int) -> bool:
+async def scenario_gate_discovery_peer_selection(cluster_size: int) -> bool:
     """
     Test that gate discovery service correctly selects peers.
 
@@ -685,22 +685,22 @@ async def run_all_tests():
 
     # Basic discovery tests
     for size in cluster_sizes:
-        result = await test_gate_peer_discovery_cluster_size(size)
+        result = await scenario_gate_peer_discovery_cluster_size(size)
         results[f"discovery_{size}_gates"] = result
 
     # Message validation tests
     for size in [3]:
-        result = await test_gate_heartbeat_message_validation(size)
+        result = await scenario_gate_heartbeat_message_validation(size)
         results[f"heartbeat_validation_{size}_gates"] = result
 
     # Peer selection tests
     for size in [3]:
-        result = await test_gate_discovery_peer_selection(size)
+        result = await scenario_gate_discovery_peer_selection(size)
         results[f"peer_selection_{size}_gates"] = result
 
     # Failure/recovery tests (only for 3 and 5 gates to save time)
     for size in [3, 5]:
-        result = await test_gate_peer_discovery_failure_recovery(size)
+        result = await scenario_gate_peer_discovery_failure_recovery(size)
         results[f"failure_recovery_{size}_gates"] = result
 
     # Final summary

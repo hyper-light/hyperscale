@@ -98,7 +98,7 @@ def get_all_manager_tcp_addrs(configs: list[dict]) -> list[tuple[str, int]]:
 # Test: Manager-Worker Discovery - Basic Discovery
 # ==========================================================================
 
-async def test_manager_worker_discovery_basic(
+async def scenario_manager_worker_discovery_basic(
     manager_count: int,
     worker_count: int,
 ) -> bool:
@@ -242,7 +242,7 @@ async def test_manager_worker_discovery_basic(
 # Test: Manager-Worker Discovery - Failure and Recovery
 # ==========================================================================
 
-async def test_manager_worker_discovery_failure_recovery(
+async def scenario_manager_worker_discovery_failure_recovery(
     manager_count: int,
     worker_count: int,
 ) -> bool:
@@ -420,7 +420,7 @@ async def test_manager_worker_discovery_failure_recovery(
 # Test: Manager-Worker Discovery - Multiple Workers Per Manager
 # ==========================================================================
 
-async def test_manager_worker_discovery_scaling(
+async def scenario_manager_worker_discovery_scaling(
     manager_count: int,
     workers_per_manager: int,
 ) -> bool:
@@ -561,7 +561,7 @@ async def test_manager_worker_discovery_scaling(
 # Test: Manager-Worker Message Validation
 # ==========================================================================
 
-async def test_manager_worker_message_validation(
+async def scenario_manager_worker_message_validation(
     manager_count: int,
     worker_count: int,
 ) -> bool:
@@ -776,24 +776,24 @@ async def run_all_tests():
     # Basic discovery tests
     print("\n--- Basic Discovery Tests ---")
     for managers, workers in [(1, 2), (2, 3), (3, 4)]:
-        result = await test_manager_worker_discovery_basic(managers, workers)
+        result = await scenario_manager_worker_discovery_basic(managers, workers)
         results[f"basic_{managers}m_{workers}w"] = result
 
     # Message validation tests
     print("\n--- Message Validation Tests ---")
-    result = await test_manager_worker_message_validation(2, 3)
+    result = await scenario_manager_worker_message_validation(2, 3)
     results["message_validation_2m_3w"] = result
 
     # Failure/recovery tests
     print("\n--- Failure/Recovery Tests ---")
     for managers, workers in [(2, 3), (3, 4)]:
-        result = await test_manager_worker_discovery_failure_recovery(managers, workers)
+        result = await scenario_manager_worker_discovery_failure_recovery(managers, workers)
         results[f"failure_recovery_{managers}m_{workers}w"] = result
 
     # Scaling tests
     print("\n--- Scaling Tests ---")
     for managers, workers_per in [(2, 3), (3, 4)]:
-        result = await test_manager_worker_discovery_scaling(managers, workers_per)
+        result = await scenario_manager_worker_discovery_scaling(managers, workers_per)
         results[f"scaling_{managers}m_{workers_per}w_per"] = result
 
     # Final summary

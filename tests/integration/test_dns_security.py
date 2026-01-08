@@ -38,7 +38,7 @@ from hyperscale.distributed_rewrite.discovery.dns.resolver import (
 # Test: IP Range Validation
 # ==========================================================================
 
-def test_ip_range_validation_allows_in_range():
+def scenario_ip_range_validation_allows_in_range():
     """Test that IPs within allowed CIDR ranges pass validation."""
     print(f"\n{'=' * 70}")
     print("TEST: IP Range Validation - Allows In-Range IPs")
@@ -82,7 +82,7 @@ def test_ip_range_validation_allows_in_range():
     return all_passed
 
 
-def test_ip_range_validation_rejects_out_of_range():
+def scenario_ip_range_validation_rejects_out_of_range():
     """Test that IPs outside allowed CIDR ranges are rejected."""
     print(f"\n{'=' * 70}")
     print("TEST: IP Range Validation - Rejects Out-of-Range IPs")
@@ -135,7 +135,7 @@ def test_ip_range_validation_rejects_out_of_range():
 # Test: Rapid IP Rotation Detection
 # ==========================================================================
 
-def test_rapid_ip_rotation_detection():
+def scenario_rapid_ip_rotation_detection():
     """Test detection of rapid IP rotation (fast-flux attack indicator)."""
     print(f"\n{'=' * 70}")
     print("TEST: Rapid IP Rotation Detection")
@@ -179,7 +179,7 @@ def test_rapid_ip_rotation_detection():
 # Test: DNS Rebinding Protection
 # ==========================================================================
 
-def test_dns_rebinding_protection():
+def scenario_dns_rebinding_protection():
     """Test blocking of private IPs for public hostnames."""
     print(f"\n{'=' * 70}")
     print("TEST: DNS Rebinding Protection")
@@ -238,7 +238,7 @@ def test_dns_rebinding_protection():
 # Test: Security Event Logging
 # ==========================================================================
 
-def test_security_event_logging():
+def scenario_security_event_logging():
     """Test that security events are properly logged and retrievable."""
     print(f"\n{'=' * 70}")
     print("TEST: Security Event Logging")
@@ -309,7 +309,7 @@ def test_security_event_logging():
 # Test: Resolver Integration
 # ==========================================================================
 
-async def test_resolver_security_integration():
+async def scenario_resolver_security_integration():
     """Test that security validator integrates with DNS resolver."""
     print(f"\n{'=' * 70}")
     print("TEST: Resolver Security Integration")
@@ -363,7 +363,7 @@ async def test_resolver_security_integration():
 # Test: Batch Validation
 # ==========================================================================
 
-def test_batch_ip_validation():
+def scenario_batch_ip_validation():
     """Test batch validation and filtering of IPs."""
     print(f"\n{'=' * 70}")
     print("TEST: Batch IP Validation")
@@ -419,7 +419,7 @@ def test_batch_ip_validation():
 # Test: IPv6 Support
 # ==========================================================================
 
-def test_ipv6_validation():
+def scenario_ipv6_validation():
     """Test that IPv6 addresses are properly validated."""
     print(f"\n{'=' * 70}")
     print("TEST: IPv6 Validation")
@@ -487,27 +487,27 @@ async def run_all_tests():
 
     # Synchronous tests
     print("\n--- IP Range Validation Tests ---")
-    results["ip_range_allows"] = test_ip_range_validation_allows_in_range()
-    results["ip_range_rejects"] = test_ip_range_validation_rejects_out_of_range()
+    results["ip_range_allows"] = scenario_ip_range_validation_allows_in_range()
+    results["ip_range_rejects"] = scenario_ip_range_validation_rejects_out_of_range()
 
     print("\n--- Anomaly Detection Tests ---")
-    results["rapid_rotation"] = test_rapid_ip_rotation_detection()
+    results["rapid_rotation"] = scenario_rapid_ip_rotation_detection()
 
     print("\n--- Rebinding Protection Tests ---")
-    results["rebinding_protection"] = test_dns_rebinding_protection()
+    results["rebinding_protection"] = scenario_dns_rebinding_protection()
 
     print("\n--- Event Logging Tests ---")
-    results["event_logging"] = test_security_event_logging()
+    results["event_logging"] = scenario_security_event_logging()
 
     print("\n--- Batch Validation Tests ---")
-    results["batch_validation"] = test_batch_ip_validation()
+    results["batch_validation"] = scenario_batch_ip_validation()
 
     print("\n--- IPv6 Support Tests ---")
-    results["ipv6_validation"] = test_ipv6_validation()
+    results["ipv6_validation"] = scenario_ipv6_validation()
 
     # Async tests
     print("\n--- Resolver Integration Tests ---")
-    results["resolver_integration"] = await test_resolver_security_integration()
+    results["resolver_integration"] = await scenario_resolver_security_integration()
 
     # Final summary
     print("\n" + "=" * 70)
