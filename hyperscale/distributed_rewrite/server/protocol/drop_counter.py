@@ -26,6 +26,7 @@ class DropCounter:
     decompression_too_large: int = 0
     decryption_failed: int = 0
     malformed_message: int = 0
+    replay_detected: int = 0
     _last_reset: float = field(default_factory=time.monotonic)
 
     def increment_rate_limited(self) -> None:
@@ -43,6 +44,9 @@ class DropCounter:
     def increment_malformed_message(self) -> None:
         self.malformed_message += 1
 
+    def increment_replay_detected(self) -> None:
+        self.replay_detected += 1
+
     @property
     def total(self) -> int:
         return (
@@ -51,6 +55,7 @@ class DropCounter:
             + self.decompression_too_large
             + self.decryption_failed
             + self.malformed_message
+            + self.replay_detected
         )
 
     @property
@@ -70,6 +75,7 @@ class DropCounter:
             decompression_too_large=self.decompression_too_large,
             decryption_failed=self.decryption_failed,
             malformed_message=self.malformed_message,
+            replay_detected=self.replay_detected,
             interval_seconds=self.interval_seconds,
         )
 
@@ -78,6 +84,7 @@ class DropCounter:
         self.decompression_too_large = 0
         self.decryption_failed = 0
         self.malformed_message = 0
+        self.replay_detected = 0
         self._last_reset = time.monotonic()
 
         return snapshot
@@ -92,6 +99,7 @@ class DropCounterSnapshot:
     decompression_too_large: int
     decryption_failed: int
     malformed_message: int
+    replay_detected: int
     interval_seconds: float
 
     @property
@@ -102,6 +110,7 @@ class DropCounterSnapshot:
             + self.decompression_too_large
             + self.decryption_failed
             + self.malformed_message
+            + self.replay_detected
         )
 
     @property

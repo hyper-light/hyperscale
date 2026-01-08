@@ -41,6 +41,7 @@ from hyperscale.distributed_rewrite.server.protocol import (
     MercurySyncTCPProtocol,
     MercurySyncUDPProtocol,
     ReplayGuard,
+    ReplayError,
     validate_message_size,
     parse_address,
     AddressValidationError,
@@ -1103,6 +1104,17 @@ class MercurySyncBaseServer(Generic[T]):
             if request_model := self.tcp_server_request_models.get(handler_name):
                 payload = request_model.load(payload)
 
+                # Validate response for replay attacks if it's a Message instance
+                if isinstance(payload, Message):
+                    try:
+                        self._replay_guard.validate_with_incarnation(
+                            payload.message_id,
+                            payload.sender_incarnation,
+                        )
+                    except ReplayError:
+                        self._tcp_drop_counter.increment_replay_detected()
+                        return
+
             handler = self.tcp_client_handler.get(handler_name)
             if handler:
                 payload = await handler(
@@ -1174,6 +1186,17 @@ class MercurySyncBaseServer(Generic[T]):
             
             if request_model := self.tcp_server_request_models.get(handler_name):
                 payload = request_model.load(payload)
+
+                # Validate message for replay attacks if it's a Message instance
+                if isinstance(payload, Message):
+                    try:
+                        self._replay_guard.validate_with_incarnation(
+                            payload.message_id,
+                            payload.sender_incarnation,
+                        )
+                    except ReplayError:
+                        self._tcp_drop_counter.increment_replay_detected()
+                        return
 
             handler = self.tcp_handlers.get(handler_name)
             if handler is None:
@@ -1249,6 +1272,17 @@ class MercurySyncBaseServer(Generic[T]):
         try:
             if request_models := self.udp_server_request_models.get(handler_name):
                     payload = request_models.load(payload)
+
+                    # Validate message for replay attacks if it's a Message instance
+                    if isinstance(payload, Message):
+                        try:
+                            self._replay_guard.validate_with_incarnation(
+                                payload.message_id,
+                                payload.sender_incarnation,
+                            )
+                        except ReplayError:
+                            self._udp_drop_counter.increment_replay_detected()
+                            return
 
             handler = self.udp_handlers[handler_name]
             response = await handler(
