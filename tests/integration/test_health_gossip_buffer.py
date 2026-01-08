@@ -420,7 +420,7 @@ class TestHealthGossipBufferEncoding:
 
         encoded = buffer.encode_piggyback()
 
-        assert encoded.startswith(b"#h|")
+        assert encoded.startswith(b"#|h")
         assert b"node-1" in encoded
 
     def test_encode_decode_roundtrip(self) -> None:
@@ -497,11 +497,11 @@ class TestHealthGossipBufferEncoding:
 
     def test_is_health_piggyback(self) -> None:
         """Test health piggyback detection."""
-        assert HealthGossipBuffer.is_health_piggyback(b"#h|data") is True
-        assert HealthGossipBuffer.is_health_piggyback(b"#h|") is True
+        assert HealthGossipBuffer.is_health_piggyback(b"#|hdata") is True
+        assert HealthGossipBuffer.is_health_piggyback(b"#|h") is True
         assert HealthGossipBuffer.is_health_piggyback(b"|regular|gossip") is False
         assert HealthGossipBuffer.is_health_piggyback(b"") is False
-        assert HealthGossipBuffer.is_health_piggyback(b"#h") is False
+        assert HealthGossipBuffer.is_health_piggyback(b"#|") is False
 
 
 class TestHealthGossipBufferPrioritization:
@@ -597,18 +597,19 @@ class TestHealthGossipBufferNegativePaths:
     def test_decode_empty_health_piggyback(self) -> None:
         """Test decoding empty health piggyback."""
         buffer = HealthGossipBuffer()
-        processed = buffer.decode_and_process_piggyback(b"#h|")
+        processed = buffer.decode_and_process_piggyback(b"#|h")
         assert processed == 0
 
     def test_decode_malformed_entries(self) -> None:
         """Test decoding with some malformed entries."""
         buffer = HealthGossipBuffer()
 
-        # Mix of valid and invalid entries
+        # Mix of valid and invalid entries (using ; as entry separator)
+        # Format: #|h + entries separated by ;
         data = (
-            b"#h|node-1|worker|healthy|1|4|10.0|15.0|" + str(time.monotonic()).encode() +
-            b"#invalid" +
-            b"#node-2|worker|busy|1|8|20.0|25.0|" + str(time.monotonic()).encode()
+            b"#|hnode-1|worker|healthy|1|4|10.0|15.0|" + str(time.monotonic()).encode() +
+            b";invalid_entry" +
+            b";node-2|worker|busy|1|8|20.0|25.0|" + str(time.monotonic()).encode()
         )
         processed = buffer.decode_and_process_piggyback(data)
 
@@ -619,7 +620,7 @@ class TestHealthGossipBufferNegativePaths:
     def test_decode_corrupted_utf8(self) -> None:
         """Test handling corrupted UTF-8 in piggyback."""
         buffer = HealthGossipBuffer()
-        data = b"#h|\xff\xfe|worker|healthy|1|4|10.0|15.0|12345.0"
+        data = b"#|h\xff\xfe|worker|healthy|1|4|10.0|15.0|12345.0"
         processed = buffer.decode_and_process_piggyback(data)
         # Should handle gracefully without crashing
         assert processed == 0
@@ -1059,8 +1060,8 @@ class TestHealthGossipBufferStatistics:
         """Test tracking of malformed entries."""
         buffer = HealthGossipBuffer()
 
-        # Send malformed data
-        buffer.decode_and_process_piggyback(b"#h|invalid1#invalid2#invalid3")
+        # Send malformed data (using ; as entry separator)
+        buffer.decode_and_process_piggyback(b"#|hinvalid1;invalid2;invalid3")
 
         stats = buffer.get_stats()
         assert stats["malformed_count"] >= 3

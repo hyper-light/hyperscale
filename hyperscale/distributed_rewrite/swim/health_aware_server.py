@@ -69,6 +69,12 @@ from .detection.suspicion_state import SuspicionState
 from .detection.suspicion_manager import SuspicionManager
 from .detection.indirect_probe_manager import IndirectProbeManager
 from .detection.probe_scheduler import ProbeScheduler
+from .detection.hierarchical_failure_detector import (
+    HierarchicalFailureDetector,
+    HierarchicalConfig,
+    NodeStatus,
+    FailureSource,
+)
 
 # Gossip
 from .gossip.gossip_buffer import GossipBuffer, MAX_UDP_PAYLOAD
@@ -160,7 +166,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._health_gossip_buffer.set_health_update_callback(
             self._peer_health_awareness.on_health_update
         )
-        
+
+        # Hierarchical failure detector for multi-layer detection
+        # - Global layer: Machine-level liveness (via timing wheel)
+        # - Job layer: Per-job responsiveness (via adaptive polling)
+        # Subclasses can use this for job-specific failure tracking
+        self._hierarchical_detector: HierarchicalFailureDetector | None = None
+
         # Initialize leader election with configurable parameters from Env
         from hyperscale.distributed_rewrite.swim.leadership.leader_state import LeaderState
         from hyperscale.distributed_rewrite.swim.leadership.leader_eligibility import LeaderEligibility
@@ -249,6 +261,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             get_n_members=self._get_member_count,
             get_lhm_multiplier=self._get_lhm_multiplier,
         )
+        # Set node port for debug logging
+        self._suspicion_manager._node_port = self._udp_port
     
     @property
     def node_id(self) -> NodeId:
@@ -431,6 +445,136 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._confirmed_peers.discard(peer)
         self._unconfirmed_peers.discard(peer)
         self._unconfirmed_peer_added_at.pop(peer, None)
+
+    # =========================================================================
+    # Hierarchical Failure Detection
+    # =========================================================================
+
+    def init_hierarchical_detector(
+        self,
+        config: HierarchicalConfig | None = None,
+        on_global_death: Callable[[tuple[str, int], int], None] | None = None,
+        on_job_death: Callable[[str, tuple[str, int], int], None] | None = None,
+        get_job_n_members: Callable[[str], int] | None = None,
+    ) -> HierarchicalFailureDetector:
+        """
+        Initialize the hierarchical failure detector for multi-layer detection.
+
+        This is optional - subclasses that need job-layer detection should call
+        this during their initialization.
+
+        Args:
+            config: Configuration for hierarchical detection.
+            on_global_death: Callback when node is declared dead at global level.
+            on_job_death: Callback when node is declared dead for specific job.
+            get_job_n_members: Callback to get member count for a job.
+
+        Returns:
+            The initialized HierarchicalFailureDetector.
+        """
+        self._hierarchical_detector = HierarchicalFailureDetector(
+            config=config,
+            on_global_death=on_global_death,
+            on_job_death=on_job_death,
+            get_n_members=self._get_member_count,
+            get_job_n_members=get_job_n_members,
+            get_lhm_multiplier=self._get_lhm_multiplier,
+        )
+        return self._hierarchical_detector
+
+    async def start_hierarchical_detector(self) -> None:
+        """Start the hierarchical failure detector if initialized."""
+        if self._hierarchical_detector:
+            await self._hierarchical_detector.start()
+
+    async def stop_hierarchical_detector(self) -> None:
+        """Stop the hierarchical failure detector if running."""
+        if self._hierarchical_detector:
+            await self._hierarchical_detector.stop()
+
+    def get_hierarchical_detector(self) -> HierarchicalFailureDetector | None:
+        """Get the hierarchical failure detector if initialized."""
+        return self._hierarchical_detector
+
+    async def suspect_node_global(
+        self,
+        node: tuple[str, int],
+        incarnation: int,
+        from_node: tuple[str, int],
+    ) -> bool:
+        """
+        Start or update a global (machine-level) suspicion.
+
+        Convenience method that delegates to the hierarchical detector.
+
+        Returns False if detector not initialized.
+        """
+        if not self._hierarchical_detector:
+            return False
+        return await self._hierarchical_detector.suspect_global(node, incarnation, from_node)
+
+    async def suspect_node_for_job(
+        self,
+        job_id: str,
+        node: tuple[str, int],
+        incarnation: int,
+        from_node: tuple[str, int],
+    ) -> bool:
+        """
+        Start or update a job-specific suspicion.
+
+        Convenience method that delegates to the hierarchical detector.
+
+        Returns False if detector not initialized.
+        """
+        if not self._hierarchical_detector:
+            return False
+        return await self._hierarchical_detector.suspect_job(
+            job_id, node, incarnation, from_node
+        )
+
+    async def is_node_alive_global(self, node: tuple[str, int]) -> bool:
+        """
+        Check if a node is alive at the global (machine) level.
+
+        Returns True if detector not initialized (fail-open).
+        """
+        if not self._hierarchical_detector:
+            return True
+        return await self._hierarchical_detector.is_alive_global(node)
+
+    def is_node_alive_for_job(self, job_id: str, node: tuple[str, int]) -> bool:
+        """
+        Check if a node is alive for a specific job.
+
+        Returns True if detector not initialized (fail-open).
+        """
+        if not self._hierarchical_detector:
+            return True
+        return self._hierarchical_detector.is_alive_for_job(job_id, node)
+
+    async def clear_job_suspicions(self, job_id: str) -> int:
+        """
+        Clear all suspicions for a completed job.
+
+        Returns 0 if detector not initialized.
+        """
+        if not self._hierarchical_detector:
+            return 0
+        return await self._hierarchical_detector.clear_job(job_id)
+
+    async def get_node_hierarchical_status(
+        self,
+        node: tuple[str, int],
+    ) -> NodeStatus | None:
+        """
+        Get comprehensive status of a node.
+
+        Returns None if detector not initialized.
+        """
+        if not self._hierarchical_detector:
+            return None
+        return await self._hierarchical_detector.get_node_status(node)
 
     def _get_lhm_multiplier(self) -> float:
         """Get the current LHM timeout multiplier."""
@@ -1639,9 +1783,11 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         attempt = 0
         max_attempts = PROBE_RETRY_POLICY.max_attempts + 1
 
+        print(f"[DEBUG SWIM {self._udp_port}] _probe_with_timeout START target={target}, timeout={timeout}, max_attempts={max_attempts}")
         while attempt < max_attempts:
             # Exit early if shutting down
             if not self._running:
+                print(f"[DEBUG SWIM {self._udp_port}] _probe_with_timeout: not running, returning False")
                 return False
 
             try:
@@ -1650,23 +1796,29 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 existing_future = self._pending_probe_acks.pop(target, None)
                 if existing_future and not existing_future.done():
                     existing_future.cancel()
+                    print(f"[DEBUG SWIM {self._udp_port}] _probe_with_timeout: cancelled existing future for {target}")
 
                 ack_future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
                 self._pending_probe_acks[target] = ack_future
+                print(f"[DEBUG SWIM {self._udp_port}] _probe_with_timeout: created future for {target}, attempt={attempt+1}/{max_attempts}")
 
                 # Send probe
                 await self.send(target, message, timeout=timeout)
+                print(f"[DEBUG SWIM {self._udp_port}] _probe_with_timeout: sent probe to {target}")
 
                 # Wait for ACK with timeout (reduced time for retries)
                 wait_time = timeout * 0.5 if attempt < max_attempts - 1 else timeout * 0.8
+                print(f"[DEBUG SWIM {self._udp_port}] _probe_with_timeout: waiting for ACK, wait_time={wait_time:.2f}s")
 
                 try:
                     await asyncio.wait_for(ack_future, timeout=wait_time)
                     # Future completed means ACK was received
+                    print(f"[DEBUG SWIM {self._udp_port}] _probe_with_timeout: ACK received from {target}, returning True")
                     self._metrics.increment('probes_received')
                     return True
                 except asyncio.TimeoutError:
                     # No ACK received within timeout, try again
+                    print(f"[DEBUG SWIM {self._udp_port}] _probe_with_timeout: TIMEOUT waiting for ACK from {target}, attempt={attempt+1}")
                     pass
                 finally:
                     # Clean up the pending probe entry
@@ -1679,6 +1831,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         PROBE_RETRY_POLICY.exponential_base ** (attempt - 1)
                     )
                     jitter = random.uniform(0, PROBE_RETRY_POLICY.jitter * backoff)
+                    print(f"[DEBUG SWIM {self._udp_port}] _probe_with_timeout: backing off {backoff+jitter:.2f}s before retry")
                     await asyncio.sleep(backoff + jitter)
 
             except asyncio.CancelledError:
@@ -2894,8 +3047,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         This hook adds piggybacked gossip data (membership + health) to
         outgoing messages for O(log n) dissemination.
         """
+        print(f"[DEBUG SWIM {self._udp_port}] SEND to {addr}, msg_first_bytes={message[:40] if message else b''}")
         # Add piggyback data (membership + health gossip) to outgoing messages
         message_with_piggyback = self._add_piggyback_safe(message)
+        print(f"[DEBUG SWIM {self._udp_port}] SEND: with_piggyback len={len(message_with_piggyback)}")
 
         return (
             addr,
@@ -2916,12 +3071,44 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         This hook intercepts responses from UDP sends (e.g., probe responses).
         We extract any embedded state for Serf-style passive discovery.
         """
+        print(f"[DEBUG SWIM {self._udp_port}] PROCESS (response handler) from {addr}, data_len={len(data) if data else 0}, first_bytes={data[:60] if data else b''}")
         if not data:
+            print(f"[DEBUG SWIM {self._udp_port}] PROCESS: empty data, returning")
             return data
+
+        # Check if this is an ACK response - need to complete pending probe future
+        msg_type = data.split(b'>', maxsplit=1)[0].split(b':', maxsplit=1)[0]
+
+        # Convert addr to tuple format for lookup - addr comes as bytes 'host:port'
+        # but _pending_probe_acks uses tuple (host, port) keys
+        addr_tuple: tuple[str, int] | None = None
+        if isinstance(addr, bytes):
+            try:
+                host, port_str = addr.decode().split(':', 1)
+                addr_tuple = (host, int(port_str))
+            except (ValueError, UnicodeDecodeError):
+                pass
+        elif isinstance(addr, tuple):
+            addr_tuple = addr
+
+        print(f"[DEBUG SWIM {self._udp_port}] PROCESS: msg_type={msg_type}, addr_tuple={addr_tuple}, pending_probe_acks keys={list(self._pending_probe_acks.keys())}")
+
+        if msg_type == b'ack' and addr_tuple:
+            print(f"[DEBUG SWIM {self._udp_port}] PROCESS: ACK response from {addr_tuple}")
+            # Complete pending probe future for this address
+            pending_future = self._pending_probe_acks.get(addr_tuple)
+            if pending_future:
+                print(f"[DEBUG SWIM {self._udp_port}] PROCESS: Found pending future for {addr_tuple}, done={pending_future.done()}")
+                if not pending_future.done():
+                    pending_future.set_result(True)
+                    print(f"[DEBUG SWIM {self._udp_port}] PROCESS: Completed pending probe future for {addr_tuple}")
+            else:
+                print(f"[DEBUG SWIM {self._udp_port}] PROCESS: No pending future for {addr_tuple}")
 
         # Extract embedded state from response (Serf-style)
         # Response format: msg_type>host:port#|sbase64_state
         clean_data = self._extract_embedded_state(data, addr)
+        print(f"[DEBUG SWIM {self._udp_port}] PROCESS: returning clean_data len={len(clean_data) if clean_data else 0}")
         return clean_data
 
     

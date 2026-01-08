@@ -262,7 +262,7 @@ class TestHealthGossipMessageFormat:
     """Test health gossip message format and integration with SWIM messages."""
 
     def test_health_piggyback_format(self) -> None:
-        """Test the #h| message format."""
+        """Test the #|h message format."""
         buffer = HealthGossipBuffer()
 
         health = HealthPiggyback(
@@ -280,7 +280,7 @@ class TestHealthGossipMessageFormat:
         encoded = buffer.encode_piggyback()
 
         # Format verification
-        assert encoded.startswith(b"#h|")
+        assert encoded.startswith(b"#|h")
         # Should contain all fields separated by |
         decoded = encoded.decode()
         assert "node-1" in decoded
@@ -301,13 +301,13 @@ class TestHealthGossipMessageFormat:
 
         encoded = buffer.encode_piggyback()
 
-        # Count # separators (excluding the #h| prefix)
-        content = encoded[3:]  # Skip #h|
-        parts = content.split(b"#")
+        # Count ; separators (excluding the #|h prefix)
+        content = encoded[3:]  # Skip #|h
+        parts = content.split(b";")
         assert len(parts) >= 1  # At least one entry
 
     def test_membership_and_health_gossip_coexistence(self) -> None:
-        """Test that membership gossip | and health gossip #h| can coexist."""
+        """Test that membership gossip | and health gossip #|h can coexist."""
         # Simulate a full SWIM message with both types
         base_message = b"ack>127.0.0.1:8001"
 
@@ -330,13 +330,13 @@ class TestHealthGossipMessageFormat:
 
         # Verify both can be identified
         assert b"|join:" in full_message  # Membership gossip
-        assert b"#h|" in full_message  # Health gossip
+        assert b"#|h" in full_message  # Health gossip
 
         # Extract health piggyback
-        health_idx = full_message.find(b"#h|")
+        health_idx = full_message.find(b"#|h")
         assert health_idx > 0
         health_data = full_message[health_idx:]
-        assert health_data.startswith(b"#h|")
+        assert health_data.startswith(b"#|h")
 
 
 class TestHealthGossipExtraction:
@@ -363,7 +363,7 @@ class TestHealthGossipExtraction:
         full_message = base_message + membership + health_piggyback
 
         # Extract health gossip first
-        health_idx = full_message.find(b"#h|")
+        health_idx = full_message.find(b"#|h")
         if health_idx > 0:
             health_data = full_message[health_idx:]
             remaining_message = full_message[:health_idx]
@@ -395,7 +395,7 @@ class TestHealthGossipExtraction:
 
         full_message = base_message + health_piggyback
 
-        health_idx = full_message.find(b"#h|")
+        health_idx = full_message.find(b"#|h")
         assert health_idx > 0
         health_data = full_message[health_idx:]
         remaining = full_message[:health_idx]
@@ -522,7 +522,7 @@ class TestHealthGossipEdgeCasesIntegration:
         """Test handling when message has no piggyback."""
         base_message = b"ack>127.0.0.1:8001"
 
-        health_idx = base_message.find(b"#h|")
+        health_idx = base_message.find(b"#|h")
         assert health_idx == -1  # No health piggyback
 
     def test_health_only_no_base_message(self) -> None:
@@ -683,10 +683,10 @@ class TestHealthGossipNegativePathsIntegration:
     """Negative path tests for health gossip SWIM integration."""
 
     def test_malformed_health_marker(self) -> None:
-        """Test handling of malformed #h marker."""
+        """Test handling of malformed #|h marker."""
         buffer = HealthGossipBuffer()
 
-        # Missing | after #h
+        # Incorrect format (missing proper prefix)
         processed = buffer.decode_and_process_piggyback(b"#hdata")
         assert processed == 0
 
@@ -695,7 +695,7 @@ class TestHealthGossipNegativePathsIntegration:
         buffer = HealthGossipBuffer()
 
         # Valid start but truncated mid-entry
-        processed = buffer.decode_and_process_piggyback(b"#h|node-1|work")
+        processed = buffer.decode_and_process_piggyback(b"#|hnode-1|work")
         assert processed == 0
 
     def test_empty_health_entries(self) -> None:
@@ -703,7 +703,7 @@ class TestHealthGossipNegativePathsIntegration:
         buffer = HealthGossipBuffer()
 
         # Multiple empty entries
-        processed = buffer.decode_and_process_piggyback(b"#h|###")
+        processed = buffer.decode_and_process_piggyback(b"#|h;;;")
         assert processed == 0
 
     def test_very_large_timestamp(self) -> None:
@@ -711,7 +711,7 @@ class TestHealthGossipNegativePathsIntegration:
         buffer = HealthGossipBuffer()
 
         # Timestamp way in future
-        data = b"#h|node-1|worker|healthy|1|4|10.0|15.0|999999999999.99"
+        data = b"#|hnode-1|worker|healthy|1|4|10.0|15.0|999999999999.99"
         processed = buffer.decode_and_process_piggyback(data)
         # Should still parse
         assert processed == 1
