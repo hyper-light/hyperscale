@@ -634,7 +634,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     # Node types (Worker, Manager, Gate) inject their own embedder implementation.
     
     # Separator for embedded state in messages
-    _STATE_SEPARATOR = b'#'
+    # Uses multi-byte sequence to avoid conflicts with health gossip (#h|entry#entry)
+    _STATE_SEPARATOR = b'#s|'
     
     def set_state_embedder(self, embedder: StateEmbedder) -> None:
         """
@@ -725,7 +726,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         Build an ack response with embedded state (using self address).
 
-        Format: ack>host:port#base64_state (if state available)
+        Format: ack>host:port#s|base64_state (if state available)
                 ack>host:port (if no state)
 
         Returns:
@@ -737,10 +738,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         Build an ack response with embedded state for a specific address.
 
-        Format: ack>host:port#base64_state|membership_gossip#h|health_gossip
+        Format: ack>host:port#s|base64_state|membership_gossip#h|health_gossip
 
         This method adds:
-        1. Serf-style embedded state (heartbeat) after #
+        1. Serf-style embedded state (heartbeat) after #s|
         2. Membership gossip piggyback after |
         3. Health gossip piggyback after #h|
 
@@ -775,12 +776,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Separates the message content from any embedded state, processes
         the state if present, and returns the clean message.
 
-        Wire format: msg_type>host:port#base64_state|membership_piggyback#h|health_gossip
+        Wire format: msg_type>host:port#s|base64_state|membership_piggyback#h|health_gossip
 
         Parsing order is critical - must match the reverse of how piggyback is added:
         1. Strip health gossip (#h|...) - added last, strip first
         2. Strip membership piggyback (|...) - added second, strip second
-        3. Extract state (#base64) - part of base message
+        3. Extract state (#s|base64) - part of base message, uses unique separator
 
         Args:
             message: Raw message that may contain embedded state and piggyback.
@@ -810,7 +811,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             msg_end = membership_idx
 
         # Step 3: Find message structure in core message only
-        # Format: msg_type>host:port#base64_state
+        # Format: msg_type>host:port#s|base64_state
         addr_sep_idx = message.find(b'>', 0, msg_end)
         if addr_sep_idx < 0:
             # No address separator - process piggyback and return
@@ -821,7 +822,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return message[:msg_end] if msg_end < len(message) else message
 
         # Find state separator after '>' but before piggyback
-        state_sep_idx = message.find(b'#', addr_sep_idx, msg_end)
+        # Uses #s| to avoid conflicts with health gossip (#h|entry#entry)
+        state_sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx, msg_end)
 
         # Process piggyback data (can happen in parallel with state processing)
         if health_piggyback:
@@ -835,7 +837,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # Extract and decode state
         # Slice once: encoded_state is between state_sep and msg_end
-        encoded_state = message[state_sep_idx + 1:msg_end]
+        # Skip 3 bytes for '#s|' separator
+        encoded_state = message[state_sep_idx + 3:msg_end]
 
         try:
             state_data = b64decode(encoded_state)
@@ -2917,7 +2920,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return data
 
         # Extract embedded state from response (Serf-style)
-        # Response format: msg_type>host:port#base64_state
+        # Response format: msg_type>host:port#s|base64_state
         clean_data = self._extract_embedded_state(data, addr)
         return clean_data
 
@@ -3000,7 +3003,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     message, target_addr = parsed
 
                     # Extract embedded state from address portion (Serf-style)
-                    # Format: host:port#base64_state
+                    # Format: host:port#s|base64_state
                     if self._STATE_SEPARATOR in target_addr:
                         print(f"[DEBUG SWIM {self._udp_port}] FOUND STATE_SEPARATOR in target_addr, parsing state from {addr}")
                         addr_part, state_part = target_addr.split(self._STATE_SEPARATOR, 1)
