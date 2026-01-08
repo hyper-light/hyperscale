@@ -69,6 +69,12 @@ from hyperscale.distributed_rewrite.reliability.rate_limiting import (
     RequestPriority,
 )
 from hyperscale.distributed_rewrite.reliability.overload import HybridOverloadDetector
+from hyperscale.distributed_rewrite.protocol.version import (
+    CURRENT_PROTOCOL_VERSION,
+    ProtocolVersion,
+    NegotiatedCapabilities,
+    get_features_for_version,
+)
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
 from hyperscale.reporting.reporter import Reporter
 from hyperscale.reporting.json import JSONConfig
@@ -220,6 +226,12 @@ class HyperscaleClient(MercurySyncBaseServer):
             ),
         )
 
+        # Protocol version negotiation (AD-25)
+        # Tracks negotiated capabilities per server (manager/gate)
+        self._server_negotiated_caps: dict[tuple[str, int], NegotiatedCapabilities] = {}
+        # Build our capabilities string once
+        self._capabilities_str = ','.join(sorted(get_features_for_version(CURRENT_PROTOCOL_VERSION)))
+
         # For selecting targets
         self._current_manager_idx = 0
         self._current_gate_idx = 0
@@ -343,6 +355,10 @@ class HyperscaleClient(MercurySyncBaseServer):
             datacenters=datacenters or [],
             callback_addr=self._get_callback_addr(),
             reporting_configs=reporting_configs_bytes,
+            # Protocol version fields (AD-25)
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            capabilities=self._capabilities_str,
         )
 
         # Initialize job tracking
@@ -399,6 +415,22 @@ class HyperscaleClient(MercurySyncBaseServer):
                 if ack.accepted:
                     # Track which manager accepted this job for future queries
                     self._job_targets[job_id] = target
+
+                    # Store negotiated capabilities (AD-25)
+                    server_version = ProtocolVersion(
+                        major=getattr(ack, 'protocol_version_major', 1),
+                        minor=getattr(ack, 'protocol_version_minor', 0),
+                    )
+                    negotiated_caps_str = getattr(ack, 'capabilities', '')
+                    negotiated_features = set(negotiated_caps_str.split(',')) if negotiated_caps_str else set()
+
+                    self._server_negotiated_caps[target] = NegotiatedCapabilities(
+                        local_version=CURRENT_PROTOCOL_VERSION,
+                        remote_version=server_version,
+                        common_features=negotiated_features,
+                        compatible=True,
+                    )
+
                     return job_id
 
                 # Check for leader redirect

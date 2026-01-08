@@ -603,6 +603,10 @@ class JobSubmission(Message):
     If reporting_configs is provided (cloudpickled list of ReporterConfig),
     the manager/gate will submit results to reporters after aggregation
     and notify the client of success/failure per reporter.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of features client supports
     """
     job_id: str                  # Unique job identifier
     workflows: bytes             # Cloudpickled list[tuple[str, list[str], Workflow]]
@@ -621,21 +625,33 @@ class JobSubmission(Message):
     # Cloudpickled list of ReporterConfig objects
     # If set, manager/gate submits results to these reporters after aggregation
     reporting_configs: bytes = b''
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""       # Comma-separated feature list
 
 
 @dataclass(slots=True)
 class JobAck(Message):
     """
     Acknowledgment of job submission.
-    
+
     Returned immediately after job is accepted for processing.
     If rejected due to not being leader, leader_addr provides redirect target.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: Server's protocol version
+    - capabilities: Comma-separated negotiated features
     """
     job_id: str                  # Job identifier
     accepted: bool               # Whether job was accepted
     error: str | None = None     # Error message if rejected
     queued_position: int = 0     # Position in queue (if queued)
     leader_addr: tuple[str, int] | None = None  # Leader address for redirect
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""       # Comma-separated negotiated features
 
 
 @dataclass(slots=True)

@@ -7055,6 +7055,30 @@ class ManagerServer(HealthAwareServer):
 
             submission = JobSubmission.load(data)
 
+            # Protocol version negotiation (AD-25)
+            client_version = ProtocolVersion(
+                major=getattr(submission, 'protocol_version_major', 1),
+                minor=getattr(submission, 'protocol_version_minor', 0),
+            )
+
+            # Check version compatibility - reject if major version differs
+            if client_version.major != CURRENT_PROTOCOL_VERSION.major:
+                ack = JobAck(
+                    job_id=submission.job_id,
+                    accepted=False,
+                    error=f"Incompatible protocol version: {client_version} (requires major version {CURRENT_PROTOCOL_VERSION.major})",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return ack.dump()
+
+            # Negotiate capabilities
+            client_caps_str = getattr(submission, 'capabilities', '')
+            client_features = set(client_caps_str.split(',')) if client_caps_str else set()
+            our_features = get_features_for_version(CURRENT_PROTOCOL_VERSION)
+            negotiated_features = client_features & our_features
+            negotiated_caps_str = ','.join(sorted(negotiated_features))
+
             # Unpickle workflows (new format with client-generated workflow IDs)
             # Format: list[tuple[str, list[str], Workflow]] - (workflow_id, dependencies, workflow)
             workflows: list[
@@ -7152,9 +7176,12 @@ class ManagerServer(HealthAwareServer):
                 job_id=submission.job_id,
                 accepted=True,
                 queued_position=self._job_manager.job_count,
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                capabilities=negotiated_caps_str,
             )
             return ack.dump()
-            
+
         except Exception as e:
             await self.handle_exception(e, "job_submission")
             ack = JobAck(
