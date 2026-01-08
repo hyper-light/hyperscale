@@ -70,6 +70,11 @@ from hyperscale.distributed_rewrite.reliability.rate_limiting import (
 )
 from hyperscale.distributed_rewrite.reliability.overload import HybridOverloadDetector
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError
+from hyperscale.reporting.reporter import Reporter
+from hyperscale.reporting.json import JSONConfig
+from hyperscale.reporting.csv import CSVConfig
+from hyperscale.reporting.xml import XMLConfig
+from hyperscale.reporting.common import ReporterTypes
 
 
 @dataclass(slots=True)
@@ -187,6 +192,17 @@ class HyperscaleClient(MercurySyncBaseServer):
 
         # Workflow result callbacks (called when each workflow completes)
         self._workflow_callbacks: dict[str, Callable[[WorkflowResultPush], None]] = {}
+
+        # Reporter configs per job for local file-based reporting
+        # job_id -> list of ReporterConfig objects
+        self._job_reporting_configs: dict[str, list] = {}
+
+        # File-based reporter types that should be handled locally
+        self._local_reporter_types = {
+            ReporterTypes.JSON,
+            ReporterTypes.CSV,
+            ReporterTypes.XML,
+        }
 
         # Progress update callbacks (for streaming windowed stats)
         from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
@@ -343,6 +359,9 @@ class HyperscaleClient(MercurySyncBaseServer):
             self._workflow_callbacks[job_id] = on_workflow_result
         if on_reporter_result:
             self._reporter_callbacks[job_id] = on_reporter_result
+
+        # Store reporting configs for local file-based reporting
+        self._job_reporting_configs[job_id] = reporting_configs or []
 
         # Get all available targets for fallback
         all_targets = []
@@ -1368,10 +1387,62 @@ class HyperscaleClient(MercurySyncBaseServer):
                 except Exception:
                     pass  # Don't let callback errors break the handler
 
+            # Submit to local file-based reporters (aggregated stats only, not per-DC)
+            if stats:
+                await self._submit_to_local_reporters(push.job_id, push.workflow_name, stats)
+
             return b'ok'
 
         except Exception:
             return b'error'
+
+    async def _submit_to_local_reporters(
+        self,
+        job_id: str,
+        workflow_name: str,
+        workflow_stats: dict,
+    ) -> None:
+        """
+        Submit workflow results to local file-based reporters.
+
+        Uses configured reporters if provided, otherwise defaults to per-workflow
+        JSON files with naming pattern: <workflow_name>_workflow_results.json
+        """
+        configs = self._job_reporting_configs.get(job_id, [])
+
+        # Filter to only file-based reporters
+        local_configs = [
+            config for config in configs
+            if hasattr(config, 'reporter_type') and config.reporter_type in self._local_reporter_types
+        ]
+
+        # If no file-based configs provided, use default per-workflow JSON
+        if not local_configs:
+            workflow_name_lower = workflow_name.lower()
+            local_configs = [
+                JSONConfig(
+                    workflow_results_filepath=f"{workflow_name_lower}_workflow_results.json",
+                    step_results_filepath=f"{workflow_name_lower}_step_results.json",
+                )
+            ]
+
+        for config in local_configs:
+            await self._submit_single_reporter(config, workflow_stats)
+
+    async def _submit_single_reporter(self, config, workflow_stats: dict) -> None:
+        """Submit results to a single local reporter."""
+        try:
+            reporter = Reporter(config)
+            await reporter.connect()
+
+            try:
+                await reporter.submit_workflow_results(workflow_stats)
+                await reporter.submit_step_results(workflow_stats)
+            finally:
+                await reporter.close()
+
+        except Exception:
+            pass  # Best effort - don't break on reporter failures
 
     @tcp.receive()
     async def windowed_stats_push(
