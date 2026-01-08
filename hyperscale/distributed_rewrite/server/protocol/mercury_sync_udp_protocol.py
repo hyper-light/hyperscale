@@ -10,7 +10,6 @@ from .utils import (
     is_ssl,
 )
 from .abstract_connection import AbstractConnection
-from .receive_buffer import ReceiveBuffer
 
 
 T = TypeVar("T", bound=AbstractConnection)
@@ -36,21 +35,8 @@ class MercurySyncUDPProtocol(asyncio.DatagramProtocol, Generic[T]):
         self.scheme: Literal["mudps", "mudp"] | None = None
         self.timeout_keep_alive_task: asyncio.TimerHandle | None = None
 
-        self._receive_buffer = ReceiveBuffer()
-        self._receive_buffer_closed = False
         self._active_requests: dict[bytes, bytes] = {}
         self._next_data: asyncio.Future = asyncio.Future()
-
-    @property
-    def trailing_data(self) -> tuple[bytes, bool]:
-        """Data that has been received, but not yet processed, represented as
-        a tuple with two elements, where the first is a byte-string containing
-        the unprocessed data itself, and the second is a bool that is True if
-        the receive connection was closed.
-
-        See :ref:`switching-protocols` for discussion of why you'd want this.
-        """
-        return (bytes(self._receive_buffer), self._receive_buffer_closed)
 
     def connection_made(self, transport: asyncio.Transport):
         self.connections.add(self)

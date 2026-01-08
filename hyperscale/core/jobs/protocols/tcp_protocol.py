@@ -26,6 +26,8 @@ from typing import (
 import cloudpickle
 import zstandard
 
+
+from .constants import MAX_DECOMPRESSED_SIZE
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.jobs.data_structures import LockedSet
 from hyperscale.core.jobs.hooks.hook_type import HookType
@@ -840,7 +842,7 @@ class TCPProtocol(Generic[T, K]):
         decompressed = b""
         
         try:
-            decompressed = self._decompressor.decompress(data)
+            decompressed = self._decompressor.decompress(data, max_output_size=MAX_DECOMPRESSED_SIZE)
 
         except Exception:
             # Sanitized error - don't leak internal details

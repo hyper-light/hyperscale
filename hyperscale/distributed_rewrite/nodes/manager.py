@@ -7109,6 +7109,16 @@ class ManagerServer(HealthAwareServer):
 
             submission = JobSubmission.load(data)
 
+            for workflow in submission.workflows:
+                if not isinstance(workflow, Workflow):
+                    return JobAck(
+                        job_id=submission.job_id, 
+                        accepted=False,
+                        error=f"{workflow.__class__.__name__} is not a valid hyperscale Workflow",
+                        protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                        protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                    )
+
             # Protocol version negotiation (AD-25)
             client_version = ProtocolVersion(
                 major=getattr(submission, 'protocol_version_major', 1),

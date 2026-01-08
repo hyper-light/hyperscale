@@ -27,6 +27,7 @@ from typing import (
 import cloudpickle
 import zstandard
 
+from .constants import MAX_DECOMPRESSED_SIZE
 from hyperscale.core.engines.client.time_parser import TimeParser
 from hyperscale.core.engines.client.udp.protocols.dtls import do_patch
 from hyperscale.core.jobs.data_structures import LockedSet
@@ -840,7 +841,10 @@ class UDPProtocol(Generic[T, K]):
         compressed_size = len(data)
 
         try:
-            decompressed = self._decompressor.decompress(data)
+            decompressed = self._decompressor.decompress(
+                data, 
+                max_output_size=MAX_DECOMPRESSED_SIZE,
+            )
 
         except Exception:
             # Sanitized error - don't leak internal details

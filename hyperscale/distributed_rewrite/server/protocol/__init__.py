@@ -17,8 +17,6 @@ from .security import (
     AddressValidationError as AddressValidationError,
     validate_message_size as validate_message_size,
     parse_address as parse_address,
-    MAX_MESSAGE_SIZE,
-    MAX_DECOMPRESSED_SIZE,
 )
 from .drop_counter import (
     DropCounter as DropCounter,

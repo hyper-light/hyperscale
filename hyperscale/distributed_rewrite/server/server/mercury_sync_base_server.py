@@ -45,7 +45,6 @@ from hyperscale.distributed_rewrite.server.protocol import (
     validate_message_size,
     parse_address,
     AddressValidationError,
-    MAX_MESSAGE_SIZE,
     frame_message,
     DropCounter,
 )
@@ -58,7 +57,7 @@ from hyperscale.distributed_rewrite.server.hooks.task import (
 
 from hyperscale.distributed_rewrite.taskex import TaskRunner
 from hyperscale.distributed_rewrite.taskex.run import Run
-from hyperscale.core.jobs.protocols.constants import MAX_DECOMPRESSED_SIZE, MAX_COMPRESSION_RATIO
+from hyperscale.core.jobs.protocols.constants import MAX_DECOMPRESSED_SIZE, MAX_MESSAGE_SIZE
 from hyperscale.logging import Logger
 from hyperscale.logging.config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerWarning, SilentDropStats
@@ -594,7 +593,7 @@ class MercurySyncBaseServer(Generic[T]):
 
             elif hook.action == 'handle':
                 self.tcp_client_handler[hook.target] = hook
-    
+
     def _get_udp_hooks(self):
         hooks: Dict[str, Handler] = {
             name: hook
@@ -1069,6 +1068,7 @@ class MercurySyncBaseServer(Generic[T]):
                             )
                         )
                     )
+
 
         except Exception:
             self._udp_drop_counter.increment_malformed_message()
@@ -1602,3 +1602,4 @@ class MercurySyncBaseServer(Generic[T]):
                 socket.error,
             ):
                 pass
+
