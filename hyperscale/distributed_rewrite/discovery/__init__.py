@@ -106,3 +106,8 @@ from hyperscale.distributed_rewrite.discovery.metrics.discovery_metrics import (
     DiscoveryMetrics as DiscoveryMetrics,
     MetricsSnapshot as MetricsSnapshot,
 )
+
+# Service facade
+from hyperscale.distributed_rewrite.discovery.discovery_service import (
+    DiscoveryService as DiscoveryService,
+)
