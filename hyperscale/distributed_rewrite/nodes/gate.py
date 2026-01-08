@@ -467,6 +467,23 @@ class GateServer(HealthAwareServer):
                 )
             self._dc_manager_discovery[datacenter_id] = dc_discovery
 
+        # Discovery service for peer gate selection (AD-28)
+        # Used for quorum operations, job leadership, and state sync
+        peer_static_seeds = [f"{host}:{port}" for host, port in self._gate_peers]
+        peer_discovery_config = env.get_discovery_config(
+            node_role="gate",
+            static_seeds=peer_static_seeds,
+        )
+        self._peer_discovery = DiscoveryService(peer_discovery_config)
+        # Pre-register seed gate peers
+        for host, port in self._gate_peers:
+            self._peer_discovery.add_peer(
+                peer_id=f"{host}:{port}",  # Use addr as initial ID until heartbeat
+                host=host,
+                port=port,
+                role="gate",
+            )
+
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
         Called when a node is marked as DEAD via SWIM.
@@ -506,6 +523,11 @@ class GateServer(HealthAwareServer):
         """
         # Remove from active peers
         self._active_gate_peers.discard(tcp_addr)
+
+        # Remove from peer discovery service (AD-28)
+        peer_host, peer_port = tcp_addr
+        peer_id = f"{peer_host}:{peer_port}"
+        self._peer_discovery.remove_peer(peer_id)
 
         # Check if this was the leader
         current_leader = self.get_current_leader()
@@ -695,6 +717,18 @@ class GateServer(HealthAwareServer):
 
         # Store peer info keyed by UDP address
         self._gate_peer_info[source_addr] = heartbeat
+
+        # Get peer TCP address for discovery tracking
+        peer_tcp_host = heartbeat.tcp_host if heartbeat.tcp_host else source_addr[0]
+        peer_tcp_port = heartbeat.tcp_port if heartbeat.tcp_port else source_addr[1]
+
+        # Update peer discovery service (AD-28)
+        self._peer_discovery.add_peer(
+            peer_id=heartbeat.node_id,
+            host=peer_tcp_host,
+            port=peer_tcp_port,
+            role="gate",
+        )
 
         # Update three-signal health state for peer gate (AD-19)
         gate_id = heartbeat.node_id
@@ -5705,6 +5739,10 @@ class GateServer(HealthAwareServer):
                     discovery.decay_failures()
                     discovery.cleanup_expired_dns()
 
+                # Decay failure counts for peer discovery service
+                self._peer_discovery.decay_failures()
+                self._peer_discovery.cleanup_expired_dns()
+
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -5768,3 +5806,46 @@ class GateServer(HealthAwareServer):
         discovery = self._dc_manager_discovery.get(datacenter_id)
         if discovery is not None:
             discovery.record_failure(manager_id)
+
+    def _select_best_peer(self, key: str) -> tuple[str, int] | None:
+        """
+        Select the best peer gate using adaptive selection (AD-28).
+
+        Uses Power of Two Choices with EWMA for load-aware selection.
+
+        Args:
+            key: Key for consistent selection (e.g., request_id)
+
+        Returns:
+            Tuple of (host, port) for the selected peer, or None if no peers available
+        """
+        # Only consider active peers
+        def is_active(peer_id: str) -> bool:
+            addr = self._peer_discovery.get_peer_address(peer_id)
+            if addr is None:
+                return False
+            return addr in self._active_gate_peers
+
+        selection = self._peer_discovery.select_peer_with_filter(key, is_active)
+        if selection is not None:
+            return self._peer_discovery.get_peer_address(selection.peer_id)
+        return None
+
+    def _record_peer_success(self, peer_id: str, latency_ms: float) -> None:
+        """
+        Record a successful request to a peer gate (AD-28).
+
+        Args:
+            peer_id: The peer that handled the request
+            latency_ms: Request latency in milliseconds
+        """
+        self._peer_discovery.record_success(peer_id, latency_ms)
+
+    def _record_peer_failure(self, peer_id: str) -> None:
+        """
+        Record a failed request to a peer gate (AD-28).
+
+        Args:
+            peer_id: The peer that failed
+        """
+        self._peer_discovery.record_failure(peer_id)

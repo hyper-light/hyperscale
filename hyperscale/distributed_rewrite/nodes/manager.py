@@ -486,6 +486,25 @@ class ManagerServer(HealthAwareServer):
             static_seeds=[],  # Workers register dynamically
         )
         self._worker_discovery = DiscoveryService(worker_discovery_config)
+
+        # Discovery service for peer manager selection (AD-28)
+        # Used for quorum operations, state sync, and leader election
+        peer_static_seeds = [f"{host}:{port}" for host, port in self._seed_managers]
+        peer_discovery_config = env.get_discovery_config(
+            node_role="manager",
+            static_seeds=peer_static_seeds,
+        )
+        self._peer_discovery = DiscoveryService(peer_discovery_config)
+        # Pre-register seed managers
+        for host, port in self._seed_managers:
+            self._peer_discovery.add_peer(
+                peer_id=f"{host}:{port}",  # Use addr as initial ID until heartbeat
+                host=host,
+                port=port,
+                role="manager",
+                datacenter_id=dc_id,
+            )
+
         self._discovery_failure_decay_interval: float = env.DISCOVERY_FAILURE_DECAY_INTERVAL
         self._discovery_maintenance_task: asyncio.Task | None = None
 
@@ -1376,6 +1395,15 @@ class ManagerServer(HealthAwareServer):
         self._active_manager_peer_ids.add(heartbeat.node_id)
         self._manager_udp_to_tcp[source_addr] = tcp_addr
         self._active_manager_peers.add(tcp_addr)
+
+        # Update peer discovery service (AD-28)
+        self._peer_discovery.add_peer(
+            peer_id=heartbeat.node_id,
+            host=tcp_host,
+            port=tcp_port,
+            role="manager",
+            datacenter_id=heartbeat.datacenter,
+        )
 
         if is_new_peer:
             self._task_runner.run(
@@ -6909,6 +6937,8 @@ class ManagerServer(HealthAwareServer):
                     self._active_manager_peer_ids.discard(peer_id)
                     self._manager_peer_unhealthy_since.pop(peer_id, None)
                     self._registered_with_managers.discard(peer_id)
+                    # Remove from peer discovery service (AD-28)
+                    self._peer_discovery.remove_peer(peer_id)
 
                     self._task_runner.run(
                         self._udp_logger.log,
@@ -6956,18 +6986,20 @@ class ManagerServer(HealthAwareServer):
         Background loop for discovery service maintenance (AD-28).
 
         Periodically:
-        - Decays failure counts to allow workers to recover
+        - Decays failure counts to allow workers and peers to recover
         - Cleans up expired DNS cache entries
         """
         while self._running:
             try:
                 await asyncio.sleep(self._discovery_failure_decay_interval)
 
-                # Decay failure counts to allow peers to recover
+                # Decay failure counts for worker discovery
                 self._worker_discovery.decay_failures()
-
-                # Clean up expired DNS cache entries
                 self._worker_discovery.cleanup_expired_dns()
+
+                # Decay failure counts for peer manager discovery
+                self._peer_discovery.decay_failures()
+                self._peer_discovery.cleanup_expired_dns()
 
             except asyncio.CancelledError:
                 break
@@ -7015,6 +7047,47 @@ class ManagerServer(HealthAwareServer):
             worker_id: The worker that failed
         """
         self._worker_discovery.record_failure(worker_id)
+
+    def _select_best_peer(self, key: str) -> tuple[str, int] | None:
+        """
+        Select the best peer manager using adaptive selection (AD-28).
+
+        Uses Power of Two Choices with EWMA for load-aware selection.
+        Used for quorum operations, state sync, etc.
+
+        Args:
+            key: Key for consistent selection (e.g., operation_id)
+
+        Returns:
+            Tuple of (host, port) for the selected peer, or None if no peers available
+        """
+        # Only consider active peers
+        def is_active(peer_id: str) -> bool:
+            return peer_id in self._active_manager_peer_ids
+
+        selection = self._peer_discovery.select_peer_with_filter(key, is_active)
+        if selection is not None:
+            return self._peer_discovery.get_peer_address(selection.peer_id)
+        return None
+
+    def _record_peer_success(self, peer_id: str, latency_ms: float) -> None:
+        """
+        Record a successful request to a peer manager (AD-28).
+
+        Args:
+            peer_id: The peer that handled the request
+            latency_ms: Request latency in milliseconds
+        """
+        self._peer_discovery.record_success(peer_id, latency_ms)
+
+    def _record_peer_failure(self, peer_id: str) -> None:
+        """
+        Record a failed request to a peer manager (AD-28).
+
+        Args:
+            peer_id: The peer that failed
+        """
+        self._peer_discovery.record_failure(peer_id)
 
     async def _orphan_workflow_scan_loop(self) -> None:
         """
