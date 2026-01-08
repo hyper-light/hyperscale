@@ -16,6 +16,7 @@ This server provides:
 import asyncio
 import random
 import time
+from base64 import b64decode, b64encode
 from typing import Callable, Literal
 
 from hyperscale.distributed_rewrite.server import tcp, udp, task
@@ -745,7 +746,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Returns:
             Ack message bytes with optional embedded state.
         """
-        import base64
 
         base_ack = b'ack>' + addr_slug
 
@@ -754,7 +754,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             return base_ack
 
         # Encode state as base64 to avoid byte issues
-        encoded_state = base64.b64encode(state)
+        encoded_state = b64encode(state)
 
         # Check if adding state would exceed MTU
         full_message = base_ack + self._STATE_SEPARATOR + encoded_state
@@ -782,7 +782,6 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Returns:
             The message with embedded state removed.
         """
-        import base64
         
         # Find state separator in the address portion
         # Format: msg_type>host:port#base64_state
@@ -801,7 +800,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         encoded_state = message[sep_idx + 1:]
         
         try:
-            state_data = base64.b64decode(encoded_state)
+            state_data = b64decode(encoded_state)
             self._process_embedded_state(state_data, source_addr)
         except Exception:
             # Invalid base64 or processing error - ignore silently
@@ -2859,7 +2858,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         data: bytes,
         clock_time: int,
     ) -> Message:
-        return data
+        """
+        Process UDP response data before it's returned to the caller.
+
+        This hook intercepts responses from UDP sends (e.g., probe responses).
+        We extract any embedded state for Serf-style passive discovery.
+        """
+        if not data:
+            return data
+
+        # Extract embedded state from response (Serf-style)
+        # Response format: msg_type>host:port#base64_state
+        clean_data = self._extract_embedded_state(data, addr)
+        return clean_data
 
     
     @udp.receive()
@@ -2946,9 +2957,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         addr_part, state_part = target_addr.split(self._STATE_SEPARATOR, 1)
                         target_addr = addr_part
                         # Process embedded state from sender
-                        import base64
+               
                         try:
-                            state_data = base64.b64decode(state_part)
+                            state_data = b64decode(state_part)
                             print(f"[DEBUG SWIM {self._udp_port}] Decoded state, len={len(state_data)}, calling _process_embedded_state")
                             self._process_embedded_state(state_data, addr)
                         except Exception as e:
@@ -3188,8 +3199,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             state = self._get_embedded_state()
                             print(f"[DEBUG SWIM {self._udp_port}] PROBE refutation: state={state is not None}, state_len={len(state) if state else 0}")
                             if state:
-                                import base64
-                                return base + self._STATE_SEPARATOR + base64.b64encode(state)
+                                return base + self._STATE_SEPARATOR + b64encode(state)
                             return base
 
                         if target not in nodes:
@@ -3257,8 +3267,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             base = b'ping-req-ack:alive>' + self._udp_addr_slug
                             state = self._get_embedded_state()
                             if state:
-                                import base64
-                                return base + self._STATE_SEPARATOR + base64.b64encode(state)
+                                return base + self._STATE_SEPARATOR + b64encode(state)
                             return base
                         
                         if target not in nodes:
@@ -3347,8 +3356,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             base = b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
                             state = self._get_embedded_state()
                             if state:
-                                import base64
-                                return base + self._STATE_SEPARATOR + base64.b64encode(state)
+                                return base + self._STATE_SEPARATOR + b64encode(state)
                             return base
                         
                         if self.is_message_fresh(target, msg_incarnation, b'SUSPECT'):
