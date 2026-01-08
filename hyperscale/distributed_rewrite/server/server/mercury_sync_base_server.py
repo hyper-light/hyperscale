@@ -1001,8 +1001,12 @@ class MercurySyncBaseServer(Generic[T]):
         transport: asyncio.Transport,
         sender_addr: tuple[str, int] | None = None,
     ):
+        # Early exit if server is not running (defense in depth)
+        if not self._running:
+            return
+
         try:
-            print(f"[DEBUG] read_server_tcp: received {len(data)} bytes from {sender_addr}")
+            print(f"[DEBUG] read_udp: received {len(data)} bytes from {sender_addr}")
             # Rate limiting (if sender address available)
             if sender_addr is not None:
                 if not self._rate_limiter.check(sender_addr):
@@ -1040,13 +1044,15 @@ class MercurySyncBaseServer(Generic[T]):
             # type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
             request_type, addr, handler_name, rest = decrypted.split(b'<', maxsplit=3)
             # Extract clock (first 64 bytes)
-            clock = rest[:64]
+            clock_time = int.from_bytes(rest[:64])
             # Extract data length (next 4 bytes)
             data_len = int.from_bytes(rest[64:68], 'big')
             # Extract payload (remaining bytes)
             payload = rest[68:68 + data_len]
 
-            print(f'[DEBUG] Received request_type={request_type} handler_name={handler_name} from addr={sender_addr}')
+            print(f'[DEBUG] Received message size {len(decrypted)} bytes with payload of {len(payload)} bytes')
+
+            print(f'[DEBUG] Received request_type={request_type} handler_name={handler_name} from addr={sender_addr} with payload={len(payload)} payload bytes')
 
             match request_type:
 
@@ -1058,7 +1064,7 @@ class MercurySyncBaseServer(Generic[T]):
                                 handler_name,
                                 addr,
                                 payload,
-                                int.from_bytes(clock),
+                                clock_time,
                                 transport,
                             ),
                         ),
@@ -1072,7 +1078,9 @@ class MercurySyncBaseServer(Generic[T]):
                             self.process_udp_client_response(
                                 handler_name,
                                 addr,
-                                rest,
+                                payload,
+                                clock_time,
+                                transport,
                             )
                         )
                     )
@@ -1294,6 +1302,9 @@ class MercurySyncBaseServer(Generic[T]):
         
         next_time = await self._udp_clock.update(clock_time)
 
+        print(f'[DEBUG] Server request received handler_name={handler_name.decode()} addr={addr.decode()} payload_bytes={len(payload)} payload bytes')
+        print(f'[DEBUG] Server request payload={payload}')
+
         try:
             parsed_addr = parse_address(addr)
         except AddressValidationError as e:
@@ -1316,6 +1327,7 @@ class MercurySyncBaseServer(Generic[T]):
                                 payload.sender_incarnation,
                             )
                         except ReplayError:
+                            print(f'[DEBUG] triggered replay error handler_name={handler_name.decode()} addr={addr.decode()}')
                             self._udp_drop_counter.increment_replay_detected()
                             return
 
@@ -1328,6 +1340,9 @@ class MercurySyncBaseServer(Generic[T]):
 
             if isinstance(response, Message):
                 response = response.dump()
+
+            print(f'[DEBUG] Server response prepared at {len(response)} bytes')
+            print(f'[DEBUG] Server response prepared at {response}')
 
             # UDP response with clock before length-prefixed data
             # Format: type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
@@ -1365,13 +1380,13 @@ class MercurySyncBaseServer(Generic[T]):
         self,
         handler_name: bytes,
         addr: bytes,
-        rest: bytes,
+        payload: bytes,
+        clock_time: int,
+        _: asyncio.DatagramTransport,
     ):
         try:
-            # Parse: clock(64 bytes)data_len(4 bytes)data(N bytes)
-            clock_time = int.from_bytes(rest[:64])
-            data_len = int.from_bytes(rest[64:68], 'big')
-            payload = rest[68:68 + data_len]
+            print(f'[DEBUG] Client response received handler_name={handler_name.decode()} addr={addr.decode()} payload_bytes={len(payload)} payload bytes')
+            print(f'[DEBUG] Client response payload={payload}')
 
             await self._udp_clock.ack(clock_time)
 
@@ -1508,6 +1523,22 @@ class MercurySyncBaseServer(Generic[T]):
         for client in self._tcp_client_transports.values():
             client.abort()
 
+        # Close UDP transport to stop receiving datagrams
+        if self._udp_transport is not None:
+            self._udp_transport.close()
+            self._udp_transport = None
+            self._udp_connected = False
+
+        # Close TCP server to stop accepting connections
+        if self._tcp_server is not None:
+            self._tcp_server.close()
+            try:
+                await self._tcp_server.wait_closed()
+            except Exception:
+                pass
+            self._tcp_server = None
+            self._tcp_connected = False
+
         # Cancel drop stats task
         if self._drop_stats_task is not None:
             self._drop_stats_task.cancel()
@@ -1563,6 +1594,26 @@ class MercurySyncBaseServer(Generic[T]):
         self._running = False
 
         self._task_runner.abort()
+
+        # Close UDP transport to stop receiving datagrams
+        if self._udp_transport is not None:
+            self._udp_transport.close()
+            self._udp_transport = None
+            self._udp_connected = False
+
+        # Close TCP server
+        if self._tcp_server is not None:
+            self._tcp_server.close()
+            self._tcp_server = None
+            self._tcp_connected = False
+
+        # Close all TCP client transports
+        for client in self._tcp_client_transports.values():
+            try:
+                client.abort()
+            except Exception:
+                pass
+        self._tcp_client_transports.clear()
 
         if self._tcp_server_cleanup_task:
             try:
