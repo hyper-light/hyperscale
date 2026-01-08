@@ -128,15 +128,20 @@ class MercurySyncBaseServer(Generic[T]):
         self._udp_transport: asyncio.DatagramTransport = None
         self._tcp_transport: asyncio.Transport = None
 
+        # Message queue size limits for backpressure
+        self._message_queue_max_size = env.MESSAGE_QUEUE_MAX_SIZE
+
+        # Use bounded queues to prevent memory exhaustion under load
+        # When queue is full, put_nowait() will raise QueueFull and message will be dropped
         self._tcp_client_data: dict[
             bytes,
             dict[bytes, asyncio.Queue[bytes]]
-        ] = defaultdict(lambda: defaultdict(asyncio.Queue))
+        ] = defaultdict(lambda: defaultdict(lambda: asyncio.Queue(maxsize=self._message_queue_max_size)))
 
         self._udp_client_data: dict[
             bytes,
             dict[bytes, asyncio.Queue[bytes | Message | Exception]]
-        ] = defaultdict(lambda: defaultdict(asyncio.Queue))
+        ] = defaultdict(lambda: defaultdict(lambda: asyncio.Queue(maxsize=self._message_queue_max_size)))
 
         self._pending_tcp_server_responses: Deque[asyncio.Task] = deque()
         self._pending_udp_server_responses: Deque[asyncio.Task] = deque()

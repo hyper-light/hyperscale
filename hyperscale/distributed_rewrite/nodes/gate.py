@@ -364,7 +364,10 @@ class GateServer(HealthAwareServer):
             window_seconds=cb_config['window_seconds'],
             half_open_after=cb_config['half_open_after'],
         )
-        
+
+        # Recovery semaphore - limits concurrent recovery operations to prevent thundering herd
+        self._recovery_semaphore = asyncio.Semaphore(env.RECOVERY_MAX_CONCURRENT)
+
         # Configuration
         self._lease_timeout = lease_timeout
 
@@ -517,10 +520,27 @@ class GateServer(HealthAwareServer):
     ) -> None:
         """
         Handle a gate peer recovering/rejoining the cluster.
+
+        Actions:
+        1. Acquire recovery semaphore (limits concurrent recovery operations)
+        2. Apply jitter delay to prevent thundering herd on mass recovery
+        3. Re-add to active peers set
+        4. Log the recovery for debugging
         """
-        # Add back to active peers
-        self._active_gate_peers.add(tcp_addr)
-        
+        # Limit concurrent recovery operations to prevent thundering herd
+        async with self._recovery_semaphore:
+            # Apply jitter before recovery actions to prevent thundering herd
+            # when multiple gates detect recovery simultaneously
+            import random
+            jitter_min = self.env.RECOVERY_JITTER_MIN
+            jitter_max = self.env.RECOVERY_JITTER_MAX
+            if jitter_max > 0:
+                jitter = random.uniform(jitter_min, jitter_max)
+                await asyncio.sleep(jitter)
+
+            # Add back to active peers
+            self._active_gate_peers.add(tcp_addr)
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -3504,6 +3524,18 @@ class GateServer(HealthAwareServer):
                 return RateLimitResponse(
                     operation="job_submit",
                     retry_after_seconds=retry_after,
+                ).dump()
+
+            # Backpressure/load shedding check (AD-22)
+            # Reject new job submissions when system is overloaded
+            if self._should_shed_request("JobSubmission"):
+                overload_state = self._load_shedder.get_current_state()
+                return JobAck(
+                    job_id="",  # No job_id yet
+                    accepted=False,
+                    error=f"System under load ({overload_state.value}), please retry later",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
             submission = JobSubmission.load(data)

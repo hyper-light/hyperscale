@@ -396,7 +396,7 @@ class ManagerServer(HealthAwareServer):
         
         # Quorum settings
         self._quorum_timeout = quorum_timeout
-        
+
         # Quorum circuit breaker - prevents repeated attempts when quorum unavailable
         # Opens after 3 failures within 30 seconds, recovers after 10 seconds
         self._quorum_circuit = ErrorStats(
@@ -404,6 +404,14 @@ class ManagerServer(HealthAwareServer):
             max_errors=3,
             half_open_after=10.0,
         )
+
+        # Recovery semaphore - limits concurrent recovery operations to prevent thundering herd
+        # When multiple nodes fail/recover simultaneously, this caps simultaneous reconnection attempts
+        self._recovery_semaphore = asyncio.Semaphore(env.RECOVERY_MAX_CONCURRENT)
+
+        # Dispatch semaphore per worker - limits concurrent dispatches to prevent worker overload
+        self._dispatch_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._dispatch_max_concurrent = env.DISPATCH_MAX_CONCURRENT_PER_WORKER
         
         # Job cleanup configuration - use shorter age for completed jobs to free memory faster
         self._completed_job_max_age: float = env.COMPLETED_JOB_MAX_AGE
@@ -613,13 +621,26 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         """
         Handle a manager peer recovering/rejoining the cluster.
-        
+
         Actions:
-        1. Re-add to active peers set (restores quorum capacity)
-        2. Log the recovery for debugging
+        1. Acquire recovery semaphore (limits concurrent recovery operations)
+        2. Apply jitter delay to prevent thundering herd on mass recovery
+        3. Re-add to active peers set (restores quorum capacity)
+        4. Log the recovery for debugging
         """
-        # Add back to active peers
-        self._active_manager_peers.add(tcp_addr)
+        # Limit concurrent recovery operations to prevent thundering herd
+        async with self._recovery_semaphore:
+            # Apply jitter before recovery actions to prevent thundering herd
+            # when multiple managers detect recovery simultaneously
+            import random
+            jitter_min = self.env.RECOVERY_JITTER_MIN
+            jitter_max = self.env.RECOVERY_JITTER_MAX
+            if jitter_max > 0:
+                jitter = random.uniform(jitter_min, jitter_max)
+                await asyncio.sleep(jitter)
+
+            # Add back to active peers
+            self._active_manager_peers.add(tcp_addr)
         
         self._task_runner.run(
             self._udp_logger.log,
@@ -742,8 +763,19 @@ class ManagerServer(HealthAwareServer):
             )
         )
 
-        # Take over leadership of each orphaned job
+        # Apply per-job jitter to spread takeover load and prevent thundering herd
+        # when multiple jobs need takeover simultaneously
+        import random
+        jitter_min = self.env.RECOVERY_JITTER_MIN
+        jitter_max = self.env.RECOVERY_JITTER_MAX
+
+        # Take over leadership of each orphaned job with jitter between each
         for job_id in orphaned_jobs:
+            # Apply jitter before each takeover to spread the load
+            if jitter_max > 0:
+                jitter = random.uniform(jitter_min, jitter_max / 2)  # Use half max for per-job
+                await asyncio.sleep(jitter)
+
             # Update job leadership to self
             old_leader = self._job_leaders.get(job_id)
             old_token = self._job_fencing_tokens.get(job_id, 0)
@@ -3375,7 +3407,15 @@ class ManagerServer(HealthAwareServer):
             return None
 
         circuit = self._get_worker_circuit(worker_node_id)
-        
+
+        # Get or create per-worker dispatch semaphore to limit concurrent dispatches
+        # This prevents overloading a single worker with too many simultaneous requests
+        if worker_node_id not in self._dispatch_semaphores:
+            self._dispatch_semaphores[worker_node_id] = asyncio.Semaphore(
+                self._dispatch_max_concurrent
+            )
+        dispatch_semaphore = self._dispatch_semaphores[worker_node_id]
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -3385,64 +3425,66 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-        
-        for attempt in range(max_retries + 1):
-            try:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"TCP send attempt {attempt + 1} to {worker_addr}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
+
+        # Limit concurrent dispatches to this worker
+        async with dispatch_semaphore:
+            for attempt in range(max_retries + 1):
+                try:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"TCP send attempt {attempt + 1} to {worker_addr}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
                     )
-                )
-                response, _ = await self.send_tcp(
-                    worker_addr,
-                    "workflow_dispatch",
-                    dispatch.dump(),
-                    timeout=5.0,
-                )
-                
-                if isinstance(response, bytes):
-                    ack = WorkflowDispatchAck.load(response)
-                    if ack.accepted:
-                        circuit.record_success()
-                        if attempt > 0:
-                            self._task_runner.run(
-                                self._udp_logger.log,
-                                ServerInfo(
-                                    message=f"Dispatched to worker {worker_node_id} after {attempt + 1} attempts",
-                                    node_host=self._host,
-                                    node_port=self._tcp_port,
-                                    node_id=self._node_id.short,
+                    response, _ = await self.send_tcp(
+                        worker_addr,
+                        "workflow_dispatch",
+                        dispatch.dump(),
+                        timeout=5.0,
+                    )
+
+                    if isinstance(response, bytes):
+                        ack = WorkflowDispatchAck.load(response)
+                        if ack.accepted:
+                            circuit.record_success()
+                            if attempt > 0:
+                                self._task_runner.run(
+                                    self._udp_logger.log,
+                                    ServerInfo(
+                                        message=f"Dispatched to worker {worker_node_id} after {attempt + 1} attempts",
+                                        node_host=self._host,
+                                        node_port=self._tcp_port,
+                                        node_id=self._node_id.short,
+                                    )
                                 )
-                            )
-                        return ack
-                    else:
-                        # Worker rejected - don't retry (not a transient error)
-                        circuit.record_error()
-                        return ack
-                        
-            except Exception as e:
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerError(
-                        message=f"Dispatch attempt {attempt + 1}/{max_retries + 1} to {worker_node_id} failed: {e}",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
+                            return ack
+                        else:
+                            # Worker rejected - don't retry (not a transient error)
+                            circuit.record_error()
+                            return ack
+
+                except Exception as e:
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerError(
+                            message=f"Dispatch attempt {attempt + 1}/{max_retries + 1} to {worker_node_id} failed: {e}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
                     )
-                )
-            
-            # Exponential backoff before retry (except after last attempt)
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-        
-        # All retries exhausted
-        circuit.record_error()
-        return None
+
+                # Exponential backoff before retry (except after last attempt)
+                if attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+
+            # All retries exhausted
+            circuit.record_error()
+            return None
     
     async def _request_quorum_confirmation(
         self,
@@ -7051,6 +7093,18 @@ class ManagerServer(HealthAwareServer):
                 return RateLimitResponse(
                     operation="job_submit",
                     retry_after_seconds=retry_after,
+                ).dump()
+
+            # Backpressure/load shedding check (AD-22)
+            # Reject new job submissions when system is overloaded
+            if self._should_shed_request("JobSubmission"):
+                overload_state = self._load_shedder.get_current_state()
+                return JobAck(
+                    job_id="",  # No job_id yet
+                    accepted=False,
+                    error=f"System under load ({overload_state.value}), please retry later",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
                 ).dump()
 
             submission = JobSubmission.load(data)

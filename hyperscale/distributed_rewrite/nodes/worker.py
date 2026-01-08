@@ -1001,10 +1001,14 @@ class WorkerServer(HealthAwareServer):
                     )
                 )
 
-            # Exponential backoff before retry (except after last attempt)
+            # Exponential backoff with jitter before retry (except after last attempt)
+            # Jitter prevents thundering herd when multiple workers retry simultaneously
             if attempt < max_retries:
+                import random
                 delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
+                # Add full jitter (0 to delay) per AWS best practices
+                jitter = random.uniform(0, delay)
+                await asyncio.sleep(delay + jitter)
 
         # All retries exhausted - record error on this manager's circuit breaker
         circuit.record_error()
@@ -1395,6 +1399,17 @@ class WorkerServer(HealthAwareServer):
                     workflow_id=dispatch.workflow_id,
                     accepted=False,
                     error="Worker is draining, not accepting new work",
+                )
+                return ack.dump()
+
+            # Check queue depth backpressure - reject if too many pending workflows
+            max_pending = self.env.MERCURY_SYNC_MAX_PENDING_WORKFLOWS
+            current_pending = len(self._pending_workflows)
+            if current_pending >= max_pending:
+                ack = WorkflowDispatchAck(
+                    workflow_id=dispatch.workflow_id,
+                    accepted=False,
+                    error=f"Queue depth limit reached: {current_pending}/{max_pending} pending",
                 )
                 return ack.dump()
 

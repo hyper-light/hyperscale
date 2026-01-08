@@ -186,6 +186,21 @@ class Env(BaseModel):
     RATE_LIMIT_BACKOFF_MULTIPLIER: StrictFloat = 1.5  # Backoff multiplier for retries
 
     # ==========================================================================
+    # Recovery and Thundering Herd Prevention Settings
+    # ==========================================================================
+    # Jitter settings - applied to recovery operations to prevent synchronized reconnection waves
+    RECOVERY_JITTER_MAX: StrictFloat = 2.0  # Max jitter (seconds) before recovery actions
+    RECOVERY_JITTER_MIN: StrictFloat = 0.1  # Min jitter (seconds) - ensures some spread
+
+    # Concurrency caps - limit simultaneous recovery operations to prevent overload
+    RECOVERY_MAX_CONCURRENT: StrictInt = 5  # Max concurrent recovery operations per node type
+    DISPATCH_MAX_CONCURRENT_PER_WORKER: StrictInt = 3  # Max concurrent dispatches to a single worker
+
+    # Message queue backpressure - prevent memory exhaustion under load
+    MESSAGE_QUEUE_MAX_SIZE: StrictInt = 1000  # Max pending messages per client connection
+    MESSAGE_QUEUE_WARN_SIZE: StrictInt = 800  # Warn threshold (80% of max)
+
+    # ==========================================================================
     # Healthcheck Extension Settings (AD-26)
     # ==========================================================================
     EXTENSION_BASE_DEADLINE: StrictFloat = 30.0  # Base deadline in seconds
