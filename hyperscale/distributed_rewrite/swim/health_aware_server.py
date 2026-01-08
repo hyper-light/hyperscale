@@ -79,6 +79,14 @@ from .leadership.local_leader_election import LocalLeaderElection
 # State embedding (Serf-style)
 from .core.state_embedder import StateEmbedder, NullStateEmbedder
 
+# Protocol version for SWIM (AD-25)
+# Used to detect incompatible nodes during join
+from hyperscale.distributed_rewrite.protocol.version import CURRENT_PROTOCOL_VERSION
+
+# SWIM protocol version prefix (included in join messages)
+# Format: "v{major}.{minor}" - allows detection of incompatible nodes
+SWIM_VERSION_PREFIX = f"v{CURRENT_PROTOCOL_VERSION.major}.{CURRENT_PROTOCOL_VERSION.minor}".encode()
+
 
 class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     """
@@ -1298,7 +1306,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             True if join succeeded, False if all retries exhausted
         """
         self_addr = self._get_self_udp_addr()
-        join_msg = b'join>' + f'{self_addr[0]}:{self_addr[1]}'.encode()
+        # Format: join>v{major}.{minor}|{host}:{port}
+        # Version prefix enables detecting incompatible nodes during join (AD-25)
+        join_msg = b'join>' + SWIM_VERSION_PREFIX + b'|' + f'{self_addr[0]}:{self_addr[1]}'.encode()
         
         async def attempt_join() -> bool:
             await self.send(seed_node, join_msg, timeout=timeout)
@@ -2732,9 +2742,48 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 
                 case b'join':
                     self._metrics.increment('joins_received')
+
+                    # Parse version prefix from join message (AD-25)
+                    # Format: v{major}.{minor}|host:port
+                    join_version_major: int | None = None
+                    join_version_minor: int | None = None
+
+                    if target_addr and b'|' in target_addr:
+                        version_part, addr_part = target_addr.split(b'|', maxsplit=1)
+                        # Parse version (e.g., "v1.0" -> major=1, minor=0)
+                        if version_part.startswith(b'v'):
+                            try:
+                                version_str = version_part[1:].decode()
+                                parts = version_str.split('.')
+                                if len(parts) == 2:
+                                    join_version_major = int(parts[0])
+                                    join_version_minor = int(parts[1])
+                            except (ValueError, UnicodeDecodeError):
+                                pass  # Malformed version, will be handled below
+
+                        # Re-parse target from the address part (after version)
+                        try:
+                            host, port = addr_part.decode().split(':', maxsplit=1)
+                            target = (host, int(port))
+                            target_addr = addr_part
+                        except (ValueError, UnicodeDecodeError):
+                            target = None
+
+                    # Validate protocol version compatibility (AD-25)
+                    # Reject joins from incompatible major versions
+                    if join_version_major is None:
+                        # No version info - could be legacy node, reject
+                        self._metrics.increment('joins_rejected_no_version')
+                        return b'nack:version_required>' + self._udp_addr_slug
+
+                    if join_version_major != CURRENT_PROTOCOL_VERSION.major:
+                        # Incompatible major version
+                        self._metrics.increment('joins_rejected_version_mismatch')
+                        return b'nack:version_mismatch>' + self._udp_addr_slug
+
                     if not await self._validate_target(target, b'join', addr):
                         return b'nack>' + self._udp_addr_slug
-                    
+
                     async with self._context.with_value(target):
                         nodes: Nodes = self._context.read('nodes')
 
@@ -2760,8 +2809,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         others = self.get_other_nodes(target)
                         base_timeout = self._context.read('current_timeout')
                         gather_timeout = self.get_lhm_adjusted_timeout(base_timeout) * 2
+                        # Propagate join with version prefix (AD-25)
+                        propagate_join_msg = b'join>' + SWIM_VERSION_PREFIX + b'|' + target_addr
                         await self._gather_with_errors(
-                            [self.send_if_ok(node, b'join>' + target_addr) for node in others],
+                            [self.send_if_ok(node, propagate_join_msg) for node in others],
                             operation="join_propagation",
                             timeout=gather_timeout,
                         )
