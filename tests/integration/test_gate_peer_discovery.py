@@ -379,8 +379,12 @@ async def scenario_gate_peer_discovery_failure_recovery(cluster_size: int) -> bo
 
     Validates:
     - Gates detect peer failure via SWIM
-    - Failed peers are removed from discovery
-    - Recovered peers are re-added to discovery
+    - Failed peers are removed from active peers
+    - Recovered gate can rejoin and see peers
+    - Other gates can see the recovered gate
+
+    Note: When a gate restarts, it gets a new NodeId but uses the same address.
+    SWIM handles this as a "rejoin" from the same UDP address.
     """
     print(f"\n{'=' * 70}")
     print(f"TEST: Gate Peer Discovery Failure/Recovery - {cluster_size} Gates")
@@ -389,8 +393,8 @@ async def scenario_gate_peer_discovery_failure_recovery(cluster_size: int) -> bo
     gate_configs = generate_gate_configs(cluster_size)
     gates: list[GateServer] = []
     stabilization_time = 15 + (cluster_size * 2)
-    failure_detection_time = 20  # Time for SWIM to detect failure
-    recovery_time = 25  # Time for recovered peer to rejoin (new NodeId needs discovery)
+    failure_detection_time = 15  # Time for SWIM to detect failure
+    recovery_time = 20  # Time for recovered peer to rejoin
 
     try:
         # Create and start gates
@@ -422,10 +426,15 @@ async def scenario_gate_peer_discovery_failure_recovery(cluster_size: int) -> bo
 
         # Record initial state
         expected_peer_count = cluster_size - 1
-        initial_discovery_ok = all(
-            gate._peer_discovery.peer_count >= expected_peer_count
-            for gate in gates
-        )
+        initial_discovery_ok = True
+
+        for i, gate in enumerate(gates):
+            active_peers = len(gate._active_gate_peers)
+            discovery_peers = gate._peer_discovery.peer_count
+            if active_peers < expected_peer_count:
+                initial_discovery_ok = False
+            print(f"    {gate_configs[i]['name']}: active_peers={active_peers}, discovery_peers={discovery_peers}")
+
         print(f"  Initial discovery: {'OK' if initial_discovery_ok else 'INCOMPLETE'}")
 
         # Stop one gate to simulate failure
@@ -477,16 +486,34 @@ async def scenario_gate_peer_discovery_failure_recovery(cluster_size: int) -> bo
         print(f"\n[7/7] Waiting for recovery detection ({recovery_time}s)...")
         await asyncio.sleep(recovery_time)
 
-        # Verify recovery
+        # Verify recovery from multiple perspectives:
+        # 1. The recovered gate should see other gates
+        # 2. Other gates should see the recovered gate (via address-based tracking)
         recovery_detected = True
+
+        # Check recovered gate's view
+        recovered_gate = gates[failed_gate_index]
+        recovered_peers = len(recovered_gate._active_gate_peers)
+        expected_peers = cluster_size - 1
+
+        recovered_status = "OK" if recovered_peers >= expected_peers else "INCOMPLETE"
+        print(f"  {failed_gate_name} (recovered): sees {recovered_peers}/{expected_peers} peers [{recovered_status}]")
+
+        if recovered_peers < expected_peers:
+            recovery_detected = False
+
+        # Check other gates' view of the recovered gate
+        # They track by TCP address, so should see the recovered gate
         for i, gate in enumerate(gates[:failed_gate_index]):
+            # Check if the failed gate's TCP address is in active_gate_peers
+            failed_tcp_addr = ('127.0.0.1', gate_configs[failed_gate_index]['tcp'])
+            has_recovered_peer = failed_tcp_addr in gate._active_gate_peers
             active_peers = len(gate._active_gate_peers)
-            expected_after_recovery = cluster_size - 1
 
-            status = "RECOVERED" if active_peers >= expected_after_recovery else "NOT RECOVERED"
-            print(f"  {gate_configs[i]['name']}: {active_peers} active peers [{status}]")
+            status = "RECOVERED" if has_recovered_peer else "NOT RECOVERED"
+            print(f"  {gate_configs[i]['name']}: {active_peers} active peers, sees recovered gate: {has_recovered_peer} [{status}]")
 
-            if active_peers < expected_after_recovery:
+            if not has_recovered_peer:
                 recovery_detected = False
 
         # Summary
@@ -687,21 +714,25 @@ async def run_all_tests():
     for size in cluster_sizes:
         result = await scenario_gate_peer_discovery_cluster_size(size)
         results[f"discovery_{size}_gates"] = result
+        await asyncio.sleep(2)  # Allow port cleanup between tests
 
     # Message validation tests
     for size in [3]:
         result = await scenario_gate_heartbeat_message_validation(size)
         results[f"heartbeat_validation_{size}_gates"] = result
+        await asyncio.sleep(2)
 
     # Peer selection tests
     for size in [3]:
         result = await scenario_gate_discovery_peer_selection(size)
         results[f"peer_selection_{size}_gates"] = result
+        await asyncio.sleep(2)
 
     # Failure/recovery tests (only for 3 and 5 gates to save time)
     for size in [3, 5]:
         result = await scenario_gate_peer_discovery_failure_recovery(size)
         results[f"failure_recovery_{size}_gates"] = result
+        await asyncio.sleep(2)
 
     # Final summary
     print("\n" + "=" * 70)
