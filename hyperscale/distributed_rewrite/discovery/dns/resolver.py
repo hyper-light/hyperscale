@@ -2,7 +2,8 @@
 Async DNS resolver with caching for peer discovery.
 
 Provides DNS-based service discovery with positive and negative caching,
-supporting both A and SRV records.
+supporting both A and SRV records. Includes security validation against
+DNS cache poisoning, hijacking, and spoofing attacks.
 """
 
 import asyncio
@@ -12,6 +13,11 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from hyperscale.distributed_rewrite.discovery.dns.negative_cache import NegativeCache
+from hyperscale.distributed_rewrite.discovery.dns.security import (
+    DNSSecurityValidator,
+    DNSSecurityEvent,
+    DNSSecurityViolation,
+)
 
 
 class DNSError(Exception):
@@ -94,6 +100,23 @@ class AsyncDNSResolver:
 
     _on_error: Callable[[str, str], None] | None = field(default=None, repr=False)
     """Optional callback when resolution fails (hostname, error)."""
+
+    _on_security_event: Callable[[DNSSecurityEvent], None] | None = field(default=None, repr=False)
+    """Optional callback when security violation is detected."""
+
+    security_validator: DNSSecurityValidator | None = field(default=None)
+    """Optional security validator for IP range and anomaly checking.
+
+    When set, resolved IPs are validated against allowed CIDR ranges
+    and checked for suspicious patterns (rapid changes, rebinding).
+    IPs that fail validation are filtered from results.
+    """
+
+    reject_on_security_violation: bool = True
+    """If True, reject IPs that fail security validation.
+
+    If False, violations are logged but IPs are still returned.
+    """
 
     def __post_init__(self) -> None:
         """Initialize the semaphore."""
@@ -225,6 +248,16 @@ class AsyncDNSResolver:
                         seen.add(addr)
                         addresses.append(addr)
 
+                # Apply security validation if configured
+                if self.security_validator and self.security_validator.is_enabled:
+                    validated_addresses = self._validate_addresses(hostname, addresses)
+                    if not validated_addresses and self.reject_on_security_violation:
+                        raise DNSError(
+                            hostname,
+                            f"All resolved IPs failed security validation: {addresses}"
+                        )
+                    addresses = validated_addresses if validated_addresses else addresses
+
                 return DNSResult(
                     hostname=hostname,
                     addresses=addresses,
@@ -347,6 +380,7 @@ class AsyncDNSResolver:
         self,
         on_resolution: Callable[[DNSResult], None] | None = None,
         on_error: Callable[[str, str], None] | None = None,
+        on_security_event: Callable[[DNSSecurityEvent], None] | None = None,
     ) -> None:
         """
         Set optional callbacks for resolution events.
@@ -354,6 +388,80 @@ class AsyncDNSResolver:
         Args:
             on_resolution: Called when resolution succeeds
             on_error: Called when resolution fails (hostname, error_message)
+            on_security_event: Called when security violation detected
         """
         self._on_resolution = on_resolution
         self._on_error = on_error
+        self._on_security_event = on_security_event
+
+    def _validate_addresses(
+        self,
+        hostname: str,
+        addresses: list[str],
+    ) -> list[str]:
+        """
+        Validate resolved addresses against security policy.
+
+        Args:
+            hostname: The hostname being resolved
+            addresses: List of resolved IP addresses
+
+        Returns:
+            List of addresses that pass validation
+        """
+        if not self.security_validator:
+            return addresses
+
+        valid_addresses: list[str] = []
+
+        for addr in addresses:
+            event = self.security_validator.validate(hostname, addr)
+
+            if event is None:
+                # No violation, address is valid
+                valid_addresses.append(addr)
+            else:
+                # Security violation detected
+                if self._on_security_event:
+                    self._on_security_event(event)
+
+                # Only block on certain violation types
+                # IP changes are informational, not blocking
+                if event.violation_type in (
+                    DNSSecurityViolation.IP_OUT_OF_RANGE,
+                    DNSSecurityViolation.PRIVATE_IP_FOR_PUBLIC_HOST,
+                    DNSSecurityViolation.RAPID_IP_ROTATION,
+                ):
+                    # Skip this address
+                    continue
+                else:
+                    # Allow informational violations through
+                    valid_addresses.append(addr)
+
+        return valid_addresses
+
+    def get_security_events(
+        self,
+        limit: int = 100,
+        violation_type: DNSSecurityViolation | None = None,
+    ) -> list[DNSSecurityEvent]:
+        """
+        Get recent DNS security events.
+
+        Args:
+            limit: Maximum events to return
+            violation_type: Filter by type (None = all)
+
+        Returns:
+            List of security events
+        """
+        if not self.security_validator:
+            return []
+        return self.security_validator.get_recent_events(limit, violation_type)
+
+    @property
+    def security_stats(self) -> dict[str, int]:
+        """Get security validation statistics."""
+        if not self.security_validator:
+            return {"enabled": False}
+        return {"enabled": True, **self.security_validator.stats}

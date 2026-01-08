@@ -285,6 +285,14 @@ class Env(BaseModel):
     DISCOVERY_DNS_TIMEOUT: StrictFloat = 5.0  # DNS resolution timeout in seconds
     DISCOVERY_DEFAULT_PORT: StrictInt = 9091  # Default port for discovered peers
 
+    # DNS Security (Phase 2) - Protects against cache poisoning, hijacking, spoofing
+    DISCOVERY_DNS_ALLOWED_CIDRS: StrictStr = ""  # Comma-separated CIDRs (e.g., "10.0.0.0/8,172.16.0.0/12")
+    DISCOVERY_DNS_BLOCK_PRIVATE_FOR_PUBLIC: StrictBool = False  # Block private IPs for public hostnames
+    DISCOVERY_DNS_DETECT_IP_CHANGES: StrictBool = True  # Enable IP change anomaly detection
+    DISCOVERY_DNS_MAX_IP_CHANGES: StrictInt = 5  # Max IP changes before rapid rotation alert
+    DISCOVERY_DNS_IP_CHANGE_WINDOW: StrictFloat = 300.0  # Window for tracking IP changes (5 min)
+    DISCOVERY_DNS_REJECT_ON_VIOLATION: StrictBool = True  # Reject IPs failing security validation
+
     # Locality configuration
     DISCOVERY_DATACENTER_ID: StrictStr = ""  # Local datacenter ID for locality-aware selection
     DISCOVERY_REGION_ID: StrictStr = ""  # Local region ID for locality-aware selection
@@ -781,6 +789,15 @@ class Env(BaseModel):
         if self.DISCOVERY_DNS_NAMES:
             dns_names = [name.strip() for name in self.DISCOVERY_DNS_NAMES.split(",") if name.strip()]
 
+        # Parse allowed CIDRs from comma-separated string
+        dns_allowed_cidrs: list[str] = []
+        if self.DISCOVERY_DNS_ALLOWED_CIDRS:
+            dns_allowed_cidrs = [
+                cidr.strip()
+                for cidr in self.DISCOVERY_DNS_ALLOWED_CIDRS.split(",")
+                if cidr.strip()
+            ]
+
         return DiscoveryConfig(
             cluster_id=cluster_id,
             environment_id=environment_id,
@@ -790,6 +807,14 @@ class Env(BaseModel):
             default_port=self.DISCOVERY_DEFAULT_PORT,
             dns_cache_ttl=self.DISCOVERY_DNS_CACHE_TTL,
             dns_timeout=self.DISCOVERY_DNS_TIMEOUT,
+            # DNS Security settings
+            dns_allowed_cidrs=dns_allowed_cidrs,
+            dns_block_private_for_public=self.DISCOVERY_DNS_BLOCK_PRIVATE_FOR_PUBLIC,
+            dns_detect_ip_changes=self.DISCOVERY_DNS_DETECT_IP_CHANGES,
+            dns_max_ip_changes_per_window=self.DISCOVERY_DNS_MAX_IP_CHANGES,
+            dns_ip_change_window_seconds=self.DISCOVERY_DNS_IP_CHANGE_WINDOW,
+            dns_reject_on_security_violation=self.DISCOVERY_DNS_REJECT_ON_VIOLATION,
+            # Locality settings
             datacenter_id=self.DISCOVERY_DATACENTER_ID,
             region_id=self.DISCOVERY_REGION_ID,
             prefer_same_dc=self.DISCOVERY_PREFER_SAME_DC,

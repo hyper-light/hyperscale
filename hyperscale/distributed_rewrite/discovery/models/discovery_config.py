@@ -56,6 +56,46 @@ class DiscoveryConfig:
     negative_cache_ttl: float = 30.0
     """Cache TTL for failed DNS lookups (prevents hammering failed names)."""
 
+    # ===== DNS Security (AD-28 Phase 2) =====
+    # Protections against: Cache Poisoning, DNS Hijacking, DNS Spoofing, Rebinding
+    dns_allowed_cidrs: list[str] = field(default_factory=list)
+    """CIDR ranges that resolved IPs must be within.
+
+    Empty list disables IP range validation.
+    Example: ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
+
+    For internal services, restrict to your network ranges to prevent
+    DNS cache poisoning attacks from redirecting to external IPs.
+    """
+
+    dns_block_private_for_public: bool = False
+    """Block private IPs for public hostnames (DNS rebinding protection).
+
+    When True, if a hostname doesn't end with internal TLDs
+    (.local, .internal, .svc, etc.), private IPs will be rejected.
+    """
+
+    dns_detect_ip_changes: bool = True
+    """Enable anomaly detection for IP changes.
+
+    Tracks historical IPs per hostname and alerts on:
+    - Rapid IP rotation (possible fast-flux attack)
+    - Unexpected IP changes (possible hijacking)
+    """
+
+    dns_max_ip_changes_per_window: int = 5
+    """Maximum IP changes allowed before triggering rapid rotation alert."""
+
+    dns_ip_change_window_seconds: float = 300.0
+    """Time window for tracking IP changes (5 minutes default)."""
+
+    dns_reject_on_security_violation: bool = True
+    """Reject IPs that fail security validation.
+
+    When True (recommended), IPs outside allowed CIDRs are filtered.
+    When False, violations are logged but IPs are still usable.
+    """
+
     # ===== Locality =====
     datacenter_id: str = ""
     """This node's datacenter identifier (e.g., 'us-east-1').
