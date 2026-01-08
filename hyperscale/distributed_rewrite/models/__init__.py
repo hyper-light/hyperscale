@@ -148,3 +148,11 @@ from .jobs import (
     JobInfo as JobInfo,
     PendingWorkflow as PendingWorkflow,
 )
+
+# Client-side result models
+from .client import (
+    ClientReporterResult as ClientReporterResult,
+    ClientWorkflowDCResult as ClientWorkflowDCResult,
+    ClientWorkflowResult as ClientWorkflowResult,
+    ClientJobResult as ClientJobResult,
+)

@@ -28,13 +28,14 @@ Usage:
 import asyncio
 import secrets
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Callable
 
 import cloudpickle
 
 from hyperscale.distributed_rewrite.server import tcp
 from hyperscale.distributed_rewrite.server.server.mercury_sync_base_server import MercurySyncBaseServer
+from hyperscale.core.jobs.protocols.constants import MAX_DECOMPRESSED_SIZE
+from hyperscale.distributed_rewrite.errors import MessageTooLargeError
 from hyperscale.distributed_rewrite.models import (
     JobSubmission,
     JobAck,
@@ -61,6 +62,11 @@ from hyperscale.distributed_rewrite.models import (
     # Cancellation (AD-20)
     JobCancelRequest,
     JobCancelResponse,
+    # Client result models
+    ClientReporterResult,
+    ClientWorkflowDCResult,
+    ClientWorkflowResult,
+    ClientJobResult,
 )
 from hyperscale.distributed_rewrite.env.env import Env
 from hyperscale.distributed_rewrite.reliability.rate_limiting import (
@@ -83,64 +89,11 @@ from hyperscale.reporting.xml import XMLConfig
 from hyperscale.reporting.common import ReporterTypes
 
 
-@dataclass(slots=True)
-class ReporterResult:
-    """Result of a reporter submission."""
-    reporter_type: str
-    success: bool
-    error: str | None = None
-    elapsed_seconds: float = 0.0
-    source: str = ""  # "manager" or "gate"
-    datacenter: str = ""  # For manager source
-
-
-@dataclass(slots=True)
-class WorkflowDCResultClient:
-    """Per-datacenter workflow result for client-side tracking."""
-    datacenter: str
-    status: str
-    stats: Any = None  # WorkflowStats for this DC
-    error: str | None = None
-    elapsed_seconds: float = 0.0
-
-
-@dataclass(slots=True)
-class WorkflowResult:
-    """Result of a completed workflow within a job."""
-    workflow_id: str
-    workflow_name: str
-    status: str
-    stats: Any = None  # Aggregated WorkflowStats (cross-DC if from gate)
-    error: str | None = None
-    elapsed_seconds: float = 0.0
-    # Completion timestamp for ordering (Unix timestamp)
-    completed_at: float = 0.0
-    # Per-datacenter breakdown (populated for multi-DC jobs via gates)
-    per_dc_results: list[WorkflowDCResultClient] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class JobResult:
-    """
-    Result of a completed job.
-
-    For single-DC jobs, only basic fields are populated.
-    For multi-DC jobs (via gates), per_datacenter_results and aggregated are populated.
-    """
-    job_id: str
-    status: str  # JobStatus value
-    total_completed: int = 0
-    total_failed: int = 0
-    overall_rate: float = 0.0
-    elapsed_seconds: float = 0.0
-    error: str | None = None
-    # Workflow results (populated as each workflow completes)
-    workflow_results: dict[str, WorkflowResult] = field(default_factory=dict)  # workflow_id -> result
-    # Multi-DC fields (populated when result comes from a gate)
-    per_datacenter_results: list = field(default_factory=list)  # list[JobFinalResult]
-    aggregated: Any = None  # AggregatedJobStats
-    # Reporter results (populated as reporters complete)
-    reporter_results: dict[str, ReporterResult] = field(default_factory=dict)  # reporter_type -> result
+# Type aliases for backwards compatibility and shorter names in this module
+ReporterResult = ClientReporterResult
+WorkflowDCResultClient = ClientWorkflowDCResult
+WorkflowResult = ClientWorkflowResult
+JobResult = ClientJobResult
 
 
 class HyperscaleClient(MercurySyncBaseServer):
@@ -340,6 +293,13 @@ class HyperscaleClient(MercurySyncBaseServer):
 
         # Serialize workflows with IDs
         workflows_bytes = cloudpickle.dumps(workflows_with_ids)
+
+        # Pre-submission size validation - fail fast before sending
+        if len(workflows_bytes) > MAX_DECOMPRESSED_SIZE:
+            raise MessageTooLargeError(
+                f"Serialized workflows exceed maximum size: "
+                f"{len(workflows_bytes)} > {MAX_DECOMPRESSED_SIZE} bytes (5MB)"
+            )
 
         # Serialize reporter configs if provided
         reporting_configs_bytes = b''
