@@ -176,7 +176,6 @@ class WorkerServer(HealthAwareServer):
         self._active_workflows: dict[str, WorkflowProgress] = {}
         self._workflow_tokens: dict[str, str] = {}  # workflow_id -> TaskRunner token
         self._workflow_cancel_events: dict[str, asyncio.Event] = {}
-        self._workflow_last_progress: dict[str, float] = {}  # workflow_id -> last update time
         self._workflow_id_to_name: dict[str, str] = {}  # workflow_id -> workflow_name for cancellation
 
         # Job leader tracking per workflow - the manager that dispatched each workflow
@@ -1602,7 +1601,6 @@ class WorkerServer(HealthAwareServer):
             self._workflow_tokens.pop(dispatch.workflow_id, None)
             self._workflow_cancel_events.pop(dispatch.workflow_id, None)
             self._active_workflows.pop(dispatch.workflow_id, None)
-            self._workflow_last_progress.pop(dispatch.workflow_id, None)
             self._workflow_cores_completed.pop(dispatch.workflow_id, None)
             self._workflow_fence_tokens.pop(dispatch.workflow_id, None)
             self._workflow_id_to_name.pop(dispatch.workflow_id, None)
@@ -1645,7 +1643,6 @@ class WorkerServer(HealthAwareServer):
                 if workflow_status_update is None:
                     # Timeout - no update yet, loop back to check cancel_event
                     continue
-
                 status = CoreWorkflowStatus(workflow_status_update.status)
 
                 # Get system stats
@@ -1673,7 +1670,7 @@ class WorkerServer(HealthAwareServer):
                 progress.avg_cpu_percent = avg_cpu
                 progress.avg_memory_mb = avg_mem
 
-                availability = await self._remote_manger.get_availability()
+                availability = self._remote_manger.get_availability()
                 (
                     workflow_assigned_cores,
                     workflow_completed_cores,
@@ -1722,12 +1719,16 @@ class WorkerServer(HealthAwareServer):
                 elif status == CoreWorkflowStatus.PENDING:
                     progress.status = WorkflowStatus.ASSIGNED.value
 
-                # Send update to job leader (not buffered) for real-time streaming
-                # Routes to the manager that dispatched this workflow.
-                # If job leader fails, discovers new leader via healthy managers.
-                if self._healthy_manager_ids:
-                    await self._send_progress_to_job_leader(progress)
-                    self._workflow_last_progress[dispatch.workflow_id] = time.monotonic()
+                # Buffer progress for controlled-rate flushing to manager
+                # This is more robust than inline rate-limiting because:
+                # 1. No data loss - every update is captured
+                # 2. Backpressure-aware - flush loop respects manager signals
+                # 3. Latest-wins - buffer keeps most recent state per workflow
+                # 4. Unified mechanism - all non-lifecycle updates go through buffer
+                #
+                # Lifecycle events (STARTED, COMPLETED, FAILED) use immediate send
+                # via _transition_workflow_status() to ensure visibility.
+                await self._send_progress_update(progress)
 
             except asyncio.CancelledError:
                 break
@@ -1824,10 +1825,12 @@ class WorkerServer(HealthAwareServer):
                     updates_to_send = dict(self._progress_buffer)
                     self._progress_buffer.clear()
 
-                # Send buffered updates
+                # Send buffered updates to job leaders
+                # Uses _send_progress_to_job_leader which routes to the correct
+                # manager (the one that dispatched the workflow) and handles failover
                 if self._healthy_manager_ids:
                     for workflow_id, progress in updates_to_send.items():
-                        await self._send_progress_update_direct(progress)
+                        await self._send_progress_to_job_leader(progress)
 
             except asyncio.CancelledError:
                 break

@@ -108,7 +108,9 @@ class RemoteGraphManager:
         self._provisioner: Provisioner | None = None
         self._graph_updates: dict[int, dict[str, asyncio.Queue[WorkflowStatusUpdate]]] = defaultdict(lambda: defaultdict(asyncio.Queue))
         self._workflow_statuses: dict[int, dict[str, Deque[WorkflowStatusUpdate]]] = defaultdict(lambda: defaultdict(deque))
-        self._available_cores_updates: asyncio.Queue[tuple[int, int, int]] | None = None
+        # Latest core availability state (assigned, completed, available) - updated atomically
+        # This replaces a queue since we only care about the current state, not history
+        self._latest_availability: tuple[int, int, int] = (0, 0, 0)
         self._cancellation_updates: dict[int, dict[str, asyncio.Queue[CancellationUpdate]]] = defaultdict(lambda: defaultdict(asyncio.Queue))
 
         # Callback for instant notification when cores become available
@@ -165,9 +167,6 @@ class RemoteGraphManager:
                     with_ssl=cert_path is not None and key_path is not None,
                 )
             )
-
-            if self._available_cores_updates is None:
-                self._available_cores_updates = asyncio.Queue()
 
             if self._controller is None:
                 self._controller = RemoteGraphController(
@@ -1567,11 +1566,15 @@ class RemoteGraphManager:
 
         return latest_update
 
-    async def get_availability(self):
-        if self._available_cores_updates:
-            return await self._available_cores_updates.get()
+    def get_availability(self) -> tuple[int, int, int]:
+        """
+        Get the current core availability state.
 
-        return 0
+        Returns (assigned, completed, available) tuple representing the
+        latest known core allocation state. This is non-blocking and
+        returns immediately with the current state.
+        """
+        return self._latest_availability
 
     def set_on_cores_available(self, callback: Any) -> None:
         """
@@ -1588,13 +1591,10 @@ class RemoteGraphManager:
         assigned: int,
         completed: int,
     ):
-        # Availablity is the total pool minus the difference between assigned and completd
+        # Availability is the total pool minus the difference between assigned and completed
         available_cores = self._threads - max(assigned - completed, 0)
-        self._available_cores_updates.put_nowait((
-            assigned,
-            completed,
-            available_cores,
-        ))
+        # Update state atomically - readers get the latest value immediately
+        self._latest_availability = (assigned, completed, available_cores)
 
         # Instantly notify callback if cores became available
         if self._on_cores_available is not None and available_cores > 0:

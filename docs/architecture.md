@@ -10672,6 +10672,379 @@ See the main project LICENSE file.
 
 ---
 
+## Worker → Manager Progress Update Architecture
+
+### Overview
+
+Workers collect progress updates from their local workflow execution (via `RemoteGraphManager`) and send them to the job leader Manager. This system is designed to be:
+
+1. **Lossless** - Every progress update is captured (no dropped samples)
+2. **Backpressure-aware** - Respects Manager overload signals
+3. **Lifecycle-immediate** - Status transitions (STARTED, COMPLETED, FAILED) are sent immediately
+4. **Rate-controlled** - Regular progress updates are batched to avoid Manager spam
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    WORKER PROGRESS UPDATE FLOW                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Local Workflow Execution (Subprocess Pool)                                  │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │  RemoteGraphController (subprocess)                                   │   │
+│  │                                                                       │   │
+│  │  ┌─────────────────┐    ┌─────────────────┐                          │   │
+│  │  │ push_workflow_  │    │ aggregate_      │                          │   │
+│  │  │ status_update   │───►│ status_updates  │                          │   │
+│  │  │ (0.1s schedule) │    │ (0.05s schedule)│                          │   │
+│  │  └─────────────────┘    └────────┬────────┘                          │   │
+│  │                                  │                                    │   │
+│  │                     completion_state.status_update_queue              │   │
+│  │                                  │                                    │   │
+│  └──────────────────────────────────┼───────────────────────────────────┘   │
+│                                     │                                        │
+│  Worker (Main Process)              │                                        │
+│  ┌──────────────────────────────────┼───────────────────────────────────┐   │
+│  │                                  ▼                                    │   │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │   │
+│  │  │               RemoteGraphManager (Leader Process)               │ │   │
+│  │  │                                                                 │ │   │
+│  │  │  ┌───────────────────────┐    ┌──────────────────────────────┐ │ │   │
+│  │  │  │ _wait_for_workflow_   │    │ get_availability()           │ │ │   │
+│  │  │  │ completion loop       │    │ (sync, non-blocking)         │ │ │   │
+│  │  │  │                       │    │                              │ │ │   │
+│  │  │  │ • Poll status queue   │    │ Returns: (assigned,          │ │ │   │
+│  │  │  │ • Update stats        │    │           completed,         │ │ │   │
+│  │  │  │ • Call callback       │    │           available)         │ │ │   │
+│  │  │  └───────────┬───────────┘    └──────────────────────────────┘ │ │   │
+│  │  │              │                                                  │ │   │
+│  │  └──────────────┼──────────────────────────────────────────────────┘ │   │
+│  │                 │                                                     │   │
+│  │                 ▼                                                     │   │
+│  │  ┌─────────────────────────────────────────────────────────────────┐ │   │
+│  │  │               _monitor_workflow_progress()                       │ │   │
+│  │  │                                                                  │ │   │
+│  │  │  • Convert WorkflowStatusUpdate → WorkflowProgress              │ │   │
+│  │  │  • Add core allocation info from CoreAllocator                  │ │   │
+│  │  │  • Add CPU/memory metrics                                       │ │   │
+│  │  │  • Call _send_progress_update() [BUFFER]                        │ │   │
+│  │  │                                                                  │ │   │
+│  │  └───────────────────────────────┬─────────────────────────────────┘ │   │
+│  │                                  │                                    │   │
+│  │          ┌───────────────────────┴───────────────────────┐           │   │
+│  │          │                                               │           │   │
+│  │          ▼                                               ▼           │   │
+│  │  ┌───────────────────────┐                 ┌────────────────────────┐│   │
+│  │  │ _progress_buffer      │                 │ _transition_workflow_  ││   │
+│  │  │ (dict: workflow_id →  │                 │ status()               ││   │
+│  │  │  latest progress)     │                 │                        ││   │
+│  │  │                       │                 │ For: STARTED,          ││   │
+│  │  │ Latest-wins: only     │                 │      COMPLETED,        ││   │
+│  │  │ most recent per       │                 │      FAILED            ││   │
+│  │  │ workflow kept         │                 │                        ││   │
+│  │  └───────────┬───────────┘                 │ → Immediate send       ││   │
+│  │              │                             │   (bypass buffer)      ││   │
+│  │              │                             └───────────┬────────────┘│   │
+│  │              ▼                                         │             │   │
+│  │  ┌───────────────────────┐                             │             │   │
+│  │  │ _progress_flush_loop  │                             │             │   │
+│  │  │ (background task)     │                             │             │   │
+│  │  │                       │                             │             │   │
+│  │  │ • Sleep for interval  │                             │             │   │
+│  │  │   (50ms default)      │                             │             │   │
+│  │  │ • Check backpressure  │                             │             │   │
+│  │  │ • Clear buffer        │                             │             │   │
+│  │  │ • Send to job leader  │                             │             │   │
+│  │  └───────────┬───────────┘                             │             │   │
+│  │              │                                         │             │   │
+│  │              └─────────────────────┬───────────────────┘             │   │
+│  │                                    │                                  │   │
+│  └────────────────────────────────────┼─────────────────────────────────┘   │
+│                                       │                                      │
+│                                       ▼                                      │
+│                     ┌─────────────────────────────────────┐                 │
+│                     │   _send_progress_to_job_leader()    │                 │
+│                     │                                     │                 │
+│                     │ Routes to the Manager that          │                 │
+│                     │ dispatched this workflow (not       │                 │
+│                     │ necessarily primary manager)        │                 │
+│                     │                                     │                 │
+│                     │ Handles:                            │                 │
+│                     │ • Job leader discovery              │                 │
+│                     │ • Failover to new leader            │                 │
+│                     │ • Circuit breaker per manager       │                 │
+│                     └──────────────────┬──────────────────┘                 │
+│                                        │                                     │
+└────────────────────────────────────────┼─────────────────────────────────────┘
+                                         │
+                                         ▼
+                              ┌─────────────────────┐
+                              │   Manager (TCP)     │
+                              │                     │
+                              │ workflow_progress() │
+                              │ handler             │
+                              └─────────────────────┘
+```
+
+### Key Components
+
+#### 1. RemoteGraphManager State Tracking
+
+The `RemoteGraphManager` maintains core availability as simple state (not a queue):
+
+```python
+class RemoteGraphManager:
+    def __init__(self, ...):
+        # Latest core availability state (assigned, completed, available)
+        # Updated atomically - readers get current value immediately
+        self._latest_availability: tuple[int, int, int] = (0, 0, 0)
+
+    def get_availability(self) -> tuple[int, int, int]:
+        """
+        Get the current core availability state.
+
+        Returns (assigned, completed, available) tuple.
+        This is NON-BLOCKING and returns immediately.
+        """
+        return self._latest_availability
+
+    def _update_available_cores(self, assigned: int, completed: int):
+        """Update state atomically and notify if cores freed."""
+        available = self._threads - max(assigned - completed, 0)
+        self._latest_availability = (assigned, completed, available)
+
+        # Instant callback if cores became available
+        if self._on_cores_available and available > 0:
+            self._on_cores_available(available)
+```
+
+**Why state-based, not queue-based?**
+- Progress updates are cumulative (totals, not deltas)
+- We only care about the *current* state, not history
+- Queue-based `await queue.get()` blocked when empty, causing 5+ second delays
+- State-based reads are instant and non-blocking
+
+#### 2. Progress Buffer (Latest-Wins)
+
+The Worker maintains a simple buffer that keeps only the latest progress per workflow:
+
+```python
+class WorkerServer:
+    def __init__(self, ...):
+        self._progress_buffer: dict[str, WorkflowProgress] = {}
+        self._progress_buffer_lock = asyncio.Lock()
+        self._progress_flush_interval: float = env.WORKER_PROGRESS_FLUSH_INTERVAL  # 50ms
+
+    async def _send_progress_update(self, progress: WorkflowProgress) -> None:
+        """
+        Buffer a progress update for batched sending.
+
+        Instead of sending immediately, updates are collected in a buffer
+        and flushed periodically by _progress_flush_loop.
+        """
+        async with self._progress_buffer_lock:
+            # Latest-wins: only keep most recent per workflow
+            self._progress_buffer[progress.workflow_id] = progress
+```
+
+**Why latest-wins?**
+- Progress is cumulative (`completed_count` is total, not delta)
+- Old samples are superseded by newer ones
+- No need for complex aggregation
+- Memory bounded: O(active_workflows)
+
+#### 3. Flush Loop (Backpressure-Aware)
+
+```python
+async def _progress_flush_loop(self) -> None:
+    """Background loop that flushes buffered progress to manager."""
+    while self._running:
+        # Respect backpressure signals from managers
+        effective_interval = self._get_effective_flush_interval()
+        await asyncio.sleep(effective_interval)
+
+        # Drop updates under heavy backpressure
+        if self._get_max_backpressure_level() >= BackpressureLevel.REJECT:
+            async with self._progress_buffer_lock:
+                self._progress_buffer.clear()
+            continue
+
+        # Get and clear buffer atomically
+        async with self._progress_buffer_lock:
+            if not self._progress_buffer:
+                continue
+            updates_to_send = dict(self._progress_buffer)
+            self._progress_buffer.clear()
+
+        # Send to job leaders
+        if self._healthy_manager_ids:
+            for workflow_id, progress in updates_to_send.items():
+                await self._send_progress_to_job_leader(progress)
+
+def _get_effective_flush_interval(self) -> float:
+    """Increase interval when managers signal backpressure."""
+    base = self._progress_flush_interval  # 50ms
+    if self._backpressure_delay_ms > 0:
+        return base + (self._backpressure_delay_ms / 1000.0)
+    return base
+```
+
+#### 4. Lifecycle Events (Immediate Send)
+
+Status transitions bypass the buffer for immediate visibility:
+
+```python
+async def _transition_workflow_status(
+    self,
+    progress: WorkflowProgress,
+    new_status: WorkflowStatus,
+    start_time: float | None = None,
+) -> None:
+    """
+    Transition workflow to a new status with IMMEDIATE send.
+
+    This is the ONLY method that should change workflow status.
+    Lifecycle events (STARTED, COMPLETED, FAILED) are always sent
+    immediately to ensure visibility even for short workflows.
+    """
+    progress.status = new_status.value
+    progress.timestamp = time.monotonic()
+    progress.collected_at = time.time()
+
+    if start_time is not None:
+        progress.elapsed_seconds = time.monotonic() - start_time
+
+    # Always send lifecycle transitions immediately (bypass buffer)
+    if self._healthy_manager_ids:
+        await self._send_progress_update_direct(progress)
+```
+
+### Job Leader Routing
+
+Progress updates are routed to the Manager that dispatched the workflow:
+
+```python
+async def _send_progress_to_job_leader(
+    self,
+    progress: WorkflowProgress,
+) -> bool:
+    """
+    Send progress to the job leader for this workflow.
+
+    Routes to the manager that dispatched (job leader).
+    Handles failover if job leader becomes unhealthy.
+    """
+    workflow_id = progress.workflow_id
+    job_leader_addr = self._workflow_job_leader.get(workflow_id)
+
+    # Try job leader first
+    if job_leader_addr:
+        success = await self._try_send_progress_to_addr(progress, job_leader_addr)
+        if success:
+            return True
+
+        # Job leader failed - need to find new leader
+        # Query any healthy manager for the current leader
+
+    # Fallback: query healthy managers for job leader
+    for manager_id in list(self._healthy_manager_ids):
+        manager_info = self._known_managers.get(manager_id)
+        if manager_info:
+            success = await self._try_send_progress_to_addr(
+                progress,
+                (manager_info.host, manager_info.tcp_port)
+            )
+            if success:
+                # Ack includes current job leader address - update routing
+                return True
+
+    return False
+```
+
+### Configuration
+
+Environment variables in `Env`:
+
+```python
+# Worker progress update configuration
+WORKER_PROGRESS_UPDATE_INTERVAL: float = 0.1    # How often to poll status queue (100ms)
+WORKER_PROGRESS_FLUSH_INTERVAL: float = 0.05    # How often to flush buffer (50ms)
+
+# Backpressure (AD-23)
+# Managers can signal workers to slow down progress updates
+# by including BackpressureSignal in progress acks
+```
+
+### Flow Comparison: Before vs After
+
+**Before (Inline Rate-Limiting):**
+```
+[status update] → [rate limit check] → [send if time passed]
+                          ↓
+                   (DROP if too soon)
+```
+- Updates could be dropped
+- No backpressure awareness
+- Competed with flush loop
+
+**After (Buffer + Flush):**
+```
+[status update] → [_progress_buffer] → [flush loop] → [send]
+                   (latest-wins)       (controlled)
+```
+- No updates dropped (latest kept)
+- Backpressure-aware
+- Single unified mechanism
+- Lifecycle events bypass for immediacy
+
+### Integration with Windowed Stats
+
+This Worker → Manager flow feeds into the Manager's `WindowedStatsCollector`:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    END-TO-END PROGRESS FLOW                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌────────────┐    ┌────────────┐                                           │
+│  │  Worker 1  │    │  Worker 2  │                                           │
+│  │            │    │            │                                           │
+│  │ [buffer]   │    │ [buffer]   │     Worker → Manager                      │
+│  │ [flush]    │    │ [flush]    │     (This section)                        │
+│  └─────┬──────┘    └─────┬──────┘                                           │
+│        │                 │                                                   │
+│        │ WorkflowProgress│                                                   │
+│        │ (50ms batched)  │                                                   │
+│        │                 │                                                   │
+│        └────────┬────────┘                                                   │
+│                 ▼                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────┐│
+│  │                    MANAGER                                               ││
+│  │                                                                          ││
+│  │  workflow_progress() ──► WindowedStatsCollector                          ││
+│  │         │                    │                                           ││
+│  │         │                    │ (time-bucketed windows)                   ││
+│  │         │                    │ (drift tolerance)                         ││
+│  │         │                    │ (aggregation)                             ││
+│  │         │                    ▼                                           ││
+│  │         │              [flush closed windows]                            ││
+│  │         │                    │                                           ││
+│  └─────────┼────────────────────┼───────────────────────────────────────────┘│
+│            │                    │                                            │
+│            │                    │ WindowedStatsPush                          │
+│            │                    │ (50ms aggregated)                          │
+│            ▼                    ▼                                            │
+│   ┌─────────────────┐    ┌─────────────────┐                                │
+│   │ Job tracking    │    │ Client/Gate     │     Manager → Client           │
+│   │ (internal)      │    │ (streaming)     │     (Next section)             │
+│   └─────────────────┘    └─────────────────┘                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Time-Windowed Streaming Stats System
 
 ### Overview

@@ -143,6 +143,7 @@ from hyperscale.distributed_rewrite.protocol.version import (
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
+from hyperscale.reporting.json import JSONConfig
 
 # New modular classes for job/workflow management
 from hyperscale.distributed_rewrite.jobs import (
@@ -4074,27 +4075,10 @@ class ManagerServer(HealthAwareServer):
                 worker_workflow_completed_cores=progress.worker_workflow_completed_cores,
                 worker_available_cores=progress.worker_available_cores,
             )
-            # TEMPORARILY COMMENTED OUT: Batched windowed stats collection
-            # await self._windowed_stats.add_progress(worker_id, stats_progress)
-            print(f"[DEBUG-MANAGER] received progress from worker {worker_id}, workflow={progress.workflow_name}, completed={progress.completed_count}, collected_at={progress.collected_at:.3f}, t={time.time():.3f}")
-
-            # TEMPORARY: Push directly to client instead of batching
-            from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
-            direct_push = WindowedStatsPush(
-                job_id=stats_progress.job_id,
-                workflow_id=stats_progress.workflow_id,
-                workflow_name=stats_progress.workflow_name,
-                window_start=stats_progress.collected_at,
-                window_end=stats_progress.collected_at,
-                completed_count=stats_progress.completed_count,
-                failed_count=stats_progress.failed_count,
-                rate_per_second=stats_progress.rate_per_second,
-                avg_cpu_percent=stats_progress.avg_cpu_percent,
-                avg_memory_mb=stats_progress.avg_memory_mb,
-                worker_count=1,
-                is_aggregated=False,
-            )
-            await self._push_windowed_stats_to_client(direct_push)
+            # Add to windowed stats collector for batched streaming to client
+            # The collector aggregates updates within time windows (50ms default)
+            # and the push loop flushes closed windows to clients
+            await self._windowed_stats.add_progress(worker_id, stats_progress)
 
             # Forward to job leader if we're not the leader
             forwarded = await self._try_forward_progress_to_leader(progress)
@@ -5261,16 +5245,49 @@ class ManagerServer(HealthAwareServer):
             callback_addr: Client callback address for push notifications
         """
         submission = self._job_submissions.get(job_id)
-        if not submission or not submission.reporting_configs:
+        if not submission:
             return
 
-        # Unpickle reporter configs
+        reporter_configs = self._get_reporter_configs(job_id, submission)
+
+        # Initialize task tracking for this job
+        if job_id not in self._job_reporter_tasks:
+            self._job_reporter_tasks[job_id] = {}
+
+        # No configs means use default per-workflow JSON output
+        if not reporter_configs:
+            token = self._task_runner.run(
+                self._submit_to_default_json_reporter,
+                job_id,
+                aggregated_stats,
+                callback_addr,
+            )
+            self._job_reporter_tasks[job_id]["json_default"] = token
+            return
+
+        # Start a background task for each reporter
+        for config in reporter_configs:
+            reporter_type = config.reporter_type.value
+            token = self._task_runner.run(
+                self._submit_to_reporter,
+                job_id,
+                config,
+                aggregated_stats,
+                callback_addr,
+            )
+            self._job_reporter_tasks[job_id][reporter_type] = token
+
+    def _get_reporter_configs(self, job_id: str, submission: JobSubmission) -> list:
+        """
+        Extract reporter configs from job submission.
+
+        Returns empty list to indicate default JSON output should be used.
+        """
+        if not submission.reporting_configs:
+            return []
+
         try:
             reporter_configs = restricted_loads(submission.reporting_configs)
-            if not reporter_configs:
-                return
-            if not isinstance(reporter_configs, list):
-                reporter_configs = [reporter_configs]
         except Exception as e:
             self._task_runner.run(
                 self._udp_logger.log,
@@ -5281,43 +5298,127 @@ class ManagerServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
+            return []
+
+        if not reporter_configs:
+            return []
+
+        if not isinstance(reporter_configs, list):
+            return [reporter_configs]
+
+        return reporter_configs
+
+    def _cleanup_reporter_task(self, job_id: str, reporter_type: str) -> None:
+        """Remove completed reporter task from tracking."""
+        job_tasks = self._job_reporter_tasks.get(job_id)
+        if not job_tasks or reporter_type not in job_tasks:
             return
 
-        # Initialize task tracking for this job
-        if job_id not in self._job_reporter_tasks:
-            self._job_reporter_tasks[job_id] = {}
+        del job_tasks[reporter_type]
 
-        # Start a background task for each reporter
-        for config in reporter_configs:
-            reporter_type = config.reporter_type.value
-            task = asyncio.create_task(
-                self._submit_to_reporter(
-                    job_id=job_id,
-                    reporter_config=config,
-                    aggregated_stats=aggregated_stats,
-                    callback_addr=callback_addr,
-                )
-            )
-            self._job_reporter_tasks[job_id][reporter_type] = task
+        if job_tasks:
+            return
 
-            # Add cleanup callback when task completes
-            task.add_done_callback(
-                lambda t, jid=job_id, rt=reporter_type: self._on_reporter_task_complete(jid, rt, t)
-            )
+        # No more reporter tasks for this job - clean up
+        del self._job_reporter_tasks[job_id]
 
-    def _on_reporter_task_complete(
+    async def _submit_to_default_json_reporter(
         self,
         job_id: str,
-        reporter_type: str,
-        task: asyncio.Task,
+        aggregated_stats: list[WorkflowStats],
+        callback_addr: tuple[str, int] | None,
     ) -> None:
-        """Callback when a reporter task completes - remove from tracking."""
-        job_tasks = self._job_reporter_tasks.get(job_id)
-        if job_tasks and reporter_type in job_tasks:
-            del job_tasks[reporter_type]
-            # Clean up job entry if no more tasks
-            if not job_tasks:
-                del self._job_reporter_tasks[job_id]
+        """
+        Submit workflow results to per-workflow JSON files.
+
+        Creates a separate JSON file for each workflow using the pattern:
+        - <workflow_name>_workflow_results.json
+        - <workflow_name>_step_results.json
+
+        Runs as a background task. Sends push notification to client
+        on success or failure.
+
+        Args:
+            job_id: The job ID
+            aggregated_stats: List of WorkflowStats to submit
+            callback_addr: Client callback for push notification
+        """
+        start_time = time.monotonic()
+        success = False
+        error_message: str | None = None
+        workflows_submitted = 0
+
+        try:
+            for workflow_stats in aggregated_stats:
+                if workflow_stats is None:
+                    continue
+
+                # Get workflow name for file naming
+                workflow_name = workflow_stats.get("workflow", "unknown")
+                workflow_name_lower = workflow_name.lower()
+
+                # Create per-workflow JSONConfig
+                config = JSONConfig(
+                    workflow_results_filepath=f"{workflow_name_lower}_workflow_results.json",
+                    step_results_filepath=f"{workflow_name_lower}_step_results.json",
+                )
+
+                reporter = Reporter(config)
+                await reporter.connect()
+
+                try:
+                    await reporter.submit_workflow_results(workflow_stats)
+                    await reporter.submit_step_results(workflow_stats)
+                    workflows_submitted += 1
+                finally:
+                    await reporter.close()
+
+            success = True
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Successfully submitted {workflows_submitted} workflow(s) for job {job_id} to JSON files",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        except Exception as e:
+            error_message = str(e)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to submit job {job_id} results to JSON: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        elapsed = time.monotonic() - start_time
+
+        # Send result push to client
+        if callback_addr:
+            result_push = ReporterResultPush(
+                job_id=job_id,
+                reporter_type="json",
+                success=success,
+                error=error_message,
+                elapsed_seconds=elapsed,
+            )
+            try:
+                await self.send_tcp(
+                    callback_addr,
+                    "reporter_result_push",
+                    result_push.dump(),
+                    timeout=5.0,
+                )
+            except Exception:
+                pass  # Best effort notification
+
+        # Cleanup task tracking
+        self._cleanup_reporter_task(job_id, "json_default")
 
     async def _submit_to_reporter(
         self,
@@ -5350,6 +5451,8 @@ class ManagerServer(HealthAwareServer):
             try:
                 # Submit each workflow's results
                 for workflow_stats in aggregated_stats:
+                    if workflow_stats is None:
+                        continue
                     await reporter.submit_workflow_results(workflow_stats)
                     await reporter.submit_step_results(workflow_stats)
                 success = True
@@ -5390,6 +5493,9 @@ class ManagerServer(HealthAwareServer):
                 elapsed_seconds=elapsed,
                 callback_addr=callback_addr,
             )
+
+        # Cleanup task tracking
+        self._cleanup_reporter_task(job_id, reporter_type)
 
     async def _send_reporter_result_push(
         self,
@@ -6039,11 +6145,7 @@ class ManagerServer(HealthAwareServer):
 
                 if not pushes:
                     continue
-
-                print(f"[DEBUG-MANAGER] flushed {len(pushes)} windows, t={time.time():.3f}")
-                for push in pushes:
-                    print(f"[DEBUG-MANAGER]   -> workflow={push.workflow_name}, completed={push.completed_count}, window=[{push.window_start:.3f}-{push.window_end:.3f}], worker_count={push.worker_count}")
-
+                
                 if has_gates:
                     # Forward unaggregated stats to gates
                     for push in pushes:

@@ -705,14 +705,14 @@ class WorkflowRunner:
 
             threads = config.get("threads")
 
-            # Compute max active tasks with a floor to prevent starvation on low-VU
-            # workflows running on high-core systems. The floor ensures at least 10x
-            # headroom relative to VU count, while high-VU workflows use the
-            # CPU-scaled formula.
-            cpu_scaled_max = math.ceil(
-                (vus * (psutil.cpu_count(logical=False) ** 2)) / threads
+            # Floor-based approach - commented out for testing
+            # self._max_active[run_id][workflow.name] = vus * 10
+
+            # Original CPU-aware formula: scales with CPU count to account for
+            # less powerful individual cores on high-CPU systems
+            self._max_active[run_id][workflow.name] = math.ceil(
+                (vus * (psutil.cpu_count() ** 2)) / threads
             )
-            self._max_active[run_id][workflow.name] = max(vus * 10, cpu_scaled_max)
 
             for client in workflow.client:
                 setup_client(

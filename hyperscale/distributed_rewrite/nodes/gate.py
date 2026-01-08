@@ -32,6 +32,7 @@ import cloudpickle
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
+from hyperscale.reporting.json import JSONConfig
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, GateStateEmbedder
@@ -4803,16 +4804,49 @@ class GateServer(HealthAwareServer):
             callback_addr: Client callback address for push notifications
         """
         submission = self._job_submissions.get(job_id)
-        if not submission or not submission.reporting_configs:
+        if not submission:
             return
 
-        # Unpickle reporter configs
+        reporter_configs = self._get_reporter_configs(job_id, submission)
+
+        # Initialize task tracking for this job
+        if job_id not in self._job_reporter_tasks:
+            self._job_reporter_tasks[job_id] = {}
+
+        # No configs means use default per-workflow JSON output
+        if not reporter_configs:
+            token = self._task_runner.run(
+                self._submit_to_default_json_reporter,
+                job_id,
+                aggregated_stats,
+                callback_addr,
+            )
+            self._job_reporter_tasks[job_id]["json_default"] = token
+            return
+
+        # Start a background task for each reporter
+        for config in reporter_configs:
+            reporter_type = config.reporter_type.value
+            token = self._task_runner.run(
+                self._submit_to_reporter,
+                job_id,
+                config,
+                aggregated_stats,
+                callback_addr,
+            )
+            self._job_reporter_tasks[job_id][reporter_type] = token
+
+    def _get_reporter_configs(self, job_id: str, submission: JobSubmission) -> list:
+        """
+        Extract reporter configs from job submission.
+
+        Returns empty list to indicate default JSON output should be used.
+        """
+        if not submission.reporting_configs:
+            return []
+
         try:
             reporter_configs = restricted_loads(submission.reporting_configs)
-            if not reporter_configs:
-                return
-            if not isinstance(reporter_configs, list):
-                reporter_configs = [reporter_configs]
         except Exception as e:
             self._task_runner.run(
                 self._udp_logger.log,
@@ -4823,45 +4857,128 @@ class GateServer(HealthAwareServer):
                     node_id=self._node_id.short,
                 )
             )
+            return []
+
+        if not reporter_configs:
+            return []
+
+        if not isinstance(reporter_configs, list):
+            return [reporter_configs]
+
+        return reporter_configs
+
+    def _cleanup_reporter_task(self, job_id: str, reporter_type: str) -> None:
+        """Remove completed reporter task from tracking."""
+        job_tasks = self._job_reporter_tasks.get(job_id)
+        if not job_tasks or reporter_type not in job_tasks:
             return
 
-        # Initialize task tracking for this job
-        if job_id not in self._job_reporter_tasks:
-            self._job_reporter_tasks[job_id] = {}
+        del job_tasks[reporter_type]
 
-        # Start a background task for each reporter
-        for config in reporter_configs:
-            reporter_type = config.reporter_type.value
-            task = asyncio.create_task(
-                self._submit_to_reporter(
-                    job_id=job_id,
-                    reporter_config=config,
-                    aggregated_stats=aggregated_stats,
-                    callback_addr=callback_addr,
-                )
-            )
-            self._job_reporter_tasks[job_id][reporter_type] = task
+        if job_tasks:
+            return
 
-            # Add cleanup callback when task completes
-            task.add_done_callback(
-                lambda t, jid=job_id, rt=reporter_type: self._on_reporter_task_complete(jid, rt, t)
-            )
+        # No more reporter tasks for this job - clean up
+        del self._job_reporter_tasks[job_id]
+        self._job_submissions.pop(job_id, None)
 
-    def _on_reporter_task_complete(
+    async def _submit_to_default_json_reporter(
         self,
         job_id: str,
-        reporter_type: str,
-        task: asyncio.Task,
+        aggregated_stats: list[WorkflowStats],
+        callback_addr: tuple[str, int] | None,
     ) -> None:
-        """Callback when a reporter task completes - remove from tracking."""
-        job_tasks = self._job_reporter_tasks.get(job_id)
-        if job_tasks and reporter_type in job_tasks:
-            del job_tasks[reporter_type]
-            # Clean up job entry if no more tasks
-            if not job_tasks:
-                del self._job_reporter_tasks[job_id]
-                # Also clean up submission since we no longer need it
-                self._job_submissions.pop(job_id, None)
+        """
+        Submit workflow results to per-workflow JSON files.
+
+        Creates a separate JSON file for each workflow using the pattern:
+        - <workflow_name>_workflow_results.json
+        - <workflow_name>_step_results.json
+
+        Runs as a background task. Sends push notification to client
+        on success or failure.
+
+        Args:
+            job_id: The job ID
+            aggregated_stats: List of WorkflowStats to submit
+            callback_addr: Client callback for push notification
+        """
+        start_time = time.monotonic()
+        success = False
+        error_message: str | None = None
+        workflows_submitted = 0
+
+        try:
+            for workflow_stats in aggregated_stats:
+                if workflow_stats is None:
+                    continue
+
+                # Get workflow name for file naming
+                workflow_name = workflow_stats.get("workflow", "unknown")
+                workflow_name_lower = workflow_name.lower()
+
+                # Create per-workflow JSONConfig
+                config = JSONConfig(
+                    workflow_results_filepath=f"{workflow_name_lower}_workflow_results.json",
+                    step_results_filepath=f"{workflow_name_lower}_step_results.json",
+                )
+
+                reporter = Reporter(config)
+                await reporter.connect()
+
+                try:
+                    await reporter.submit_workflow_results(workflow_stats)
+                    await reporter.submit_step_results(workflow_stats)
+                    workflows_submitted += 1
+                finally:
+                    await reporter.close()
+
+            success = True
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Successfully submitted {workflows_submitted} workflow(s) for job {job_id} to JSON files",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        except Exception as e:
+            error_message = str(e)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerWarning(
+                    message=f"Failed to submit job {job_id} results to JSON: {e}",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        elapsed = time.monotonic() - start_time
+
+        # Send result push to client
+        if callback_addr:
+            result_push = ReporterResultPush(
+                job_id=job_id,
+                reporter_type="json",
+                success=success,
+                error=error_message,
+                elapsed_seconds=elapsed,
+            )
+            try:
+                await self.send_tcp(
+                    callback_addr,
+                    "reporter_result_push",
+                    result_push.dump(),
+                    timeout=5.0,
+                )
+            except Exception:
+                pass  # Best effort notification
+
+        # Cleanup task tracking
+        self._cleanup_reporter_task(job_id, "json_default")
 
     async def _submit_to_reporter(
         self,
@@ -4897,6 +5014,8 @@ class GateServer(HealthAwareServer):
             try:
                 # Submit each workflow's aggregated stats
                 for workflow_stats in aggregated_stats:
+                    if workflow_stats is None:
+                        continue
                     await reporter.submit_workflow_results(workflow_stats)
                     await reporter.submit_step_results(workflow_stats)
                 success = True
@@ -4937,6 +5056,9 @@ class GateServer(HealthAwareServer):
                 elapsed_seconds=elapsed,
                 callback_addr=callback_addr,
             )
+
+        # Cleanup task tracking
+        self._cleanup_reporter_task(job_id, reporter_type)
 
     async def _send_reporter_result_push(
         self,
@@ -5160,74 +5282,12 @@ class GateServer(HealthAwareServer):
                 ).dump()
 
             request = WorkflowQueryRequest.load(data)
+            dc_results = await self._query_all_datacenters(request)
 
-            # Query all datacenter leaders concurrently
-            dc_results: dict[str, list[WorkflowStatusInfo]] = {}
-
-            async def query_dc(dc_id: str, manager_addr: tuple[str, int]) -> None:
-                """Query a single datacenter's manager."""
-                try:
-                    response_data, _ = await self.send_tcp(
-                        manager_addr,
-                        "workflow_query",
-                        request.dump(),
-                        timeout=5.0,
-                    )
-                    if isinstance(response_data, Exception) or response_data == b'error':
-                        return
-
-                    manager_response = WorkflowQueryResponse.load(response_data)
-                    dc_results[dc_id] = manager_response.workflows
-
-                except Exception:
-                    # DC query failed - skip this DC
-                    pass
-
-            # Get per-DC job leaders if this query has a job_id
-            # Job leaders are the managers that accepted the job in each DC
-            job_dc_managers = self._job_dc_managers.get(request.job_id, {}) if request.job_id else {}
-
-            # Find a manager address for each datacenter
-            # Priority: job leader > cluster leader > any healthy manager
-            query_tasks = []
-            for dc_id in self._datacenter_managers.keys():
-                target_addr: tuple[str, int] | None = None
-
-                # First priority: use job leader for this DC if known
-                if dc_id in job_dc_managers:
-                    target_addr = job_dc_managers[dc_id]
-                else:
-                    # Fall back to cluster leader or any healthy manager
-                    manager_statuses = self._datacenter_manager_status.get(dc_id, {})
-                    fallback_addr: tuple[str, int] | None = None
-
-                    for manager_addr, heartbeat in manager_statuses.items():
-                        # Track any valid manager as fallback
-                        if fallback_addr is None:
-                            fallback_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
-                        # Prefer cluster leader if available
-                        if heartbeat.is_leader:
-                            target_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
-                            break
-
-                    # Use cluster leader if found, otherwise any manager
-                    if target_addr is None:
-                        target_addr = fallback_addr
-
-                if target_addr:
-                    query_tasks.append(query_dc(dc_id, target_addr))
-
-            # Run all DC queries concurrently
-            if query_tasks:
-                await asyncio.gather(*query_tasks, return_exceptions=True)
-
-            # Build response grouped by datacenter
-            datacenters: list[DatacenterWorkflowStatus] = []
-            for dc_id, workflows in dc_results.items():
-                datacenters.append(DatacenterWorkflowStatus(
-                    dc_id=dc_id,
-                    workflows=workflows,
-                ))
+            datacenters = [
+                DatacenterWorkflowStatus(dc_id=dc_id, workflows=workflows)
+                for dc_id, workflows in dc_results.items()
+            ]
 
             response = GateWorkflowQueryResponse(
                 request_id=request.request_id,
@@ -5240,6 +5300,76 @@ class GateServer(HealthAwareServer):
         except Exception as e:
             await self.handle_exception(e, "workflow_query")
             return b'error'
+
+    async def _query_all_datacenters(
+        self,
+        request: WorkflowQueryRequest,
+    ) -> dict[str, list[WorkflowStatusInfo]]:
+        """
+        Query all datacenter managers for workflow status.
+
+        Returns dict mapping DC ID to list of workflow status info.
+        """
+        dc_results: dict[str, list[WorkflowStatusInfo]] = {}
+
+        async def query_dc(dc_id: str, manager_addr: tuple[str, int]) -> None:
+            try:
+                response_data, _ = await self.send_tcp(
+                    manager_addr,
+                    "workflow_query",
+                    request.dump(),
+                    timeout=5.0,
+                )
+                if isinstance(response_data, Exception) or response_data == b'error':
+                    return
+
+                manager_response = WorkflowQueryResponse.load(response_data)
+                dc_results[dc_id] = manager_response.workflows
+
+            except Exception:
+                pass  # DC query failed - skip this DC
+
+        # Get per-DC job leaders if this query has a job_id
+        job_dc_managers = self._job_dc_managers.get(request.job_id, {}) if request.job_id else {}
+
+        # Build query tasks for each datacenter
+        query_tasks = []
+        for dc_id in self._datacenter_managers.keys():
+            target_addr = self._get_dc_query_target(dc_id, job_dc_managers)
+            if target_addr:
+                query_tasks.append(query_dc(dc_id, target_addr))
+
+        if query_tasks:
+            await asyncio.gather(*query_tasks, return_exceptions=True)
+
+        return dc_results
+
+    def _get_dc_query_target(
+        self,
+        dc_id: str,
+        job_dc_managers: dict[str, tuple[str, int]],
+    ) -> tuple[str, int] | None:
+        """
+        Get the best manager address to query for a datacenter.
+
+        Priority: job leader > cluster leader > any healthy manager.
+        """
+        # First priority: use job leader for this DC if known
+        if dc_id in job_dc_managers:
+            return job_dc_managers[dc_id]
+
+        # Fall back to cluster leader or any healthy manager
+        manager_statuses = self._datacenter_manager_status.get(dc_id, {})
+        fallback_addr: tuple[str, int] | None = None
+
+        for manager_addr, heartbeat in manager_statuses.items():
+            if fallback_addr is None:
+                fallback_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
+
+            if heartbeat.is_leader:
+                return (heartbeat.tcp_host, heartbeat.tcp_port)
+
+        return fallback_addr
 
     @tcp.receive()
     async def datacenter_list(

@@ -1400,6 +1400,7 @@ class HyperscaleClient(MercurySyncBaseServer):
                 return b'rate_limited'
 
             import cloudpickle
+            import time as time_module
             from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
             push: WindowedStatsPush = cloudpickle.loads(data)
 
