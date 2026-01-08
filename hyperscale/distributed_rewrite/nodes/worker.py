@@ -271,7 +271,11 @@ class WorkerServer(HealthAwareServer):
 
         self._updates = InterfaceUpdatesController()
 
-        self._remote_manger = RemoteGraphManager(self._updates, self._total_cores)
+        self._remote_manger = RemoteGraphManager(
+            self._updates,
+            self._total_cores,
+            status_update_poll_interval=env.STATUS_UPDATE_POLL_INTERVAL,
+        )
         self._server_pool = LocalServerPool(self._total_cores)
         self._pool_task: asyncio.Task | None = None
         self._local_udp_port = self._udp_port + (self._total_cores ** 2)

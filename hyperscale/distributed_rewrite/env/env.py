@@ -211,6 +211,10 @@ class Env(BaseModel):
     STATS_PUSH_INTERVAL_MS: StrictFloat = 50.0  # How often to flush windows and push (ms)
     STATS_MAX_WINDOW_AGE_MS: StrictFloat = 5000.0  # Max age before window is dropped (cleanup)
 
+    # Status update processing interval (seconds) - controls how often _process_status_updates runs
+    # during workflow completion wait. Lower values = more responsive UI updates.
+    STATUS_UPDATE_POLL_INTERVAL: StrictFloat = 0.05  # 50ms default for real-time UI
+
     # Client rate limiting for progress updates only
     CLIENT_PROGRESS_RATE_LIMIT: StrictFloat = 100.0  # Max progress callbacks per second
     CLIENT_PROGRESS_BURST: StrictInt = 20  # Burst allowance for progress callbacks
@@ -399,6 +403,7 @@ class Env(BaseModel):
             "STATS_DRIFT_TOLERANCE_MS": float,
             "STATS_PUSH_INTERVAL_MS": float,
             "STATS_MAX_WINDOW_AGE_MS": float,
+            "STATUS_UPDATE_POLL_INTERVAL": float,
             "CLIENT_PROGRESS_RATE_LIMIT": float,
             "CLIENT_PROGRESS_BURST": int,
             # Cross-DC correlation settings (Phase 7)

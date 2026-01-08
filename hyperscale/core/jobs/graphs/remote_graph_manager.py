@@ -89,6 +89,7 @@ class RemoteGraphManager:
         self,
         updates: InterfaceUpdatesController,
         workers: int,
+        status_update_poll_interval: float = 0.05,
     ) -> None:
         self._updates = updates
         self._workers: List[Tuple[str, int]] | None = None
@@ -101,6 +102,7 @@ class RemoteGraphManager:
         self._workflow_last_elapsed: Dict[str, float] = {}
 
         self._threads = workers
+        self._status_update_poll_interval = status_update_poll_interval
         self._controller: RemoteGraphController | None = None
         self._role = InstanceRoleType.PROVISIONER
         self._provisioner: Provisioner | None = None
@@ -1281,7 +1283,7 @@ class RemoteGraphManager:
             try:
                 await asyncio.wait_for(
                     completion_state.completion_event.wait(),
-                    timeout=min(0.05, remaining_timeout),
+                    timeout=min(self._status_update_poll_interval, remaining_timeout),
                 )
             except asyncio.TimeoutError:
                 pass  # Expected - just check for status updates
