@@ -159,6 +159,7 @@ class MercurySyncBaseServer(Generic[T]):
         
         # Security utilities
         self._replay_guard = ReplayGuard()
+        self._client_replay_guard = ReplayGuard()
         self._rate_limiter = ServerRateLimiter()
         self._secure_random = secrets.SystemRandom()  # Cryptographically secure RNG
 
@@ -1342,6 +1343,17 @@ class MercurySyncBaseServer(Generic[T]):
 
             if response_model := self.udp_client_response_models.get(handler_name):
                     payload = response_model.load(payload)
+
+                    # Validate message for replay attacks if it's a Message instance
+                    if isinstance(payload, Message):
+                        try:
+                            self._client_replay_guard.validate_with_incarnation(
+                                payload.message_id,
+                                payload.sender_incarnation,
+                            )
+                        except ReplayError:
+                            self._udp_drop_counter.increment_replay_detected()
+                            return
 
 
             handler = self.udp_client_handlers.get(handler_name)
