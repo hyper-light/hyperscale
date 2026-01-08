@@ -1619,9 +1619,8 @@ class WorkerServer(HealthAwareServer):
             try:
                 await asyncio.sleep(self._progress_update_interval)
 
-                # Drain all pending stats from WorkflowRunner, get most recent
-                # This prevents backlog when updates are produced faster than consumed
-                workflow_status_update = await self._remote_manger.drain_workflow_updates(run_id, workflow_name)
+                # Get next available status update from WorkflowRunner
+                workflow_status_update = await self._remote_manger.get_workflow_update(run_id, workflow_name)
                 if workflow_status_update is None:
                     # No update available yet, keep waiting
                     continue
