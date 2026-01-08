@@ -54,6 +54,10 @@ class Env(BaseModel):
     SWIM_UDP_POLL_INTERVAL: StrictInt = 1  # Reduced from 2 - more frequent probing
     SWIM_SUSPICION_MIN_TIMEOUT: StrictFloat = 1.5  # Reduced from 2.0 - faster confirmation
     SWIM_SUSPICION_MAX_TIMEOUT: StrictFloat = 8.0  # Reduced from 15.0 - faster failure declaration
+    # Refutation rate limiting - prevents incarnation exhaustion attacks
+    # If an attacker sends many probes/suspects about us, we limit how fast we increment incarnation
+    SWIM_REFUTATION_RATE_LIMIT_TOKENS: StrictInt = 5  # Max refutations per window
+    SWIM_REFUTATION_RATE_LIMIT_WINDOW: StrictFloat = 10.0  # Window duration in seconds
     
     # Leader Election Settings
     LEADER_HEARTBEAT_INTERVAL: StrictFloat = 2.0  # Seconds between leader heartbeats
@@ -341,6 +345,8 @@ class Env(BaseModel):
             "SWIM_UDP_POLL_INTERVAL": int,
             "SWIM_SUSPICION_MIN_TIMEOUT": float,
             "SWIM_SUSPICION_MAX_TIMEOUT": float,
+            "SWIM_REFUTATION_RATE_LIMIT_TOKENS": int,
+            "SWIM_REFUTATION_RATE_LIMIT_WINDOW": float,
             # Circuit breaker settings
             "CIRCUIT_BREAKER_MAX_ERRORS": int,
             "CIRCUIT_BREAKER_WINDOW_SECONDS": float,
@@ -493,13 +499,13 @@ class Env(BaseModel):
     def get_swim_init_context(self) -> dict:
         """
         Get SWIM protocol init_context from environment settings.
-        
+
         Note: The 'nodes' dict is created fresh each time as it needs
         to be unique per server instance (contains asyncio.Queue objects).
         """
         from collections import defaultdict
         import asyncio
-        
+
         return {
             'max_probe_timeout': self.SWIM_MAX_PROBE_TIMEOUT,
             'min_probe_timeout': self.SWIM_MIN_PROBE_TIMEOUT,
@@ -508,6 +514,8 @@ class Env(BaseModel):
             'udp_poll_interval': self.SWIM_UDP_POLL_INTERVAL,
             'suspicion_min_timeout': self.SWIM_SUSPICION_MIN_TIMEOUT,
             'suspicion_max_timeout': self.SWIM_SUSPICION_MAX_TIMEOUT,
+            'refutation_rate_limit_tokens': self.SWIM_REFUTATION_RATE_LIMIT_TOKENS,
+            'refutation_rate_limit_window': self.SWIM_REFUTATION_RATE_LIMIT_WINDOW,
         }
     
     def get_circuit_breaker_config(self) -> dict:
