@@ -1181,7 +1181,7 @@ class TestRecoveryPatterns:
     def test_extension_tracker_recovery_cycle(self):
         """Test extension tracker through full exhaustion-recovery cycle."""
         manager = WorkerHealthManager(
-            WorkerHealthManagerConfig(max_extensions=3)
+            WorkerHealthManagerConfig(max_extensions=3, grace_period=0.0)
         )
 
         from hyperscale.distributed_rewrite.models import (
@@ -1198,6 +1198,16 @@ class TestRecoveryPatterns:
                 active_workflow_count=1,
             )
             manager.handle_extension_request(request, time.time() + 30)
+
+        # Make one more request to trigger exhaustion_time to be set
+        final_request = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="still busy",
+            current_progress=40.0,
+            estimated_completion=30.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(final_request, time.time() + 30)
 
         should_evict, _ = manager.should_evict_worker("worker-1")
         assert should_evict is True
@@ -1657,7 +1667,7 @@ class TestPartialFailureSplitBrain:
     def test_extension_tracker_isolation_between_workers(self):
         """Test extension trackers are isolated between workers."""
         manager = WorkerHealthManager(
-            WorkerHealthManagerConfig(max_extensions=2)
+            WorkerHealthManagerConfig(max_extensions=2, grace_period=0.0)
         )
 
         from hyperscale.distributed_rewrite.models import HealthcheckExtensionRequest
@@ -1672,6 +1682,16 @@ class TestPartialFailureSplitBrain:
                 active_workflow_count=1,
             )
             manager.handle_extension_request(request, time.time() + 30)
+
+        # Make one more request to trigger exhaustion_time to be set
+        final_request = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="still busy",
+            current_progress=30.0,
+            estimated_completion=30.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(final_request, time.time() + 30)
 
         # worker-1 should be exhausted
         should_evict1, _ = manager.should_evict_worker("worker-1")
