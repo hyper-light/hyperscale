@@ -22,6 +22,7 @@ class AuditEventType(Enum):
     NODE_CONFIRMED_DEAD = "node_confirmed_dead"
     NODE_REFUTED = "node_refuted"
     NODE_REJOIN = "node_rejoin"
+    NODE_RECOVERED = "node_recovered"  # Node transitioned from DEAD back to OK
     
     # Leadership events
     ELECTION_STARTED = "election_started"

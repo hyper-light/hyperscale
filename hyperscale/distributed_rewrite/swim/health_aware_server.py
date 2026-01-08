@@ -2143,8 +2143,42 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         incarnation: int,
         timestamp: float,
     ) -> bool:
-        """Update the state of a node. Returns True if state changed."""
-        return self._incarnation_tracker.update_node(node, status, incarnation, timestamp)
+        """
+        Update the state of a node. Returns True if state changed.
+
+        Also invokes _on_node_join_callbacks when a node transitions from
+        DEAD to OK/ALIVE (recovery detection).
+        """
+        # Get previous state before updating
+        previous_state = self._incarnation_tracker.get_node_state(node)
+        was_dead = previous_state and previous_state.status == b'DEAD'
+
+        # Perform the actual update
+        updated = self._incarnation_tracker.update_node(node, status, incarnation, timestamp)
+
+        # If node was DEAD and is now being set to OK/ALIVE, invoke join callbacks
+        # This handles recovery detection for nodes that come back after being marked dead
+        if updated and was_dead and status in (b'OK', b'ALIVE'):
+            self._metrics.increment('node_recoveries_detected')
+            self._audit_log.record(
+                AuditEventType.NODE_RECOVERED,
+                node=node,
+                incarnation=incarnation,
+            )
+
+            # Add back to probe scheduler
+            self._probe_scheduler.add_member(node)
+
+            # Invoke registered callbacks (composition pattern)
+            for callback in self._on_node_join_callbacks:
+                try:
+                    callback(node)
+                except Exception as e:
+                    self._task_runner.run(
+                        self.handle_exception, e, "on_node_join_callback (recovery)"
+                    )
+
+        return updated
     
     async def start_suspicion(
         self,
@@ -2730,8 +2764,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     # node that responded to our probe
                     nodes: Nodes = self._context.read('nodes')
                     if addr in nodes:
-                        # Update incarnation tracker to mark the source as alive
-                        self._incarnation_tracker.update_node(addr, b'OK', 0, time.monotonic())
+                        # Update node state - use update_node_state to trigger recovery
+                        # callbacks if node was previously DEAD
+                        self.update_node_state(addr, b'OK', 0, time.monotonic())
                         await self.decrease_failure_detector('successful_probe')
                     if target:
                         if target not in nodes:
