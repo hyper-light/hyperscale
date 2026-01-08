@@ -290,9 +290,9 @@ async def test_gate_heartbeat_message_validation(cluster_size: int) -> bool:
                 validation_results["peer_tracking_valid"] = False
 
             # Validate gate state
-            gate_state = gate._state.value if hasattr(gate._state, 'value') else str(gate._state)
+            gate_state = gate._gate_state.value if hasattr(gate._gate_state, 'value') else str(gate._gate_state)
             valid_states = {"syncing", "active", "draining"}
-            if gate_state in valid_states:
+            if gate_state.lower() in valid_states:
                 print(f"    state: {gate_state} [PASS]")
             else:
                 print(f"    state: {gate_state} (invalid) [FAIL]")
