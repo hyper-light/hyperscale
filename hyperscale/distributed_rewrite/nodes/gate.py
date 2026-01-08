@@ -785,12 +785,30 @@ class GateServer(HealthAwareServer):
         if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
             return
 
-        # Store peer info keyed by UDP address
+        # Store peer info keyed by UDP address (source_addr is the SWIM UDP address)
         self._gate_peer_info[source_addr] = heartbeat
 
         # Get peer TCP address for discovery tracking
+        # Note: TCP and UDP addresses can be completely different - use heartbeat fields
         peer_tcp_host = heartbeat.tcp_host if heartbeat.tcp_host else source_addr[0]
         peer_tcp_port = heartbeat.tcp_port if heartbeat.tcp_port else source_addr[1]
+        peer_tcp_addr = (peer_tcp_host, peer_tcp_port)
+
+        # Update UDP to TCP mapping for failure/recovery callbacks
+        # source_addr is the UDP address from SWIM, peer_tcp_addr is from heartbeat
+        # This mapping is critical: without it, _on_node_join/_on_node_dead
+        # cannot find the TCP address for dynamically discovered gates
+        udp_addr = source_addr  # SWIM source address is always UDP
+        if udp_addr not in self._gate_udp_to_tcp:
+            self._gate_udp_to_tcp[udp_addr] = peer_tcp_addr
+            # Also add to active peers since this is a new discovery via heartbeat
+            self._active_gate_peers.add(peer_tcp_addr)
+        elif self._gate_udp_to_tcp[udp_addr] != peer_tcp_addr:
+            # TCP address changed (rare but possible) - update mapping
+            old_tcp_addr = self._gate_udp_to_tcp[udp_addr]
+            self._active_gate_peers.discard(old_tcp_addr)
+            self._gate_udp_to_tcp[udp_addr] = peer_tcp_addr
+            self._active_gate_peers.add(peer_tcp_addr)
 
         # Update peer discovery service (AD-28)
         self._peer_discovery.add_peer(
@@ -818,10 +836,8 @@ class GateServer(HealthAwareServer):
             overload_state=getattr(heartbeat, 'overload_state', 'healthy'),
         )
 
-        # Get peer TCP address for job leadership tracking
-        peer_tcp_addr = (heartbeat.tcp_host, heartbeat.tcp_port) if heartbeat.tcp_host else source_addr
-
         # Process job leadership claims (Serf-style UDP piggybacking)
+        # peer_tcp_addr was computed earlier for UDP-to-TCP mapping
         self._process_job_leadership_heartbeat(heartbeat, peer_tcp_addr)
 
         # Process per-DC manager tracking for jobs led by this peer
