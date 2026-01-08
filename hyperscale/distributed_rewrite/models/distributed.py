@@ -376,14 +376,22 @@ class GateHeartbeat(Message):
 class ManagerRegistrationResponse(Message):
     """
     Registration acknowledgment from gate to manager.
-    
+
     Contains list of all known healthy gates so manager can
     establish redundant communication channels.
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated negotiated features
     """
     accepted: bool                          # Whether registration was accepted
     gate_id: str                            # Responding gate's node_id
     healthy_gates: list[GateInfo]           # All known healthy gates (including self)
     error: str | None = None                # Error message if not accepted
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""                  # Comma-separated negotiated features
 
 
 @dataclass(slots=True, kw_only=True)
@@ -525,6 +533,10 @@ class ManagerHeartbeat(Message):
     - health_throughput: Current job/workflow throughput
     - health_expected_throughput: Expected throughput based on capacity
     - health_overload_state: Overload state from HybridOverloadDetector
+
+    Protocol Version (AD-25):
+    - protocol_version_major/minor: For version compatibility checks
+    - capabilities: Comma-separated list of supported features
     """
     node_id: str                 # Manager identifier
     datacenter: str              # Datacenter identifier
@@ -558,6 +570,10 @@ class ManagerHeartbeat(Message):
     # Used by gates to distinguish load from failures
     workers_with_extensions: int = 0  # Workers currently with active extensions
     lhm_score: int = 0  # Local Health Multiplier score (0-8, higher = more stressed)
+    # Protocol version fields (AD-25) - defaults for backwards compatibility
+    protocol_version_major: int = 1
+    protocol_version_minor: int = 0
+    capabilities: str = ""       # Comma-separated feature list
 
 
 # =============================================================================

@@ -138,6 +138,14 @@ from hyperscale.distributed_rewrite.datacenters import (
     CorrelationSeverity,
 )
 from hyperscale.distributed_rewrite.env import Env
+from hyperscale.distributed_rewrite.protocol.version import (
+    ProtocolVersion,
+    NodeCapabilities,
+    NegotiatedCapabilities,
+    negotiate_capabilities,
+    CURRENT_PROTOCOL_VERSION,
+    get_features_for_version,
+)
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 
 
@@ -257,6 +265,13 @@ class GateServer(HealthAwareServer):
         self._rate_limiter = ServerRateLimiter(
             inactive_cleanup_seconds=300.0,  # Cleanup after 5 minutes
         )
+
+        # Protocol version negotiation (AD-25)
+        # Our capabilities for negotiation with managers
+        self._node_capabilities = NodeCapabilities.current(node_version=f"gate-{self._node_id.short}")
+        # Negotiated capabilities per manager
+        # Maps manager_addr -> NegotiatedCapabilities
+        self._manager_negotiated_caps: dict[tuple[str, int], NegotiatedCapabilities] = {}
 
         # Versioned state clock for rejecting stale updates
         # Tracks per-datacenter versions using Lamport timestamps
@@ -3251,28 +3266,75 @@ class GateServer(HealthAwareServer):
     ):
         """
         Handle manager registration.
-        
+
         Managers register with gates at startup to discover all healthy gates.
         This is analogous to Workers registering with Managers.
+
+        Protocol Negotiation (AD-25):
+        - Extracts manager's protocol version and capabilities from heartbeat
+        - Performs capability negotiation
+        - Returns negotiated capabilities in response
+        - Rejects registration if protocol versions are incompatible
         """
         try:
             heartbeat = ManagerHeartbeat.load(data)
-            
+
             # Store per-datacenter, per-manager using manager's self-reported address
             dc = heartbeat.datacenter
             manager_addr = (heartbeat.tcp_host, heartbeat.tcp_port)
-            
+
+            # Protocol version negotiation (AD-25)
+            manager_version = ProtocolVersion(
+                major=getattr(heartbeat, 'protocol_version_major', 1),
+                minor=getattr(heartbeat, 'protocol_version_minor', 0),
+            )
+            manager_caps_str = getattr(heartbeat, 'capabilities', '')
+            manager_capabilities = set(manager_caps_str.split(',')) if manager_caps_str else set()
+
+            manager_node_caps = NodeCapabilities(
+                protocol_version=manager_version,
+                capabilities=manager_capabilities,
+                node_version=heartbeat.node_id,
+            )
+
+            # Negotiate capabilities
+            negotiated = negotiate_capabilities(self._node_capabilities, manager_node_caps)
+
+            if not negotiated.compatible:
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerWarning(
+                        message=f"Manager registration rejected: incompatible protocol version "
+                                f"{manager_version} (we are {CURRENT_PROTOCOL_VERSION})",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+                response = ManagerRegistrationResponse(
+                    accepted=False,
+                    gate_id=self._node_id.full,
+                    healthy_gates=[],
+                    error=f"Incompatible protocol version: {manager_version} vs {CURRENT_PROTOCOL_VERSION}",
+                    protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                    protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                )
+                return response.dump()
+
+            # Store negotiated capabilities for this manager
+            self._manager_negotiated_caps[manager_addr] = negotiated
+
             if dc not in self._datacenter_manager_status:
                 self._datacenter_manager_status[dc] = {}
             self._datacenter_manager_status[dc][manager_addr] = heartbeat
             self._manager_last_status[manager_addr] = time.monotonic()
-            
+
             # Add manager address to datacenter managers (if not already tracked)
             if dc not in self._datacenter_managers:
                 self._datacenter_managers[dc] = []
             if manager_addr not in self._datacenter_managers[dc]:
                 self._datacenter_managers[dc].append(manager_addr)
-            
+
             # Update DC registration state (AD-27)
             # Use version as generation proxy - detects restarts via node_id change
             self._record_manager_heartbeat(dc, manager_addr, heartbeat.node_id, heartbeat.version)
@@ -3280,20 +3342,26 @@ class GateServer(HealthAwareServer):
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
-                    message=f"Manager registered: {heartbeat.node_id} from DC {dc} ({heartbeat.worker_count} workers)",
+                    message=f"Manager registered: {heartbeat.node_id} from DC {dc} "
+                            f"({heartbeat.worker_count} workers, protocol {manager_version}, "
+                            f"{len(negotiated.common_features)} features)",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
 
-            # Return ack with all healthy gates
+            # Return ack with all healthy gates and negotiated capabilities
+            negotiated_caps_str = ','.join(sorted(negotiated.common_features))
             response = ManagerRegistrationResponse(
                 accepted=True,
                 gate_id=self._node_id.full,
                 healthy_gates=self._get_healthy_gates(),
+                protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+                protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+                capabilities=negotiated_caps_str,
             )
-            
+
             # Broadcast this manager discovery to peer gates (include status info)
             self._task_runner.run(
                 self._broadcast_manager_discovery,
@@ -3305,7 +3373,7 @@ class GateServer(HealthAwareServer):
                 heartbeat.available_cores,
                 getattr(heartbeat, 'total_cores', 0),
             )
-            
+
             return response.dump()
             
         except Exception as e:

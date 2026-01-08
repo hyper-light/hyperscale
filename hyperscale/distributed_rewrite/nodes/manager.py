@@ -137,8 +137,10 @@ from hyperscale.distributed_rewrite.health import (
 from hyperscale.distributed_rewrite.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
     NodeCapabilities,
+    NegotiatedCapabilities,
     ProtocolVersion,
     negotiate_capabilities,
+    get_features_for_version,
 )
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 from hyperscale.reporting.results import Results
@@ -221,7 +223,11 @@ class ManagerServer(HealthAwareServer):
         self._known_gates: dict[str, GateInfo] = {}  # node_id -> GateInfo
         self._healthy_gate_ids: set[str] = set()  # Currently healthy gate node_ids
         self._primary_gate_id: str | None = None  # Primary gate (prefer leader)
-        
+
+        # Protocol version negotiation with gates (AD-25)
+        # Maps gate_id -> NegotiatedCapabilities
+        self._gate_negotiated_caps: dict[str, NegotiatedCapabilities] = {}
+
         # Circuit breaker for gate communication
         # Tracks failures and implements fail-fast when gates are unreachable
         cb_config = env.get_circuit_breaker_config()
@@ -2332,20 +2338,47 @@ class ManagerServer(HealthAwareServer):
                 result = ManagerRegistrationResponse.load(response)
                 if result.accepted:
                     self._gate_circuit.record_success()
-                    if attempt > 0:
-                        self._task_runner.run(
-                            self._udp_logger.log,
-                            ServerInfo(
-                                message=f"Registered with gate {gate_addr} after {attempt + 1} attempts",
-                                node_host=self._host,
-                                node_port=self._tcp_port,
-                                node_id=self._node_id.short,
-                            )
+
+                    # Store negotiated capabilities (AD-25)
+                    gate_version = ProtocolVersion(
+                        major=getattr(result, 'protocol_version_major', 1),
+                        minor=getattr(result, 'protocol_version_minor', 0),
+                    )
+                    negotiated_caps_str = getattr(result, 'capabilities', '')
+                    negotiated_features = set(negotiated_caps_str.split(',')) if negotiated_caps_str else set()
+
+                    self._gate_negotiated_caps[result.gate_id] = NegotiatedCapabilities(
+                        local_version=CURRENT_PROTOCOL_VERSION,
+                        remote_version=gate_version,
+                        common_features=negotiated_features,
+                        compatible=True,
+                    )
+
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Registered with gate {gate_addr} (protocol {gate_version}, "
+                                    f"{len(negotiated_features)} features)"
+                                    + (f" after {attempt + 1} attempts" if attempt > 0 else ""),
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
                         )
+                    )
                     return result
                 else:
-                    # Gate rejected registration - don't retry
+                    # Gate rejected registration - log error and don't retry
                     self._gate_circuit.record_error()
+                    error_msg = getattr(result, 'error', 'Unknown error')
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerWarning(
+                            message=f"Gate {gate_addr} rejected registration: {error_msg}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
                     return result
                     
             except Exception as e:
@@ -2928,6 +2961,9 @@ class ManagerServer(HealthAwareServer):
                 gate_info.udp_port,
             )
 
+        # Build capabilities string for protocol negotiation (AD-25)
+        capabilities_str = ','.join(sorted(get_features_for_version(CURRENT_PROTOCOL_VERSION)))
+
         return ManagerHeartbeat(
             node_id=self._node_id.full,
             datacenter=self._node_id.datacenter,
@@ -2950,6 +2986,10 @@ class ManagerServer(HealthAwareServer):
             # Extension and LHM tracking for cross-DC correlation (Phase 7)
             workers_with_extensions=self._worker_health_manager.workers_with_active_extensions,
             lhm_score=self._local_health.score,
+            # Protocol version fields (AD-25)
+            protocol_version_major=CURRENT_PROTOCOL_VERSION.major,
+            protocol_version_minor=CURRENT_PROTOCOL_VERSION.minor,
+            capabilities=capabilities_str,
         )
     
     async def _gate_heartbeat_loop(self) -> None:
