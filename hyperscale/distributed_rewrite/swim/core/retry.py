@@ -11,7 +11,7 @@ Provides robust retry logic for distributed systems with:
 import asyncio
 import random
 from dataclasses import dataclass, field
-from typing import TypeVar, Callable, Awaitable, Any
+from typing import TypeVar, Callable, Awaitable, Any, ClassVar
 from enum import Enum, auto
 
 from .errors import SwimError, ErrorCategory, ErrorSeverity, NetworkError
@@ -176,7 +176,7 @@ class RetryResult:
     """
     
     # Maximum errors to store (prevents memory growth during extended retries)
-    MAX_STORED_ERRORS: int = 10
+    MAX_STORED_ERRORS: ClassVar[int] = 10
 
 
 async def retry_with_backoff(

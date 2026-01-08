@@ -93,10 +93,16 @@ class HealthGossipEntry:
         Field separator: '|' (pipe)
         """
         health = self.health
+        # Convert overload_state enum to its string name
+        overload_state_str = (
+            health.overload_state.name
+            if hasattr(health.overload_state, 'name')
+            else str(health.overload_state)
+        )
         parts = [
             health.node_id,
             health.node_type,
-            health.overload_state,
+            overload_state_str,
             "1" if health.accepting_work else "0",
             str(health.capacity),
             f"{health.throughput:.2f}",
