@@ -46,10 +46,10 @@ from hyperscale.distributed_rewrite.server.protocol import (
     parse_address,
     AddressValidationError,
     MAX_MESSAGE_SIZE,
-    MAX_DECOMPRESSED_SIZE,
     frame_message,
     DropCounter,
 )
+from hyperscale.distributed_rewrite.server.protocol.security import MessageSizeError
 from hyperscale.distributed_rewrite.reliability import ServerRateLimiter
 from hyperscale.distributed_rewrite.server.events import LamportClock
 from hyperscale.distributed_rewrite.server.hooks.task import (
@@ -58,6 +58,7 @@ from hyperscale.distributed_rewrite.server.hooks.task import (
 
 from hyperscale.distributed_rewrite.taskex import TaskRunner
 from hyperscale.distributed_rewrite.taskex.run import Run
+from hyperscale.core.jobs.protocols.constants import MAX_DECOMPRESSED_SIZE, MAX_COMPRESSION_RATIO
 from hyperscale.logging import Logger
 from hyperscale.logging.config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerWarning, SilentDropStats
@@ -1024,6 +1025,13 @@ class MercurySyncBaseServer(Generic[T]):
                 max_output_size=MAX_DECOMPRESSED_SIZE,
             )
 
+            # Validate compression ratio to detect compression bombs
+            try:
+                validate_message_size(len(decrypted_data), len(decrypted))
+            except MessageSizeError:
+                self._udp_drop_counter.increment_decompression_too_large()
+                return
+
             # Parse length-prefixed UDP message format:
             # type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
             request_type, addr, handler_name, rest = decrypted.split(b'<', maxsplit=3)
@@ -1076,11 +1084,14 @@ class MercurySyncBaseServer(Generic[T]):
                 decrypted_data,
                 max_output_size=MAX_DECOMPRESSED_SIZE,
             )
-        except Exception as decompression_error:
+            # Validate compression ratio to detect compression bombs
+            validate_message_size(len(decrypted_data), len(decrypted))
+        except (MessageSizeError, Exception) as decompression_error:
             await self._log_security_warning(
                 f"TCP client response decompression failed: {type(decompression_error).__name__}",
                 protocol="tcp",
             )
+            self._tcp_drop_counter.increment_decompression_too_large()
             return
 
         # Parse length-prefixed message format:
@@ -1166,6 +1177,13 @@ class MercurySyncBaseServer(Generic[T]):
                 decrypted_data,
                 max_output_size=MAX_DECOMPRESSED_SIZE,
             )
+
+            # Validate compression ratio to detect compression bombs
+            try:
+                validate_message_size(len(decrypted_data), len(decrypted))
+            except MessageSizeError:
+                self._tcp_drop_counter.increment_decompression_too_large()
+                return
 
             # Parse length-prefixed message format:
             # address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
