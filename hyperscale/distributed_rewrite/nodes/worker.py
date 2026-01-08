@@ -1618,7 +1618,8 @@ class WorkerServer(HealthAwareServer):
                 # Get stats from WorkflowRunner
                 workflow_status_update = await self._remote_manger.get_workflow_update(run_id, workflow_name)
                 if workflow_status_update is None:
-                    return
+                    # No update available yet, keep waiting
+                    continue
 
                 status = CoreWorkflowStatus(workflow_status_update.status)
                 
