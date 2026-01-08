@@ -226,9 +226,10 @@ class GateServer(HealthAwareServer):
         # Track active gate peers (removed when SWIM marks as dead)
         self._active_gate_peers: set[tuple[str, int]] = set(self._gate_peers)
 
-        # Lock protecting _active_gate_peers modifications to prevent race conditions
-        # between concurrent failure/recovery handlers (asyncio task interleaving)
-        self._peer_state_lock = asyncio.Lock()
+        # Per-peer locks protecting _active_gate_peers modifications to prevent race conditions
+        # between concurrent failure/recovery handlers for the SAME peer (asyncio task interleaving)
+        # Using per-peer locks allows concurrent operations on different peers without serialization
+        self._peer_state_locks: dict[tuple[str, int], asyncio.Lock] = {}
 
         # Monotonic epoch per peer address to detect stale failure/recovery operations
         # Incremented on each state change; handlers check epoch hasn't changed after await
@@ -515,6 +516,17 @@ class GateServer(HealthAwareServer):
         if gate_tcp_addr:
             self._task_runner.run(self._handle_gate_peer_recovery, node_addr, gate_tcp_addr)
     
+    def _get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
+        """
+        Get or create a lock for a specific peer address.
+
+        Per-peer locks allow concurrent failure/recovery operations on different peers
+        while ensuring serialization for operations on the same peer.
+        """
+        if peer_addr not in self._peer_state_locks:
+            self._peer_state_locks[peer_addr] = asyncio.Lock()
+        return self._peer_state_locks[peer_addr]
+
     async def _handle_gate_peer_failure(
         self,
         udp_addr: tuple[str, int],
@@ -530,10 +542,11 @@ class GateServer(HealthAwareServer):
         Also handles per-job leadership takeover when the failed gate was leading jobs.
 
         Thread safety:
-        - Uses _peer_state_lock to coordinate with recovery handler
+        - Uses per-peer lock to coordinate with recovery handler for same peer
         - Increments epoch to invalidate any in-flight recovery operations
         """
-        async with self._peer_state_lock:
+        peer_lock = self._get_peer_state_lock(tcp_addr)
+        async with peer_lock:
             # Increment epoch to invalidate any pending recovery operations
             self._peer_state_epoch[tcp_addr] = self._peer_state_epoch.get(tcp_addr, 0) + 1
 
@@ -595,10 +608,12 @@ class GateServer(HealthAwareServer):
 
         Thread safety:
         - Uses epoch checking to detect if failure handler ran during our jitter
-        - Uses _peer_state_lock to coordinate state changes
+        - Uses per-peer lock to coordinate state changes for same peer
         """
+        peer_lock = self._get_peer_state_lock(tcp_addr)
+
         # Capture epoch BEFORE any await points
-        async with self._peer_state_lock:
+        async with peer_lock:
             initial_epoch = self._peer_state_epoch.get(tcp_addr, 0)
 
         # Limit concurrent recovery operations to prevent thundering herd
@@ -613,7 +628,7 @@ class GateServer(HealthAwareServer):
                 await asyncio.sleep(jitter)
 
             # After jitter, check if peer was marked dead during our sleep
-            async with self._peer_state_lock:
+            async with peer_lock:
                 current_epoch = self._peer_state_epoch.get(tcp_addr, 0)
                 if current_epoch != initial_epoch:
                     # Epoch changed - a failure was detected during our jitter
