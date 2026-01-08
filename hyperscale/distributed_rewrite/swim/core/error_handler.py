@@ -89,10 +89,26 @@ class ErrorStats:
                 self._circuit_opened_at = now
     
     def record_success(self) -> None:
-        """Record a successful operation (for half-open state)."""
+        """
+        Record a successful operation.
+
+        In HALF_OPEN state: Closes the circuit and clears error history.
+        In OPEN state: No effect (must wait for half_open_after timeout first).
+        In CLOSED state: Prunes old timestamps, helping prevent false opens.
+
+        IMPORTANT: When closing from HALF_OPEN, we clear the timestamps deque.
+        Without this, the circuit would immediately re-open on the next error
+        because old errors would still be counted in the window.
+        """
         if self._circuit_state == CircuitState.HALF_OPEN:
             self._circuit_state = CircuitState.CLOSED
             self._circuit_opened_at = None
+            # CRITICAL: Clear error history to allow real recovery
+            # Without this, circuit immediately re-opens on next error
+            self._timestamps.clear()
+        elif self._circuit_state == CircuitState.CLOSED:
+            # Prune old entries to keep window current
+            self._prune_old_entries(time.monotonic())
     
     def _prune_old_entries(self, now: float) -> None:
         """Remove entries outside the window."""
@@ -289,9 +305,15 @@ class ErrorHandler:
     ) -> None:
         """
         Wrap and handle a raw exception.
-        
+
         Converts standard exceptions to SwimError types.
+        System-level exceptions (KeyboardInterrupt, SystemExit, GeneratorExit)
+        are re-raised immediately without processing.
         """
+        # System-level exceptions must be re-raised immediately
+        # These signal process termination and should never be suppressed
+        if isinstance(exception, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise exception
 
         # Convert known exceptions to SwimError types
         if isinstance(exception, SwimError):
@@ -308,6 +330,17 @@ class ErrorHandler:
             await self.handle(
                 NetworkError(
                     f"Connection error during {operation}",
+                    cause=exception,
+                    operation=operation,
+                )
+            )
+        elif isinstance(exception, OSError):
+            # OSError is the base class for many network errors:
+            # ConnectionRefusedError, BrokenPipeError, etc.
+            # Treat as TRANSIENT since network conditions can change
+            await self.handle(
+                NetworkError(
+                    f"OS/socket error during {operation}: {exception}",
                     cause=exception,
                     operation=operation,
                 )
@@ -469,29 +502,42 @@ class ErrorHandler:
                     pass  # Logging is best-effort
     
     async def _update_lhm(self, error: SwimError) -> None:
-        """Update Local Health Multiplier based on error."""
+        """
+        Update Local Health Multiplier based on error.
+
+        IMPORTANT: This is intentionally conservative to avoid double-counting.
+        Most LHM updates happen via direct calls to increase_failure_detector()
+        at the point of the event (e.g., probe timeout, refutation needed).
+
+        The error handler only updates LHM for:
+        - FATAL errors (always serious)
+        - RESOURCE errors (indicate local node is struggling)
+
+        We explicitly DO NOT update LHM here for:
+        - NETWORK errors: Already handled by direct calls in probe logic
+        - PROTOCOL errors: Usually indicate remote issues, not local health
+        - ELECTION errors: Handled by election logic directly
+        - TRANSIENT errors: Expected behavior, not health issues
+        """
         if not self.increment_lhm:
             return
-        
-        # Map error types to LHM event types
+
+        # Only update LHM for errors that clearly indicate LOCAL node issues
         event_type: str | None = None
-        
-        if error.category == ErrorCategory.NETWORK:
-            if error.severity == ErrorSeverity.TRANSIENT:
-                event_type = 'probe_timeout'
-            else:
-                event_type = 'network_error'
-        
+
+        if error.severity == ErrorSeverity.FATAL:
+            # Fatal errors always affect health significantly
+            event_type = 'event_loop_critical'
+
         elif error.category == ErrorCategory.RESOURCE:
-            event_type = 'resource_pressure'
-        
-        elif error.category == ErrorCategory.ELECTION:
-            if 'split_brain' in error.message.lower():
-                event_type = 'refutation'
-        
-        elif error.severity == ErrorSeverity.FATAL:
-            event_type = 'fatal_error'
-        
+            # Resource exhaustion is a clear signal of local problems
+            event_type = 'event_loop_lag'
+
+        # Note: We intentionally skip NETWORK, PROTOCOL, ELECTION, and TRANSIENT
+        # errors here. They are either:
+        # 1. Already handled by direct increase_failure_detector() calls
+        # 2. Indicate remote node issues rather than local health problems
+
         if event_type:
             try:
                 await self.increment_lhm(event_type)
@@ -550,6 +596,10 @@ class ErrorContext:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
         if exc_val is not None:
+            # System-level exceptions must NEVER be suppressed
+            if isinstance(exc_val, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                return False  # Always propagate
+
             # CancelledError is not an error - it's a normal signal for task cancellation
             # Log at debug level for visibility but don't treat as error or update metrics
             if isinstance(exc_val, asyncio.CancelledError):

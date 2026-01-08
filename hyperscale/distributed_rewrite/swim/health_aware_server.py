@@ -396,7 +396,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     async def _on_event_loop_critical(self, lag_ratio: float) -> None:
         """Called when event loop is critically overloaded."""
-        # More aggressive LHM increment
+        # More aggressive LHM increment: +2 total for critical (vs +1 for lag)
+        # This helps the node back off faster when severely overloaded
         await self.increase_failure_detector('event_loop_critical')
         await self.increase_failure_detector('event_loop_critical')
         

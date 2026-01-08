@@ -34,7 +34,7 @@ class LocalHealthMultiplier:
     REFUTATION_PENALTY: int = 1  # Paper: "Refuting a suspect message about self: +1"
     MISSED_NACK_PENALTY: int = 1
     EVENT_LOOP_LAG_PENALTY: int = 1
-    EVENT_LOOP_CRITICAL_PENALTY: int = 2
+    EVENT_LOOP_CRITICAL_PENALTY: int = 1  # Per Lifeguard paper: all penalties are +1
     SUCCESSFUL_PROBE_REWARD: int = 1
     SUCCESSFUL_NACK_REWARD: int = 1
     EVENT_LOOP_RECOVERED_REWARD: int = 1
