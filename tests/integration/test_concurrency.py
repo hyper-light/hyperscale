@@ -774,8 +774,8 @@ class TestExtensionTrackerConcurrency:
 
         async def request_extension(progress: float):
             nonlocal granted_count
-            # request_extension returns (granted, extension_seconds, denial_reason)
-            granted, _extension_seconds, _denial_reason = tracker.request_extension(
+            # request_extension returns (granted, extension_seconds, denial_reason, is_warning)
+            granted, _extension_seconds, _denial_reason, _is_warning = tracker.request_extension(
                 reason="test",
                 current_progress=progress,
             )

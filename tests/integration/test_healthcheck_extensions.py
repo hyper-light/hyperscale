@@ -51,7 +51,7 @@ class TestExtensionTracker:
             base_deadline=30.0,
         )
 
-        granted, seconds, reason = tracker.request_extension(
+        granted, seconds, reason, _ = tracker.request_extension(
             reason="busy with workflow",
             current_progress=1.0,
         )
@@ -70,27 +70,27 @@ class TestExtensionTracker:
         )
 
         # First extension: 32/2 = 16
-        granted, seconds, _ = tracker.request_extension("busy", 1.0)
+        granted, seconds, _, _ = tracker.request_extension("busy", 1.0)
         assert granted is True
         assert seconds == 16.0
 
         # Second extension: 32/4 = 8
-        granted, seconds, _ = tracker.request_extension("busy", 2.0)
+        granted, seconds, _, _ = tracker.request_extension("busy", 2.0)
         assert granted is True
         assert seconds == 8.0
 
         # Third extension: 32/8 = 4
-        granted, seconds, _ = tracker.request_extension("busy", 3.0)
+        granted, seconds, _, _ = tracker.request_extension("busy", 3.0)
         assert granted is True
         assert seconds == 4.0
 
         # Fourth extension: 32/16 = 2
-        granted, seconds, _ = tracker.request_extension("busy", 4.0)
+        granted, seconds, _, _ = tracker.request_extension("busy", 4.0)
         assert granted is True
         assert seconds == 2.0
 
         # Fifth extension: 32/32 = 1 (min_grant)
-        granted, seconds, _ = tracker.request_extension("busy", 5.0)
+        granted, seconds, _, _ = tracker.request_extension("busy", 5.0)
         assert granted is True
         assert seconds == 1.0
 
@@ -105,7 +105,7 @@ class TestExtensionTracker:
 
         # Request multiple extensions
         for i in range(5):
-            granted, seconds, _ = tracker.request_extension(
+            granted, seconds, _, _ = tracker.request_extension(
                 reason="busy",
                 current_progress=float(i + 1),
             )
@@ -117,21 +117,21 @@ class TestExtensionTracker:
         tracker = ExtensionTracker(worker_id="worker-1")
 
         # First extension succeeds (no prior progress to compare)
-        granted, _, _ = tracker.request_extension("busy", 1.0)
+        granted, _, _, _ = tracker.request_extension("busy", 1.0)
         assert granted is True
 
         # Same progress - should be denied
-        granted, _, reason = tracker.request_extension("busy", 1.0)
+        granted, _, reason, _ = tracker.request_extension("busy", 1.0)
         assert granted is False
         assert "No progress" in reason
 
         # Lower progress - should be denied
-        granted, _, reason = tracker.request_extension("busy", 0.5)
+        granted, _, reason, _ = tracker.request_extension("busy", 0.5)
         assert granted is False
         assert "No progress" in reason
 
         # Higher progress - should be granted
-        granted, _, _ = tracker.request_extension("busy", 2.0)
+        granted, _, _, _ = tracker.request_extension("busy", 2.0)
         assert granted is True
 
     def test_max_extensions_enforced(self):
@@ -143,13 +143,13 @@ class TestExtensionTracker:
 
         # Use up all extensions
         for i in range(3):
-            granted, _, _ = tracker.request_extension("busy", float(i + 1))
+            granted, _, _, _ = tracker.request_extension("busy", float(i + 1))
             assert granted is True
 
         assert tracker.is_exhausted is True
 
         # Next request should be denied
-        granted, _, reason = tracker.request_extension("busy", 4.0)
+        granted, _, reason, _ = tracker.request_extension("busy", 4.0)
         assert granted is False
         assert "exceeded" in reason.lower()
 
@@ -423,7 +423,7 @@ class TestExtensionScenarios:
         # Simulate 5 extension requests with increasing progress
         extensions_granted = []
         for i in range(5):
-            granted, seconds, _ = tracker.request_extension(
+            granted, seconds, _, _ = tracker.request_extension(
                 reason=f"step {i + 1} of 5",
                 current_progress=float(i + 1) * 20,  # 20, 40, 60, 80, 100
             )
@@ -524,3 +524,485 @@ class TestExtensionScenarios:
 
         state = manager.get_worker_extension_state("worker-1")
         assert state["extension_count"] == 5
+
+
+class TestGracefulExhaustion:
+    """Test the graceful exhaustion feature for deadline extensions.
+
+    The graceful exhaustion feature ensures workers have time to checkpoint
+    and save state before being forcefully evicted. Key behaviors:
+
+    1. Warning threshold: When remaining extensions hit warning_threshold,
+       is_warning=True is returned so the worker can prepare for exhaustion.
+
+    2. Grace period: After exhaustion, the worker has grace_period seconds
+       to complete any final operations before being marked for eviction.
+
+    3. Eviction: Only after both exhaustion AND grace_period expiry does
+       should_evict return True.
+    """
+
+    def test_is_warning_triggers_at_warning_threshold(self):
+        """is_warning should be True when remaining extensions hit warning_threshold."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=3,
+            warning_threshold=1,  # Warn when 1 extension remains
+        )
+
+        # First extension: 2 remaining - no warning
+        granted, _, _, is_warning = tracker.request_extension("busy", 1.0)
+        assert granted is True
+        assert is_warning is False
+        assert tracker.get_remaining_extensions() == 2
+
+        # Second extension: 1 remaining - WARNING
+        granted, _, _, is_warning = tracker.request_extension("busy", 2.0)
+        assert granted is True
+        assert is_warning is True
+        assert tracker.get_remaining_extensions() == 1
+
+        # Third extension: 0 remaining - no warning (already sent)
+        granted, _, _, is_warning = tracker.request_extension("busy", 3.0)
+        assert granted is True
+        assert is_warning is False  # Warning already sent
+        assert tracker.get_remaining_extensions() == 0
+
+    def test_is_warning_only_sent_once(self):
+        """is_warning should only be True once per cycle."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=5,
+            warning_threshold=2,  # Warn when 2 extensions remain
+        )
+
+        warnings_received = []
+        for i in range(5):
+            granted, _, _, is_warning = tracker.request_extension("busy", float(i + 1))
+            assert granted is True
+            warnings_received.append(is_warning)
+
+        # Only one warning should have been sent
+        assert warnings_received.count(True) == 1
+        # Warning should be at the 3rd request (when remaining == 2)
+        assert warnings_received[2] is True
+
+    def test_warning_sent_flag_reset_on_reset(self):
+        """warning_sent should be cleared when tracker is reset."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=2,
+            warning_threshold=1,
+        )
+
+        # First extension
+        tracker.request_extension("busy", 1.0)
+
+        # Second extension triggers warning
+        _, _, _, is_warning = tracker.request_extension("busy", 2.0)
+        assert is_warning is True
+        assert tracker.warning_sent is True
+
+        # Reset tracker
+        tracker.reset()
+        assert tracker.warning_sent is False
+
+        # New cycle - warning should be sent again at threshold
+        tracker.request_extension("busy", 1.0)
+        _, _, _, is_warning = tracker.request_extension("busy", 2.0)
+        assert is_warning is True
+
+    def test_exhaustion_time_set_on_first_denial_after_max(self):
+        """exhaustion_time should be set when first request is denied after max."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=2,
+            grace_period=10.0,
+        )
+
+        # Use up all extensions
+        tracker.request_extension("busy", 1.0)
+        tracker.request_extension("busy", 2.0)
+        assert tracker.is_exhausted is True
+        assert tracker.exhaustion_time is None  # Not set yet
+
+        # First denial sets exhaustion_time
+        granted, _, _, _ = tracker.request_extension("busy", 3.0)
+        assert granted is False
+        assert tracker.exhaustion_time is not None
+
+        # Remember the exhaustion time
+        exhaustion_time = tracker.exhaustion_time
+
+        # Subsequent denials don't change exhaustion_time
+        tracker.request_extension("busy", 4.0)
+        assert tracker.exhaustion_time == exhaustion_time
+
+    def test_is_in_grace_period_after_exhaustion(self):
+        """is_in_grace_period should be True after exhaustion until grace_period expires."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=1,
+            grace_period=1.0,  # 1 second grace period for fast test
+        )
+
+        # Use up extension
+        tracker.request_extension("busy", 1.0)
+        assert tracker.is_exhausted is True
+        assert tracker.is_in_grace_period is False  # Not yet
+
+        # Trigger exhaustion_time by requesting when exhausted
+        tracker.request_extension("busy", 2.0)
+        assert tracker.is_in_grace_period is True
+        assert tracker.grace_period_remaining > 0
+
+    def test_grace_period_remaining_decreases(self):
+        """grace_period_remaining should decrease over time."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=1,
+            grace_period=5.0,
+        )
+
+        # Exhaust and trigger grace period
+        tracker.request_extension("busy", 1.0)
+        tracker.request_extension("busy", 2.0)
+
+        initial_remaining = tracker.grace_period_remaining
+        assert initial_remaining > 0
+        assert initial_remaining <= 5.0
+
+        # Sleep briefly and check remaining decreases
+        time.sleep(0.1)
+        later_remaining = tracker.grace_period_remaining
+        assert later_remaining < initial_remaining
+
+    def test_should_evict_false_during_grace_period(self):
+        """should_evict should be False while in grace period."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=1,
+            grace_period=5.0,  # Long grace period
+        )
+
+        # Exhaust and trigger grace period
+        tracker.request_extension("busy", 1.0)
+        tracker.request_extension("busy", 2.0)
+
+        assert tracker.is_exhausted is True
+        assert tracker.is_in_grace_period is True
+        assert tracker.should_evict is False
+
+    def test_should_evict_true_after_grace_period_expires(self):
+        """should_evict should be True after grace period expires."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=1,
+            grace_period=0.0,  # Immediate expiry
+        )
+
+        # Exhaust and trigger grace period
+        tracker.request_extension("busy", 1.0)
+        tracker.request_extension("busy", 2.0)
+
+        assert tracker.is_exhausted is True
+        assert tracker.should_evict is True  # Grace period already expired
+
+    def test_exhaustion_time_reset_clears(self):
+        """reset should clear exhaustion_time and grace period state."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=1,
+            grace_period=5.0,
+        )
+
+        # Exhaust and trigger grace period
+        tracker.request_extension("busy", 1.0)
+        tracker.request_extension("busy", 2.0)
+
+        assert tracker.exhaustion_time is not None
+        assert tracker.is_in_grace_period is True
+
+        # Reset
+        tracker.reset()
+
+        assert tracker.exhaustion_time is None
+        assert tracker.is_in_grace_period is False
+        assert tracker.grace_period_remaining == 0.0
+        assert tracker.should_evict is False
+
+
+class TestGracefulExhaustionWithManager:
+    """Test graceful exhaustion through the WorkerHealthManager interface."""
+
+    def test_manager_response_includes_warning_flag(self):
+        """handle_extension_request response should include is_exhaustion_warning."""
+        manager = WorkerHealthManager(
+            WorkerHealthManagerConfig(
+                max_extensions=2,
+                warning_threshold=1,
+            )
+        )
+        deadline = time.monotonic() + 30.0
+
+        # First request - no warning
+        request1 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="busy",
+            current_progress=1.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        response1 = manager.handle_extension_request(request1, deadline)
+        assert response1.granted is True
+        assert response1.is_exhaustion_warning is False
+
+        # Second request - WARNING (1 remaining hits threshold)
+        request2 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="busy",
+            current_progress=2.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        response2 = manager.handle_extension_request(request2, deadline)
+        assert response2.granted is True
+        assert response2.is_exhaustion_warning is True
+
+    def test_manager_response_includes_grace_period_info(self):
+        """handle_extension_request denial should include grace period info."""
+        manager = WorkerHealthManager(
+            WorkerHealthManagerConfig(
+                max_extensions=1,
+                grace_period=10.0,
+            )
+        )
+        deadline = time.monotonic() + 30.0
+
+        # Use up extensions
+        request1 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="busy",
+            current_progress=1.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(request1, deadline)
+
+        # Denied request - triggers grace period
+        request2 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="still busy",
+            current_progress=2.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        response2 = manager.handle_extension_request(request2, deadline)
+
+        assert response2.granted is False
+        assert response2.in_grace_period is True
+        assert response2.grace_period_remaining > 0
+
+    def test_manager_should_evict_respects_grace_period(self):
+        """should_evict_worker should respect grace period."""
+        manager = WorkerHealthManager(
+            WorkerHealthManagerConfig(
+                max_extensions=1,
+                grace_period=5.0,  # Long grace period
+            )
+        )
+        deadline = time.monotonic() + 30.0
+
+        # Use up extensions
+        request1 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="busy",
+            current_progress=1.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(request1, deadline)
+
+        # Trigger exhaustion
+        request2 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="still busy",
+            current_progress=2.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(request2, deadline)
+
+        # Should NOT evict during grace period
+        should_evict, reason = manager.should_evict_worker("worker-1")
+        assert should_evict is False
+        assert reason is None
+
+    def test_manager_should_evict_after_grace_period_expires(self):
+        """should_evict_worker should return True after grace period expires."""
+        manager = WorkerHealthManager(
+            WorkerHealthManagerConfig(
+                max_extensions=1,
+                grace_period=0.0,  # Immediate expiry
+            )
+        )
+        deadline = time.monotonic() + 30.0
+
+        # Use up extensions
+        request1 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="busy",
+            current_progress=1.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(request1, deadline)
+
+        # Trigger exhaustion
+        request2 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="still busy",
+            current_progress=2.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(request2, deadline)
+
+        # Should evict - grace period already expired
+        should_evict, reason = manager.should_evict_worker("worker-1")
+        assert should_evict is True
+        assert "exhausted all 1 extensions" in reason
+        assert "0.0s grace period" in reason
+
+    def test_manager_state_includes_grace_period_info(self):
+        """get_worker_extension_state should include grace period info."""
+        manager = WorkerHealthManager(
+            WorkerHealthManagerConfig(
+                max_extensions=1,
+                grace_period=10.0,
+            )
+        )
+        deadline = time.monotonic() + 30.0
+
+        # Use up extensions
+        request1 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="busy",
+            current_progress=1.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(request1, deadline)
+
+        # Trigger exhaustion
+        request2 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="still busy",
+            current_progress=2.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(request2, deadline)
+
+        state = manager.get_worker_extension_state("worker-1")
+
+        assert state["is_exhausted"] is True
+        assert state["in_grace_period"] is True
+        assert state["grace_period_remaining"] > 0
+        assert state["should_evict"] is False
+        assert state["warning_sent"] is True
+
+    def test_manager_healthy_resets_grace_period(self):
+        """on_worker_healthy should reset grace period state."""
+        manager = WorkerHealthManager(
+            WorkerHealthManagerConfig(
+                max_extensions=1,
+                grace_period=10.0,
+            )
+        )
+        deadline = time.monotonic() + 30.0
+
+        # Use up extensions and trigger exhaustion
+        request1 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="busy",
+            current_progress=1.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(request1, deadline)
+
+        request2 = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="still busy",
+            current_progress=2.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(request2, deadline)
+
+        state_before = manager.get_worker_extension_state("worker-1")
+        assert state_before["is_exhausted"] is True
+        assert state_before["in_grace_period"] is True
+
+        # Worker becomes healthy
+        manager.on_worker_healthy("worker-1")
+
+        state_after = manager.get_worker_extension_state("worker-1")
+        assert state_after["is_exhausted"] is False
+        assert state_after["in_grace_period"] is False
+        assert state_after["grace_period_remaining"] == 0.0
+        assert state_after["warning_sent"] is False
+
+
+class TestWarningThresholdConfigurations:
+    """Test different warning_threshold configurations."""
+
+    def test_warning_threshold_zero_never_warns(self):
+        """warning_threshold=0 should never trigger warning."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=5,
+            warning_threshold=0,
+        )
+
+        warnings = []
+        for i in range(5):
+            granted, _, _, is_warning = tracker.request_extension("busy", float(i + 1))
+            assert granted is True
+            warnings.append(is_warning)
+
+        # No warnings should have been sent
+        assert all(w is False for w in warnings)
+
+    def test_warning_threshold_equals_max_extensions(self):
+        """warning_threshold=max_extensions should warn on first request."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=3,
+            warning_threshold=3,  # Warn immediately
+        )
+
+        # First request should trigger warning (3 remaining == 3 threshold)
+        granted, _, _, is_warning = tracker.request_extension("busy", 1.0)
+        assert granted is True
+        assert is_warning is True
+
+    def test_warning_threshold_larger_than_max_warns_all(self):
+        """warning_threshold > max_extensions should warn on first request only."""
+        tracker = ExtensionTracker(
+            worker_id="worker-1",
+            max_extensions=3,
+            warning_threshold=10,  # Much larger than max
+        )
+
+        warnings = []
+        for i in range(3):
+            granted, _, _, is_warning = tracker.request_extension("busy", float(i + 1))
+            assert granted is True
+            warnings.append(is_warning)
+
+        # Only first should warn (warning_sent prevents subsequent warnings)
+        assert warnings[0] is True
+        assert warnings[1] is False
+        assert warnings[2] is False

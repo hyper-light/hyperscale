@@ -259,14 +259,14 @@ class TestResourceExhaustion:
 
         # Exhaust all extensions with increasing progress
         for i in range(3):
-            granted, _, _ = tracker.request_extension(
+            granted, _, _, _ = tracker.request_extension(
                 reason="busy",
                 current_progress=float(i + 1) * 10.0,
             )
             assert granted is True
 
         # Further requests denied
-        granted, _, reason = tracker.request_extension(
+        granted, _, reason, _ = tracker.request_extension(
             reason="still busy",
             current_progress=40.0,
         )
@@ -477,14 +477,14 @@ class TestStateCorruptionRecovery:
         )
 
         # First extension with progress 50
-        granted, _, _ = tracker.request_extension(
+        granted, _, _, _ = tracker.request_extension(
             reason="busy",
             current_progress=50.0,
         )
         assert granted is True
 
         # Second extension with LOWER progress (regression)
-        granted, _, reason = tracker.request_extension(
+        granted, _, reason, _ = tracker.request_extension(
             reason="still busy",
             current_progress=30.0,  # Less than 50
         )
@@ -508,7 +508,7 @@ class TestStateCorruptionRecovery:
 
         # Should be usable again
         assert tracker.is_exhausted is False
-        granted, _, _ = tracker.request_extension(
+        granted, _, _, _ = tracker.request_extension(
             reason="new cycle",
             current_progress=5.0,
         )
@@ -520,6 +520,7 @@ class TestStateCorruptionRecovery:
             WorkerHealthManagerConfig(
                 max_extensions=2,
                 eviction_threshold=3,
+                grace_period=0.0,  # Immediate eviction after exhaustion
             )
         )
 
@@ -538,6 +539,16 @@ class TestStateCorruptionRecovery:
                 active_workflow_count=1,
             )
             manager.handle_extension_request(request, time.time() + 30)
+
+        # Make one more request to trigger exhaustion_time to be set
+        final_request = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="exhausted",
+            current_progress=30.0,
+            estimated_completion=30.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(final_request, time.time() + 30)
 
         # Check eviction state
         should_evict, _ = manager.should_evict_worker("worker-1")
@@ -873,7 +884,7 @@ class TestNumericOverflowBoundary:
         expected_grants = [16.0, 8.0, 4.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
         for i, expected in enumerate(expected_grants):
-            granted, actual_grant, _ = tracker.request_extension(
+            granted, actual_grant, _, _ = tracker.request_extension(
                 reason="busy",
                 current_progress=float((i + 1) * 10),
             )
@@ -1331,7 +1342,7 @@ class TestClockSkewTimeBased:
         )
 
         # Request extension
-        granted, extension_seconds, _ = tracker.request_extension(
+        granted, extension_seconds, _, _ = tracker.request_extension(
             reason="busy",
             current_progress=10.0,
         )
@@ -1457,7 +1468,7 @@ class TestDataStructureInvariants:
 
         total_granted = 0.0
         for i in range(6):
-            granted, amount, _ = tracker.request_extension(
+            granted, amount, _, _ = tracker.request_extension(
                 reason="busy",
                 current_progress=float((i + 1) * 10),
             )
@@ -1905,10 +1916,10 @@ class TestDeadlineTimeoutInteractions:
 
         current_deadline = 1000.0  # Arbitrary
 
-        _, grant1, _ = tracker.request_extension("r1", current_progress=10.0)
+        _, grant1, _, _ = tracker.request_extension("r1", current_progress=10.0)
         deadline1 = tracker.get_new_deadline(current_deadline, grant1)
 
-        _, grant2, _ = tracker.request_extension("r2", current_progress=20.0)
+        _, grant2, _, _ = tracker.request_extension("r2", current_progress=20.0)
         deadline2 = tracker.get_new_deadline(deadline1, grant2)
 
         # Each extension should add to the deadline
@@ -1935,7 +1946,7 @@ class TestErrorMessageQuality:
         tracker.request_extension("r1", current_progress=10.0)
 
         # Next should be denied with clear reason
-        _, _, reason = tracker.request_extension("r2", current_progress=20.0)
+        _, _, reason, _ = tracker.request_extension("r2", current_progress=20.0)
 
         assert reason is not None
         assert "maximum" in reason.lower() or "exceeded" in reason.lower()
@@ -1948,7 +1959,7 @@ class TestErrorMessageQuality:
         )
 
         tracker.request_extension("r1", current_progress=50.0)
-        _, _, reason = tracker.request_extension("r2", current_progress=30.0)
+        _, _, reason, _ = tracker.request_extension("r2", current_progress=30.0)
 
         assert reason is not None
         assert "30" in reason or "50" in reason  # Should mention the values
@@ -1977,7 +1988,7 @@ class TestErrorMessageQuality:
     def test_worker_eviction_reason_descriptive(self):
         """Test worker eviction reason is descriptive."""
         manager = WorkerHealthManager(
-            WorkerHealthManagerConfig(max_extensions=2, eviction_threshold=1)
+            WorkerHealthManagerConfig(max_extensions=2, eviction_threshold=1, grace_period=0.0)
         )
 
         from hyperscale.distributed_rewrite.models import HealthcheckExtensionRequest
@@ -1992,6 +2003,16 @@ class TestErrorMessageQuality:
                 active_workflow_count=1,
             )
             manager.handle_extension_request(request, time.time() + 30)
+
+        # Make one more request to trigger exhaustion_time to be set
+        final_request = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="exhausted",
+            current_progress=30.0,
+            estimated_completion=30.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(final_request, time.time() + 30)
 
         should_evict, reason = manager.should_evict_worker("worker-1")
 
@@ -2179,15 +2200,15 @@ class TestPriorityStateTransitionEdges:
         )
 
         # Zero progress initially allowed
-        granted, _, _ = tracker.request_extension("r1", current_progress=0.0)
+        granted, _, _, _ = tracker.request_extension("r1", current_progress=0.0)
         assert granted is True
 
         # Same progress should be denied (no improvement)
-        granted, _, _ = tracker.request_extension("r2", current_progress=0.0)
+        granted, _, _, _ = tracker.request_extension("r2", current_progress=0.0)
         assert granted is False
 
         # Tiny improvement should work
-        granted, _, _ = tracker.request_extension("r3", current_progress=0.0001)
+        granted, _, _, _ = tracker.request_extension("r3", current_progress=0.0001)
         assert granted is True
 
 
@@ -2401,7 +2422,7 @@ class TestGracefulDegradation:
         # Exhaust with increasing progress
         grants = []
         for i in range(5):
-            granted, amount, reason = tracker.request_extension(
+            granted, amount, reason, _ = tracker.request_extension(
                 reason="busy",
                 current_progress=float((i + 1) * 10),
             )

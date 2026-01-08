@@ -48,7 +48,7 @@ class TestLogarithmicDecay:
             max_extensions=5,
         )
 
-        granted, extension_seconds, denial_reason = tracker.request_extension(
+        granted, extension_seconds, denial_reason, _ = tracker.request_extension(
             reason="long workflow",
             current_progress=1.0,
         )
@@ -70,7 +70,7 @@ class TestLogarithmicDecay:
         tracker.request_extension(reason="first", current_progress=1.0)
 
         # Second extension
-        granted, extension_seconds, _ = tracker.request_extension(
+        granted, extension_seconds, _, _ = tracker.request_extension(
             reason="second",
             current_progress=2.0,  # Must show progress
         )
@@ -97,7 +97,7 @@ class TestLogarithmicDecay:
         ]
 
         for index, expected in enumerate(expected_grants):
-            granted, extension_seconds, _ = tracker.request_extension(
+            granted, extension_seconds, _, _ = tracker.request_extension(
                 reason=f"extension {index + 1}",
                 current_progress=float(index + 1),
             )
@@ -114,15 +114,15 @@ class TestLogarithmicDecay:
         )
 
         # First: 4/2 = 2.0
-        _, grant_1, _ = tracker.request_extension(reason="1", current_progress=1.0)
+        _, grant_1, _, _ = tracker.request_extension(reason="1", current_progress=1.0)
         assert grant_1 == 2.0
 
         # Second: 4/4 = 1.0, but min_grant is 2.0
-        _, grant_2, _ = tracker.request_extension(reason="2", current_progress=2.0)
+        _, grant_2, _, _ = tracker.request_extension(reason="2", current_progress=2.0)
         assert grant_2 == 2.0  # Floored to min_grant
 
         # Third: 4/8 = 0.5, but min_grant is 2.0
-        _, grant_3, _ = tracker.request_extension(reason="3", current_progress=3.0)
+        _, grant_3, _, _ = tracker.request_extension(reason="3", current_progress=3.0)
         assert grant_3 == 2.0  # Floored to min_grant
 
     def test_very_small_base_deadline(self):
@@ -135,7 +135,7 @@ class TestLogarithmicDecay:
         )
 
         # 0.5 / 2 = 0.25, but min_grant is 1.0
-        granted, extension_seconds, _ = tracker.request_extension(
+        granted, extension_seconds, _, _ = tracker.request_extension(
             reason="small deadline",
             current_progress=1.0,
         )
@@ -153,7 +153,7 @@ class TestLogarithmicDecay:
         )
 
         expected = 1800.0  # 3600 / 2
-        granted, extension_seconds, _ = tracker.request_extension(
+        granted, extension_seconds, _, _ = tracker.request_extension(
             reason="very long workflow",
             current_progress=1.0,
         )
@@ -180,7 +180,7 @@ class TestProgressRequirements:
         )
 
         # First extension with progress=0 should work
-        granted, _, _ = tracker.request_extension(
+        granted, _, _, _ = tracker.request_extension(
             reason="starting work",
             current_progress=0.0,
         )
@@ -200,7 +200,7 @@ class TestProgressRequirements:
         tracker.request_extension(reason="first", current_progress=5.0)
 
         # Second extension with same progress - should be denied
-        granted, extension_seconds, denial_reason = tracker.request_extension(
+        granted, extension_seconds, denial_reason, _ = tracker.request_extension(
             reason="second",
             current_progress=5.0,  # No progress
         )
@@ -221,7 +221,7 @@ class TestProgressRequirements:
         tracker.request_extension(reason="first", current_progress=10.0)
 
         # Equal progress - denied
-        granted, _, denial_reason = tracker.request_extension(
+        granted, _, denial_reason, _ = tracker.request_extension(
             reason="no change",
             current_progress=10.0,
         )
@@ -240,7 +240,7 @@ class TestProgressRequirements:
         tracker.request_extension(reason="first", current_progress=10.0)
 
         # Decreased progress - denied
-        granted, _, denial_reason = tracker.request_extension(
+        granted, _, denial_reason, _ = tracker.request_extension(
             reason="went backwards",
             current_progress=5.0,  # Less than 10.0
         )
@@ -262,7 +262,7 @@ class TestProgressRequirements:
         tracker.request_extension(reason="first", current_progress=100.0)
 
         # Tiny increment
-        granted, _, _ = tracker.request_extension(
+        granted, _, _, _ = tracker.request_extension(
             reason="tiny progress",
             current_progress=100.0001,
         )
@@ -278,7 +278,7 @@ class TestProgressRequirements:
             max_extensions=5,
         )
 
-        granted, _, _ = tracker.request_extension(
+        granted, _, _, _ = tracker.request_extension(
             reason="negative start",
             current_progress=-100.0,
         )
@@ -297,7 +297,7 @@ class TestProgressRequirements:
         tracker.request_extension(reason="first", current_progress=-100.0)
 
         # -50 > -100, so this is progress
-        granted, _, _ = tracker.request_extension(
+        granted, _, _, _ = tracker.request_extension(
             reason="less negative",
             current_progress=-50.0,
         )
@@ -324,14 +324,14 @@ class TestMaximumExtensionLimits:
 
         # Use all 3 extensions
         for index in range(3):
-            granted, _, _ = tracker.request_extension(
+            granted, _, _, _ = tracker.request_extension(
                 reason=f"extension {index + 1}",
                 current_progress=float(index + 1),
             )
             assert granted, f"Extension {index + 1} should be granted"
 
         # 4th request should be denied
-        granted, extension_seconds, denial_reason = tracker.request_extension(
+        granted, extension_seconds, denial_reason, _ = tracker.request_extension(
             reason="one too many",
             current_progress=4.0,
         )
@@ -349,7 +349,7 @@ class TestMaximumExtensionLimits:
             max_extensions=0,
         )
 
-        granted, extension_seconds, denial_reason = tracker.request_extension(
+        granted, extension_seconds, denial_reason, _ = tracker.request_extension(
             reason="please extend",
             current_progress=1.0,
         )
@@ -368,14 +368,14 @@ class TestMaximumExtensionLimits:
         )
 
         # First extension works
-        granted, _, _ = tracker.request_extension(
+        granted, _, _, _ = tracker.request_extension(
             reason="only chance",
             current_progress=1.0,
         )
         assert granted
 
         # Second is denied
-        granted, _, denial_reason = tracker.request_extension(
+        granted, _, denial_reason, _ = tracker.request_extension(
             reason="no more",
             current_progress=2.0,
         )
@@ -486,7 +486,7 @@ class TestStateReset:
         tracker.reset()
 
         # New extension should work with full grant
-        granted, extension_seconds, _ = tracker.request_extension(
+        granted, extension_seconds, _, _ = tracker.request_extension(
             reason="after reset",
             current_progress=1.0,
         )
@@ -554,7 +554,7 @@ class TestDeadlineCalculations:
         expected_total = 0.0
 
         for index in range(5):
-            granted, extension_seconds, _ = tracker.request_extension(
+            granted, extension_seconds, _, _ = tracker.request_extension(
                 reason=f"{index + 1}",
                 current_progress=float(index + 1),
             )
@@ -671,8 +671,9 @@ class TestEvictionThresholds:
     """Tests for worker eviction decisions."""
 
     def test_should_evict_after_max_extensions(self):
-        """Worker should be evicted after exhausting extensions."""
-        config = WorkerHealthManagerConfig(max_extensions=2)
+        """Worker should be evicted after exhausting extensions and grace period."""
+        # Set grace_period=0 so eviction happens immediately after exhaustion
+        config = WorkerHealthManagerConfig(max_extensions=2, grace_period=0.0)
         manager = WorkerHealthManager(config)
 
         # Exhaust all extensions
@@ -686,10 +687,20 @@ class TestEvictionThresholds:
             )
             manager.handle_extension_request(request, current_deadline=1000.0)
 
+        # Make one more request to trigger exhaustion_time to be set
+        final_request = HealthcheckExtensionRequest(
+            worker_id="worker-1",
+            reason="exhausted",
+            current_progress=3.0,
+            estimated_completion=5.0,
+            active_workflow_count=1,
+        )
+        manager.handle_extension_request(final_request, current_deadline=1000.0)
+
         should_evict, reason = manager.should_evict_worker("worker-1")
 
         assert should_evict
-        assert "exhausted all 2 deadline extensions" in reason
+        assert "exhausted all 2 extensions" in reason
 
     def test_should_evict_after_extension_failures(self):
         """Worker should be evicted after consecutive extension failures."""
@@ -950,7 +961,7 @@ class TestEdgeCases:
             max_extensions=5,
         )
 
-        granted, _, _ = tracker.request_extension(
+        granted, _, _, _ = tracker.request_extension(
             reason="initializing",
             current_progress=0.0,
         )

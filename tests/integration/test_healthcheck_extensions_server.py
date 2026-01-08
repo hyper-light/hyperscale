@@ -217,7 +217,7 @@ class TestExtensionTrackerBasics:
             max_extensions=5,
         )
 
-        granted, seconds, reason = tracker.request_extension(
+        granted, seconds, reason, _ = tracker.request_extension(
             reason="busy",
             current_progress=0.1,
         )
@@ -246,7 +246,7 @@ class TestExtensionTrackerBasics:
 
         progress = 0.1
         for idx, expected in enumerate(expected_grants):
-            granted, seconds, _ = tracker.request_extension(
+            granted, seconds, _, _ = tracker.request_extension(
                 reason="busy",
                 current_progress=progress,
             )
@@ -266,7 +266,7 @@ class TestExtensionTrackerBasics:
         # Request max_extensions times
         progress = 0.1
         for _ in range(3):
-            granted, _, _ = tracker.request_extension(
+            granted, _, _, _ = tracker.request_extension(
                 reason="busy",
                 current_progress=progress,
             )
@@ -274,7 +274,7 @@ class TestExtensionTrackerBasics:
             progress += 0.1
 
         # Next request should be denied
-        granted, seconds, reason = tracker.request_extension(
+        granted, seconds, reason, _ = tracker.request_extension(
             reason="busy",
             current_progress=progress,
         )
@@ -293,14 +293,14 @@ class TestExtensionTrackerBasics:
         )
 
         # First extension at progress=0.1
-        granted, _, _ = tracker.request_extension(
+        granted, _, _, _ = tracker.request_extension(
             reason="busy",
             current_progress=0.1,
         )
         assert granted is True
 
         # Second extension without progress should be denied
-        granted, seconds, reason = tracker.request_extension(
+        granted, seconds, reason, _ = tracker.request_extension(
             reason="busy",
             current_progress=0.1,  # Same as before
         )
@@ -605,10 +605,11 @@ class TestEvictionScenarios:
 
     @pytest.mark.asyncio
     async def test_eviction_after_exhausting_extensions(self) -> None:
-        """Test worker eviction after exhausting all extensions."""
+        """Test worker eviction after exhausting all extensions and grace period."""
         config = WorkerHealthManagerConfig(
             max_extensions=3,
             eviction_threshold=2,
+            grace_period=0.0,  # Immediate eviction after exhaustion
         )
         worker = SimulatedWorker("worker-1", WorkerState.STUCK)
         worker.add_workflow(WorkflowInfo(workflow_id="wf-1"))
@@ -624,7 +625,12 @@ class TestEvictionScenarios:
             await manager.handle_extension_request(worker, request)
             progress += 0.1
 
-        # Should recommend eviction after max extensions
+        # Make one more request to trigger exhaustion_time to be set
+        worker.set_progress(progress)
+        request = worker.create_extension_request("exhausted")
+        await manager.handle_extension_request(worker, request)
+
+        # Should recommend eviction after max extensions and grace period
         should_evict, reason = manager.should_evict_worker("worker-1")
         assert should_evict is True
         assert "exhausted" in reason.lower()
