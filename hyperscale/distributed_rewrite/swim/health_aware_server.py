@@ -1401,9 +1401,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except asyncio.QueueEmpty:
             return False
         
-        if include_piggyback:
-            message = message + self.get_piggyback_data()
-        
+        # Note: Piggyback is added centrally in send() hook via _add_piggyback_safe()
+        # The include_piggyback parameter is kept for backwards compatibility but ignored
+
         # Track the send and log failures
         try:
             await self._send_with_retry(node, message, timeout)
@@ -1534,7 +1534,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             timeout = self.get_lhm_adjusted_timeout(base_timeout)
 
             target_addr = f'{target[0]}:{target[1]}'.encode()
-            probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
+            # Note: Piggyback is added centrally in send() hook via _add_piggyback_safe()
+            probe_msg = b'probe>' + target_addr
 
             print(f"[DEBUG SWIM {self._udp_port}] PROBE sending to {target}")
             response_received = await self._probe_with_timeout(target, probe_msg, timeout)
@@ -2845,9 +2846,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         message: bytes,
         timeout: int | None = None,
     ) -> bytes:
+        """
+        Prepare outgoing UDP message before sending.
+
+        This hook adds piggybacked gossip data (membership + health) to
+        outgoing messages for O(log n) dissemination.
+        """
+        # Add piggyback data (membership + health gossip) to outgoing messages
+        message_with_piggyback = self._add_piggyback_safe(message)
+
         return (
             addr,
-            message,
+            message_with_piggyback,
             timeout,
         )
     
