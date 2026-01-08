@@ -164,6 +164,7 @@ class MercurySyncBaseServer(Generic[T]):
         
         # Security utilities
         self._replay_guard = ReplayGuard()
+        self._client_replay_guard = ReplayGuard()
         self._rate_limiter = ServerRateLimiter()
         self._secure_random = secrets.SystemRandom()  # Cryptographically secure RNG
 
@@ -1026,16 +1027,16 @@ class MercurySyncBaseServer(Generic[T]):
             # Parse length-prefixed UDP message format:
             # type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
             request_type, addr, handler_name, rest = decrypted.split(b'<', maxsplit=3)
+            # Extract clock (first 64 bytes)
+            clock = rest[:64]
+            # Extract data length (next 4 bytes)
+            data_len = int.from_bytes(rest[64:68], 'big')
+            # Extract payload (remaining bytes)
+            payload = rest[68:68 + data_len]
 
             match request_type:
 
                 case b'c':
-                    # Extract clock (first 64 bytes)
-                    clock = rest[:64]
-                    # Extract data length (next 4 bytes)
-                    data_len = int.from_bytes(rest[64:68], 'big')
-                    # Extract payload (remaining bytes)
-                    payload = rest[68:68 + data_len]
 
                     self._pending_udp_server_responses.append(
                         asyncio.ensure_future(
@@ -1347,6 +1348,17 @@ class MercurySyncBaseServer(Generic[T]):
 
             if response_model := self.udp_client_response_models.get(handler_name):
                     payload = response_model.load(payload)
+
+                    # Validate message for replay attacks if it's a Message instance
+                    if isinstance(payload, Message):
+                        try:
+                            self._client_replay_guard.validate_with_incarnation(
+                                payload.message_id,
+                                payload.sender_incarnation,
+                            )
+                        except ReplayError:
+                            self._udp_drop_counter.increment_replay_detected()
+                            return
 
 
             handler = self.udp_client_handlers.get(handler_name)
