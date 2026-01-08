@@ -789,38 +789,53 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         Returns:
             The message with embedded state and piggyback removed.
         """
-        # Step 1: Strip health gossip piggyback (format: #h|entry1#entry2#...)
-        # This MUST be first because health piggyback uses '#' as entry separator,
-        # which conflicts with the state separator.
+        # Track boundaries to avoid repeated slicing until the end
+        # msg_end marks where the core message ends (before any piggyback)
+        msg_end = len(message)
+        health_piggyback: bytes | None = None
+        membership_piggyback: bytes | None = None
+
+        # Step 1: Find health gossip piggyback (#h|...)
+        # Health is always appended last, so search from end is valid
         health_idx = message.find(b'#h|')
         if health_idx > 0:
             health_piggyback = message[health_idx:]
-            message = message[:health_idx]
-            self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
+            msg_end = health_idx
 
-        # Step 2: Strip membership piggyback (format: |type:incarnation:host:port|...)
-        # Membership piggyback is added AFTER state, so it appears between state and health.
-        membership_idx = message.find(b'|')
+        # Step 2: Find membership piggyback (|...) in the remaining portion
+        # Only search up to msg_end to avoid finding '|' in health data
+        membership_idx = message.find(b'|', 0, msg_end)
         if membership_idx > 0:
-            membership_piggyback = message[membership_idx:]
-            message = message[:membership_idx]
-            # Process membership piggyback asynchronously
+            membership_piggyback = message[membership_idx:msg_end]
+            msg_end = membership_idx
+
+        # Step 3: Find message structure in core message only
+        # Format: msg_type>host:port#base64_state
+        addr_sep_idx = message.find(b'>', 0, msg_end)
+        if addr_sep_idx < 0:
+            # No address separator - process piggyback and return
+            if health_piggyback:
+                self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
+            if membership_piggyback:
+                self._task_runner.run(self.process_piggyback_data, membership_piggyback)
+            return message[:msg_end] if msg_end < len(message) else message
+
+        # Find state separator after '>' but before piggyback
+        state_sep_idx = message.find(b'#', addr_sep_idx, msg_end)
+
+        # Process piggyback data (can happen in parallel with state processing)
+        if health_piggyback:
+            self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
+        if membership_piggyback:
             self._task_runner.run(self.process_piggyback_data, membership_piggyback)
 
-        # Step 3: Extract state from address portion
-        # Format after stripping piggyback: msg_type>host:port#base64_state
-        addr_sep_idx = message.find(b'>')
-        if addr_sep_idx < 0:
-            return message
-
-        # Find the state separator AFTER the '>' (first # in address portion)
-        sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx)
-        if sep_idx < 0:
-            return message
+        # No state separator - return clean message
+        if state_sep_idx < 0:
+            return message[:msg_end] if msg_end < len(message) else message
 
         # Extract and decode state
-        clean_message = message[:sep_idx]
-        encoded_state = message[sep_idx + 1:]
+        # Slice once: encoded_state is between state_sep and msg_end
+        encoded_state = message[state_sep_idx + 1:msg_end]
 
         try:
             state_data = b64decode(encoded_state)
@@ -829,7 +844,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             # Invalid base64 or processing error - ignore silently
             pass
 
-        return clean_message
+        # Return message up to state separator (excludes state and all piggyback)
+        return message[:state_sep_idx]
     
     # === Message Size Helpers ===
     
