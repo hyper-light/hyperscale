@@ -666,14 +666,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     ) -> None:
         """
         Process embedded state received from another node.
-        
+
         Delegates to the injected StateEmbedder to handle heartbeat data
         from incoming SWIM messages.
-        
+
         Args:
             state_data: Serialized state bytes from the remote node.
             source_addr: The (host, port) of the node that sent the state.
         """
+        print(f"[DEBUG SWIM {self._udp_port}] _process_embedded_state called, embedder={type(self._state_embedder).__name__}")
         self._state_embedder.process_state(state_data, source_addr)
     
     async def _build_xprobe_response(
@@ -2937,18 +2938,21 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     target = addr
                 else:
                     message, target_addr = parsed
-                    
+
                     # Extract embedded state from address portion (Serf-style)
                     # Format: host:port#base64_state
                     if self._STATE_SEPARATOR in target_addr:
+                        print(f"[DEBUG SWIM {self._udp_port}] FOUND STATE_SEPARATOR in target_addr, parsing state from {addr}")
                         addr_part, state_part = target_addr.split(self._STATE_SEPARATOR, 1)
                         target_addr = addr_part
                         # Process embedded state from sender
                         import base64
                         try:
                             state_data = base64.b64decode(state_part)
+                            print(f"[DEBUG SWIM {self._udp_port}] Decoded state, len={len(state_data)}, calling _process_embedded_state")
                             self._process_embedded_state(state_data, addr)
-                        except Exception:
+                        except Exception as e:
+                            print(f"[DEBUG SWIM {self._udp_port}] State decode/process FAILED: {e}")
                             pass  # Invalid state, ignore
                     
                     host, port = target_addr.decode().split(':', maxsplit=1)
@@ -2988,7 +2992,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             await self.increase_failure_detector('missed_nack')
                             return b'nack:unknown>' + self._udp_addr_slug
                         await self.decrease_failure_detector('successful_nack')
-                    return b'ack>' + self._udp_addr_slug
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
 
                 case b'nack':
                     # NACK means the sender couldn't reach the target or doesn't know it
@@ -3015,8 +3020,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     # Log the NACK reason for diagnostics
                     print(f"[DEBUG SWIM {self._udp_port}] NACK reason: {nack_reason}")
 
-                    return b'ack>' + self._udp_addr_slug
-                
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
+
                 case b'join':
                     self._metrics.increment('joins_received')
 
@@ -3157,7 +3163,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         self._incarnation_tracker.update_node(target, b'DEAD', 0, time.monotonic())
                         self.update_probe_scheduler_membership()
 
-                        return b'ack>' + self._udp_addr_slug
+                        # Embed state in ack for Serf-style heartbeat propagation
+                        return self._build_ack_with_state()
 
                 case b'probe':
                     print(f"[DEBUG SWIM {self._udp_port}] PROBE received from {addr}, target={target}")
@@ -3282,19 +3289,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                                 source=addr,
                             )
                         )
-                        return b'ack>' + self._udp_addr_slug
-                    
+                        # Embed state in ack for Serf-style heartbeat propagation
+                        return self._build_ack_with_state()
+
                     msg_parts = message.split(b':', maxsplit=1)
                     if len(msg_parts) > 1:
                         status_str = msg_parts[1]
                         if status_str == b'alive' and target:
                             await self.handle_indirect_probe_response(target, is_alive=True)
                             await self.decrease_failure_detector('successful_probe')
-                            return b'ack>' + self._udp_addr_slug
+                            # Embed state in ack for Serf-style heartbeat propagation
+                            return self._build_ack_with_state()
                         elif status_str in (b'dead', b'timeout', b'unknown') and target:
                             await self.handle_indirect_probe_response(target, is_alive=False)
-                    return b'ack>' + self._udp_addr_slug
-                
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
+
                 case b'alive':
                     msg_incarnation = await self._parse_incarnation_safe(message, addr)
 
@@ -3320,8 +3330,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             )
                             await self.decrease_failure_detector('successful_probe')
 
-                    return b'ack>' + self._udp_addr_slug
-                
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
+
                 case b'suspect':
                     msg_incarnation = await self._parse_incarnation_safe(message, addr)
 
@@ -3342,18 +3353,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         
                         if self.is_message_fresh(target, msg_incarnation, b'SUSPECT'):
                             await self.start_suspicion(target, msg_incarnation, addr)
-                            
+
                             suspicion = self._suspicion_manager.get_suspicion(target)
                             if suspicion and suspicion.should_regossip():
                                 suspicion.mark_regossiped()
                                 await self.broadcast_suspicion(target, msg_incarnation)
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
+
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
+
                 # Leadership messages
                 case b'leader-claim':
                     term, candidate_lhm = await self._parse_leadership_claim(message, addr)
-                    
+
                     if target:
                         vote_msg = self._leader_election.handle_claim(target, term, candidate_lhm)
                         if vote_msg:
@@ -3365,8 +3377,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                                     self._context.read('current_timeout')
                                 ),
                             )
-                    
-                    return b'ack>' + self._udp_addr_slug
+
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
                 
                 case b'leader-vote':
                     # Verify we're actually expecting votes (are we a candidate?)
@@ -3378,14 +3391,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                                 source=addr,
                             )
                         )
-                        return b'ack>' + self._udp_addr_slug
-                    
+                        # Embed state in ack for Serf-style heartbeat propagation
+                        return self._build_ack_with_state()
+
                     term = await self._parse_term_safe(message, addr)
-                    
+
                     if self._leader_election.handle_vote(addr, term):
                         self._leader_election.state.become_leader(term)
                         self._leader_election.state.current_leader = self._get_self_udp_addr()
-                        
+
                         self_addr = self._get_self_udp_addr()
                         elected_msg = (
                             b'leader-elected:' +
@@ -3393,12 +3407,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                             f'{self_addr[0]}:{self_addr[1]}'.encode()
                         )
                         self._broadcast_leadership_message(elected_msg)
-                    
-                    return b'ack>' + self._udp_addr_slug
+
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
                 
                 case b'leader-elected':
                     term = await self._parse_term_safe(message, addr)
-                    
+
                     if target:
                         # Check if we received our own election announcement (shouldn't happen)
                         self_addr = self._get_self_udp_addr()
@@ -3410,16 +3425,18 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                                     source=addr,
                                 )
                             )
-                            return b'ack>' + self._udp_addr_slug
-                        
+                            # Embed state in ack for Serf-style heartbeat propagation
+                            return self._build_ack_with_state()
+
                         await self._leader_election.handle_elected(target, term)
-                    
-                    return b'ack>' + self._udp_addr_slug
+
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
                 
                 case b'leader-heartbeat':
                     self._metrics.increment('heartbeats_received')
                     term = await self._parse_term_safe(message, addr)
-                    
+
                     # Check if we received our own heartbeat (shouldn't happen)
                     if target:
                         self_addr = self._get_self_udp_addr()
@@ -3431,7 +3448,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                                     source=addr,
                                 )
                             )
-                            return b'ack>' + self._udp_addr_slug
+                            # Embed state in ack for Serf-style heartbeat propagation
+                            return self._build_ack_with_state()
                     
                     if target:
                         self_addr = self._get_self_udp_addr()
@@ -3478,20 +3496,22 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                                 self._task_runner.run(self._leader_election._step_down)
                         
                         await self._leader_election.handle_heartbeat(target, term)
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
+
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
+
                 case b'leader-stepdown':
                     term = await self._parse_term_safe(message, addr)
-                    
+
                     if target:
                         await self._leader_election.handle_stepdown(target, term)
-                    
-                    return b'ack>' + self._udp_addr_slug
+
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
                 
                 case b'pre-vote-req':
                     term, candidate_lhm = await self._parse_leadership_claim(message, addr)
-                    
+
                     if target:
                         resp = self._leader_election.handle_pre_vote_request(
                             candidate=target,
@@ -3504,9 +3524,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                                 target,
                                 resp,
                             )
-                    
-                    return b'ack>' + self._udp_addr_slug
-                
+
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
+
                 case b'pre-vote-resp':
                     # Verify we're actually in a pre-voting phase
                     if not self._leader_election.state.pre_voting_in_progress:
@@ -3517,17 +3538,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                                 source=addr,
                             )
                         )
-                        return b'ack>' + self._udp_addr_slug
-                    
+                        # Embed state in ack for Serf-style heartbeat propagation
+                        return self._build_ack_with_state()
+
                     term, granted = await self._parse_pre_vote_response(message, addr)
-                    
+
                     self._leader_election.handle_pre_vote_response(
                         voter=addr,
                         term=term,
                         granted=granted,
                     )
-                    
-                    return b'ack>' + self._udp_addr_slug
+
+                    # Embed state in ack for Serf-style heartbeat propagation
+                    return self._build_ack_with_state()
                     
                 case _:
                     # Unknown message type - log for monitoring
