@@ -143,14 +143,10 @@ class WorkerServer(HealthAwareServer):
     ):
         # Core capacity (set before super().__init__ so state embedder can access it)
         self._total_cores = env.WORKER_MAX_CORES or self._get_os_cpus() or 1
-        # Reserve one core for control plane (monitoring, progress updates, etc.)
-        # Execution cores are used for actual workflow execution
-        self._execution_cores = max(self._total_cores - 1, 1)
 
         # Core allocator for thread-safe core management
         # Uses composition to encapsulate all core allocation logic
-        # Uses execution_cores since that's what's available for workflow allocation
-        self._core_allocator = CoreAllocator(self._execution_cores)
+        self._core_allocator = CoreAllocator(self._total_cores)
         
         # Manager discovery
         # Seed managers from config (TCP addresses) - tried in order until one succeeds
@@ -277,10 +273,10 @@ class WorkerServer(HealthAwareServer):
 
         self._remote_manger = RemoteGraphManager(
             self._updates,
-            self._execution_cores,
+            self._total_cores,
             status_update_poll_interval=env.STATUS_UPDATE_POLL_INTERVAL,
         )
-        self._server_pool = LocalServerPool(self._execution_cores)
+        self._server_pool = LocalServerPool(self._total_cores)
         self._pool_task: asyncio.Task | None = None
         self._local_udp_port = self._udp_port + (self._total_cores ** 2)
         self._worker_connect_timeout = TimeParser(env.MERCURY_SYNC_CONNECT_SECONDS).time
@@ -321,8 +317,8 @@ class WorkerServer(HealthAwareServer):
                 MERCURY_SYNC_LOGS_DIRECTORY=self._env.MERCURY_SYNC_LOGS_DIRECTORY,
                 MERCURY_SYNC_LOG_LEVEL=self._env.MERCURY_SYNC_LOG_LEVEL,
                 MERCURY_SYNC_MAX_CONCURRENCY=self._env.MERCURY_SYNC_MAX_CONCURRENCY,
-                MERCURY_SYNC_TASK_RUNNER_MAX_THREADS=self._execution_cores,
-                MERCURY_SYNC_MAX_RUNNING_WORKFLOWS=self._execution_cores,
+                MERCURY_SYNC_TASK_RUNNER_MAX_THREADS=self._total_cores,
+                MERCURY_SYNC_MAX_RUNNING_WORKFLOWS=self._total_cores,
                 MERCURY_SYNC_MAX_PENDING_WORKFLOWS=100,
             )
         return self._core_env
@@ -554,7 +550,7 @@ class WorkerServer(HealthAwareServer):
         manager_count = len(self._known_managers)
         await self._udp_logger.log(
             ServerInfo(
-                message=f"Worker started with {self._execution_cores} execution cores (1 reserved for control plane), registered with {manager_count} managers",
+                message=f"Worker started with {self._total_cores} cores, registered with {manager_count} managers",
                 node_host=self._host,
                 node_port=self._tcp_port,
                 node_id=self._node_id.short,
@@ -958,7 +954,7 @@ class WorkerServer(HealthAwareServer):
 
         registration = WorkerRegistration(
             node=self.node_info,
-            total_cores=self._execution_cores,
+            total_cores=self._total_cores,
             available_cores=self._core_allocator.available_cores,
             memory_mb=self._get_memory_mb(),
             available_memory_mb=self._get_available_memory_mb(),
@@ -1066,7 +1062,7 @@ class WorkerServer(HealthAwareServer):
         return WorkerStateSnapshot(
             node_id=self._node_id.full,
             state=self._get_worker_state().value,
-            total_cores=self._execution_cores,
+            total_cores=self._total_cores,
             available_cores=self._core_allocator.available_cores,
             version=self._state_version,
             active_workflows=dict(self._active_workflows),
@@ -1331,7 +1327,7 @@ class WorkerServer(HealthAwareServer):
             ack = ManagerToWorkerRegistrationAck(
                 accepted=True,
                 worker_id=self._node_id.full,
-                total_cores=self._execution_cores,
+                total_cores=self._total_cores,
                 available_cores=self._core_allocator.available_cores,
             )
             return ack.dump()
@@ -1619,10 +1615,7 @@ class WorkerServer(HealthAwareServer):
         workflow_name = progress.workflow_name
 
         
-        iteration = 0
-        print(f"[DEBUG-WORKER] monitor loop STARTING for {workflow_name}, run_id={run_id}")
         while not cancel_event.is_set():
-            iteration += 1
             try:
                 await asyncio.sleep(self._progress_update_interval)
 
@@ -1630,8 +1623,6 @@ class WorkerServer(HealthAwareServer):
                 workflow_status_update = await self._remote_manger.get_workflow_update(run_id, workflow_name)
                 if workflow_status_update is None:
                     # No update available yet, keep waiting
-                    if iteration <= 3 or iteration % 20 == 0:  # Only print first 3 and every 20th
-                        print(f"[DEBUG-WORKER] no update for {workflow_name}, run_id={run_id}, iter={iteration}, t={time.time():.3f}")
                     continue
 
                 status = CoreWorkflowStatus(workflow_status_update.status)
@@ -1713,15 +1704,12 @@ class WorkerServer(HealthAwareServer):
                 # Send update directly (not buffered) for real-time streaming
                 # The manager's windowed stats collector handles time-correlation
                 if self._healthy_manager_ids:
-                    print(f"[DEBUG-WORKER] sending progress for {workflow_name}, completed={progress.completed_count}, t={time.time():.3f}")
                     await self._send_progress_update_direct(progress)
                     self._workflow_last_progress[dispatch.workflow_id] = time.monotonic()
                 
             except asyncio.CancelledError:
-                print(f"[DEBUG-WORKER] monitor loop CANCELLED for {workflow_name}, run_id={run_id}, iter={iteration}")
                 break
             except Exception as err:
-                print(f"[DEBUG-WORKER] monitor loop ERROR for {workflow_name}, run_id={run_id}, iter={iteration}: {err}")
                 await self._udp_logger.log(
                     ServerError(
                         node_host=self._host,
@@ -1730,7 +1718,6 @@ class WorkerServer(HealthAwareServer):
                         message=f'Encountered Update Error: {str(err)} for workflow: {progress.workflow_name} workflow id: {progress.workflow_id}'
                     )
                 )
-        print(f"[DEBUG-WORKER] monitor loop EXITED for {workflow_name}, run_id={run_id}, iter={iteration}, cancel_set={cancel_event.is_set()}")
     
     async def _transition_workflow_status(
         self,
