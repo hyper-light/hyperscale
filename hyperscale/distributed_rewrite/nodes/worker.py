@@ -283,8 +283,20 @@ class WorkerServer(HealthAwareServer):
             state_embedder=state_embedder,
         )
         
-        # Register callback for manager failure detection via SWIM
+        # Register callbacks for manager failure/recovery detection via SWIM
         self.register_on_node_dead(self._on_node_dead)
+        self.register_on_node_join(self._on_node_join)
+
+        # Per-manager locks for failure/recovery coordination (asyncio task interleaving)
+        # Using per-manager locks allows concurrent operations on different managers
+        self._manager_state_locks: dict[str, asyncio.Lock] = {}
+
+        # Monotonic epoch per manager to detect stale failure/recovery operations
+        # Incremented on each state change; handlers check epoch hasn't changed after await
+        self._manager_state_epoch: dict[str, int] = {}
+
+        # Recovery semaphore to limit concurrent recovery operations (prevents thundering herd)
+        self._recovery_semaphore = asyncio.Semaphore(env.RECOVERY_SEMAPHORE_SIZE)
 
         self._updates = InterfaceUpdatesController()
 
@@ -577,51 +589,133 @@ class WorkerServer(HealthAwareServer):
             )
         )
     
+    def _get_manager_state_lock(self, manager_id: str) -> asyncio.Lock:
+        """
+        Get or create a lock for a specific manager.
+
+        Per-manager locks allow concurrent failure/recovery operations on different managers
+        while ensuring serialization for operations on the same manager.
+        """
+        if manager_id not in self._manager_state_locks:
+            self._manager_state_locks[manager_id] = asyncio.Lock()
+        return self._manager_state_locks[manager_id]
+
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
         Called when a node is marked as DEAD via SWIM.
 
-        Marks the manager as unhealthy in our tracking and records the time
-        for eventual reaping after the configured interval.
+        Dispatches to async handler for proper lock coordination.
         """
         # Find which manager this address belongs to
         for manager_id, manager in list(self._known_managers.items()):
             if (manager.udp_host, manager.udp_port) == node_addr:
-                self._healthy_manager_ids.discard(manager_id)
-
-                # Track when this manager became unhealthy for reaping
-                if manager_id not in self._manager_unhealthy_since:
-                    self._manager_unhealthy_since[manager_id] = time.monotonic()
-
-                self._task_runner.run(
-                    self._udp_logger.log,
-                    ServerInfo(
-                        message=f"Manager {manager_id} marked unhealthy (SWIM DEAD)",
-                        node_host=self._host,
-                        node_port=self._tcp_port,
-                        node_id=self._node_id.short,
-                    )
-                )
-
-                # If this was our primary manager, select a new one
-                if manager_id == self._primary_manager_id:
-                    self._task_runner.run(self._select_new_primary_manager)
+                self._task_runner.run(self._handle_manager_failure, manager_id)
                 break
-    
-    def _on_node_alive(self, node_addr: tuple[str, int]) -> None:
-        """
-        Called when a node is confirmed ALIVE via SWIM.
 
-        Marks the manager as healthy in our tracking and clears the
-        unhealthy timestamp so it won't be reaped.
+    def _on_node_join(self, node_addr: tuple[str, int]) -> None:
+        """
+        Called when a node joins or rejoins the SWIM cluster.
+
+        Dispatches to async handler for proper jitter and lock coordination.
         """
         # Find which manager this address belongs to
         for manager_id, manager in list(self._known_managers.items()):
             if (manager.udp_host, manager.udp_port) == node_addr:
+                self._task_runner.run(self._handle_manager_recovery, manager_id)
+                break
+
+    async def _handle_manager_failure(self, manager_id: str) -> None:
+        """
+        Handle a manager becoming unavailable (detected via SWIM).
+
+        Thread safety:
+        - Uses per-manager lock to coordinate with recovery handler
+        - Increments epoch to invalidate any in-flight recovery operations
+        """
+        manager_lock = self._get_manager_state_lock(manager_id)
+        async with manager_lock:
+            # Increment epoch to invalidate any pending recovery operations
+            self._manager_state_epoch[manager_id] = self._manager_state_epoch.get(manager_id, 0) + 1
+
+            # Remove from healthy set
+            self._healthy_manager_ids.discard(manager_id)
+
+            # Track when this manager became unhealthy for reaping
+            if manager_id not in self._manager_unhealthy_since:
+                self._manager_unhealthy_since[manager_id] = time.monotonic()
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager {manager_id} marked unhealthy (SWIM DEAD)",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # If this was our primary manager, select a new one
+        if manager_id == self._primary_manager_id:
+            await self._select_new_primary_manager()
+
+    async def _handle_manager_recovery(self, manager_id: str) -> None:
+        """
+        Handle a manager recovering/rejoining the cluster.
+
+        Thread safety:
+        - Uses epoch checking to detect if failure handler ran during our jitter
+        - Uses per-manager lock to coordinate state changes
+        """
+        manager_lock = self._get_manager_state_lock(manager_id)
+
+        # Capture epoch BEFORE any await points
+        async with manager_lock:
+            initial_epoch = self._manager_state_epoch.get(manager_id, 0)
+
+        # Limit concurrent recovery operations to prevent thundering herd
+        async with self._recovery_semaphore:
+            # Apply jitter before recovery actions to prevent thundering herd
+            # when multiple workers detect recovery simultaneously
+            import random
+            jitter_min = self._env.RECOVERY_JITTER_MIN
+            jitter_max = self._env.RECOVERY_JITTER_MAX
+            if jitter_max > 0:
+                jitter = random.uniform(jitter_min, jitter_max)
+                await asyncio.sleep(jitter)
+
+            # After jitter, check if manager was marked dead during our sleep
+            async with manager_lock:
+                current_epoch = self._manager_state_epoch.get(manager_id, 0)
+                if current_epoch != initial_epoch:
+                    # Epoch changed - a failure was detected during our jitter
+                    # Don't add manager back as it's now considered dead
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=f"Manager recovery for {manager_id} aborted: epoch changed "
+                                    f"({initial_epoch} -> {current_epoch}) during jitter",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return
+
+                # Epoch unchanged - safe to add manager back
                 self._healthy_manager_ids.add(manager_id)
+
                 # Clear unhealthy tracking - manager recovered
                 self._manager_unhealthy_since.pop(manager_id, None)
-                break
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Manager {manager_id} has REJOINED the cluster",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
     
     def _handle_manager_heartbeat(
         self,
