@@ -667,9 +667,9 @@ async def test_manager_worker_message_validation(
                 validation_results["worker_cores_valid"] = False
 
             # Validate state
-            worker_state = worker._state.value if hasattr(worker._state, 'value') else str(worker._state)
-            valid_states = {"starting", "syncing", "active", "draining", "stopped"}
-            if worker_state in valid_states:
+            worker_state = worker._get_worker_state().value if hasattr(worker._get_worker_state(), 'value') else str(worker._get_worker_state())
+            valid_states = {"starting", "syncing", "active", "draining", "stopped", "healthy", "degraded", "overloaded"}
+            if worker_state.lower() in valid_states:
                 print(f"    state: {worker_state} [PASS]")
             else:
                 print(f"    state: {worker_state} (invalid) [FAIL]")

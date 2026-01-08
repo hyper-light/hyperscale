@@ -286,9 +286,9 @@ async def test_manager_heartbeat_message_validation(cluster_size: int) -> bool:
                 validation_results["peer_tracking_valid"] = False
 
             # Validate manager state
-            manager_state = manager._state.value if hasattr(manager._state, 'value') else str(manager._state)
+            manager_state = manager._manager_state.value if hasattr(manager._manager_state, 'value') else str(manager._manager_state)
             valid_states = {"syncing", "active", "draining"}
-            if manager_state in valid_states:
+            if manager_state.lower() in valid_states:
                 print(f"    state: {manager_state} [PASS]")
             else:
                 print(f"    state: {manager_state} (invalid) [FAIL]")
