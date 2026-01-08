@@ -31,6 +31,14 @@ from hyperscale.distributed_rewrite.reliability.backpressure import (
     StatsBufferConfig as StatsBufferConfig,
     StatsEntry as StatsEntry,
 )
+from hyperscale.distributed_rewrite.reliability.robust_queue import (
+    RobustMessageQueue as RobustMessageQueue,
+    RobustQueueConfig as RobustQueueConfig,
+    QueuePutResult as QueuePutResult,
+    QueueState as QueueState,
+    QueueMetrics as QueueMetrics,
+    QueueFullError as QueueFullError,
+)
 from hyperscale.distributed_rewrite.reliability.rate_limiting import (
     # Core rate limiting
     SlidingWindowCounter as SlidingWindowCounter,
