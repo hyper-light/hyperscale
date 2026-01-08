@@ -78,8 +78,8 @@ class Env(BaseModel):
     CIRCUIT_BREAKER_HALF_OPEN_AFTER: StrictFloat = 10.0
 
     # Worker Progress Update Settings (tuned for real-time terminal UI)
-    WORKER_PROGRESS_UPDATE_INTERVAL: StrictFloat = 0.1  # How often to collect progress locally (100ms)
-    WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 0.1  # How often to send buffered updates to manager (100ms)
+    WORKER_PROGRESS_UPDATE_INTERVAL: StrictFloat = 0.05  # How often to collect progress locally (50ms)
+    WORKER_PROGRESS_FLUSH_INTERVAL: StrictFloat = 0.05  # How often to send buffered updates to manager (50ms)
     WORKER_MAX_CORES: StrictInt | None = None
 
     # Worker Dead Manager Cleanup Settings

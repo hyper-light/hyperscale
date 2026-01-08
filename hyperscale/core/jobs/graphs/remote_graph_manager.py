@@ -1493,6 +1493,35 @@ class RemoteGraphManager:
 
         return workflow_status_update
 
+    async def drain_workflow_updates(self, run_id: int, workflow: str) -> WorkflowStatusUpdate | None:
+        """
+        Drain all pending updates and return the most recent one.
+
+        This prevents update backlog when updates are produced faster than
+        they are consumed. Later updates contain cumulative counts so we
+        only need the most recent.
+
+        Returns:
+            The most recent WorkflowStatusUpdate, or None if no updates.
+        """
+        latest_update: WorkflowStatusUpdate | None = None
+        queue = self._graph_updates[run_id][workflow]
+
+        # Drain all available updates, keeping only the latest
+        while not queue.empty():
+            try:
+                latest_update = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        # Track status if we got an update
+        if self._status_lock and latest_update:
+            await self._status_lock.acquire()
+            self._workflow_statuses[run_id][workflow].append(latest_update.status)
+            self._status_lock.release()
+
+        return latest_update
+
     async def get_availability(self):
         if self._available_cores_updates:
             return await self._available_cores_updates.get()

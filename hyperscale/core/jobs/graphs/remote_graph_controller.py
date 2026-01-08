@@ -1270,7 +1270,7 @@ class RemoteGraphController(UDPProtocol[JobContext[Any], JobContext[Any]]):
         ),
         trigger="MANUAL",
         repeat="ALWAYS",
-        schedule="0.1s",
+        schedule="0.05s",
         keep_policy="COUNT",
     )
     async def aggregate_status_updates(
