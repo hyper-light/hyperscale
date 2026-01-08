@@ -219,7 +219,8 @@ class DiscoveryService:
                         port=self.config.default_port,
                         force_refresh=force_refresh,
                     )
-                    self._metrics.record_dns_success()
+                    # Note: We don't have cache info from resolver, record as uncached query
+                    self._metrics.record_dns_query(cached=False)
 
                     for addr in result.addresses:
                         port = result.port or self.config.default_port
@@ -378,7 +379,8 @@ class DiscoveryService:
                 selection = self._selector.select_with_filter(key, locality_filter_fn)
                 if selection is not None:
                     self._metrics.record_selection(
-                        was_load_balanced=selection.was_load_balanced
+                        tier=preferred_tier,
+                        load_balanced=selection.was_load_balanced,
                     )
                     return selection
 
@@ -386,7 +388,8 @@ class DiscoveryService:
         result = self._selector.select(key)
         if result is not None:
             self._metrics.record_selection(
-                was_load_balanced=result.was_load_balanced
+                tier=LocalityTier.GLOBAL,
+                load_balanced=result.was_load_balanced,
             )
         return result
 
@@ -419,7 +422,8 @@ class DiscoveryService:
         result = self._selector.select_with_filter(key, filter_fn)
         if result is not None:
             self._metrics.record_selection(
-                was_load_balanced=result.was_load_balanced
+                tier=self._get_peer_tier(result.peer_id),
+                load_balanced=result.was_load_balanced,
             )
         return result
 
@@ -432,7 +436,7 @@ class DiscoveryService:
             latency_ms: Request latency in milliseconds
         """
         self._selector.record_success(peer_id, latency_ms)
-        self._metrics.record_request_success(latency_ms)
+        self._metrics.record_peer_latency(latency_ms)
 
         # Also update PeerInfo
         peer = self._peers.get(peer_id)
@@ -447,7 +451,7 @@ class DiscoveryService:
             peer_id: The peer that failed
         """
         self._selector.record_failure(peer_id)
-        self._metrics.record_request_failure()
+        self._metrics.record_connection_failed()
 
         # Also update PeerInfo
         peer = self._peers.get(peer_id)
