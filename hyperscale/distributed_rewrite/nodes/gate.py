@@ -32,7 +32,7 @@ import cloudpickle
 from hyperscale.distributed_rewrite.server import tcp, udp
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
-from hyperscale.reporting.json import JSONConfig
+from hyperscale.reporting.common import ReporterTypes
 from hyperscale.reporting.common.results_types import WorkflowStats
 from hyperscale.distributed_rewrite.server.events import VersionedStateClock
 from hyperscale.distributed_rewrite.swim import HealthAwareServer, GateStateEmbedder
@@ -4809,20 +4809,14 @@ class GateServer(HealthAwareServer):
 
         reporter_configs = self._get_reporter_configs(job_id, submission)
 
+        # No remote-capable reporters configured - skip submission
+        # File-based reporters (JSON, CSV, XML) are handled client-side
+        if not reporter_configs:
+            return
+
         # Initialize task tracking for this job
         if job_id not in self._job_reporter_tasks:
             self._job_reporter_tasks[job_id] = {}
-
-        # No configs means use default per-workflow JSON output
-        if not reporter_configs:
-            token = self._task_runner.run(
-                self._submit_to_default_json_reporter,
-                job_id,
-                aggregated_stats,
-                callback_addr,
-            )
-            self._job_reporter_tasks[job_id]["json_default"] = token
-            return
 
         # Start a background task for each reporter
         for config in reporter_configs:
@@ -4838,10 +4832,20 @@ class GateServer(HealthAwareServer):
 
     def _get_reporter_configs(self, job_id: str, submission: JobSubmission) -> list:
         """
-        Extract reporter configs from job submission.
+        Extract remote-capable reporter configs from job submission.
 
-        Returns empty list to indicate default JSON output should be used.
+        Filters out file-based reporters (JSON, CSV, XML) since gates
+        cannot write to the client's local filesystem. Returns only reporters
+        that can submit to remote destinations.
+
+        Returns empty list if no remote-capable reporters are configured.
         """
+        file_based_reporter_types = {
+            ReporterTypes.JSON,
+            ReporterTypes.CSV,
+            ReporterTypes.XML,
+        }
+
         if not submission.reporting_configs:
             return []
 
@@ -4863,9 +4867,15 @@ class GateServer(HealthAwareServer):
             return []
 
         if not isinstance(reporter_configs, list):
-            return [reporter_configs]
+            reporter_configs = [reporter_configs]
 
-        return reporter_configs
+        # Filter out file-based reporters - they can't write to client's filesystem
+        remote_configs = [
+            config for config in reporter_configs
+            if config.reporter_type not in file_based_reporter_types
+        ]
+
+        return remote_configs
 
     def _cleanup_reporter_task(self, job_id: str, reporter_type: str) -> None:
         """Remove completed reporter task from tracking."""
@@ -4881,104 +4891,6 @@ class GateServer(HealthAwareServer):
         # No more reporter tasks for this job - clean up
         del self._job_reporter_tasks[job_id]
         self._job_submissions.pop(job_id, None)
-
-    async def _submit_to_default_json_reporter(
-        self,
-        job_id: str,
-        aggregated_stats: list[WorkflowStats],
-        callback_addr: tuple[str, int] | None,
-    ) -> None:
-        """
-        Submit workflow results to per-workflow JSON files.
-
-        Creates a separate JSON file for each workflow using the pattern:
-        - <workflow_name>_workflow_results.json
-        - <workflow_name>_step_results.json
-
-        Runs as a background task. Sends push notification to client
-        on success or failure.
-
-        Args:
-            job_id: The job ID
-            aggregated_stats: List of WorkflowStats to submit
-            callback_addr: Client callback for push notification
-        """
-        start_time = time.monotonic()
-        success = False
-        error_message: str | None = None
-        workflows_submitted = 0
-
-        try:
-            for workflow_stats in aggregated_stats:
-                if workflow_stats is None:
-                    continue
-
-                # Get workflow name for file naming
-                workflow_name = workflow_stats.get("workflow", "unknown")
-                workflow_name_lower = workflow_name.lower()
-
-                # Create per-workflow JSONConfig
-                config = JSONConfig(
-                    workflow_results_filepath=f"{workflow_name_lower}_workflow_results.json",
-                    step_results_filepath=f"{workflow_name_lower}_step_results.json",
-                )
-
-                reporter = Reporter(config)
-                await reporter.connect()
-
-                try:
-                    await reporter.submit_workflow_results(workflow_stats)
-                    await reporter.submit_step_results(workflow_stats)
-                    workflows_submitted += 1
-                finally:
-                    await reporter.close()
-
-            success = True
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerInfo(
-                    message=f"Successfully submitted {workflows_submitted} workflow(s) for job {job_id} to JSON files",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-
-        except Exception as e:
-            error_message = str(e)
-            self._task_runner.run(
-                self._udp_logger.log,
-                ServerWarning(
-                    message=f"Failed to submit job {job_id} results to JSON: {e}",
-                    node_host=self._host,
-                    node_port=self._tcp_port,
-                    node_id=self._node_id.short,
-                )
-            )
-
-        elapsed = time.monotonic() - start_time
-
-        # Send result push to client
-        if callback_addr:
-            result_push = ReporterResultPush(
-                job_id=job_id,
-                reporter_type="json",
-                success=success,
-                error=error_message,
-                elapsed_seconds=elapsed,
-            )
-            try:
-                await self.send_tcp(
-                    callback_addr,
-                    "reporter_result_push",
-                    result_push.dump(),
-                    timeout=5.0,
-                )
-            except Exception:
-                pass  # Best effort notification
-
-        # Cleanup task tracking
-        self._cleanup_reporter_task(job_id, "json_default")
 
     async def _submit_to_reporter(
         self,
