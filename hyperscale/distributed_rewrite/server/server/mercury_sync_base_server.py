@@ -1012,12 +1012,10 @@ class MercurySyncBaseServer(Generic[T]):
                 self._udp_drop_counter.increment_decryption_failed()
                 return
 
-            decrypted = self._decompressor.decompress(decrypted_data)
-
-            # Validate decompressed size
-            if len(decrypted) > MAX_DECOMPRESSED_SIZE:
-                self._udp_drop_counter.increment_decompression_too_large()
-                return
+            decrypted = self._decompressor.decompress(
+                decrypted_data,
+                max_output_size=MAX_DECOMPRESSED_SIZE,
+            )
 
             # Parse length-prefixed UDP message format:
             # type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
@@ -1067,15 +1065,10 @@ class MercurySyncBaseServer(Generic[T]):
     ):
         try:
             decrypted_data = self._encryptor.decrypt(data)
-            decrypted = self._decompressor.decompress(decrypted_data)
-
-            # Validate decompressed size (same as server request handling)
-            if len(decrypted) > MAX_DECOMPRESSED_SIZE:
-                await self._log_security_warning(
-                    "TCP client response decompressed message too large",
-                    protocol="tcp",
-                )
-                return
+            decrypted = self._decompressor.decompress(
+                decrypted_data,
+                max_output_size=MAX_DECOMPRESSED_SIZE,
+            )
         except Exception as decompression_error:
             await self._log_security_warning(
                 f"TCP client response decompression failed: {type(decompression_error).__name__}",
@@ -1151,12 +1144,10 @@ class MercurySyncBaseServer(Generic[T]):
                 self._tcp_drop_counter.increment_decryption_failed()
                 return
 
-            decrypted = self._decompressor.decompress(decrypted_data)
-
-            # Validate decompressed size
-            if len(decrypted) > MAX_DECOMPRESSED_SIZE:
-                self._tcp_drop_counter.increment_decompression_too_large()
-                return
+            decrypted = self._decompressor.decompress(
+                decrypted_data,
+                max_output_size=MAX_DECOMPRESSED_SIZE,
+            )
 
             # Parse length-prefixed message format:
             # address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
