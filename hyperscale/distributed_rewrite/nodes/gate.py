@@ -146,6 +146,7 @@ from hyperscale.distributed_rewrite.protocol.version import (
     CURRENT_PROTOCOL_VERSION,
     get_features_for_version,
 )
+from hyperscale.distributed_rewrite.discovery import DiscoveryService
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 
 
@@ -440,7 +441,32 @@ class GateServer(HealthAwareServer):
         # Register known DCs with correlation detector
         for dc_id in self._datacenter_managers.keys():
             self._cross_dc_correlation.add_datacenter(dc_id)
-    
+
+        # Discovery services for adaptive manager selection per datacenter (AD-28)
+        # Each datacenter has its own DiscoveryService for locality-aware selection
+        self._dc_manager_discovery: dict[str, DiscoveryService] = {}
+        self._discovery_failure_decay_interval: float = env.DISCOVERY_FAILURE_DECAY_INTERVAL
+        self._discovery_maintenance_task: asyncio.Task | None = None
+
+        # Initialize discovery service per datacenter
+        for datacenter_id, manager_addrs in self._datacenter_managers.items():
+            static_seeds = [f"{host}:{port}" for host, port in manager_addrs]
+            dc_discovery_config = env.get_discovery_config(
+                node_role="gate",
+                static_seeds=static_seeds,
+            )
+            dc_discovery = DiscoveryService(dc_discovery_config)
+            # Pre-register configured managers
+            for host, port in manager_addrs:
+                dc_discovery.add_peer(
+                    peer_id=f"{host}:{port}",  # Use addr as initial ID until heartbeat received
+                    host=host,
+                    port=port,
+                    role="manager",
+                    datacenter_id=datacenter_id,
+                )
+            self._dc_manager_discovery[datacenter_id] = dc_discovery
+
     def _on_node_dead(self, node_addr: tuple[str, int]) -> None:
         """
         Called when a node is marked as DEAD via SWIM.
@@ -590,6 +616,19 @@ class GateServer(HealthAwareServer):
             self._datacenter_manager_status[dc] = {}
         self._datacenter_manager_status[dc][manager_addr] = heartbeat
         self._manager_last_status[manager_addr] = time.monotonic()
+
+        # Update discovery service with manager info (AD-28)
+        if dc in self._dc_manager_discovery:
+            discovery = self._dc_manager_discovery[dc]
+            # Use actual node_id from heartbeat (better than synthetic addr-based ID)
+            peer_id = heartbeat.node_id if heartbeat.node_id else f"{manager_addr[0]}:{manager_addr[1]}"
+            discovery.add_peer(
+                peer_id=peer_id,
+                host=manager_addr[0],
+                port=manager_addr[1],
+                role="manager",
+                datacenter_id=dc,
+            )
 
         # Update three-signal health state (AD-19)
         manager_key = (dc, manager_addr)
@@ -2689,6 +2728,9 @@ class GateServer(HealthAwareServer):
         # Start windowed stats push loop for streaming progress to clients
         self._task_runner.run(self._windowed_stats_push_loop)
 
+        # Start discovery maintenance loop (AD-28)
+        self._discovery_maintenance_task = asyncio.create_task(self._discovery_maintenance_loop())
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -2709,6 +2751,14 @@ class GateServer(HealthAwareServer):
         """Stop the gate server."""
         # Set _running to False early to stop all background loops
         self._running = False
+
+        # Cancel discovery maintenance loop (AD-28)
+        if self._discovery_maintenance_task and not self._discovery_maintenance_task.done():
+            self._discovery_maintenance_task.cancel()
+            try:
+                await self._discovery_maintenance_task
+            except asyncio.CancelledError:
+                pass
 
         # Stop federated health monitor
         await self._dc_health_monitor.stop()
@@ -5637,3 +5687,84 @@ class GateServer(HealthAwareServer):
         except Exception:
             # Client unreachable - continue, will retry next window
             pass
+
+    async def _discovery_maintenance_loop(self) -> None:
+        """
+        Background loop for discovery service maintenance (AD-28).
+
+        Periodically:
+        - Decays failure counts to allow managers to recover
+        - Cleans up expired DNS cache entries
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._discovery_failure_decay_interval)
+
+                # Decay failure counts for all DC discovery services
+                for discovery in self._dc_manager_discovery.values():
+                    discovery.decay_failures()
+                    discovery.cleanup_expired_dns()
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    def _select_best_manager_for_dc(self, datacenter_id: str, key: str) -> tuple[str, int] | None:
+        """
+        Select the best manager in a datacenter using adaptive selection (AD-28).
+
+        Uses Power of Two Choices with EWMA for load-aware selection.
+
+        Args:
+            datacenter_id: The datacenter to select from
+            key: Key for consistent selection (e.g., job_id)
+
+        Returns:
+            Tuple of (host, port) for the selected manager, or None if no managers available
+        """
+        discovery = self._dc_manager_discovery.get(datacenter_id)
+        if discovery is None:
+            return None
+
+        # Only consider healthy managers (via three-signal health)
+        def is_healthy(peer_id: str) -> bool:
+            addr = discovery.get_peer_address(peer_id)
+            if addr is None:
+                return False
+            manager_key = (datacenter_id, addr)
+            health_state = self._manager_health.get(manager_key)
+            if health_state is None:
+                return True  # Assume healthy if not yet tracked
+            routing = health_state.get_routing_decision()
+            return routing.should_route
+
+        selection = discovery.select_peer_with_filter(key, is_healthy)
+        if selection is not None:
+            return discovery.get_peer_address(selection.peer_id)
+        return None
+
+    def _record_manager_success(self, datacenter_id: str, manager_id: str, latency_ms: float) -> None:
+        """
+        Record a successful request to a manager (AD-28).
+
+        Args:
+            datacenter_id: The datacenter the manager belongs to
+            manager_id: The manager that handled the request
+            latency_ms: Request latency in milliseconds
+        """
+        discovery = self._dc_manager_discovery.get(datacenter_id)
+        if discovery is not None:
+            discovery.record_success(manager_id, latency_ms)
+
+    def _record_manager_failure(self, datacenter_id: str, manager_id: str) -> None:
+        """
+        Record a failed request to a manager (AD-28).
+
+        Args:
+            datacenter_id: The datacenter the manager belongs to
+            manager_id: The manager that failed
+        """
+        discovery = self._dc_manager_discovery.get(datacenter_id)
+        if discovery is not None:
+            discovery.record_failure(manager_id)
