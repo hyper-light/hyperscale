@@ -107,8 +107,8 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     """
 
     def __init__(
-        self, 
-        *args, 
+        self,
+        *args,
         dc_id: str = "default",
         priority: int = 50,
         # State embedding (Serf-style heartbeat in SWIM messages)
@@ -120,6 +120,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         rate_limit_cache_size: int = 500,  # Track at most 500 senders
         rate_limit_tokens: int = 100,      # Max tokens per sender
         rate_limit_refill: float = 10.0,   # Tokens per second
+        # Refutation rate limiting - prevents incarnation exhaustion attacks
+        refutation_rate_limit_tokens: int = 5,  # Max refutations per window
+        refutation_rate_limit_window: float = 10.0,  # Window duration in seconds
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -135,6 +138,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._incarnation_tracker = IncarnationTracker()
         self._suspicion_manager = SuspicionManager()
         self._indirect_probe_manager = IndirectProbeManager()
+
+        # Direct probe ACK tracking - key is target addr, value is Future set when ACK received
+        self._pending_probe_acks: dict[tuple[str, int], asyncio.Future[bool]] = {}
+
         self._gossip_buffer = GossipBuffer()
         self._gossip_buffer.set_overflow_callback(self._on_gossip_overflow)
         self._probe_scheduler = ProbeScheduler()
@@ -189,6 +196,13 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self._rate_limit_tokens: int = rate_limit_tokens
         self._rate_limit_refill: float = rate_limit_refill
         self._rate_limit_stats = {'accepted': 0, 'rejected': 0}
+
+        # Refutation rate limiting - prevent incarnation exhaustion attacks
+        # Configurable via init params or Env settings
+        self._refutation_rate_limit_tokens: int = refutation_rate_limit_tokens
+        self._refutation_rate_limit_window: float = refutation_rate_limit_window
+        self._last_refutation_time: float = 0.0
+        self._refutation_count_in_window: int = 0
         
         # Initialize error handler (logger set up after server starts)
         self._error_handler: ErrorHandler | None = None
@@ -1021,6 +1035,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     
     def _on_suspicion_expired(self, node: tuple[str, int], incarnation: int) -> None:
         """Callback when a suspicion expires - mark node as DEAD."""
+        # DEBUG: Track when nodes are marked DEAD
+        print(f"[DEBUG SWIM {self._udp_port}] _on_suspicion_expired: {node} marked DEAD (incarnation={incarnation})")
+
         self._metrics.increment('suspicions_expired')
         self._audit_log.record(
             AuditEventType.NODE_CONFIRMED_DEAD,
@@ -1028,9 +1045,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             incarnation=incarnation,
         )
         self._incarnation_tracker.update_node(
-            node, 
-            b'DEAD', 
-            incarnation, 
+            node,
+            b'DEAD',
+            incarnation,
             time.monotonic(),
         )
         # Queue the death notification for gossip
@@ -1043,6 +1060,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         self.update_probe_scheduler_membership()
 
         # Invoke registered callbacks (composition pattern)
+        print(f"[DEBUG SWIM {self._udp_port}] Invoking {len(self._on_node_dead_callbacks)} on_node_dead callbacks for {node}")
         for callback in self._on_node_dead_callbacks:
             try:
                 callback(node)
@@ -1387,22 +1405,24 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         target = self._probe_scheduler.get_next_target()
         if target is None:
             return
-        
+
         if self.udp_target_is_self(target):
             return
-        
+
         # Use ErrorContext for consistent error handling throughout the probe
         async with ErrorContext(self._error_handler, f"probe_round_{target[0]}_{target[1]}") as ctx:
             node_state = self._incarnation_tracker.get_node_state(target)
             incarnation = node_state.incarnation if node_state else 0
-            
+
             base_timeout = self._context.read('current_timeout')
             timeout = self.get_lhm_adjusted_timeout(base_timeout)
-            
+
             target_addr = f'{target[0]}:{target[1]}'.encode()
             probe_msg = b'probe>' + target_addr + self.get_piggyback_data()
-            
+
+            print(f"[DEBUG SWIM {self._udp_port}] PROBE sending to {target}")
             response_received = await self._probe_with_timeout(target, probe_msg, timeout)
+            print(f"[DEBUG SWIM {self._udp_port}] PROBE to {target} response_received={response_received}")
 
             # Exit early if shutting down
             if not self._running:
@@ -1442,16 +1462,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             await self.broadcast_suspicion(target, incarnation)
     
     async def _probe_with_timeout(
-        self, 
-        target: tuple[str, int], 
+        self,
+        target: tuple[str, int],
         message: bytes,
         timeout: float,
     ) -> bool:
         """
         Send a probe message with retries before falling back to indirect.
-        
+
         Uses PROBE_RETRY_POLICY for retry logic with exponential backoff.
-        Returns True if probe succeeded, False if all retries exhausted.
+        Returns True if probe succeeded (ACK received), False if all retries exhausted.
+
+        Uses Future-based ACK tracking: we wait for the actual ACK message to arrive,
+        not just checking cached node state which could be stale.
         """
         self._metrics.increment('probes_sent')
         attempt = 0
@@ -1463,19 +1486,33 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 return False
 
             try:
+                # Create a Future to wait for ACK from this specific probe
+                # Cancel any existing pending probe to the same target (stale)
+                existing_future = self._pending_probe_acks.pop(target, None)
+                if existing_future and not existing_future.done():
+                    existing_future.cancel()
+
+                ack_future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+                self._pending_probe_acks[target] = ack_future
+
                 # Send probe
                 await self.send(target, message, timeout=timeout)
-                
-                # Wait for potential response (reduced time for retries)
+
+                # Wait for ACK with timeout (reduced time for retries)
                 wait_time = timeout * 0.5 if attempt < max_attempts - 1 else timeout * 0.8
-                await asyncio.sleep(wait_time)
-                
-                # Check if we got an ack (tracked via incarnation/node state)
-                node_state = self._incarnation_tracker.get_node_state(target)
-                if node_state and node_state.status == b'OK':
-                    self._metrics.increment('probes_received')  # Got response
+
+                try:
+                    await asyncio.wait_for(ack_future, timeout=wait_time)
+                    # Future completed means ACK was received
+                    self._metrics.increment('probes_received')
                     return True
-                
+                except asyncio.TimeoutError:
+                    # No ACK received within timeout, try again
+                    pass
+                finally:
+                    # Clean up the pending probe entry
+                    self._pending_probe_acks.pop(target, None)
+
                 attempt += 1
                 if attempt < max_attempts:
                     # Exponential backoff with jitter before retry
@@ -1484,24 +1521,25 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     )
                     jitter = random.uniform(0, PROBE_RETRY_POLICY.jitter * backoff)
                     await asyncio.sleep(backoff + jitter)
-                    
-            except asyncio.TimeoutError:
-                attempt += 1
-                if attempt >= max_attempts:
-                    self._metrics.increment('probes_timeout')
-                    await self.handle_error(ProbeTimeoutError(target, timeout))
-                    return False
+
+            except asyncio.CancelledError:
+                # Clean up on cancellation
+                self._pending_probe_acks.pop(target, None)
+                raise
             except OSError as e:
                 # Network error - wrap with appropriate error type
+                self._pending_probe_acks.pop(target, None)
                 self._metrics.increment('probes_failed')
                 await self.handle_error(self._make_network_error(e, target, "Probe"))
                 return False
             except Exception as e:
+                self._pending_probe_acks.pop(target, None)
                 self._metrics.increment('probes_failed')
                 await self.handle_exception(e, f"probe_{target[0]}_{target[1]}")
                 return False
-        
-        self._metrics.increment('probes_failed')
+
+        self._metrics.increment('probes_timeout')
+        await self.handle_error(ProbeTimeoutError(target, timeout))
         return False
     
     def stop_probe_cycle(self) -> None:
@@ -1618,6 +1656,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         except Exception as e:
             if self._error_handler:
                 await self.handle_exception(e, "shutdown_stop_probe_cycle")
+
+        # Cancel all pending probe ACK futures
+        for future in self._pending_probe_acks.values():
+            if not future.done():
+                future.cancel()
+        self._pending_probe_acks.clear()
 
         # Stop leader election (stops sending heartbeats)
         try:
@@ -2152,13 +2196,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Get previous state before updating
         previous_state = self._incarnation_tracker.get_node_state(node)
         was_dead = previous_state and previous_state.status == b'DEAD'
+        prev_status = previous_state.status if previous_state else b'UNKNOWN'
 
         # Perform the actual update
         updated = self._incarnation_tracker.update_node(node, status, incarnation, timestamp)
 
+        # DEBUG: Track state transitions
+        if updated:
+            print(f"[DEBUG SWIM {self._udp_port}] update_node_state: {node} {prev_status} -> {status} (updated={updated}, was_dead={was_dead})")
+
         # If node was DEAD and is now being set to OK/ALIVE, invoke join callbacks
         # This handles recovery detection for nodes that come back after being marked dead
         if updated and was_dead and status in (b'OK', b'ALIVE'):
+            print(f"[DEBUG SWIM {self._udp_port}] DEAD->OK transition detected for {node}, invoking {len(self._on_node_join_callbacks)} callbacks")
             self._metrics.increment('node_recoveries_detected')
             self._audit_log.record(
                 AuditEventType.NODE_RECOVERED,
@@ -2187,6 +2237,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         from_node: tuple[str, int],
     ) -> SuspicionState | None:
         """Start suspecting a node or add confirmation to existing suspicion."""
+        # DEBUG: Track when suspicion starts
+        print(f"[DEBUG SWIM {self._udp_port}] start_suspicion: {node} suspected by {from_node} (incarnation={incarnation})")
+
         self._metrics.increment('suspicions_started')
         self._audit_log.record(
             AuditEventType.NODE_SUSPECTED,
@@ -2406,10 +2459,29 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     async def broadcast_refutation(self) -> int:
         """
         Broadcast an alive message to refute any suspicions about this node.
-        
+
         Uses retry_with_backoff for each send since refutation is critical.
         Tracks send failures and logs them but doesn't fail the overall operation.
+
+        Rate limited to prevent incarnation exhaustion attacks - if an attacker
+        sends many probes/suspects about us, we don't want to burn through
+        all possible incarnation numbers.
         """
+        # Rate limiting check
+        now = time.monotonic()
+        window_elapsed = now - self._last_refutation_time
+
+        if window_elapsed >= self._refutation_rate_limit_window:
+            # Reset window
+            self._last_refutation_time = now
+            self._refutation_count_in_window = 1
+        else:
+            self._refutation_count_in_window += 1
+            if self._refutation_count_in_window > self._refutation_rate_limit_tokens:
+                # Rate limited - return current incarnation without incrementing
+                print(f"[DEBUG SWIM {self._udp_port}] Refutation rate limited: {self._refutation_count_in_window} in window")
+                return self._incarnation_tracker.get_self_incarnation()
+
         new_incarnation = self.increment_incarnation()
         
         nodes: Nodes = self._context.read('nodes')
@@ -2668,6 +2740,7 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         data: Message,
         clock_time: int,
     ) -> Message:
+        print(f"[DEBUG SWIM {self._udp_port}] UDP RECEIVE from {addr}, data_len={len(data)}, first_bytes={data[:50] if data else b''}")
         try:
             # Validate message size first - prevent memory issues from oversized messages
             if len(data) > MAX_UDP_PAYLOAD:
@@ -2757,22 +2830,57 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
             msg_type = message.split(b':', maxsplit=1)[0]
 
             match msg_type:
-                case b'ack' | b'nack':
-                    # ack/nack may or may not have target
+                case b'ack':
                     # When we receive an ack, mark the SOURCE (addr) as alive
                     # This is critical for probe responses - the source is the
                     # node that responded to our probe
+                    print(f"[DEBUG SWIM {self._udp_port}] ACK received from {addr}")
+
+                    # Complete any pending probe Future for this address
+                    # This unblocks _probe_with_timeout waiting for ACK
+                    pending_future = self._pending_probe_acks.get(addr)
+                    if pending_future and not pending_future.done():
+                        pending_future.set_result(True)
+                        print(f"[DEBUG SWIM {self._udp_port}] ACK: completed pending probe future for {addr}")
+
                     nodes: Nodes = self._context.read('nodes')
                     if addr in nodes:
                         # Update node state - use update_node_state to trigger recovery
                         # callbacks if node was previously DEAD
+                        print(f"[DEBUG SWIM {self._udp_port}] ACK: addr {addr} in nodes, updating state to OK")
                         self.update_node_state(addr, b'OK', 0, time.monotonic())
                         await self.decrease_failure_detector('successful_probe')
+                    else:
+                        print(f"[DEBUG SWIM {self._udp_port}] ACK: addr {addr} NOT in nodes, skipping update")
                     if target:
                         if target not in nodes:
                             await self.increase_failure_detector('missed_nack')
-                            return b'nack>' + self._udp_addr_slug
+                            return b'nack:unknown>' + self._udp_addr_slug
                         await self.decrease_failure_detector('successful_nack')
+                    return b'ack>' + self._udp_addr_slug
+
+                case b'nack':
+                    # NACK means the sender couldn't reach the target or doesn't know it
+                    # Per Lifeguard: nack:unknown = not in membership, nack:unreachable = can't contact
+                    # nack:invalid = malformed request
+                    # We should NOT complete the pending probe future - let it timeout
+                    print(f"[DEBUG SWIM {self._udp_port}] NACK received from {addr}, message={message[:50]}")
+
+                    # Parse NACK reason if present (nack:reason>addr)
+                    nack_reason = b'unspecified'
+                    if b':' in msg_type or b':' in message.split(b'>', 1)[0]:
+                        parts = message.split(b'>', 1)[0].split(b':')
+                        if len(parts) >= 2:
+                            nack_reason = parts[1]
+
+                    # The sender (addr) is alive since it responded, just couldn't help
+                    nodes: Nodes = self._context.read('nodes')
+                    if addr in nodes:
+                        self.update_node_state(addr, b'OK', 0, time.monotonic())
+
+                    # Log the NACK reason for diagnostics
+                    print(f"[DEBUG SWIM {self._udp_port}] NACK reason: {nack_reason}")
+
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'join':
@@ -2853,9 +2961,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         )
 
                         await self._safe_queue_put(nodes[target], (clock_time, b'OK'), target)
-                        
+
                         self._probe_scheduler.add_member(target)
-                        
+
+                        # DEBUG: Track join message processing
+                        print(f"[DEBUG SWIM {self._udp_port}] JOIN message: {target} joined cluster, invoking {len(self._on_node_join_callbacks)} callbacks")
+
                         # Invoke registered callbacks (composition pattern)
                         for callback in self._on_node_join_callbacks:
                             try:
@@ -2909,25 +3020,34 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                         return b'ack>' + self._udp_addr_slug
 
                 case b'probe':
+                    print(f"[DEBUG SWIM {self._udp_port}] PROBE received from {addr}, target={target}")
                     if not await self._validate_target(target, b'probe', addr):
+                        print(f"[DEBUG SWIM {self._udp_port}] PROBE: target validation failed")
                         return b'nack>' + self._udp_addr_slug
-                    
+
                     async with self._context.with_value(target):
                         nodes: Nodes = self._context.read('nodes')
 
                         if self.udp_target_is_self(target):
+                            print(f"[DEBUG SWIM {self._udp_port}] PROBE: target is self, sending refutation")
                             await self.increase_failure_detector('refutation')
                             new_incarnation = await self.broadcast_refutation()
                             # Include embedded state when proving we're alive
                             base = b'alive:' + str(new_incarnation).encode() + b'>' + self._udp_addr_slug
                             state = self._get_embedded_state()
+                            print(f"[DEBUG SWIM {self._udp_port}] PROBE refutation: state={state is not None}, state_len={len(state) if state else 0}")
                             if state:
                                 import base64
                                 return base + self._STATE_SEPARATOR + base64.b64encode(state)
                             return base
-                        
+
                         if target not in nodes:
-                            return b'nack>' + self._udp_addr_slug
+                            # Per Lifeguard: distinguish "unknown" (not in membership) from
+                            # "unreachable" (in membership but can't contact)
+                            print(f"[DEBUG SWIM {self._udp_port}] PROBE: target {target} not in nodes, sending nack:unknown")
+                            return b'nack:unknown>' + self._udp_addr_slug
+
+                        print(f"[DEBUG SWIM {self._udp_port}] PROBE: sending ack to {target}")
 
                         base_timeout = self._context.read('current_timeout')
                         timeout = self.get_lhm_adjusted_timeout(base_timeout)
@@ -2977,9 +3097,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 case b'ping-req':
                     async with self._context.with_value(target):
                         nodes: Nodes = self._context.read('nodes')
-                        
+
                         if target is None:
-                            return b'nack>' + self._udp_addr_slug
+                            return b'nack:invalid>' + self._udp_addr_slug
                         
                         if self.udp_target_is_self(target):
                             # Include embedded state when responding to indirect probe
@@ -3033,18 +3153,26 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 
                 case b'alive':
                     msg_incarnation = await self._parse_incarnation_safe(message, addr)
-                    
+
+                    # Complete any pending probe Future for this address
+                    # 'alive' is sent as a response when a node is probed about itself
+                    # This is equivalent to an ACK for probe purposes
+                    pending_future = self._pending_probe_acks.get(addr)
+                    if pending_future and not pending_future.done():
+                        pending_future.set_result(True)
+                        print(f"[DEBUG SWIM {self._udp_port}] ALIVE: completed pending probe future for {addr}")
+
                     if target:
                         if self.is_message_fresh(target, msg_incarnation, b'OK'):
                             await self.refute_suspicion(target, msg_incarnation)
                             self.update_node_state(
-                                target, 
-                                b'OK', 
-                                msg_incarnation, 
+                                target,
+                                b'OK',
+                                msg_incarnation,
                                 time.monotonic(),
                             )
                             await self.decrease_failure_detector('successful_probe')
-                    
+
                     return b'ack>' + self._udp_addr_slug
                 
                 case b'suspect':
