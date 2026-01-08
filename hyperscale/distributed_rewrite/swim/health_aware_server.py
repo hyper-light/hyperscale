@@ -737,32 +737,32 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         """
         Build an ack response with embedded state for a specific address.
 
-        Format: ack>host:port#base64_state (if state available)
-                ack>host:port (if no state)
+        Format: ack>host:port#base64_state|membership_gossip#h|health_gossip
+
+        This method adds:
+        1. Serf-style embedded state (heartbeat) after #
+        2. Membership gossip piggyback after |
+        3. Health gossip piggyback after #h|
 
         Args:
             addr_slug: The address slug to include in the ack (e.g., b'127.0.0.1:9000')
 
         Returns:
-            Ack message bytes with optional embedded state.
+            Ack message bytes with embedded state and gossip piggyback.
         """
-
         base_ack = b'ack>' + addr_slug
 
+        # Add Serf-style embedded state (heartbeat)
         state = self._get_embedded_state()
-        if state is None:
-            return base_ack
+        if state is not None:
+            encoded_state = b64encode(state)
+            ack_with_state = base_ack + self._STATE_SEPARATOR + encoded_state
+            # Check if state fits
+            if len(ack_with_state) <= MAX_UDP_PAYLOAD:
+                base_ack = ack_with_state
 
-        # Encode state as base64 to avoid byte issues
-        encoded_state = b64encode(state)
-
-        # Check if adding state would exceed MTU
-        full_message = base_ack + self._STATE_SEPARATOR + encoded_state
-        if len(full_message) > MAX_UDP_PAYLOAD:
-            # State too large, skip it
-            return base_ack
-
-        return full_message
+        # Add gossip piggyback (membership + health) - Phase 6.1 compliant
+        return self._add_piggyback_safe(base_ack)
     
     def _extract_embedded_state(
         self,
