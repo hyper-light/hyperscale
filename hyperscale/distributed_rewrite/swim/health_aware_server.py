@@ -771,41 +771,64 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     ) -> bytes:
         """
         Extract and process embedded state from an incoming message.
-        
+
         Separates the message content from any embedded state, processes
         the state if present, and returns the clean message.
-        
+
+        Wire format: msg_type>host:port#base64_state|membership_piggyback#h|health_gossip
+
+        Parsing order is critical - must match the reverse of how piggyback is added:
+        1. Strip health gossip (#h|...) - added last, strip first
+        2. Strip membership piggyback (|...) - added second, strip second
+        3. Extract state (#base64) - part of base message
+
         Args:
-            message: Raw message that may contain embedded state.
+            message: Raw message that may contain embedded state and piggyback.
             source_addr: The (host, port) of the sender.
-        
+
         Returns:
-            The message with embedded state removed.
+            The message with embedded state and piggyback removed.
         """
-        
-        # Find state separator in the address portion
-        # Format: msg_type>host:port#base64_state
-        sep_idx = message.rfind(self._STATE_SEPARATOR)
+        # Step 1: Strip health gossip piggyback (format: #h|entry1#entry2#...)
+        # This MUST be first because health piggyback uses '#' as entry separator,
+        # which conflicts with the state separator.
+        health_idx = message.find(b'#h|')
+        if health_idx > 0:
+            health_piggyback = message[health_idx:]
+            message = message[:health_idx]
+            self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback)
+
+        # Step 2: Strip membership piggyback (format: |type:incarnation:host:port|...)
+        # Membership piggyback is added AFTER state, so it appears between state and health.
+        membership_idx = message.find(b'|')
+        if membership_idx > 0:
+            membership_piggyback = message[membership_idx:]
+            message = message[:membership_idx]
+            # Process membership piggyback asynchronously
+            self._task_runner.run(self.process_piggyback_data, membership_piggyback)
+
+        # Step 3: Extract state from address portion
+        # Format after stripping piggyback: msg_type>host:port#base64_state
+        addr_sep_idx = message.find(b'>')
+        if addr_sep_idx < 0:
+            return message
+
+        # Find the state separator AFTER the '>' (first # in address portion)
+        sep_idx = message.find(self._STATE_SEPARATOR, addr_sep_idx)
         if sep_idx < 0:
             return message
-        
-        # Check if separator is after the '>' (in address portion)
-        addr_sep_idx = message.find(b'>')
-        if addr_sep_idx < 0 or sep_idx < addr_sep_idx:
-            # Separator is in message type, not state
-            return message
-        
+
         # Extract and decode state
         clean_message = message[:sep_idx]
         encoded_state = message[sep_idx + 1:]
-        
+
         try:
             state_data = b64decode(encoded_state)
             self._process_embedded_state(state_data, source_addr)
         except Exception:
             # Invalid base64 or processing error - ignore silently
             pass
-        
+
         return clean_message
     
     # === Message Size Helpers ===
