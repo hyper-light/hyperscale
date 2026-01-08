@@ -225,6 +225,23 @@ class ManagerServer(HealthAwareServer):
         self._healthy_gate_ids: set[str] = set()  # Currently healthy gate node_ids
         self._primary_gate_id: str | None = None  # Primary gate (prefer leader)
 
+        # Gate UDP to TCP address mapping for SWIM failure/recovery callbacks
+        # Maps UDP addr (from SWIM source_addr) -> TCP addr (from heartbeat)
+        # Critical: SWIM callbacks receive UDP addresses, but we track by TCP
+        self._gate_udp_to_tcp: dict[tuple[str, int], tuple[str, int]] = {}
+        for i, tcp_addr in enumerate(self._seed_gates):
+            if i < len(self._gate_udp_addrs):
+                self._gate_udp_to_tcp[self._gate_udp_addrs[i]] = tcp_addr
+
+        # Per-gate locks protecting gate state modifications to prevent race conditions
+        # between concurrent failure/recovery handlers for the SAME gate (asyncio task interleaving)
+        # Keyed by gate node_id since that's how we track gate state
+        self._gate_state_locks: dict[str, asyncio.Lock] = {}
+
+        # Monotonic epoch per gate node_id to detect stale failure/recovery operations
+        # Incremented on each state change; handlers check epoch hasn't changed after await
+        self._gate_state_epoch: dict[str, int] = {}
+
         # Protocol version negotiation with gates (AD-25)
         # Maps gate_id -> NegotiatedCapabilities
         self._gate_negotiated_caps: dict[str, NegotiatedCapabilities] = {}
@@ -598,9 +615,10 @@ class ManagerServer(HealthAwareServer):
         """
         Called when a node is marked as DEAD via SWIM.
 
-        Handles both worker and manager peer failures:
+        Handles worker, manager peer, and gate failures:
         - Worker death → triggers workflow retry on other workers
         - Manager peer death → updates quorum tracking, logs for debugging
+        - Gate death → updates gate tracking, clears primary if needed
 
         Note: Leadership handling is automatic via lease expiry in LocalLeaderElection.
         If the dead manager was the leader, lease will expire and trigger re-election.
@@ -625,6 +643,22 @@ class ManagerServer(HealthAwareServer):
                         self._manager_peer_unhealthy_since[manager_id] = time.monotonic()
                     break
             self._task_runner.run(self._handle_manager_peer_failure, node_addr, manager_tcp_addr)
+            return
+
+        # Check if this is a gate
+        gate_tcp_addr = self._gate_udp_to_tcp.get(node_addr)
+        if gate_tcp_addr:
+            # Find gate node_id if known
+            gate_node_id: str | None = None
+            for gate_id, gate_info in self._known_gates.items():
+                if (gate_info.tcp_host, gate_info.tcp_port) == gate_tcp_addr:
+                    gate_node_id = gate_id
+                    if gate_id not in self._gate_unhealthy_since:
+                        self._gate_unhealthy_since[gate_id] = time.monotonic()
+                    break
+            self._task_runner.run(
+                self._handle_gate_peer_failure, node_addr, gate_tcp_addr, gate_node_id
+            )
     
     def _on_node_join(self, node_addr: tuple[str, int]) -> None:
         """
@@ -633,6 +667,7 @@ class ManagerServer(HealthAwareServer):
         Handles node recovery:
         - Worker rejoin → clears unhealthy tracking (re-registration via TCP)
         - Manager peer rejoin → adds back to active peers set for quorum, clears unhealthy tracking
+        - Gate rejoin → adds back to healthy gates set
 
         Worker joins are handled via register_worker TCP flow, not here.
         """
@@ -652,6 +687,21 @@ class ManagerServer(HealthAwareServer):
                     self._manager_peer_unhealthy_since.pop(manager_id, None)
                     break
             self._task_runner.run(self._handle_manager_peer_recovery, node_addr, manager_tcp_addr)
+            return
+
+        # Check if this is a gate
+        gate_tcp_addr = self._gate_udp_to_tcp.get(node_addr)
+        if gate_tcp_addr:
+            # Find gate node_id if known
+            gate_node_id: str | None = None
+            for gate_id, gate_info in self._known_gates.items():
+                if (gate_info.tcp_host, gate_info.tcp_port) == gate_tcp_addr:
+                    gate_node_id = gate_id
+                    self._gate_unhealthy_since.pop(gate_id, None)
+                    break
+            self._task_runner.run(
+                self._handle_gate_peer_recovery, node_addr, gate_tcp_addr, gate_node_id
+            )
 
     def _get_peer_state_lock(self, peer_addr: tuple[str, int]) -> asyncio.Lock:
         """
@@ -821,6 +871,192 @@ class ManagerServer(HealthAwareServer):
         # Check if the dead manager was leading any jobs
         # If we're the cluster leader, take over those jobs
         await self._handle_job_leader_failure(tcp_addr)
+
+    def _get_gate_state_lock(self, gate_id: str) -> asyncio.Lock:
+        """
+        Get or create a lock for a specific gate node_id.
+
+        Per-gate locks allow concurrent failure/recovery operations on different gates
+        while ensuring serialization for operations on the same gate.
+        """
+        if gate_id not in self._gate_state_locks:
+            self._gate_state_locks[gate_id] = asyncio.Lock()
+        return self._gate_state_locks[gate_id]
+
+    async def _handle_gate_peer_failure(
+        self,
+        udp_addr: tuple[str, int],
+        tcp_addr: tuple[str, int],
+        gate_node_id: str | None,
+    ) -> None:
+        """
+        Handle a gate becoming unavailable (detected via SWIM).
+
+        Actions:
+        1. If gate_node_id known, acquire per-gate lock and increment epoch
+        2. Remove from healthy_gate_ids
+        3. Clear primary_gate_id if this was the primary
+        4. Log the failure for debugging
+
+        Thread safety:
+        - Uses per-gate lock (by node_id) to coordinate with recovery handler
+        - Increments epoch to invalidate any in-flight recovery operations
+        """
+        if gate_node_id:
+            gate_lock = self._get_gate_state_lock(gate_node_id)
+            async with gate_lock:
+                # Increment epoch to invalidate any pending recovery operations
+                self._gate_state_epoch[gate_node_id] = self._gate_state_epoch.get(gate_node_id, 0) + 1
+
+                # Remove from healthy gates
+                self._healthy_gate_ids.discard(gate_node_id)
+
+                # Clear primary if this was the primary gate
+                if self._primary_gate_id == gate_node_id:
+                    self._primary_gate_id = None
+                    # Try to select a new primary from remaining healthy gates
+                    for healthy_gate_id in self._healthy_gate_ids:
+                        gate_info = self._known_gates.get(healthy_gate_id)
+                        if gate_info and gate_info.is_leader:
+                            self._primary_gate_id = healthy_gate_id
+                            break
+                    # If no leader found, just pick any healthy gate
+                    if self._primary_gate_id is None and self._healthy_gate_ids:
+                        self._primary_gate_id = next(iter(self._healthy_gate_ids))
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Gate {gate_node_id[:8]}... at {tcp_addr} (UDP: {udp_addr}) marked as DEAD"
+                            f" - primary is now {self._primary_gate_id[:8] if self._primary_gate_id else 'NONE'}...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+        else:
+            # Gate not in _known_gates yet - just log
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Unknown gate at {tcp_addr} (UDP: {udp_addr}) marked as DEAD (not in _known_gates)",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        # Log gate cluster status
+        healthy_count = len(self._healthy_gate_ids)
+        known_count = len(self._known_gates)
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Gate cluster: {healthy_count}/{known_count} healthy, primary={self._primary_gate_id[:8] if self._primary_gate_id else 'NONE'}...",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+    async def _handle_gate_peer_recovery(
+        self,
+        udp_addr: tuple[str, int],
+        tcp_addr: tuple[str, int],
+        gate_node_id: str | None,
+    ) -> None:
+        """
+        Handle a gate recovering/rejoining the cluster.
+
+        Actions:
+        1. Capture current epoch before any await
+        2. Acquire recovery semaphore (limits concurrent recovery operations)
+        3. Apply jitter delay to prevent thundering herd on mass recovery
+        4. Verify epoch hasn't changed (gate wasn't marked dead during jitter)
+        5. Re-add to healthy_gate_ids
+
+        Thread safety:
+        - Uses epoch checking to detect if failure handler ran during our jitter
+        - Uses per-gate lock (by node_id) to coordinate state changes for same gate
+        """
+        if not gate_node_id:
+            # Gate not in _known_gates yet - can't do recovery, wait for heartbeat
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Unknown gate at {tcp_addr} (UDP: {udp_addr}) rejoined - waiting for heartbeat",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+            return
+
+        gate_lock = self._get_gate_state_lock(gate_node_id)
+
+        # Capture epoch BEFORE any await points
+        async with gate_lock:
+            initial_epoch = self._gate_state_epoch.get(gate_node_id, 0)
+
+        # Limit concurrent recovery operations to prevent thundering herd
+        async with self._recovery_semaphore:
+            # Apply jitter before recovery actions to prevent thundering herd
+            # when multiple nodes detect recovery simultaneously
+            import random
+            jitter_min = self.env.RECOVERY_JITTER_MIN
+            jitter_max = self.env.RECOVERY_JITTER_MAX
+            if jitter_max > 0:
+                jitter = random.uniform(jitter_min, jitter_max)
+                await asyncio.sleep(jitter)
+
+            # After jitter, check if gate was marked dead during our sleep
+            async with gate_lock:
+                current_epoch = self._gate_state_epoch.get(gate_node_id, 0)
+                if current_epoch != initial_epoch:
+                    # Epoch changed - a failure was detected during our jitter
+                    # Don't add gate back as it's now considered dead
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=f"Gate {gate_node_id[:8]}... recovery aborted: epoch changed "
+                                    f"({initial_epoch} -> {current_epoch}) during jitter",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return
+
+                # Epoch unchanged - safe to add gate back
+                self._healthy_gate_ids.add(gate_node_id)
+
+                # If no primary and this gate is a leader, make it primary
+                gate_info = self._known_gates.get(gate_node_id)
+                if gate_info and gate_info.is_leader and not self._primary_gate_id:
+                    self._primary_gate_id = gate_node_id
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Gate {gate_node_id[:8]}... at {tcp_addr} (UDP: {udp_addr}) has REJOINED the cluster",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # Log gate cluster status
+        healthy_count = len(self._healthy_gate_ids)
+        known_count = len(self._known_gates)
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Gate cluster: {healthy_count}/{known_count} healthy, primary={self._primary_gate_id[:8] if self._primary_gate_id else 'NONE'}...",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     async def _handle_job_leader_failure(
         self,
@@ -1539,15 +1775,34 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         """
         Handle GateHeartbeat received from gates via SWIM.
-        
+
         This enables managers to track gate leadership changes in real-time
         without waiting for TCP ack responses.
+
+        Critical: Also maintains _gate_udp_to_tcp mapping for SWIM failure/recovery callbacks.
+        The source_addr is UDP (from SWIM), and TCP address comes from heartbeat fields.
         """
         gate_id = heartbeat.node_id
-        
+
+        # Get TCP address from heartbeat fields (not convention assumption)
+        # source_addr is the UDP address from SWIM
+        udp_addr = source_addr
+        tcp_host = heartbeat.tcp_host if heartbeat.tcp_host else source_addr[0]
+        tcp_port = heartbeat.tcp_port if heartbeat.tcp_port else source_addr[1]
+        tcp_addr = (tcp_host, tcp_port)
+
+        # Update UDP to TCP mapping for failure/recovery callbacks
+        # This mapping is critical: without it, _on_node_join/_on_node_dead
+        # cannot find the TCP address for dynamically discovered gates
+        if udp_addr not in self._gate_udp_to_tcp:
+            self._gate_udp_to_tcp[udp_addr] = tcp_addr
+        elif self._gate_udp_to_tcp[udp_addr] != tcp_addr:
+            # TCP address changed (rare but possible) - update mapping
+            self._gate_udp_to_tcp[udp_addr] = tcp_addr
+
         # Check if this is a known gate
         existing_gate = self._known_gates.get(gate_id)
-        
+
         if existing_gate:
             # Update is_leader status if it changed
             old_is_leader = existing_gate.is_leader
@@ -1555,19 +1810,19 @@ class ManagerServer(HealthAwareServer):
                 # Update the gate info with new leadership status
                 self._known_gates[gate_id] = GateInfo(
                     node_id=existing_gate.node_id,
-                    tcp_host=existing_gate.tcp_host,
-                    tcp_port=existing_gate.tcp_port,
-                    udp_host=existing_gate.udp_host,
-                    udp_port=existing_gate.udp_port,
+                    tcp_host=tcp_host,
+                    tcp_port=tcp_port,
+                    udp_host=udp_addr[0],
+                    udp_port=udp_addr[1],
                     datacenter=heartbeat.datacenter,
                     is_leader=heartbeat.is_leader,
                 )
-                
+
                 # If this gate became the leader, switch primary
                 if heartbeat.is_leader and self._primary_gate_id != gate_id:
                     old_primary = self._primary_gate_id
                     self._primary_gate_id = gate_id
-                    
+
                     self._task_runner.run(
                         self._udp_logger.log,
                         ServerInfo(
@@ -1578,28 +1833,28 @@ class ManagerServer(HealthAwareServer):
                         )
                     )
         else:
-            # New gate discovered via SWIM - create entry
+            # New gate discovered via SWIM - create entry using heartbeat TCP fields
             self._known_gates[gate_id] = GateInfo(
                 node_id=gate_id,
-                tcp_host=source_addr[0],
-                tcp_port=source_addr[1] - 1,  # Convention: TCP = UDP - 1
-                udp_host=source_addr[0],
-                udp_port=source_addr[1],
+                tcp_host=tcp_host,
+                tcp_port=tcp_port,
+                udp_host=udp_addr[0],
+                udp_port=udp_addr[1],
                 datacenter=heartbeat.datacenter,
                 is_leader=heartbeat.is_leader,
             )
             self._healthy_gate_ids.add(gate_id)
-            
+
             self._task_runner.run(
                 self._udp_logger.log,
                 ServerInfo(
-                    message=f"Discovered new gate via SWIM: {gate_id} (leader={heartbeat.is_leader})",
+                    message=f"Discovered new gate via SWIM: {gate_id} (leader={heartbeat.is_leader}, tcp={tcp_addr})",
                     node_host=self._host,
                     node_port=self._tcp_port,
                     node_id=self._node_id.short,
                 )
             )
-            
+
             # If this is a leader and we don't have one, use it
             if heartbeat.is_leader and not self._primary_gate_id:
                 self._primary_gate_id = gate_id
