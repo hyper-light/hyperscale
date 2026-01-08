@@ -89,13 +89,14 @@ class LocalHealthMultiplier:
     def get_multiplier(self) -> float:
         """
         Get the current LHM multiplier for timeout calculations.
-        
+
         Per Lifeguard paper, the multiplier increases probe timeout
         and suspicion timeout based on local health score.
-        
-        Returns a value from 1.0 (healthy) to 1 + max_score (unhealthy).
+
+        Returns a value from 1.0 (healthy) to 2.0 (max unhealthy).
+        Formula: multiplier = 1 + (score / max_score)
         """
-        return 1.0 + (self.score / self.max_score) * self.max_score
+        return 1.0 + (self.score / self.max_score)
     
     def reset(self) -> None:
         """Reset LHM to healthy state."""
