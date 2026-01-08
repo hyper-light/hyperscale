@@ -39,6 +39,19 @@ A high-performance, fault-tolerant distributed workflow execution system designe
 - [Security](#security)
 - [Message Protocol Reference](#message-protocol-reference)
 - [Module Structure](#module-structure)
+- [Bootstrap & Service Discovery](#bootstrap--service-discovery)
+  - [Design Goals](#design-goals)
+  - [Architecture Decision](#architecture-decision)
+  - [Discovery Approaches Evaluated](#discovery-approaches-evaluated)
+  - [Chosen Solution: DNS + Seeds with Parallel Probing](#chosen-solution-dns--seeds-with-parallel-probing)
+  - [Bootstrap Protocol](#bootstrap-protocol)
+  - [DNS Resolution](#dns-resolution)
+  - [Peer Probing](#peer-probing)
+  - [Health-Aware Peer Cache](#health-aware-peer-cache)
+  - [Failure Scenarios](#failure-scenarios)
+  - [Configuration](#configuration)
+  - [Module Structure](#bootstrap-module-structure)
+  - [Example Implementations](#example-implementations)
 
 ---
 
@@ -11583,6 +11596,822 @@ Worker1     Worker2     Manager           Gate           Client
    │           │           │                │ WindowedStats │
    │           │           │                │               │
    │           │           │                │     [callback]│
+```
+
+---
+
+## Bootstrap & Service Discovery
+
+### Design Goals
+
+The bootstrap system must satisfy these requirements:
+
+1. **Environment Agnostic**: Works identically on bare metal, VMs, containers, and Kubernetes
+2. **No External Dependencies**: No etcd, Consul, Zookeeper, or other coordination services
+3. **Fast Convergence**: New nodes join the cluster in sub-second time under normal conditions
+4. **Churn Resilient**: Handles frequent node restarts, rolling deployments, and autoscaling
+5. **Robust Under Failure**: Continues operating when some seeds are unavailable
+6. **Simple Configuration**: Minimal config required - just seed addresses or DNS name
+
+### Architecture Decision
+
+**Decision**: Hybrid DNS + Static Seeds with Parallel Probing
+
+After evaluating multiple approaches, we chose a hybrid strategy that:
+- Accepts static seed addresses (bare metal friendly)
+- Optionally accepts DNS names for dynamic discovery (Kubernetes friendly)
+- Probes all candidates in parallel with short timeouts
+- Succeeds on first response (any live peer is sufficient)
+- Hands off to SWIM gossip once joined
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         BOOTSTRAP ARCHITECTURE                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                │
+│  │   Static     │     │     DNS      │     │   Health     │                │
+│  │   Seeds      │     │   Resolver   │     │    Cache     │                │
+│  │              │     │              │     │              │                │
+│  │ 10.0.1.5:9000│     │ managers.svc │     │ Recently     │                │
+│  │ 10.0.1.6:9000│     │ → [IP1, IP2] │     │ alive peers  │                │
+│  └──────┬───────┘     └──────┬───────┘     └──────┬───────┘                │
+│         │                    │                    │                         │
+│         └────────────────────┼────────────────────┘                         │
+│                              │                                              │
+│                              ▼                                              │
+│                    ┌─────────────────┐                                      │
+│                    │   Candidate     │                                      │
+│                    │   Aggregator    │                                      │
+│                    │                 │                                      │
+│                    │ Dedup + Merge   │                                      │
+│                    └────────┬────────┘                                      │
+│                             │                                               │
+│                             ▼                                               │
+│         ┌───────────────────────────────────────────┐                       │
+│         │           PARALLEL PROBER                  │                       │
+│         │                                            │                       │
+│         │  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐      │                       │
+│         │  │Probe│  │Probe│  │Probe│  │Probe│      │                       │
+│         │  │ #1  │  │ #2  │  │ #3  │  │ #4  │ ...  │                       │
+│         │  └──┬──┘  └──┬──┘  └──┬──┘  └──┬──┘      │                       │
+│         │     │        │        │        │          │                       │
+│         │     └────────┴────┬───┴────────┘          │                       │
+│         │                   │                       │                       │
+│         │            First Success                  │                       │
+│         │            (cancel rest)                  │                       │
+│         └───────────────────┬───────────────────────┘                       │
+│                             │                                               │
+│                             ▼                                               │
+│                    ┌─────────────────┐                                      │
+│                    │  SWIM Cluster   │                                      │
+│                    │     Join        │                                      │
+│                    │                 │                                      │
+│                    │ Gossip takes    │                                      │
+│                    │ over from here  │                                      │
+│                    └─────────────────┘                                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Discovery Approaches Evaluated
+
+| Approach | Pros | Cons | Verdict |
+|----------|------|------|---------|
+| **Static Seeds** | Simple, predictable, works everywhere | Requires config updates when seeds change | ✅ Use as primary |
+| **DNS-Based** | Dynamic, K8s-native via headless services | TTL caching, stale records | ✅ Use as supplement |
+| **Multicast/Broadcast** | Zero config, auto-discovery | Blocked by cloud providers, no cross-subnet | ❌ Rejected |
+| **External Service (etcd/Consul)** | Feature-rich, proven | External dependency, operational burden | ❌ Rejected |
+| **Shared Storage** | Works with NFS/S3 | Latency, complexity, another dependency | ❌ Rejected |
+| **Port Scanning** | No config needed | Slow, looks malicious, security alerts | ❌ Rejected |
+
+### Chosen Solution: DNS + Seeds with Parallel Probing
+
+The key insight: **bootstrap is a one-time operation per node startup**. Once joined, SWIM handles all membership changes. We only need to find *one* live peer to join through.
+
+#### Why This Works Under Churn
+
+```
+Timeline showing node C crashing and replacement C' joining:
+─────────────────────────────────────────────────────────────────────────────
+t=0     Cluster healthy: [A, B, C, D, E] all running
+t=1     Pod C crashes, orchestrator starts replacement C'
+t=2     DNS still returns C's old IP (TTL not expired)
+t=3     New node F tries to join, resolves [A, B, C_old, D, E]
+t=4     F probes ALL in parallel with 500ms timeout
+t=5     A responds first (50ms) → F joins via A, cancels other probes
+t=6     C_old probe times out (ignored, F already joined)
+t=7     DNS updates, now returns [A, B, C', D, E]
+t=8     C' bootstrap probes, joins via any live peer
+t=9     SWIM gossip propagates C' membership to all nodes
+─────────────────────────────────────────────────────────────────────────────
+
+Key points:
+- Parallel probing means one dead node doesn't block join
+- 500ms timeout prevents long waits for unreachable hosts
+- First responder wins - we don't wait for all probes
+- SWIM handles ongoing membership after initial join
+```
+
+### Bootstrap Protocol
+
+#### State Machine
+
+```
+                              ┌─────────────┐
+                              │   INITIAL   │
+                              └──────┬──────┘
+                                     │
+                              resolve candidates
+                                     │
+                                     ▼
+                              ┌─────────────┐
+                     ┌───────▶│  RESOLVING  │◀───────┐
+                     │        └──────┬──────┘        │
+                     │               │               │
+                     │        candidates ready       │
+                     │               │               │
+                     │               ▼               │
+                     │        ┌─────────────┐        │
+                     │        │   PROBING   │        │
+                     │        └──────┬──────┘        │
+                     │               │               │
+                     │     ┌─────────┴─────────┐     │
+                     │     │                   │     │
+                     │  success             all fail │
+                     │     │                   │     │
+                     │     ▼                   ▼     │
+                     │ ┌────────┐      ┌───────────┐ │
+                     │ │ JOINED │      │  BACKOFF  │─┘
+                     │ └────────┘      └───────────┘
+                     │                       │
+                     │                  max retries
+                     │                       │
+                     │                       ▼
+                     │               ┌──────────────┐
+                     └───────────────│    FAILED    │
+                                     └──────────────┘
+```
+
+#### Sequence Diagram: Successful Join
+
+```
+    New Node              Seed A             Seed B (dead)         Seed C
+        │                    │                    │                    │
+        │──── resolve() ────▶│                    │                    │
+        │◀─── [A, B, C] ─────│                    │                    │
+        │                    │                    │                    │
+        ├─────── PING ──────▶│                    │                    │
+        ├─────── PING ───────┼───────────────────▶│                    │
+        ├─────── PING ───────┼────────────────────┼───────────────────▶│
+        │                    │                    │                    │
+        │◀────── PONG ───────│                    │     (timeout)      │
+        │                    │              (500ms)│                    │
+        │    [cancel B, C probes]                 │                    │
+        │                    │                    │                    │
+        │───── JOIN_REQ ────▶│                    │                    │
+        │◀──── JOIN_ACK ─────│                    │                    │
+        │                    │                    │                    │
+        │   [SWIM gossip begins]                  │                    │
+        │◀───── GOSSIP ──────│                    │                    │
+        │                    │                    │                    │
+     JOINED               ACTIVE              DEAD                  ACTIVE
+```
+
+#### Sequence Diagram: All Seeds Down, Retry with Backoff
+
+```
+    New Node              Seed A (down)      Seed B (down)      Seed C (down)
+        │                      │                  │                  │
+        │──── resolve() ──────▶│                  │                  │
+        │◀─── [A, B, C] ───────│                  │                  │
+        │                      │                  │                  │
+        ├─────── PING ────────▶│                  │                  │
+        ├─────── PING ─────────┼─────────────────▶│                  │
+        ├─────── PING ─────────┼──────────────────┼─────────────────▶│
+        │                      │                  │                  │
+        │                (500ms timeout)    (500ms timeout)   (500ms timeout)
+        │                      │                  │                  │
+        │   [all probes failed]│                  │                  │
+        │                      │                  │                  │
+        │   [backoff: 500ms]   │                  │                  │
+        │        ...           │                  │                  │
+        │                      │                  │                  │
+        │──── resolve() ──────▶│                  │                  │
+        │◀─── [A, B, C] ───────│ (A comes back up)│                  │
+        │                      │                  │                  │
+        ├─────── PING ────────▶│                  │                  │
+        │◀────── PONG ─────────│                  │                  │
+        │                      │                  │                  │
+        │───── JOIN_REQ ──────▶│                  │                  │
+        │◀──── JOIN_ACK ───────│                  │                  │
+        │                      │                  │                  │
+     JOINED                 ACTIVE             DOWN                DOWN
+```
+
+### DNS Resolution
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           DNS RESOLVER                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────┐                                                        │
+│  │  DNSConfig      │                                                        │
+│  │                 │                                                        │
+│  │  - name: str    │     ┌─────────────────────────────────────────┐       │
+│  │  - port: int    │────▶│            AsyncDNSResolver              │       │
+│  │  - timeout: 2.0 │     │                                          │       │
+│  │  - cache_ttl: 5 │     │  ┌──────────────────────────────────┐   │       │
+│  └─────────────────┘     │  │       Resolution Cache           │   │       │
+│                          │  │                                   │   │       │
+│                          │  │  name → (addresses, expiry_time) │   │       │
+│                          │  └──────────────────────────────────┘   │       │
+│                          │                                          │       │
+│                          │  resolve(name) → list[PeerAddress]      │       │
+│                          │                                          │       │
+│                          │  Uses asyncio.get_event_loop()          │       │
+│                          │       .getaddrinfo() for non-blocking   │       │
+│                          └─────────────────────────────────────────┘       │
+│                                                                              │
+│  Resolution Flow:                                                           │
+│  ┌────────┐    ┌─────────┐    ┌─────────┐    ┌──────────────┐             │
+│  │ Check  │───▶│ Cache   │───▶│ Return  │    │              │             │
+│  │ Cache  │    │ Valid?  │yes │ Cached  │    │   Resolve    │             │
+│  └────────┘    └────┬────┘    └─────────┘    │   via DNS    │             │
+│                     │ no                      │              │             │
+│                     └────────────────────────▶│ getaddrinfo  │             │
+│                                               └──────┬───────┘             │
+│                                                      │                      │
+│                                               ┌──────▼───────┐             │
+│                                               │ Update Cache │             │
+│                                               │ + Return     │             │
+│                                               └──────────────┘             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### DNS TTL Considerations
+
+```
+Problem: DNS caching returns stale IPs for crashed pods
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                           │
+│  Time    DNS Response         Actual Cluster       Issue                 │
+│  ────    ────────────         ──────────────       ─────                 │
+│  t=0     [A, B, C]            [A, B, C]            None                  │
+│  t=1     [A, B, C]            [A, B, C']           C crashed, C' started │
+│  t=2     [A, B, C] (cached)   [A, B, C']           Stale C in DNS        │
+│  t=3     [A, B, C'] (updated) [A, B, C']           Resolved              │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Solution: Parallel probing with short timeouts
+
+- Probe ALL resolved addresses simultaneously
+- Use 500ms timeout (not TCP default 30s)
+- Dead IPs timeout while live ones respond
+- First responder wins, cancel the rest
+- Stale DNS entries cause 500ms delay, not blocking failure
+```
+
+### Peer Probing
+
+#### Parallel Probe Strategy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        PARALLEL PROBE EXECUTION                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Input: candidates = [(10.0.1.5, 9000), (10.0.1.6, 9000), (10.0.1.7, 9000)] │
+│  Timeout: 500ms per probe                                                   │
+│  Max concurrent: 10 (configurable)                                          │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                      │   │
+│  │  t=0ms    ┌──────┐   ┌──────┐   ┌──────┐                           │   │
+│  │           │Probe │   │Probe │   │Probe │   All start simultaneously│   │
+│  │           │ :5   │   │ :6   │   │ :7   │                           │   │
+│  │           └──┬───┘   └──┬───┘   └──┬───┘                           │   │
+│  │              │          │          │                                │   │
+│  │  t=50ms      │          │          │                                │   │
+│  │              ▼          │          │                                │   │
+│  │           ┌──────┐      │          │   :5 responds first!          │   │
+│  │           │ PONG │      │          │                                │   │
+│  │           └──────┘      │          │                                │   │
+│  │              │          │          │                                │   │
+│  │              │     ┌────┴────┐ ┌───┴───┐                           │   │
+│  │              │     │ CANCEL  │ │CANCEL │   Cancel remaining probes │   │
+│  │              │     └─────────┘ └───────┘                           │   │
+│  │              │                                                      │   │
+│  │              ▼                                                      │   │
+│  │        Return (10.0.1.5, 9000)                                     │   │
+│  │                                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Worst case (all dead):                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                      │   │
+│  │  t=0ms    ┌──────┐   ┌──────┐   ┌──────┐                           │   │
+│  │           │Probe │   │Probe │   │Probe │                           │   │
+│  │           │ :5   │   │ :6   │   │ :7   │                           │   │
+│  │           └──┬───┘   └──┬───┘   └──┬───┘                           │   │
+│  │              │          │          │                                │   │
+│  │  t=500ms     ▼          ▼          ▼    All timeout together       │   │
+│  │          TIMEOUT    TIMEOUT    TIMEOUT                              │   │
+│  │                                                                      │   │
+│  │        Return None (trigger backoff + retry)                        │   │
+│  │                                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Probe Protocol
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PROBE WIRE PROTOCOL                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Request (PING):                                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  0                   1                   2                   3     │    │
+│  │  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1  │    │
+│  │ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+  │    │
+│  │ |     'P'       |     'I'       |     'N'       |     'G'       |  │    │
+│  │ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+  │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Response (PONG):                                                           │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  0                   1                   2                   3     │    │
+│  │  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1  │    │
+│  │ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+  │    │
+│  │ |     'P'       |     'O'       |     'N'       |     'G'       |  │    │
+│  │ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+  │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Simple 4-byte exchange:                                                    │
+│  - Fast to send/receive                                                     │
+│  - Easy to validate                                                         │
+│  - No serialization overhead                                                │
+│  - Works with any TCP implementation                                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Health-Aware Peer Cache
+
+To accelerate subsequent bootstrap attempts (e.g., after network blip), we cache recently-responsive peers:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         HEALTH-AWARE PEER CACHE                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                        PeerHealthCache                               │   │
+│  │                                                                      │   │
+│  │  ┌────────────────────────────────────────────────────────────┐    │   │
+│  │  │  (host, port)  │  last_seen   │  success_count  │  state   │    │   │
+│  │  ├────────────────┼──────────────┼─────────────────┼──────────┤    │   │
+│  │  │  10.0.1.5:9000 │  1704067200  │       47        │  HEALTHY │    │   │
+│  │  │  10.0.1.6:9000 │  1704067180  │       12        │  HEALTHY │    │   │
+│  │  │  10.0.1.7:9000 │  1704066000  │        0        │  EXPIRED │    │   │
+│  │  └────────────────┴──────────────┴─────────────────┴──────────┘    │   │
+│  │                                                                      │   │
+│  │  Methods:                                                            │   │
+│  │  - record_success(addr): Update last_seen, increment count          │   │
+│  │  - record_failure(addr): Decrement count, mark stale if zero        │   │
+│  │  - get_healthy_peers(): Return peers seen within TTL                │   │
+│  │  - evict_expired(): Remove entries older than cache_ttl             │   │
+│  │                                                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  Usage in Candidate Aggregation:                                            │
+│                                                                              │
+│     1. Get candidates from DNS/seeds                                        │
+│     2. Get healthy peers from cache                                         │
+│     3. Prioritize: cached healthy → DNS/seeds → all others                 │
+│     4. Probe in priority order (still parallel, but start with likely-live) │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Failure Scenarios
+
+#### Scenario Matrix
+
+| Scenario | Behavior | Recovery Time |
+|----------|----------|---------------|
+| 1 of N seeds down | Parallel probe, others respond | < 100ms |
+| All seeds down temporarily | Backoff + retry until one recovers | backoff intervals |
+| DNS returns stale IPs | Stale IPs timeout, live ones respond | + 500ms worst case |
+| Network partition (split brain) | Nodes join different partitions | Requires SWIM partition healing |
+| Total cluster failure | Retry indefinitely with backoff | Until first node recovers |
+| DNS completely unavailable | Fall back to static seeds | Immediate if seeds configured |
+
+#### Backoff Strategy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        EXPONENTIAL BACKOFF                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Attempt    Base Delay    Jitter (0-25%)    Actual Delay    Cumulative     │
+│  ───────    ──────────    ──────────────    ────────────    ──────────     │
+│     1         500ms          0-125ms        500-625ms        ~560ms        │
+│     2        1000ms          0-250ms       1000-1250ms       ~1.7s         │
+│     3        2000ms          0-500ms       2000-2500ms       ~3.9s         │
+│     4        4000ms         0-1000ms       4000-5000ms       ~8.4s         │
+│     5        8000ms         0-2000ms       8000-10000ms     ~17.4s         │
+│     6       15000ms         0-3750ms      15000-18750ms     ~34.3s         │
+│    ...        ...             ...             ...             ...           │
+│    N       15000ms (cap)   0-3750ms      15000-18750ms       ...           │
+│                                                                              │
+│  Configuration:                                                             │
+│  - initial_backoff: 500ms                                                   │
+│  - max_backoff: 15000ms (15 seconds)                                        │
+│  - backoff_multiplier: 2.0                                                  │
+│  - jitter_factor: 0.25 (25% randomization)                                  │
+│                                                                              │
+│  Why jitter?                                                                │
+│  - Prevents thundering herd when multiple nodes retry simultaneously        │
+│  - Spreads load on recovering seeds                                         │
+│  - Reduces contention during cluster-wide restarts                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Configuration
+
+#### BootstrapConfig
+
+```python
+@dataclass(slots=True)
+class BootstrapConfig:
+    """Configuration for cluster bootstrap."""
+    
+    # Static seed addresses (tried first)
+    seeds: list[str] = field(default_factory=list)
+    
+    # DNS name for dynamic discovery (optional, supplements seeds)
+    dns_name: str | None = None
+    
+    # Default port when not specified in address
+    default_port: int = 9000
+    
+    # Probe timeout per candidate (short to enable fast failure detection)
+    probe_timeout: float = 0.5  # 500ms
+    
+    # Maximum concurrent probes (prevent socket exhaustion)
+    max_concurrent_probes: int = 10
+    
+    # Backoff configuration
+    initial_backoff: float = 0.5      # 500ms
+    max_backoff: float = 15.0         # 15 seconds
+    backoff_multiplier: float = 2.0
+    jitter_factor: float = 0.25       # 25% randomization
+    
+    # DNS resolution timeout
+    dns_timeout: float = 2.0
+    
+    # Health cache TTL (how long to remember responsive peers)
+    health_cache_ttl: float = 60.0    # 1 minute
+```
+
+#### Environment-Specific Examples
+
+```yaml
+# Bare Metal / Static IPs
+bootstrap:
+  seeds:
+    - "10.0.1.5:9000"
+    - "10.0.1.6:9000"
+    - "10.0.1.7:9000"
+
+# Kubernetes (Headless Service)
+bootstrap:
+  dns_name: "managers.hyperscale.svc.cluster.local"
+  default_port: 9000
+
+# Hybrid (DNS primary, static fallback)
+bootstrap:
+  dns_name: "managers.prod.internal"
+  seeds:
+    - "10.0.1.5:9000"  # Fallback if DNS fails
+  default_port: 9000
+```
+
+### Bootstrap Module Structure
+
+```
+hyperscale/distributed_rewrite/bootstrap/
+├── __init__.py                 # Public exports
+├── bootstrap.py                # Main Bootstrapper class
+├── dns/
+│   ├── __init__.py
+│   ├── resolver.py             # AsyncDNSResolver
+│   └── models/
+│       ├── __init__.py
+│       ├── dns_config.py       # DNSConfig dataclass
+│       └── dns_result.py       # DNSResult dataclass
+├── probing/
+│   ├── __init__.py
+│   ├── parallel_prober.py      # ParallelProber class
+│   └── models/
+│       ├── __init__.py
+│       ├── probe_config.py     # ProbeConfig dataclass
+│       └── probe_result.py     # ProbeResult dataclass
+├── cache/
+│   ├── __init__.py
+│   ├── peer_health_cache.py    # PeerHealthCache class
+│   └── models/
+│       ├── __init__.py
+│       └── peer_entry.py       # PeerCacheEntry dataclass
+└── models/
+    ├── __init__.py
+    ├── bootstrap_config.py     # BootstrapConfig dataclass
+    ├── bootstrap_result.py     # BootstrapResult dataclass
+    ├── bootstrap_state.py      # BootstrapState enum
+    └── peer_address.py         # PeerAddress dataclass
+```
+
+### Example Implementations
+
+#### Integration with ManagerServer
+
+```python
+class ManagerServer(HealthAwareServer):
+    def __init__(
+        self,
+        host: str,
+        tcp_port: int,
+        udp_port: int,
+        env: Env,
+        dc_id: str = "default",
+        # New: Bootstrap configuration (replaces seed_managers)
+        bootstrap_config: BootstrapConfig | None = None,
+        # Legacy: Still supported for backwards compatibility
+        seed_managers: list[tuple[str, int]] | None = None,
+        ...
+    ):
+        ...
+        
+        # Initialize bootstrapper
+        if bootstrap_config:
+            self._bootstrapper = Bootstrapper(bootstrap_config)
+        elif seed_managers:
+            # Legacy: Convert seed_managers to BootstrapConfig
+            self._bootstrapper = Bootstrapper(
+                BootstrapConfig(
+                    seeds=[f"{host}:{port}" for host, port in seed_managers]
+                )
+            )
+        else:
+            self._bootstrapper = None
+    
+    async def start(self) -> None:
+        await self.start_server(init_context=self.env.get_swim_init_context())
+        
+        # Bootstrap: discover peers before joining cluster
+        if self._bootstrapper:
+            bootstrap_result = await self._bootstrapper.bootstrap()
+            
+            if bootstrap_result.success:
+                # Join cluster via discovered peer
+                await self.join_cluster(bootstrap_result.peer.to_udp_addr())
+                
+                # Register with the peer to get full cluster topology
+                await self._register_with_peer(bootstrap_result.peer.to_tcp_addr())
+        
+        # Continue with normal startup...
+        await self._task_runner.run(self.start_probe_cycle)
+        ...
+```
+
+#### Integration with WorkerServer
+
+```python
+class WorkerServer(HealthAwareServer):
+    def __init__(
+        self,
+        host: str,
+        tcp_port: int,
+        udp_port: int,
+        env: Env,
+        dc_id: str = "default",
+        # New: Bootstrap configuration
+        bootstrap_config: BootstrapConfig | None = None,
+        # Legacy: Still supported
+        seed_managers: list[tuple[str, int]] | None = None,
+    ):
+        ...
+        
+        # Workers bootstrap to find managers
+        if bootstrap_config:
+            self._bootstrapper = Bootstrapper(bootstrap_config)
+        elif seed_managers:
+            self._bootstrapper = Bootstrapper(
+                BootstrapConfig(
+                    seeds=[f"{host}:{port}" for host, port in seed_managers]
+                )
+            )
+        else:
+            self._bootstrapper = None
+    
+    async def start(self, timeout: float | None = None) -> None:
+        await self.start_server(init_context=self.env.get_swim_init_context())
+        
+        # Bootstrap: find at least one manager
+        if self._bootstrapper:
+            result = await self._bootstrapper.bootstrap()
+            
+            if result.success:
+                # Register with discovered manager
+                success = await self._register_with_manager(result.peer.to_tcp_addr())
+                
+                if success:
+                    # Manager returns full topology in registration response
+                    # _known_managers populated by _register_with_manager
+                    pass
+            else:
+                raise RuntimeError(f"Failed to bootstrap: {result.error}")
+        
+        # Join SWIM cluster with all known managers
+        for manager in self._known_managers.values():
+            await self.join_cluster((manager.udp_host, manager.udp_port))
+        
+        # Continue with normal startup...
+```
+
+#### Integration with GateServer
+
+```python
+class GateServer(HealthAwareServer):
+    def __init__(
+        self,
+        host: str,
+        tcp_port: int,
+        udp_port: int,
+        env: Env,
+        dc_id: str = "global",
+        # New: Per-role bootstrap configs
+        gate_bootstrap: BootstrapConfig | None = None,
+        manager_bootstrap: dict[str, BootstrapConfig] | None = None,  # dc_id -> config
+        # Legacy
+        gate_peers: list[tuple[str, int]] | None = None,
+        datacenter_managers: dict[str, list[tuple[str, int]]] | None = None,
+        ...
+    ):
+        ...
+        
+        # Gate peer discovery
+        if gate_bootstrap:
+            self._gate_bootstrapper = Bootstrapper(gate_bootstrap)
+        elif gate_peers:
+            self._gate_bootstrapper = Bootstrapper(
+                BootstrapConfig(
+                    seeds=[f"{h}:{p}" for h, p in gate_peers]
+                )
+            )
+        else:
+            self._gate_bootstrapper = None
+        
+        # Per-datacenter manager discovery
+        self._dc_bootstrappers: dict[str, Bootstrapper] = {}
+        if manager_bootstrap:
+            for dc_id, config in manager_bootstrap.items():
+                self._dc_bootstrappers[dc_id] = Bootstrapper(config)
+        elif datacenter_managers:
+            for dc_id, addrs in datacenter_managers.items():
+                self._dc_bootstrappers[dc_id] = Bootstrapper(
+                    BootstrapConfig(
+                        seeds=[f"{h}:{p}" for h, p in addrs]
+                    )
+                )
+    
+    async def start(self) -> None:
+        await self.start_server(init_context=self.env.get_swim_init_context())
+        
+        # Bootstrap gate cluster
+        if self._gate_bootstrapper:
+            result = await self._gate_bootstrapper.bootstrap()
+            if result.success:
+                await self.join_cluster(result.peer.to_udp_addr())
+        
+        # Bootstrap per-datacenter manager connections
+        for dc_id, bootstrapper in self._dc_bootstrappers.items():
+            result = await bootstrapper.bootstrap()
+            if result.success:
+                # Store discovered manager for this DC
+                self._dc_primary_managers[dc_id] = result.peer.to_tcp_addr()
+        
+        # Continue with normal startup...
+```
+
+#### Bootstrapper Core Implementation
+
+```python
+class Bootstrapper:
+    """
+    Discovers and connects to cluster peers.
+    
+    Combines DNS resolution, static seeds, and health caching
+    to find live peers quickly. Uses parallel probing with short
+    timeouts for fast convergence even when some candidates are dead.
+    """
+    
+    def __init__(self, config: BootstrapConfig):
+        self._config = config
+        self._dns_resolver = AsyncDNSResolver(
+            timeout=config.dns_timeout,
+            cache_ttl=config.health_cache_ttl,
+        )
+        self._prober = ParallelProber(
+            timeout=config.probe_timeout,
+            max_concurrent=config.max_concurrent_probes,
+        )
+        self._health_cache = PeerHealthCache(ttl=config.health_cache_ttl)
+        self._state = BootstrapState.INITIAL
+    
+    async def bootstrap(self) -> BootstrapResult:
+        """
+        Discover and connect to a live peer.
+        
+        Returns BootstrapResult with the first responsive peer,
+        or an error if all candidates fail after retries.
+        """
+        backoff = self._config.initial_backoff
+        
+        while True:
+            self._state = BootstrapState.RESOLVING
+            candidates = await self._resolve_candidates()
+            
+            if not candidates:
+                self._state = BootstrapState.BACKOFF
+                await self._sleep_with_jitter(backoff)
+                backoff = min(backoff * self._config.backoff_multiplier, 
+                             self._config.max_backoff)
+                continue
+            
+            self._state = BootstrapState.PROBING
+            result = await self._prober.probe_first_success(candidates)
+            
+            if result.success:
+                self._state = BootstrapState.JOINED
+                self._health_cache.record_success(result.peer)
+                return BootstrapResult(success=True, peer=result.peer)
+            
+            # All probes failed - backoff and retry
+            self._state = BootstrapState.BACKOFF
+            await self._sleep_with_jitter(backoff)
+            backoff = min(backoff * self._config.backoff_multiplier,
+                         self._config.max_backoff)
+    
+    async def _resolve_candidates(self) -> list[PeerAddress]:
+        """Aggregate candidates from all sources."""
+        candidates: list[PeerAddress] = []
+        seen: set[tuple[str, int]] = set()
+        
+        # Priority 1: Recently healthy peers from cache
+        for peer in self._health_cache.get_healthy_peers():
+            key = (peer.host, peer.port)
+            if key not in seen:
+                candidates.append(peer)
+                seen.add(key)
+        
+        # Priority 2: Static seeds
+        for seed in self._config.seeds:
+            peer = PeerAddress.parse(seed, self._config.default_port)
+            key = (peer.host, peer.port)
+            if key not in seen:
+                candidates.append(peer)
+                seen.add(key)
+        
+        # Priority 3: DNS resolution
+        if self._config.dns_name:
+            dns_peers = await self._dns_resolver.resolve(
+                self._config.dns_name,
+                self._config.default_port,
+            )
+            for peer in dns_peers:
+                key = (peer.host, peer.port)
+                if key not in seen:
+                    candidates.append(peer)
+                    seen.add(key)
+        
+        return candidates
+    
+    async def _sleep_with_jitter(self, base_delay: float) -> None:
+        """Sleep with randomized jitter to prevent thundering herd."""
+        jitter = base_delay * self._config.jitter_factor * random.random()
+        await asyncio.sleep(base_delay + jitter)
 ```
 
 ---
