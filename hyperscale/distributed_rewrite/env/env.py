@@ -272,6 +272,32 @@ class Env(BaseModel):
     CROSS_DC_LHM_STRESSED_THRESHOLD: StrictInt = 3  # LHM score (0-8) to consider DC stressed
     CROSS_DC_LHM_CORRELATION_FRACTION: StrictFloat = 0.5  # Fraction of DCs for LHM correlation
 
+    # ==========================================================================
+    # Discovery Service Settings (AD-28)
+    # ==========================================================================
+    # DNS-based peer discovery
+    DISCOVERY_DNS_NAMES: StrictStr = ""  # Comma-separated DNS names for manager discovery
+    DISCOVERY_DNS_CACHE_TTL: StrictFloat = 60.0  # DNS cache TTL in seconds
+    DISCOVERY_DNS_TIMEOUT: StrictFloat = 5.0  # DNS resolution timeout in seconds
+    DISCOVERY_DEFAULT_PORT: StrictInt = 9091  # Default port for discovered peers
+
+    # Locality configuration
+    DISCOVERY_DATACENTER_ID: StrictStr = ""  # Local datacenter ID for locality-aware selection
+    DISCOVERY_REGION_ID: StrictStr = ""  # Local region ID for locality-aware selection
+    DISCOVERY_PREFER_SAME_DC: StrictBool = True  # Prefer same-DC peers over cross-DC
+
+    # Adaptive peer selection (Power of Two Choices with EWMA)
+    DISCOVERY_CANDIDATE_SET_SIZE: StrictInt = 3  # Number of candidates for power-of-two selection
+    DISCOVERY_EWMA_ALPHA: StrictFloat = 0.3  # EWMA smoothing factor for latency tracking
+    DISCOVERY_BASELINE_LATENCY_MS: StrictFloat = 50.0  # Baseline latency for EWMA initialization
+    DISCOVERY_LATENCY_MULTIPLIER_THRESHOLD: StrictFloat = 2.0  # Latency threshold multiplier
+    DISCOVERY_MIN_PEERS_PER_TIER: StrictInt = 1  # Minimum peers per locality tier
+
+    # Probing and health
+    DISCOVERY_MAX_CONCURRENT_PROBES: StrictInt = 10  # Max concurrent DNS resolutions/probes
+    DISCOVERY_PROBE_INTERVAL: StrictFloat = 30.0  # Seconds between peer health probes
+    DISCOVERY_FAILURE_DECAY_INTERVAL: StrictFloat = 60.0  # Seconds between failure count decay
+
     @classmethod
     def types_map(cls) -> Dict[str, Callable[[str], PrimaryType]]:
         return {
@@ -721,4 +747,52 @@ class Env(BaseModel):
             enable_lhm_correlation=self.CROSS_DC_ENABLE_LHM_CORRELATION,
             lhm_stressed_threshold=self.CROSS_DC_LHM_STRESSED_THRESHOLD,
             lhm_correlation_fraction=self.CROSS_DC_LHM_CORRELATION_FRACTION,
+        )
+
+    def get_discovery_config(
+        self,
+        cluster_id: str = "hyperscale",
+        environment_id: str = "default",
+        node_role: str = "worker",
+        static_seeds: list[str] | None = None,
+    ):
+        """
+        Get discovery service configuration (AD-28).
+
+        Creates configuration for peer discovery, locality-aware selection,
+        and adaptive load balancing.
+
+        Args:
+            cluster_id: Cluster identifier for filtering peers
+            environment_id: Environment identifier
+            node_role: Role of the local node ('worker', 'manager', etc.)
+            static_seeds: Static seed addresses in "host:port" format
+        """
+        from hyperscale.distributed_rewrite.discovery.models.discovery_config import (
+            DiscoveryConfig,
+        )
+
+        # Parse DNS names from comma-separated string
+        dns_names: list[str] = []
+        if self.DISCOVERY_DNS_NAMES:
+            dns_names = [name.strip() for name in self.DISCOVERY_DNS_NAMES.split(",") if name.strip()]
+
+        return DiscoveryConfig(
+            cluster_id=cluster_id,
+            environment_id=environment_id,
+            node_role=node_role,
+            dns_names=dns_names,
+            static_seeds=static_seeds or [],
+            default_port=self.DISCOVERY_DEFAULT_PORT,
+            dns_cache_ttl=self.DISCOVERY_DNS_CACHE_TTL,
+            dns_timeout=self.DISCOVERY_DNS_TIMEOUT,
+            datacenter_id=self.DISCOVERY_DATACENTER_ID,
+            region_id=self.DISCOVERY_REGION_ID,
+            prefer_same_dc=self.DISCOVERY_PREFER_SAME_DC,
+            candidate_set_size=self.DISCOVERY_CANDIDATE_SET_SIZE,
+            ewma_alpha=self.DISCOVERY_EWMA_ALPHA,
+            baseline_latency_ms=self.DISCOVERY_BASELINE_LATENCY_MS,
+            latency_multiplier_threshold=self.DISCOVERY_LATENCY_MULTIPLIER_THRESHOLD,
+            min_peers_per_tier=self.DISCOVERY_MIN_PEERS_PER_TIER,
+            max_concurrent_probes=self.DISCOVERY_MAX_CONCURRENT_PROBES,
         )

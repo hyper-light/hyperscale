@@ -138,7 +138,7 @@ class DiscoveryService:
         )
         ewma_config = EWMAConfig(
             alpha=self.config.ewma_alpha,
-            initial_latency_ms=self.config.baseline_latency_ms,
+            initial_estimate_ms=self.config.baseline_latency_ms,
             failure_penalty_ms=self.config.baseline_latency_ms * self.config.latency_multiplier_threshold,
         )
         self._selector = AdaptiveEWMASelector(

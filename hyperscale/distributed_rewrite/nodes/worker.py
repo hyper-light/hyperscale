@@ -92,6 +92,7 @@ from hyperscale.distributed_rewrite.protocol.version import (
     NegotiatedCapabilities,
     get_features_for_version,
 )
+from hyperscale.distributed_rewrite.discovery import DiscoveryService
 from hyperscale.logging.config.logging_config import LoggingConfig
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerError, ServerWarning, ServerDebug
 
@@ -161,6 +162,18 @@ class WorkerServer(HealthAwareServer):
         self._manager_unhealthy_since: dict[str, float] = {}  # manager_id -> time.monotonic() when marked unhealthy
         self._dead_manager_reap_interval: float = env.WORKER_DEAD_MANAGER_REAP_INTERVAL
         self._dead_manager_check_interval: float = env.WORKER_DEAD_MANAGER_CHECK_INTERVAL
+
+        # Discovery service for adaptive peer selection (AD-28)
+        # Provides locality-aware, EWMA-based manager selection
+        static_seeds = [f"{host}:{port}" for host, port in self._seed_managers]
+        discovery_config = env.get_discovery_config(
+            node_role="worker",
+            static_seeds=static_seeds,
+        )
+        self._discovery_service = DiscoveryService(discovery_config)
+        self._discovery_probe_interval: float = env.DISCOVERY_PROBE_INTERVAL
+        self._discovery_failure_decay_interval: float = env.DISCOVERY_FAILURE_DECAY_INTERVAL
+        self._discovery_maintenance_task: asyncio.Task | None = None
 
         # TCP timeout settings
         self._tcp_timeout_short: float = env.WORKER_TCP_TIMEOUT_SHORT
@@ -551,6 +564,9 @@ class WorkerServer(HealthAwareServer):
         # Start cancellation polling loop
         self._cancellation_poll_task = asyncio.create_task(self._cancellation_poll_loop())
 
+        # Start discovery maintenance loop (AD-28)
+        self._discovery_maintenance_task = asyncio.create_task(self._discovery_maintenance_loop())
+
         manager_count = len(self._known_managers)
         await self._udp_logger.log(
             ServerInfo(
@@ -819,6 +835,14 @@ class WorkerServer(HealthAwareServer):
             except asyncio.CancelledError:
                 pass
 
+        # Cancel discovery maintenance loop (AD-28)
+        if self._discovery_maintenance_task and not self._discovery_maintenance_task.done():
+            self._discovery_maintenance_task.cancel()
+            try:
+                await self._discovery_maintenance_task
+            except asyncio.CancelledError:
+                pass
+
         # Cancel all active workflows via TaskRunner
         for workflow_id in list(self._workflow_tokens.keys()):
             await self._cancel_workflow(workflow_id, "server_shutdown")
@@ -883,6 +907,13 @@ class WorkerServer(HealthAwareServer):
         if self._cancellation_poll_task and not self._cancellation_poll_task.done():
             try:
                 self._cancellation_poll_task.cancel()
+            except Exception:
+                pass
+
+        # Cancel discovery maintenance loop (AD-28)
+        if self._discovery_maintenance_task and not self._discovery_maintenance_task.done():
+            try:
+                self._discovery_maintenance_task.cancel()
             except Exception:
                 pass
 
@@ -1286,6 +1317,14 @@ class WorkerServer(HealthAwareServer):
             self._known_managers[manager.node_id] = manager
             # Mark as healthy since we just received this info
             self._healthy_manager_ids.add(manager.node_id)
+            # Add to discovery service for adaptive selection (AD-28)
+            self._discovery_service.add_peer(
+                peer_id=manager.node_id,
+                host=manager.tcp_host,
+                port=manager.tcp_port,
+                role="manager",
+                datacenter_id=manager.datacenter or "",
+            )
 
     @tcp.handle('manager_register')
     async def handle_manager_register(
@@ -1307,6 +1346,14 @@ class WorkerServer(HealthAwareServer):
             # Add this manager to our known managers
             self._known_managers[registration.manager.node_id] = registration.manager
             self._healthy_manager_ids.add(registration.manager.node_id)
+            # Add to discovery service for adaptive selection (AD-28)
+            self._discovery_service.add_peer(
+                peer_id=registration.manager.node_id,
+                host=registration.manager.tcp_host,
+                port=registration.manager.tcp_port,
+                role="manager",
+                datacenter_id=registration.manager.datacenter or "",
+            )
 
             # Also add any other managers included in the registration
             if registration.known_managers:
@@ -1973,6 +2020,8 @@ class WorkerServer(HealthAwareServer):
                     self._healthy_manager_ids.discard(manager_id)
                     self._manager_unhealthy_since.pop(manager_id, None)
                     self._manager_circuits.pop(manager_id, None)
+                    # Remove from discovery service (AD-28)
+                    self._discovery_service.remove_peer(manager_id)
 
                     # Also clean up address-based circuit breaker if we know the address
                     if manager_addr:
@@ -1992,6 +2041,75 @@ class WorkerServer(HealthAwareServer):
                 break
             except Exception:
                 pass
+
+    async def _discovery_maintenance_loop(self) -> None:
+        """
+        Background loop for discovery service maintenance (AD-28).
+
+        Periodically:
+        - Runs DNS discovery for new managers
+        - Decays failure counts to allow recovery
+        - Cleans up expired DNS cache entries
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._discovery_failure_decay_interval)
+
+                # Decay failure counts to allow peers to recover
+                self._discovery_service.decay_failures()
+
+                # Clean up expired DNS cache entries
+                self._discovery_service.cleanup_expired_dns()
+
+                # Optionally discover new peers via DNS (if configured)
+                if self._discovery_service.config.dns_names:
+                    await self._discovery_service.discover_peers()
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    def _select_best_manager(self, key: str) -> tuple[str, int] | None:
+        """
+        Select the best manager for a given key using adaptive selection (AD-28).
+
+        Uses Power of Two Choices with EWMA for load-aware selection,
+        with locality preferences if configured.
+
+        Args:
+            key: Key for consistent selection (e.g., workflow_id)
+
+        Returns:
+            Tuple of (host, port) for the selected manager, or None if no managers available
+        """
+        # Only consider healthy managers
+        def is_healthy(peer_id: str) -> bool:
+            return peer_id in self._healthy_manager_ids
+
+        selection = self._discovery_service.select_peer_with_filter(key, is_healthy)
+        if selection is not None:
+            return self._discovery_service.get_peer_address(selection.peer_id)
+        return None
+
+    def _record_manager_success(self, manager_id: str, latency_ms: float) -> None:
+        """
+        Record a successful request to a manager (AD-28).
+
+        Args:
+            manager_id: The manager that handled the request
+            latency_ms: Request latency in milliseconds
+        """
+        self._discovery_service.record_success(manager_id, latency_ms)
+
+    def _record_manager_failure(self, manager_id: str) -> None:
+        """
+        Record a failed request to a manager (AD-28).
+
+        Args:
+            manager_id: The manager that failed
+        """
+        self._discovery_service.record_failure(manager_id)
 
     async def _cancellation_poll_loop(self) -> None:
         """

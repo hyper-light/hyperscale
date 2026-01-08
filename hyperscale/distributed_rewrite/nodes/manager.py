@@ -142,6 +142,7 @@ from hyperscale.distributed_rewrite.protocol.version import (
     negotiate_capabilities,
     get_features_for_version,
 )
+from hyperscale.distributed_rewrite.discovery import DiscoveryService
 from hyperscale.logging.hyperscale_logging_models import ServerInfo, ServerWarning, ServerError, ServerDebug
 from hyperscale.reporting.results import Results
 from hyperscale.reporting.reporter import Reporter
@@ -477,6 +478,16 @@ class ManagerServer(HealthAwareServer):
         # Worker deadlines for extension tracking
         # Maps worker_id -> deadline timestamp
         self._worker_deadlines: dict[str, float] = {}
+
+        # Discovery service for adaptive worker selection (AD-28)
+        # Provides locality-aware, EWMA-based worker selection
+        worker_discovery_config = env.get_discovery_config(
+            node_role="manager",
+            static_seeds=[],  # Workers register dynamically
+        )
+        self._worker_discovery = DiscoveryService(worker_discovery_config)
+        self._discovery_failure_decay_interval: float = env.DISCOVERY_FAILURE_DECAY_INTERVAL
+        self._discovery_maintenance_task: asyncio.Task | None = None
 
         # Time-windowed stats collector for streaming progress updates
         # Collects WorkflowProgress updates into time-correlated windows
@@ -1190,6 +1201,14 @@ class ManagerServer(HealthAwareServer):
 
                     # Register with WorkerPool
                     await self._worker_pool.register_worker(worker_reg)
+
+                    # Add to discovery service for adaptive selection (AD-28)
+                    self._worker_discovery.add_peer(
+                        peer_id=ack.worker_id,
+                        host=worker_addr[0],
+                        port=worker_addr[1],
+                        role="worker",
+                    )
 
                     self._task_runner.run(
                         self._udp_logger.log,
@@ -2028,6 +2047,9 @@ class ManagerServer(HealthAwareServer):
         # Start orphaned workflow scanner
         self._orphan_scan_task = asyncio.create_task(self._orphan_workflow_scan_loop())
 
+        # Start discovery maintenance loop (AD-28)
+        self._discovery_maintenance_task = asyncio.create_task(self._discovery_maintenance_loop())
+
         # Start periodic job state sync to peer managers
         self._task_runner.run(self._peer_job_state_sync_loop)
 
@@ -2451,6 +2473,14 @@ class ManagerServer(HealthAwareServer):
             self._dead_node_reap_task.cancel()
             try:
                 await self._dead_node_reap_task
+            except asyncio.CancelledError:
+                pass
+
+        # Cancel discovery maintenance loop (AD-28)
+        if self._discovery_maintenance_task and not self._discovery_maintenance_task.done():
+            self._discovery_maintenance_task.cancel()
+            try:
+                await self._discovery_maintenance_task
             except asyncio.CancelledError:
                 pass
 
@@ -3771,6 +3801,14 @@ class ManagerServer(HealthAwareServer):
 
             # Register with WorkerPool
             worker_info = await self._worker_pool.register_worker(registration)
+
+            # Add to discovery service for adaptive selection (AD-28)
+            self._worker_discovery.add_peer(
+                peer_id=worker_info.node_id,
+                host=registration.node.host,
+                port=registration.node.tcp_port,
+                role="worker",
+            )
 
             self._increment_version()
 
@@ -6835,6 +6873,8 @@ class ManagerServer(HealthAwareServer):
                     self._workers.pop(worker_id, None)
                     self._worker_circuits.pop(worker_id, None)
                     self._worker_unhealthy_since.pop(worker_id, None)
+                    # Remove from discovery service (AD-28)
+                    self._worker_discovery.remove_peer(worker_id)
 
                     self._task_runner.run(
                         self._udp_logger.log,
@@ -6910,6 +6950,71 @@ class ManagerServer(HealthAwareServer):
                 break
             except Exception as e:
                 await self.handle_exception(e, "dead_node_reap_loop")
+
+    async def _discovery_maintenance_loop(self) -> None:
+        """
+        Background loop for discovery service maintenance (AD-28).
+
+        Periodically:
+        - Decays failure counts to allow workers to recover
+        - Cleans up expired DNS cache entries
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._discovery_failure_decay_interval)
+
+                # Decay failure counts to allow peers to recover
+                self._worker_discovery.decay_failures()
+
+                # Clean up expired DNS cache entries
+                self._worker_discovery.cleanup_expired_dns()
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    def _select_best_worker(self, key: str) -> tuple[str, int] | None:
+        """
+        Select the best worker for a given key using adaptive selection (AD-28).
+
+        Uses Power of Two Choices with EWMA for load-aware selection,
+        with locality preferences if configured.
+
+        Args:
+            key: Key for consistent selection (e.g., workflow_id)
+
+        Returns:
+            Tuple of (host, port) for the selected worker, or None if no workers available
+        """
+        # Only consider healthy workers (via WorkerPool)
+        def is_healthy(peer_id: str) -> bool:
+            worker_info = self._worker_pool.get_worker(peer_id)
+            return worker_info is not None and worker_info.health == WorkerHealth.HEALTHY
+
+        selection = self._worker_discovery.select_peer_with_filter(key, is_healthy)
+        if selection is not None:
+            return self._worker_discovery.get_peer_address(selection.peer_id)
+        return None
+
+    def _record_worker_success(self, worker_id: str, latency_ms: float) -> None:
+        """
+        Record a successful request to a worker (AD-28).
+
+        Args:
+            worker_id: The worker that handled the request
+            latency_ms: Request latency in milliseconds
+        """
+        self._worker_discovery.record_success(worker_id, latency_ms)
+
+    def _record_worker_failure(self, worker_id: str) -> None:
+        """
+        Record a failed request to a worker (AD-28).
+
+        Args:
+            worker_id: The worker that failed
+        """
+        self._worker_discovery.record_failure(worker_id)
 
     async def _orphan_workflow_scan_loop(self) -> None:
         """

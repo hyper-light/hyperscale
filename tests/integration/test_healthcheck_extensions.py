@@ -595,21 +595,22 @@ class TestGracefulExhaustion:
             warning_threshold=1,
         )
 
-        # First extension
-        tracker.request_extension("busy", 1.0)
-
-        # Second extension triggers warning
-        _, _, _, is_warning = tracker.request_extension("busy", 2.0)
+        # First extension triggers warning (remaining=1 after grant, hits threshold)
+        # Warning triggers when remaining <= warning_threshold
+        _, _, _, is_warning = tracker.request_extension("busy", 1.0)
         assert is_warning is True
         assert tracker.warning_sent is True
+
+        # Second extension - warning already sent
+        _, _, _, is_warning = tracker.request_extension("busy", 2.0)
+        assert is_warning is False
 
         # Reset tracker
         tracker.reset()
         assert tracker.warning_sent is False
 
         # New cycle - warning should be sent again at threshold
-        tracker.request_extension("busy", 1.0)
-        _, _, _, is_warning = tracker.request_extension("busy", 2.0)
+        _, _, _, is_warning = tracker.request_extension("busy", 1.0)
         assert is_warning is True
 
     def test_exhaustion_time_set_on_first_denial_after_max(self):
@@ -745,7 +746,8 @@ class TestGracefulExhaustionWithManager:
         )
         deadline = time.monotonic() + 30.0
 
-        # First request - no warning
+        # First request - WARNING (remaining=1 after grant, hits threshold=1)
+        # Warning triggers when remaining <= warning_threshold
         request1 = HealthcheckExtensionRequest(
             worker_id="worker-1",
             reason="busy",
@@ -755,9 +757,9 @@ class TestGracefulExhaustionWithManager:
         )
         response1 = manager.handle_extension_request(request1, deadline)
         assert response1.granted is True
-        assert response1.is_exhaustion_warning is False
+        assert response1.is_exhaustion_warning is True
 
-        # Second request - WARNING (1 remaining hits threshold)
+        # Second request - no warning (already sent)
         request2 = HealthcheckExtensionRequest(
             worker_id="worker-1",
             reason="busy",
@@ -767,7 +769,7 @@ class TestGracefulExhaustionWithManager:
         )
         response2 = manager.handle_extension_request(request2, deadline)
         assert response2.granted is True
-        assert response2.is_exhaustion_warning is True
+        assert response2.is_exhaustion_warning is False
 
     def test_manager_response_includes_grace_period_info(self):
         """handle_extension_request denial should include grace period info."""
@@ -958,8 +960,8 @@ class TestGracefulExhaustionWithManager:
 class TestWarningThresholdConfigurations:
     """Test different warning_threshold configurations."""
 
-    def test_warning_threshold_zero_never_warns(self):
-        """warning_threshold=0 should never trigger warning."""
+    def test_warning_threshold_zero_warns_on_last(self):
+        """warning_threshold=0 should warn only on the last extension (when remaining=0)."""
         tracker = ExtensionTracker(
             worker_id="worker-1",
             max_extensions=5,
@@ -972,8 +974,8 @@ class TestWarningThresholdConfigurations:
             assert granted is True
             warnings.append(is_warning)
 
-        # No warnings should have been sent
-        assert all(w is False for w in warnings)
+        # Only the last extension should trigger warning (remaining=0 <= threshold=0)
+        assert warnings == [False, False, False, False, True]
 
     def test_warning_threshold_equals_max_extensions(self):
         """warning_threshold=max_extensions should warn on first request."""
