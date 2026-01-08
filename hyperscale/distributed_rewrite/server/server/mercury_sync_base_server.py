@@ -985,7 +985,7 @@ class MercurySyncBaseServer(Generic[T]):
         data: bytes,
         transport: asyncio.Transport,
     ):
-        # print(f"DEBUG read_server_tcp: received {len(data)} bytes")
+       
         self._pending_tcp_server_responses.append(
             asyncio.ensure_future(
                 self.process_tcp_server_request(
@@ -1002,20 +1002,24 @@ class MercurySyncBaseServer(Generic[T]):
         sender_addr: tuple[str, int] | None = None,
     ):
         try:
+            print(f"[DEBUG] read_server_tcp: received {len(data)} bytes from {sender_addr}")
             # Rate limiting (if sender address available)
             if sender_addr is not None:
                 if not self._rate_limiter.check(sender_addr):
                     self._udp_drop_counter.increment_rate_limited()
+                    print(f'[DEBUG] Rate limited {sender_addr}')
                     return
 
             # Message size validation (before decompression)
             if len(data) > MAX_MESSAGE_SIZE:
+                print(f'[DEBUG] Exceeded max size {sender_addr}')
                 self._udp_drop_counter.increment_message_too_large()
                 return
 
             try:
                 decrypted_data = self._encryptor.decrypt(data)
             except Exception:
+                print(f'[DEBUG] Failed decryption {sender_addr}')
                 self._udp_drop_counter.increment_decryption_failed()
                 return
 
@@ -1028,6 +1032,7 @@ class MercurySyncBaseServer(Generic[T]):
             try:
                 validate_message_size(len(decrypted_data), len(decrypted))
             except MessageSizeError:
+                print(f'[DEBUG] Exceeded message size limit {sender_addr}')
                 self._udp_drop_counter.increment_decompression_too_large()
                 return
 
@@ -1040,6 +1045,8 @@ class MercurySyncBaseServer(Generic[T]):
             data_len = int.from_bytes(rest[64:68], 'big')
             # Extract payload (remaining bytes)
             payload = rest[68:68 + data_len]
+
+            print(f'[DEBUG] Received request_type={request_type} handler_name={handler_name} from addr={sender_addr}')
 
             match request_type:
 
@@ -1058,19 +1065,23 @@ class MercurySyncBaseServer(Generic[T]):
                     )
 
                 case b's':
-
+                    # Server response - pass the full 'rest' to process_udp_client_response
+                    # which expects clock(64) + data_len(4) + data(N), NOT pre-extracted payload
                     self._pending_udp_server_responses.append(
                         asyncio.ensure_future(
                             self.process_udp_client_response(
                                 handler_name,
                                 addr,
-                                payload,
+                                rest,
                             )
                         )
                     )
 
 
-        except Exception:
+        except Exception as err:
+            print(f'[DEBUG] Encountered unknown error {sender_addr} - {str(err)}')
+            import traceback
+            print(traceback.format_exc())
             self._udp_drop_counter.increment_malformed_message()
 
     async def process_tcp_client_response(
@@ -1282,11 +1293,11 @@ class MercurySyncBaseServer(Generic[T]):
     ):
         
         next_time = await self._udp_clock.update(clock_time)
-        handler_name = b''
 
         try:
             parsed_addr = parse_address(addr)
         except AddressValidationError as e:
+            print(f'[DEBUG] failed due to malformed request {addr}')
             await self._log_security_warning(
                 f"UDP server request malformed address: {e}",
                 protocol="udp",
@@ -1330,14 +1341,14 @@ class MercurySyncBaseServer(Generic[T]):
             transport.sendto(response_payload, parsed_addr)
 
         except Exception as e:
+            import traceback
+            print(traceback.format_exc())
+            print(f'[DEBUG] failed to process due to {str(e)} - {list(addr)}')
             # Log security event - don't leak internal details
             await self._log_security_warning(
                 f"UDP server request failed: {type(e).__name__}",
                 protocol="udp",
             )
-
-            if handler_name == b'':
-                handler_name = b'error'
 
             # Sanitized error response
             error_msg = b'Request processing failed'
