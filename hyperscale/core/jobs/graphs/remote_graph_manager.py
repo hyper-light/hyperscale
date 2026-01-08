@@ -1281,7 +1281,7 @@ class RemoteGraphManager:
             try:
                 await asyncio.wait_for(
                     completion_state.completion_event.wait(),
-                    timeout=min(0.1, remaining_timeout),
+                    timeout=min(0.05, remaining_timeout),
                 )
             except asyncio.TimeoutError:
                 pass  # Expected - just check for status updates
