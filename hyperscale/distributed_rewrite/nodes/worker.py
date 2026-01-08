@@ -805,7 +805,49 @@ class WorkerServer(HealthAwareServer):
             # If this is a leader and we don't have one, use it
             if heartbeat.is_leader and not self._primary_manager_id:
                 self._primary_manager_id = manager_id
-    
+
+        # Process job leadership updates from this manager
+        # This enables proactive job leader discovery via UDP heartbeats
+        if heartbeat.job_leaderships:
+            self._process_job_leadership_heartbeat(heartbeat, source_addr)
+
+    def _process_job_leadership_heartbeat(
+        self,
+        heartbeat: ManagerHeartbeat,
+        source_addr: tuple[str, int],
+    ) -> None:
+        """
+        Process job leadership claims from ManagerHeartbeat.
+
+        When a manager heartbeat includes job_leaderships, update our
+        _workflow_job_leader mapping for any active workflows belonging
+        to those jobs. This enables proactive leadership discovery
+        without waiting for TCP ack responses.
+        """
+        # Get TCP address for the manager (for job leader routing)
+        tcp_host = heartbeat.tcp_host if heartbeat.tcp_host else source_addr[0]
+        tcp_port = heartbeat.tcp_port if heartbeat.tcp_port else source_addr[1] - 1
+        manager_tcp_addr = (tcp_host, tcp_port)
+
+        # Check each of our active workflows to see if this manager leads its job
+        for workflow_id, progress in list(self._active_workflows.items()):
+            job_id = progress.job_id
+            if job_id in heartbeat.job_leaderships:
+                # This manager claims leadership of this job
+                current_leader = self._workflow_job_leader.get(workflow_id)
+                if current_leader != manager_tcp_addr:
+                    self._workflow_job_leader[workflow_id] = manager_tcp_addr
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Job leader update via SWIM: workflow {workflow_id} "
+                                    f"job {job_id} -> {manager_tcp_addr}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
     async def _select_new_primary_manager(self) -> None:
         """Select a new primary manager from healthy managers."""
         # Prefer the leader if we know one

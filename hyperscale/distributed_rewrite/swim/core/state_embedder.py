@@ -272,6 +272,8 @@ class ManagerStateEmbedder:
     get_current_gate_leader_host: Callable[[], str | None] | None = None
     get_current_gate_leader_port: Callable[[], int | None] | None = None
     get_known_gates: Callable[[], dict[str, tuple[str, int, str, int]]] | None = None
+    # Job leadership tracking for worker notification
+    get_job_leaderships: Callable[[], dict[str, tuple[int, int]]] | None = None
 
     def get_state(self) -> bytes | None:
         """Get ManagerHeartbeat to embed in SWIM messages."""
@@ -303,6 +305,8 @@ class ManagerStateEmbedder:
             current_gate_leader_host=self.get_current_gate_leader_host() if self.get_current_gate_leader_host else None,
             current_gate_leader_port=self.get_current_gate_leader_port() if self.get_current_gate_leader_port else None,
             known_gates=self.get_known_gates() if self.get_known_gates else {},
+            # Job leadership for worker notification
+            job_leaderships=self.get_job_leaderships() if self.get_job_leaderships else {},
         )
         return heartbeat.dump()
     

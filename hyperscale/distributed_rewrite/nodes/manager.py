@@ -596,6 +596,7 @@ class ManagerServer(HealthAwareServer):
             get_current_gate_leader_host=lambda: self._current_gate_leader_addr[0] if self._current_gate_leader_addr else None,
             get_current_gate_leader_port=lambda: self._current_gate_leader_addr[1] if self._current_gate_leader_addr else None,
             get_known_gates=self._get_known_gates_for_heartbeat,
+            get_job_leaderships=self._get_job_leaderships_for_heartbeat,
         ))
         
         # Register leadership callbacks (composition pattern - no override)
@@ -1583,6 +1584,10 @@ class ManagerServer(HealthAwareServer):
 
         Also handles extension requests piggybacked on heartbeats (AD-26).
         """
+        # AD-29: Confirm this peer in the SWIM layer since we received their heartbeat
+        # This allows the suspicion subprotocol to function properly
+        self.confirm_peer(source_addr)
+
         # Check if update is stale using versioned clock
         if self._versioned_clock.is_entity_stale(heartbeat.node_id, heartbeat.version):
             # Stale update - discard
@@ -2042,6 +2047,25 @@ class ManagerServer(HealthAwareServer):
                 gate_info.udp_host,
                 gate_info.udp_port,
             )
+        return result
+
+    def _get_job_leaderships_for_heartbeat(self) -> dict[str, tuple[int, int]]:
+        """
+        Get job leaderships for piggybacking in ManagerHeartbeat.
+
+        Returns dict mapping job_id -> (fencing_token, layer_version) for jobs
+        where this manager is the leader. This enables workers to proactively
+        learn about job leadership changes via UDP heartbeats instead of
+        waiting for TCP ack responses.
+        """
+        result: dict[str, tuple[int, int]] = {}
+        my_node_id = self._node_id.full
+        for job_id, leader_id in self._job_leaders.items():
+            if leader_id == my_node_id:
+                fencing_token = self._job_fencing_tokens.get(job_id, 1)
+                # layer_version tracks the version of job metadata
+                layer_version = self._state_version
+                result[job_id] = (fencing_token, layer_version)
         return result
 
     @property
