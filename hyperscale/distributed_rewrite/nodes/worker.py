@@ -724,11 +724,15 @@ class WorkerServer(HealthAwareServer):
     ) -> None:
         """
         Handle ManagerHeartbeat received via SWIM message embedding.
-        
+
         This enables workers to track leadership changes in real-time
         without waiting for TCP ack responses. When a manager's leadership
         status changes, workers can immediately update their primary manager.
         """
+        # AD-29: Confirm this peer in the SWIM layer since we received their heartbeat
+        # This allows the suspicion subprotocol to function properly
+        self.confirm_peer(source_addr)
+
         # Find or create manager info for this address
         manager_id = heartbeat.node_id
         

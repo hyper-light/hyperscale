@@ -233,7 +233,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         # Called when a node's status changes (e.g., becomes DEAD or rejoins)
         self._on_node_dead_callbacks: list[Callable[[tuple[str, int]], None]] = []
         self._on_node_join_callbacks: list[Callable[[tuple[str, int]], None]] = []
-        
+
+        # Peer confirmation tracking (AD-29: Protocol-Level Peer Confirmation)
+        # Failure detection only applies to peers we've successfully communicated with.
+        # This prevents false positives during cluster initialization.
+        self._confirmed_peers: set[tuple[str, int]] = set()  # Successfully reached at least once
+        self._unconfirmed_peers: set[tuple[str, int]] = set()  # Known but not yet reached
+        self._unconfirmed_peer_added_at: dict[tuple[str, int], float] = {}  # For stale detection
+        self._peer_confirmation_callbacks: list[Callable[[tuple[str, int]], None]] = []
+
         # Set up suspicion manager callbacks
         self._suspicion_manager.set_callbacks(
             on_expired=self._on_suspicion_expired,
@@ -308,14 +316,121 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
     ) -> None:
         """
         Register a callback to be invoked when a node joins or rejoins the cluster.
-        
+
         Use this to handle worker/peer recovery without overriding methods.
-        
+
         Args:
             callback: Function receiving the joining node's address.
         """
         self._on_node_join_callbacks.append(callback)
-    
+
+    def register_on_peer_confirmed(
+        self,
+        callback: Callable[[tuple[str, int]], None],
+    ) -> None:
+        """
+        Register a callback to be invoked when a peer is confirmed.
+
+        Confirmation occurs on the first successful communication with a peer.
+        Use this to add peers to active tracking only after confirmation.
+
+        Args:
+            callback: Function receiving the confirmed peer's address.
+        """
+        self._peer_confirmation_callbacks.append(callback)
+
+    # =========================================================================
+    # Peer Confirmation (AD-29)
+    # =========================================================================
+
+    def add_unconfirmed_peer(self, peer: tuple[str, int]) -> None:
+        """
+        Add a peer from configuration as unconfirmed.
+
+        Unconfirmed peers are probed but failure detection does NOT apply
+        until we successfully communicate with them at least once.
+
+        Args:
+            peer: The UDP address of the peer to track.
+        """
+        if peer == self._get_self_udp_addr():
+            return  # Don't track self
+
+        if peer in self._confirmed_peers:
+            return  # Already confirmed, no action needed
+
+        if peer not in self._unconfirmed_peers:
+            self._unconfirmed_peers.add(peer)
+            self._unconfirmed_peer_added_at[peer] = time.monotonic()
+            print(f"[DEBUG SWIM {self._udp_port}] add_unconfirmed_peer: {peer} added to unconfirmed set")
+
+    def confirm_peer(self, peer: tuple[str, int]) -> bool:
+        """
+        Mark a peer as confirmed after successful communication.
+
+        This transitions the peer from unconfirmed to confirmed state,
+        enabling failure detection for this peer.
+
+        Args:
+            peer: The UDP address of the peer to confirm.
+
+        Returns:
+            True if peer was newly confirmed, False if already confirmed.
+        """
+        if peer == self._get_self_udp_addr():
+            return False  # Don't confirm self
+
+        if peer in self._confirmed_peers:
+            return False  # Already confirmed
+
+        # Transition from unconfirmed to confirmed
+        was_unconfirmed = peer in self._unconfirmed_peers
+        self._unconfirmed_peers.discard(peer)
+        self._unconfirmed_peer_added_at.pop(peer, None)
+        self._confirmed_peers.add(peer)
+
+        if was_unconfirmed:
+            print(f"[DEBUG SWIM {self._udp_port}] confirm_peer: {peer} CONFIRMED (was unconfirmed)")
+        else:
+            print(f"[DEBUG SWIM {self._udp_port}] confirm_peer: {peer} CONFIRMED (was unknown)")
+
+        # Invoke confirmation callbacks
+        for callback in self._peer_confirmation_callbacks:
+            try:
+                callback(peer)
+            except Exception as e:
+                self._task_runner.run(
+                    self.handle_exception, e, "on_peer_confirmed_callback"
+                )
+
+        return True
+
+    def is_peer_confirmed(self, peer: tuple[str, int]) -> bool:
+        """Check if a peer has been confirmed."""
+        return peer in self._confirmed_peers
+
+    def is_peer_unconfirmed(self, peer: tuple[str, int]) -> bool:
+        """Check if a peer is known but unconfirmed."""
+        return peer in self._unconfirmed_peers
+
+    def get_confirmed_peers(self) -> set[tuple[str, int]]:
+        """Get the set of confirmed peers."""
+        return self._confirmed_peers.copy()
+
+    def get_unconfirmed_peers(self) -> set[tuple[str, int]]:
+        """Get the set of unconfirmed peers."""
+        return self._unconfirmed_peers.copy()
+
+    def remove_peer_tracking(self, peer: tuple[str, int]) -> None:
+        """
+        Remove a peer from all confirmation tracking.
+
+        Use when a peer is intentionally removed from the cluster.
+        """
+        self._confirmed_peers.discard(peer)
+        self._unconfirmed_peers.discard(peer)
+        self._unconfirmed_peer_added_at.pop(peer, None)
+
     def _get_lhm_multiplier(self) -> float:
         """Get the current LHM timeout multiplier."""
         return self._local_health.get_multiplier()
@@ -2237,7 +2352,19 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
         incarnation: int,
         from_node: tuple[str, int],
     ) -> SuspicionState | None:
-        """Start suspecting a node or add confirmation to existing suspicion."""
+        """
+        Start suspecting a node or add confirmation to existing suspicion.
+
+        Per AD-29: Only confirmed peers can be suspected. If we've never
+        successfully communicated with a peer, we can't meaningfully suspect
+        them - they might just not be up yet during cluster formation.
+        """
+        # AD-29: Guard against suspecting unconfirmed peers
+        if not self.is_peer_confirmed(node):
+            print(f"[DEBUG SWIM {self._udp_port}] start_suspicion: SKIPPED for {node} (not confirmed)")
+            self._metrics.increment('suspicions_skipped_unconfirmed')
+            return None
+
         # DEBUG: Track when suspicion starts
         print(f"[DEBUG SWIM {self._udp_port}] start_suspicion: {node} suspected by {from_node} (incarnation={incarnation})")
 
@@ -2837,6 +2964,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     # node that responded to our probe
                     print(f"[DEBUG SWIM {self._udp_port}] ACK received from {addr}")
 
+                    # AD-29: Confirm peer on successful communication
+                    self.confirm_peer(addr)
+
                     # Complete any pending probe Future for this address
                     # This unblocks _probe_with_timeout waiting for ACK
                     pending_future = self._pending_probe_acks.get(addr)
@@ -2866,6 +2996,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                     # nack:invalid = malformed request
                     # We should NOT complete the pending probe future - let it timeout
                     print(f"[DEBUG SWIM {self._udp_port}] NACK received from {addr}, message={message[:50]}")
+
+                    # AD-29: Confirm peer on successful communication (even NACK is communication)
+                    self.confirm_peer(addr)
 
                     # Parse NACK reason if present (nack:reason>addr)
                     nack_reason = b'unspecified'
@@ -2965,6 +3098,12 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
                         self._probe_scheduler.add_member(target)
 
+                        # AD-29: Confirm both the sender and the joining node
+                        # The sender (addr) responded to our cluster, so it's confirmed
+                        # The target (joining node) is now a confirmed member
+                        self.confirm_peer(addr)
+                        self.confirm_peer(target)
+
                         # DEBUG: Track join message processing
                         print(f"[DEBUG SWIM {self._udp_port}] JOIN message: {target} joined cluster, invoking {len(self._on_node_join_callbacks)} callbacks")
 
@@ -3022,6 +3161,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
                 case b'probe':
                     print(f"[DEBUG SWIM {self._udp_port}] PROBE received from {addr}, target={target}")
+
+                    # AD-29: Confirm the sender - they successfully reached us
+                    self.confirm_peer(addr)
+
                     if not await self._validate_target(target, b'probe', addr):
                         print(f"[DEBUG SWIM {self._udp_port}] PROBE: target validation failed")
                         return b'nack>' + self._udp_addr_slug
@@ -3155,6 +3298,9 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 case b'alive':
                     msg_incarnation = await self._parse_incarnation_safe(message, addr)
 
+                    # AD-29: Confirm the sender - they successfully responded
+                    self.confirm_peer(addr)
+
                     # Complete any pending probe Future for this address
                     # 'alive' is sent as a response when a node is probed about itself
                     # This is equivalent to an ACK for probe purposes
@@ -3178,7 +3324,10 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 
                 case b'suspect':
                     msg_incarnation = await self._parse_incarnation_safe(message, addr)
-                    
+
+                    # AD-29: Confirm the sender - they successfully sent us a message
+                    self.confirm_peer(addr)
+
                     if target:
                         if self.udp_target_is_self(target):
                             await self.increase_failure_detector('refutation')

@@ -283,8 +283,10 @@ class ManagerServer(HealthAwareServer):
         # Track active manager peers by node_id (removed when SWIM marks as dead)
         self._active_manager_peer_ids: set[str] = set()
 
-        # Legacy: Track active peers by TCP addr for backwards compat during transition
-        self._active_manager_peers: set[tuple[str, int]] = set(self._seed_managers)
+        # Track active peers by TCP addr
+        # AD-29: Start empty - peers become active ONLY after we receive their heartbeat
+        # This prevents false failure detection during cluster formation
+        self._active_manager_peers: set[tuple[str, int]] = set()
 
         # Per-peer locks protecting _active_manager_peers modifications to prevent race conditions
         # between concurrent failure/recovery handlers for the SAME peer (asyncio task interleaving)
@@ -1679,6 +1681,10 @@ class ManagerServer(HealthAwareServer):
         # Store peer info keyed by UDP address
         self._manager_peer_info[source_addr] = heartbeat
 
+        # AD-29: Confirm this peer in the SWIM layer since we received their heartbeat
+        # This allows the suspicion subprotocol to function properly
+        self.confirm_peer(source_addr)
+
         # Update version tracking
         self._task_runner.run(
             self._versioned_clock.update_entity, heartbeat.node_id, heartbeat.version
@@ -1869,6 +1875,10 @@ class ManagerServer(HealthAwareServer):
         Critical: Also maintains _gate_udp_to_tcp mapping for SWIM failure/recovery callbacks.
         The source_addr is UDP (from SWIM), and TCP address comes from heartbeat fields.
         """
+        # AD-29: Confirm this peer in the SWIM layer since we received their heartbeat
+        # This allows the suspicion subprotocol to function properly
+        self.confirm_peer(source_addr)
+
         gate_id = heartbeat.node_id
 
         # Get TCP address from heartbeat fields (not convention assumption)

@@ -229,8 +229,10 @@ class GateServer(HealthAwareServer):
                 print(f"[DEBUG GATE INIT tcp={tcp_port}] Mapping UDP {self._gate_udp_peers[i]} -> TCP {tcp_addr}")
 
         # Track active gate peers (removed when SWIM marks as dead)
-        self._active_gate_peers: set[tuple[str, int]] = set(self._gate_peers)
-        print(f"[DEBUG GATE INIT tcp={tcp_port}] _active_gate_peers initialized: {self._active_gate_peers}")
+        # AD-29: Start empty - peers become active ONLY after we receive their heartbeat
+        # This prevents false failure detection during cluster formation
+        self._active_gate_peers: set[tuple[str, int]] = set()
+        print(f"[DEBUG GATE INIT tcp={tcp_port}] _active_gate_peers initialized empty (AD-29: peers start unconfirmed)")
 
         # Per-peer locks protecting _active_gate_peers modifications to prevent race conditions
         # between concurrent failure/recovery handlers for the SAME peer (asyncio task interleaving)
@@ -831,6 +833,10 @@ class GateServer(HealthAwareServer):
         print(f"[DEBUG GATE {self._tcp_port}] Heartbeat TCP addr from fields: {peer_tcp_addr}")
         print(f"[DEBUG GATE {self._tcp_port}] Current _gate_udp_to_tcp: {self._gate_udp_to_tcp}")
         print(f"[DEBUG GATE {self._tcp_port}] Current _active_gate_peers BEFORE: {self._active_gate_peers}")
+
+        # AD-29: Confirm this peer in the SWIM layer since we received their heartbeat
+        # This allows the suspicion subprotocol to function properly
+        self.confirm_peer(source_addr)
 
         # Update UDP to TCP mapping for failure/recovery callbacks
         # source_addr is the UDP address from SWIM, peer_tcp_addr is from heartbeat
