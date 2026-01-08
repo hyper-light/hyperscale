@@ -805,7 +805,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
 
         # Step 2: Find membership piggyback (|...) in the remaining portion
         # Only search up to msg_end to avoid finding '|' in health data
+        # Must skip the '|' in state separator '#s|' - only match bare '|'
         membership_idx = message.find(b'|', 0, msg_end)
+        # Check if this '|' is part of the state separator '#s|'
+        while membership_idx > 0:
+            if membership_idx >= 2 and message[membership_idx - 2:membership_idx + 1] == b'#s|':
+                # This '|' is part of state separator, find next '|'
+                membership_idx = message.find(b'|', membership_idx + 1, msg_end)
+            else:
+                break
         if membership_idx > 0:
             membership_piggyback = message[membership_idx:msg_end]
             msg_end = membership_idx
@@ -2975,7 +2983,15 @@ class HealthAwareServer(MercurySyncBaseServer[Ctx]):
                 self._health_gossip_buffer.decode_and_process_piggyback(health_piggyback_data)
 
             # Extract any piggybacked membership updates (format: |type:incarnation:host:port|...)
+            # Must skip the '|' in state separator '#s|' - only match bare '|' not preceded by '#s'
             piggyback_idx = data.find(b'|')
+            # Check if this '|' is part of the state separator '#s|'
+            while piggyback_idx > 0:
+                if piggyback_idx >= 2 and data[piggyback_idx - 2:piggyback_idx + 1] == b'#s|':
+                    # This '|' is part of state separator, find next '|'
+                    piggyback_idx = data.find(b'|', piggyback_idx + 1)
+                else:
+                    break
             if piggyback_idx > 0:
                 main_data = data[:piggyback_idx]
                 piggyback_data = data[piggyback_idx:]

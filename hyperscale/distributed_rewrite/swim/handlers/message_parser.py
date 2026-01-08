@@ -75,7 +75,15 @@ class MessageParser:
             data = data[:health_idx]
 
         # Extract membership piggyback (format: |type:incarnation:host:port|...)
+        # Must skip the '|' in state separator '#s|' - only match bare '|'
         piggyback_idx = data.find(b'|')
+        # Check if this '|' is part of the state separator '#s|'
+        while piggyback_idx > 0:
+            if piggyback_idx >= 2 and data[piggyback_idx - 2:piggyback_idx + 1] == b'#s|':
+                # This '|' is part of state separator, find next '|'
+                piggyback_idx = data.find(b'|', piggyback_idx + 1)
+            else:
+                break
         if piggyback_idx > 0:
             membership_piggyback = data[piggyback_idx:]
             data = data[:piggyback_idx]
