@@ -1834,6 +1834,563 @@ hyperscale/distributed_rewrite/
 
 ---
 
+### AD-28: Enhanced DNS Discovery with Peer Selection
+
+**Decision**: Implement a robust, locality-aware peer discovery and selection system using Weighted Rendezvous Hashing combined with Adaptive EWMA-based selection, bounded connection pools, and comprehensive security validation.
+
+**Rationale**:
+- Current static seed approach doesn't scale for globally distributed deployments
+- Need to prevent accidental cross-cluster and cross-environment joins
+- Role-based security prevents workers from directly contacting gates or vice versa
+- Locality awareness reduces latency by preferring same-DC peers
+- Adaptive selection handles heterogeneous peer performance gracefully
+- Sticky connections reduce connection churn while allowing health-based eviction
+
+**Problem Statement**:
+In a globally distributed performance testing framework, peers can:
+1. Be in different datacenters with varying latencies (1ms same-DC vs 200ms cross-region)
+2. Experience temporary overload during test execution
+3. Crash and restart with different IPs (Kubernetes pod replacement)
+4. Be misconfigured to accidentally join wrong cluster/environment
+5. Attempt unauthorized role-based connections (worker→gate should be blocked)
+
+#### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     ENHANCED DNS DISCOVERY ARCHITECTURE                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                           LAYER 1: DNS RESOLUTION                                │ │
+│  │                                                                                   │ │
+│  │  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐     │ │
+│  │  │   Static     │   │     DNS      │   │   Negative   │   │   Positive   │     │ │
+│  │  │   Seeds      │   │   Resolver   │   │    Cache     │   │    Cache     │     │ │
+│  │  │              │   │              │   │              │   │              │     │ │
+│  │  │ 10.0.1.5:9000│   │ SRV records  │   │ Failed hosts │   │ Resolved IPs │     │ │
+│  │  │ 10.0.1.6:9000│   │ + A records  │   │ (30s TTL)    │   │ (DNS TTL)    │     │ │
+│  │  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘   └──────┬───────┘     │ │
+│  │         │                  │                  │                  │              │ │
+│  │         └──────────────────┴──────────────────┴──────────────────┘              │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │  Candidate Set      │                                  │ │
+│  │                        │  (all discovered)   │                                  │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  └───────────────────────────────────┼──────────────────────────────────────────────┘ │
+│                                      │                                                │
+│  ┌───────────────────────────────────┼──────────────────────────────────────────────┐ │
+│  │                           LAYER 2: SECURITY VALIDATION                           │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │  Cluster ID Check   │ ─── Reject if cluster_id ≠ ours  │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │ Environment Check   │ ─── Reject if env_id ≠ ours      │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │  Role Validation    │ ─── Check mTLS cert claims       │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  └───────────────────────────────────┼──────────────────────────────────────────────┘ │
+│                                      │                                                │
+│  ┌───────────────────────────────────┼──────────────────────────────────────────────┐ │
+│  │                           LAYER 3: LOCALITY FILTER                               │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │     ┌─────────────────────────────────────────────────────────────────────┐    │ │
+│  │     │                      LOCALITY TIERS                                   │    │ │
+│  │     │                                                                       │    │ │
+│  │     │   Tier 0 (preferred): Same datacenter         (latency < 2ms)        │    │ │
+│  │     │   Tier 1 (fallback):  Same region             (latency < 50ms)       │    │ │
+│  │     │   Tier 2 (emergency): Global (any DC)         (latency varies)       │    │ │
+│  │     │                                                                       │    │ │
+│  │     │   Selection: Try Tier 0 first. If < min_peers, add Tier 1, etc.      │    │ │
+│  │     │                                                                       │    │ │
+│  │     └─────────────────────────────────────────────────────────────────────┘    │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │  Locality-Filtered  │                                  │ │
+│  │                        │   Candidate Set     │                                  │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  └───────────────────────────────────┼──────────────────────────────────────────────┘ │
+│                                      │                                                │
+│  ┌───────────────────────────────────┼──────────────────────────────────────────────┐ │
+│  │                           LAYER 4: PEER SELECTION                                │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │     ┌─────────────────────────────────────────────────────────────────────┐    │ │
+│  │     │           WEIGHTED RENDEZVOUS HASH + POWER OF TWO CHOICES            │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Step 1: Rendezvous Hash produces deterministic candidate ranking    │    │ │
+│  │     │          score = hash(peer_id || selector_id || role) * health_weight│    │ │
+│  │     │          → Top K candidates (K=8)                                    │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Step 2: Power of Two Choices for load balancing                     │    │ │
+│  │     │          From K candidates, randomly sample 2                        │    │ │
+│  │     │          Compare their EWMA latency scores                           │    │ │
+│  │     │          Choose the one with lower latency                           │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Step 3: Maintain sticky primary (K=3) and backup (K=2) connections  │    │ │
+│  │     │          Only switch when health degrades significantly              │    │ │
+│  │     │                                                                       │    │ │
+│  │     └─────────────────────────────────────────────────────────────────────┘    │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │                        ┌─────────────────────┐                                  │ │
+│  │                        │   Selected Peers    │                                  │ │
+│  │                        │   (3 primary +      │                                  │ │
+│  │                        │    2 backup)        │                                  │ │
+│  │                        └──────────┬──────────┘                                  │ │
+│  └───────────────────────────────────┼──────────────────────────────────────────────┘ │
+│                                      │                                                │
+│  ┌───────────────────────────────────┼──────────────────────────────────────────────┐ │
+│  │                           LAYER 5: CONNECTION POOL                               │ │
+│  │                                   │                                              │ │
+│  │                                   ▼                                              │ │
+│  │     ┌─────────────────────────────────────────────────────────────────────┐    │ │
+│  │     │                    STICKY CONNECTION POOL                             │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Primary Connections (3):                                            │    │ │
+│  │     │  ┌─────────┐  ┌─────────┐  ┌─────────┐                              │    │ │
+│  │     │  │ Peer A  │  │ Peer B  │  │ Peer C  │   Active connections        │    │ │
+│  │     │  │ EWMA:2ms│  │ EWMA:3ms│  │ EWMA:5ms│   Round-robin for requests  │    │ │
+│  │     │  └─────────┘  └─────────┘  └─────────┘                              │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Backup Connections (2):                                             │    │ │
+│  │     │  ┌─────────┐  ┌─────────┐                                           │    │ │
+│  │     │  │ Peer D  │  │ Peer E  │   Ready to promote on primary failure     │    │ │
+│  │     │  │ EWMA:8ms│  │EWMA:10ms│                                           │    │ │
+│  │     │  └─────────┘  └─────────┘                                           │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  Eviction Policy:                                                    │    │ │
+│  │     │  - error_rate > 5%  OR                                               │    │ │
+│  │     │  - consecutive_failures > 3  OR                                      │    │ │
+│  │     │  - latency > p99_baseline * 3                                        │    │ │
+│  │     │                                                                       │    │ │
+│  │     │  On eviction: Promote backup → primary, replenish from candidates    │    │ │
+│  │     │                                                                       │    │ │
+│  │     └─────────────────────────────────────────────────────────────────────┘    │ │
+│  └──────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Security: Cluster ID and Environment ID
+
+Prevents accidental cross-cluster and cross-environment joins:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     CLUSTER/ENVIRONMENT ISOLATION                                    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  Problem: Misconfigured node in staging tries to join production cluster             │
+│                                                                                       │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │                                                                                  │ │
+│  │    STAGING NODE                        PRODUCTION CLUSTER                       │ │
+│  │    cluster_id: "hyperscale-staging"    cluster_id: "hyperscale-prod"           │ │
+│  │    env_id: "staging"                   env_id: "production"                    │ │
+│  │                                                                                  │ │
+│  │         │                                       │                               │ │
+│  │         │──── Registration Request ────────────▶│                               │ │
+│  │         │     cluster_id: "hyperscale-staging" │                               │ │
+│  │         │                                       │                               │ │
+│  │         │◀─── REJECT: cluster_id mismatch ─────│                               │ │
+│  │         │     expected: "hyperscale-prod"       │                               │ │
+│  │         │                                       │                               │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                       │
+│  Configuration:                                                                      │
+│  ```python                                                                           │
+│  @dataclass(slots=True)                                                             │
+│  class DiscoveryConfig:                                                             │
+│      cluster_id: str         # Required - unique cluster identifier                 │
+│      environment_id: str     # Required - prod/staging/dev                          │
+│      ...                                                                            │
+│  ```                                                                                │
+│                                                                                       │
+│  Wire Protocol Addition:                                                            │
+│  - All registration messages include cluster_id and environment_id                  │
+│  - Receiver validates BEFORE processing any other fields                            │
+│  - Mismatch results in immediate rejection with clear error message                 │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Security: Role-Based Connection Matrix
+
+mTLS certificate claims enforce which node types can communicate:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        ROLE-BASED CONNECTION MATRIX                                  │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  Certificate Claim Format:                                                           │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  Subject Alternative Name (SAN):                                                │ │
+│  │    URI: hyperscale://role/{worker|manager|gate|client}                         │ │
+│  │    URI: hyperscale://cluster/{cluster_id}                                      │ │
+│  │    URI: hyperscale://env/{environment_id}                                      │ │
+│  │    URI: hyperscale://dc/{datacenter_id}                                        │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                       │
+│  Connection Matrix:                                                                  │
+│  ┌────────────┬─────────────────────────────────────────────────────────────────┐  │
+│  │  Initiator │                        Can Connect To                            │  │
+│  ├────────────┼──────────┬──────────┬──────────┬──────────────────────────────────┤  │
+│  │            │  Worker  │  Manager │   Gate   │   Client                       │  │
+│  ├────────────┼──────────┼──────────┼──────────┼──────────────────────────────────┤  │
+│  │  Client    │    ❌    │    ❌    │    ✅    │      ❌                        │  │
+│  │            │          │          │ (submit) │                                │  │
+│  ├────────────┼──────────┼──────────┼──────────┼──────────────────────────────────┤  │
+│  │  Gate      │    ❌    │    ✅    │    ✅    │      ✅ (push)                 │  │
+│  │            │          │ (forward)│ (peer)   │                                │  │
+│  ├────────────┼──────────┼──────────┼──────────┼──────────────────────────────────┤  │
+│  │  Manager   │    ✅    │    ✅    │    ✅    │      ✅ (push)                 │  │
+│  │            │(dispatch)│  (peer)  │ (report) │                                │  │
+│  ├────────────┼──────────┼──────────┼──────────┼──────────────────────────────────┤  │
+│  │  Worker    │    ❌    │    ✅    │    ❌    │      ❌                        │  │
+│  │            │          │(progress)│          │                                │  │
+│  └────────────┴──────────┴──────────┴──────────┴──────────────────────────────────┘  │
+│                                                                                       │
+│  Example Rejection:                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────────────┐ │
+│  │  Worker (role=worker) attempts to connect to Gate (role=gate)                  │ │
+│  │                                                                                  │ │
+│  │  Gate extracts initiator role from mTLS cert: "worker"                         │ │
+│  │  Gate checks: is "worker" in allowed_initiators? NO                            │ │
+│  │  Gate rejects: "Connection denied: role 'worker' cannot connect to 'gate'"     │ │
+│  └────────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Peer Selection Algorithm: Weighted Rendezvous Hash + Power of Two Choices
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    PEER SELECTION ALGORITHM                                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  STEP 1: WEIGHTED RENDEZVOUS HASH (for deterministic candidate ranking)             │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                       │
+│  For each peer P in the locality-filtered candidate set:                            │
+│                                                                                       │
+│    base_score = hash(peer_id || selector_id || role)                                │
+│    health_weight = 1.0 - (error_rate * 2) - (latency_factor * 0.5)                 │
+│    weighted_score = base_score * max(0.1, health_weight)                            │
+│                                                                                       │
+│  Sort by weighted_score descending → Top K candidates (K=8)                         │
+│                                                                                       │
+│  Why Rendezvous Hash?                                                               │
+│  - Deterministic: same inputs always produce same ranking (debuggable)              │
+│  - Minimal disruption: adding/removing peer only affects that peer's connections    │
+│  - No central coordination needed                                                    │
+│                                                                                       │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│  STEP 2: POWER OF TWO CHOICES (for load balancing among candidates)                 │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                       │
+│  From K candidates, to select one connection:                                       │
+│                                                                                       │
+│    candidate_a = random.choice(candidates)                                          │
+│    candidate_b = random.choice(candidates - {candidate_a})                          │
+│    chosen = candidate_a if ewma_latency[a] < ewma_latency[b] else candidate_b       │
+│                                                                                       │
+│  Why Power of Two?                                                                   │
+│  - Avoids thundering herd (not everyone picks the "best")                           │
+│  - Automatically load balances across peers                                         │
+│  - O(1) selection vs O(n) for finding global minimum                                │
+│                                                                                       │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│  STEP 3: ADAPTIVE EWMA LATENCY TRACKING                                             │
+│  ─────────────────────────────────────────────────────────────────────────────────  │
+│                                                                                       │
+│  For each request to peer P:                                                        │
+│                                                                                       │
+│    measured_latency = response_time - request_time                                  │
+│    ewma[P] = α * measured_latency + (1 - α) * ewma[P]                              │
+│                                                                                       │
+│  Where α = 0.2 (balance between responsiveness and stability)                       │
+│                                                                                       │
+│  Benefits:                                                                           │
+│  - Smooths transient spikes (one slow request doesn't cause failover)               │
+│  - Adapts to persistent degradation                                                 │
+│  - Simple to compute and store                                                       │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Sticky Connections with Health-Based Eviction
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    STICKY CONNECTION LIFECYCLE                                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  Initial State:                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  PRIMARY (3)          BACKUP (2)           CANDIDATE POOL (K=8)            │   │
+│  │  [A, B, C]            [D, E]               [A, B, C, D, E, F, G, H]         │   │
+│  │  (active)             (warm standby)        (from rendezvous hash)          │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                       │
+│  Request Routing:                                                                    │
+│  - Round-robin across PRIMARY connections                                           │
+│  - Track latency per request for EWMA                                               │
+│  - Track errors per connection                                                       │
+│                                                                                       │
+│  Health Monitoring (per connection):                                                │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  Metric               │  Threshold        │  Action                        │    │
+│  ├───────────────────────┼───────────────────┼─────────────────────────────────┤    │
+│  │  error_rate           │  > 5%             │  Mark DEGRADED                 │    │
+│  │  consecutive_failures │  > 3              │  Mark UNHEALTHY → evict        │    │
+│  │  ewma_latency         │  > p99 * 3        │  Mark SLOW → evict             │    │
+│  │  connection_age       │  > 1 hour         │  Consider refresh              │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Eviction Sequence:                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                              │   │
+│  │  t=0   PRIMARY: [A, B, C]    BACKUP: [D, E]                                 │   │
+│  │        Peer B: consecutive_failures = 4 (threshold = 3)                     │   │
+│  │                                                                              │   │
+│  │  t=1   Evict B from PRIMARY                                                 │   │
+│  │        PRIMARY: [A, _, C]    BACKUP: [D, E]                                 │   │
+│  │                                                                              │   │
+│  │  t=2   Promote D to PRIMARY                                                 │   │
+│  │        PRIMARY: [A, D, C]    BACKUP: [_, E]                                 │   │
+│  │                                                                              │   │
+│  │  t=3   Replenish BACKUP from candidate pool (with jitter: 100-500ms)        │   │
+│  │        Select F using Power of Two Choices                                  │   │
+│  │        PRIMARY: [A, D, C]    BACKUP: [F, E]                                 │   │
+│  │                                                                              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Discovery Timing and Jitter
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    TIMING CONFIGURATION                                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  DNS Resolution:                                                                     │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  dns_timeout:           2.0 seconds                                        │    │
+│  │  dns_cache_ttl:         Respect DNS TTL (or default 30s)                   │    │
+│  │  negative_cache_ttl:    30 seconds (don't hammer failed lookups)           │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Peer Probing:                                                                       │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  probe_timeout:         500ms per probe                                    │    │
+│  │  max_concurrent_probes: 10 (prevent socket exhaustion)                     │    │
+│  │  probe_jitter:          0-100ms (prevent synchronized probing)             │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Backoff (when all probes fail):                                                    │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  initial_backoff:       500ms                                              │    │
+│  │  max_backoff:           15 seconds                                         │    │
+│  │  backoff_multiplier:    2.0                                                │    │
+│  │  jitter_factor:         0.25 (25% randomization)                           │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Discovery Refresh:                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  refresh_interval:      60 seconds (re-evaluate candidate set)             │    │
+│  │  refresh_jitter:        0-5 seconds (prevent synchronized refresh)         │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Connection Pool:                                                                    │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  promotion_jitter:      100-500ms (prevent synchronized recovery)          │    │
+│  │  connection_max_age:    3600 seconds (1 hour, then consider refresh)       │    │
+│  │  ewma_alpha:            0.2 (balance responsiveness vs stability)          │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Metrics and Observability
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    DISCOVERY METRICS                                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                       │
+│  DNS Metrics:                                                                        │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  discovery_dns_lookups_total{datacenter, result}                           │    │
+│  │    - result: "success" | "timeout" | "error" | "negative_cached"           │    │
+│  │                                                                              │    │
+│  │  discovery_dns_cache_hits_total{type}                                      │    │
+│  │    - type: "positive" | "negative"                                         │    │
+│  │                                                                              │    │
+│  │  discovery_dns_resolution_duration_ms{datacenter}                          │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Selection Metrics:                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  discovery_candidate_set_size{role, datacenter}                            │    │
+│  │  discovery_candidate_set_changes_total{reason}                             │    │
+│  │    - reason: "dns_update" | "health_change" | "peer_added" | "peer_removed"│    │
+│  │                                                                              │    │
+│  │  discovery_locality_tier_selected_total{tier}                              │    │
+│  │    - tier: "same_dc" | "same_region" | "global"                            │    │
+│  │                                                                              │    │
+│  │  discovery_selection_duration_ms                                           │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Connection Pool Metrics:                                                            │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  discovery_pool_connections{state, role}                                   │    │
+│  │    - state: "primary" | "backup"                                           │    │
+│  │                                                                              │    │
+│  │  discovery_pool_promotions_total{from_state, to_state}                     │    │
+│  │  discovery_pool_evictions_total{reason}                                    │    │
+│  │    - reason: "error_rate" | "consecutive_failures" | "latency" | "stale"   │    │
+│  │                                                                              │    │
+│  │  discovery_peer_ewma_latency_ms{peer_id, datacenter}                       │    │
+│  │  discovery_peer_error_rate{peer_id}                                        │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+│  Security Metrics:                                                                   │
+│  ┌────────────────────────────────────────────────────────────────────────────┐    │
+│  │  discovery_cluster_id_rejections_total{expected, received}                 │    │
+│  │  discovery_environment_id_rejections_total{expected, received}             │    │
+│  │  discovery_role_rejections_total{initiator_role, target_role}              │    │
+│  └────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                       │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Configuration
+
+```python
+@dataclass(slots=True)
+class DiscoveryConfig:
+    """Configuration for enhanced peer discovery."""
+
+    # ===== Security (Required) =====
+    cluster_id: str              # Unique cluster identifier (e.g., "hyperscale-prod")
+    environment_id: str          # Environment (e.g., "production", "staging")
+
+    # ===== DNS Configuration =====
+    dns_names: list[str] = field(default_factory=list)  # SRV/A records to resolve
+    static_seeds: list[str] = field(default_factory=list)  # Fallback addresses
+    dns_timeout: float = 2.0
+    dns_cache_ttl: float = 30.0  # Override if DNS doesn't provide TTL
+    negative_cache_ttl: float = 30.0  # Don't re-resolve failed names
+
+    # ===== Locality =====
+    datacenter_id: str = ""      # This node's datacenter
+    region_id: str = ""          # This node's region (group of DCs)
+    prefer_same_dc: bool = True
+    prefer_same_region: bool = True
+    min_peers_per_tier: int = 3  # Minimum before falling back to next tier
+
+    # ===== Peer Selection =====
+    candidate_set_size: int = 8           # K for rendezvous hash
+    primary_connections: int = 3          # Active connections
+    backup_connections: int = 2           # Warm standby
+    ewma_alpha: float = 0.2               # Latency smoothing factor
+
+    # ===== Health Thresholds =====
+    error_rate_threshold: float = 0.05    # 5% errors → concern
+    consecutive_failure_limit: int = 3    # Hard failures → evict
+    latency_multiplier_threshold: float = 3.0  # 3x baseline → evict
+
+    # ===== Timing =====
+    probe_timeout: float = 0.5            # 500ms per probe
+    max_concurrent_probes: int = 10
+    initial_backoff: float = 0.5          # 500ms
+    max_backoff: float = 15.0             # 15 seconds
+    backoff_multiplier: float = 2.0
+    jitter_factor: float = 0.25           # 25% randomization
+    refresh_interval: float = 60.0        # Re-evaluate candidates
+    promotion_jitter: tuple[float, float] = (0.1, 0.5)  # 100-500ms
+```
+
+#### Module Structure
+
+```
+hyperscale/distributed_rewrite/discovery/
+├── __init__.py                    # Public exports
+├── discovery_service.py           # Main DiscoveryService orchestrator
+│
+├── dns/
+│   ├── __init__.py
+│   ├── resolver.py                # AsyncDNSResolver with caching
+│   └── negative_cache.py          # NegativeCache for failed lookups
+│
+├── locality/
+│   ├── __init__.py
+│   ├── locality_filter.py         # LocalityFilter (DC/region preference)
+│   └── locality_info.py           # LocalityInfo dataclass
+│
+├── selection/
+│   ├── __init__.py
+│   ├── rendezvous_hash.py         # WeightedRendezvousHash
+│   ├── power_of_two.py            # PowerOfTwoSelector
+│   └── ewma_tracker.py            # EWMALatencyTracker
+│
+├── pool/
+│   ├── __init__.py
+│   ├── connection_pool.py         # ConnectionPool with sticky connections
+│   ├── peer_health.py             # PeerHealthTracker
+│   └── promotion.py               # PromotionManager
+│
+├── security/
+│   ├── __init__.py
+│   ├── cluster_validator.py       # ClusterValidator (cluster_id/env_id)
+│   └── role_validator.py          # RoleValidator (mTLS cert claims)
+│
+├── metrics/
+│   ├── __init__.py
+│   └── discovery_metrics.py       # DiscoveryMetrics
+│
+└── models/
+    ├── __init__.py
+    ├── discovery_config.py        # DiscoveryConfig dataclass
+    ├── peer_info.py               # PeerInfo with health data
+    ├── candidate_set.py           # CandidateSet dataclass
+    └── connection_state.py        # ConnectionState enum
+```
+
+**Trade-offs**:
+- (+) Deterministic peer selection via rendezvous hash (debuggable)
+- (+) Load balancing via Power of Two Choices (avoids thundering herd)
+- (+) Locality awareness reduces cross-DC traffic
+- (+) Strong security boundaries prevent misconfiguration
+- (+) Sticky connections reduce churn overhead
+- (-) More complex than simple round-robin
+- (-) Requires certificate infrastructure for role validation
+- (-) EWMA requires per-peer state tracking
+
+**Alternatives Considered**:
+- Simple round-robin: Too naive, no health awareness
+- Consistent hashing: Good but disrupts more on topology changes
+- Central load balancer: Single point of failure, external dependency
+- Random selection: No locality awareness, unpredictable behavior
+
+---
+
 ## Architecture
 
 ### Node Types
