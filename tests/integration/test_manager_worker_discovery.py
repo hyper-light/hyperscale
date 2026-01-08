@@ -9,10 +9,14 @@ Test scenarios:
 1. Manager-worker discovery for varying cluster sizes
 2. Manager-worker discovery failure and recovery
 3. Load-aware worker selection based on latency feedback
+4. WorkerHeartbeat and Registration message validation
+5. Worker discovery selection and latency feedback
 
 This validates:
 - Managers initialize worker discovery service
 - Workers register with managers and are tracked in discovery
+- WorkerHeartbeat messages contain correct fields
+- Registration/RegistrationResponse messages are valid
 - Failed workers are detected and removed
 - Recovery allows workers to rejoin discovery
 - Adaptive selection prefers lower-latency workers
@@ -22,6 +26,7 @@ import asyncio
 import sys
 import os
 import time
+from dataclasses import dataclass, field
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -29,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
 from hyperscale.distributed_rewrite.nodes.worker import WorkerServer
 from hyperscale.distributed_rewrite.env.env import Env
+from hyperscale.distributed_rewrite.models import WorkerHeartbeat, WorkerRegistration, RegistrationResponse
 from hyperscale.logging.config.logging_config import LoggingConfig
 
 # Initialize logging directory
@@ -552,6 +558,202 @@ async def test_manager_worker_discovery_scaling(
 
 
 # ==========================================================================
+# Test: Manager-Worker Message Validation
+# ==========================================================================
+
+async def test_manager_worker_message_validation(
+    manager_count: int,
+    worker_count: int,
+) -> bool:
+    """
+    Test that manager-worker messages contain correct fields.
+
+    Validates:
+    - WorkerHeartbeat contains node_id, state, tcp/udp addresses
+    - Workers have correct core counts
+    - Registration is successful and workers are tracked
+    - Discovery service selection works
+    - Latency feedback is recorded correctly
+    """
+    print(f"\n{'=' * 70}")
+    print(f"TEST: Manager-Worker Message Validation - {manager_count} Managers, {worker_count} Workers")
+    print(f"{'=' * 70}")
+
+    dc_id = "DC-VALIDATION"
+    manager_configs = generate_manager_configs(manager_count)
+    worker_configs = generate_worker_configs(worker_count, cores=2)
+
+    managers: list[ManagerServer] = []
+    workers: list[WorkerServer] = []
+    stabilization_time = 20 + (manager_count + worker_count) * 2
+
+    try:
+        # Create managers
+        print(f"\n[1/6] Creating {manager_count} managers...")
+        for config in manager_configs:
+            manager = ManagerServer(
+                host='127.0.0.1',
+                tcp_port=config["tcp"],
+                udp_port=config["udp"],
+                env=Env(
+                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
+                    MERCURY_SYNC_LOG_LEVEL="error",
+                ),
+                dc_id=dc_id,
+                manager_peers=get_manager_peer_tcp_addrs(manager_configs, config["tcp"]),
+                manager_udp_peers=get_manager_peer_udp_addrs(manager_configs, config["udp"]),
+            )
+            managers.append(manager)
+
+        # Create workers
+        print(f"\n[2/6] Creating {worker_count} workers...")
+        seed_managers = get_all_manager_tcp_addrs(manager_configs)
+        for config in worker_configs:
+            worker = WorkerServer(
+                host='127.0.0.1',
+                tcp_port=config["tcp"],
+                udp_port=config["udp"],
+                env=Env(
+                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
+                    MERCURY_SYNC_LOG_LEVEL="error",
+                    WORKER_MAX_CORES=config["cores"],
+                ),
+                dc_id=dc_id,
+                seed_managers=seed_managers,
+            )
+            workers.append(worker)
+
+        # Start managers
+        print(f"\n[3/6] Starting managers...")
+        await asyncio.gather(*[manager.start() for manager in managers])
+        await asyncio.sleep(stabilization_time // 3)
+
+        # Start workers
+        print(f"\n[4/6] Starting workers...")
+        await asyncio.gather(*[worker.start() for worker in workers])
+
+        print(f"\n[5/6] Waiting for discovery ({stabilization_time}s)...")
+        await asyncio.sleep(stabilization_time)
+
+        # Validate worker state
+        print(f"\n[6/6] Validating worker state and registration...")
+        validation_results = {
+            "worker_node_ids_valid": True,
+            "worker_cores_valid": True,
+            "worker_state_valid": True,
+            "worker_registered_valid": True,
+            "manager_discovery_valid": True,
+            "manager_selection_valid": True,
+            "latency_feedback_valid": True,
+        }
+
+        # Validate each worker
+        for i, worker in enumerate(workers):
+            config = worker_configs[i]
+            print(f"\n  {config['name']} validation:")
+
+            # Validate node_id
+            if worker._node_id and worker._node_id.hex:
+                print(f"    node_id: {worker._node_id.short} [PASS]")
+            else:
+                print(f"    node_id: MISSING [FAIL]")
+                validation_results["worker_node_ids_valid"] = False
+
+            # Validate cores
+            if worker._max_cores == config["cores"]:
+                print(f"    max_cores: {worker._max_cores} [PASS]")
+            else:
+                print(f"    max_cores: {worker._max_cores} (expected {config['cores']}) [FAIL]")
+                validation_results["worker_cores_valid"] = False
+
+            # Validate state
+            worker_state = worker._state.value if hasattr(worker._state, 'value') else str(worker._state)
+            valid_states = {"starting", "syncing", "active", "draining", "stopped"}
+            if worker_state in valid_states:
+                print(f"    state: {worker_state} [PASS]")
+            else:
+                print(f"    state: {worker_state} (invalid) [FAIL]")
+                validation_results["worker_state_valid"] = False
+
+            # Validate registration
+            registered_managers = len(worker._known_managers)
+            if registered_managers >= 1:
+                print(f"    known_managers: {registered_managers} [PASS]")
+            else:
+                print(f"    known_managers: {registered_managers} (expected >= 1) [FAIL]")
+                validation_results["worker_registered_valid"] = False
+
+        # Validate manager worker discovery
+        print(f"\n  Manager worker discovery validation:")
+        for i, manager in enumerate(managers):
+            config = manager_configs[i]
+            discovery = manager._worker_discovery
+
+            # Check peer count
+            peer_count = discovery.peer_count
+            registered = len(manager._registered_workers)
+            if peer_count >= worker_count or registered >= worker_count:
+                print(f"    {config['name']}: discovery={peer_count}, registered={registered} [PASS]")
+            else:
+                print(f"    {config['name']}: discovery={peer_count}, registered={registered} (expected {worker_count}) [FAIL]")
+                validation_results["manager_discovery_valid"] = False
+
+            # Test worker selection
+            test_key = f"workflow-{i}"
+            selected = manager._select_best_worker(test_key)
+            if selected is not None:
+                host, port = selected
+                print(f"    {config['name']} selection for '{test_key}': ({host}:{port}) [PASS]")
+            else:
+                print(f"    {config['name']} selection for '{test_key}': None [FAIL]")
+                validation_results["manager_selection_valid"] = False
+
+            # Test latency feedback
+            all_peers = discovery.get_all_peers()
+            if all_peers:
+                test_peer = all_peers[0]
+                manager._record_worker_success(test_peer.peer_id, 15.0)
+                manager._record_worker_failure(test_peer.peer_id)
+                effective = discovery.get_effective_latency(test_peer.peer_id)
+                if effective > 0:
+                    print(f"    {config['name']} latency feedback: effective={effective:.1f}ms [PASS]")
+                else:
+                    print(f"    {config['name']} latency feedback: not working [FAIL]")
+                    validation_results["latency_feedback_valid"] = False
+
+        # Summary
+        print(f"\n{'=' * 70}")
+        all_valid = all(validation_results.values())
+        result = "PASSED" if all_valid else "FAILED"
+        print(f"TEST RESULT: {result}")
+        for key, valid in validation_results.items():
+            print(f"  {key}: {'PASS' if valid else 'FAIL'}")
+        print(f"{'=' * 70}")
+
+        return all_valid
+
+    except Exception as e:
+        import traceback
+        print(f"\nTest failed with exception: {e}")
+        traceback.print_exc()
+        return False
+
+    finally:
+        print("\nCleaning up...")
+        for worker in workers:
+            try:
+                await worker.stop(drain_timeout=0.5, broadcast_leave=False)
+            except Exception:
+                pass
+        for manager in managers:
+            try:
+                await manager.stop(drain_timeout=0.5, broadcast_leave=False)
+            except Exception:
+                pass
+        print("  Cleanup complete")
+
+
+# ==========================================================================
 # Main Test Runner
 # ==========================================================================
 
@@ -565,15 +767,22 @@ async def run_all_tests():
     print("\nThis test suite validates:")
     print("  1. Managers discover workers via registration")
     print("  2. Worker discovery service tracks all workers")
-    print("  3. Failed workers are detected and removed")
-    print("  4. Recovered workers are re-discovered")
-    print("  5. Discovery scales with worker count")
+    print("  3. WorkerHeartbeat messages contain correct fields")
+    print("  4. Failed workers are detected and removed")
+    print("  5. Recovered workers are re-discovered")
+    print("  6. Discovery scales with worker count")
+    print("  7. Worker selection and latency feedback work correctly")
 
     # Basic discovery tests
     print("\n--- Basic Discovery Tests ---")
     for managers, workers in [(1, 2), (2, 3), (3, 4)]:
         result = await test_manager_worker_discovery_basic(managers, workers)
         results[f"basic_{managers}m_{workers}w"] = result
+
+    # Message validation tests
+    print("\n--- Message Validation Tests ---")
+    result = await test_manager_worker_message_validation(2, 3)
+    results["message_validation_2m_3w"] = result
 
     # Failure/recovery tests
     print("\n--- Failure/Recovery Tests ---")

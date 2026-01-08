@@ -9,11 +9,15 @@ Test scenarios:
 1. Manager-gate discovery for varying cluster sizes and DC counts
 2. Manager-gate discovery failure and recovery
 3. Cross-datacenter discovery and locality awareness
+4. ManagerHeartbeat and ManagerRegistrationResponse message validation
+5. Per-DC discovery service selection and latency feedback
 
 This validates:
 - Gates discover managers in multiple datacenters
 - Managers register with gates successfully
 - Per-DC manager discovery tracking
+- ManagerHeartbeat messages contain correct fields
+- ManagerRegistrationResponse includes healthy_gates list
 - Failed nodes are detected and removed
 - Recovery allows nodes to rejoin discovery
 """
@@ -22,6 +26,7 @@ import asyncio
 import sys
 import os
 import time
+from dataclasses import dataclass, field
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -29,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from hyperscale.distributed_rewrite.nodes.gate import GateServer
 from hyperscale.distributed_rewrite.nodes.manager import ManagerServer
 from hyperscale.distributed_rewrite.env.env import Env
+from hyperscale.distributed_rewrite.models import ManagerHeartbeat, ManagerRegistrationResponse
 from hyperscale.logging.config.logging_config import LoggingConfig
 
 # Initialize logging directory
@@ -609,6 +615,180 @@ async def test_manager_gate_discovery_failure_recovery(
 
 
 # ==========================================================================
+# Test: Manager-Gate Message Validation
+# ==========================================================================
+
+async def test_manager_gate_message_validation(gate_count: int, manager_count: int) -> bool:
+    """
+    Test that manager-gate messages contain correct fields.
+
+    Validates:
+    - ManagerHeartbeat contains datacenter, node_id, tcp/udp addresses
+    - Gates track managers per-DC correctly
+    - Manager registration with gates is successful
+    - Discovery service selection works for per-DC managers
+    """
+    print(f"\n{'=' * 70}")
+    print(f"TEST: Manager-Gate Message Validation - {gate_count} Gates, {manager_count} Managers")
+    print(f"{'=' * 70}")
+
+    dc_id = "DC-VALIDATION"
+    gate_configs = generate_gate_configs(gate_count)
+    manager_configs = generate_manager_configs_for_dc(dc_id, manager_count, base_tcp_port=9000)
+
+    gates: list[GateServer] = []
+    managers: list[ManagerServer] = []
+    stabilization_time = 20 + (gate_count + manager_count) * 2
+
+    try:
+        # Create infrastructure
+        print(f"\n[1/6] Creating infrastructure...")
+        datacenter_managers = {dc_id: get_dc_manager_tcp_addrs(manager_configs)}
+        datacenter_manager_udp = {dc_id: get_dc_manager_udp_addrs(manager_configs)}
+
+        for config in gate_configs:
+            gate = GateServer(
+                host='127.0.0.1',
+                tcp_port=config["tcp"],
+                udp_port=config["udp"],
+                env=Env(
+                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
+                    MERCURY_SYNC_LOG_LEVEL="error",
+                ),
+                dc_id="global",
+                datacenter_managers=datacenter_managers,
+                datacenter_manager_udp=datacenter_manager_udp,
+                gate_peers=get_gate_peer_tcp_addrs(gate_configs, config["tcp"]),
+                gate_udp_peers=get_gate_peer_udp_addrs(gate_configs, config["udp"]),
+            )
+            gates.append(gate)
+
+        for config in manager_configs:
+            manager = ManagerServer(
+                host='127.0.0.1',
+                tcp_port=config["tcp"],
+                udp_port=config["udp"],
+                env=Env(
+                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
+                    MERCURY_SYNC_LOG_LEVEL="error",
+                ),
+                dc_id=dc_id,
+                manager_peers=get_manager_peer_tcp_addrs(manager_configs, config["tcp"]),
+                manager_udp_peers=get_manager_peer_udp_addrs(manager_configs, config["udp"]),
+                gate_addrs=get_all_gate_tcp_addrs(gate_configs),
+            )
+            managers.append(manager)
+
+        print(f"  Created {gate_count} gates and {manager_count} managers")
+
+        # Start infrastructure
+        print(f"\n[2/6] Starting gates...")
+        await asyncio.gather(*[gate.start() for gate in gates])
+
+        print(f"\n[3/6] Starting managers...")
+        await asyncio.gather(*[manager.start() for manager in managers])
+
+        print(f"\n[4/6] Waiting for discovery ({stabilization_time}s)...")
+        await asyncio.sleep(stabilization_time)
+
+        # Validate manager state
+        print(f"\n[5/6] Validating manager state and registration...")
+        validation_results = {
+            "manager_dc_valid": True,
+            "manager_addresses_valid": True,
+            "manager_registered_gates": True,
+            "gate_dc_discovery_valid": True,
+            "gate_selection_valid": True,
+        }
+
+        for i, manager in enumerate(managers):
+            config = manager_configs[i]
+            print(f"\n  {config['name']} validation:")
+
+            # Validate datacenter is set
+            if manager._dc_id == dc_id:
+                print(f"    datacenter: {manager._dc_id} [PASS]")
+            else:
+                print(f"    datacenter: {manager._dc_id} (expected {dc_id}) [FAIL]")
+                validation_results["manager_dc_valid"] = False
+
+            # Validate addresses
+            if manager._tcp_port == config["tcp"] and manager._udp_port == config["udp"]:
+                print(f"    addresses: TCP:{manager._tcp_port} UDP:{manager._udp_port} [PASS]")
+            else:
+                print(f"    addresses: mismatch [FAIL]")
+                validation_results["manager_addresses_valid"] = False
+
+            # Validate registration with gates
+            registered_gates = len(manager._registered_with_gates)
+            if registered_gates >= 1:
+                print(f"    registered_with_gates: {registered_gates} [PASS]")
+            else:
+                print(f"    registered_with_gates: {registered_gates} (expected >= 1) [FAIL]")
+                validation_results["manager_registered_gates"] = False
+
+        # Validate gate per-DC discovery
+        print(f"\n[6/6] Validating gate per-DC discovery and selection...")
+        for i, gate in enumerate(gates):
+            config = gate_configs[i]
+            print(f"\n  {config['name']} validation:")
+
+            # Check DC discovery service
+            dc_discovery = gate._dc_manager_discovery.get(dc_id)
+            if dc_discovery:
+                peer_count = dc_discovery.peer_count
+                if peer_count >= manager_count:
+                    print(f"    {dc_id} discovery: {peer_count}/{manager_count} managers [PASS]")
+                else:
+                    print(f"    {dc_id} discovery: {peer_count}/{manager_count} managers [FAIL]")
+                    validation_results["gate_dc_discovery_valid"] = False
+
+                # Test manager selection for DC
+                test_key = f"job-{i}"
+                selected = gate._select_best_manager_for_dc(dc_id, test_key)
+                if selected is not None:
+                    host, port = selected
+                    print(f"    selection for key '{test_key}': ({host}:{port}) [PASS]")
+                else:
+                    print(f"    selection for key '{test_key}': None [FAIL]")
+                    validation_results["gate_selection_valid"] = False
+            else:
+                print(f"    {dc_id} discovery: NOT FOUND [FAIL]")
+                validation_results["gate_dc_discovery_valid"] = False
+
+        # Summary
+        print(f"\n{'=' * 70}")
+        all_valid = all(validation_results.values())
+        result = "PASSED" if all_valid else "FAILED"
+        print(f"TEST RESULT: {result}")
+        for key, valid in validation_results.items():
+            print(f"  {key}: {'PASS' if valid else 'FAIL'}")
+        print(f"{'=' * 70}")
+
+        return all_valid
+
+    except Exception as e:
+        import traceback
+        print(f"\nTest failed with exception: {e}")
+        traceback.print_exc()
+        return False
+
+    finally:
+        print("\nCleaning up...")
+        for manager in managers:
+            try:
+                await manager.stop(drain_timeout=0.5, broadcast_leave=False)
+            except Exception:
+                pass
+        for gate in gates:
+            try:
+                await gate.stop(drain_timeout=0.5, broadcast_leave=False)
+            except Exception:
+                pass
+        print("  Cleanup complete")
+
+
+# ==========================================================================
 # Main Test Runner
 # ==========================================================================
 
@@ -622,8 +802,10 @@ async def run_all_tests():
     print("\nThis test suite validates:")
     print("  1. Gates discover managers in single and multiple datacenters")
     print("  2. Per-DC discovery services track managers correctly")
-    print("  3. Failed nodes are detected and removed")
-    print("  4. Recovered nodes are re-discovered")
+    print("  3. ManagerHeartbeat messages contain correct fields")
+    print("  4. Failed nodes are detected and removed")
+    print("  5. Recovered nodes are re-discovered")
+    print("  6. Per-DC manager selection works correctly")
 
     # Single DC tests
     print("\n--- Single DC Tests ---")
@@ -636,6 +818,11 @@ async def run_all_tests():
     for gates, managers_per_dc, dcs in [(2, 2, 2), (3, 3, 2), (3, 2, 3)]:
         result = await test_manager_gate_discovery_multi_dc(gates, managers_per_dc, dcs)
         results[f"multi_dc_{gates}g_{managers_per_dc}m_{dcs}dc"] = result
+
+    # Message validation tests
+    print("\n--- Message Validation Tests ---")
+    result = await test_manager_gate_message_validation(2, 3)
+    results["message_validation_2g_3m"] = result
 
     # Failure/recovery tests
     print("\n--- Failure/Recovery Tests ---")

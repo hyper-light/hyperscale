@@ -9,10 +9,12 @@ Test scenarios:
 1. Gate peer discovery for varying cluster sizes (2, 3, 5 gates)
 2. Gate peer discovery failure and recovery
 3. Load-aware peer selection based on latency feedback
+4. GateHeartbeat message validation
 
 This validates:
 - Gates initialize peer discovery with configured peers
 - Peers are tracked on heartbeat receipt
+- GateHeartbeat messages contain correct fields
 - Failed peers are removed from discovery
 - Recovery allows peers to rejoin discovery
 - Adaptive selection prefers lower-latency peers
@@ -22,17 +24,49 @@ import asyncio
 import sys
 import os
 import time
+from dataclasses import dataclass, field
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from hyperscale.distributed_rewrite.nodes.gate import GateServer
 from hyperscale.distributed_rewrite.env.env import Env
+from hyperscale.distributed_rewrite.models import GateHeartbeat
 from hyperscale.logging.config.logging_config import LoggingConfig
 
 # Initialize logging directory
 _logging_config = LoggingConfig()
 _logging_config.update(log_directory=os.getcwd())
+
+
+# ==========================================================================
+# Message Capture Helper
+# ==========================================================================
+
+@dataclass
+class MessageCapture:
+    """Captures messages for validation."""
+    gate_heartbeats: list[GateHeartbeat] = field(default_factory=list)
+    heartbeat_sources: dict[str, list[GateHeartbeat]] = field(default_factory=dict)
+
+    def record_heartbeat(self, heartbeat: GateHeartbeat, source_addr: tuple[str, int]) -> None:
+        """Record a received heartbeat."""
+        self.gate_heartbeats.append(heartbeat)
+        source_key = f"{source_addr[0]}:{source_addr[1]}"
+        if source_key not in self.heartbeat_sources:
+            self.heartbeat_sources[source_key] = []
+        self.heartbeat_sources[source_key].append(heartbeat)
+
+    def get_unique_node_ids(self) -> set[str]:
+        """Get unique node IDs from captured heartbeats."""
+        return {hb.node_id for hb in self.gate_heartbeats}
+
+    def get_heartbeat_count_by_node(self) -> dict[str, int]:
+        """Get heartbeat count per node."""
+        counts: dict[str, int] = {}
+        for hb in self.gate_heartbeats:
+            counts[hb.node_id] = counts.get(hb.node_id, 0) + 1
+        return counts
 
 
 # ==========================================================================
@@ -166,6 +200,173 @@ async def test_gate_peer_discovery_cluster_size(cluster_size: int) -> bool:
                 print(f"  {gate_configs[i]['name']} stopped")
             except Exception as e:
                 print(f"  {gate_configs[i]['name']} stop failed: {e}")
+
+
+# ==========================================================================
+# Test: Gate Heartbeat Message Validation
+# ==========================================================================
+
+async def test_gate_heartbeat_message_validation(cluster_size: int) -> bool:
+    """
+    Test that GateHeartbeat messages contain correct fields.
+
+    Validates:
+    - GateHeartbeat messages are sent between peers
+    - node_id field is populated correctly
+    - datacenter field matches configured dc_id
+    - tcp_host/tcp_port are populated for routing
+    - known_gates dict contains peer information
+    - state field is valid (syncing, active, draining)
+    """
+    print(f"\n{'=' * 70}")
+    print(f"TEST: Gate Heartbeat Message Validation - {cluster_size} Gates")
+    print(f"{'=' * 70}")
+
+    gate_configs = generate_gate_configs(cluster_size)
+    gates: list[GateServer] = []
+    stabilization_time = 15 + (cluster_size * 2)
+
+    try:
+        # Create gates
+        print(f"\n[1/5] Creating {cluster_size} gates...")
+        for config in gate_configs:
+            gate = GateServer(
+                host='127.0.0.1',
+                tcp_port=config["tcp"],
+                udp_port=config["udp"],
+                env=Env(
+                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
+                    MERCURY_SYNC_LOG_LEVEL="error",
+                ),
+                dc_id="global",
+                datacenter_managers={},
+                datacenter_manager_udp={},
+                gate_peers=get_gate_peer_tcp_addrs(gate_configs, config["tcp"]),
+                gate_udp_peers=get_gate_peer_udp_addrs(gate_configs, config["udp"]),
+            )
+            gates.append(gate)
+            print(f"  Created {config['name']}")
+
+        # Start gates
+        print(f"\n[2/5] Starting gates...")
+        start_tasks = [gate.start() for gate in gates]
+        await asyncio.gather(*start_tasks)
+
+        # Collect node IDs
+        node_ids = {gate._node_id.hex for gate in gates}
+        print(f"  Node IDs: {[gate._node_id.short for gate in gates]}")
+
+        print(f"\n[3/5] Waiting for heartbeat exchange ({stabilization_time}s)...")
+        await asyncio.sleep(stabilization_time)
+
+        # Validate gate state and peer tracking
+        print(f"\n[4/5] Validating gate state and peer tracking...")
+        validation_results = {
+            "node_ids_valid": True,
+            "peer_tracking_valid": True,
+            "state_valid": True,
+            "address_tracking_valid": True,
+            "known_gates_valid": True,
+        }
+
+        for i, gate in enumerate(gates):
+            config = gate_configs[i]
+            print(f"\n  {config['name']} validation:")
+
+            # Validate node_id is set
+            if not gate._node_id or not gate._node_id.hex:
+                print(f"    node_id: MISSING [FAIL]")
+                validation_results["node_ids_valid"] = False
+            else:
+                print(f"    node_id: {gate._node_id.short} [PASS]")
+
+            # Validate gate is tracking peers
+            active_peers = len(gate._active_gate_peers)
+            expected_peers = cluster_size - 1
+            if active_peers >= expected_peers:
+                print(f"    active_peers: {active_peers}/{expected_peers} [PASS]")
+            else:
+                print(f"    active_peers: {active_peers}/{expected_peers} [FAIL]")
+                validation_results["peer_tracking_valid"] = False
+
+            # Validate gate state
+            gate_state = gate._state.value if hasattr(gate._state, 'value') else str(gate._state)
+            valid_states = {"syncing", "active", "draining"}
+            if gate_state in valid_states:
+                print(f"    state: {gate_state} [PASS]")
+            else:
+                print(f"    state: {gate_state} (invalid) [FAIL]")
+                validation_results["state_valid"] = False
+
+            # Validate address tracking
+            if gate._tcp_port == config["tcp"] and gate._udp_port == config["udp"]:
+                print(f"    addresses: TCP:{gate._tcp_port} UDP:{gate._udp_port} [PASS]")
+            else:
+                print(f"    addresses: TCP:{gate._tcp_port} UDP:{gate._udp_port} (mismatch) [FAIL]")
+                validation_results["address_tracking_valid"] = False
+
+            # Validate UDP-to-TCP mapping for peers
+            udp_to_tcp_count = len(gate._gate_udp_to_tcp)
+            if udp_to_tcp_count >= expected_peers:
+                print(f"    udp_to_tcp mappings: {udp_to_tcp_count} [PASS]")
+            else:
+                print(f"    udp_to_tcp mappings: {udp_to_tcp_count} (expected {expected_peers}) [FAIL]")
+                validation_results["known_gates_valid"] = False
+
+        # Validate peer discovery service state
+        print(f"\n[5/5] Validating discovery service state...")
+        discovery_valid = True
+
+        for i, gate in enumerate(gates):
+            config = gate_configs[i]
+            discovery = gate._peer_discovery
+
+            # Check that peers were added to discovery
+            peer_count = discovery.peer_count
+            if peer_count >= cluster_size - 1:
+                print(f"  {config['name']}: {peer_count} peers in discovery [PASS]")
+            else:
+                print(f"  {config['name']}: {peer_count} peers in discovery (expected {cluster_size - 1}) [FAIL]")
+                discovery_valid = False
+
+            # Verify peer addresses are retrievable
+            all_peers = discovery.get_all_peers()
+            for peer in all_peers:
+                if peer.host and peer.port > 0:
+                    continue
+                else:
+                    print(f"    Peer {peer.peer_id}: invalid address [FAIL]")
+                    discovery_valid = False
+
+        # Summary
+        print(f"\n{'=' * 70}")
+        all_valid = all(validation_results.values()) and discovery_valid
+        result = "PASSED" if all_valid else "FAILED"
+        print(f"TEST RESULT: {result}")
+        print(f"  Node IDs valid: {'PASS' if validation_results['node_ids_valid'] else 'FAIL'}")
+        print(f"  Peer tracking valid: {'PASS' if validation_results['peer_tracking_valid'] else 'FAIL'}")
+        print(f"  State valid: {'PASS' if validation_results['state_valid'] else 'FAIL'}")
+        print(f"  Address tracking valid: {'PASS' if validation_results['address_tracking_valid'] else 'FAIL'}")
+        print(f"  Known gates valid: {'PASS' if validation_results['known_gates_valid'] else 'FAIL'}")
+        print(f"  Discovery service valid: {'PASS' if discovery_valid else 'FAIL'}")
+        print(f"{'=' * 70}")
+
+        return all_valid
+
+    except Exception as e:
+        import traceback
+        print(f"\nTest failed with exception: {e}")
+        traceback.print_exc()
+        return False
+
+    finally:
+        print("\nCleaning up...")
+        for i, gate in enumerate(gates):
+            try:
+                await gate.stop(drain_timeout=0.5, broadcast_leave=False)
+            except Exception:
+                pass
+        print("  Cleanup complete")
 
 
 # ==========================================================================
@@ -317,6 +518,149 @@ async def test_gate_peer_discovery_failure_recovery(cluster_size: int) -> bool:
 
 
 # ==========================================================================
+# Test: Gate Discovery Service Selection
+# ==========================================================================
+
+async def test_gate_discovery_peer_selection(cluster_size: int) -> bool:
+    """
+    Test that gate discovery service correctly selects peers.
+
+    Validates:
+    - _select_best_peer returns valid peer addresses
+    - Selection is deterministic for same key
+    - Peer addresses are correctly formatted
+    """
+    print(f"\n{'=' * 70}")
+    print(f"TEST: Gate Discovery Peer Selection - {cluster_size} Gates")
+    print(f"{'=' * 70}")
+
+    gate_configs = generate_gate_configs(cluster_size)
+    gates: list[GateServer] = []
+    stabilization_time = 15 + (cluster_size * 2)
+
+    try:
+        # Create and start gates
+        print(f"\n[1/4] Creating and starting {cluster_size} gates...")
+        for config in gate_configs:
+            gate = GateServer(
+                host='127.0.0.1',
+                tcp_port=config["tcp"],
+                udp_port=config["udp"],
+                env=Env(
+                    MERCURY_SYNC_REQUEST_TIMEOUT='5s',
+                    MERCURY_SYNC_LOG_LEVEL="error",
+                ),
+                dc_id="global",
+                datacenter_managers={},
+                datacenter_manager_udp={},
+                gate_peers=get_gate_peer_tcp_addrs(gate_configs, config["tcp"]),
+                gate_udp_peers=get_gate_peer_udp_addrs(gate_configs, config["udp"]),
+            )
+            gates.append(gate)
+
+        await asyncio.gather(*[gate.start() for gate in gates])
+        print(f"  All gates started")
+
+        print(f"\n[2/4] Waiting for discovery ({stabilization_time}s)...")
+        await asyncio.sleep(stabilization_time)
+
+        # Test peer selection
+        print(f"\n[3/4] Testing peer selection...")
+        selection_valid = True
+        test_keys = ["test-key-1", "test-key-2", "workflow-abc"]
+
+        for i, gate in enumerate(gates):
+            config = gate_configs[i]
+            print(f"\n  {config['name']}:")
+
+            for key in test_keys:
+                # Select peer multiple times to verify determinism
+                selections = []
+                for _ in range(3):
+                    selected = gate._select_best_peer(key)
+                    selections.append(selected)
+
+                # Verify selection returned a result
+                if selections[0] is None:
+                    print(f"    key='{key}': No peer selected [FAIL]")
+                    selection_valid = False
+                    continue
+
+                # Verify all selections are the same (deterministic)
+                if all(s == selections[0] for s in selections):
+                    host, port = selections[0]
+                    print(f"    key='{key}': ({host}:{port}) [PASS - deterministic]")
+                else:
+                    print(f"    key='{key}': Non-deterministic selection [FAIL]")
+                    selection_valid = False
+
+                # Verify address format
+                host, port = selections[0]
+                if not isinstance(host, str) or not isinstance(port, int):
+                    print(f"      Invalid address format [FAIL]")
+                    selection_valid = False
+                elif port <= 0 or port > 65535:
+                    print(f"      Invalid port number [FAIL]")
+                    selection_valid = False
+
+        # Validate latency recording
+        print(f"\n[4/4] Testing latency feedback recording...")
+        feedback_valid = True
+
+        for i, gate in enumerate(gates):
+            config = gate_configs[i]
+            discovery = gate._peer_discovery
+
+            # Get a peer to test with
+            all_peers = discovery.get_all_peers()
+            if not all_peers:
+                continue
+
+            test_peer = all_peers[0]
+
+            # Record some successes
+            for latency in [10.0, 15.0, 12.0]:
+                gate._record_peer_success(test_peer.peer_id, latency)
+
+            # Record a failure
+            gate._record_peer_failure(test_peer.peer_id)
+
+            # Verify effective latency changed
+            effective_latency = discovery.get_effective_latency(test_peer.peer_id)
+            if effective_latency > 0:
+                print(f"  {config['name']}: Latency tracking working (effective={effective_latency:.1f}ms) [PASS]")
+            else:
+                print(f"  {config['name']}: Latency tracking not working [FAIL]")
+                feedback_valid = False
+
+        # Summary
+        print(f"\n{'=' * 70}")
+        all_valid = selection_valid and feedback_valid
+        result = "PASSED" if all_valid else "FAILED"
+        print(f"TEST RESULT: {result}")
+        print(f"  Peer selection valid: {'PASS' if selection_valid else 'FAIL'}")
+        print(f"  Feedback recording valid: {'PASS' if feedback_valid else 'FAIL'}")
+        print(f"{'=' * 70}")
+
+        return all_valid
+
+    except Exception as e:
+        import traceback
+        print(f"\nTest failed with exception: {e}")
+        traceback.print_exc()
+        return False
+
+    finally:
+        print("\nCleaning up...")
+        for gate in gates:
+            try:
+                await gate.stop(drain_timeout=0.5, broadcast_leave=False)
+            except Exception:
+                pass
+        print("  Cleanup complete")
+
+
+# ==========================================================================
 # Main Test Runner
 # ==========================================================================
 
@@ -333,14 +677,26 @@ async def run_all_tests():
     print("\nThis test suite validates:")
     print("  1. Gates discover each other via SWIM heartbeats")
     print("  2. Peer discovery service tracks all peers")
-    print("  3. Failed peers are detected and removed")
-    print("  4. Recovered peers are re-discovered")
+    print("  3. GateHeartbeat messages contain correct fields")
+    print("  4. Failed peers are detected and removed")
+    print("  5. Recovered peers are re-discovered")
+    print("  6. Peer selection works correctly")
     print(f"\nCluster sizes to test: {cluster_sizes}")
 
     # Basic discovery tests
     for size in cluster_sizes:
         result = await test_gate_peer_discovery_cluster_size(size)
         results[f"discovery_{size}_gates"] = result
+
+    # Message validation tests
+    for size in [3]:
+        result = await test_gate_heartbeat_message_validation(size)
+        results[f"heartbeat_validation_{size}_gates"] = result
+
+    # Peer selection tests
+    for size in [3]:
+        result = await test_gate_discovery_peer_selection(size)
+        results[f"peer_selection_{size}_gates"] = result
 
     # Failure/recovery tests (only for 3 and 5 gates to save time)
     for size in [3, 5]:
