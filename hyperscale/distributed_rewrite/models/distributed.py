@@ -284,13 +284,20 @@ class ManagerToWorkerRegistrationAck(Message):
 class WorkflowProgressAck(Message):
     """
     Acknowledgment for workflow progress updates.
-    
+
     Includes updated manager list so workers can maintain
     accurate view of cluster topology and leadership.
+
+    Also includes job_leader_addr for the specific job, enabling workers
+    to route progress updates to the correct manager even after failover.
     """
     manager_id: str                         # Responding manager's node_id
-    is_leader: bool                         # Whether this manager is leader
+    is_leader: bool                         # Whether this manager is cluster leader
     healthy_managers: list[ManagerInfo]     # Current healthy managers
+    # Job leader address - the manager currently responsible for this job.
+    # None if the job is unknown or this manager doesn't track it.
+    # Workers should update their routing to send progress to this address.
+    job_leader_addr: tuple[str, int] | None = None
 
 
 # =============================================================================

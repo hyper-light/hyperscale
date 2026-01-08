@@ -179,6 +179,11 @@ class WorkerServer(HealthAwareServer):
         self._workflow_last_progress: dict[str, float] = {}  # workflow_id -> last update time
         self._workflow_id_to_name: dict[str, str] = {}  # workflow_id -> workflow_name for cancellation
 
+        # Job leader tracking per workflow - the manager that dispatched each workflow
+        # This is the manager we should send progress updates to.
+        # Updated when receiving progress acks if job leadership changes (failover).
+        self._workflow_job_leader: dict[str, tuple[str, int]] = {}  # workflow_id -> (host, tcp_port)
+
         # Fence token tracking for at-most-once dispatch
         # Tracks highest fence token seen per workflow_id to reject stale/duplicate dispatches
         # Key: workflow_id, Value: highest fence_token seen
@@ -1455,6 +1460,10 @@ class WorkerServer(HealthAwareServer):
             )
             self._active_workflows[dispatch.workflow_id] = progress
 
+            # Store the dispatching manager as the job leader for this workflow
+            # Progress updates will be sent to this manager (or its successor on failover)
+            self._workflow_job_leader[dispatch.workflow_id] = addr
+
             # Create cancellation event
             cancel_event = asyncio.Event()
             self._workflow_cancel_events[dispatch.workflow_id] = cancel_event
@@ -1492,6 +1501,7 @@ class WorkerServer(HealthAwareServer):
                 self._workflow_cancel_events.pop(dispatch.workflow_id, None)
                 self._active_workflows.pop(dispatch.workflow_id, None)
                 self._workflow_fence_tokens.pop(dispatch.workflow_id, None)
+                self._workflow_job_leader.pop(dispatch.workflow_id, None)
 
             workflow_id = dispatch.workflow_id if dispatch else "unknown"
             ack = WorkflowDispatchAck(
@@ -1596,6 +1606,7 @@ class WorkerServer(HealthAwareServer):
             self._workflow_cores_completed.pop(dispatch.workflow_id, None)
             self._workflow_fence_tokens.pop(dispatch.workflow_id, None)
             self._workflow_id_to_name.pop(dispatch.workflow_id, None)
+            self._workflow_job_leader.pop(dispatch.workflow_id, None)
             self._remote_manger.start_server_cleanup()
 
         return (
@@ -1610,23 +1621,33 @@ class WorkerServer(HealthAwareServer):
         run_id: int,
         cancel_event: asyncio.Event,
     ) -> None:
-        """Monitor workflow progress and send updates to manager."""
+        """
+        Monitor workflow progress and send updates to the job leader.
+
+        Uses event-driven waiting on the update queue instead of polling.
+        Updates are sent immediately when available, routed to the job leader
+        (the manager that dispatched this workflow). If the job leader fails,
+        automatically discovers the new leader via other healthy managers.
+        """
         start_time = time.monotonic()
         workflow_name = progress.workflow_name
 
-        
         while not cancel_event.is_set():
             try:
-                await asyncio.sleep(self._progress_update_interval)
+                # Event-driven: block on queue until update available or timeout
+                # Use short timeout to check cancel_event periodically
+                workflow_status_update = await self._remote_manger.wait_for_workflow_update(
+                    run_id,
+                    workflow_name,
+                    timeout=0.5,  # Check cancel_event every 500ms
+                )
 
-                # Get next available status update from WorkflowRunner
-                workflow_status_update = await self._remote_manger.get_workflow_update(run_id, workflow_name)
                 if workflow_status_update is None:
-                    # No update available yet, keep waiting
+                    # Timeout - no update yet, loop back to check cancel_event
                     continue
 
                 status = CoreWorkflowStatus(workflow_status_update.status)
-                
+
                 # Get system stats
                 avg_cpu, avg_mem = (
                     self._cpu_monitor.get_moving_avg(
@@ -1638,7 +1659,7 @@ class WorkerServer(HealthAwareServer):
                         progress.workflow_name,
                     ),
                 )
-                
+
                 # Update progress
                 progress.completed_count = workflow_status_update.completed_count
                 progress.failed_count = workflow_status_update.failed_count
@@ -1667,7 +1688,7 @@ class WorkerServer(HealthAwareServer):
                 # Live available cores from CoreAllocator - this is the real-time
                 # count of cores that have finished their work and are available
                 progress.worker_available_cores = self._core_allocator.available_cores
-                
+
                 # Convert step stats
                 progress.step_stats = [
                     StepStats(
@@ -1678,7 +1699,7 @@ class WorkerServer(HealthAwareServer):
                     )
                     for step_name, stats in workflow_status_update.step_stats.items()
                 ]
-                
+
                 # Estimate cores_completed based on work completed
                 total_cores = len(progress.assigned_cores)
                 if total_cores > 0:
@@ -1689,7 +1710,7 @@ class WorkerServer(HealthAwareServer):
                         int(total_cores * (workflow_status_update.completed_count / total_work))
                     )
                     progress.cores_completed = estimated_complete
-                
+
                 # Map status
                 if status == CoreWorkflowStatus.RUNNING:
                     progress.status = WorkflowStatus.RUNNING.value
@@ -1700,13 +1721,14 @@ class WorkerServer(HealthAwareServer):
                     progress.status = WorkflowStatus.FAILED.value
                 elif status == CoreWorkflowStatus.PENDING:
                     progress.status = WorkflowStatus.ASSIGNED.value
-                
-                # Send update directly (not buffered) for real-time streaming
-                # The manager's windowed stats collector handles time-correlation
+
+                # Send update to job leader (not buffered) for real-time streaming
+                # Routes to the manager that dispatched this workflow.
+                # If job leader fails, discovers new leader via healthy managers.
                 if self._healthy_manager_ids:
-                    await self._send_progress_update_direct(progress)
+                    await self._send_progress_to_job_leader(progress)
                     self._workflow_last_progress[dispatch.workflow_id] = time.monotonic()
-                
+
             except asyncio.CancelledError:
                 break
             except Exception as err:
@@ -2083,7 +2105,103 @@ class WorkerServer(HealthAwareServer):
 
         # All retries exhausted
         circuit.record_error()
-    
+
+    async def _send_progress_to_job_leader(
+        self,
+        progress: WorkflowProgress,
+    ) -> bool:
+        """
+        Send progress update to the job leader for this workflow.
+
+        Routes progress to the manager that dispatched the workflow (job leader).
+        If the job leader fails, queries any healthy manager to discover the
+        new job leader and updates local routing.
+
+        Args:
+            progress: Workflow progress to send
+
+        Returns:
+            True if successfully sent to some manager (job leader or fallback),
+            False if all attempts failed.
+        """
+        workflow_id = progress.workflow_id
+        job_leader_addr = self._workflow_job_leader.get(workflow_id)
+
+        # Try job leader first
+        if job_leader_addr:
+            success = await self._try_send_progress_to_addr(progress, job_leader_addr)
+            if success:
+                return True
+
+            # Job leader failed - need to find new leader
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Job leader {job_leader_addr} failed for workflow {workflow_id[:16]}..., discovering new leader",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+        # Job leader unknown or failed - query any healthy manager
+        # The ack will include the current job leader address
+        for manager_id in list(self._healthy_manager_ids):
+            manager_info = self._known_managers.get(manager_id)
+            if not manager_info:
+                continue
+
+            manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+
+            # Skip if this is the failed job leader
+            if manager_addr == job_leader_addr:
+                continue
+
+            # Check circuit breaker
+            if self._is_manager_circuit_open(manager_id):
+                continue
+
+            success = await self._try_send_progress_to_addr(progress, manager_addr)
+            if success:
+                return True
+
+        return False
+
+    async def _try_send_progress_to_addr(
+        self,
+        progress: WorkflowProgress,
+        manager_addr: tuple[str, int],
+    ) -> bool:
+        """
+        Attempt to send progress to a specific manager address.
+
+        Processes the ack to update job leader routing if leadership changed.
+
+        Returns:
+            True if send succeeded, False otherwise.
+        """
+        circuit = self._get_manager_circuit_by_addr(manager_addr)
+
+        try:
+            response, _ = await self.send_tcp(
+                manager_addr,
+                "workflow_progress",
+                progress.dump(),
+                timeout=1.0,
+            )
+
+            if response and isinstance(response, bytes) and response != b'error':
+                # Process ack - this updates job leader routing
+                self._process_workflow_progress_ack(response, progress.workflow_id)
+                circuit.record_success()
+                return True
+
+            circuit.record_error()
+            return False
+
+        except Exception:
+            circuit.record_error()
+            return False
+
     async def _send_progress_to_all_managers(self, progress: WorkflowProgress) -> None:
         """Send a progress update to ALL healthy managers and process acks."""
         for manager_id in list(self._healthy_manager_ids):
@@ -2263,34 +2381,54 @@ class WorkerServer(HealthAwareServer):
             )
         )
     
-    def _process_workflow_progress_ack(self, data: bytes) -> None:
+    def _process_workflow_progress_ack(self, data: bytes, workflow_id: str | None = None) -> None:
         """
-        Process WorkflowProgressAck to update manager topology.
-        
-        This enables continuous manager list refresh - every ack includes
-        the current list of healthy managers and leadership status.
+        Process WorkflowProgressAck to update manager topology and job leader routing.
+
+        This enables:
+        1. Continuous manager list refresh - every ack includes healthy managers
+        2. Job leader discovery - ack includes current job leader for failover
+
+        Args:
+            data: Serialized WorkflowProgressAck bytes
+            workflow_id: If provided, updates job leader routing for this workflow
         """
         try:
             ack = WorkflowProgressAck.load(data)
-            
+
             # Update known managers from ack
             self._update_known_managers(ack.healthy_managers)
-            
-            # Update primary manager if leadership changed
+
+            # Update primary manager if cluster leadership changed
             if ack.is_leader and self._primary_manager_id != ack.manager_id:
                 old_primary = self._primary_manager_id
                 self._primary_manager_id = ack.manager_id
-                
+
                 self._task_runner.run(
                     self._udp_logger.log,
                     ServerInfo(
-                        message=f"Leadership change detected: {old_primary} -> {ack.manager_id}",
+                        message=f"Cluster leadership change detected: {old_primary} -> {ack.manager_id}",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,
                     )
                 )
-                
+
+            # Update job leader routing if provided and changed
+            if workflow_id and ack.job_leader_addr:
+                current_leader = self._workflow_job_leader.get(workflow_id)
+                if current_leader != ack.job_leader_addr:
+                    self._workflow_job_leader[workflow_id] = ack.job_leader_addr
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerInfo(
+                            message=f"Job leader updated for workflow {workflow_id[:16]}...: {current_leader} -> {ack.job_leader_addr}",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
         except Exception:
             # Backwards compatibility: ignore parse errors for old b'ok' responses
             pass

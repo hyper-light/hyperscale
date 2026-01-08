@@ -4074,7 +4074,27 @@ class ManagerServer(HealthAwareServer):
                 worker_workflow_completed_cores=progress.worker_workflow_completed_cores,
                 worker_available_cores=progress.worker_available_cores,
             )
-            await self._windowed_stats.add_progress(worker_id, stats_progress)
+            # TEMPORARILY COMMENTED OUT: Batched windowed stats collection
+            # await self._windowed_stats.add_progress(worker_id, stats_progress)
+            print(f"[DEBUG-MANAGER] received progress from worker {worker_id}, workflow={progress.workflow_name}, completed={progress.completed_count}, collected_at={progress.collected_at:.3f}, t={time.time():.3f}")
+
+            # TEMPORARY: Push directly to client instead of batching
+            from hyperscale.distributed_rewrite.jobs import WindowedStatsPush
+            direct_push = WindowedStatsPush(
+                job_id=stats_progress.job_id,
+                workflow_id=stats_progress.workflow_id,
+                workflow_name=stats_progress.workflow_name,
+                window_start=stats_progress.collected_at,
+                window_end=stats_progress.collected_at,
+                completed_count=stats_progress.completed_count,
+                failed_count=stats_progress.failed_count,
+                rate_per_second=stats_progress.rate_per_second,
+                avg_cpu_percent=stats_progress.avg_cpu_percent,
+                avg_memory_mb=stats_progress.avg_memory_mb,
+                worker_count=1,
+                is_aggregated=False,
+            )
+            await self._push_windowed_stats_to_client(direct_push)
 
             # Forward to job leader if we're not the leader
             forwarded = await self._try_forward_progress_to_leader(progress)
@@ -4089,7 +4109,7 @@ class ManagerServer(HealthAwareServer):
             # Update job state and handle completion/failure
             await self._update_job_from_progress(progress)
 
-            return self._create_progress_ack().dump()
+            return self._create_progress_ack(job_id=progress.job_id).dump()
 
         except Exception as e:
             await self.handle_exception(e, "receive_workflow_progress")
@@ -4147,7 +4167,7 @@ class ManagerServer(HealthAwareServer):
         # Aggregate progress from all sub-workflows
         aggregated_progress = self._aggregate_sub_workflow_progress(parent_workflow_id)
         if aggregated_progress is None:
-            return progress, self._create_progress_ack().dump()
+            return progress, self._create_progress_ack(job_id=progress.job_id).dump()
 
         return aggregated_progress, None
 
@@ -4275,12 +4295,23 @@ class ManagerServer(HealthAwareServer):
         else:
             self._check_job_completion(job_id)
 
-    def _create_progress_ack(self) -> WorkflowProgressAck:
-        """Create a WorkflowProgressAck with current manager topology."""
+    def _create_progress_ack(self, job_id: str | None = None) -> WorkflowProgressAck:
+        """Create a WorkflowProgressAck with current manager topology and job leader info.
+
+        Args:
+            job_id: If provided, includes the current job leader address so the worker
+                    can route future progress updates correctly (esp. after failover).
+        """
+        # Get job leader address if job_id is provided
+        job_leader_addr: tuple[str, int] | None = None
+        if job_id:
+            job_leader_addr = self._get_job_leader_addr(job_id)
+
         return WorkflowProgressAck(
             manager_id=self._node_id.full,
             is_leader=self.is_leader(),
             healthy_managers=self._get_healthy_managers(),
+            job_leader_addr=job_leader_addr,
         )
     
     def _parse_workflow_token(self, workflow_id: str) -> tuple[str, str] | None:
@@ -6008,6 +6039,10 @@ class ManagerServer(HealthAwareServer):
 
                 if not pushes:
                     continue
+
+                print(f"[DEBUG-MANAGER] flushed {len(pushes)} windows, t={time.time():.3f}")
+                for push in pushes:
+                    print(f"[DEBUG-MANAGER]   -> workflow={push.workflow_name}, completed={push.completed_count}, window=[{push.window_start:.3f}-{push.window_end:.3f}], worker_count={push.worker_count}")
 
                 if has_gates:
                     # Forward unaggregated stats to gates

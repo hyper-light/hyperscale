@@ -1495,6 +1495,49 @@ class RemoteGraphManager:
 
         return workflow_status_update
 
+    async def wait_for_workflow_update(
+        self,
+        run_id: int,
+        workflow: str,
+        timeout: float | None = None,
+    ) -> WorkflowStatusUpdate | None:
+        """
+        Wait for the next workflow update, blocking until one is available.
+
+        This is the event-driven alternative to polling get_workflow_update().
+        It blocks on the asyncio Queue, yielding control to other tasks while
+        waiting, and returns immediately when an update arrives.
+
+        Args:
+            run_id: The run identifier
+            workflow: The workflow name
+            timeout: Optional timeout in seconds. If None, waits indefinitely.
+                     If timeout expires, returns None.
+
+        Returns:
+            WorkflowStatusUpdate when available, or None on timeout.
+        """
+        queue = self._graph_updates[run_id][workflow]
+
+        try:
+            if timeout is not None:
+                workflow_status_update = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=timeout,
+                )
+            else:
+                workflow_status_update = await queue.get()
+
+            if self._status_lock and workflow_status_update:
+                await self._status_lock.acquire()
+                self._workflow_statuses[run_id][workflow].append(workflow_status_update.status)
+                self._status_lock.release()
+
+            return workflow_status_update
+
+        except asyncio.TimeoutError:
+            return None
+
     async def drain_workflow_updates(self, run_id: int, workflow: str) -> WorkflowStatusUpdate | None:
         """
         Drain all pending updates and return the most recent one.
