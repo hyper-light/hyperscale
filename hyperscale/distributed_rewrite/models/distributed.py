@@ -560,6 +560,11 @@ class ManagerHeartbeat(Message):
     # Piggybacked gate discovery - gates learn about other gates from managers
     # Maps gate_id -> (tcp_host, tcp_port, udp_host, udp_port)
     known_gates: dict[str, tuple[str, int, str, int]] = field(default_factory=dict)
+    # Gate cluster leadership tracking - propagated among managers for consistency
+    # When a manager discovers a gate leader, it piggybacks this info to peer managers
+    current_gate_leader_id: str | None = None
+    current_gate_leader_host: str | None = None
+    current_gate_leader_port: int | None = None
     # Health piggyback fields (AD-19)
     health_accepting_jobs: bool = True
     health_has_quorum: bool = True

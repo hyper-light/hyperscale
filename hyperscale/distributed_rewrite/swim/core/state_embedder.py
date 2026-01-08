@@ -267,6 +267,11 @@ class ManagerStateEmbedder:
     get_health_throughput: Callable[[], float] | None = None
     get_health_expected_throughput: Callable[[], float] | None = None
     get_health_overload_state: Callable[[], str] | None = None
+    # Gate leader tracking for propagation among managers
+    get_current_gate_leader_id: Callable[[], str | None] | None = None
+    get_current_gate_leader_host: Callable[[], str | None] | None = None
+    get_current_gate_leader_port: Callable[[], int | None] | None = None
+    get_known_gates: Callable[[], dict[str, tuple[str, int, str, int]]] | None = None
 
     def get_state(self) -> bytes | None:
         """Get ManagerHeartbeat to embed in SWIM messages."""
@@ -293,6 +298,11 @@ class ManagerStateEmbedder:
             health_throughput=self.get_health_throughput() if self.get_health_throughput else 0.0,
             health_expected_throughput=self.get_health_expected_throughput() if self.get_health_expected_throughput else 0.0,
             health_overload_state=self.get_health_overload_state() if self.get_health_overload_state else "healthy",
+            # Gate leader tracking for propagation among managers
+            current_gate_leader_id=self.get_current_gate_leader_id() if self.get_current_gate_leader_id else None,
+            current_gate_leader_host=self.get_current_gate_leader_host() if self.get_current_gate_leader_host else None,
+            current_gate_leader_port=self.get_current_gate_leader_port() if self.get_current_gate_leader_port else None,
+            known_gates=self.get_known_gates() if self.get_known_gates else {},
         )
         return heartbeat.dump()
     

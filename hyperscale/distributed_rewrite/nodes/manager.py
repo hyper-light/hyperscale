@@ -242,6 +242,11 @@ class ManagerServer(HealthAwareServer):
         # Incremented on each state change; handlers check epoch hasn't changed after await
         self._gate_state_epoch: dict[str, int] = {}
 
+        # Gate cluster leadership tracking - discovered via heartbeats, propagated to peer managers
+        # Updated when we receive GateHeartbeat with is_leader=True
+        self._current_gate_leader_id: str | None = None
+        self._current_gate_leader_addr: tuple[str, int] | None = None  # TCP address
+
         # Protocol version negotiation with gates (AD-25)
         # Maps gate_id -> NegotiatedCapabilities
         self._gate_negotiated_caps: dict[str, NegotiatedCapabilities] = {}
@@ -584,6 +589,11 @@ class ManagerServer(HealthAwareServer):
             get_health_throughput=lambda: 0.0,  # Actual throughput tracking deferred
             get_health_expected_throughput=lambda: 0.0,  # Expected throughput calculation deferred
             get_health_overload_state=lambda: self._overload_detector.get_state(0.0, 0.0),
+            # Gate leader tracking for propagation among managers
+            get_current_gate_leader_id=lambda: self._current_gate_leader_id,
+            get_current_gate_leader_host=lambda: self._current_gate_leader_addr[0] if self._current_gate_leader_addr else None,
+            get_current_gate_leader_port=lambda: self._current_gate_leader_addr[1] if self._current_gate_leader_addr else None,
+            get_known_gates=self._get_known_gates_for_heartbeat,
         ))
         
         # Register leadership callbacks (composition pattern - no override)
@@ -1732,6 +1742,83 @@ class ManagerServer(HealthAwareServer):
                     tcp_addr,
                 )
 
+        # Process gate leader info from peer's heartbeat (propagation)
+        # If peer knows a gate leader we don't, adopt their information
+        self._process_gate_leader_from_peer(heartbeat)
+
+        # Process known_gates from peer (gate discovery propagation)
+        self._process_known_gates_from_peer(heartbeat)
+
+    def _process_gate_leader_from_peer(self, heartbeat: ManagerHeartbeat) -> None:
+        """
+        Process gate leader information from a peer manager's heartbeat.
+
+        Enables gate leader discovery to propagate across manager cluster:
+        - If peer knows a gate leader we don't know, adopt their info
+        - If peer knows the same leader, no update needed
+        - If peer knows a different leader, prefer the one in our local tracking
+          (we will update from gate's heartbeat directly if wrong)
+        """
+        peer_gate_leader_id = heartbeat.current_gate_leader_id
+        peer_gate_leader_host = heartbeat.current_gate_leader_host
+        peer_gate_leader_port = heartbeat.current_gate_leader_port
+
+        # Skip if peer doesn't know a gate leader
+        if not peer_gate_leader_id or not peer_gate_leader_host or not peer_gate_leader_port:
+            return
+
+        # If we don't know a gate leader, adopt peer's knowledge
+        if not self._current_gate_leader_id:
+            self._current_gate_leader_id = peer_gate_leader_id
+            self._current_gate_leader_addr = (peer_gate_leader_host, peer_gate_leader_port)
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerDebug(
+                    message=f"Learned gate leader {peer_gate_leader_id[:8]}... from peer {heartbeat.node_id[:8]}...",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+    def _process_known_gates_from_peer(self, heartbeat: ManagerHeartbeat) -> None:
+        """
+        Process known gates from a peer manager's heartbeat.
+
+        Enables gate discovery to propagate across manager cluster:
+        - If peer knows gates we don't, add them to our known_gates
+        - Maintains UDP to TCP mapping for SWIM callbacks
+        """
+        for gate_id, (tcp_host, tcp_port, udp_host, udp_port) in heartbeat.known_gates.items():
+            if gate_id not in self._known_gates:
+                # New gate discovered via peer
+                self._known_gates[gate_id] = GateInfo(
+                    node_id=gate_id,
+                    tcp_host=tcp_host,
+                    tcp_port=tcp_port,
+                    udp_host=udp_host,
+                    udp_port=udp_port,
+                    datacenter=heartbeat.datacenter,  # Use peer's DC as approximation
+                    is_leader=False,  # Unknown until we get direct heartbeat
+                )
+                self._healthy_gate_ids.add(gate_id)
+
+                # Update UDP to TCP mapping
+                udp_addr = (udp_host, udp_port)
+                tcp_addr = (tcp_host, tcp_port)
+                if udp_addr not in self._gate_udp_to_tcp:
+                    self._gate_udp_to_tcp[udp_addr] = tcp_addr
+
+                self._task_runner.run(
+                    self._udp_logger.log,
+                    ServerDebug(
+                        message=f"Discovered gate {gate_id[:8]}... via peer {heartbeat.node_id[:8]}...",
+                        node_host=self._host,
+                        node_port=self._tcp_port,
+                        node_id=self._node_id.short,
+                    )
+                )
+
     def _process_job_leadership_heartbeat(
         self,
         heartbeat: ManagerHeartbeat,
@@ -1818,15 +1905,21 @@ class ManagerServer(HealthAwareServer):
                     is_leader=heartbeat.is_leader,
                 )
 
-                # If this gate became the leader, switch primary
+                # If this gate became the leader, switch primary and update gate leader tracking
                 if heartbeat.is_leader and self._primary_gate_id != gate_id:
                     old_primary = self._primary_gate_id
                     self._primary_gate_id = gate_id
 
+                    # Update gate leader tracking for propagation to peer managers
+                    old_gate_leader = self._current_gate_leader_id
+                    self._current_gate_leader_id = gate_id
+                    self._current_gate_leader_addr = tcp_addr
+
                     self._task_runner.run(
                         self._udp_logger.log,
                         ServerInfo(
-                            message=f"Gate leadership change via SWIM: {old_primary} -> {gate_id}",
+                            message=f"Gate leadership change via SWIM: {old_primary} -> {gate_id}"
+                                    f" (leader tracking: {old_gate_leader} -> {gate_id})",
                             node_host=self._host,
                             node_port=self._tcp_port,
                             node_id=self._node_id.short,
@@ -1858,6 +1951,11 @@ class ManagerServer(HealthAwareServer):
             # If this is a leader and we don't have one, use it
             if heartbeat.is_leader and not self._primary_gate_id:
                 self._primary_gate_id = gate_id
+
+            # Update gate leader tracking if this is a leader
+            if heartbeat.is_leader and not self._current_gate_leader_id:
+                self._current_gate_leader_id = gate_id
+                self._current_gate_leader_addr = tcp_addr
     
     def _update_known_gates(self, gates: list[GateInfo]) -> None:
         """
@@ -1918,7 +2016,24 @@ class ManagerServer(HealthAwareServer):
             if gate:
                 addrs.append((gate.tcp_host, gate.tcp_port))
         return addrs
-    
+
+    def _get_known_gates_for_heartbeat(self) -> dict[str, tuple[str, int, str, int]]:
+        """
+        Get known gates for piggybacking in ManagerHeartbeat.
+
+        Returns dict mapping gate_id -> (tcp_host, tcp_port, udp_host, udp_port).
+        This enables peer managers to learn about gates we've discovered.
+        """
+        result: dict[str, tuple[str, int, str, int]] = {}
+        for gate_id, gate_info in self._known_gates.items():
+            result[gate_id] = (
+                gate_info.tcp_host,
+                gate_info.tcp_port,
+                gate_info.udp_host,
+                gate_info.udp_port,
+            )
+        return result
+
     @property
     def node_info(self) -> NodeInfo:
         """Get this manager's node info."""
