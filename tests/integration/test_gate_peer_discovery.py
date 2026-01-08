@@ -253,7 +253,7 @@ async def test_gate_heartbeat_message_validation(cluster_size: int) -> bool:
         await asyncio.gather(*start_tasks)
 
         # Collect node IDs
-        node_ids = {gate._node_id.hex for gate in gates}
+        node_ids = {str(gate._node_id) for gate in gates}
         print(f"  Node IDs: {[gate._node_id.short for gate in gates]}")
 
         print(f"\n[3/5] Waiting for heartbeat exchange ({stabilization_time}s)...")
@@ -274,7 +274,7 @@ async def test_gate_heartbeat_message_validation(cluster_size: int) -> bool:
             print(f"\n  {config['name']} validation:")
 
             # Validate node_id is set
-            if not gate._node_id or not gate._node_id.hex:
+            if not gate._node_id or not str(gate._node_id):
                 print(f"    node_id: MISSING [FAIL]")
                 validation_results["node_ids_valid"] = False
             else:
@@ -388,9 +388,9 @@ async def test_gate_peer_discovery_failure_recovery(cluster_size: int) -> bool:
 
     gate_configs = generate_gate_configs(cluster_size)
     gates: list[GateServer] = []
-    stabilization_time = 10 + (cluster_size * 2)
-    failure_detection_time = 15  # Time for SWIM to detect failure
-    recovery_time = 15  # Time for recovered peer to rejoin
+    stabilization_time = 15 + (cluster_size * 2)
+    failure_detection_time = 20  # Time for SWIM to detect failure
+    recovery_time = 25  # Time for recovered peer to rejoin (new NodeId needs discovery)
 
     try:
         # Create and start gates

@@ -656,7 +656,8 @@ class ManagerServer(HealthAwareServer):
         1. Acquire recovery semaphore (limits concurrent recovery operations)
         2. Apply jitter delay to prevent thundering herd on mass recovery
         3. Re-add to active peers set (restores quorum capacity)
-        4. Log the recovery for debugging
+        4. Add to peer discovery with synthetic peer_id (real NodeId comes via heartbeat)
+        5. Log the recovery for debugging
         """
         # Limit concurrent recovery operations to prevent thundering herd
         async with self._recovery_semaphore:
@@ -671,6 +672,18 @@ class ManagerServer(HealthAwareServer):
 
             # Add back to active peers
             self._active_manager_peers.add(tcp_addr)
+
+            # Add to peer discovery with synthetic peer_id based on address
+            # The real NodeId will be updated when we receive the peer's heartbeat
+            peer_host, peer_port = tcp_addr
+            synthetic_peer_id = f"{peer_host}:{peer_port}"
+            self._peer_discovery.add_peer(
+                peer_id=synthetic_peer_id,
+                host=peer_host,
+                port=peer_port,
+                role="manager",
+                datacenter_id=self._dc_id,
+            )
         
         self._task_runner.run(
             self._udp_logger.log,

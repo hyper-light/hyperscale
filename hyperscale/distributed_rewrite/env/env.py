@@ -45,12 +45,15 @@ class Env(BaseModel):
     MERCURY_SYNC_DUPLICATE_JOB_POLICY: Literal["reject", "replace"] = "replace"
     
     # SWIM Protocol Settings
-    SWIM_MAX_PROBE_TIMEOUT: StrictInt = 10
+    # Tuned for faster failure detection while avoiding false positives:
+    # - Total detection time: ~4-8 seconds (probe timeout + suspicion)
+    # - Previous: ~6-15 seconds
+    SWIM_MAX_PROBE_TIMEOUT: StrictInt = 5  # Reduced from 10 - faster failure escalation
     SWIM_MIN_PROBE_TIMEOUT: StrictInt = 1
-    SWIM_CURRENT_TIMEOUT: StrictInt = 2
-    SWIM_UDP_POLL_INTERVAL: StrictInt = 2
-    SWIM_SUSPICION_MIN_TIMEOUT: StrictFloat = 2.0
-    SWIM_SUSPICION_MAX_TIMEOUT: StrictFloat = 15.0
+    SWIM_CURRENT_TIMEOUT: StrictInt = 1  # Reduced from 2 - faster initial probe timeout
+    SWIM_UDP_POLL_INTERVAL: StrictInt = 1  # Reduced from 2 - more frequent probing
+    SWIM_SUSPICION_MIN_TIMEOUT: StrictFloat = 1.5  # Reduced from 2.0 - faster confirmation
+    SWIM_SUSPICION_MAX_TIMEOUT: StrictFloat = 8.0  # Reduced from 15.0 - faster failure declaration
     
     # Leader Election Settings
     LEADER_HEARTBEAT_INTERVAL: StrictFloat = 2.0  # Seconds between leader heartbeats
@@ -189,8 +192,9 @@ class Env(BaseModel):
     # Recovery and Thundering Herd Prevention Settings
     # ==========================================================================
     # Jitter settings - applied to recovery operations to prevent synchronized reconnection waves
-    RECOVERY_JITTER_MAX: StrictFloat = 2.0  # Max jitter (seconds) before recovery actions
-    RECOVERY_JITTER_MIN: StrictFloat = 0.1  # Min jitter (seconds) - ensures some spread
+    # Reduced from 0.1-2.0s to 0.05-0.5s for faster recovery while still preventing thundering herd
+    RECOVERY_JITTER_MAX: StrictFloat = 0.5  # Reduced from 2.0 - faster recovery
+    RECOVERY_JITTER_MIN: StrictFloat = 0.05  # Reduced from 0.1 - minimal delay
 
     # Concurrency caps - limit simultaneous recovery operations to prevent overload
     RECOVERY_MAX_CONCURRENT: StrictInt = 5  # Max concurrent recovery operations per node type

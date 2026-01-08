@@ -653,7 +653,7 @@ async def test_manager_worker_message_validation(
             print(f"\n  {config['name']} validation:")
 
             # Validate node_id
-            if worker._node_id and worker._node_id.hex:
+            if worker._node_id and str(worker._node_id):
                 print(f"    node_id: {worker._node_id.short} [PASS]")
             else:
                 print(f"    node_id: MISSING [FAIL]")

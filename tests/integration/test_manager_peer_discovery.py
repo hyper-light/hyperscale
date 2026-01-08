@@ -240,7 +240,7 @@ async def test_manager_heartbeat_message_validation(cluster_size: int) -> bool:
         await asyncio.gather(*start_tasks)
 
         # Collect node IDs
-        node_ids = {manager._node_id.hex for manager in managers}
+        node_ids = {str(manager._node_id) for manager in managers}
         print(f"  Node IDs: {[manager._node_id.short for manager in managers]}")
 
         print(f"\n[3/5] Waiting for heartbeat exchange ({stabilization_time}s)...")
@@ -263,7 +263,7 @@ async def test_manager_heartbeat_message_validation(cluster_size: int) -> bool:
             print(f"\n  {config['name']} validation:")
 
             # Validate node_id is set
-            if not manager._node_id or not manager._node_id.hex:
+            if not manager._node_id or not str(manager._node_id):
                 print(f"    node_id: MISSING [FAIL]")
                 validation_results["node_ids_valid"] = False
             else:
