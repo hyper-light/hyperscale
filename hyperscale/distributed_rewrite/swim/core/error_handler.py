@@ -262,9 +262,13 @@ class ErrorHandler:
         # 1. Log with structured context
         await self._log_error(error)
 
-        # 2. Update error stats
+        # 2. Update error stats - but only for non-TRANSIENT errors
+        # TRANSIENT errors (like stale messages) are expected in async distributed
+        # systems and should NOT trip the circuit breaker. They indicate normal
+        # protocol operation (e.g., incarnation changes during refutation).
         stats = self._get_stats(error.category)
-        stats.record_error()
+        if error.severity != ErrorSeverity.TRANSIENT:
+            stats.record_error()
 
         # 3. Affect LHM based on error
         await self._update_lhm(error)
