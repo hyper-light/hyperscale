@@ -225,6 +225,14 @@ class GateServer(HealthAwareServer):
         
         # Track active gate peers (removed when SWIM marks as dead)
         self._active_gate_peers: set[tuple[str, int]] = set(self._gate_peers)
+
+        # Lock protecting _active_gate_peers modifications to prevent race conditions
+        # between concurrent failure/recovery handlers (asyncio task interleaving)
+        self._peer_state_lock = asyncio.Lock()
+
+        # Monotonic epoch per peer address to detect stale failure/recovery operations
+        # Incremented on each state change; handlers check epoch hasn't changed after await
+        self._peer_state_epoch: dict[tuple[str, int], int] = {}
         
         # Track gate peer info from GateHeartbeat (proper node_ids, leadership, etc)
         # Maps UDP addr -> GateHeartbeat for peers we've heard from via SWIM
@@ -520,14 +528,22 @@ class GateServer(HealthAwareServer):
         - Leadership re-election is automatic via LocalLeaderElection
 
         Also handles per-job leadership takeover when the failed gate was leading jobs.
-        """
-        # Remove from active peers
-        self._active_gate_peers.discard(tcp_addr)
 
-        # Remove from peer discovery service (AD-28)
-        peer_host, peer_port = tcp_addr
-        peer_id = f"{peer_host}:{peer_port}"
-        self._peer_discovery.remove_peer(peer_id)
+        Thread safety:
+        - Uses _peer_state_lock to coordinate with recovery handler
+        - Increments epoch to invalidate any in-flight recovery operations
+        """
+        async with self._peer_state_lock:
+            # Increment epoch to invalidate any pending recovery operations
+            self._peer_state_epoch[tcp_addr] = self._peer_state_epoch.get(tcp_addr, 0) + 1
+
+            # Remove from active peers
+            self._active_gate_peers.discard(tcp_addr)
+
+            # Remove from peer discovery service (AD-28)
+            peer_host, peer_port = tcp_addr
+            peer_id = f"{peer_host}:{peer_port}"
+            self._peer_discovery.remove_peer(peer_id)
 
         # Check if this was the leader
         current_leader = self.get_current_leader()
@@ -570,12 +586,21 @@ class GateServer(HealthAwareServer):
         Handle a gate peer recovering/rejoining the cluster.
 
         Actions:
-        1. Acquire recovery semaphore (limits concurrent recovery operations)
-        2. Apply jitter delay to prevent thundering herd on mass recovery
-        3. Re-add to active peers set
-        4. Add to peer discovery with synthetic peer_id (real NodeId comes via heartbeat)
-        5. Log the recovery for debugging
+        1. Capture current epoch before any await
+        2. Acquire recovery semaphore (limits concurrent recovery operations)
+        3. Apply jitter delay to prevent thundering herd on mass recovery
+        4. Verify epoch hasn't changed (peer wasn't marked dead during jitter)
+        5. Re-add to active peers set
+        6. Add to peer discovery with synthetic peer_id (real NodeId comes via heartbeat)
+
+        Thread safety:
+        - Uses epoch checking to detect if failure handler ran during our jitter
+        - Uses _peer_state_lock to coordinate state changes
         """
+        # Capture epoch BEFORE any await points
+        async with self._peer_state_lock:
+            initial_epoch = self._peer_state_epoch.get(tcp_addr, 0)
+
         # Limit concurrent recovery operations to prevent thundering herd
         async with self._recovery_semaphore:
             # Apply jitter before recovery actions to prevent thundering herd
@@ -587,19 +612,37 @@ class GateServer(HealthAwareServer):
                 jitter = random.uniform(jitter_min, jitter_max)
                 await asyncio.sleep(jitter)
 
-            # Add back to active peers
-            self._active_gate_peers.add(tcp_addr)
+            # After jitter, check if peer was marked dead during our sleep
+            async with self._peer_state_lock:
+                current_epoch = self._peer_state_epoch.get(tcp_addr, 0)
+                if current_epoch != initial_epoch:
+                    # Epoch changed - a failure was detected during our jitter
+                    # Don't add peer back as it's now considered dead
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=f"Gate peer recovery for {tcp_addr} aborted: epoch changed "
+                                    f"({initial_epoch} -> {current_epoch}) during jitter",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return
 
-            # Add to peer discovery with synthetic peer_id based on address
-            # The real NodeId will be updated when we receive the peer's heartbeat
-            peer_host, peer_port = tcp_addr
-            synthetic_peer_id = f"{peer_host}:{peer_port}"
-            self._peer_discovery.add_peer(
-                peer_id=synthetic_peer_id,
-                host=peer_host,
-                port=peer_port,
-                role="gate",
-            )
+                # Epoch unchanged - safe to add peer back
+                self._active_gate_peers.add(tcp_addr)
+
+                # Add to peer discovery with synthetic peer_id based on address
+                # The real NodeId will be updated when we receive the peer's heartbeat
+                peer_host, peer_port = tcp_addr
+                synthetic_peer_id = f"{peer_host}:{peer_port}"
+                self._peer_discovery.add_peer(
+                    peer_id=synthetic_peer_id,
+                    host=peer_host,
+                    port=peer_port,
+                    role="gate",
+                )
 
         self._task_runner.run(
             self._udp_logger.log,
@@ -610,11 +653,11 @@ class GateServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-        
+
         # Log cluster status
         active_count = len(self._active_gate_peers) + 1  # Include self
         total_gates = len(self._gate_peers) + 1
-        
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(

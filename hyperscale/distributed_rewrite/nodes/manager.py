@@ -264,6 +264,14 @@ class ManagerServer(HealthAwareServer):
         # Legacy: Track active peers by TCP addr for backwards compat during transition
         self._active_manager_peers: set[tuple[str, int]] = set(self._seed_managers)
 
+        # Lock protecting _active_manager_peers modifications to prevent race conditions
+        # between concurrent failure/recovery handlers (asyncio task interleaving)
+        self._peer_state_lock = asyncio.Lock()
+
+        # Monotonic epoch per peer address to detect stale failure/recovery operations
+        # Incremented on each state change; handlers check epoch hasn't changed after await
+        self._peer_state_epoch: dict[tuple[str, int], int] = {}
+
         # Track manager peer info from ManagerHeartbeat (proper node_ids, leadership, etc)
         # Maps UDP addr -> ManagerHeartbeat for peers we've heard from via SWIM
         self._manager_peer_info: dict[tuple[str, int], ManagerHeartbeat] = {}
@@ -653,12 +661,21 @@ class ManagerServer(HealthAwareServer):
         Handle a manager peer recovering/rejoining the cluster.
 
         Actions:
-        1. Acquire recovery semaphore (limits concurrent recovery operations)
-        2. Apply jitter delay to prevent thundering herd on mass recovery
-        3. Re-add to active peers set (restores quorum capacity)
-        4. Add to peer discovery with synthetic peer_id (real NodeId comes via heartbeat)
-        5. Log the recovery for debugging
+        1. Capture current epoch before any await
+        2. Acquire recovery semaphore (limits concurrent recovery operations)
+        3. Apply jitter delay to prevent thundering herd on mass recovery
+        4. Verify epoch hasn't changed (peer wasn't marked dead during jitter)
+        5. Re-add to active peers set (restores quorum capacity)
+        6. Add to peer discovery with synthetic peer_id (real NodeId comes via heartbeat)
+
+        Thread safety:
+        - Uses epoch checking to detect if failure handler ran during our jitter
+        - Uses _peer_state_lock to coordinate state changes
         """
+        # Capture epoch BEFORE any await points
+        async with self._peer_state_lock:
+            initial_epoch = self._peer_state_epoch.get(tcp_addr, 0)
+
         # Limit concurrent recovery operations to prevent thundering herd
         async with self._recovery_semaphore:
             # Apply jitter before recovery actions to prevent thundering herd
@@ -670,21 +687,39 @@ class ManagerServer(HealthAwareServer):
                 jitter = random.uniform(jitter_min, jitter_max)
                 await asyncio.sleep(jitter)
 
-            # Add back to active peers
-            self._active_manager_peers.add(tcp_addr)
+            # After jitter, check if peer was marked dead during our sleep
+            async with self._peer_state_lock:
+                current_epoch = self._peer_state_epoch.get(tcp_addr, 0)
+                if current_epoch != initial_epoch:
+                    # Epoch changed - a failure was detected during our jitter
+                    # Don't add peer back as it's now considered dead
+                    self._task_runner.run(
+                        self._udp_logger.log,
+                        ServerDebug(
+                            message=f"Manager peer recovery for {tcp_addr} aborted: epoch changed "
+                                    f"({initial_epoch} -> {current_epoch}) during jitter",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+                    return
 
-            # Add to peer discovery with synthetic peer_id based on address
-            # The real NodeId will be updated when we receive the peer's heartbeat
-            peer_host, peer_port = tcp_addr
-            synthetic_peer_id = f"{peer_host}:{peer_port}"
-            self._peer_discovery.add_peer(
-                peer_id=synthetic_peer_id,
-                host=peer_host,
-                port=peer_port,
-                role="manager",
-                datacenter_id=self._dc_id,
-            )
-        
+                # Epoch unchanged - safe to add peer back
+                self._active_manager_peers.add(tcp_addr)
+
+                # Add to peer discovery with synthetic peer_id based on address
+                # The real NodeId will be updated when we receive the peer's heartbeat
+                peer_host, peer_port = tcp_addr
+                synthetic_peer_id = f"{peer_host}:{peer_port}"
+                self._peer_discovery.add_peer(
+                    peer_id=synthetic_peer_id,
+                    host=peer_host,
+                    port=peer_port,
+                    role="manager",
+                    datacenter_id=self._dc_id,
+                )
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -694,12 +729,12 @@ class ManagerServer(HealthAwareServer):
                 node_id=self._node_id.short,
             )
         )
-        
+
         # Log quorum status
         active_count = len(self._active_manager_peers) + 1  # Include self
         required_quorum = self._quorum_size
         have_quorum = active_count >= required_quorum
-        
+
         self._task_runner.run(
             self._udp_logger.log,
             ServerInfo(
@@ -717,17 +752,26 @@ class ManagerServer(HealthAwareServer):
     ) -> None:
         """
         Handle a manager peer becoming unavailable (detected via SWIM).
-        
+
         Actions:
-        1. Remove from active peers set (affects quorum calculation)
-        2. Log the failure for debugging
-        3. If we were waiting on quorum from this peer, those requests will timeout
-        
+        1. Increment epoch (invalidates any pending recovery operations)
+        2. Remove from active peers set (affects quorum calculation)
+        3. Log the failure for debugging
+        4. If we were waiting on quorum from this peer, those requests will timeout
+
         Note: Leadership re-election is automatic via LocalLeaderElection
         when the leader's heartbeats stop (lease expiry).
+
+        Thread safety:
+        - Uses _peer_state_lock to coordinate with recovery handler
+        - Increments epoch to invalidate any in-flight recovery operations
         """
-        # Remove from active peers
-        self._active_manager_peers.discard(tcp_addr)
+        async with self._peer_state_lock:
+            # Increment epoch to invalidate any pending recovery operations
+            self._peer_state_epoch[tcp_addr] = self._peer_state_epoch.get(tcp_addr, 0) + 1
+
+            # Remove from active peers
+            self._active_manager_peers.discard(tcp_addr)
         
         # Check if this was the leader
         current_leader = self.get_current_leader()
