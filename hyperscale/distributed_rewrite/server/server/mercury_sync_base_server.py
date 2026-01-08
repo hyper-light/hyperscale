@@ -1021,16 +1021,16 @@ class MercurySyncBaseServer(Generic[T]):
             # Parse length-prefixed UDP message format:
             # type<address<handler<clock(64 bytes)data_len(4 bytes)data(N bytes)
             request_type, addr, handler_name, rest = decrypted.split(b'<', maxsplit=3)
+            # Extract clock (first 64 bytes)
+            clock = rest[:64]
+            # Extract data length (next 4 bytes)
+            data_len = int.from_bytes(rest[64:68], 'big')
+            # Extract payload (remaining bytes)
+            payload = rest[68:68 + data_len]
 
             match request_type:
 
                 case b'c':
-                    # Extract clock (first 64 bytes)
-                    clock = rest[:64]
-                    # Extract data length (next 4 bytes)
-                    data_len = int.from_bytes(rest[64:68], 'big')
-                    # Extract payload (remaining bytes)
-                    payload = rest[68:68 + data_len]
 
                     self._pending_udp_server_responses.append(
                         asyncio.ensure_future(
