@@ -59,6 +59,7 @@ The minimal-impact bool flag approach has been implemented:
 - [x] **2.0e** Reset `_cancelled = False` at start of `run()`
 - [x] **2.0f** `RemoteGraphController.cancel_workflow_background()` calls `request_cancellation()` before task cancel
 - [x] **2.0g** Fix `Run.cancel()` to use timeout and always update status
+- [x] **2.0h** Add event-driven workflow completion signaling
 
 **Files modified**:
 - `hyperscale/core/jobs/graphs/workflow_runner.py`
@@ -97,6 +98,30 @@ async def cancel(self, timeout: float = 5.0):
     self.status = RunStatus.CANCELLED
     self.end = time.monotonic()
     self.elapsed = self.end - self.start
+```
+
+### Completed: Event-Driven Workflow Completion Signaling
+
+**Problem**: `cancel_workflow_background()` used polling via `tasks.cancel()` to wait for workflow termination. This was converted to event-driven but had gaps.
+
+**Solution**:
+- Added `_is_cancelled: asyncio.Event` to WorkflowRunner
+- Added `await_cancellation()` method that waits on the event
+- Event is set at the end of both `_execute_test_workflow` AND `_execute_non_test_workflow`
+- Event is cleared at start of `run()` alongside the bool flag reset
+- `cancel_workflow_background()` now uses `await_cancellation()` instead of `tasks.cancel()`
+
+**Flow**:
+```
+cancel_workflow_background()
+    │
+    ├─► request_cancellation()  # Sets _cancelled = True
+    │       │
+    │       └─► Generators stop yielding new VUs
+    │
+    └─► await_cancellation()  # Waits on _is_cancelled event
+            │
+            └─► Event fires when _execute_*_workflow completes
 ```
 
 ### Current Architecture Documentation

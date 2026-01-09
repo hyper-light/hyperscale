@@ -146,6 +146,7 @@ class WorkflowRunner:
         self._cpu_monitor = CPUMonitor(env)
         self._memory_monitor = MemoryMonitor(env)
         self._logger = Logger()
+        self._is_cancelled: asyncio.Event = asyncio.Event()
 
         # Cancellation flag - checked by generators to stop spawning new VUs
         self._cancelled: bool = False
@@ -158,6 +159,16 @@ class WorkflowRunner:
             self._run_check_lock = asyncio.Lock()
 
         self._clear()
+
+    async def await_cancellation(self) -> None:
+        """
+        Wait for the current workflow to finish (by cancellation or completion).
+
+        This event is set when either _execute_test_workflow or
+        _execute_non_test_workflow completes, regardless of whether
+        the workflow was cancelled or finished normally.
+        """
+        await self._is_cancelled.wait()
 
     def request_cancellation(self) -> None:
         """
@@ -279,8 +290,9 @@ class WorkflowRunner:
         Exception | None,
         WorkflowStatus,
     ]:
-        # Reset cancellation flag for new workflow run
+        # Reset cancellation state for new workflow run
         self._cancelled = False
+        self._is_cancelled.clear()
 
         default_config = {
             "node_id": self._node_id,
@@ -938,6 +950,9 @@ class WorkflowRunner:
             elapsed,
         )
 
+        if not self._is_cancelled.is_set():
+            self._is_cancelled.set()
+
         return processed_results
 
     async def _execute_non_test_workflow(
@@ -972,6 +987,9 @@ class WorkflowRunner:
                 for pend in self._pending[run_id][workflow_name]
             ]
         )
+
+        if not self._is_cancelled.is_set():
+            self._is_cancelled.set()
 
         return {result.get_name(): guard_result(result) for result in execution_results}
 
