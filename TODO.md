@@ -58,10 +58,46 @@ The minimal-impact bool flag approach has been implemented:
 - [x] **2.0d** Update `_generate_constant()` while loop: same pattern
 - [x] **2.0e** Reset `_cancelled = False` at start of `run()`
 - [x] **2.0f** `RemoteGraphController.cancel_workflow_background()` calls `request_cancellation()` before task cancel
+- [x] **2.0g** Fix `Run.cancel()` to use timeout and always update status
 
 **Files modified**:
 - `hyperscale/core/jobs/graphs/workflow_runner.py`
 - `hyperscale/core/jobs/graphs/remote_graph_controller.py` (already updated)
+- `hyperscale/core/jobs/tasks/run.py` - Added timeout parameter to prevent hangs
+- `hyperscale/core/jobs/tasks/task_hook.py` - Pass through timeout parameter
+- `hyperscale/core/jobs/tasks/task_runner.py` - Pass through timeout parameter
+
+### Completed: Task Runner Cancellation Fix
+
+**Problem**: `Run.cancel()` could hang indefinitely if a task didn't respond to cancellation. The status was only updated after awaiting the task, so timeouts left status unchanged.
+
+**Solution**:
+- Added `timeout` parameter to `Run.cancel()` (default: 5.0 seconds)
+- Uses `asyncio.wait_for(asyncio.shield(task), timeout)` to prevent indefinite hangs
+- Always updates `status = CANCELLED`, `end`, and `elapsed` regardless of timeout/exception
+- Propagated timeout parameter through `Task.cancel()` and `TaskRunner.cancel()`
+
+```python
+# Before (could hang forever):
+async def cancel(self):
+    if self._task and not self._task.done():
+        self._task.cancel()
+        await self._task  # <-- Could hang!
+    self.status = RunStatus.CANCELLED  # <-- Never reached on hang
+
+# After (bounded wait, always updates status):
+async def cancel(self, timeout: float = 5.0):
+    if self._task and not self._task.done():
+        self._task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            pass
+    # Always update status, even if timeout occurred
+    self.status = RunStatus.CANCELLED
+    self.end = time.monotonic()
+    self.elapsed = self.end - self.start
+```
 
 ### Current Architecture Documentation
 

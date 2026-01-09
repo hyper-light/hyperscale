@@ -85,10 +85,10 @@ class TaskRunner:
         if task := self.tasks.get(task_name):
             return await task.complete(run_id)
 
-    async def cancel(self, task_name: str, run_id: str):
+    async def cancel(self, task_name: str, run_id: str, timeout: float = 5.0):
         task = self.tasks.get(task_name)
         if task:
-            await task.cancel(run_id)
+            await task.cancel(run_id, timeout=timeout)
 
     async def cancel_schedule(
         self,

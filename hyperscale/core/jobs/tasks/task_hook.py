@@ -76,9 +76,9 @@ class Task(Generic[T]):
         if run := self._runs.get(run_id):
             return await run.complete()
 
-    async def cancel(self, run_id: str):
+    async def cancel(self, run_id: str, timeout: float = 5.0):
         if run := self._runs.get(run_id):
-            await run.cancel()
+            await run.cancel(timeout=timeout)
 
     async def cancel_schedule(self):
         # Snapshot to avoid dict mutation during iteration
