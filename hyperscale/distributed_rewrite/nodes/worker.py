@@ -234,6 +234,15 @@ class WorkerServer(HealthAwareServer):
         self._cancellation_poll_interval: float = env.WORKER_CANCELLATION_POLL_INTERVAL
         self._cancellation_poll_task: asyncio.Task | None = None
 
+        # Orphaned workflow tracking (Section 2.7)
+        # When a job leader manager fails, workflows are marked as orphaned.
+        # If JobLeaderWorkerTransfer arrives before grace period expires, workflow continues.
+        # If grace period expires without transfer, workflow is cancelled.
+        self._orphaned_workflows: dict[str, float] = {}  # workflow_id -> orphan_timestamp
+        self._orphan_grace_period: float = env.WORKER_ORPHAN_GRACE_PERIOD
+        self._orphan_check_interval: float = env.WORKER_ORPHAN_CHECK_INTERVAL
+        self._orphan_check_task: asyncio.Task | None = None
+
         # State versioning (Lamport clock extension)
         self._state_version = 0
 
@@ -580,6 +589,9 @@ class WorkerServer(HealthAwareServer):
         # Start cancellation polling loop
         self._cancellation_poll_task = asyncio.create_task(self._cancellation_poll_loop())
 
+        # Start orphan grace period checker loop (Section 2.7)
+        self._orphan_check_task = asyncio.create_task(self._orphan_check_loop())
+
         # Start discovery maintenance loop (AD-28)
         self._discovery_maintenance_task = asyncio.create_task(self._discovery_maintenance_loop())
 
@@ -635,6 +647,11 @@ class WorkerServer(HealthAwareServer):
         Thread safety:
         - Uses per-manager lock to coordinate with recovery handler
         - Increments epoch to invalidate any in-flight recovery operations
+
+        Orphan handling (Section 2.7):
+        - When a job leader manager fails, workflows are marked as orphaned
+        - If JobLeaderWorkerTransfer arrives before grace period, workflow continues
+        - If grace period expires without transfer, workflow is cancelled
         """
         manager_lock = self._get_manager_state_lock(manager_id)
         async with manager_lock:
@@ -648,8 +665,7 @@ class WorkerServer(HealthAwareServer):
             if manager_id not in self._manager_unhealthy_since:
                 self._manager_unhealthy_since[manager_id] = time.monotonic()
 
-        self._task_runner.run(
-            self._udp_logger.log,
+        await self._udp_logger.log(
             ServerInfo(
                 message=f"Manager {manager_id} marked unhealthy (SWIM DEAD)",
                 node_host=self._host,
@@ -658,9 +674,50 @@ class WorkerServer(HealthAwareServer):
             )
         )
 
+        # Mark workflows as orphaned if this manager was their job leader (Section 2.7)
+        await self._mark_workflows_orphaned_for_manager(manager_id)
+
         # If this was our primary manager, select a new one
         if manager_id == self._primary_manager_id:
             await self._select_new_primary_manager()
+
+    async def _mark_workflows_orphaned_for_manager(self, manager_id: str) -> None:
+        """
+        Mark workflows as orphaned when their job leader manager fails.
+
+        Workflows are added to _orphaned_workflows with a timestamp.
+        The orphan grace period checker will cancel them if no
+        JobLeaderWorkerTransfer arrives before the grace period expires.
+        """
+        # Get the dead manager's TCP address
+        manager_info = self._known_managers.get(manager_id)
+        if not manager_info:
+            return
+
+        dead_manager_addr = (manager_info.tcp_host, manager_info.tcp_port)
+        orphaned_count = 0
+        current_time = time.monotonic()
+
+        # Find all workflows whose job leader was the dead manager
+        for workflow_id, job_leader_addr in list(self._workflow_job_leader.items()):
+            if job_leader_addr == dead_manager_addr:
+                # Check if workflow is still active
+                if workflow_id in self._active_workflows:
+                    # Mark as orphaned (don't cancel yet - wait for potential transfer)
+                    if workflow_id not in self._orphaned_workflows:
+                        self._orphaned_workflows[workflow_id] = current_time
+                        orphaned_count += 1
+
+        if orphaned_count > 0:
+            await self._udp_logger.log(
+                ServerWarning(
+                    message=f"Marked {orphaned_count} workflow(s) as orphaned after manager {manager_id} failure. "
+                            f"Grace period: {self._orphan_grace_period}s",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
 
     async def _handle_manager_recovery(self, manager_id: str) -> None:
         """
@@ -979,6 +1036,14 @@ class WorkerServer(HealthAwareServer):
             except asyncio.CancelledError:
                 pass
 
+        # Cancel orphan check loop (Section 2.7)
+        if self._orphan_check_task and not self._orphan_check_task.done():
+            self._orphan_check_task.cancel()
+            try:
+                await self._orphan_check_task
+            except asyncio.CancelledError:
+                pass
+
         # Cancel discovery maintenance loop (AD-28)
         if self._discovery_maintenance_task and not self._discovery_maintenance_task.done():
             self._discovery_maintenance_task.cancel()
@@ -1052,6 +1117,13 @@ class WorkerServer(HealthAwareServer):
         if self._cancellation_poll_task and not self._cancellation_poll_task.done():
             try:
                 self._cancellation_poll_task.cancel()
+            except Exception:
+                pass
+
+        # Cancel orphan check loop (Section 2.7)
+        if self._orphan_check_task and not self._orphan_check_task.done():
+            try:
+                self._orphan_check_task.cancel()
             except Exception:
                 pass
 
@@ -1806,6 +1878,8 @@ class WorkerServer(HealthAwareServer):
                 self._active_workflows.pop(dispatch.workflow_id, None)
                 self._workflow_fence_tokens.pop(dispatch.workflow_id, None)
                 self._workflow_job_leader.pop(dispatch.workflow_id, None)
+                # Clean up orphan tracking if present (Section 2.7)
+                self._orphaned_workflows.pop(dispatch.workflow_id, None)
 
             workflow_id = dispatch.workflow_id if dispatch else "unknown"
             ack = WorkflowDispatchAck(
@@ -1910,6 +1984,8 @@ class WorkerServer(HealthAwareServer):
             self._workflow_fence_tokens.pop(dispatch.workflow_id, None)
             self._workflow_id_to_name.pop(dispatch.workflow_id, None)
             self._workflow_job_leader.pop(dispatch.workflow_id, None)
+            # Clean up orphan tracking if present (Section 2.7)
+            self._orphaned_workflows.pop(dispatch.workflow_id, None)
             self._remote_manger.start_server_cleanup()
 
         return (
@@ -2283,6 +2359,69 @@ class WorkerServer(HealthAwareServer):
             except asyncio.CancelledError:
                 break
             except Exception:
+                pass
+
+    async def _orphan_check_loop(self) -> None:
+        """
+        Background loop that checks for orphaned workflows whose grace period has expired (Section 2.7).
+
+        Orphaned workflows are those whose job leader manager failed and have not
+        received a JobLeaderWorkerTransfer notification within the grace period.
+
+        When grace period expires:
+        - Workflow is cancelled via the event-driven cancellation system
+        - Workflow is removed from orphaned tracking
+        - Log message is emitted for debugging
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(self._orphan_check_interval)
+
+                current_time = time.monotonic()
+                workflows_to_cancel: list[str] = []
+
+                # Find workflows whose grace period has expired
+                for workflow_id, orphan_timestamp in list(self._orphaned_workflows.items()):
+                    elapsed = current_time - orphan_timestamp
+                    if elapsed >= self._orphan_grace_period:
+                        workflows_to_cancel.append(workflow_id)
+
+                # Cancel expired orphaned workflows
+                for workflow_id in workflows_to_cancel:
+                    # Remove from orphan tracking first
+                    self._orphaned_workflows.pop(workflow_id, None)
+
+                    # Check if workflow is still active (may have completed naturally)
+                    if workflow_id not in self._active_workflows:
+                        continue
+
+                    await self._udp_logger.log(
+                        ServerWarning(
+                            message=f"Cancelling orphaned workflow {workflow_id[:8]}... - "
+                                    f"grace period ({self._orphan_grace_period}s) expired without job leader transfer",
+                            node_host=self._host,
+                            node_port=self._tcp_port,
+                            node_id=self._node_id.short,
+                        )
+                    )
+
+                    # Cancel the workflow using the existing cancellation mechanism
+                    success, errors = await self._cancel_workflow(workflow_id, "orphan_grace_period_expired")
+
+                    if not success or errors:
+                        await self._udp_logger.log(
+                            ServerError(
+                                message=f"Error cancelling orphaned workflow {workflow_id[:8]}...: {errors}",
+                                node_host=self._host,
+                                node_port=self._tcp_port,
+                                node_id=self._node_id.short,
+                            )
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Don't crash the loop on transient errors
                 pass
 
     async def _discovery_maintenance_loop(self) -> None:
@@ -2854,11 +2993,16 @@ class WorkerServer(HealthAwareServer):
         When a manager takes over job leadership from a failed manager,
         it notifies workers with active workflows so they update their
         _workflow_job_leader mapping to route progress to the new manager.
+
+        Orphan handling (Section 2.7):
+        - Clears workflows from _orphaned_workflows when transfer arrives
+        - This prevents cancellation if transfer arrives before grace period expires
         """
         try:
             transfer = JobLeaderWorkerTransfer.load(data)
 
             workflows_updated = 0
+            workflows_rescued_from_orphan = 0
 
             # Update routing for each workflow mentioned in the transfer
             for workflow_id in transfer.workflow_ids:
@@ -2871,12 +3015,21 @@ class WorkerServer(HealthAwareServer):
                         self._workflow_job_leader[workflow_id] = new_leader
                         workflows_updated += 1
 
+                    # Clear from orphaned workflows if present (Section 2.7)
+                    # Transfer arrived before grace period expired - workflow is rescued
+                    if workflow_id in self._orphaned_workflows:
+                        del self._orphaned_workflows[workflow_id]
+                        workflows_rescued_from_orphan += 1
+
             if workflows_updated > 0:
-                self._task_runner.run(
-                    self._udp_logger.log,
+                rescue_message = ""
+                if workflows_rescued_from_orphan > 0:
+                    rescue_message = f" ({workflows_rescued_from_orphan} rescued from orphan state)"
+
+                await self._udp_logger.log(
                     ServerInfo(
                         message=f"Job {transfer.job_id[:8]}... leadership transfer: "
-                                f"updated {workflows_updated} workflow(s) to route to {transfer.new_manager_addr}",
+                                f"updated {workflows_updated} workflow(s) to route to {transfer.new_manager_addr}{rescue_message}",
                         node_host=self._host,
                         node_port=self._tcp_port,
                         node_id=self._node_id.short,

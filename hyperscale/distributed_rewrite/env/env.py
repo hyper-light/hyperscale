@@ -100,6 +100,12 @@ class Env(BaseModel):
     WORKER_TCP_TIMEOUT_SHORT: StrictFloat = 2.0  # Short timeout for quick operations
     WORKER_TCP_TIMEOUT_STANDARD: StrictFloat = 5.0  # Standard timeout for progress/result pushes
 
+    # Worker Orphan Grace Period Settings (Section 2.7)
+    # Grace period before cancelling workflows when job leader manager fails
+    # Should be longer than expected election + takeover time
+    WORKER_ORPHAN_GRACE_PERIOD: StrictFloat = 5.0  # Seconds to wait for JobLeaderWorkerTransfer
+    WORKER_ORPHAN_CHECK_INTERVAL: StrictFloat = 1.0  # Seconds between orphan grace period checks
+
     # Manager Startup and Dispatch Settings
     MANAGER_STARTUP_SYNC_DELAY: StrictFloat = 2.0  # Seconds to wait for leader election before state sync
     MANAGER_STATE_SYNC_TIMEOUT: StrictFloat = 5.0  # Timeout for state sync request to leader
@@ -202,6 +208,7 @@ class Env(BaseModel):
 
     # Concurrency caps - limit simultaneous recovery operations to prevent overload
     RECOVERY_MAX_CONCURRENT: StrictInt = 5  # Max concurrent recovery operations per node type
+    RECOVERY_SEMAPHORE_SIZE: StrictInt = 5  # Semaphore size for limiting concurrent recovery
     DISPATCH_MAX_CONCURRENT_PER_WORKER: StrictInt = 3  # Max concurrent dispatches to a single worker
 
     # Message queue backpressure - prevent memory exhaustion under load
@@ -395,6 +402,9 @@ class Env(BaseModel):
             # Worker TCP timeout settings
             "WORKER_TCP_TIMEOUT_SHORT": float,
             "WORKER_TCP_TIMEOUT_STANDARD": float,
+            # Worker orphan grace period settings
+            "WORKER_ORPHAN_GRACE_PERIOD": float,
+            "WORKER_ORPHAN_CHECK_INTERVAL": float,
             # Manager startup and dispatch settings
             "MANAGER_STARTUP_SYNC_DELAY": float,
             "MANAGER_STATE_SYNC_TIMEOUT": float,
@@ -510,6 +520,14 @@ class Env(BaseModel):
             "CROSS_DC_ENABLE_LHM_CORRELATION": bool,
             "CROSS_DC_LHM_STRESSED_THRESHOLD": int,
             "CROSS_DC_LHM_CORRELATION_FRACTION": float,
+            # Recovery and thundering herd settings
+            "RECOVERY_JITTER_MAX": float,
+            "RECOVERY_JITTER_MIN": float,
+            "RECOVERY_MAX_CONCURRENT": int,
+            "RECOVERY_SEMAPHORE_SIZE": int,
+            "DISPATCH_MAX_CONCURRENT_PER_WORKER": int,
+            "MESSAGE_QUEUE_MAX_SIZE": int,
+            "MESSAGE_QUEUE_WARN_SIZE": int,
             # Bounded pending response queues settings (AD-32)
             "PENDING_RESPONSE_MAX_CONCURRENT": int,
             "PENDING_RESPONSE_HIGH_LIMIT": int,

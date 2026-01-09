@@ -8,6 +8,8 @@ This document tracks the remaining work for robust job leadership transfer and w
 
 ## 1. Fix Job Leadership Takeover When SWIM Leader IS Job Leader (Option A)
 
+**Status**: ✅ Complete
+
 **Problem**: When Manager A is both the SWIM cluster leader AND job leader, and Manager A fails:
 1. SWIM detects failure (probe → suspicion → confirmed dead)
 2. `_on_node_dead` callback fires on surviving managers
@@ -19,21 +21,21 @@ This document tracks the remaining work for robust job leadership transfer and w
 
 ### Tasks
 
-- [ ] **1.1** Add `_dead_managers` tracking set to manager
+- [x] **1.1** Add `_dead_managers` tracking set to manager
   - Track managers confirmed dead via SWIM
   - Populate in `_on_node_dead` callback
   - Clear entries when manager rejoins via `_on_node_join`
 
-- [ ] **1.2** Add `_scan_for_orphaned_jobs()` method
+- [x] **1.2** Add `_scan_for_orphaned_jobs()` method
   - Called from `_on_manager_become_leader`
   - For each job in `_job_leader_addrs`, check if leader is in `_dead_managers`
   - Take over any orphaned jobs found
 
-- [ ] **1.3** Update `_on_manager_become_leader` to call `_scan_for_orphaned_jobs()`
+- [x] **1.3** Update `_on_manager_become_leader` to call `_scan_for_orphaned_jobs()`
   - Run after initial leader stabilization
   - Log jobs being taken over
 
-- [ ] **1.4** Handle edge case: new leader fails during takeover
+- [x] **1.4** Handle edge case: new leader fails during takeover
   - The next elected leader will also scan for orphaned jobs
   - Fencing tokens prevent duplicate takeover
 
@@ -44,7 +46,7 @@ This document tracks the remaining work for robust job leadership transfer and w
 
 ## 2. Refactor Workflow Cancellation to Event-Based Approach
 
-**Status**: ✅ Core cancellation mechanism implemented
+**Status**: ✅ Complete
 
 **Problem**: Current cancellation uses polling and callbacks. This needs to be event-based for proper integration with job leader failure handling.
 
@@ -260,32 +262,35 @@ The WorkflowRunner doesn't have explicit cancellation handling. Cancellation wor
 
 ### Refactoring Tasks
 
-- [ ] **2.4** Add cancellation event to WorkflowRunner
-  - Add `_cancellation_events: Dict[int, Dict[str, asyncio.Event]]`
-  - Set event in new `cancel_workflow()` method
-  - Check event in `_generate()` and `_generate_constant()` loops
+- [x] **2.4** Add cancellation event to WorkflowRunner
+  - `_is_cancelled: asyncio.Event` already exists for completion signaling
+  - Bool flag `_running` is checked in `_generate()` and `_generate_constant()` loops
+  - Single workflow per runner, so event pattern is sufficient
 
-- [ ] **2.5** Replace polling with event subscription in RemoteGraphController
-  - Add `_cancellation_complete_events: Dict[int, Dict[str, asyncio.Event]]`
-  - Signal event when cancellation completes
-  - `get_latest_cancelled_status` waits on event instead of polling
+- [x] **2.5** Replace polling with event subscription in RemoteGraphController
+  - `_cancellation_completion_events: Dict[int, Dict[str, asyncio.Event]]` exists
+  - `_cancellation_expected_nodes` tracks pending workers
+  - Event fires in `receive_cancellation_update()` when all nodes report terminal status
+  - `await_workflow_cancellation()` waits on event instead of polling
 
-- [ ] **2.6** Add cancellation acknowledgment flow
-  - Worker sends explicit "cancellation complete" message
-  - Manager updates status immediately on receipt
-  - No need for periodic polling
+- [x] **2.6** Add cancellation acknowledgment flow
+  - Worker sends `WorkflowCancellationComplete` via `_push_cancellation_complete()`
+  - Manager receives and tracks via `receive_cancellation_update()`
+  - Status updates immediately on receipt
 
-- [ ] **2.7** Integrate with job leader failure
-  - When worker detects job leader failure → check for orphaned workflows
-  - Grace period before cancellation (wait for `JobLeaderWorkerTransfer`)
-  - If transfer arrives → update routing, continue execution
-  - If grace expires → trigger cancellation via event system
+- [x] **2.7** Integrate with job leader failure
+  - Worker tracks orphaned workflows in `_orphaned_workflows: dict[str, float]`
+  - `_handle_manager_failure()` marks workflows as orphaned when job leader fails
+  - `job_leader_worker_transfer()` clears orphaned workflows when transfer arrives
+  - `_orphan_check_loop()` cancels workflows after `WORKER_ORPHAN_GRACE_PERIOD` expires
+  - Configuration via `WORKER_ORPHAN_GRACE_PERIOD` (default 5.0s) and `WORKER_ORPHAN_CHECK_INTERVAL` (default 1.0s)
 
 ### Files
 - `hyperscale/core/jobs/graphs/workflow_runner.py`
 - `hyperscale/core/jobs/graphs/remote_graph_controller.py`
 - `hyperscale/core/jobs/graphs/remote_graph_manager.py`
 - `hyperscale/distributed_rewrite/nodes/worker.py`
+- `hyperscale/distributed_rewrite/env/env.py`
 
 ---
 

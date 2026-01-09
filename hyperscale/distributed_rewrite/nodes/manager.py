@@ -157,13 +157,9 @@ from hyperscale.reporting.common import ReporterTypes
 # New modular classes for job/workflow management
 from hyperscale.distributed_rewrite.jobs import (
     JobManager,
-    TrackingToken,
     WorkflowStateMachine,
     JobInfo,
-    WorkflowInfo,
-    SubWorkflowInfo,
     WorkerPool,
-    WorkerInfo,
     WorkerHealth,
     WorkflowDispatcher,
     WindowedStatsCollector,
@@ -315,6 +311,12 @@ class ManagerServer(HealthAwareServer):
         self._worker_unhealthy_since: dict[str, float] = {}
         self._manager_peer_unhealthy_since: dict[str, float] = {}
         self._gate_unhealthy_since: dict[str, float] = {}
+
+        # Dead manager tracking for orphaned job scanning (AD-31 Section 1)
+        # Tracks TCP addresses of managers confirmed dead via SWIM
+        # Used by new SWIM leaders to scan for orphaned jobs after election
+        # Cleared when manager rejoins via _on_node_join
+        self._dead_managers: set[tuple[str, int]] = set()
 
         # Reaping intervals from config
         self._dead_worker_reap_interval: float = env.MANAGER_DEAD_WORKER_REAP_INTERVAL
@@ -628,14 +630,22 @@ class ManagerServer(HealthAwareServer):
     def _on_manager_become_leader(self) -> None:
         """
         Called when this manager becomes the leader.
-        
+
         Triggers state sync from:
         1. All known workers to get workflow state (workers are source of truth)
         2. Peer managers to get job-level metadata (retry counts, etc.)
+
+        AD-31 Section 1: Also scans for orphaned jobs that may have been
+        missed during the election period when is_leader() returned False.
         """
         # Schedule async state sync via task runner
         self._task_runner.run(self._sync_state_from_workers)
         self._task_runner.run(self._sync_state_from_manager_peers)
+
+        # AD-31 Section 1: Scan for orphaned jobs from dead managers
+        # This catches jobs that couldn't be taken over during the election
+        # period when is_leader() returned False in _handle_job_leader_failure()
+        self._task_runner.run(self._scan_for_orphaned_jobs)
     
     def _on_manager_lose_leadership(self) -> None:
         """Called when this manager loses leadership."""
@@ -667,6 +677,10 @@ class ManagerServer(HealthAwareServer):
         # Check if this is a manager peer
         manager_tcp_addr = self._manager_udp_to_tcp.get(node_addr)
         if manager_tcp_addr:
+            # Track dead manager for orphaned job scanning (AD-31 Section 1)
+            # This allows new SWIM leaders to find orphaned jobs after election
+            self._dead_managers.add(manager_tcp_addr)
+
             # Find manager node_id if known
             for manager_id, manager_info in self._known_manager_peers.items():
                 if (manager_info.tcp_host, manager_info.tcp_port) == manager_tcp_addr:
@@ -712,6 +726,10 @@ class ManagerServer(HealthAwareServer):
         # Check if this is a manager peer
         manager_tcp_addr = self._manager_udp_to_tcp.get(node_addr)
         if manager_tcp_addr:
+            # Clear from dead managers tracking (AD-31 Section 1)
+            # Manager has rejoined, so it's no longer considered dead for orphan scanning
+            self._dead_managers.discard(manager_tcp_addr)
+
             # Clear unhealthy tracking for any manager peer at this address
             for manager_id, manager_info in self._known_manager_peers.items():
                 if (manager_info.tcp_host, manager_info.tcp_port) == manager_tcp_addr:
@@ -1175,6 +1193,112 @@ class ManagerServer(HealthAwareServer):
 
             # AD-31: Notify workers with active workflows of job leadership transfer
             await self._notify_workers_of_leadership_transfer(job_id, old_leader)
+
+    async def _scan_for_orphaned_jobs(self) -> None:
+        """
+        Scan for and take over orphaned jobs after becoming SWIM cluster leader.
+
+        AD-31 Section 1: When the SWIM leader fails and was also a job leader,
+        the new SWIM leader may not be able to take over the job during
+        `_handle_job_leader_failure()` because `is_leader()` returns False
+        during the election. This method runs after election completes to
+        catch any orphaned jobs that were missed.
+
+        This is called from `_on_manager_become_leader()` after the new leader
+        is established and initial state sync begins.
+
+        The method:
+        1. Iterates through all tracked jobs in `_job_leader_addrs`
+        2. Checks if the job's leader is in `_dead_managers`
+        3. Takes over leadership of any orphaned jobs found
+        4. Clears the dead manager from `_dead_managers` after processing
+
+        Edge case handling:
+        - If this leader fails during takeover, the next elected leader
+          will also call this method and find the same orphaned jobs
+        - Fencing tokens prevent duplicate/stale takeovers
+        """
+        if not self._dead_managers:
+            return
+
+        # Find all orphaned jobs (leader is in dead managers set)
+        orphaned_jobs: list[tuple[str, tuple[str, int]]] = []
+        for job_id, leader_addr in list(self._job_leader_addrs.items()):
+            if leader_addr in self._dead_managers:
+                orphaned_jobs.append((job_id, leader_addr))
+
+        if not orphaned_jobs:
+            # No orphaned jobs found, clear dead managers tracking
+            # (they may have been leading jobs that completed before they died)
+            self._dead_managers.clear()
+            return
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"New SWIM leader scanning for orphaned jobs: found {len(orphaned_jobs)} jobs from {len(self._dead_managers)} dead managers",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
+
+        # Apply per-job jitter to spread takeover load
+        import random
+        jitter_min = self.env.RECOVERY_JITTER_MIN
+        jitter_max = self.env.RECOVERY_JITTER_MAX
+
+        # Track which dead managers we've processed
+        processed_dead_managers: set[tuple[str, int]] = set()
+
+        for job_id, dead_leader_addr in orphaned_jobs:
+            # Apply jitter before each takeover
+            if jitter_max > 0:
+                jitter = random.uniform(jitter_min, jitter_max / 2)
+                await asyncio.sleep(jitter)
+
+            # Update job leadership to self
+            old_leader = self._job_leaders.get(job_id)
+            old_token = self._job_fencing_tokens.get(job_id, 0)
+            new_token = old_token + 1
+
+            self._job_leaders[job_id] = self._node_id.full
+            self._job_leader_addrs[job_id] = (self._host, self._tcp_port)
+            self._job_fencing_tokens[job_id] = new_token
+
+            # Increment state version
+            self._increment_version()
+
+            self._task_runner.run(
+                self._udp_logger.log,
+                ServerInfo(
+                    message=f"Orphan scan: took over job {job_id[:8]}... (was: {old_leader[:8] if old_leader else 'unknown'}..., token: {old_token} -> {new_token})",
+                    node_host=self._host,
+                    node_port=self._tcp_port,
+                    node_id=self._node_id.short,
+                )
+            )
+
+            # Notify gate and workers of leadership transfer
+            await self._notify_gate_of_leadership_transfer(job_id, old_leader)
+            await self._notify_workers_of_leadership_transfer(job_id, old_leader)
+
+            # Track that we processed this dead manager
+            processed_dead_managers.add(dead_leader_addr)
+
+        # Clear processed dead managers from tracking
+        # This prevents re-scanning for the same managers on subsequent calls
+        self._dead_managers -= processed_dead_managers
+
+        self._task_runner.run(
+            self._udp_logger.log,
+            ServerInfo(
+                message=f"Orphan scan complete: took over {len(orphaned_jobs)} jobs, cleared {len(processed_dead_managers)} dead managers from tracking",
+                node_host=self._host,
+                node_port=self._tcp_port,
+                node_id=self._node_id.short,
+            )
+        )
 
     async def _notify_gate_of_leadership_transfer(
         self,
